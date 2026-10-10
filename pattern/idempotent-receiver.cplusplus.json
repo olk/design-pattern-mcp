@@ -1,0 +1,56 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::unordered_set::insert + std::mutex",
+  "implementation_notes": "The classic C++ guard: one mutex-protected std::unordered_set whose insert() returns a pair whose .second is true only for the delivery that inserted the key - a single atomic claim instead of a separate contains()/insert() pair. Process-local and non-durable, so it fits only receivers that tolerate losing the seen-set on restart and that never run two instances against the same queue; the SQLite inbox variant is the durable counterpart. Values may carry an expiry timestamp so a sweep can enforce the retention window an unordered_set does not have.",
+  "code_sketch": "std::mutex m;\nstd::unordered_set<std::string> seen;\nbool claim(const std::string& id) {\n    std::lock_guard<std::mutex> lk(m);\n    return seen.insert(id).second;   // false => already claimed\n}\nvoid on_message(const Message& msg) {\n    if (!claim(msg.key)) { ack(msg); return; }   // duplicate: absorb\n    apply_effects(msg); ack(msg);\n}",
+  "pitfalls": [
+    "std::unordered_set::insert is atomic only under the same mutex; a lock-free read path (count() then insert()) reintroduces the check-then-act race.",
+    "The set dies with the process and is per-process: with competing consumers each instance claims the same key independently.",
+    "No TTL exists for unordered_set entries - retention must be swept deliberately or the guard grows for the process lifetime."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/container/unordered_set/insert",
+    "https://en.cppreference.com/w/cpp/thread/mutex"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "unordered-set-claim",
+      "name": "In-process claim with std::unordered_set",
+      "paradigm": "concurrent",
+      "implementation_notes": "The classic C++ guard: one mutex-protected std::unordered_set whose insert() returns a pair whose .second is true only for the delivery that inserted the key - a single atomic claim instead of a separate contains()/insert() pair. Process-local and non-durable, so it fits only receivers that tolerate losing the seen-set on restart and that never run two instances against the same queue; the SQLite inbox variant is the durable counterpart. Values may carry an expiry timestamp so a sweep can enforce the retention window an unordered_set does not have.",
+      "code_sketch": "std::mutex m;\nstd::unordered_set<std::string> seen;\nbool claim(const std::string& id) {\n    std::lock_guard<std::mutex> lk(m);\n    return seen.insert(id).second;   // false => already claimed\n}\nvoid on_message(const Message& msg) {\n    if (!claim(msg.key)) { ack(msg); return; }   // duplicate: absorb\n    apply_effects(msg); ack(msg);\n}",
+      "pitfalls": [
+        "std::unordered_set::insert is atomic only under the same mutex; a lock-free read path (count() then insert()) reintroduces the check-then-act race.",
+        "The set dies with the process and is per-process: with competing consumers each instance claims the same key independently.",
+        "No TTL exists for unordered_set entries - retention must be swept deliberately or the guard grows for the process lifetime."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/unordered_set/insert",
+        "https://en.cppreference.com/w/cpp/thread/mutex"
+      ],
+      "min_standard": "C++11",
+      "idiom_name": "std::unordered_set::insert + std::mutex"
+    },
+    {
+      "variant_id": "sqlite-inbox",
+      "name": "Durable SQLite inbox (INSERT OR IGNORE)",
+      "paradigm": "oo",
+      "implementation_notes": "The durable realization: a claim table with a UNIQUE key column, where `INSERT OR IGNORE` plus sqlite3_changes() is the atomic claim and the business write joins the same transaction so a crash cannot leave effects without a marker. Choose it whenever redelivery can outlive the process or several processes consume the same queue; run BEGIN IMMEDIATE (or WAL plus busy retry) so concurrent claim attempts serialize at the database rather than in application code.",
+      "code_sketch": "sqlite3_exec(db, \"BEGIN IMMEDIATE\", nullptr, nullptr, nullptr);\nsqlite3_prepare_v2(db, \"INSERT OR IGNORE INTO seen(key, at) VALUES(?1, ?2)\", -1, &st, nullptr);\nsqlite3_bind_text(st, 1, msg.key.c_str(), -1, SQLITE_TRANSIENT);\nsqlite3_step(st); sqlite3_finalize(st);\nif (sqlite3_changes(db) == 0) { rollback(db); ack(msg); return; }  // duplicate\napply_effects(db, msg);                    // same transaction\nsqlite3_exec(db, \"COMMIT\", nullptr, nullptr, nullptr); ack(msg);",
+      "pitfalls": [
+        "Committing the marker before the business write turns a crash into a lost message; keep both in one transaction.",
+        "SQLITE_BUSY from concurrent writers must be retried as a transient failure, never mistaken for a duplicate claim."
+      ],
+      "sources": [
+        "https://sqlite.org/lang_conflict.html",
+        "https://sqlite.org/c3ref/changes.html"
+      ],
+      "min_standard": "C++11",
+      "idiom_name": "SQLite unique key + INSERT OR IGNORE + sqlite3_changes()"
+    }
+  ],
+  "default_variant": "unordered-set-claim"
+}

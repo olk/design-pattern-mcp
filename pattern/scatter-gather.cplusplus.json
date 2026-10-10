@@ -1,0 +1,83 @@
+{
+  "pattern": "scatter-gather",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::async(std::launch::async) per recipient + future::wait_for against one deadline",
+  "implementation_notes": "The standard library supplies half of the pattern: std::async or std::packaged_task give the fan-out (one future per recipient) but there is no standard when_all before C++26, so the gather is a hand-written pass over the futures using future::wait_for(remaining) against a single steady_clock deadline. The launch policy must be passed explicitly (std::launch::async), otherwise the implementation may defer the call and nothing runs until someone waits. Prefer this variant for plain request/response calls; when the recipients are already asynchronous I/O, the Asio awaitable operators and the C++26 senders variants express the same gather with the transport's own completion machinery.",
+  "code_sketch": "auto deadline = std::chrono::steady_clock::now() + budget;\nstd::vector<std::future<Offer>> futs;\nfor (auto& r : recipients) futs.push_back(std::async(std::launch::async, ask, r));\nstd::vector<Offer> got;\nfor (auto& f : futs)\n    if (f.wait_for(deadline - std::chrono::steady_clock::now()) == std::future_status::ready)\n        got.push_back(f.get());     // each get() may throw: collect per-future",
+  "pitfalls": [
+    "The future returned by std::async blocks in its destructor: spawning without storing the futures silently serialises the fan-out.",
+    "A deferred std::async call returns future_status::deferred from wait_for immediately and never runs, so the gather reports zero answers without any error.",
+    "Exceptions surface at get(), one recipient at a time: a throwing recipient must not abort the merge of the others.",
+    "wait_for may return later than the deadline under scheduling contention; the budget is a floor on patience, not a hard bound."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/async",
+    "https://en.cppreference.com/w/cpp/thread/future/wait_for"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-async-futures",
+      "name": "std::async fan-out with a shared steady_clock deadline",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::async(std::launch::async) per recipient + future::wait_for against one deadline",
+      "implementation_notes": "The standard library supplies half of the pattern: std::async or std::packaged_task give the fan-out (one future per recipient) but there is no standard when_all before C++26, so the gather is a hand-written pass over the futures using future::wait_for(remaining) against a single steady_clock deadline. The launch policy must be passed explicitly (std::launch::async), otherwise the implementation may defer the call and nothing runs until someone waits. Prefer this variant for plain request/response calls; when the recipients are already asynchronous I/O, the Asio awaitable operators and the C++26 senders variants express the same gather with the transport's own completion machinery.",
+      "code_sketch": "auto deadline = std::chrono::steady_clock::now() + budget;\nstd::vector<std::future<Offer>> futs;\nfor (auto& r : recipients) futs.push_back(std::async(std::launch::async, ask, r));\nstd::vector<Offer> got;\nfor (auto& f : futs)\n    if (f.wait_for(deadline - std::chrono::steady_clock::now()) == std::future_status::ready)\n        got.push_back(f.get());     // each get() may throw: collect per-future",
+      "pitfalls": [
+        "The future returned by std::async blocks in its destructor: spawning without storing the futures silently serialises the fan-out.",
+        "A deferred std::async call returns future_status::deferred from wait_for immediately and never runs, so the gather reports zero answers without any error.",
+        "Exceptions surface at get(), one recipient at a time: a throwing recipient must not abort the merge of the others.",
+        "wait_for may return later than the deadline under scheduling contention; the budget is a floor on patience, not a hard bound."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async",
+        "https://en.cppreference.com/w/cpp/thread/future/wait_for"
+      ]
+    },
+    {
+      "variant_id": "asio-awaitable-operators",
+      "name": "Boost.Asio awaitable operators (co_await A && B / A || B)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines",
+        "Boost.Asio"
+      ],
+      "idiom_name": "co_await (a && b) / co_await (a || b) over make_parallel_group",
+      "implementation_notes": "Boost.Asio's awaitable_operators turn the gather into operators on awaitables: operator&& completes when all operations have completed and yields their values, operator|| as soon as one completes, reporting which. Both are sugar over make_parallel_group(ops).async_wait(condition, token), whose cancellation condition decides whether the operations still outstanding are cancelled - wait_for_all, wait_for_one, wait_for_one_error and wait_for_one_success are the supplied policies. That is where the deadline lives: race the group against a steady_timer, or use wait_for_one_success for a first-good-answer gather.",
+      "code_sketch": "using namespace boost::asio::experimental::awaitable_operators;\nauto both = co_await (ask(ep1) && ask(ep2));          // wait-for-all, values as a tuple\nco_await make_parallel_group(ask(ep1), ask(ep2), ask(ep3))\n    .async_wait(boost::asio::experimental::wait_for_one_success(),\n                [](auto order, boost::system::error_code e1, Offer o1,\n                   boost::system::error_code e2, Offer o2,\n                   boost::system::error_code e3, Offer o3) { /* first success wins */ });",
+      "pitfalls": [
+        "operator|| completes on the first completion, success or failure: first-successful-answer semantics need wait_for_one_success or an explicit retry loop.",
+        "Awaitables in a parallel group must not outlive the io_context that drives them: cancellation on destruction is not a substitute for an explicit deadline.",
+        "The losing operations are cancelled only when the group's cancellation condition asks for it; without one, stragglers keep running to completion."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/experimental__awaitable_operators.html",
+        "https://raw.githubusercontent.com/boostorg/asio/develop/include/boost/asio/experimental/parallel_group.hpp"
+      ]
+    },
+    {
+      "variant_id": "senders-when-all",
+      "name": "C++26 std::execution::when_all over senders",
+      "paradigm": "concurrent",
+      "min_standard": "C++26",
+      "requires_features": [
+        "std-execution-senders"
+      ],
+      "idiom_name": "std::execution::when_all(senders...) + this_thread::sync_wait",
+      "implementation_notes": "C++26 finally standardises the composition primitive the pattern was missing: when_all adapts several senders into one that completes once all of the inputs have completed, forwarding their values in argument order, and the stop token threaded through it propagates cancellation to the operations still running. First-best still has to be written by hand - the standard has no when_any (the future-based when_all of the concurrency TS is now only the historical predecessor) - so a gather that must answer with the first reply races the group against a timer sender. Choose this variant for library code that already models its I/O as senders; for application code the coroutine variant is far less machinery.",
+      "code_sketch": "auto all = std::execution::when_all(ask(ep1), ask(ep2), ask(ep3));\nauto [o1, o2, o3] = std::this_thread::sync_wait(std::move(all)).value();\nmerge({o1, o2, o3});   // values arrive in argument order, after every input completed",
+      "pitfalls": [
+        "when_all completes when every input has completed, error paths included: a per-recipient failure policy is still the caller's job.",
+        "There is no standard first-result adaptor, so a latency-bounded gather needs a hand-written sender or a timer-based race.",
+        "A sender that never completes stalls the whole group: the time budget must be part of the composition, not an afterthought."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/execution/when_all"
+      ]
+    }
+  ],
+  "default_variant": "std-async-futures",
+  "version": "1.0"
+}

@@ -1,0 +1,208 @@
+{
+  "category": "concurrency-resilience",
+  "name": "guarded-suspension",
+  "aliases": [
+    "conditional block",
+    "suspended execution"
+  ],
+  "intent": "Suspend a state-dependent method call inside the object that owns the state until another thread makes its guard predicate true, so callers neither poll nor get refused while the object is temporarily not ready.",
+  "problem": "A method may only proceed while a precondition over shared state holds - a buffer is non-empty, a pool still has a free lease, a session is authenticated, a worker has a task - and that state is produced by another thread at an unknown time. The recurring decision is what the caller should do while the guard is false: refusing the request would drop work the application still needs, forcing the transition would break the object's invariants, and polling wastes a core and still races. Guarded suspension answers it by waiting on a condition the object itself owns, and by making that wait atomic with respect to the state change that ends it.",
+  "context": "Concurrent objects whose methods are state-dependent and whose state changes arrive from other threads: bounded buffers and handoff queues, resource pools, server request/response handoffs, readiness and shutdown gates, worker idle loops. Applicable where the runtime can efficiently park or suspend a caller (OS threads, coroutines) and where the object already owns a lock or monitor, so no notification can be lost between the predicate check and the wait. Ill-suited to single-threaded event loops, to callers that must never be delayed, and to waits whose eventual completion cannot be guaranteed.",
+  "benefits": [
+    "No busy waiting: a not-ready caller sleeps in a wait set (or suspends its coroutine) instead of spinning, so a temporarily unavailable object costs no CPU while it is unavailable.",
+    "No lost transitions: the predicate is evaluated under the lock and the wait atomically releases it, so a state change that happens between the check and the sleep still wakes the waiter, and the waiter re-acquires the lock before acting.",
+    "The precondition stays with the state it describes: call sites simply call the method, while the check-and-retry protocol lives in the one object that owns the state - instead of being duplicated at every caller.",
+    "The guarded action observes a consistent state: the woken thread holds the lock when the predicate is re-tested, so it never acts on a torn or stale view produced by another thread mid-update.",
+    "Waiting is a first-class, policy-bearing step: timeout, deadline and cancellation attach at the wait (wait/notifyAll, Condition.await, pthread_cond_timedwait, wait_timeout), so liveness policy is designed rather than hoped for.",
+    "Turn-taking without dropping work: producer and consumer meet in one handshake, so the transition delays work rather than losing it - precisely the property the balking counterpart gives up.",
+    "No new machinery for the common cases: every mainstream runtime ships the wait set plus its notification operation (monitors, condition variables, blocking queues, channels), so the pattern usually selects a primitive instead of inventing one."
+  ],
+  "tradeoffs": [
+    "Deadlock and lost-wakeup risk: waiting while holding another lock, or signalling before the waiter is enqueued, freezes the program; both failures are timing-dependent and therefore expensive to reproduce and diagnose.",
+    "The predicate must be re-checked after every wake: POSIX, the JVM, .NET and Rust all permit spurious wake-ups, so an if-guard silently executes the action on an unsatisfied state.",
+    "A waiting caller occupies a thread (or a suspended coroutine and its state) for an unbounded time: unbounded waiters exhaust thread pools, and a request path that blocks without a timeout converts overload into unavailability.",
+    "Waking the wrong waiter or every waiter: signal/notify is cheaper but can leave a different predicate unsatisfied (a hang), while broadcast/notifyAll and close-a-channel avoid the hang at the price of a thundering herd and lock convoy on each state change.",
+    "Suspension is invisible at the call site: interruption, cancellation and timeouts must be threaded through the wait explicitly, otherwise shutdown cannot stop a blocked worker and the caller cannot distinguish slow from hung.",
+    "No fairness or progress guarantee: the wait set has no ordering contract, so a waiter can starve while new arrivals win the lock, and only a timed wait turns an unbounded wait into a decision the caller can act on."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 5,
+    "maintainability": 5,
+    "simplicity": 4,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Guarded Object",
+      "responsibility": "Owns the shared state, the lock and the wait set, and exposes state-dependent methods whose preconditions it decides."
+    },
+    {
+      "role": "Guard (predicate)",
+      "responsibility": "The boolean condition over the guarded state that must hold before the method may proceed; it is evaluated under the lock and re-evaluated after every wake-up."
+    },
+    {
+      "role": "Guarded Method",
+      "responsibility": "Acquires the lock, waits on the condition while the guard is false, performs the action once the guard holds, and releases the lock on every exit path."
+    },
+    {
+      "role": "Notifier (state-changing method)",
+      "responsibility": "Mutates the guarded state and signals the wait set in the same critical section - state first, then notification - so waiting callers cannot miss the transition."
+    },
+    {
+      "role": "Wait Set / Condition",
+      "responsibility": "The runtime queue (monitor wait set, condition variable, blocking queue, channel) in which callers are parked and from which signal/signalAll/notify/notifyAll removes them, re-acquiring the lock before they return."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Actor mailbox handoff: an Akka/Orleans/Swift-Actor mailbox is a lock-free guarded queue; the actor suspends on an empty mailbox and resumes when a message arrives, which is the same monitor-wait pattern expressed at the language level.",
+    "Swift async / Structured Concurrency: a Task.sleep or async let that suspends until a condition is a coroutine-level guarded suspension; the suspension point is backed by a condition variable or event channel inside the runtime.",
+    "CompletableFuture / async result: a future's blocking get() is a timed guarded suspension on the thread that submitted the asynchronous operation; the completion path (complete()) is the notifier.",
+    "Pipeline stage coordination: in a multi-stage streaming pipeline each stage blocks on input while the upstream stage processes, synchronising via a bounded channel whose put/get implement the guard.",
+    "Bounded buffers and handoff queues: a consumer's take waits while the buffer is empty and a producer's put waits while it is full (producer-consumer).",
+    "Resource pools: acquire blocks until a lease is returned to a connection, thread or object pool instead of failing or spinning when the pool is exhausted.",
+    "Server-side handoff: an acceptor or reader thread publishes a request and the worker waits for work to appear; a caller waits for the response slot to be filled.",
+    "Readiness and start-up gates: components wait until a dependency reports connected, initialised or ready, and callers wait until a session, device or circuit is open.",
+    "Shutdown and flush coordination: a terminator waits until in-flight work has drained, and a flusher waits while the buffer still holds entries (two-phase termination).",
+    "Platform queue and channel APIs: BlockingQueue.take/put, Queue#pop, Channel.receive/for-await, condition-variable waits - the same guard hidden behind a library type.",
+    "Project Loom virtual threads (JEP 444): a virtual thread calling Object.wait() parks its Continuation; the carrier thread is released for other virtual threads, so the program continues throughput while one virtual thread waits. The guarded action still re-checks the predicate on wake, and the pattern's semantics are preserved — only the threading model changes.",
+    "Akka typed actor mailbox: each actor has a single-threaded mailbox; receive() suspends the actor's continuation when the mailbox is empty, resuming when a message is dispatched. This is language-level guarded suspension where the wait set is the mailbox queue and the guard is 'mailbox non-empty'.",
+    "Kotlin coroutines rendezvous channel: Channel() (unbuffered/rendezvous) suspends the sender until a receiver is ready, and vice versa — the same lock-free handoff as an unbuffered Go channel. The suspension is a coroutine-level guarded wait on rendezvous.",
+    "Python asyncio.Condition: an async context manager that wraps an asyncio.Lock; await cond.wait() releases the lock and suspends the task until notify() is called, making it an async guarded suspension where the runtime schedules other tasks during the wait.",
+    "Go unbuffered channel send/receive: goroutine G1 executing ch <- x on an unbuffered channel sleeps (gopark) until goroutine G2 executes <-ch, at which point the runtime directly transfers the value and stack copy (rendezvous handoff). This is the language-level form of guarded suspension: the guard is 'receiver present', the wait set is the sudog queue in hchan.",
+    "Erlang/OTP process mailbox: a gen_server receiving messages from its mailbox blocks (receive...end) until a matching message arrives — the OTP process is a state machine whose transitions are guarded by message arrival, making each receive a suspension point in the actor's event loop.",
+    ".NET TaskCompletionSource<T>: GetAwaiter().GetResult() on a not-yet-completed TCS is a synchronous guarded suspension; the async continuation (ConfigureAwait, await) is an asynchronous one. SetResult() is the notifier. TCS is a one-shot asymmetric guarded suspension where one side never waits (the completor) and one side always waits (the synchronously blocked caller).",
+    "JDK ArrayBlockingQueue: the queue is one ReentrantLock plus two Condition objects, notEmpty and notFull - take() awaits notEmpty while count == 0, put() awaits notFull while the buffer is full, and each signals the other condition only after mutating count and the circular buffer inside the same critical section. It is the reference production realisation of a two-predicate guarded suspension, including the fairness switch and the timed offer/poll variants.",
+    "Go standard library: database/sql guards queries against a concurrent Close with closingMutex, which parks readers and the closing writer on two sync.Cond values (read/write), and net/http's Server.Shutdown waits until in-flight requests have drained. Both are the case Go's own guidance reserves sync.Cond for - a predicate that changes back and forth over time rather than a one-shot handoff.",
+    "HikariCP connection pool: DataSource.getConnection() suspends the caller until a lease is returned while the pool already holds maximumPoolSize connections, bounded by connectionTimeout (default 30000 ms, minimum 250 ms), after which it throws SQLException rather than waiting on - a guarded suspension in which the deadline is a documented, first-class outcome instead of an accident."
+  ],
+  "avoid_when": [
+    "The caller can proceed with a default, a refusal or an error: balking (return immediately) or an Optional/Result answer is simpler than blocking.",
+    "The caller is waiting for the result of one specific operation rather than for shared state: Future/Promise, async-await or request-reply with correlation is the right shape, and it carries its own timeout.",
+    "The platform is a single-threaded event loop (browser main thread, Node's main thread, UI loops): blocking is impossible, so await an asynchronous queue instead - the JavaScript and TypeScript language files classify this as discouraged for exactly that reason.",
+    "Waiting cannot be guaranteed to end (the notifier may never run) and the caller must not hang: use a queue with a timeout or dead-letter policy, and bound every request-path wait with a deadline.",
+    "A plain bounded queue, semaphore or channel already expresses the condition ('items available', 'space available', 'a permit is free'): do not hand-roll a wait set over a structure that ships one."
+  ],
+  "language_files": {
+    "generic": "guarded-suspension.generic.json",
+    "c": "guarded-suspension.c.json",
+    "cplusplus": "guarded-suspension.cplusplus.json",
+    "csharp": "guarded-suspension.csharp.json",
+    "go": "guarded-suspension.go.json",
+    "java": "guarded-suspension.java.json",
+    "javascript": "guarded-suspension.javascript.json",
+    "kotlin": "guarded-suspension.kotlin.json",
+    "python": "guarded-suspension.python.json",
+    "ruby": "guarded-suspension.ruby.json",
+    "rust": "guarded-suspension.rust.json",
+    "scala": "guarded-suspension.scala.json",
+    "swift": "guarded-suspension.swift.json",
+    "typescript": "guarded-suspension.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "posa2",
+    "modern"
+  ],
+  "related_patterns": [
+    "monitor-object",
+    "balking",
+    "producer-consumer",
+    "guardian-object",
+    "read-write-lock",
+    "two-phase-termination",
+    "thread-safe-interface",
+    "counting-semaphore",
+    "reactor",
+    "future-promise",
+    "actor"
+  ],
+  "anti_patterns": [
+    "Polling in place of waiting: while (!ready) sleep(1ms) burns CPU, adds latency and hides the missing notification protocol behind a retry loop.",
+    "if instead of while: treating the return from the wait as proof that the guard holds, so a spurious wake-up or a signal meant for another predicate executes the action on an unsatisfied state.",
+    "Signalling without a state change (or before the waiter has enqueued): the notify hands nothing over, and a program that looks correct hangs only under load.",
+    "Broadcast storms: notifyAll on every mutation in a queue with one interchangeable waiter class, so every state change wakes all waiters and they fight for the lock.",
+    "Waiting while holding other locks, or inside callbacks invoked from the guarded action: lock-order inversion and callback deadlocks recreate the problem the pattern separates away.",
+    "Unbounded blocking in a request path with no timeout, cancellation or fairness policy: a delayed notification becomes a stalled request that nothing can shed."
+  ],
+  "design_principles": [
+    "Encapsulation of the guard: the object owns the predicate, so no caller can race it, weaken it or re-implement it.",
+    "Atomicity: predicate evaluation, wait-time lock release and lock re-acquisition are one indivisible step with respect to the notifier.",
+    "Separation of concerns: state mutation and notification (notifier) stay distinct from the state-dependent action (guarded method).",
+    "Invariant preservation: the action runs only under a re-validated invariant, so the state it observes is consistent rather than a mid-update snapshot.",
+    "Explicit liveness policy: bounded waits, timeouts and cancellation belong to the design of the wait, not to the caller's optimism."
+  ],
+  "best_practices": [
+    "Use the predicate-form wait overload wherever the runtime offers one — std::condition_variable::wait(lock, pred) in C++, Condition.await(predicate) in Java, or Channel.connect(constraint) in Go — so the library enforces the while-loop semantics instead of relying on hand-written guards.",
+    "Signal (notify) only after the state change is durable inside the critical section; signalling before the mutation is the primary cause of lost-wakeup hangs that disappear under load.",
+    "Prefer notifyAll/broadcast when one wait set protects several independent predicates; reserve notify/signal for the case where all waiters are interchangeable (single queue length, one resource type).  Broadcasting on every change to a multi-predicate monitor is the classic cause of a thundering-herd lock convoy.",
+    "Give every unbounded wait an explicit timeout or deadline, and treat expiration as a first-class outcome the caller must handle — never an indistinguishable fallback path.",
+    "In async/await runtimes (Swift actors, .NET async, Kotlin coroutines), model the guarded wait as a suspension point on a condition channel or a Task-completion future rather than as a blocking thread; the actor's mailbox itself is the wait set.",
+    "Propagate interruption and cancellation exceptions rather than swallowing them; a finally-block notify as a patch for a missing signal is a code smell that will be invisible until the race fires under production load.",
+    "Keep the lock hold time minimal — acquire the lock, evaluate and wait, then release; do not perform I/O, heavy computation, or callbacks inside the critical section.",
+    "Document which method is responsible for the complementary notification; a wait whose signal has no declared owner is a latent hang waiting to surface in production.",
+    "Always re-check the predicate after every wake, and prefer the library's predicate form - condition_variable::wait(lock, pred), Condition.wait_for, Condvar::wait_while - over a hand-written loop.",
+    "Change the state and notify inside the same critical section, state first and notification second, so no waiter can miss the transition.",
+    "Prefer notifyAll/broadcast when one wait set serves several predicates; use notify_one/signal only when the waiting threads are genuinely interchangeable.",
+    "Give every boundary wait a deadline or a cancellation path, and make the timeout an explicit outcome the caller can handle instead of an indistinguishable return.",
+    "Preserve the interruption contract: propagate InterruptedException, ThreadInterruptedException and CancellationException rather than swallowing them, and never use a finally-notify as a patch for a lost wake-up.",
+    "Keep the critical section that holds the guard small: do the state-dependent bookkeeping under the lock and leave expensive work outside it.",
+    "Document who notifies and under which state change; a wait whose notification has no owner is a future hang.",
+    "Prefer a library condition, queue or channel over a hand-rolled flag, and pick the queue whenever the condition is literally 'an item is available'.",
+    "The predicate-form wait overload is the single highest-leverage practice: std::condition_variable::wait(lock, pred), Condition.await(predicate), while (!pred) wait(). It prevents both spurious-wakeup and lost-wakeup bugs at the library level, eliminating an entire class of production incidents. Always prefer it.",
+    "Design the notification order explicitly: signal after state change, inside the same critical section. The order 'state mutate, then signal' is what prevents the lost-wakeup race where a notifier fires before the waiter has entered the wait set.",
+    "Distinguish the scope of notification: notify/signal wakes one waiter (use when waiters are interchangeable — a single resource, a queue length); notifyAll/broadcast wakes all (use when different waiters guard different predicates, so only the satisfied one proceeds). The wrong choice causes either hangs (one notifies, wrong waiter wakes) or thundering herds (broadcast on every state change).",
+    "Treat spurious wakeups as guaranteed by the runtime: on Linux, futex wake can return more waiters than were explicitly woken; in the JVM, the JLS permits Object.wait to return spuriously. The while-loop over a predicate is not defensive programming — it is the required contract.",
+    "Avoid nested suspension: do not call a guarded method (which may wait) while holding a lock that the notifier needs to acquire. This is the lock-order inversion deadlock that makes a suspension that looks correct in isolation hang the whole program in deployment.",
+    "Model async/await suspension as language-level guarded suspension: Kotlin Channel.send/receive, Go unbuffered channel send/receive, Swift actor mailbox receive, Python asyncio.Condition.wait — all are implementations of the pattern where the runtime's scheduler owns the wait set. Understanding the guard-and-predicate structure explains why these primitives work and how to avoid misuse.",
+    "In virtual-thread environments (Project Loom, goroutines), blocking a virtual thread no longer exhausts an OS thread pool — but the guarded action's correctness requirements (re-check predicate, state-first notification, bounded wait) remain unchanged. Virtual threads change the cost of blocking, not the semantics of the guard.",
+    "Design for notification completeness: every wait must have exactly one notifier, and that notifier must be called on every state change that could satisfy the guard. A notification whose call site is unknown or undocumented is a future production incident."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Lea, D., Concurrent Programming in Java: Design Principles and Patterns, 2nd ed. (Addison-Wesley, 1999) — §3.2 'Guarded Methods', §3.2.1 'Guarded Suspension'; the definitive reference for waiting guarded methods and their notification protocols. https://gee.cs.oswego.edu/dl/cpj/index.html",
+    "Schmidt, D. C., et al., 'The Guarded Suspension Pattern' — ACE/TAO pattern sheet describing the lock + condition-variable form with formal pre/post conditions. https://www.dre.vanderbilt.edu/~schmidt/cs254/2022-PDFs/6.2.2-Java-ConditionObject-pt2-guarded-suspension.pdf",
+    "Oracle Java Tutorial, 'Guarded Blocks' — practical introduction using Object.wait/notify with the while-loop pattern. https://docs.oracle.com/javase/tutorial/essential/concurrency/guardmeth.html",
+    "Wikipedia — Guarded Suspension — peer-reviewed summary with the canonical Java example and references to the pattern's origins in monitor-based concurrency. https://en.wikipedia.org/wiki/Guarded_suspension",
+    "Java Design Patterns — Guarded Suspension — annotated Java implementation with discussion of bounded-queue handoff and producer-consumer context. https://java-design-patterns.com/patterns/guarded-suspension/",
+    "Stroustrup, B., et al., C++ Core Guidelines — 'Be Aware of the Traps of Condition Variables' (Modernes C++): covers lost-wakeup and spurious-wakeup with recommended predicate-based wait overloads. https://www.modernescpp.com/index.php/c-core-guidelines-be-aware-of-the-traps-of-condition-variables/",
+    "Grand, M., Patterns in Java Volume 1, 2nd ed. (Wiley, 2002) — catalogs guarded suspension as a named concurrency pattern with a monitor-based formulation, explicitly distinguishing it from the GoF behavioural patterns.",
+    "Baeldung, 'Why wait() Requires Synchronization' (2024) — explains why Object.wait() requires holding the monitor lock and how synchronization prevents lost wakeups. https://www.baeldung.com/java-wait",
+    "Eli Bendersky, 'Basics of Futexes' (2018) — deep dive into the Linux futex syscall that underlies pthread_cond_wait and JVM Object.wait() on Linux, explaining the timeout, spurious wakeup, and wait-wake handoff mechanics. https://eli.thegreenplace.net/2018/basics-of-futexes/",
+    "Go runtime: runtime/chan.go — canonical hchan struct implementation showing the rendezvous send/receive handoff for unbuffered channels. https://go.dev/src/runtime/chan.go",
+    "Bigos, K., et al., 'Correct and Efficient Work-Stealing for Weak Memory Models' (PPoPP 2023) — research on concurrent queue implementation pitfalls relevant to producer-consumer and guarded suspension. https://arxiv.org/abs/2302.06675",
+    "PVS-Studio V1089 Rule — static analysis rule for waiting on a condition variable without a predicate. https://pvs-studio.com",
+    "JEP 444: Virtual Threads (OpenJDK, 2023) — Project Loom virtual threads; blocking a virtual thread parks the Continuation rather than the OS thread. https://openjdk.org/jeps/444",
+    "Inngest, 'What Python's asyncio primitives get wrong about shared state' (2026) — correctness issues in asyncio.Event, asyncio.Condition, and asyncio.Queue for async guarded suspension. https://www.inngest.com/blog/asyncio-primitives-shared-state",
+    "Lea, D., 'Concurrent Programming in Java: State Dependence' (Informit) — §3.2 'Guarded Methods' and guarded suspension: state-dependent method invocation, the suspend-until-the-guard-holds protocol, and the timeout/balking fallbacks the pattern must offer. https://www.informit.com/articles/article.aspx?p=31539&seqNum=2",
+    "Pattern-Oriented Software Architecture Volume 2: Patterns for Concurrent and Networked Objects (Schmidt, Stal, Röhnert, Buschmann; Wiley, 2000) — the pattern language (Monitor Object, Thread-Safe Interface, Active Object, Leader/Followers) in which the Guarded Suspension pattern sheet sits. https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/",
+    "Rust standard library, std::sync::Condvar — official documentation of wait/wait_while/wait_timeout_while: the wait atomically releases the mutex and re-acquires it, spurious wake-ups are expected so the predicate is re-tested on every return, and poisoning is reported on re-acquisition. https://doc.rust-lang.org/std/sync/struct.Condvar.html",
+    "Oracle, ArrayBlockingQueue Javadoc (JDK 24) — the bounded FIFO queue whose blocking put/take are the pattern's contract, documented together with the optional fairness policy and the timed offer/poll outcomes. https://docs.oracle.com/en/java/javase/24/docs/api/java.base/java/util/concurrent/ArrayBlockingQueue.html",
+    "OpenJDK, java.util.concurrent.ArrayBlockingQueue source — one ReentrantLock plus notEmpty/notFull Condition objects, with enqueue/dequeue signalling the opposite condition after updating count under the lock: the two-predicate monitor in shipped form. https://github.com/openjdk-mirror/jdk7u-jdk/blob/master/src/share/classes/java/util/concurrent/ArrayBlockingQueue.java",
+    "Go: Under the Hood, §11.4 'Condition Variables' — why Wait must sit inside a for loop (Mesa semantics; spurious and interfering wake-ups across pthreads, Java and Go), the ticketing notifyList, and the standard library sites that genuinely use Cond: database/sql closemu and HTTP server shutdown draining. https://golang.design/under-the-hood/en/part3concurrency/ch11sync/cond/",
+    "golang/go#21165, 'proposal: sync: remove the Cond type' — the sharpest published criticism of the pattern's raw primitive: condition variables are hard to use, prone to missed and spurious signals, poorly documented, and non-zero-value, which is why Go steers callers to channels instead. https://github.com/golang/go/issues/21165",
+    "golang/go#81043, 'database/sql: closingMutex lost wakeup deadlocks Rows.Next against concurrent Rows.Close' — a lost-wakeup suspension hang found in the shipped Go standard library, evidence that the state-before-notification contract is still broken in mature code. https://github.com/golang/go/issues/81043",
+    "HikariCP README (brettwooldridge/HikariCP) — connectionTimeout semantics: getConnection() waits for a connection to become available while the pool is at maximumPoolSize and then fails with SQLException, a production pool that bounds its guarded wait. https://github.com/brettwooldridge/HikariCP/blob/dev/README.md"
+  ],
+  "related_patterns_notes": {
+    "condition-variable": "condition-variable"
+  }
+}

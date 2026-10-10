@@ -1,0 +1,57 @@
+{
+  "pattern": "bulkhead",
+  "language": "cplusplus",
+  "support": "library",
+  "implementation_notes": "Since C++20 the standard library ships the semaphore the pattern needs: one std::counting_semaphore<N> per dependency (std::binary_semaphore for a single slot), try_acquire_for() as a bounded wait that doubles as the fail-fast path, and a RAII guard whose destructor releases the permit so every exit path returns it - replacing the classic explicit pool bookkeeping with scope-based release. Keep this form when calls suspend or an event loop already owns the threads; switch to the dedicated-pool variant when the dependency call blocks a thread.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-counting-semaphore",
+      "name": "std::counting_semaphore permit (C++20)",
+      "paradigm": "concurrent",
+      "implementation_notes": "Since C++20 the standard library ships the semaphore the pattern needs: one std::counting_semaphore<N> per dependency (std::binary_semaphore for a single slot), try_acquire_for() as a bounded wait that doubles as the fail-fast path, and a RAII guard whose destructor releases the permit so every exit path returns it - replacing the classic explicit pool bookkeeping with scope-based release. Keep this form when calls suspend or an event loop already owns the threads; switch to the dedicated-pool variant when the dependency call blocks a thread.",
+      "min_standard": "C++20",
+      "idiom_name": "std::counting_semaphore try_acquire_for (C++20)",
+      "code_sketch": "static std::counting_semaphore<8> db_slots{8};\n\nif (!db_slots.try_acquire_for(std::chrono::milliseconds{50}))\n    return respond_busy();                        // saturated: fail fast\nstruct Release { std::counting_semaphore<8>& s;\n                 ~Release() { s.release(); } } rel{db_slots};\nauto rows = db.query(sql);                        // permit returned on scope exit",
+      "pitfalls": [
+        "std::counting_semaphore exists only from C++20; older toolchains need a mutex/condition_variable counter or a library semaphore (Boost).",
+        "try_acquire_for returns false both on timeout and on saturation by other callers; the rejection is the same, but logs should not claim a specific cause.",
+        "A counting semaphore does not bound the waiting queue, so unconstrained waiters still grow memory and latency unless waits are timed out.",
+        "Never capture the semaphore by value in the guard: the release must hit the shared instance, not a copy."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/counting_semaphore"
+      ]
+    },
+    {
+      "variant_id": "dedicated-thread-pool",
+      "name": "Dedicated fixed worker pool per dependency (C++11)",
+      "paradigm": "concurrent",
+      "implementation_notes": "The classic thread-level bulkhead: a fixed pool of N threads per dependency plus a bounded queue; the caller posts work and never blocks, so a stalled dependency occupies only its own N threads. Boost.Asio's thread_pool is the pragmatic library form and a hand-rolled std::thread pool over std::condition_variable the dependency-free one. Choose this over the semaphore when the dependency call blocks a thread and the caller must stay responsive; remember the pool's work queue is unbounded until you bound it yourself.",
+      "min_standard": "C++11",
+      "idiom_name": "boost::asio::thread_pool (or std::thread pool) per dependency",
+      "code_sketch": "boost::asio::thread_pool db_pool{8};           // one pool per dependency\nstd::counting_semaphore<64> db_admission{64};  // bound the pool's queue\n\nif (!db_admission.try_acquire()) return respond_busy();\nboost::asio::post(db_pool, [&, req] {\n    auto rows = db.query(req.sql);             // blocking call, isolated pool\n    db_admission.release();\n    deliver(rows);\n});",
+      "pitfalls": [
+        "boost::asio::thread_pool's work queue is unbounded; without a separate admission bound a stalled dependency accumulates arbitrary pending work.",
+        "Captured state must outlive the posted functor: capturing stack references by reference is a use-after-free when the caller returns first.",
+        "One pool per dependency multiplies idle threads and stacks; never create a pool per request or per call site."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/thread_pool.html",
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    }
+  ],
+  "default_variant": "std-counting-semaphore",
+  "idiom_name": "std::counting_semaphore try_acquire_for (C++20)",
+  "code_sketch": "static std::counting_semaphore<8> db_slots{8};\n\nif (!db_slots.try_acquire_for(std::chrono::milliseconds{50}))\n    return respond_busy();                        // saturated: fail fast\nstruct Release { std::counting_semaphore<8>& s;\n                 ~Release() { s.release(); } } rel{db_slots};\nauto rows = db.query(sql);                        // permit returned on scope exit",
+  "pitfalls": [
+    "std::counting_semaphore exists only from C++20; older toolchains need a mutex/condition_variable counter or a library semaphore (Boost).",
+    "try_acquire_for returns false both on timeout and on saturation by other callers; the rejection is the same, but logs should not claim a specific cause.",
+    "A counting semaphore does not bound the waiting queue, so unconstrained waiters still grow memory and latency unless waits are timed out.",
+    "Never capture the semaphore by value in the guard: the release must hit the shared instance, not a copy."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/counting_semaphore"
+  ]
+}

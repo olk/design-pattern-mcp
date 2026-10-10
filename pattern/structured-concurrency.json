@@ -1,0 +1,148 @@
+{
+  "category": "concurrency-resilience",
+  "name": "structured-concurrency",
+  "aliases": [
+    "nursery",
+    "task scope"
+  ],
+  "intent": "Confine the lifetimes of related concurrent subtasks to the dynamic extent of the operation that started them, so the parent cannot complete before its children do and failure or cancellation in either direction tears down the whole task tree in a controlled way.",
+  "problem": "With raw spawn primitives (go, Thread.new, create_task, Task.Run, std::async, pthread_create) a child runs independently of the code that started it: when the parent fails, is cancelled or returns early, its children keep running, their failures are never observed, and shutdown must be coordinated by hand. The task-subtask relationships exist only in the developer's head, so leaked tasks, delayed cancellation and orphaned work become normal.",
+  "context": "Request-scoped or operation-scoped concurrency in servers, pipeline stages, batch jobs and UI work trees - anywhere a computation fans out into related subtasks that must all finish before the caller continues, cancellation is cooperative, and the runtime can represent the parent-child task relation (threads with interruption, tokens, coroutines, task groups or structured task scopes).",
+  "benefits": [
+    "Lifetime containment: every child finishes - or is cancelled and has finished - before the scope exits, so no task can outlive the operation that started it.",
+    "Failure is structural: the first child failure cancels the siblings and surfaces as the scope's failure instead of being lost or handled ad hoc at each call site.",
+    "Cancellation propagates in both directions (parent to children, sibling to sibling) and the scope is the single place that waits for cleanup to complete.",
+    "Observability: the nesting of scopes mirrors the code, so profilers, debuggers and thread dumps can present the task tree instead of unrelated stacks.",
+    "Composition: scopes nest arbitrarily, and completion policies (all-success, first-success/race, await-all) are chosen per scope instead of being hand-coded per call site."
+  ],
+  "tradeoffs": [
+    "Cancellation is cooperative: nothing can force a child to stop and scope exit normally waits for it, so a child that ignores its signal or blocks on non-interruptible calls delays the whole scope (Java's close waits even for cancelled subtasks; Swift groups run cancelled children to completion).",
+    "Long-lived background work does not fit: fire-and-forget and daemon tasks must be hoisted to a longer-lived supervisor or an explicit escape hatch, turning previously invisible lifetime decisions into explicit design work.",
+    "Joining couples the parent's latency to its slowest child; even fail-fast policies must wait for cancellation to complete, so worst-case latency is the slowest child plus cancellation latency.",
+    "Blocking or CPU-bound children can starve the scope's scheduler (runtime workers, dispatchers, carrier threads), so mixed workloads need offloading rules such as spawn_blocking, Dispatchers.IO or dedicated pools.",
+    "Failure semantics are language-specific and heavier than a plain exception - ExceptionGroup, FailedException, suppressed exceptions, JoinError - and the team must understand and unwrap them; scopes also add machinery over a bare spawn call."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 6,
+    "maintainability": 8,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Scope owner (parent task)",
+      "responsibility": "Opens the scope, forks the child tasks, decides when to stop forking, joins the scope and owns the operation's outcome."
+    },
+    {
+      "role": "Child task",
+      "responsibility": "Runs one subtask concurrently; its lifetime is confined to the scope, and it must observe the cancellation signal at safe points and clean up in finally/ensure/defer."
+    },
+    {
+      "role": "Scope (task group, nursery, task scope)",
+      "responsibility": "Runtime object that owns the children, enforces parent-child nesting, joins every child at exit and cancels those still running."
+    },
+    {
+      "role": "Completion policy (joiner)",
+      "responsibility": "Decides when the scope is done and whether a child outcome cancels the remaining children: all-success, first-success/race, await-all, or collect-until-predicate."
+    },
+    {
+      "role": "Cancellation signal",
+      "responsibility": "Cooperative channel shared with the children - interrupt, stop_token, CancellationToken, context.Context, AbortSignal, atomic stop flag - that children poll and the scope triggers on failure or shutdown."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Request handlers that fan out to several backends (user profile, orders, recommendations) and must fail fast, cancel siblings and return only once every call has stopped.",
+    "Parallel data retrieval and combination (read several shards or files, then join the parts) where a failure must not leave half of the fetches running.",
+    "Hedged requests and races: start several replicas and take the first success, cancelling the rest via an any-success completion policy.",
+    "Batch jobs with a per-operation deadline, where a scope timeout must cancel the entire sub-tree of work when the budget is exhausted.",
+    "UI or application work trees in which cancelling a screen, document or session must stop every background task that belonged to it.",
+    "Python 3.11+ services replacing ad-hoc asyncio.create_task fan-out with asyncio.TaskGroup - the stdlib API documented as leveraging structural concurrency so a group of related tasks is awaited with strong safety guarantees: a failed child cancels the siblings and the errors surface as an ExceptionGroup at the scope exit.",
+    "Kotlin coroutines code in which each request, screen or session opens a coroutineScope and starts its subtasks with launch/async - kotlinx.coroutines relies on structured concurrency, a tree hierarchy of parent and child tasks with linked lifecycles, so abandoning the request cancels the whole coroutine subtree.",
+    "Go request handlers fanning out RPCs with errgroup.WithContext from golang.org/x/sync: the derived Context is cancelled as soon as any goroutine returns a non-nil error, and Wait returns only once every goroutine has finished, giving the handler a fail-fast join point."
+  ],
+  "avoid_when": [
+    "The work is genuinely fire-and-forget or must outlive the operation (background indexing, email delivery): use a queue, a supervisor or an explicitly owned long-lived task instead.",
+    "There is only one subtask and nothing to fan out - a sequential call or a plain await is simpler and needs no scope machinery.",
+    "The workload is CPU-bound batch parallelism over a fixed collection: parallel loops and parallel collections (Parallel.ForEach, parallel streams, rayon) express that shape with less ceremony.",
+    "The children cannot cooperate (third-party blocking calls that ignore cancellation): the scope can then only wait for them, and a timeout- or supervisor-based design is the real answer."
+  ],
+  "language_files": {
+    "generic": "structured-concurrency.generic.json",
+    "c": "structured-concurrency.c.json",
+    "cplusplus": "structured-concurrency.cplusplus.json",
+    "csharp": "structured-concurrency.csharp.json",
+    "go": "structured-concurrency.go.json",
+    "java": "structured-concurrency.java.json",
+    "javascript": "structured-concurrency.javascript.json",
+    "kotlin": "structured-concurrency.kotlin.json",
+    "python": "structured-concurrency.python.json",
+    "ruby": "structured-concurrency.ruby.json",
+    "rust": "structured-concurrency.rust.json",
+    "scala": "structured-concurrency.scala.json",
+    "swift": "structured-concurrency.swift.json",
+    "typescript": "structured-concurrency.typescript.json"
+  },
+  "paradigm": [
+    "concurrent"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "cancellation-token",
+    "fork-join",
+    "async-method-invocation",
+    "future-promise",
+    "master-worker",
+    "thread-pool",
+    "actor"
+  ],
+  "anti_patterns": [
+    "Spawn-and-forget inside the function that owns the operation ('go statement' style): the child outlives the caller and its failures vanish.",
+    "Catching the scope's failure and returning success while children are still running or still cleaning up.",
+    "Awaiting futures through whatever handle happens to be around, so the task-subtask relation exists only in comments instead of in a scope.",
+    "Cancelling through a flag that children never check, then claiming the operation was cancelled.",
+    "Using a whole-program scope (GlobalScope, detached tasks, root executors) and calling it structured concurrency."
+  ],
+  "design_principles": [
+    "Code structure mirrors task structure: the block that starts the subtasks is the block that joins them.",
+    "Lifetime containment/nesting: a child's lifetime is bounded by its parent's, so the task tree mirrors the call tree.",
+    "Fail fast with cooperative cancellation: one failure triggers cancellation and children return at their next safe point.",
+    "Separation of mechanism and policy: the scope owns creation, joining and cancellation; a joiner/completion policy decides outcomes.",
+    "RAII or lexical scoping for concurrency: the scope is entered and left like any other structured block (try-with-resources, async with, supervised)."
+  ],
+  "best_practices": [
+    "Confine every related subtask to one scope and always join before returning - on the success, failure and timeout paths alike.",
+    "Make children cancellation-aware: check the signal at safe points, keep critical sections short and clean up in finally/ensure/defer.",
+    "Choose the completion policy explicitly (all-success, first-success/race, await-all) instead of accepting a default by accident.",
+    "Bound the number of children per scope (semaphore, SetLimit, bounded group) so fan-out cannot overwhelm the scheduler or the downstream services.",
+    "Keep scopes short-lived and nested; move genuinely long-lived work into an owned supervisor or queue rather than widening the scope.",
+    "Surface scope failures with their causes (unwrap ExceptionGroup/FailedException/JoinError) and never swallow cancellation exceptions."
+  ],
+  "version": "1.1",
+  "sources": [
+    "docs/design-patterns.md §7 'Task lifetimes and asynchronous work' - Structured Concurrency row; originating citations: OpenJDK JEP 499/JEP 505 (Pressler et al., 2024/2025) and Nathaniel J. Smith, 'Notes on structured concurrency' (2018).",
+    "https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/",
+    "https://openjdk.org/jeps/505",
+    "https://openjdk.org/jeps/499",
+    "https://ox.softwaremill.com/latest/structured-concurrency/fork-join.html",
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://kotlinlang.org/docs/coroutines-basics.html",
+    "https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html",
+    "https://softwaremill.com/critique-of-jep-505-structured-concurrency-fifth-preview/"
+  ]
+}

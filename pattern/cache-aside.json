@@ -1,0 +1,190 @@
+{
+  "category": "persistence-state",
+  "name": "cache-aside",
+  "aliases": [
+    "look-aside cache",
+    "lazy loading cache"
+  ],
+  "intent": "Place the cache beside the authoritative store and make the application own the protocol: look up the cache first, load the entry from the store on a miss and populate it with a TTL, and invalidate the entry right after each write to the store - so repeated reads stay cheap while the store, never the cache, decides what is true.",
+  "problem": "A source of truth (relational database, downstream service, object store) is expensive or rate-limited for the read volume an application receives, while most reads repeat a small set of keys: without a cache every request pays the source-of-truth cost, and with an unmanaged cache the copies silently drift. The recurring decision is where the read path looks first, when a miss may populate the entry, and what a write must do so the cached copy stops lying.",
+  "context": "Read-heavy paths in front of a slower or metered authoritative store, typically several application instances sharing a Redis or Memcached tier, or each holding an in-process cache, where a bounded amount of staleness is acceptable and every writer can be held to the same invalidation discipline. It applies when the read/write ratio is high, when the cache itself does not provide read-through or write-through, and when lost or evicted entries can always be recomputed from the store.",
+  "benefits": [
+    "Reads that hit the cache never touch the source of truth, so latency and load drop exactly on the paths that repeat.",
+    "Only requested data is cached: the working set tracks the real access pattern instead of preloading everything the application might need.",
+    "The cache can be added, resized or removed without changing the data model - the source of truth stays authoritative and the application keeps working (more slowly) with a cold or absent cache.",
+    "Failure isolation is explicit: a miss, an eviction or a cache outage is defined to fall back to the source of truth, so the cache never owns correctness.",
+    "Population policy (TTL, what to cache, what to skip) can be tuned per key family without touching the store or the callers."
+  ],
+  "tradeoffs": [
+    "Bounded staleness is inherent: between a write to the source of truth and the invalidation or expiry of the entry, readers can see the previous value - and a writer that bypasses the application leaves the cache stale until the TTL fires.",
+    "The miss path is a load amplifier: a hot key that expires or is invalidated can send every concurrent reader to the source of truth at once, so stampede control (single-flight, per-key lock, early refresh) is part of the pattern rather than a later optimization.",
+    "Correctness depends on discipline repeated at every write path: commit to the store and only then invalidate - removing the entry first opens a window in which a reader repopulates the stale value.",
+    "The cache becomes a second production dependency with its own failure and capacity modes; if a cache outage is not degraded cleanly to the source of truth, the pattern turns an optimization into an availability risk.",
+    "Key structure, serialization format and their versioning become a contract: a deploy that changes the value shape can misread or overwrite entries unless keys carry a namespace or version.",
+    "Cold caches after a deploy or scale-out make the first requests slower exactly when traffic is rising, so priming or request coalescing has to be planned.",
+    "Tuning is per data set: too short a TTL thrashes the store, too long makes stale reads the norm, and eviction behaviour must be understood before the cache is trusted under pressure."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Read path (client)",
+      "responsibility": "Asks the cache first and uses the source of truth only on a miss, so the lookup order is decided in one place instead of at every call site."
+    },
+    {
+      "role": "Cache",
+      "responsibility": "Keyed store of entries with an eviction policy and a TTL; may be in-process or shared, but never authoritative and never required for correctness."
+    },
+    {
+      "role": "Source of truth",
+      "responsibility": "The authoritative data store (database, service, object store) that is always correct and must remain able to answer when the cache cannot."
+    },
+    {
+      "role": "Loader (miss handler)",
+      "responsibility": "Reads the source of truth for the missing key, hands the value to the cache with an expiry, and decides what not to cache (errors, absent rows)."
+    },
+    {
+      "role": "Invalidator (write path)",
+      "responsibility": "Commits changes to the source of truth and then removes or refreshes the corresponding entry; centralised so no writer can forget it."
+    },
+    {
+      "role": "Expiry and staleness policy",
+      "responsibility": "Declares the TTL and the stale-read behaviour (serve stale, block, recompute) plus the stampede policy for hot keys that lapse."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Read-heavy lookups by natural key (product catalogs, user profiles, article pages) in front of a relational database.",
+    "Several service instances sharing a Redis or Memcached tier where every instance must see the same cached copy and the same invalidation.",
+    "Reference data that changes slowly (currency rates, feature flags, configuration, price lists) refreshed by TTL with explicit invalidation when it is edited.",
+    "Expensive aggregate or derived results (dashboards, search pages, recommendations) recomputed into the cache per request key.",
+    "Per-instance in-process caches for hot, rarely changing values where a shared cache would add network latency without adding much.",
+    "Multi-level caching in Kubernetes: an in-process L1 (Caffeine) sidecar on each pod with an L2 Redis cluster, where the L1 is invalidated on each incoming request via a bloom filter or pub/sub.",
+    "CDN edge caching for static or semi-static API responses: the application server acts as the origin and issues cache-aside reads; CDN edges serve from their own look-aside cache with short TTLs and PURGE invalidation on writes.",
+    "RAG and vector cache in AI pipelines: embedding results cached by query hash so repeated semantically identical questions hit the vector store once and reuse cached results; TTL bounds staleness of the embedding index.",
+    "Django's low-level cache API (cache.get / cache.get_or_set with a per-key timeout, cache.delete on save) is cache-aside as a framework primitive; MediaWiki's WANObjectCache does the same at Wikipedia scale via getWithSet, invalidating page parses through cross-datacenter purges rather than direct writes.",
+    "Spring's cache abstraction applies the pattern declaratively: @Cacheable loads and populates on a miss, @CacheEvict removes the entry after the writer, with RedisCacheManager supplying the TTL - the application still owns both paths, the annotation only moves where.",
+    "Hibernate's second-level cache read-write concurrency strategy is a managed cache-aside: the updated entry is soft-locked around the transaction so concurrent readers miss to the database instead of repopulating the cache with the pre-commit value."
+  ],
+  "avoid_when": [
+    "Read-after-write freshness is required on the same path: use write-through (or update the cache inside the same transaction) instead of tolerating a staleness window.",
+    "The data is static or small enough to hold in memory from startup: prime it once and serve it without a cache tier.",
+    "The cache or framework already provides read-through and write-through: do not re-implement the protocol underneath it.",
+    "The hit rate would be low because keys are mostly unique: the extra lookup and population work costs more than it saves.",
+    "The data is sensitive or security relevant and the cache is shared between users or applications: read it from the primary source instead."
+  ],
+  "language_files": {
+    "generic": "cache-aside.generic.json",
+    "c": "cache-aside.c.json",
+    "cplusplus": "cache-aside.cplusplus.json",
+    "csharp": "cache-aside.csharp.json",
+    "go": "cache-aside.go.json",
+    "java": "cache-aside.java.json",
+    "javascript": "cache-aside.javascript.json",
+    "kotlin": "cache-aside.kotlin.json",
+    "python": "cache-aside.python.json",
+    "ruby": "cache-aside.ruby.json",
+    "rust": "cache-aside.rust.json",
+    "scala": "cache-aside.scala.json",
+    "swift": "cache-aside.swift.json",
+    "typescript": "cache-aside.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "caching",
+    "memoization",
+    "lazy-load",
+    "lazy-initialization",
+    "singleflight",
+    "write-behind",
+    "data-access-object",
+    "identity-map"
+  ],
+  "anti_patterns": [
+    "Cache-first writes: deleting or overwriting the entry before the source-of-truth commit, which lets a concurrent reader repopulate the stale value.",
+    "Cache as database: treating the cached copy as authoritative, so a flush or eviction becomes data loss.",
+    "No TTL and no invalidation on some write path: entries survive forever and the cache starts lying about the data.",
+    "Unbounded or unnamespaced caching of user-specific data in a shared cache, mixing tenants and leaking data across requests.",
+    "Expiring hot keys with no stampede protection, turning every expiry into a burst of duplicate source-of-truth reads.",
+    "Negative cache poisoning: if a key never existed in the source of truth and is not cached as absent, every request for it hits the origin; an attacker can enumerate non-existent IDs and saturate the database.",
+    "Hot-key saturation: a single key receiving orders-of-magnitude more QPS than median (e.g. a celebrity post) saturates one cache shard regardless of total cluster throughput; mitigate with key replication or an L1 buffer.",
+    "Cache penetration via key cardinality explosion: search queries, pagination and dynamic filters can create millions of unique keys with near-zero hit rate, thrashing the cache; cap key diversity and use a Bloom filter.",
+    "Serialization version skew: a deploy changes the value shape but old serialized entries are still in cache, causing deserialisation errors or silent data corruption; version keys with a schema prefix.",
+    "Double-write inconsistency: writing to cache and database in non-atomic sequence (cache-first, or database-write succeeds but cache-invalidate fails) leaves the cache and store disagreeing; always commit to the store first.",
+    "Cold cache after a rolling deploy: every new pod instance starts with an empty L1 in-process cache; without pre-warming the hot set, the first burst of traffic stampedes the shared L2 and origin.",
+    "Cache as a load-bearing dependency: if Redis going down causes the application to fail rather than degrade gracefully to the store, the cache has become a correctness dependency instead of an optimisation."
+  ],
+  "design_principles": [
+    "Single source of truth: the cache is an optimization that may always be discarded, so correctness lives in the store.",
+    "Bounded staleness as an explicit contract: the TTL and the stale-read behaviour are part of the interface, not an accident.",
+    "Ordered write path: mutate the store first and invalidate second - the reverse order is a documented correctness bug.",
+    "Fail safe to the store: cache errors and evictions degrade to source-of-truth reads rather than wrong answers.",
+    "Centralised invalidation: one place defines which keys a write affects, so no writer can silently skip it."
+  ],
+  "best_practices": [
+    "Update the source of truth first, then remove the entry (or refresh it); never invalidate before the commit.",
+    "Give every entry a TTL as a safety net even when explicit invalidation exists, and align it with how stale the data is allowed to be.",
+    "Namespace and version cache keys (application, schema version, tenant) so deploys and shared caches cannot misread each other.",
+    "Coalesce concurrent misses per key (single-flight, per-key lock, provider-side dedup) and consider serving briefly stale data while one loader refreshes.",
+    "Decide and document what is not cached: errors, missing rows (or a short negative entry), large objects, and anything sensitive.",
+    "Instrument hit ratio, miss latency and eviction behaviour; a cache that is not measured cannot be tuned or trusted.",
+    "Degrade explicitly: when the cache is unavailable, read the source of truth rather than failing the request.",
+    "Add TTL jitter (±10–20%) so entries filled together do not expire simultaneously, spreading the herd across time instead of concentrating it at the TTL cliff.",
+    "Cache negative results (the 'not found' sentinel) with a short TTL (30–60 s) to prevent cache-penetration attacks and reduce origin load from repeated absent-key queries.",
+    "Layer a local in-process L1 cache (e.g. Caffeine) in front of a shared L2 (Redis/Memcached) to reduce network hops for the hottest keys; invalidate L1 via pub/sub or keyspace notifications.",
+    "Use stale-while-revalidate: serve a stale value while refreshing asynchronously in the background, so readers never wait on a miss for hot keys that are within the grace window.",
+    "Implement probabilistic early expiration (XFetch/PER) for the hottest keys: independently roll dice to refresh before TTL fires, smearing recomputation across time instead of concentrating it at expiry.",
+    "Pre-warm the cache before scale-out events or deploys: run a priming script that touches the expected hot keys so new nodes do not start cold into rising traffic.",
+    "Version cache keys with a schema or payload prefix (e.g. product:v2:42) and bump the prefix on breaking changes so old entries age out instead of deserialising into wrong shapes."
+  ],
+  "sources": [
+    "Cloud Design Patterns: Prescriptive Architecture Guidance for Cloud Applications (Microsoft patterns & practices, 2014) - Cache-Aside.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside",
+    "https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html",
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.memory.memorycache",
+    "Scaling Memcache at Facebook (Nishtala et al., NSDI 2013) — introduces leases to prevent stale sets and thundering herds; peak DB query rate reduced from 17K/s to 1.3K/s for susceptible keys. https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala",
+    "Performance at Scale with Amazon ElastiCache (AWS Whitepaper) — lazy caching as foundation, jittered TTLs, prewarming procedure, hot-key and hot-shard mitigation, combined lazy-loading + write-through hybrid guidance. https://docs.aws.amazon.com/pdfs/whitepapers/latest/scale-performance-elasticache/scale-performance-elasticache.pdf",
+    "AWS Caching Best Practices — TTL as blast-radius cap on bugs, combined lazy-loading + write-through, thundering herd effect, TTL jitter, cache prewarming, eviction policy selection (allkeys-lru vs allkeys-lfu). https://aws.amazon.com/caching/best-practices/",
+    "Redis Cache-Aside Guide (redis.io) — Go and Python implementations with Lua singleflight locks for stampede protection, stale-while-revalidate, explicit invalidation order (delete, never set). https://redis.io/docs/latest/develop/use-cases/cache-aside/",
+    "\"Optimal Probabilistic Cache Stampede Prevention\" (Vattani, Chierichetti, Lowenstein, VLDB 2015) — XFetch/PER algorithm: refresh before TTL fires with probability rising as expiry approaches; lock-free, coordination-free stampede prevention at scale. https://www.vldb.org/pvls/vol14/p1357-vattani.pdf",
+    "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html",
+    "https://docs.djangoproject.com/en/stable/topics/cache/",
+    "https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html",
+    "https://docs.hibernate.org/stable/orm/javadocs/org/hibernate/annotations/CacheConcurrencyStrategy.html",
+    "https://wikitech.wikimedia.org/wiki/Memcached",
+    "https://ishu.dev/post/cache-invalidation-cdc-dual-write-2026-07-21"
+  ],
+  "version": "1.2",
+  "related_patterns_notes": {
+    "read-through": "read-through",
+    "write-through": "write-through",
+    "refresh-ahead": "refresh-ahead",
+    "leases": "leases",
+    "hybridcache": "hybridcache",
+    "mcrouter": "mcrouter"
+  }
+}

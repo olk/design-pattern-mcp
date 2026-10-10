@@ -1,0 +1,158 @@
+{
+  "category": "workflow-messaging",
+  "name": "message-store",
+  "aliases": [
+    "message journal",
+    "message archive"
+  ],
+  "intent": "Copy selected message data into a durable, independently queryable store outside the main flow, so auditing, operations and forensics can report on messages long after the messaging system and its logs have forgotten them - without making delivery depend on the store.",
+  "problem": "Message data is transient by design: a message is consumed, acknowledged and gone, brokers discard what their retention policy no longer needs, and application logs are unstructured, rotated and rarely queryable. When an auditor asks what was actually sent for a given order, or an operator must reconstruct an incident from last week, nothing durable and reportable exists - and bolting recording onto the delivery path would couple every send to a store that can itself fail.",
+  "context": "Asynchronous messaging across a process, host or organizational boundary where an obligation outlives the messages: regulatory audit, reconciliation, incident forensics or capacity reporting. The store is written outside the delivery path (fire-and-forget, batched, or through a Wire Tap on a control channel), lives in its own schema or database, and its retention, access control and redaction are explicit policy decisions rather than side effects of the messaging infrastructure.",
+  "benefits": [
+    "Independent reporting: audits, dashboards and post-mortems query the store without touching or slowing the live flow, so the loose coupling of the messaging solution survives the reporting requirement.",
+    "Retention that outlives everything else: the record survives process restarts, log rotation and the broker's own TTL, because its lifetime is a policy of the store rather than of the transport.",
+    "Evidence for reconstruction: a stable message or correlation id plus the selected payload fields lets responders replay what actually crossed the wire and join it with Message History's route or with downstream reconciliation data.",
+    "Bounded, selective cost: only the fields the reporting purpose justifies (id, channel, timestamp, redacted payload) have to be kept, so the store can stay small even where the message rate is high.",
+    "Decoupled load: reporting traffic lands on the store, not on the messaging or business path, so a heavy audit query cannot delay delivery.",
+    "Separable accountability: the store can be owned, backed up, encrypted and inspected by a different team with different privileges than the message flow."
+  ],
+  "tradeoffs": [
+    "The copy is a second write that can fail silently: if the tap drops, batches or its writer dies, the flow keeps running and the audit trail develops holes exactly where incidents and audits look - the store's own health has to be monitored as a separate signal.",
+    "No transaction spans the flow and the store: unless the record shares the business transaction (which reintroduces coupling and its availability), it can lag or miss the very message that crashed the process - the store is evidence, not a guarantee.",
+    "Storage and write amplification: every selected message is written a second time and retained, so payload-heavy stores grow quickly and expiry, partitioning and archiving become recurring operational work.",
+    "Security liability by accumulation: a durable, queryable duplicate of production payloads is the most attractive dataset in the system - it needs redaction at write time, encryption at rest and tight read access, or the audit trail becomes a data-protection incident.",
+    "Schema and format drift: stored records outlive the message contract, so readers must version and tolerate old shapes, and a payload change made carelessly silently renders history unreadable.",
+    "False confidence: once a message store exists people assume any question can be answered from it, although the stored projection (selected fields, sampling, tap lag) bounds what can honestly be reconstructed."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 5,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Message Store",
+      "responsibility": "The durable, queryable record itself: it defines the record schema, appends without blocking the flow, answers lookups by message or correlation id, and applies the retention and deletion rules; it must survive restarts independently of the messaging system."
+    },
+    {
+      "role": "Stored Message Record",
+      "responsibility": "The projection that is kept - a stable message id and correlation id, channel or route, timestamp and size always, plus only those payload fields the reporting purpose justifies, usually redacted, masked or hashed."
+    },
+    {
+      "role": "Store Tap",
+      "responsibility": "Copies selected messages out of the flow into the store: a fire-and-forget copy on a secondary channel, a Wire Tap, or a batched writer; it must never block or fail the delivery path, and its drops must be counted."
+    },
+    {
+      "role": "Retention and Redaction Policy",
+      "responsibility": "Decides which fields are stored, masked or dropped, how long each class of record lives, and when records expire, are archived or purged; it is what makes the store lawful, affordable and defensible."
+    },
+    {
+      "role": "Store Reader",
+      "responsibility": "Auditors, operators, reconciliation jobs and dashboards that query the store through a read-only reporting surface - never by taking a dependency on the live flow."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Regulatory audit trails: retain id, channel, timestamp and selected redacted fields of payment, invoicing or healthcare messages so a compliance query can be answered months later.",
+    "Incident forensics: keep the exact payload of failing or rejected messages alongside a Dead Letter Channel so a production defect can be reproduced from evidence instead of from guesswork.",
+    "Reconciliation: compare the store's record of what was sent with downstream ledgers or partner acknowledgements to find messages that left the system but never took effect.",
+    "Operational reporting: message volumes, sizes and end-to-end latency per channel and route, computed from stored records rather than from instrumented code paths.",
+    "Replay and test data: sample production traffic into the store to replay it against a fixed build or to generate realistic test corpora, with sensitive fields redacted.",
+    "Service-level measurement: prove delivery and processing times by comparing the store's send and receive timestamps with the routing path recorded by Message History.",
+    "Framework-backed message retention: Spring Integration's persistent MessageStore implementations can keep aggregator or QueueChannel state outside process memory for restart-safe inspection, while a separate reporting projection preserves the off-path audit boundary.",
+    "Event-log replay and controlled recovery: Apache Kafka topic retention and Amazon EventBridge Archive and Replay can preserve selected events long enough for forensic queries or bounded replay, but their retention, filtering and ordering semantics must be recorded with the evidence.",
+    "Dead-letter investigation: Azure Service Bus dead-letter queues and message browsing let operators inspect failed or expired messages without consuming the live queue, providing a concrete forensic source that still must be distinguished from proof that every message was delivered."
+  ],
+  "avoid_when": [
+    "You actually need delivery durability: the store is not where a message waits to be delivered - use Store-and-Forward, Transactional Message Queue or Guaranteed Delivery for that and keep the store as a separate concern.",
+    "The payload is personal or confidential and there is no lawful basis or retention rule for a duplicate: store metadata and counts only, hash the identifiers, or store nothing at all.",
+    "The platform already retains what is needed: a log-based broker's retained topic, a broker archive or an existing database audit table makes a second store duplicate cost with a second consistency story.",
+    "A sampled metric or aggregate counter answers the question: if only volume, error rates or latency matter, Watchman-style monitoring is far cheaper than a row per message.",
+    "The audit write would have to be on the critical path (acknowledged before delivery): that turns observability into an availability risk and usually means the requirement is really delivery durability.",
+    "The need is transient debugging: a Wire Tap into existing logs with the same short retention is enough, and a durable store only adds a dataset to protect."
+  ],
+  "language_files": {
+    "generic": "message-store.generic.json",
+    "c": "message-store.c.json",
+    "cplusplus": "message-store.cplusplus.json",
+    "csharp": "message-store.csharp.json",
+    "go": "message-store.go.json",
+    "java": "message-store.java.json",
+    "javascript": "message-store.javascript.json",
+    "kotlin": "message-store.kotlin.json",
+    "python": "message-store.python.json",
+    "ruby": "message-store.ruby.json",
+    "rust": "message-store.rust.json",
+    "scala": "message-store.scala.json",
+    "swift": "message-store.swift.json",
+    "typescript": "message-store.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "data-oriented"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "wire-tap",
+    "message-history",
+    "control-bus",
+    "store-and-forward",
+    "transactional-message-queue",
+    "guaranteed-delivery",
+    "claim-check",
+    "message-expiration"
+  ],
+  "anti_patterns": [
+    "Treating the message store as the delivery mechanism: a copy in the store is mistaken for a guarantee that the message arrived, so the flow's real durability gaps stay unfixed.",
+    "Synchronous, blocking store writes on the delivery path, so an audit-store outage stops the business flow - observability has become a single point of failure.",
+    "Store everything forever: unbounded retention of full payloads including personal data, turning an audit control into a compliance incident and a cost centre.",
+    "Silently swallowing tap failures (an empty catch around the copy), so the audit trail's holes are as invisible as the problems it was built to expose.",
+    "Records without a stable message or correlation id, so the store cannot be joined to routing history, dead letters or reconciliation - rows nobody can interpret."
+  ],
+  "design_principles": [
+    "The store is an observer, not a participant: nothing on the delivery path may depend on the store being available or fast.",
+    "Separate the guarantees: delivery durability and record durability are different properties, served by Guaranteed Delivery versus Message Store.",
+    "Purpose limitation and data minimisation: store the projection the reporting purpose requires, not everything that passes through.",
+    "Information hiding: readers get a narrow read-only query surface; the schema and its evolution stay an implementation detail of the store.",
+    "Fail safe, not fail silent: the tap's failures must be visible (counters, alerts, a dead-letter for the copy) while never failing the message."
+  ],
+  "best_practices": [
+    "Write the record off the critical path (bounded queue, batched writer, or a Wire Tap on a control channel) and make the tap explicitly lossy-but-monitored rather than blocking.",
+    "Always store the envelope metadata - message id, correlation id, channel or route, timestamp, size - even when the payload itself is not kept.",
+    "Redact, mask or hash sensitive fields at write time and encrypt the store at rest; treat the store as the most sensitive dataset in the system.",
+    "Define retention per record class (expiry attribute, drop or partition by age, archive to cold storage), purge on a schedule and measure store growth.",
+    "Version the stored record and keep changes additive; readers must tolerate old shapes, so the store's schema deserves the same review as a public API.",
+    "Monitor the tap itself - lag, drop counts, batch failures, store write errors - because an observability component whose own health is unobserved defeats its purpose.",
+    "Use the store for what it is (evidence, reporting, forensics) and pair it with Guaranteed Delivery, Store-and-Forward or a Dead Letter Channel when the requirement is really delivery or failure handling."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - System Management pattern group, Message Store (with Wire Tap, Message History, Control Bus and Smart Proxy).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageStore.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/WireTap.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageHistory.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/SmartProxy.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/ControlBus.html",
+    "https://docs.enterprise.spring.io/spring-integration/reference/message-store.html",
+    "https://kafka.apache.org/43/configuration/topic-configs/",
+    "https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-archive.html",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-browsing",
+    "https://static.brandur.org/fragments/events"
+  ]
+}

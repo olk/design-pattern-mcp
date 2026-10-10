@@ -1,0 +1,79 @@
+{
+  "pattern": "registry",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "static table + registry_register/registry_lookup",
+  "implementation_notes": "The default C realization: a file-static array of name-keyed entries plus registry_register/registry_lookup free functions. Small entry counts are searched linearly; sort the array and use bsearch(3) or switch to a hash when it grows. The registry is a module, not an object: callers see only the two functions.",
+  "code_sketch": "struct reg_entry { const char *name; void *impl; };\nstatic struct reg_entry reg[64];\nstatic size_t reg_n;\nvoid registry_register(const char *name, void *impl) {\n    if (reg_n == 64) abort();             /* full: fail fast */\n    reg[reg_n++] = (struct reg_entry){ name, impl };\n}\nvoid *registry_lookup(const char *name) {\n    for (size_t i = 0; i < reg_n; i++)\n        if (strcmp(reg[i].name, name) == 0) return reg[i].impl;\n    return NULL;\n}",
+  "pitfalls": [
+    "Nothing is thread-safe by default: two threads calling registry_register concurrently corrupt reg_n, so guard both operations with a pthread_mutex/pthread_rwlock or allow registration only during single-threaded start-up.",
+    "The fixed capacity is a silent failure mode: registry_register must return an error (or abort) when the table is full.",
+    "Entries are borrowed pointers: the registry never frees them, so lifetime and deallocation stay with the registrant."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/hsearch.3.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "static-table",
+      "name": "Static entry table + register/lookup functions",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "static table + registry_register/registry_lookup",
+      "implementation_notes": "The default C realization: a file-static array of name-keyed entries plus registry_register/registry_lookup free functions. Small entry counts are searched linearly; sort the array and use bsearch(3) or switch to a hash when it grows. The registry is a module, not an object: callers see only the two functions.",
+      "code_sketch": "struct reg_entry { const char *name; void *impl; };\nstatic struct reg_entry reg[64];\nstatic size_t reg_n;\nvoid registry_register(const char *name, void *impl) {\n    if (reg_n == 64) abort();             /* full: fail fast */\n    reg[reg_n++] = (struct reg_entry){ name, impl };\n}\nvoid *registry_lookup(const char *name) {\n    for (size_t i = 0; i < reg_n; i++)\n        if (strcmp(reg[i].name, name) == 0) return reg[i].impl;\n    return NULL;\n}",
+      "pitfalls": [
+        "Nothing is thread-safe by default: two threads calling registry_register concurrently corrupt reg_n, so guard both operations with a pthread_mutex/pthread_rwlock or allow registration only during single-threaded start-up.",
+        "The fixed capacity is a silent failure mode: registry_register must return an error (or abort) when the table is full.",
+        "Entries are borrowed pointers: the registry never frees them, so lifetime and deallocation stay with the registrant."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/hsearch.3.html"
+      ]
+    },
+    {
+      "variant_id": "posix-hsearch",
+      "name": "POSIX hsearch hash table",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "POSIX hsearch (XSI)"
+      ],
+      "idiom_name": "hcreate/hsearch ENTRY table",
+      "implementation_notes": "POSIX gives C a hash table whose entries are literally ENTRY { char *key; void *data; }: hcreate(nel) once, hsearch(item, ENTER) to register and hsearch(item, FIND) to look up (glibc adds reentrant hcreate_r/hsearch_r for several tables). It replaces the hand-written table when entry counts are large, but it is only the storage: you still write the register/lookup wrappers.",
+      "code_sketch": "ENTRY e = { .key = \"json\", .data = &json_codec };\nENTRY *found;\n\nif (!hcreate(30)) return -1;          /* one global table, XSI */\nhsearch(e, ENTER);                    /* register */\n\ne.key = name;\nfound = hsearch(e, FIND);             /* lookup */\nif (found == NULL) return unknown();\nreturn (struct codec *)found->data;",
+      "pitfalls": [
+        "hsearch is MT-Unsafe (glibc documents a race on the global table) and the non-reentrant hcreate allows only one table per process.",
+        "Entries can be added but never deleted, and hdestroy does not free the key/data buffers - the caller must keep bookkeeping if the table is ever rebuilt.",
+        "Keys are compared with strcmp, so keys are NUL-terminated strings only; the table size is fixed at hcreate time and cannot grow."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/hsearch.3.html",
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/hcreate.html"
+      ]
+    },
+    {
+      "variant_id": "constructor-registration",
+      "name": "Link-time self-registration via constructor attribute",
+      "paradigm": "procedural",
+      "min_standard": "C11",
+      "requires_features": [
+        "gcc/clang constructor attribute"
+      ],
+      "idiom_name": "__attribute__((constructor)) + registry_register",
+      "implementation_notes": "Modules register themselves before main() with a function attribute: __attribute__((constructor)) runs at load time, so each module calls registry_register from its own constructor and the core never lists its modules. This mirrors the registration half of the classic structure (the Registry object is still the shared table), and it is what makes plugin-style C registries self-describing.",
+      "code_sketch": "static const struct codec json_codec = { .name = \"json\", ... };\n\nstatic void __attribute__((constructor)) register_json(void) {\n    registry_register(json_codec.name, (void *)&json_codec);\n}\n/* linked modules run their constructors before main(); no central list */\nint main(void) {\n    const struct codec *c = registry_lookup(\"json\");\n    return c ? c->encode(...) : 1;\n}",
+      "pitfalls": [
+        "Constructor order between translation units is unspecified, so anything that depends on a specific registration order (or on the registry's own storage being ready) is undefined behaviour - the C analogue of the static initialization order fiasco.",
+        "Linkers may drop an object file whose symbols nobody references, and a --gc-sections/static-library build silently loses registrations; __attribute__((constructor)) is a GCC/Clang extension, not ISO C.",
+        "Registration before main makes failures invisible until first lookup, so the lookup path must report unknown keys loudly."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/hsearch.3.html",
+        "https://gitlab.freedesktop.org/wayland/weston/-/blob/main/libweston/plugin-registry.c"
+      ]
+    }
+  ],
+  "default_variant": "static-table",
+  "version": "1.0"
+}

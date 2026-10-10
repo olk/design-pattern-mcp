@@ -1,0 +1,57 @@
+{
+  "pattern": "two-step-view",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "libxml2 logical page behind unique_ptr owners + libxslt transform per channel",
+  "implementation_notes": "Stage one builds the logical page as a libxml2 document whose pointers are adopted immediately by std::unique_ptr with the matching deleter (xmlFreeDoc, xsltFreeStylesheet), so the intermediate cannot leak on an early return or an exception; the tree stays strictly channel-neutral. Stage two compiles one stylesheet per channel once and runs xsltApplyStylesheet per render, which keeps HTML, text and XSL-FO outputs derived from the same page. Modern C++ adds nothing to the split itself - it only makes ownership exception-safe and hides the xmlChar* ceremony behind std::string_view wrappers. Choose it when XSLT stylesheets are the team's rendering technology; otherwise the sibling variant avoids the dependency entirely.",
+  "code_sketch": "std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> page(xmlNewDoc(BAD_CAST \"1.0\"), xmlFreeDoc);\nxmlNodePtr inv = xmlNewNode(nullptr, BAD_CAST \"invoice\");   // stage 1: logical page\nxmlDocSetRootElement(page.get(), inv);\nxmlNewChild(inv, nullptr, BAD_CAST \"customer\", BAD_CAST \"ACME\");\n\nstd::unique_ptr<xsltStylesheet, decltype(&xsltFreeStylesheet)> xsl(\n    xsltParseStylesheetFile(BAD_CAST \"invoice-html.xsl\"), xsltFreeStylesheet);\nstd::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> out(\n    xsltApplyStylesheet(xsl.get(), page.get(), nullptr), xmlFreeDoc);  // stage 2\nxsltSaveResultToFile(stdout, out.get(), xsl.get());",
+  "pitfalls": [
+    "A raw pointer created before the wrapper that owns it is constructed leaks if anything in between throws; adopt each allocation immediately.",
+    "libxslt and libxml2 keep process-global parser flags and cleanup routines, so they are not tied to your objects and mixing a vendored and a system copy is a link-time trap.",
+    "The result document returned by xsltApplyStylesheet is owned by the caller and is not freed by xsltFreeStylesheet; forgetting xmlFreeDoc leaks one page per request."
+  ],
+  "sources": [
+    "https://gnome.pages.gitlab.gnome.org/libxslt/tutorial/libxslttutorial.html",
+    "https://www.w3.org/TR/1999/REC-xslt-19991116"
+  ],
+  "variants": [
+    {
+      "variant_id": "libxml2-libxslt",
+      "name": "RAII-wrapped libxml2 page + libxslt stylesheet",
+      "paradigm": "declarative",
+      "min_standard": "C++11",
+      "idiom_name": "libxml2 logical page behind unique_ptr owners + libxslt transform per channel",
+      "implementation_notes": "Stage one builds the logical page as a libxml2 document whose pointers are adopted immediately by std::unique_ptr with the matching deleter (xmlFreeDoc, xsltFreeStylesheet), so the intermediate cannot leak on an early return or an exception; the tree stays strictly channel-neutral. Stage two compiles one stylesheet per channel once and runs xsltApplyStylesheet per render, which keeps HTML, text and XSL-FO outputs derived from the same page. Modern C++ adds nothing to the split itself - it only makes ownership exception-safe and hides the xmlChar* ceremony behind std::string_view wrappers. Choose it when XSLT stylesheets are the team's rendering technology; otherwise the sibling variant avoids the dependency entirely.",
+      "code_sketch": "std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> page(xmlNewDoc(BAD_CAST \"1.0\"), xmlFreeDoc);\nxmlNodePtr inv = xmlNewNode(nullptr, BAD_CAST \"invoice\");   // stage 1: logical page\nxmlDocSetRootElement(page.get(), inv);\nxmlNewChild(inv, nullptr, BAD_CAST \"customer\", BAD_CAST \"ACME\");\n\nstd::unique_ptr<xsltStylesheet, decltype(&xsltFreeStylesheet)> xsl(\n    xsltParseStylesheetFile(BAD_CAST \"invoice-html.xsl\"), xsltFreeStylesheet);\nstd::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> out(\n    xsltApplyStylesheet(xsl.get(), page.get(), nullptr), xmlFreeDoc);  // stage 2\nxsltSaveResultToFile(stdout, out.get(), xsl.get());",
+      "pitfalls": [
+        "A raw pointer created before the wrapper that owns it is constructed leaks if anything in between throws; adopt each allocation immediately.",
+        "libxslt and libxml2 keep process-global parser flags and cleanup routines, so they are not tied to your objects and mixing a vendored and a system copy is a link-time trap.",
+        "The result document returned by xsltApplyStylesheet is owned by the caller and is not freed by xsltFreeStylesheet; forgetting xmlFreeDoc leaks one page per request."
+      ],
+      "sources": [
+        "https://gnome.pages.gitlab.gnome.org/libxslt/tutorial/libxslttutorial.html",
+        "https://www.w3.org/TR/1999/REC-xslt-19991116"
+      ]
+    },
+    {
+      "variant_id": "node-tree-writers",
+      "name": "Hand-rolled node tree + one writer per channel",
+      "paradigm": "procedural",
+      "min_standard": "C++11",
+      "idiom_name": "Node{tag, attrs, children} page tree + render_html/render_text writer functions",
+      "implementation_notes": "When libxml2/libxslt cannot be taken (embedded targets, dependency policy), model the logical page as a tiny node struct - tag, attributes, children - and write one renderer per channel as a tree walk, for example render_html and render_text over the same Node. The split survives because the tree is channel-neutral and only the writers know about markup; what you give up is the declarative stylesheet, so escaping, vocabulary and tree lifetime become your code and a house-style change needs a recompile. Choose it for small, stable page vocabularies where the XSLT toolchain would be the larger dependency.",
+      "code_sketch": "using Attrs = std::vector<std::pair<std::string, std::string>>;\nstruct Node { std::string tag; Attrs attrs; std::vector<Node> children; };\n\nstd::string render_html(const Node&);   // one writer per channel\nstd::string render_text(const Node&);   // same page, other channel\n\nNode page() {                           // stage 1: logical page\n    return Node{\"invoice\", {{\"total\", \"42.00\"}}, {Node{\"customer\", {}, {}}}};\n}",
+      "pitfalls": [
+        "Each writer must escape for its own channel; escaping while building the tree double-escapes, and skipping it in one writer is an injection hole.",
+        "Owning the tree means owning copies and recursion depth: a deep page copied node by node costs more than a libxml2 node pool, and a recursive writer can overflow the stack on adversarial input.",
+        "Without a stylesheet the renderers are C++ code, so a look-and-feel change is a rebuild and a release - the flexibility the split is supposed to buy is reduced."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/vector",
+        "https://gnome.pages.gitlab.gnome.org/libxslt/tutorial/libxslttutorial.html"
+      ]
+    }
+  ],
+  "default_variant": "libxml2-libxslt",
+  "version": "1.0"
+}

@@ -1,0 +1,57 @@
+{
+  "pattern": "cache-aside",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "django.core.cache.cache.get_or_set(key, default, timeout)",
+  "implementation_notes": "The dominant Python realization is the framework cache: Django's cache.get_or_set(key, default, timeout) performs the read and the populate in one call - a callable default is only used when the value has to be set - with backends for in-memory, file, database, Memcached and Redis, and cache.delete(key) as the invalidation step after the model write; cache versioning (the VERSION setting or the version= argument) is the built-in answer to payload changes. In-process, functools.lru_cache and @cache are the stdlib memoization form: they are documented as threadsafe but argument-keyed with no TTL and no invalidation, which makes them the degenerate case rather than the full pattern.",
+  "code_sketch": "from django.core.cache import cache\n\ndef get_profile(user_id):\n    return cache.get_or_set(f\"profile:{user_id}\",\n                            lambda: Profile.objects.get(pk=user_id), 300)\n\ndef update_profile(user_id, data):\n    Profile.objects.filter(pk=user_id).update(**data)   # source of truth first\n    cache.delete(f\"profile:{user_id}\")                  # then invalidate",
+  "pitfalls": [
+    "cache.get() cannot distinguish a missing key from a stored None (the documentation recommends a sentinel object), so caching a None result silently extends the absence and negative caching must be decided explicitly.",
+    "get_or_set does not coalesce concurrent misses: several workers can each run the callable, so a hot key under a cold cache fans out to the database.",
+    "Backends serialize values (pickle for several backends), so cached objects are a trust boundary and the payload shape must be versioned when it changes."
+  ],
+  "sources": [
+    "https://docs.djangoproject.com/en/stable/topics/cache/",
+    "https://docs.python.org/3/library/functools.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "django-get-or-set",
+      "name": "Django cache.get_or_set + cache.delete",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "django.core.cache.cache.get_or_set(key, default, timeout)",
+      "implementation_notes": "The dominant Python realization is the framework cache: Django's cache.get_or_set(key, default, timeout) performs the read and the populate in one call - a callable default is only used when the value has to be set - with backends for in-memory, file, database, Memcached and Redis, and cache.delete(key) as the invalidation step after the model write; cache versioning (the VERSION setting or the version= argument) is the built-in answer to payload changes. In-process, functools.lru_cache and @cache are the stdlib memoization form: they are documented as threadsafe but argument-keyed with no TTL and no invalidation, which makes them the degenerate case rather than the full pattern.",
+      "code_sketch": "from django.core.cache import cache\n\ndef get_profile(user_id):\n    return cache.get_or_set(f\"profile:{user_id}\",\n                            lambda: Profile.objects.get(pk=user_id), 300)\n\ndef update_profile(user_id, data):\n    Profile.objects.filter(pk=user_id).update(**data)   # source of truth first\n    cache.delete(f\"profile:{user_id}\")                  # then invalidate",
+      "pitfalls": [
+        "cache.get() cannot distinguish a missing key from a stored None (the documentation recommends a sentinel object), so caching a None result silently extends the absence and negative caching must be decided explicitly.",
+        "get_or_set does not coalesce concurrent misses: several workers can each run the callable, so a hot key under a cold cache fans out to the database.",
+        "Backends serialize values (pickle for several backends), so cached objects are a trust boundary and the payload shape must be versioned when it changes."
+      ],
+      "sources": [
+        "https://docs.djangoproject.com/en/stable/topics/cache/",
+        "https://docs.python.org/3/library/functools.html"
+      ]
+    },
+    {
+      "variant_id": "redis-py-manual",
+      "name": "redis-py get/setex/delete (explicit client)",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "redis.Redis.get / setex(ttl) / delete with explicit serialization",
+      "implementation_notes": "Without a framework the protocol is written directly against the client: redis-py's r.get(key) is the read, r.setex(key, ttl, payload) the populate-with-TTL, and r.delete(key) the invalidation executed after the source-of-truth commit, with a connection pool (redis.ConnectionPool or from_url) keeping per-request calls cheap and None as the miss signal. Serialization is explicit - JSON (often through pydantic) or pickle - and a Redis error should be caught and treated as a miss so the request degrades to the database.",
+      "code_sketch": "r = redis.Redis.from_url(os.environ[\"REDIS_URL\"], decode_responses=True)\n\ndef get_user(user_id: int) -> User:\n    key = f\"user:v1:{user_id}\"\n    if (raw := r.get(key)) is not None:                 # cache hit\n        return User.model_validate_json(raw)\n    user = db.fetch_user(user_id)                       # source of truth on a miss\n    r.setex(key, 300, user.model_dump_json())           # populate with TTL\n    return user\n\ndef update_user(user_id: int, patch: dict) -> None:\n    db.update_user(user_id, patch)                      # store first\n    r.delete(f\"user:v1:{user_id}\")                      # then invalidate",
+      "pitfalls": [
+        "redis-py returns bytes unless decode_responses=True; mixing the two silently breaks equality checks and JSON parsing.",
+        "Wrap the cache calls so a ConnectionError is a miss rather than a 500 - otherwise Redis becomes a hard dependency of the read path.",
+        "No eviction is guaranteed: configure maxmemory-policy on the server, and namespace and version the keys because the instance is usually shared."
+      ],
+      "sources": [
+        "https://redis.readthedocs.io/en/stable/commands.html",
+        "https://docs.djangoproject.com/en/stable/topics/cache/"
+      ]
+    }
+  ],
+  "default_variant": "django-get-or-set",
+  "version": "1.0"
+}

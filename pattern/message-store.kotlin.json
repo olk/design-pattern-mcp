@@ -1,0 +1,20 @@
+{
+  "pattern": "message-store",
+  "language": "kotlin",
+  "support": "idiomatic",
+  "idiom_name": "data class record + Exposed table with a coroutine Channel writer",
+  "implementation_notes": "Kotlin adds two things to the JVM realization: an immutable data class as the stored record (a sealed hierarchy when payload shapes vary) and coroutines for the off-path copy - the tap becomes a Channel<MessageRecord> drained by a single writer coroutine on Dispatchers.IO, so the request path only offers and never touches the store, which is what replaces the classic Store object and interceptor. Persistence is a typed table: Exposed's Table/insert or SQLDelight's compile-time generated queries over the JDBC driver, both giving parameterised statements and transactions; on a Spring stack the JVM MessageStore remains available. Retention is a scheduled delete by timestamp, and reporting reads through Flow-based queries. The explicit abstraction is still worth writing when several stores must be behind one interface; otherwise the data class plus the channel is the pattern.",
+  "code_sketch": "data class MessageRecord(val id: String, val channel: String, val at: Instant, val body: String)\nprivate val tap = Channel<MessageRecord>(capacity = 10_000)\nfun offer(r: MessageRecord) {\n    tap.trySend(r).onFailure { drops.increment() }    // never suspends, never throws\n}\nfun CoroutineScope.storeWriter(db: Database) = launch(Dispatchers.IO) {\n    for (r in tap) db.transaction { insertRecord(r) } // single writer, one connection\n}\n// Exposed: object MsgStore : Table(\"msg_store\") { val id = varchar(\"id\", 64) /* ... */ }\n// retention: MsgStore.deleteWhere { MsgStore.at less cutoff } on a schedule",
+  "pitfalls": [
+    "Channel.trySend drops silently when the buffer is full: recording the drop (counter, log, alert) is the difference between a monitored audit gap and a mystery.",
+    "Dispatchers.IO is a shared elastic pool; a writer loop that never yields to other work can starve it, so bound the writer's concurrency and keep the transaction block synchronous.",
+    "Suspending inside a JDBC transaction block moves the connection between threads mid-transaction; keep Exposed/SQLDelight transactions synchronous and confine them to the writer coroutine.",
+    "A data class whose toString includes the payload leaks audit content into application logs; exclude the payload or store its redacted form only."
+  ],
+  "sources": [
+    "https://jetbrains.github.io/Exposed/",
+    "https://sqldelight.github.io/sqldelight/",
+    "https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html"
+  ],
+  "version": "1.0"
+}

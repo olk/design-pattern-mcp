@@ -1,0 +1,59 @@
+{
+  "pattern": "dynamic-router",
+  "language": "ruby",
+  "support": "idiomatic",
+  "idiom_name": "Hash of procs/lambdas (+ Object#public_send for method-name rules) republished under a Mutex",
+  "implementation_notes": "Ruby's dispatch table is a Hash from key to callable, or from key to a method name invoked with public_send, which goes through normal method lookup and refuses private methods (unlike send). The control channel is conventionally a signal (SIGUSR1) or a reader thread that republishes the table; replace the whole frozen Hash under a Mutex rather than mutating entries in place, because Hash#[]= is atomic per key but a multi-rule update is not visible as one generation. Freeze published tables so an accidental rule edit fails loudly instead of mutating live routing.",
+  "code_sketch": "class Router\n  def initialize(rules)\n    @mutex, @rules = Mutex.new, rules.freeze\n  end\n  def publish(rules)                                # control channel\n    @mutex.synchronize { @rules = rules.freeze }\n  end\n  def route(msg)\n    rules = @rules                                  # one snapshot per message\n    (rules[msg.key] || method(:dead_letter)).call(msg)\n  end\nend",
+  "pitfalls": [
+    "send bypasses method visibility and happily calls private methods; use public_send for any method name that comes from a rule.",
+    "A frozen Hash raises FrozenError on writes - freeze deliberately so a stray rule edit fails loudly instead of mutating live routing state.",
+    "Signal handlers run in a restricted context: allocations and locking inside a trap can raise ThreadError, so hand the reload to a queue and republish from a thread."
+  ],
+  "sources": [
+    "https://docs.ruby-lang.org/en/3.3/Object.html",
+    "https://docs.ruby-lang.org/en/3.3/Hash.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "hash-dispatch-table",
+      "name": "Hash dispatch table with public_send and a mutex-guarded swap",
+      "paradigm": "oo",
+      "min_standard": "Ruby2.0",
+      "idiom_name": "Hash of procs/lambdas (+ Object#public_send for method-name rules) republished under a Mutex",
+      "implementation_notes": "Ruby's dispatch table is a Hash from key to callable, or from key to a method name invoked with public_send, which goes through normal method lookup and refuses private methods (unlike send). The control channel is conventionally a signal (SIGUSR1) or a reader thread that republishes the table; replace the whole frozen Hash under a Mutex rather than mutating entries in place, because Hash#[]= is atomic per key but a multi-rule update is not visible as one generation. Freeze published tables so an accidental rule edit fails loudly instead of mutating live routing.",
+      "code_sketch": "class Router\n  def initialize(rules)\n    @mutex, @rules = Mutex.new, rules.freeze\n  end\n  def publish(rules)                                # control channel\n    @mutex.synchronize { @rules = rules.freeze }\n  end\n  def route(msg)\n    rules = @rules                                  # one snapshot per message\n    (rules[msg.key] || method(:dead_letter)).call(msg)\n  end\nend",
+      "pitfalls": [
+        "send bypasses method visibility and happily calls private methods; use public_send for any method name that comes from a rule.",
+        "A frozen Hash raises FrozenError on writes - freeze deliberately so a stray rule edit fails loudly instead of mutating live routing state.",
+        "Signal handlers run in a restricted context: allocations and locking inside a trap can raise ThreadError, so hand the reload to a queue and republish from a thread."
+      ],
+      "sources": [
+        "https://docs.ruby-lang.org/en/3.3/Object.html",
+        "https://docs.ruby-lang.org/en/3.3/Hash.html"
+      ]
+    },
+    {
+      "variant_id": "rails-routes-draw",
+      "name": "Rails route set rebuilt at runtime",
+      "paradigm": "declarative",
+      "min_standard": "Ruby3.0",
+      "requires_features": [
+        "rails"
+      ],
+      "idiom_name": "Rails.application.routes.draw + reload_routes! / mounted Rack rule router",
+      "implementation_notes": "In a Rails application the router is the framework's: routes declared with Rails.application.routes.draw map verb plus path to a controller action, the route set is a runtime object that can be rebuilt with Rails.application.reload_routes! (or by calling draw again) so route changes land without a restart, and constraints (lambda or request-based) turn message content into a matching condition. Route order is significant because the first matching route wins, and a mounted Rack application is the escape hatch for destinations that are not controllers - including a rule-base router of its own. Use this realization for request-shaped traffic inside a Rails app; for in-process dispatch keep the Hash table.",
+      "code_sketch": "Rails.application.routes.draw do\n  get  \"/orders/:id\", to: \"orders#show\"\n  post \"/orders\",     to: \"orders#create\"\n  mount TenantRouter.new(rule_base), at: \"/tenants\"   # runtime rule base\nend\n\n# control channel: rebuild the route set without restarting the app\nRails.application.reload_routes!",
+      "pitfalls": [
+        "Route order is first-match-wins, so a broad route added by a rule update can shadow the specific routes declared after it.",
+        "reload_routes! rebuilds the URL helpers too; code holding old helpers keeps generating stale paths.",
+        "Calling draw at runtime from several threads mutates global router state - serialize rule updates, or prefer a mounted Rack app for genuinely dynamic per-tenant routing."
+      ],
+      "sources": [
+        "https://guides.rubyonrails.org/routing.html"
+      ]
+    }
+  ],
+  "default_variant": "hash-dispatch-table"
+}

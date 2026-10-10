@@ -1,0 +1,57 @@
+{
+  "pattern": "control-bus",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "TSTP/TERM/TTIN signals + Sidekiq::ProcessSet#quiet!/stop!/dump_threads + Sidekiq::Stats",
+  "implementation_notes": "In a Sidekiq deployment the control bus is the process signal protocol plus the Sidekiq API. Operationally the signals are the commands: TSTP quiets a process (stop fetching new jobs, finish the current ones), TERM requests shutdown within the -t timeout and pushes unfinished jobs back to Redis, TTIN dumps thread backtraces for a stuck worker. Where signals are unavailable (JRuby, Windows, Heroku), Sidekiq::ProcessSet#each(&:quiet!) / :stop! / :dump_threads are the same commands delivered over Redis - literally a message-based control bus - and the Web UI is a console built exclusively on that API. Queue-level operations (Sidekiq::Queue#clear, pause in Sidekiq Pro) and Stats/WorkSet provide the status half.",
+  "code_sketch": "require 'sidekiq/api'\n\nSidekiq::ProcessSet.new.each(&:quiet!)        # == TSTP: stop fetching, finish in-flight jobs\nSidekiq::ProcessSet.new.each(&:stop!)         # == TERM: graceful shutdown within -t timeout\nSidekiq::ProcessSet.new.each(&:dump_threads) if stuck?\n\nSidekiq::Stats.new.failed                     # status half: counters, queue depths, latency\nSidekiq::Queue.new('mailer').latency",
+  "pitfalls": [
+    "The Sidekiq API reads and mutates Redis structures without locks: its results are best-effort snapshots, so a console must not treat counts or the process set as consistent and must not bulk-delete across a live system.",
+    "quiet!/stop! act on the process, not on individual jobs: a long-running job still delays shutdown until the timeout, after which it is forcefully terminated and re-enqueued - jobs must be idempotent for that to be safe.",
+    "Signals and the API can disagree (a process may have exited between the ProcessSet read and the command), so scripts should re-read state after acting instead of assuming the command landed."
+  ],
+  "sources": [
+    "https://github.com/sidekiq/sidekiq/wiki/Signals",
+    "https://github.com/sidekiq/sidekiq/wiki/API"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sidekiq-control-api",
+      "name": "Sidekiq signal protocol plus the Sidekiq API and Web UI",
+      "paradigm": "oo",
+      "min_standard": "Ruby2.5",
+      "idiom_name": "TSTP/TERM/TTIN signals + Sidekiq::ProcessSet#quiet!/stop!/dump_threads + Sidekiq::Stats",
+      "implementation_notes": "In a Sidekiq deployment the control bus is the process signal protocol plus the Sidekiq API. Operationally the signals are the commands: TSTP quiets a process (stop fetching new jobs, finish the current ones), TERM requests shutdown within the -t timeout and pushes unfinished jobs back to Redis, TTIN dumps thread backtraces for a stuck worker. Where signals are unavailable (JRuby, Windows, Heroku), Sidekiq::ProcessSet#each(&:quiet!) / :stop! / :dump_threads are the same commands delivered over Redis - literally a message-based control bus - and the Web UI is a console built exclusively on that API. Queue-level operations (Sidekiq::Queue#clear, pause in Sidekiq Pro) and Stats/WorkSet provide the status half.",
+      "code_sketch": "require 'sidekiq/api'\n\nSidekiq::ProcessSet.new.each(&:quiet!)        # == TSTP: stop fetching, finish in-flight jobs\nSidekiq::ProcessSet.new.each(&:stop!)         # == TERM: graceful shutdown within -t timeout\nSidekiq::ProcessSet.new.each(&:dump_threads) if stuck?\n\nSidekiq::Stats.new.failed                     # status half: counters, queue depths, latency\nSidekiq::Queue.new('mailer').latency",
+      "pitfalls": [
+        "The Sidekiq API reads and mutates Redis structures without locks: its results are best-effort snapshots, so a console must not treat counts or the process set as consistent and must not bulk-delete across a live system.",
+        "quiet!/stop! act on the process, not on individual jobs: a long-running job still delays shutdown until the timeout, after which it is forcefully terminated and re-enqueued - jobs must be idempotent for that to be safe.",
+        "Signals and the API can disagree (a process may have exited between the ProcessSet read and the command), so scripts should re-read state after acting instead of assuming the command landed."
+      ],
+      "sources": [
+        "https://github.com/sidekiq/sidekiq/wiki/Signals",
+        "https://github.com/sidekiq/sidekiq/wiki/API"
+      ]
+    },
+    {
+      "variant_id": "signals-and-instrumentation",
+      "name": "Signal.trap handlers plus ActiveSupport::Notifications instrumentation",
+      "paradigm": "procedural",
+      "min_standard": "Ruby2.5",
+      "idiom_name": "Signal.trap('HUP'/'TERM') flags + ActiveSupport::Notifications.instrument/subscribe",
+      "implementation_notes": "Without Sidekiq (a plain Rack app or daemon), the control bus is Ruby's signal facility plus an instrumentation bus: Signal.trap('HUP') for reconfiguration, 'USR1' for an ad-hoc dump, 'TERM' for a controlled shutdown, with the trap block only setting a flag so the real work happens in the main loop. The status half in Rails is ActiveSupport::Notifications: instrument('integration.process') around a unit of work publishes an event (name, timing, payload, allocations) to subscribers, so a monitor subscribes instead of polling internals - the same shape as a control bus, with events flowing the other way. Use the Sidekiq variant when worker lifecycle, not application instrumentation, is what must be controlled.",
+      "code_sketch": "Signal.trap('HUP')  { RELOAD = true }        # traps run asynchronously: set flags only\nSignal.trap('TERM') { SHUTDOWN = true }\n\nActiveSupport::Notifications.subscribe('integration.process') do |event|\n  metrics.record(event.name, event.duration, event.payload)      # status half\nend\n\nActiveSupport::Notifications.instrument('integration.process', queue: 'orders') do\n  handle_message\nend",
+      "pitfalls": [
+        "Signal.trap handlers run in a restricted context where most Mutex/Thread operations are unsafe, and they replace Ruby's default handler: heavy or blocking work in a trap is a hang, and the handler must tolerate a signal arriving during its own reload.",
+        "ActiveSupport::Notifications subscribers are synchronous and unguarded: an exception in a subscriber is re-raised into the instrumented business code (InstrumentationSubscriberError), so monitoring must never be able to break the flow it observes.",
+        "Flags set by traps are read at loop boundaries: a loop that blocks for minutes ignores the shutdown flag and looks unresponsive to the operator."
+      ],
+      "sources": [
+        "https://ruby-doc.org/core/Signal.html",
+        "https://api.rubyonrails.org/classes/ActiveSupport/Notifications.html"
+      ]
+    }
+  ],
+  "default_variant": "sidekiq-control-api"
+}

@@ -1,0 +1,18 @@
+{
+  "pattern": "two-phase-termination",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "termination latch + cooperative safe points + completion join",
+  "implementation_notes": "Language-neutral form: give the participant an idempotent, safely published stop request (atomic flag, Event, latch, token) that it checks at strategic points between units of work. On seeing it, the participant withdraws from accepting new work, finishes or abandons the current unit according to policy, releases the resources it owns, flushes state, notifies dependants and publishes the terminal state; expose that last fact as a join/await/latch so callers can distinguish requested from terminated. Whatever the platform offers - interrupt status, cancellation or stop tokens, context cancellation - only carries phase 1; the cleanup and the completion signal are the participant's own code, and a delete-with-a-wait is not a termination protocol.",
+  "code_sketch": "# phase 1 - any thread, idempotent\nstop.set()                        # atomic flag / Event / token.cancel()\nwake(worker)                      # condition signal, interrupt, queue close\n\n# phase 2 - the participant's own thread\nwhile not stop.is_set():          # strategic safe points\n    work_one()\ndrain_or_abort_in_flight()\nrelease(locks, buffers, handles)  # the substance of the second phase\nnotify_dependants(); terminated.set()\n\n# completion: worker.join() / await worker / awaitTermination(deadline)",
+  "pitfalls": [
+    "Skipping the join and treating the stop request as the termination: resources are released by the process exit while cleanup code is still running.",
+    "No wake-up for blocked waits: a latched flag alone leaves a worker parked in a condition/variable/syscall until the timeout, so phase 2 starts late or never.",
+    "Cleanup that depends on state the participant no longer owns (a lock it already dropped, a connection a sibling component closed, a logger that was shut down first).",
+    "Wrong move: handling SIGTERM inside the app and treating that as the end of the protocol -> failure: load-balancer and endpoint removal propagate slower than the drain, so new requests keep arriving at the terminating instance and keep-alive connections survive the drain -> instead: flip readiness to not-ready first, let routing converge, and explicitly close idle keep-alive connections as part of phase 2.",
+    "Wrong move: draining without cancelling or time-boxing in-flight external calls -> failure: one hung downstream call holds the drain open past the orchestrator's kill deadline and the process is SIGKILLed with everything else still in flight -> instead: give the drain a hard deadline shorter than the kill window, cancel per-request work on it, and exit non-zero logging exactly what was abandoned.",
+    "Wrong move: relying on a preStop sleep (or any out-of-process delay) instead of making readiness reflect the draining state -> failure: the sleep masks the propagation race without stopping traffic, and asynchronous side effects can still complete after the instance started failing requests -> instead: drive draining through an internal drain flag wired to the readiness endpoint and measure real endpoint-propagation delay for the drain budget."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

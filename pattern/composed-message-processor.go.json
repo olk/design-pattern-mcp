@@ -1,0 +1,58 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "jobs/result channels + sync.WaitGroup fan-in",
+  "implementation_notes": "Go's documented pipeline idiom is the whole composite: the splitter feeds a jobs channel, one goroutine per worker drains it, results return on a single channel, and a sync.WaitGroup over the senders closes that channel so the aggregator's range loop terminates exactly when the last part is done - the Go blog calls this fan-out/fan-in. The routing decision is a switch in the dispatcher (or one jobs channel per part kind), and the aggregate is a fold in the collector; the channel carries the part index, so no shared memory is needed.",
+  "code_sketch": "jobs := make(chan Part)\nresults := make(chan Result)\nvar wg sync.WaitGroup\nfor i := 0; i < workers; i++ {\n    wg.Add(1)\n    go func() { defer wg.Done(); for p := range jobs { results <- route(p) } }()\n}\ngo func() { for _, p := range split(msg) { jobs <- p }; close(jobs) }()\ngo func() { wg.Wait(); close(results) }()\nreport := Report{}\nfor r := range results { report.Merge(r) }        // aggregation",
+  "pitfalls": [
+    "Close the results channel only after close(jobs) and wg.Wait(); closing it earlier panics with a send on closed channel.",
+    "Returning early from the aggregator leaves workers blocked on the results channel - goroutines are not garbage collected (the Go blog documents this leak); use buffering or a done channel.",
+    "An unbounded goroutine per part is not a worker pool: large composites need workers derived from a bound, not len(parts)."
+  ],
+  "sources": [
+    "https://go.dev/blog/pipelines"
+  ],
+  "variants": [
+    {
+      "variant_id": "channel-fanin",
+      "name": "goroutine fan-out + results channel + sync.WaitGroup",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "jobs/result channels + sync.WaitGroup fan-in",
+      "implementation_notes": "Go's documented pipeline idiom is the whole composite: the splitter feeds a jobs channel, one goroutine per worker drains it, results return on a single channel, and a sync.WaitGroup over the senders closes that channel so the aggregator's range loop terminates exactly when the last part is done - the Go blog calls this fan-out/fan-in. The routing decision is a switch in the dispatcher (or one jobs channel per part kind), and the aggregate is a fold in the collector; the channel carries the part index, so no shared memory is needed.",
+      "code_sketch": "jobs := make(chan Part)\nresults := make(chan Result)\nvar wg sync.WaitGroup\nfor i := 0; i < workers; i++ {\n    wg.Add(1)\n    go func() { defer wg.Done(); for p := range jobs { results <- route(p) } }()\n}\ngo func() { for _, p := range split(msg) { jobs <- p }; close(jobs) }()\ngo func() { wg.Wait(); close(results) }()\nreport := Report{}\nfor r := range results { report.Merge(r) }        // aggregation",
+      "pitfalls": [
+        "Close the results channel only after close(jobs) and wg.Wait(); closing it earlier panics with a send on closed channel.",
+        "Returning early from the aggregator leaves workers blocked on the results channel - goroutines are not garbage collected (the Go blog documents this leak); use buffering or a done channel.",
+        "An unbounded goroutine per part is not a worker pool: large composites need workers derived from a bound, not len(parts)."
+      ],
+      "sources": [
+        "https://go.dev/blog/pipelines"
+      ]
+    },
+    {
+      "variant_id": "errgroup-fanin",
+      "name": "golang.org/x/sync/errgroup with a bounded limit",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.20",
+      "requires_features": [
+        "golang.org/x/sync/errgroup"
+      ],
+      "idiom_name": "errgroup.Group + SetLimit + indexed result slice",
+      "implementation_notes": "errgroup layers two things over the same fan-out that a composed processor actually needs: the first part error cancels the derived context so the siblings stop, and SetLimit bounds concurrency without a hand-rolled semaphore. Results go into a preallocated slice indexed by part position, so the correlation state is still an index rather than a map. Prefer it when one failed part must abort the composite; keep the bare channel fan-in when a partial aggregate must survive individual part failures.",
+      "code_sketch": "g, ctx := errgroup.WithContext(ctx)\ng.SetLimit(8)\nresults := make([]Result, len(parts))\nfor i, p := range parts {\n    i, p := i, p\n    g.Go(func() error { r, err := route(ctx, p); results[i] = r; return err })\n}\nif err := g.Wait(); err != nil { return Report{}, err }   // fail the composite\nreturn merge(results), nil",
+      "pitfalls": [
+        "Writing results[i] is race-free only because each goroutine owns one index; a shared accumulator still needs a mutex.",
+        "SetLimit's Go blocks once the limit is reached, so calling Go from inside a limited goroutine that holds the last slot self-deadlocks.",
+        "A failed part cancels the context: parts that do not observe ctx keep working, so the aggregate must not assume all sibling work stopped."
+      ],
+      "sources": [
+        "https://pkg.go.dev/golang.org/x/sync/errgroup",
+        "https://go.dev/blog/pipelines"
+      ]
+    }
+  ],
+  "default_variant": "channel-fanin",
+  "version": "1.0"
+}

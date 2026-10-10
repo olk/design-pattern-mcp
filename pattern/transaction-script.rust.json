@@ -1,0 +1,18 @@
+{
+  "pattern": "transaction-script",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "async handler function + sqlx Transaction with ? propagation and drop-rollback",
+  "implementation_notes": "Rust has no class-per-script convention: the script is an async function (usually an axum/actix handler or a service method) that acquires a transaction with pool.begin().await? and runs its queries through &mut *tx, propagating every failure with ?. sqlx supplies RAII semantics - a Transaction still in progress when it goes out of scope is rolled back on drop - so the rollback path needs no explicit code, while commit() consumes the transaction and must be the last fallible step. Presentation stays outside: the handler returns Result<Json<T>, AppError> and the script is a plain async function over the pool, which makes it testable against a scratch database. Diesel's connection.transaction(|conn| ...) closure is the blocking equivalent with the same commit-on-Ok/rollback-on-Err contract.",
+  "code_sketch": "async fn place_order(State(pool): State<PgPool>, Json(req): Json<PlaceOrder>) -> Result<Json<OrderId>, AppError> {\n    let mut tx = pool.begin().await?;                     // dropped => rollback\n    let available: i32 = sqlx::query_scalar(\"SELECT available FROM stock WHERE id = $1 FOR UPDATE\")\n        .bind(req.product_id).fetch_one(&mut *tx).await?;\n    if available < req.qty { return Err(AppError::Conflict(\"insufficient stock\")); }\n    sqlx::query(\"UPDATE stock SET available = available - $1 WHERE id = $2\")\n        .bind(req.qty).bind(req.product_id).execute(&mut *tx).await?;\n    let id: i64 = sqlx::query_scalar(\"INSERT INTO orders (product_id, qty) VALUES ($1, $2) RETURNING id\")\n        .bind(req.product_id).bind(req.qty).fetch_one(&mut *tx).await?;\n    tx.commit().await?;                                  // last fallible step\n    Ok(Json(OrderId(id)))\n}",
+  "pitfalls": [
+    "Returning Err before commit() is safe only because Drop rolls back - but a failed commit must still be propagated, or the outcome is silently unknown.",
+    "The transaction borrows a pooled connection for its whole lifetime; a forgotten .await or blocking work between begin and commit can exhaust the pool.",
+    "Holding the transaction across a long side effect (HTTP call, message send) keeps row locks; keep side effects after commit or use an outbox."
+  ],
+  "sources": [
+    "https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html",
+    "https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html"
+  ],
+  "version": "1.0"
+}

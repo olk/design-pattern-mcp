@@ -1,0 +1,57 @@
+{
+  "pattern": "service-activator",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "BackgroundService.ExecuteAsync + ChannelReader.ReadAllAsync",
+  "implementation_notes": "In-process the idiomatic realization is a BackgroundService whose ExecuteAsync loops over a Channels reader and calls the service, resolving it from a scope per message; the loop is the endpoint and the endpoint class disappears. ReadAllAsync keeps the code linear while the channel handles hand-off and (in the bounded variant) backpressure. Prefer this form for in-process work queues and transports that expose no SDK of their own.",
+  "code_sketch": "protected override async Task ExecuteAsync(CancellationToken ct) {\n    await foreach (var msg in _queue.Reader.ReadAllAsync(ct)) {\n        using var scope = _scopes.CreateScope();            // scoped service per message\n        var svc = scope.ServiceProvider.GetRequiredService<OrderService>();\n        var receipt = await svc.PlaceAsync(msg.Order, ct);\n        if (receipt is not null) await _out.Writer.WriteAsync(receipt, ct);\n    }\n}",
+  "pitfalls": [
+    "A scoped service such as a DbContext must not be captured by the singleton BackgroundService: resolve it from IServiceScopeFactory per message or state leaks across messages.",
+    "An unhandled exception in ExecuteAsync fails or stops the background task silently; catch per message and route the failure to the error path.",
+    "The default unbounded Channel<T> removes backpressure; use a bounded channel so producers feel a slow service."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.backgroundservice?view=net-9.0"
+  ],
+  "variants": [
+    {
+      "variant_id": "hosted-channel-worker",
+      "name": "Generic host BackgroundService over System.Threading.Channels",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "IAsyncEnumerable"
+      ],
+      "idiom_name": "BackgroundService.ExecuteAsync + ChannelReader.ReadAllAsync",
+      "implementation_notes": "In-process the idiomatic realization is a BackgroundService whose ExecuteAsync loops over a Channels reader and calls the service, resolving it from a scope per message; the loop is the endpoint and the endpoint class disappears. ReadAllAsync keeps the code linear while the channel handles hand-off and (in the bounded variant) backpressure. Prefer this form for in-process work queues and transports that expose no SDK of their own.",
+      "code_sketch": "protected override async Task ExecuteAsync(CancellationToken ct) {\n    await foreach (var msg in _queue.Reader.ReadAllAsync(ct)) {\n        using var scope = _scopes.CreateScope();            // scoped service per message\n        var svc = scope.ServiceProvider.GetRequiredService<OrderService>();\n        var receipt = await svc.PlaceAsync(msg.Order, ct);\n        if (receipt is not null) await _out.Writer.WriteAsync(receipt, ct);\n    }\n}",
+      "pitfalls": [
+        "A scoped service such as a DbContext must not be captured by the singleton BackgroundService: resolve it from IServiceScopeFactory per message or state leaks across messages.",
+        "An unhandled exception in ExecuteAsync fails or stops the background task silently; catch per message and route the failure to the error path.",
+        "The default unbounded Channel<T> removes backpressure; use a bounded channel so producers feel a slow service."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.backgroundservice?view=net-9.0"
+      ]
+    },
+    {
+      "variant_id": "broker-processor",
+      "name": "Broker SDK processor (Azure Service Bus ServiceBusProcessor)",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "ServiceBusProcessor.ProcessMessageAsync handler delegate",
+      "implementation_notes": "With a real broker the SDK supplies the endpoint: subscribing a handler to ProcessMessageAsync delivers each received message to it, and the handler invokes the application service before explicitly completing, abandoning or dead-lettering the message - the acknowledgement boundary the in-process loop does not have. Use it whenever the transport is a queue or topic with its own delivery semantics; MassTransit and NServiceBus consumer classes are the equivalent shape with the framework owning retries.",
+      "code_sketch": "processor.ProcessMessageAsync += async args => {\n    var order = args.Message.Body.ToObjectFromJson<Order>();\n    try {\n        var receipt = await _orders.PlaceAsync(order);\n        await args.CompleteMessageAsync(args.Message);     // ack after the service\n        await _reply.SendAsync(receipt);\n    } catch (Exception e) { await args.DeadLetterMessageAsync(args.Message, e.Message); }\n};",
+      "pitfalls": [
+        "The handler must not start or stop the processor from inside itself; the API documentation warns that this can deadlock.",
+        "Forgetting CompleteMessageAsync leaves the message to be redelivered after the lock expires, so the service runs again - at-least-once is the default, not a setting.",
+        "Letting an exception escape only increments the delivery count with no diagnosable cause; translate it into abandon or dead-letter explicitly."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusprocessor.processmessageasync?view=azure-dotnet"
+      ]
+    }
+  ],
+  "default_variant": "hosted-channel-worker",
+  "version": "1.0"
+}

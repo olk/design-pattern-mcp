@@ -1,0 +1,179 @@
+{
+  "category": "persistence-state",
+  "name": "lazy-acquisition",
+  "aliases": [
+    "lazy loading",
+    "deferred acquisition"
+  ],
+  "intent": "Defer acquiring an expensive or scarce resource until it is first used, so the acquisition cost is paid only by the holders that actually use it, while clients keep seeing an ordinary interface.",
+  "problem": "A resource is costly to acquire, scarce, and on many execution paths never needed at all, yet the code that holds it acquires it during construction, at start-up or on a hot entry path: the process pays for resources it never dereferences, start-up time grows with every optional subsystem, and scarce capacity (descriptors, connections, licenses, memory) is consumed by holders that never use it.",
+  "context": "Applies to long-lived holders - objects, modules, services, containers - that front an external resource such as a file, socket or database connection, license, thread pool, GPU context, translation catalog or large lookup table. It pays off when the acquisition cost is large relative to a use, when a significant fraction of holders never use the resource, and when the runtime offers a one-time guard (or the holder is provably single-threaded). It is the wrong tool when the resource must be validated at boot, when acquisition is cheap, or when first use sits on a latency-critical path.",
+  "benefits": [
+    "Work is paid for only when needed: sessions, requests or features that never touch the resource never trigger the acquisition, which shortens start-up and cuts idle cost.",
+    "Scarce capacity is used better: file descriptors, connections, licenses and memory are consumed by the holders that use them rather than by every constructed object.",
+    "Acquisition cost is amortized onto the first real use instead of being concentrated in construction and start-up, so start-up time stops scaling with the number of optional subsystems.",
+    "The acquisition policy lives in one place - the holder plus its guard and factory - instead of being restated at every use site.",
+    "Optional features can be declared like ordinary dependencies on the client side and still cost only the resources they consume.",
+    "Cold paths stop dominating warm measurements, because expensive setup is excluded from the paths that do not need it."
+  ],
+  "tradeoffs": [
+    "Failures move from construction/start-up to first use, often on a rarer and less privileged path; several runtimes cache the failure permanently (C# Lazy<T>, Go sync.Once, Rust LazyLock poisoning) while others retry on every access (Kotlin lazy, Python cached_property, C++ call_once), so the same design has opposite recovery behaviour per language.",
+    "First use pays the whole acquisition cost: latency becomes bimodal and the p99 of an otherwise fast path can jump; without single-flight or warm-up, N concurrent first users can each trigger an acquisition (and each leak all but one resource).",
+    "The guard must respect the language memory model: a bare check-then-assign is a data race in C, C++ and Java, and double-acquires with side effects in JavaScript, Ruby, Kotlin with LazyThreadSafetyMode.PUBLICATION and Swift lazy instance properties.",
+    "Lifetime entanglement: the holder must own or coordinate release, or the resource outlives its usefulness - statics in Rust never drop, C has no destructor, and a Java static holder pins the resource per classloader (a leak on redeploy).",
+    "Resource budgets become demand-driven and harder to observe: capacity, connection counts and timeouts can no longer be read off the start-up path, which complicates capacity planning and alerting.",
+    "Every holder becomes a two-state object (not yet acquired vs acquired) and every use path must handle both, which is a subtle source of null/undefined, torn-read and half-published-object defects."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Resource Holder (Proxy)",
+      "responsibility": "Presents the resource interface to clients and holds the only mutable state of the collaboration. It never lets a client observe a half-acquired resource and is the only participant that touches the guard."
+    },
+    {
+      "role": "Acquisition Guard",
+      "responsibility": "The one-time initialization primitive (once flag/cell, Lazy<T>, sync.Once, lazy delegate, holder class, double-checked lock) that makes the factory run at most once and publishes the result with the memory ordering the runtime requires."
+    },
+    {
+      "role": "Resource Factory (Supplier)",
+      "responsibility": "Performs the real acquisition - open, dial, allocate, load - and returns the handle or an error. Injecting it keeps transport, credential and retry policy out of the holder."
+    },
+    {
+      "role": "Lifecycle Owner",
+      "responsibility": "Decides when the acquired resource is released (scope exit, dispose, eviction, recycling) and guarantees that the release happens; deterministic-destruction languages express it as the owning object or scope, others as an explicit close/Dispose contract."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Uses the resource strictly through the holder, never acquires it, and may never learn that an acquisition took place."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "A request-handling object that opens a file or blob stream only on the code paths that actually read it (report export, attachment download, audit sink).",
+    "A service holding connections to a rarely consulted downstream — archive store, fallback provider, secondary region — that most requests never call.",
+    "A large lookup table, model or translation catalog loaded on first use instead of at process start, keeping start-up and memory bounded for the sessions that never need it.",
+    "Optional subsystems in desktop and mobile apps (camera, location, payment SDK, plugins) initialized when the feature is opened rather than when the app launches.",
+    "Test fixtures and tooling: starting a container, browser or database only for the tests that need it, so the fast path stays fast.",
+    "Per-session state in a server — a scratch buffer, a decompressor, a TLS session or prepared statement — allocated on first use of the session rather than on accept.",
+    "Database connection pools: HikariCP and similar pools typically create connections lazily on the first checkout rather than at pool construction, to avoid pinninglicenses and consuming file descriptors before the application is fully started.",
+    "Dependency injection containers (Spring @Lazy, Dagger 2 Lazy<T>) defer the creation of bean instances until they are first injected, reducing start-up time and breaking circular dependency cycles during bootstrap.",
+    "Logging frameworks (SLF4J/Logback): Logger instances are static final but the actual appender (file, socket, console) is initialized when the first log event at that level is fired, so logging infrastructure does not block application start.",
+    "Configuration objects: large YAML or JSON config trees are parsed and validated lazily on first access rather than eagerly at start-up, keeping CLI tools fast for commands that do not need the full configuration.",
+    "GPU contexts in graphics applications (OpenGL, Vulkan, CUDA) are expensive to create and are deferred until the first draw call or compute kernel launch, allowing the application to start and display a window without claiming GPU memory.",
+    "HTTP/service clients (gRPC channels, REST clients): a channel is lazily opened on the first request, enabling the client to be instantiated at module load time while deferring the TCP handshake and TLS handshake to the first real call.",
+    "Spring Framework @Lazy bean definitions instantiate singleton beans when first requested rather than during ApplicationContext startup, making an optional integration genuinely demand-driven while retaining the container's proxy and lifecycle semantics.",
+    "Go's sync.Once lets a service wrap a one-time connection, parser or cache acquisition so concurrent first callers wait for one initializer and later callers reuse the published result.",
+    ".NET's System.Lazy<T> defers a factory until Value is first read and makes the thread-safety and exception-caching policy explicit through its constructors and LazyThreadSafetyMode."
+  ],
+  "avoid_when": [
+    "Acquisition is cheap relative to the guard: construct or acquire eagerly and drop the holder entirely (plain constructor call, Eager Acquisition).",
+    "The resource is needed on every path or must be validated at boot - configuration, credentials, the log sink, health dependencies: acquire it eagerly so failures surface at start-up (Fail Fast).",
+    "First use is latency-critical and cannot absorb the acquisition cost: warm the resource before traffic (Eager Acquisition) or acquire it during readiness checks.",
+    "The runtime already defers the resource kind for you - a lazy module import, a framework's lazy binding, a pool that dials on demand (Object Pool, Caching): do not wrap it in a second lazy layer.",
+    "The acquisition can fail transiently while the available guard caches failure permanently (Go sync.Once, C# Lazy<T>, Rust LazyLock): build a retrying holder first, because lazy acquisition on top of a caching guard turns an outage into a permanent state."
+  ],
+  "language_files": {
+    "generic": "lazy-acquisition.generic.json",
+    "c": "lazy-acquisition.c.json",
+    "cplusplus": "lazy-acquisition.cplusplus.json",
+    "csharp": "lazy-acquisition.csharp.json",
+    "go": "lazy-acquisition.go.json",
+    "java": "lazy-acquisition.java.json",
+    "javascript": "lazy-acquisition.javascript.json",
+    "kotlin": "lazy-acquisition.kotlin.json",
+    "python": "lazy-acquisition.python.json",
+    "ruby": "lazy-acquisition.ruby.json",
+    "rust": "lazy-acquisition.rust.json",
+    "scala": "lazy-acquisition.scala.json",
+    "swift": "lazy-acquisition.swift.json",
+    "typescript": "lazy-acquisition.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "posa3"
+  ],
+  "related_patterns": [
+    "lazy-initialization",
+    "lazy-load",
+    "eager-acquisition",
+    "partial-acquisition",
+    "caching",
+    "object-pool",
+    "virtual-proxy",
+    "memoization",
+    "leader-followers"
+  ],
+  "anti_patterns": [
+    "The unguarded check-then-assign (`if (!res) res = acquire();`) in code that can run concurrently - the guard is the pattern; without it this is a race that duplicates or tears resources.",
+    "Lazy-acquiring boot-critical resources (configuration, credentials, log sink, health dependency): a start-up error becomes a runtime error and, with a caching guard, a permanent one.",
+    "Caching a failure by accident and then assuming retry exists: with Go Once, C# Lazy or Rust LazyLock the second attempt never runs, so the dependency outage never heals.",
+    "Lazy acquisition without an owner: the holder outlives the scope that should have released the resource, so the optimization leaks connections and handles.",
+    "Wrapping resources the runtime already acquires lazily (dynamic imports, pools, lazily injected framework bindings) in a second lazy layer, adding two-state defects without removing any cost.",
+    "Wrapping a lazily-initialized resource in a second lazy layer: two one-time guards in series add complexity and delay without removing cost; prefer a single guard closer to the actual acquisition point."
+  ],
+  "design_principles": [
+    "Defer work until it is needed (lazy evaluation): pay for a resource on first use, not on construction.",
+    "Separate the concerns of the collaboration: the holder presents, the factory acquires, the guard guarantees at-most-once, the owner releases.",
+    "Encapsulate state transitions: clients see one interface and the not-yet-acquired state never leaks out as a partial object.",
+    "Idempotence: first use and every later use must yield the same resource, so initialization has to be at-most-once and repeat-safe.",
+    "Treat publication as a concurrency decision: making the acquired value visible to other threads is part of the design, not an implementation detail.",
+    "Move failure deliberately: if acquisition is deferred, choose where the failure is reported (first use, an explicit validate step, a readiness probe) instead of losing it.",
+    "Fail deliberately: lazy acquisition shifts when a failure is observed — choose that point explicitly (first access, readiness probe, explicit validate()) rather than allowing a silent null or cryptic null-pointer miles from the actual problem.",
+    "Ownership is not optional: every lazily acquired resource needs a clear owner that knows how to release it; without this the pattern is a memory leak waiting to happen."
+  ],
+  "best_practices": [
+    "Use the language's one-time guard (once flag, Lazy<T>, lazy delegate, holder class) instead of hand-writing a check that assumes single-threaded execution.",
+    "Single-flight the acquisition and bound it with a timeout, so N concurrent first users produce one attempt and no caller waits forever.",
+    "Decide error semantics explicitly — whether a failed acquisition is cached or retried, and which callers observe it; never let the holder return a nil/undefined handle silently.",
+    "Give the holder an owner with a release policy (dispose, close, scope exit, eviction): lazy acquisition is only half of resource lifecycle.",
+    "Keep always-needed and boot-critical resources eager and validated at start-up; defer only what is genuinely optional or rare.",
+    "Instrument first use: count acquisitions, record first-use latency (cold start), and alert on acquisition failures so the deferral stays visible.",
+    "Provide an explicit warm-up or prefetch path for latency-critical holders, so the deferral can be paid outside the request path when the workload demands it.",
+    "Prefer initialization-on-demand holder idioms (JVM holder, C++ magic statics, Go sync.Once) over bare flag checks in multithreaded contexts, as they encode thread-safety guarantees at the language level.",
+    "Avoid returning nil or zero-value handles from lazy getters; fail fast or raise an explicit error so callers can handle it rather than invoking a null pointer at a distance.",
+    "In languages with garbage collectors, watch for retain cycles: if two objects hold lazy references to each other, neither is collected until the cycle is broken — use weak references or explicit break methods.",
+    "For resources with bounded capacity (connection pools, thread pools), consider lazy-acquisition alongside a bounded maximum to prevent unbounded growth if usage patterns change unexpectedly.",
+    "When lazy acquisition wraps a remote dependency, add circuit-breaker logic so a failed init does not poison every downstream call; prefer retry-ready guards over caching guards for remote resources."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Kircher & Jain, Pattern-Oriented Software Architecture Vol. 3: Patterns for Resource Management (Wiley, 2004) — Lazy Acquisition, from the resource-acquisition group of patterns.",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/ — POSA series index; POSA3 covers the complete resource lifecycle (acquisition, coordination, release).",
+    "https://en.wikipedia.org/wiki/Lazy_initialization — lazy initialization, the tactic this pattern applies to acquiring a resource.",
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_once.html — POSIX dynamic package initialization, the canonical one-time acquisition guard.",
+    "Joshua Bloch, Effective Java, 3rd ed., Item 83: \"Lazy initialization\" (Addison-Wesley, 2018) — definitive treatment of lazy init in Java including holder idiom and double-checked locking.",
+    "Brian Goetz et al., Java Concurrency in Practice, Chapter 5: \"Building blocks\" (Addison-Wesley, 2006) — covers SafeLazyInitialization, synchronized holders, and the Java Memory Model implications of lazy patterns.",
+    "https://en.cppreference.com/w/cpp/language/storage_duration.html — C++11 \"magic statics\": thread-safe initialization of block-scope static variables (ISO/IEC 14882 §6.7 [stmt.dcl]).",
+    "https://go.dev/blog/sync — \"The Go Blog: Go Concurrency Patterns: Once\" (Adgell, 2014) — covers sync.Once and when it is appropriate for lazy initialization in Go.",
+    "Gamma, Helm, Johnson & Vlissides, Design Patterns: Elements of Reusable Object-Oriented Software, Addison-Wesley, 1995 — Proxy pattern (structural) and its LazyLoadVariant virtual proxy role.",
+    "http://www.kircher-schwanninger.de/michael/publications/LazyAcquisition.pdf — canonical Lazy Acquisition pattern description: defer resource acquisition until the latest practical time and distinguish it from eager acquisition.",
+    "https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-lazy-init.html — Spring Framework reference for @Lazy and lazy-init bean creation, including dependency-triggered eager creation.",
+    "https://pkg.go.dev/sync — official Go sync package documentation for sync.Once's exactly-once initialization and synchronization semantics.",
+    "https://learn.microsoft.com/en-us/dotnet/framework/performance/lazy-initialization — Microsoft guidance for System.Lazy<T>, thread-safety modes, first-access initialization and cached exceptions.",
+    "https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html — authoritative critique of unsafe double-checked locking and partially visible lazy objects."
+  ],
+  "related_patterns_notes": {
+    "resource-holder": "resource-holder",
+    "lookup-dispatcher": "lookup-dispatcher"
+  }
+}

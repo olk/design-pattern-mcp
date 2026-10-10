@@ -1,0 +1,170 @@
+{
+  "category": "construction-composition",
+  "name": "multiton",
+  "aliases": [
+    "registry of singletons"
+  ],
+  "intent": "Guarantee one shared instance per key rather than one per process: the type or module owns a keyed registry, creates the instance on the first request for its key, and returns that same instance to every later request, without exposing any way for clients to add or replace mappings.",
+  "problem": "A family of expensive or stateful resources must exist once per key - one pool per tenant, one client per region, one handler per device, one configuration per environment - yet the classic singleton is too coarse and a plain factory is too weak: the factory happily builds a second object for a key that already has one, splitting the resource's state, while a process-wide singleton flattens genuinely different keys into one instance. A shared map is not the answer either, because callers who can write to it no longer receive the instance created for their key.",
+  "context": "Applies when the key space is a real domain dimension - tenant, region, shard, device, environment, dialect - and the shared object is expensive, stateful or resource-holding enough that a second instance for the same key is a defect. It is a same-process mechanism: the registry lives in one module, class or package and is therefore per process, class loader, worker or replica, so anything that must be unique across processes needs a service or an external store instead. Concurrency and key-space size are the two design pressures: the first request per key must create exactly one instance, and an unbounded key space turns the registry into a cache that needs an eviction policy.",
+  "benefits": [
+    "Keyed uniqueness is enforced by the owner instead of by convention: the accessor is the only way to obtain an instance, so two callers asking for the same key cannot end up holding two objects.",
+    "The singleton idea scales to a real key dimension: per-tenant, per-region or per-device state stays separate instead of being flattened into one process-wide instance or duplicated by a factory.",
+    "Lazy creation per key: instances and the connections, buffers or handles behind them are built only for the keys actually requested, not eagerly for the whole key set.",
+    "A lookup replaces a construction on the hot path, so repeated requests for a key reuse an expensive object together with its warm state (open socket, parsed schema, cached credentials).",
+    "The registry is one place to see which keys are live, to bound their number and to close them at shutdown - admission control and lifecycle gain a single owner instead of being spread over call sites.",
+    "Late binding: the key can be computed at the call site (tenant id from the request, region from configuration), so the code that needs the resource does not have to be wired with it up front."
+  ],
+  "tradeoffs": [
+    "Process-local scope silently forks 'one per key': every replica, class loader, worker, isolate or test module registry builds and holds its own instance, so anything coordinated through the instance - connection, cache, counter - diverges between them.",
+    "The registry owns instances for the life of the process unless a cleanup path exists: keys accumulate, per-tenant resources are never released, and nothing closes them on shutdown - the pattern ships without an eviction or disposal policy, so one has to be designed alongside it.",
+    "The key is part of identity, so a mistyped, unstable or non-normalised key (case, alias, retried request) creates a second instance while the call still succeeds - the failure is silent resource splitting rather than an error.",
+    "It is global mutable state behind a keyed accessor: the dependency is invisible in every signature, tests cannot substitute the instance, and suites grow reset()/clear() hooks that leak state between test cases.",
+    "Exactly-once creation under concurrency is easy to get wrong: without an atomic create-or-return two racing first requests each build an instance, one is discarded while its pool or handle stays open, and the bug surfaces only under load.",
+    "An unbounded key space (request ids, user ids, retried ids) degenerates into a cache with no eviction, expiry or invalidation, which is a different - and much larger - problem than the one the pattern solves."
+  ],
+  "quality_attributes": {
+    "testability": 3,
+    "extensibility": 5,
+    "maintainability": 4,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 5,
+    "security": 4,
+    "scalability": 4
+  },
+  "participants": [
+    {
+      "role": "Multiton (registry)",
+      "responsibility": "Owns the key -> instance mapping, closes construction (private constructor, module-private storage) and exposes the single access operation that returns or lazily creates the instance for a key."
+    },
+    {
+      "role": "Key",
+      "responsibility": "Identifier that selects the instance - enum, string, tenant/region/device id. It must be stable and comparable, its normalisation is part of the contract, and clients cannot invent keys that the registry was not meant to serve."
+    },
+    {
+      "role": "Instance",
+      "responsibility": "The shared object created once per key (pool, client, handler, configuration). It holds the key-specific state and must tolerate the concurrent use its accessor implies."
+    },
+    {
+      "role": "Instance factory",
+      "responsibility": "The per-key construction step the registry invokes on a miss - a function, lambda or create(key) method - which must not be skipped and must not return before the instance is safe to publish."
+    },
+    {
+      "role": "Clients",
+      "responsibility": "Request instances by key through the accessor and never construct, clone or register instances themselves; they must not assume any other route to the instance exists."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Multi-tenant services: one database connection pool, session store or tenant-scoped client per tenant id, created when the tenant is first seen.",
+    "Regional or shard-aware clients: one HTTP client with its own credentials and endpoint per region, shard or cluster, keyed by the region code.",
+    "Per-device or per-connection handlers in long-lived servers and device gateways, keyed by device id or protocol family.",
+    "Per-environment configuration objects in a tool or test harness: one configuration per environment name while several environments are active in the same process.",
+    "Per-stage loggers or metric registries in a pipeline, where each stage needs its own sink but a second sink for the same stage would duplicate or interleave output.",
+    "Per-dialect or per-version runtime services (one parser, one schema registry, one embedded engine) keyed by dialect or engine version.",
+    "ASP.NET Core keyed dependency injection: AddKeyedSingleton registers multiple implementations under service keys and FromKeyedServices resolves the selected key; the container supplies one keyed singleton within its service-provider lifetime rather than cross-process uniqueness.",
+    "Spring Framework ApplicationContext: @Qualifier or @Named selects among bean definitions, while singleton scope caches one instance per bean definition and container; use the context lifecycle instead of a process-global map.",
+    "Google Guice named bindings: Names.named distinguishes bindings of the same type and Singleton scope makes each named binding one instance per Injector, giving a container-managed multiton-like family with explicit scope."
+  ],
+  "avoid_when": [
+    "One shared instance per process is what you actually need - use a singleton (or a container-managed single instance) and keep the key out of it.",
+    "A composition root can create and inject the few instances in use - pass them explicitly; keyed lookup earns its place only when the key arrives at call time.",
+    "The instances are interchangeable and reuse is the goal - use an object pool, which recycles anonymous objects, rather than a registry that binds identity to keys.",
+    "The key space is unbounded or entries must be evictable (per-request, per-user caches) - use a cache with an explicit eviction and expiry policy, not an identity registry.",
+    "The platform already offers keyed lifetimes (AddKeyedSingleton, keyed providers, container scopes) - register the factory there instead of hand-rolling a static map.",
+    "The uniqueness has to hold across processes or machines - the registry is per process; expose a service or a distributed store instead."
+  ],
+  "language_files": {
+    "generic": "multiton.generic.json",
+    "c": "multiton.c.json",
+    "cplusplus": "multiton.cplusplus.json",
+    "csharp": "multiton.csharp.json",
+    "go": "multiton.go.json",
+    "java": "multiton.java.json",
+    "javascript": "multiton.javascript.json",
+    "kotlin": "multiton.kotlin.json",
+    "python": "multiton.python.json",
+    "ruby": "multiton.ruby.json",
+    "rust": "multiton.rust.json",
+    "scala": "multiton.scala.json",
+    "swift": "multiton.swift.json",
+    "typescript": "multiton.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "module",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "singleton",
+    "registry",
+    "flyweight",
+    "object-pool",
+    "caching",
+    "named-constructor",
+    "dependency-injection",
+    "monostate"
+  ],
+  "anti_patterns": [
+    "Multiton as a hidden service locator: every class reaches into the registry for whatever it needs instead of receiving dependencies, so the object graph is invisible in every signature.",
+    "Stringly-typed keys with no canonicalisation: 'Tenant-A' and 'tenant-a' are different keys, and the process quietly holds two pools for one tenant.",
+    "A public register(key, value) added 'for tests' or for plugins, which turns the closed registry into a general-purpose writable map.",
+    "Per-request or per-user keys in a process-lifetime registry: the map grows without bound and behaves like a memory leak with no eviction.",
+    "Sharing one instance per key over mutable per-call state (a session, a transaction), so unrelated callers serialise on the instance without any coordination."
+  ],
+  "design_principles": [
+    "Encapsulation and information hiding: the map and the creation path are private; only the keyed access operation is public.",
+    "Single responsibility: the registry owns uniqueness and lifetime, the instance owns the key-specific behaviour.",
+    "Separation of concerns: key -> instance lookup is separated from instance construction, which is delegated to a per-key factory.",
+    "Dependency inversion and explicit dependencies: when a container or injection point exists, register the keyed lifetime there instead of hiding it behind a static accessor.",
+    "Least surprise: the key is part of identity, so its normalisation, stability and validity are part of the contract, not an implementation detail."
+  ],
+  "best_practices": [
+    "Make construction closed: private constructor or module-private storage plus an accessor that is the only public way in.",
+    "Perform the check-and-create atomically - concurrent map or lock held across the whole step - and release the lock before doing long work with the instance.",
+    "Give the registry an explicit lifecycle: a shutdown/close-all that disposes instances in a defined order, and a test-only reset that is not part of the production API.",
+    "Bound the key space or add an eviction policy; reject or log keys that do not come from the expected domain, because a registry is not a generic cache.",
+    "Prefer the container's keyed registration when one exists, and keep the static form for code that has no injection point.",
+    "Treat failed creation as a failure: never store a half-built or placeholder instance, and decide whether the next request retries.",
+    "Document what the key is part of: normalisation rules, case sensitivity, and what happens when two keys denote the same resource."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Multiton pattern, Wikipedia - generalises Singleton to one instance per key managed through a map; notes that Design Patterns does not name the pattern but describes a registry of singletons for subclassing singletons; contrasts the multiton with a writable hash table (no client-added mappings, never a null reference).",
+    "https://en.wikipedia.org/wiki/Multiton_pattern",
+    "Ilkka Seppala et al., java-design-patterns.com - Multiton (also known as Registry of Singletons): keyed instances via ConcurrentHashMap, applicability ('only one instance for each unique key') and consequences.",
+    "https://java-design-patterns.com/patterns/multiton/",
+    "Richard Carr, The Multiton Design Pattern (blackwasp.co.uk) - keyed GetMultiton over a dictionary with a lock: 'essentially the multiton provides the functionality of a group of singletons'.",
+    "https://blackwasp.co.uk/Multiton.aspx",
+    "Rosetta Code, Multiton - thread-safe realizations across languages, including the C++ static map plus mutex and the Rust OnceLock<Mutex<HashMap>> form.",
+    "https://rosettacode.org/wiki/Multiton",
+    "Software Patterns Lexicon, The Multiton Pattern in Rust - the Rust multiton as a keyed registry of shared instances: HashMap, Arc, Mutex/OnceLock and the per-key OnceLock slot for expensive initialisation.",
+    "https://softwarepatternslexicon.com/rust/structural-design-patterns-in-rust/the-multiton-pattern/",
+    "Andrew Lock, Making ConcurrentDictionary.GetOrAdd thread safe using Lazy - the BCL's documented GetOrAdd behaviour (valueFactory may run more than once) and the Lazy<T> slot that makes initialisation run-once.",
+    "https://andrewlock.net/making-getoradd-on-concurrentdictionary-thread-safe-using-lazy/",
+    "Stack Overflow, Thread safe multitons in Java - ConcurrentHashMap.computeIfAbsent as the post-Java-8 keyed create-or-return, with the Future-based memoizer as the earlier alternative.",
+    "https://stackoverflow.com/questions/11126866/thread-safe-multitons-in-java",
+    "Canonical multiton definition, Wikipedia - bounded keyed instances generalizing singleton, with a registry that controls creation and reuse rather than a writable map.",
+    "https://en.wikipedia.org/wiki/Multiton_pattern",
+    "ASP.NET Core dependency injection, Microsoft Learn - keyed service registration and resolution with AddKeyedSingleton and FromKeyedServices.",
+    "https://learn.microsoft.com/en-us/aspnet/core/fundamentals/dependency-injection?view=aspnetcore-10.0",
+    "Spring Framework reference, Fine-tuning Annotation-based Autowiring with Qualifiers - @Qualifier and named candidate selection.",
+    "https://docs.spring.io/spring-framework/reference/core/beans/annotation-config/autowired-qualifiers.html",
+    "Spring Framework reference, Bean Scopes - singleton scope caches one instance per bean definition per container.",
+    "https://docs.spring.io/spring-framework/reference/core/beans/factory-scopes.html",
+    "Google Guice Binder API - named bindings with Names.named and singleton-scoped bindings per Injector.",
+    "https://google.github.io/guice/api-docs/7.0.0/javadoc/com/google/inject/Binder.html",
+    "Mark Seemann, Service Locator is an Anti-Pattern - hidden dependencies, runtime failures and testability costs relevant to global registries.",
+    "https://blog.ploeh.dk/2010/02/03/ServiceLocatorisanAnti-Pattern/"
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "pattern": "monitor-object",
+  "language": "csharp",
+  "support": "native",
+  "idiom_name": "lock (_gate) + Monitor.Wait/Pulse/PulseAll",
+  "implementation_notes": "C# realises the monitor in the language and the BCL: the lock statement (Monitor.Enter/Exit in a try/finally, emitted by the compiler) is the monitor lock, and Monitor.Wait/Pulse/PulseAll are the monitor conditions, each locked object carrying a waiting queue and a ready queue. The compiler releases the lock on exceptions, which removes the classic release-on-every-path bug, and Monitor is reentrant with thread affinity. Since C# 13 the lock statement binds to System.Threading.Lock (EnterScope, a ref struct scope) for better performance, but Lock has no Wait/Pulse, so condition-based scheduling still uses Monitor on a separate object. In async code the whole structure is replaced by non-blocking serialisation, because await is forbidden inside a lock body.",
+  "code_sketch": "class BoundedQueue<T> {\n    private readonly object _gate = new();\n    private readonly Queue<T> _q = new();\n    private readonly int _cap;\n    public void Put(T item) {\n        lock (_gate) {\n            while (_q.Count == _cap) Monitor.Wait(_gate);   // predicate loop\n            _q.Enqueue(item);\n            Monitor.PulseAll(_gate);\n        }\n    }\n}",
+  "pitfalls": [
+    "Monitor.Wait/Pulse/PulseAll require the lock to be held and Pulse moves only one waiter to the ready queue: with a single per-object wait queue you normally need PulseAll plus a predicate loop.",
+    "Locking on this, a Type or an interned string lets foreign code share the lock; lock on a private dedicated object (or a System.Threading.Lock on .NET 9 and later) and never on a value type, because each call would box a fresh copy.",
+    "The lock statement cannot contain await, and blocking a thread-pool thread inside a monitor starves the pool; async code needs SemaphoreSlim or Channel based serialisation instead."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.monitor",
+    "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/lock"
+  ],
+  "variants": [
+    {
+      "variant_id": "monitor-lock",
+      "name": "lock statement + System.Threading.Monitor (intrinsic CLR monitor)",
+      "paradigm": "oo",
+      "min_standard": "C#1",
+      "idiom_name": "lock (_gate) + Monitor.Wait/Pulse/PulseAll",
+      "implementation_notes": "C# realises the monitor in the language and the BCL: the lock statement (Monitor.Enter/Exit in a try/finally, emitted by the compiler) is the monitor lock, and Monitor.Wait/Pulse/PulseAll are the monitor conditions, each locked object carrying a waiting queue and a ready queue. The compiler releases the lock on exceptions, which removes the classic release-on-every-path bug, and Monitor is reentrant with thread affinity. Since C# 13 the lock statement binds to System.Threading.Lock (EnterScope, a ref struct scope) for better performance, but Lock has no Wait/Pulse, so condition-based scheduling still uses Monitor on a separate object. In async code the whole structure is replaced by non-blocking serialisation, because await is forbidden inside a lock body.",
+      "code_sketch": "class BoundedQueue<T> {\n    private readonly object _gate = new();\n    private readonly Queue<T> _q = new();\n    private readonly int _cap;\n    public void Put(T item) {\n        lock (_gate) {\n            while (_q.Count == _cap) Monitor.Wait(_gate);   // predicate loop\n            _q.Enqueue(item);\n            Monitor.PulseAll(_gate);\n        }\n    }\n}",
+      "pitfalls": [
+        "Monitor.Wait/Pulse/PulseAll require the lock to be held and Pulse moves only one waiter to the ready queue: with a single per-object wait queue you normally need PulseAll plus a predicate loop.",
+        "Locking on this, a Type or an interned string lets foreign code share the lock; lock on a private dedicated object (or a System.Threading.Lock on .NET 9 and later) and never on a value type, because each call would box a fresh copy.",
+        "The lock statement cannot contain await, and blocking a thread-pool thread inside a monitor starves the pool; async code needs SemaphoreSlim or Channel based serialisation instead."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.monitor",
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/lock"
+      ]
+    },
+    {
+      "variant_id": "async-serialisation",
+      "name": "SemaphoreSlim / Channel async serialisation",
+      "paradigm": "concurrent",
+      "min_standard": "C#5",
+      "requires_features": [
+        "async",
+        "SemaphoreSlim"
+      ],
+      "idiom_name": "SemaphoreSlim(1,1).WaitAsync + awaiting queue or channel",
+      "implementation_notes": "When the object is used from async code, blocking monitors are unusable - await cannot appear inside a lock body and would pin a pool thread anyway - so the monitor degenerates into an async serialiser: SemaphoreSlim(1,1).WaitAsync delimits the critical section and a second semaphore or a Channel carries the callers that must wait for the object's state to change. The serialisation guarantee is the same, but there are no monitor conditions, so predicates are re-evaluated after every await and capacity is signalled through the channel or semaphore rather than Wait/Pulse.",
+      "code_sketch": "private readonly SemaphoreSlim _gate = new(1, 1);\nprivate readonly SemaphoreSlim _items = new(0, int.MaxValue);\nprivate readonly SemaphoreSlim _space;\n\npublic async Task PutAsync(T item, CancellationToken ct = default) {\n    await _space.WaitAsync(ct);        // await until there is room\n    await _gate.WaitAsync(ct);\n    try { _q.Enqueue(item); _items.Release(); }\n    finally { _gate.Release(); }\n}",
+      "pitfalls": [
+        "SemaphoreSlim must be a private field and every successful Wait must be paired with a Release in finally; a forgotten release wedges the object permanently and no monitor inspector will reveal it.",
+        "An async serialiser has no monitor condition: a predicate must be re-checked after every await, and spurious progress (cancelled waits, faulted tasks) must not leak permits."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.semaphoreslim"
+      ]
+    }
+  ],
+  "default_variant": "monitor-lock",
+  "version": "1.0"
+}

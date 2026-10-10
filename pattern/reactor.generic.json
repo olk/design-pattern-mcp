@@ -1,0 +1,24 @@
+{
+  "pattern": "reactor",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "initiation dispatcher loop + handle-to-handler registry over a readiness demultiplexer",
+  "implementation_notes": "Language-neutral core: keep a registry mapping each handle to the handler object that services it; loop by blocking in the synchronous event demultiplexer (select/poll/epoll_wait/kqueue, or the runtime's selector) until at least one handle is ready; for each ready handle look up its handler and call its hook (handle_event/handle_input/handle_output/handle_timeout), which performs the non-blocking I/O on that handle and returns. Registration and removal are explicit operations that must also update the demultiplexer's interest set, and any other thread that registers must wake a blocked loop through a self-pipe/eventfd/execute-style wakeup channel. The loop must never block inside a handler, must bound its per-iteration dispatch to avoid timer starvation, and must integrate a timer wheel or priority queue for timeouts. Modern implementations may layer io_uring completion handling alongside the readiness path to handle file I/O or to batch network operations.",
+  "code_sketch": "handlers = {}                                  # handle -> handler registry\nloop:\n    ready = demultiplexer.wait(handles)        # blocks until >=1 handle is ready\n    for handle in ready:\n        handler = handlers[handle]             # the initiation dispatcher decides\n        handler.handle_event(handle)           # hook call; must not block\n    # registering/unregistering from another thread must also wake the demultiplexer",
+  "pitfalls": [
+    "A handler that blocks or runs long work stalls every other handle: the single-threaded loop has no isolation and no watchdog.",
+    "Interest changes made while the loop is blocked are lost unless they arrive with a wakeup (self-pipe, eventfd, event-loop execute), which is the Reactor's most common subtle bug.",
+    "Level-triggered demultiplexers re-report a handle until it is drained, so a partially consumed handle burns the CPU; edge-triggered ones never re-report it unless readiness is re-armed or the handler drains to EAGAIN.",
+    "Keeping every socket permanently registered for write readiness spins the CPU when the send buffer is full; register for write only when buffered output exists.",
+    "Dispatching to a handler whose handle has already been closed produces undefined behaviour (a stale handle may have been reallocated to a new resource); always deregister before closing.",
+    "Throwing an unchecked exception from a handler hook crashes the entire loop; every hook must contain a top-level catch that terminates the connection cleanly.",
+    "Layering a second reactor on top of a runtime that already owns the loop (e.g. a hand-written select loop inside Node.js, asyncio, Netty or SwiftNIO) causes two dispatchers to fight over one descriptor set.",
+    "Cross-platform differences between kqueue and epoll can cause subtle bugs: epoll requires explicit EPOLLET re-arm after handling, while kqueue's EV_DISABLE after handling is optional; edge-triggered semantics differ in their treatment of EPOLLOUT.",
+    "Timer granularity on the loop thread can cause deadline misses: a timer wheel or min-heap must be integrated with the demultiplexer's blocking timeout to ensure timers fire within acceptable bounds.",
+    "io_uring integration complexity: SQPOLL mode dedicates a CPU core and cannot be used in containers without CAP_SYS_NICE; multishot operations require careful buffer ring lifetime management; mixing reactor (epoll) and proactor (io_uring) paths doubles the completion handling code.",
+    "Wrong move: treat readiness as completed I/O -> the handler can still read or write zero bytes or hit EAGAIN after a readiness notification -> instead use non-blocking operations, drain until EAGAIN, and re-arm interest according to the demultiplexer semantics.",
+    "Wrong move: run blocking DNS, filesystem, or CPU work directly in a framework-managed reactor callback -> the loop stalls every other handle -> instead offload it to a bounded worker layer and post the result back through the loop's wakeup mechanism."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

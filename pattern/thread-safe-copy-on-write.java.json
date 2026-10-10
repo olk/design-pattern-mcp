@@ -1,0 +1,61 @@
+{
+  "pattern": "thread-safe-copy-on-write",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "CopyOnWriteArrayList / CopyOnWriteArraySet",
+  "implementation_notes": "The JDK ships the pattern for collections: CopyOnWriteArrayList is 'a thread-safe variant of ArrayList in which all mutative operations (add, set, and so on) are implemented by making a fresh copy of the underlying array', and its iterator is a snapshot - 'the iterator will not reflect additions, removals, or changes to the list since the iterator was created' - so traversal needs no lock and cannot throw ConcurrentModificationException. The package guide states the rule that keeps it honest: 'A CopyOnWriteArrayList is preferable to a synchronized ArrayList when the expected number of reads and traversals greatly outnumber the number of updates to a list.' What replaces the counted body is the JVM's safe publication over the array reference: there is no user-visible reference count to protect and the copy is paid per mutation. For whole-value state instead of a list, the second variant publishes an immutable snapshot through an AtomicReference.",
+  "code_sketch": "private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();\n\nvoid fire(Event e) {                        // no lock, no ConcurrentModificationException\n    for (Listener l : listeners) l.onEvent(e);   // snapshot iterator\n}\n\nvoid register(Listener l) {\n    listeners.add(l);                       // copies the whole backing array\n}",
+  "pitfalls": [
+    "The copy is per mutation, not per transaction: add/set/removeAll each copy the whole backing array, so a write-heavy list degenerates into O(n) copies and garbage - ConcurrentLinkedQueue or ConcurrentHashMap are the right shapes there.",
+    "Snapshot iterators never see later changes and iterator.remove/set/add throw UnsupportedOperationException: code that relied on a live view or on in-place removal must be restructured (iterate to collect, then removeAll).",
+    "The collection is thread-safe, the elements are not: a mutable Listener or value stored inside still needs its own synchronisation, and compound check-then-act sequences on the list need an external lock."
+  ],
+  "sources": [
+    "Java SE 21 API, CopyOnWriteArrayList - mutative operations 'implemented by making a fresh copy of the underlying array', snapshot iterator semantics, and the read-vastly-outnumbers-write guidance in the package summary: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html",
+    "Java SE 21 API, java.util.concurrent package summary - CopyOnWriteArrayList versus synchronized ArrayList, and the happens-before guarantees for concurrent collections: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "copyonwrite-collections",
+      "name": "java.util.concurrent copy-on-write collections (snapshot iterators)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "CopyOnWriteArrayList / CopyOnWriteArraySet",
+      "implementation_notes": "The JDK ships the pattern for collections: CopyOnWriteArrayList is 'a thread-safe variant of ArrayList in which all mutative operations (add, set, and so on) are implemented by making a fresh copy of the underlying array', and its iterator is a snapshot - 'the iterator will not reflect additions, removals, or changes to the list since the iterator was created' - so traversal needs no lock and cannot throw ConcurrentModificationException. The package guide states the rule that keeps it honest: 'A CopyOnWriteArrayList is preferable to a synchronized ArrayList when the expected number of reads and traversals greatly outnumber the number of updates to a list.' What replaces the counted body is the JVM's safe publication over the array reference: there is no user-visible reference count to protect and the copy is paid per mutation. For whole-value state instead of a list, the second variant publishes an immutable snapshot through an AtomicReference.",
+      "code_sketch": "private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();\n\nvoid fire(Event e) {                        // no lock, no ConcurrentModificationException\n    for (Listener l : listeners) l.onEvent(e);   // snapshot iterator\n}\n\nvoid register(Listener l) {\n    listeners.add(l);                       // copies the whole backing array\n}",
+      "pitfalls": [
+        "The copy is per mutation, not per transaction: add/set/removeAll each copy the whole backing array, so a write-heavy list degenerates into O(n) copies and garbage - ConcurrentLinkedQueue or ConcurrentHashMap are the right shapes there.",
+        "Snapshot iterators never see later changes and iterator.remove/set/add throw UnsupportedOperationException: code that relied on a live view or on in-place removal must be restructured (iterate to collect, then removeAll).",
+        "The collection is thread-safe, the elements are not: a mutable Listener or value stored inside still needs its own synchronisation, and compound check-then-act sequences on the list need an external lock."
+      ],
+      "sources": [
+        "Java SE 21 API, CopyOnWriteArrayList - mutative operations 'implemented by making a fresh copy of the underlying array', snapshot iterator semantics, and the read-vastly-outnumbers-write guidance in the package summary: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html",
+        "Java SE 21 API, java.util.concurrent package summary - CopyOnWriteArrayList versus synchronized ArrayList, and the happens-before guarantees for concurrent collections: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-snapshot",
+      "name": "AtomicReference-published immutable snapshot",
+      "paradigm": "concurrent",
+      "min_standard": "Java10",
+      "requires_features": [
+        "AtomicReference",
+        "List.copyOf"
+      ],
+      "idiom_name": "AtomicReference<V> + immutable copy (List.copyOf/Map.copyOf) with updateAndGet",
+      "implementation_notes": "When the shared state is a whole value rather than a list, publish an immutable snapshot through one reference: AtomicReference is 'an object reference that may be updated atomically' whose get/set have volatile memory effects, and its functional updateAndGet/accumulateAndGet retry the transformation until the compare-and-set wins, so a reader either sees the snapshot before or after an update and never a partial one. Java 10's List.copyOf/Map.copyOf/Set.copyOf produce the immutable snapshot cheaply to build once and share. That replaces the counted body with the JVM's safe publication: readers hold their own local reference to the snapshot they read, writers copy-on-write and publish. Same caution as the collection variant - the copy is per update, so it fits read-mostly state.",
+      "code_sketch": "private final AtomicReference<Map<String, Integer>> routes =\n    new AtomicReference<>(Map.of());\n\nint lookup(String k) { return routes.get().get(k); }    // volatile read, no lock\n\nvoid add(String k, int v) {\n    routes.updateAndGet(cur -> {                        // CAS retry loop\n        var next = new HashMap<>(cur);                  // copy-on-write\n        next.put(k, v);\n        return Map.copyOf(next);                        // immutable snapshot\n    });\n}",
+      "pitfalls": [
+        "updateAndGet may invoke the lambda several times: it must be side-effect-free and derive the new snapshot only from the value it is handed, or a retried update duplicates its effect.",
+        "Map.copyOf is shallow: a mutable value inside the snapshot is shared with every reader, and a reference to the mutable map that was copied still aliases nothing - so deep-immutability is the caller's job.",
+        "Copying a large map per update is O(n) and the CAS loop is not starvation-free: for write-heavy state ConcurrentHashMap (fine-grained locking) beats snapshot publishing."
+      ],
+      "sources": [
+        "Java SE 21 API, AtomicReference - atomic updates with volatile memory effects, compareAndSet/getAndUpdate/updateAndGet: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html",
+        "Java SE 21 API, java.util.concurrent package summary - concurrent collections and the happens-before rules they extend: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html"
+      ]
+    }
+  ],
+  "default_variant": "copyonwrite-collections",
+  "version": "1.0"
+}

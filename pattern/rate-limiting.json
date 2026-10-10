@@ -1,0 +1,166 @@
+{
+  "category": "concurrency-resilience",
+  "name": "rate-limiting",
+  "aliases": [
+    "throttling"
+  ],
+  "intent": "Bound the rate at which work is admitted to, or issued against, a resource so that offered load stays inside what the service, dependency or budget can actually sustain, turning excess demand into a deliberate, cheap refusal or a controlled delay instead of an overload collapse.",
+  "problem": "Traffic arrives in bursts and at a scale unrelated to capacity: retry storms, batch jobs, abusive clients and noisy neighbours can drive a service or a metered dependency past the rate it can serve, where the result is unbounded queueing, latency collapse, cascading failures or quota violations. Without a declared limit and an accounting mechanism, the system discovers its ceiling only while it is already failing, and every caller suffers for the excess of a few.",
+  "context": "Applies at any boundary where a rate can be declared and attributed: a public API or endpoint protecting itself from abuse and noisy neighbours, a client or worker pool protecting a downstream dependency's quota and budget, and multi-tenant or multi-workstream systems sharing one capacity. It requires an attribution key (caller, tenant, API key, route, connection or cost weight), a time basis (rate, burst, window) and a decision policy for demand over the limit.",
+  "benefits": [
+    "Predictable, bounded load: the protected resource sees at most the configured rate, so latency, queue depth and memory stay inside the design envelope instead of degrading open-endedly.",
+    "Cheap overload signalling: a refusal (429/503 with Retry-After) costs far less than serving, queueing or timing a request out, and it tells the caller something actionable instead of stalling.",
+    "Fairness and isolation: metering per principal stops one aggressive consumer or tenant from consuming shared capacity and starving everyone else (noisy-neighbour protection).",
+    "Quota and cost protection: metered APIs, third-party quotas and paid dependencies stop generating overage charges, retry amplification and account penalties.",
+    "Stable capacity planning: the enforced ceiling makes throughput predictable, lets the resource be sized and SLO'd against a known rate, and turns the limit into a runtime-tunable operational knob.",
+    "Defence in depth: volume limits blunt credential stuffing, scraping and brute-force attempts, and give incident responders a knob before more drastic measures are needed."
+  ],
+  "tradeoffs": [
+    "Rejected work is still real demand: a 429 protects the server but shifts the decision to the caller, and clients that retry blindly turn a throttle into a retry storm - capped retries, backoff with jitter and retry budgets are coupled prerequisites, not optional.",
+    "Limits are guesses against a moving target: too tight destroys goodput on legitimate bursts, too loose protects nothing, and the real constraint is often cost per request rather than requests per second, so the wrong dimension gives false safety.",
+    "Distributed limits need shared state: local counters undercount behind N replicas, while a central counter adds a synchronous dependency, latency and hot-key contention to every decision - accuracy and latency trade directly against each other.",
+    "Attribution is hard and its errors are social: NATed and proxied clients share an IP, so crude keying throttles unrelated users together, while per-tenant quotas require identity and quota accounting that the limiter cannot invent.",
+    "Added machinery and observability surface: bucket or window state, partitioners, header emission, Retry-After semantics, dashboards and alerting - and the rejection path itself must be cheap and load-tested, or refusals become the new bottleneck.",
+    "Throttling can only defer a capacity deficit: if demand durably exceeds what the system serves, the limit converts a visible outage into a permanently degraded service unless capacity is added or work is shed by priority."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 8,
+    "security": 7,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Limiter / Throttle",
+      "responsibility": "Holds the configured limit (rate, burst or window) and the accounting state, reads a monotonic clock and admits or refuses each request; it is the single choke point in front of the protected resource."
+    },
+    {
+      "role": "Caller / Offered Load",
+      "responsibility": "The arriving work - clients, retries, batch jobs, tenants - measured against the limiter under an attribution key; a well-behaved caller honours Retry-After and backs off instead of retrying immediately."
+    },
+    {
+      "role": "Protected Resource",
+      "responsibility": "The service, dependency or budget whose capacity or quota the limit serves; one of its dimensions saturates first (requests, cost, concurrency, bytes) and the limit is set on that dimension."
+    },
+    {
+      "role": "Attribution Key",
+      "responsibility": "Maps each request to the counter it is metered against - principal, tenant, API key, route, connection or cost weight - and thereby decides who shares a limit and who is isolated."
+    },
+    {
+      "role": "Decision Policy / Rejection Handler",
+      "responsibility": "Defines what happens over the limit - refuse with 429/503 and Retry-After, delay (shape), enqueue in a bounded buffer, degrade or defer by priority - and is where back-pressure is propagated to callers."
+    },
+    {
+      "role": "Shared Counter Store",
+      "responsibility": "Optional but decisive in distributed deployments: the atomic counter (Redis-style increment or script, lease, or token service) that makes a single limit hold across replicas, at the cost of a synchronous dependency and hot-key contention."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "module",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Public API gateways and endpoints: per-key or per-IP request limits that prevent abuse and preserve capacity for legitimate callers.",
+    "Client or worker pools calling a metered third-party API (payments, messaging, search, model inference): cap requests or cost per quota window and pace instead of paying for retries and overages.",
+    "Multi-tenant SaaS platforms: per-tenant quotas and rate limits so one tenant cannot monopolize shared resources or degrade the others (noisy-neighbour protection).",
+    "Batch ingestion into a rate-limited store: pace writes to the provisioned throughput instead of the retry-on-error loop that repeatedly re-sends rejected records.",
+    "Authentication and account-recovery endpoints (login, OTP, password reset): volume limits that make credential stuffing and brute force expensive.",
+    "Service-to-service overload protection: server-side admission control that rejects excess early (per-customer limits) while well-behaved clients self-regulate with client-side or adaptive throttling.",
+    "Connection and message floods: bounds on new connections per client, messages per socket or telemetry events per device.",
+    "Envoy Proxy global rate limiting: an HTTP or network filter asks an external gRPC rate-limit service for a decision shared across Envoy instances, with local token-bucket limiting available to absorb bursts before the global check.",
+    "NGINX ngx_http_limit_req_module: a shared-memory zone tracks a leaky-bucket rate per key, with configurable burst and delay/rejection behavior at the edge.",
+    "ASP.NET Core RateLimiting middleware: global or endpoint policies partition limits by user, IP or API key and provide fixed-window, sliding-window, token-bucket and concurrency limiters."
+  ],
+  "avoid_when": [
+    "The bottleneck is concurrency or a long-running operation rather than rate: bound concurrent access with a semaphore or a worker pool (counting-semaphore, thread-pool) instead.",
+    "Traffic is smooth and predictable and capacity has headroom: the limiter adds state, a clock dependency and a rejection path for no benefit - monitor and scale instead.",
+    "The goal is to absorb bursts without losing work and callers can tolerate latency: a bounded queue (load-leveller) is the better tool; throttling is for when excess must be refused or delayed.",
+    "The threat is a volumetric denial-of-service attack: that belongs to the network, CDN or WAF edge; application throttling meters legitimate traffic and is not sized to absorb a flood.",
+    "Work is deferrable indefinitely and failures are unacceptable: a durable backlog with a shed policy and priority beats a hard refusal - but only if the backlog is bounded and monitored.",
+    "A single process or script talks to one local resource slowly and simple batching or serialization already keeps utilization safe."
+  ],
+  "language_files": {
+    "generic": "rate-limiting.generic.json",
+    "c": "rate-limiting.c.json",
+    "cplusplus": "rate-limiting.cplusplus.json",
+    "csharp": "rate-limiting.csharp.json",
+    "go": "rate-limiting.go.json",
+    "java": "rate-limiting.java.json",
+    "javascript": "rate-limiting.javascript.json",
+    "kotlin": "rate-limiting.kotlin.json",
+    "python": "rate-limiting.python.json",
+    "ruby": "rate-limiting.ruby.json",
+    "rust": "rate-limiting.rust.json",
+    "scala": "rate-limiting.scala.json",
+    "swift": "rate-limiting.swift.json",
+    "typescript": "rate-limiting.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "backpressure",
+    "load-leveller",
+    "bulkhead",
+    "circuit-breaker",
+    "retry-with-backoff",
+    "counting-semaphore",
+    "graceful-degradation",
+    "timeout"
+  ],
+  "anti_patterns": [
+    "Per-replica in-memory limits presented as a global limit: each instance admits the full rate and the dependency sees the limit multiplied by the replica count.",
+    "Throttling only at the edge of collapse (or after saturation): latency has already spiked and in-flight work is already lost; limits must engage below the hard capacity limit on an early signal.",
+    "Blind retries on 429 without backoff, jitter or honouring Retry-After, which turns rejection into a retry storm that consumes more capacity than the original traffic.",
+    "Using the throttle as the only protection: no autoscaling, no priority shedding, no fixing the expensive operation, so the system runs permanently at the limit and calls it reliability.",
+    "Keying on raw IP addresses behind NAT, corporate proxies or shared tokens, throttling thousands of unrelated users as one principal.",
+    "Unbounded queueing in place of a limit: hiding excess demand in a queue relocates the failure to memory, disk or latency - the queue must be bounded and have a shed policy."
+  ],
+  "design_principles": [
+    "Bound the offered load explicitly: an undeclared limit is discovered only in the incident, and every shared resource has one.",
+    "Decide early and cheaply: the rejection path must cost far less than the work it prevents, so authenticate, parse and evaluate limits as late (and cheaply) as possible.",
+    "Separate policy from mechanism: what happens over the limit (refuse, delay, queue, degrade) is a product decision; the accounting algorithm (bucket, window, GCRA) is an implementation detail.",
+    "Meter the dimension that saturates first - cost, concurrency or bytes can be the real ceiling even when requests per second look fine.",
+    "Fairness through attribution: meter per principal so one consumer cannot consume shared capacity, and choose the key with the isolation the product actually promises.",
+    "Signal back-pressure instead of absorbing harm silently: 429/503 with Retry-After, and propagate downstream throttling rather than masking it with internal retries."
+  ],
+  "best_practices": [
+    "Pick the dimension that saturates first and meter that: requests per second, cost or units per window, bytes, or concurrency - not QPS by reflex.",
+    "Choose the algorithm deliberately and state the burst allowance: token bucket for tolerated bursts, leaky bucket for steady egress, fixed window for simplicity, sliding window to remove boundary bursts.",
+    "Return 429 for rate limits and 503 for temporary capacity, always with Retry-After, and name the exceeded limit and its scope so callers can adapt.",
+    "Keep the rejection path cheap and load-test it; a flood of refused requests must not saturate authentication, parsing or logging.",
+    "Coordinate retries with the limiter: capped attempts, exponential backoff with jitter, per-client retry budgets, and client-side or adaptive throttling at the caller.",
+    "For multi-replica limits choose explicitly between an approximate shared limit (divide the quota per replica, reconcile periodically) and a centralized atomic counter, and document the accuracy-latency tradeoff.",
+    "Make limits runtime-configurable, observe refusals and remaining quota, and prefer early signals (utilization, p99 latency) over waiting for saturation.",
+    "Propagate downstream throttling upstream and align limits with the component that saturates first at every enforcement boundary (gateway, service, partition, dependency)."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Catalog home: docs/design-patterns.md, section 7 'Execute under concurrency, time and failure', subgroup 'Dependency failure and overload' - 'Rate Limiting / Throttling: volume must stay inside what you or the dependency can serve'.",
+    "Homer, Sharp, Brader, Narumoto & Swanson, Cloud Design Patterns: Prescriptive Architecture Guidance for Cloud Applications (Microsoft patterns & practices, 2014) - Throttling Pattern.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/throttling",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/rate-limiting-pattern",
+    "https://sre.google/sre-book/handling-overload/",
+    "https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11",
+    "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_features/global_rate_limiting.html",
+    "https://nginx.org/en/docs/http/ngx%5Fhttp%5Flimit%5Freq_module.html",
+    "https://learn.microsoft.com/en-us/aspnet/core/performance/rate-limit?view=aspnetcore-9.0",
+    "https://developers.cloudflare.com/waf/rate-limiting-rules/best-practices/",
+    "https://dechonet.com/blog/rate-limiting-is-not-a-security-strategy"
+  ]
+}

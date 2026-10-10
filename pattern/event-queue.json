@@ -1,0 +1,175 @@
+{
+  "category": "specialized-components",
+  "name": "event-queue",
+  "aliases": [
+    "message queue",
+    "message pump"
+  ],
+  "intent": "Reify requests and notifications as events in a FIFO queue so the sender returns immediately and the receiver drains at its own cadence - decoupling the two in time, the axis Observer and Command (which decouple only who handles) leave untouched.",
+  "problem": "A direct call binds the caller to the receiver's timing and thread: the caller blocks until the work finishes, requests arriving in the same window cannot be aggregated or coalesced, and the work runs wherever the sender happened to be - even though the receiver has a natural processing point of its own (a frame tick, a UI event loop, a dedicated worker thread) where batching, pacing, or thread affinity would be cheaper or safer.",
+  "context": "Per-object runtimes, simulation and game loops, GUI/OS event loops and message-driven subsystems where work should be honoured later than it is issued: the sender only needs fire-and-forget semantics, the receiver pulls at a point of its own choosing, and the pending window may be aggregated, reordered, dropped or processed on another thread. Applies both single-threaded (decoupling in time) and across threads (decoupling in time and space).",
+  "benefits": [
+    "Temporal decoupling: the sender returns immediately while the receiver drains when it is ready, so a slow subsystem (audio, disk, network) no longer stalls its callers.",
+    "Static decoupling: the sender needs no reference to the receiver, so the same event can be handled directly or broadcast to any number of registered listeners.",
+    "Aggregation window: because pending requests are visible together, duplicates can be coalesced, progress updates collapsed and work batched per tick.",
+    "Thread marshalling: the queue is the single hand-off point between subsystems, letting each domain keep its own loop and thread instead of sharing locks on live state.",
+    "Back-pressure and pacing point: the receiver can throttle, batch, prioritise or deliberately drop pending work at one place that is easy to observe and log.",
+    "Inspecting and replaying the queue makes timing-dependent behaviour reproducible in tests and in bug reports."
+  ],
+  "tradeoffs": [
+    "The sender loses control: it can only enqueue and hope, so a fire-and-forget queue is the wrong tool whenever a response, a result or an error must come back.",
+    "Events are processed against a later world state, so payloads must be data-heavy snapshots and receivers must not assume the referenced objects are still alive.",
+    "Deferred causality: failures and latency surface far from the enqueue site, and the responsibility for a request is spread across two points in time, which complicates debugging.",
+    "Feedback loops become silent: when A sends an event that causes B to answer with an event A handles, the asynchrony unwinds the stack, so cycles spin forever instead of overflowing it.",
+    "A central queue is a global variable: any subsystem can post to it, hidden couplings creep in, and isolated tests need the queue injected.",
+    "Unbounded queues grow silently when producers outrun the drain; bounded queues push the overload decision (block, drop, coalesce) onto every sender."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 8,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Event / Message",
+      "responsibility": "Reified request or notification carrying the data the receiver will need later; the unit stored in the queue."
+    },
+    {
+      "role": "Sender (Producer)",
+      "responsibility": "Appends the event to the queue and returns; never runs the handler and does not know who consumes it."
+    },
+    {
+      "role": "Queue",
+      "responsibility": "Stores pending events in FIFO order (ring buffer, deque or channel); enforces the capacity/overload policy and, when spanned across threads, the synchronization."
+    },
+    {
+      "role": "Receiver (Processor)",
+      "responsibility": "Drains the queue at its own cadence - once per tick, on the UI thread, or on a dedicated worker - handling items directly or routing them."
+    },
+    {
+      "role": "Listener / Dispatcher",
+      "responsibility": "Optional in broadcast mode: routes each drained event to the registered interested parties instead of a single owner handling it."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Game and simulation systems: combat and AI post 'enemy died' or 'play sound' events that the audio, tutorial and achievement systems drain once per frame.",
+    "GUI and OS event loops: the platform buffers input events and the application pulls them with a get-next-event call at its own pace (Windows WndProc, Qt event loop, macOS NSApplication).",
+    "Deferring expensive work off a latency-critical path: logging, telemetry, asset loading or persistence posted to a background worker while the caller continues.",
+    "UI thread marshalling: workers post state updates to the main queue instead of mutating UI state from arbitrary threads.",
+    "Server internals: network handlers enqueue decoded messages that a worker pool or a single-threaded game/room loop drains in order.",
+    "Coalescing bursts: progress reporting, resize/scroll notifications or repeated damage events collapsed into one pending entry before the expensive handler runs.",
+    "Real-time audio and music pipelines: MIDI events queued from input threads to the audio thread via lock-free SPSC ring buffers (LinuxSampler, SuperCollider); audio callbacks poll the queue at block start.",
+    "Distributed message queues and event streams: Kafka, RabbitMQ, NATS, or AWS SQS/SNS implement the same decoupling semantics across process or machine boundaries, with durability, replay, and fan-out.",
+    "Network I/O demultiplexing: epoll/kqueue/IOCP-based servers use an event queue internally to buffer ready handles before dispatch to handlers (Reactor pattern builds on this).",
+    "Firmware and RTOS event-driven architectures: Cortex-M-based systems use per-priority SPSC queues from ISRs to tasks, with priority inheritance on mutexes protecting shared resources.",
+    "CQRS and event-sourcing: commands and domain events are queued before processing to decouple the write model from read-model projectors, enabling eventual consistency and replay.",
+    "Live instrumentation and profiling: trace events are enqueued from hot paths and flushed asynchronously to avoid perturbing timing; queue depth is the primary profiling signal.",
+    "Qt's event system: QCoreApplication::postEvent() queues heap-allocated QEvents for the next event-loop pass, with priority ordering and compression of redundant events (multiple paint/resize requests collapse into one) - an in-process event queue shipped as framework infrastructure.",
+    "Win32 GUI: each GUI thread owns a message queue; PostMessage/PostThreadMessage append MSG records and the thread's own GetMessage/TranslateMessage/DispatchMessage loop is the drain point, while the blocking SendMessage variant shows exactly what the queue removes (the caller waiting on the receiver).",
+    "libuv and Node.js: uv_async_send() marshals notifications from worker threads onto the loop thread; sends are deliberately coalesced (several sends may fire one callback), trading per-event fidelity for bounded drain work."
+  ],
+  "avoid_when": [
+    "The caller needs the result or the error synchronously: call directly or return a future/promise rather than queueing a request you cannot answer.",
+    "Only the who of a notification must be decoupled but not the when: Observer or Command gives the same decoupling with less machinery.",
+    "There is no natural drain point and no consumer to own the queue - the queue just accumulates lag and memory.",
+    "The runtime already provides the queue and its semantics (browser/Node event loop, dispatch queues, Go channels): building a second queue on top reorders and double-buffers events for no gain.",
+    "Request order must equal arrival order and the requests are dependent on each other, because aggregation, prioritisation and broadcast routing change observable ordering."
+  ],
+  "language_files": {
+    "generic": "event-queue.generic.json",
+    "c": "event-queue.c.json",
+    "cplusplus": "event-queue.cplusplus.json",
+    "csharp": "event-queue.csharp.json",
+    "go": "event-queue.go.json",
+    "java": "event-queue.java.json",
+    "javascript": "event-queue.javascript.json",
+    "kotlin": "event-queue.kotlin.json",
+    "python": "event-queue.python.json",
+    "ruby": "event-queue.ruby.json",
+    "rust": "event-queue.rust.json",
+    "scala": "event-queue.scala.json",
+    "swift": "event-queue.swift.json",
+    "typescript": "event-queue.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "game-programming"
+  ],
+  "related_patterns": [
+    "observer",
+    "publisher-subscriber",
+    "command",
+    "update-method",
+    "game-loop",
+    "double-buffer",
+    "producer-consumer",
+    "event-aggregator",
+    "reactor",
+    "proactor",
+    "half-sync-half-async",
+    "acceptor-connector",
+    "active-object"
+  ],
+  "anti_patterns": [
+    "Posting new events from inside a handler, so two systems answer each other's events in an unbounded, stack-free feedback loop.",
+    "Using the event queue as a global message bus for every interaction, turning a decoupling mechanism into a hidden global variable.",
+    "Bounded-but-ignored queues that silently drop events, or unbounded queues that grow until the process dies because the drain cannot keep up.",
+    "Deferring work whose inputs are only valid at send time (dead entity references, freed resources) and discovering this at drain time.",
+    "Replacing a call that needed an answer with a fire-and-forget event, losing the result and the error path.",
+    "Rebuilding an event queue on top of a runtime that already has one (main-thread dispatch, channels, the job queue), double-buffering and reordering events for no benefit."
+  ],
+  "design_principles": [
+    "Separation of concerns: the enqueue site and the processing site are different responsibilities in different places.",
+    "Decoupling in time is a distinct axis from decoupling in space (Observer/Command decouple who, the queue decouples when).",
+    "Single ownership of the drain point: exactly one place decides when and how many pending events are processed.",
+    "Explicit resource bounds: every queue needs a capacity and an overload policy, chosen, not defaulted.",
+    "Information hiding: senders see a narrow posting API, never the queue's data structure or its consumers."
+  ],
+  "best_practices": [
+    "Reify the request as a plain record that carries everything the handler needs; do not rely on the world still looking the same at drain time. Use stable entity identifiers (e.g., generation-counters) and check liveness at handler entry.",
+    "Drain at one well-defined point (a tick, the main queue, a dedicated worker) and bound the work per drain cycle so the loop cannot starve other per-frame work.",
+    "Choose and document the overload policy — block, drop oldest, drop newest, coalesce — and size the capacity from that decision. An unbounded queue with no overload policy is a memory leak that masquerades as a feature.",
+    "Aggregate during enqueue when the pending window is small (duplicate scan is cheap) and the caller must stay fast. Aggregate during drain when the queue is large or the caller can tolerate the walk.",
+    "Log every posted event in development builds; a little debug tracing is what makes an asynchronous bug reproducible. In production, log at minimum the queue depth, overflow count, and drain latency.",
+    "Keep the queue injected or encapsulated rather than global, so tests can post and drain deterministically. A queue accessed via a registry or singleton is harder to test and silently encourages hidden couplings.",
+    "When the queue spans threads, use explicit memory semantics: a queue type with documented memory-order guarantees (acquire/release on the index), not a shared mutable list guarded by a blanket lock.",
+    "In real-time or embedded contexts, pre-allocate all event objects from a fixed-block memory pool; never call malloc or free inside the event path. Bound the pool to the worst-case in-flight count and assert on exhaustion in development.",
+    "When mixing event queues with an RTOS, map each interrupt-priority level to its own SPSC queue and drain in priority order. High-priority safety ISRs above the syscall-priority threshold must never post to a BASEPRI-protected queue.",
+    "Design handlers to be idempotent: at-least-once delivery means the same event can be delivered twice after a stalled-worker recovery. Duplicate-safe handlers avoid subtle double-processing bugs.",
+    "Monitor event-loop lag (how far behind the drain point is falling) and queue depth as first-class metrics. Alert when drain falls behind or queue depth grows monotonically.",
+    "Avoid sending events from inside a handler — the feedback loop unwinds the stack and becomes silent. If feedback is required, use a separate dispatch pass or a dedicated side-channel queue."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Nystrom, R. (2014). 'Event Queue — Decoupling Patterns.' Game Programming Patterns. http://gameprogrammingpatterns.com/event-queue.html",
+    "Schmidt, D. C., Stal, M., Rohnert, H., & Buschmann, F. (2000). 'Event Handling Patterns.' Pattern-Oriented Software Architecture, Volume 2: Patterns for Concurrent and Networked Objects. Wiley. ISBN 0-471-60695-2.",
+    "Schmidt, D. C. (1999). 'Design Patterns and Frameworks for Concurrent CORBA Event Channels.' Washington University. http://www.dre.vanderbilt.edu/~schmidt/PDF/event_channel.pdf",
+    "Bencina, R. (2012). 'Programming with Lightweight Asynchronous Messages: Some Basic Patterns.' http://www.rossbencina.com/code/programming-with-lightweight-asynchronous-messages-some-basic-patterns",
+    "Arumi, D., Garcia, F., & Amatriain, X. (2006). 'A Data-flow Pattern Catalog for Sound and Music Computing.' Proc. Pattern Languages of Programs (PLOP). http://www.mtg.upf.edu/files/publications/2ddcef-PLOP-2006-arumi-garcia-amatriain.pdf",
+    "Gala, C. (2026). 'Event-Driven Firmware Architecture — Concurrency, Bounded Latency, and Determinism on Cortex-M.' Kalapi Infotech. https://kalapiinfotech.in/event-driven-firmware-architecture-done-properly-concurrency-bounded-latency-and-determinism-on-cortex-m/",
+    "TheCodeForge (2026). 'Backpressure: Stop Your System From Drowning in Requests.' https://thecodeforge.io/system-design/backpressure/",
+    "Qt Documentation. 'The Event System' (QCoreApplication::postEvent, event compression, event loop dispatch). https://doc.qt.io/qt-6/eventsandfilters.html",
+    "Microsoft Learn. 'About Messages and Message Queues' (per-thread queues, PostMessage, GetMessage/PeekMessage vs SendMessage). https://learn.microsoft.com/en-us/windows/win32/winmsg/about-messages-and-message-queues",
+    "libuv Documentation. 'uv_async_t - Async handle' (waking the event loop from another thread; coalesced sends). https://docs.libuv.org/en/v1.x/async.html",
+    "Google Guava issue #1740 (2013). 'Consider alternative to EventBus's re-entrant event queueing strategy' (re-entrant post breaking the dispatch-timing guarantee; deadlock). https://github.com/google/guava/issues/1740"
+  ]
+}

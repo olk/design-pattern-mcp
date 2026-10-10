@@ -1,0 +1,57 @@
+{
+  "pattern": "data-access-object",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "DAO class over a PEP 249 DB-API connection (sqlite3 in the standard library)",
+  "implementation_notes": "Python standardises the driver rather than the DAO: PEP 249 gives every compliant driver the same connect/cursor/execute/fetchone contract - including paramstyle and a common exception hierarchy - and sqlite3 ships one in the standard library, so a DAO class holds an injected connection and translates driver exceptions (sqlite3.IntegrityError, driver-specific database errors) into the application's own errors. What replaces the classic structure is the DB-API protocol plus dependency injection: callers can be handed any object with the same methods, no interface declaration is required, and a fake DAO in tests needs no database. Keep the plain class while the SQL must remain visible; move to the ORM variant when mapping and identity tracking are the hard part.",
+  "code_sketch": "class CustomerDao:                               # PEP 249 driver underneath\n    def __init__(self, conn: sqlite3.Connection) -> None: self._conn = conn\n    def find(self, customer_id: int) -> Customer | None:\n        cur = self._conn.execute(\n            \"SELECT id, name, version FROM customer WHERE id = ?\", (customer_id,))\n        row = cur.fetchone()\n        return Customer(*row) if row else None   # tuple -> transfer object\n    def add(self, c: Customer) -> None:\n        try:\n            with self._conn:                     # one transaction per call\n                self._conn.execute(\"INSERT INTO customer (id, name) VALUES (?, ?)\", (c.id, c.name))\n        except sqlite3.IntegrityError as exc:    # store error -> own error\n            raise DuplicateCustomer(c.id) from exc",
+  "pitfalls": [
+    "DB-API connections are not universally thread-safe (sqlite3 refuses cross-thread use by default), so give each thread its own connection or guard access explicitly.",
+    "Cursor results are consumed by the first pass and rows arrive as tuples; map them at the boundary instead of returning cursors, and remember a swallowed exception inside `with conn` still commits everything executed before it.",
+    "Parameter placeholders are driver-specific (qmark for sqlite3, format/pyformat for other drivers): string interpolation instead of bound parameters is both a portability and an injection defect."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/sqlite3.html",
+    "https://peps.python.org/pep-0249/",
+    "https://docs.sqlalchemy.org/en/20/orm/session_basics.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "dbapi-dao",
+      "name": "Hand-written DAO over a PEP 249 DB-API connection",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "DAO class over a PEP 249 DB-API connection (sqlite3 in the standard library)",
+      "implementation_notes": "Python standardises the driver rather than the DAO: PEP 249 gives every compliant driver the same connect/cursor/execute/fetchone contract - including paramstyle and a common exception hierarchy - and sqlite3 ships one in the standard library, so a DAO class holds an injected connection and translates driver exceptions (sqlite3.IntegrityError, driver-specific database errors) into the application's own errors. What replaces the classic structure is the DB-API protocol plus dependency injection: callers can be handed any object with the same methods, no interface declaration is required, and a fake DAO in tests needs no database. Keep the plain class while the SQL must remain visible; move to the ORM variant when mapping and identity tracking are the hard part.",
+      "code_sketch": "class CustomerDao:                               # PEP 249 driver underneath\n    def __init__(self, conn: sqlite3.Connection) -> None: self._conn = conn\n    def find(self, customer_id: int) -> Customer | None:\n        cur = self._conn.execute(\n            \"SELECT id, name, version FROM customer WHERE id = ?\", (customer_id,))\n        row = cur.fetchone()\n        return Customer(*row) if row else None   # tuple -> transfer object\n    def add(self, c: Customer) -> None:\n        try:\n            with self._conn:                     # one transaction per call\n                self._conn.execute(\"INSERT INTO customer (id, name) VALUES (?, ?)\", (c.id, c.name))\n        except sqlite3.IntegrityError as exc:    # store error -> own error\n            raise DuplicateCustomer(c.id) from exc",
+      "pitfalls": [
+        "DB-API connections are not universally thread-safe (sqlite3 refuses cross-thread use by default), so give each thread its own connection or guard access explicitly.",
+        "Cursor results are consumed by the first pass and rows arrive as tuples; map them at the boundary instead of returning cursors, and remember a swallowed exception inside `with conn` still commits everything executed before it.",
+        "Parameter placeholders are driver-specific (qmark for sqlite3, format/pyformat for other drivers): string interpolation instead of bound parameters is both a portability and an injection defect."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://peps.python.org/pep-0249/",
+        "https://docs.sqlalchemy.org/en/20/orm/session_basics.html"
+      ]
+    },
+    {
+      "variant_id": "sqlalchemy-session-dao",
+      "name": "DAO over a SQLAlchemy 2.0 Session (select/scalars)",
+      "paradigm": "declarative",
+      "min_standard": "Python3.8",
+      "idiom_name": "Session.get / Session.scalars(select(...)) with an ORM mapping",
+      "implementation_notes": "With SQLAlchemy the DAO becomes a thin layer over Session, which establishes all conversations with the database, keeps an identity map and flushes pending changes as a unit of work; queries are built with select() and executed through Session.scalars() or Session.execute(), and Session.get() hits the identity map before the database. Choose it when object mapping and transactional consistency are the real problem; keep the DB-API DAO when the SQL and driver behaviour must stay fully visible and no ORM belongs in the stack. The trade-off is that the session, not the DAO, now owns identity and transactions, so the DAO must not keep one alive.",
+      "code_sketch": "class CustomerDao:\n    def __init__(self, session: Session) -> None:  # sessionmaker at module scope\n        self._session = session\n\n    def find(self, customer_id: int) -> Customer | None:\n        return self._session.get(Customer, customer_id)      # identity map first\n\n    def by_email(self, email: str) -> list[Customer]:\n        return list(self._session.scalars(\n            select(Customer).where(Customer.email == email)))  # 2.0 style, no Query",
+      "pitfalls": [
+        "Session objects are not thread-safe and must be short-lived (one per request or unit of work); a module-level Session shared across threads corrupts identity and transaction state.",
+        "After commit all instances are expired: attribute access outside the transaction emits new SELECTs or raises DetachedInstanceError, so map to transfer objects before returning."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/session_basics.html"
+      ]
+    }
+  ],
+  "default_variant": "dbapi-dao"
+}

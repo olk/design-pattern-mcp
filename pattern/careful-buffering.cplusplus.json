@@ -1,0 +1,55 @@
+{
+  "pattern": "careful-buffering",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::deque guarded by std::mutex, std::condition_variable, wait_for for bounded waits",
+  "implementation_notes": "The C++ standard library has the primitives but no bounded queue, so the pattern is written out: a std::deque (or fixed array ring) behind a std::mutex, with std::condition_variable for the block policy and wait_for for a bounded wait, and the full-policy implemented in one place inside push. A try_push returning bool (reject) and pop_front-before-push_back (drop-oldest) are one line each, which is the point - the policy stays explicit rather than distributed across call sites. Hand-rolling is the right default when you need custom policies, watermarks or per-item accounting; when a fixed-capacity container already expresses the policy, prefer it.",
+  "code_sketch": "class ShedQueue {                       // capacity fixed, drop-oldest policy\n    std::deque<Item> q_; std::mutex m_; std::condition_variable cv_; std::size_t cap_{1024};\npublic:\n    bool try_push(Item it) {            // false => shed; the caller counts it\n        std::lock_guard lk{m_};\n        bool room = q_.size() < cap_;\n        if (!room) q_.pop_front();\n        q_.push_back(std::move(it)); cv_.notify_one(); return room; }\n    Item pop() {\n        std::unique_lock lk{m_}; cv_.wait(lk, [&]{ return !q_.empty(); });\n        Item it = std::move(q_.front()); q_.pop_front(); return it; } };",
+  "pitfalls": [
+    "Waiting without the predicate overload: spurious wakeups and missed notifications then have to be handled by hand, and usually are not.",
+    "Calling notify_one while not holding the mutex is legal but losing the wakeup is not: check the predicate under the lock before waiting.",
+    "Blocking push from a thread that also consumes, or from a std::async/ForkJoin-style worker with a small pool, deadlocks the pool once all workers are blocked on a full queue."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-mutex-condvar",
+      "name": "std::mutex + std::condition_variable bounded queue (hand-written)",
+      "paradigm": "concurrent",
+      "implementation_notes": "The C++ standard library has the primitives but no bounded queue, so the pattern is written out: a std::deque (or fixed array ring) behind a std::mutex, with std::condition_variable for the block policy and wait_for for a bounded wait, and the full-policy implemented in one place inside push. A try_push returning bool (reject) and pop_front-before-push_back (drop-oldest) are one line each, which is the point - the policy stays explicit rather than distributed across call sites. Hand-rolling is the right default when you need custom policies, watermarks or per-item accounting; when a fixed-capacity container already expresses the policy, prefer it.",
+      "min_standard": "C++11",
+      "idiom_name": "std::deque guarded by std::mutex, std::condition_variable, wait_for for bounded waits",
+      "code_sketch": "class ShedQueue {                       // capacity fixed, drop-oldest policy\n    std::deque<Item> q_; std::mutex m_; std::condition_variable cv_; std::size_t cap_{1024};\npublic:\n    bool try_push(Item it) {            // false => shed; the caller counts it\n        std::lock_guard lk{m_};\n        bool room = q_.size() < cap_;\n        if (!room) q_.pop_front();\n        q_.push_back(std::move(it)); cv_.notify_one(); return room; }\n    Item pop() {\n        std::unique_lock lk{m_}; cv_.wait(lk, [&]{ return !q_.empty(); });\n        Item it = std::move(q_.front()); q_.pop_front(); return it; } };",
+      "pitfalls": [
+        "Waiting without the predicate overload: spurious wakeups and missed notifications then have to be handled by hand, and usually are not.",
+        "Calling notify_one while not holding the mutex is legal but losing the wakeup is not: check the predicate under the lock before waiting.",
+        "Blocking push from a thread that also consumes, or from a std::async/ForkJoin-style worker with a small pool, deadlocks the pool once all workers are blocked on a full queue."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "boost-fixed-capacity",
+      "name": "Boost fixed-capacity containers (structural bound)",
+      "paradigm": "data-oriented",
+      "implementation_notes": "Boost makes the bound a property of the data structure instead of a runtime check: boost::circular_buffer is fixed-capacity by design and, once full, overwrites the oldest element, which is drop-oldest with no policy code at all; boost::lockfree::spsc_queue is a fixed-size lock-free ring whose push returns false when there is no room, which is the reject policy with no lock. Choose these when the capacity is genuinely static and either the overwrite semantics are exactly what you want (rolling windows) or the single-producer/single-consumer constraint holds; keep the mutex/condition_variable form when you must block a producer, need multiple producers, or want the lost item back.",
+      "min_standard": "C++11",
+      "idiom_name": "boost::circular_buffer (overwrites oldest) and boost::lockfree::spsc_queue (push fails when full)",
+      "code_sketch": "boost::circular_buffer<Task> recent(1024);   // fixed capacity: the bound is structural\nrecent.push_back(task);                      // full => the oldest element is overwritten\nboost::lockfree::spsc_queue<Task> q{1024};   // lock-free SPSC ring, fixed capacity\nif (!q.push(task)) ++dropped;                // full => push() returns false (reject)",
+      "pitfalls": [
+        "circular_buffer is not thread-safe: the overwrite must happen under your own lock, and size()/full() snapshots race with the producer.",
+        "spsc_queue means exactly one producer thread and one consumer thread; adding a second producer silently corrupts the ring instead of failing.",
+        "Overwrite-based eviction can steal an element a consumer already holds a reference or iterator to, turning a policy into a dangling read."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/circular_buffer/implementation.html",
+        "https://www.boost.org/libs/circular_buffer"
+      ]
+    }
+  ],
+  "default_variant": "std-mutex-condvar",
+  "version": "1.0"
+}

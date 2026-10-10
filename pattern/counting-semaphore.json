@@ -1,0 +1,187 @@
+{
+  "category": "concurrency-resilience",
+  "name": "counting-semaphore",
+  "aliases": [
+    "semaphore",
+    "general semaphore"
+  ],
+  "intent": "Cap the concurrent use of a finite resource by handing out a fixed number of permits: every operation performs the equivalent of Dijkstra's P/acquire before touching the resource and the equivalent of V/release on every exit path, so at most N operations are inside at once instead of concurrency growing without limit.",
+  "problem": "A finite resource - a connection pool, file handles, memory, a downstream API - degrades or fails when too many operations use it at once, but the call sites have no shared, enforceable notion of 'too many': thread-per-request designs, fan-out loops and retry bursts each add concurrency independently, so the resource is oversubscribed exactly when it is least able to cope. A per-second rate limit does not fix this, because ten slow operations saturate such a resource just as thoroughly as a thousand fast ones; what is needed is a bound on simultaneous use, expressed as one number the code enforces at a single admission point.",
+  "context": "Concurrent, thread- or task-based software in which one shared resource has a hard or empirical concurrency ceiling: service clients with connection pools, workers that open files or sockets, caches with bounded builders, batch fan-out against an API with a quota. The decision is local to the code that uses the resource - a permit counter plus a release discipline, not distributed coordination - and it complements rather than replaces rate limiting, timeouts and circuit breakers.",
+  "benefits": [
+    "Caps real resource consumption, not arrival rate: however fast operations arrive, at most N hold the resource, which is what connection pools, file descriptors, memory budgets and downstream quotas actually limit.",
+    "Turns overload into bounded queueing (or an explicit fast rejection) instead of cascading failure: excess operations wait for a permit instead of piling onto a saturated resource.",
+    "One admission point for heterogeneous callers: every path that touches the resource acquires from the same counter, so the bound cannot be evaded by adding a new call site.",
+    "Separates the admission policy from the resource owner: the pool or client stays simple, while the concurrency budget becomes a configurable, measurable number.",
+    "Weighted permits let one counter cover variable-size work - a request that needs k units acquires k - which a mutex or a fixed worker pool cannot express.",
+    "A one-permit semaphore is an ownership-free mutex: the permit may be released by a different thread or context, which is what hand-off and deadlock-recovery scenarios need.",
+    "Supports context cancellation natively in many implementations (Java Semaphore.tryAcquire, Go golang.org/x/sync/semaphore.Weighted.Acquire with context), preventing leaked permits when callers are cancelled.",
+    "Enables natural backpressure: producers that cannot acquire a permit slow down without buffering unboundedly, unlike a plain queue which can grow until memory is exhausted."
+  ],
+  "tradeoffs": [
+    "Permits are anonymous: the semaphore counts holders, it does not know which item of a pool each holder owns, so handing out a specific free item still needs separate bookkeeping.",
+    "Release is not ownership-checked and usually unbounded: a stray or duplicated release silently raises the permit count above the intended ceiling, and the bound is gone until the process restarts. Use a bounded form (BoundedSemaphore, Semaphore with fairness) to detect this class of bug.",
+    "A permit lost on an error, early return, panic or cancellation path shrinks capacity permanently; under sustained traffic the service slowly starves with no error to point at. Always release in a finally/defer/RAII construct.",
+    "Blocking acquisition couples the caller's latency to the slowest holder: without a timeout or cancellation the wait is unbounded, so one stuck holder becomes an unbounded queue of stuck waiters. Use try-acquire with a deadline or wrap with wait_for/asyncio.wait_for.",
+    "Fairness is a trade: FIFO ordering avoids starvation but costs throughput through hand-off and context switches, while non-fair barging can starve an unlucky waiter indefinitely under high contention.",
+    "It bounds concurrency, not rate: a holder may release and reacquire immediately, so a 'N per second' quota is not enforced - conflating the two produces a limit that is simultaneously too loose and too strict. Use a token-bucket rate limiter separately for rate enforcement.",
+    "Several semaphores reintroduce deadlock: a task holding one permit and waiting for another can deadlock, so acquisition order or try-with-backoff has to be designed deliberately. When acquiring multiple semaphores, always acquire in consistent order or use try-acquire with exponential backoff.",
+    "In-process semaphores bound one process only: each replica gets its own N permits, so a shared downstream quota needs an inter-process or externally coordinated limiter (e.g., a distributed rate limiter, Redis-based token bucket, or a shared proxy)."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Semaphore",
+      "responsibility": "Owns the permit counter and the queue of blocked acquirers: acquire() atomically decrements the counter or blocks, release() increments it and wakes a waiter; the implementation decides fairness (FIFO) or barging. Many implementations (Java Semaphore, Go golang.org/x/sync/semaphore) support context-aware cancellation so blocked acquirers can be interrupted."
+    },
+    {
+      "role": "Permit",
+      "responsibility": "The token returned by a successful acquire and returned by release; in RAII languages (C++, Rust, Python with context managers) it is a value whose destruction or drop releases the permit automatically, guaranteeing release on every exit path including panics and cancellations."
+    },
+    {
+      "role": "Client task",
+      "responsibility": "The thread, coroutine or worker that must acquire a permit before touching the resource and release it on every exit path - success, error, timeout and cancellation alike."
+    },
+    {
+      "role": "Bounded resource",
+      "responsibility": "The thing whose concurrent use is capped: a connection pool, a set of file handles, a memory budget, a downstream API or an accelerator. The resource itself typically knows nothing about the semaphore."
+    },
+    {
+      "role": "Admission policy",
+      "responsibility": "What happens when no permit is available - block, block with a deadline, try and fail fast, or shed load with a distinguishable error; it is part of the pattern's configuration, not an implementation detail. This decision determines whether the semaphore acts as a queue (backpressure) or a rejection gate."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Bounding connections to a database or downstream API: acquire a permit before checking out a connection, so a fan-out burst can never drain the client library's pool.",
+    "Limiting concurrent file or socket handles in a crawler, indexer or media pipeline where the operating system's descriptor limit is the real ceiling.",
+    "Capping parallel work in a batch job (at most N workers at a time) without building a full thread pool when the workers are created elsewhere.",
+    "Bounding memory-hungry or CPU-heavy operations - image and PDF transforms, model inference - to the number the machine can actually run concurrently.",
+    "Protecting a third-party API with a documented concurrency quota ('at most 5 simultaneous requests') rather than a per-second rate limit.",
+    "Serving as the counting gate of a bounded-buffer hand-off: 'empty' and 'full' permits in a producer-consumer protocol, or a one-permit signal released from a different thread or interrupt handler. This is the classic pattern from Dijkstra's EWD 123 and The Little Book of Semaphores.",
+    "Serialising a shared test fixture (a database, a port, a temporary directory) with a one-permit semaphore while the rest of the suite stays parallel.",
+    "Implementing a token-bucket rate limiter where a background thread or timer refills permits at a steady rate, and callers acquire a permit before each operation, providing controlled bursty throughput without the semaphore acting as a rate limiter itself.",
+    "Bounding goroutine parallelism in Go: a buffered channel of capacity N (chan struct{}) serves as an idiomatic semaphore, where sending acquires and receiving releases, providing natural backpressure for I/O-bound workloads.",
+    "Weighted resource allocation: an operation requiring k units acquires k permits, enabling fine-grained control over heterogeneous workloads (e.g., large requests taking more connection pool permits) - supported natively by golang.org/x/sync/semaphore.Weighted and Java's acquire(int permits) variant.",
+    "Semaphore-based bulkheads in resilience libraries: Resilience4j's SemaphoreBulkhead caps in-flight calls to a dependency at maxConcurrentCalls and waits at most maxWaitDuration before rejecting with BulkheadFullException - a counting semaphore with the admission policy made configurable.",
+    "Throttling outbound requests in async Rust: an Arc<tokio::sync::Semaphore> shared across tasks with one permit acquired per request; acquire_many covers weighted work and add_permits adjusts the ceiling at runtime, with release happening automatically when the permit is dropped.",
+    "Async-friendly throttling in .NET: SemaphoreSlim.WaitAsync awaits a permit without pinning a thread-pool thread, the primitive Microsoft Learn documents for limiting concurrent access to a resource or pool inside a single process."
+  ],
+  "avoid_when": [
+    "The concern is requests per second rather than simultaneous users: a token-bucket rate limiter (Rate Limiting) is the right primitive, and a semaphore will not spread work over time.",
+    "Only one operation may run at a time and the same thread both takes and returns it: an ordinary mutex or lock is simpler and enforces ownership.",
+    "The capacity belongs to one keyed partition (tenant, dependency, route) and each needs its own budget: a bulkhead or per-key limiter expresses that directly, whereas one semaphore gives a single global ceiling.",
+    "The resource is a queue of work whose capacity is what matters: a bounded queue or load leveller already blocks producers when full, so a separate counter only duplicates the bound.",
+    "The dependency fails hard and fast rather than saturating: a circuit breaker plus a timeout addresses that without a permit counter.",
+    "The work is CPU-bound and the pool size is already fixed by an executor or worker pool: the worker count is the semaphore, and a second bound only hides the real one.",
+    "Fairness is required and the semaphore implementation does not support it: non-fair semaphores can starve waiters indefinitely under high contention, so a fair semaphore or a separate FIFO queue is needed."
+  ],
+  "language_files": {
+    "generic": "counting-semaphore.generic.json",
+    "c": "counting-semaphore.c.json",
+    "cplusplus": "counting-semaphore.cplusplus.json",
+    "csharp": "counting-semaphore.csharp.json",
+    "go": "counting-semaphore.go.json",
+    "java": "counting-semaphore.java.json",
+    "javascript": "counting-semaphore.javascript.json",
+    "kotlin": "counting-semaphore.kotlin.json",
+    "python": "counting-semaphore.python.json",
+    "ruby": "counting-semaphore.ruby.json",
+    "rust": "counting-semaphore.rust.json",
+    "scala": "counting-semaphore.scala.json",
+    "swift": "counting-semaphore.swift.json",
+    "typescript": "counting-semaphore.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "producer-consumer",
+    "thread-pool",
+    "barrier-countdown-latch",
+    "bulkhead",
+    "rate-limiting",
+    "object-pool",
+    "backpressure"
+  ],
+  "anti_patterns": [
+    "Using a semaphore as a rate limiter ('100 permits per second'), so bursts still hit the resource all at once and the number is tuned to the wrong unit.",
+    "Releasing only on the success path (no finally, defer or RAII), leaking permits until the service starves and the effective ceiling reaches zero.",
+    "Unbounded acquisition - acquire() with no timeout or cancellation - so one stuck holder becomes an unbounded queue of blocked callers and the outage spreads.",
+    "Releasing without having acquired (or releasing twice), which silently raises the permit count past its ceiling because a semaphore has no owner.",
+    "Hard-coding the permit count at each call site, so every caller bounds the same resource differently and the effective limit is the sum of the guesses.",
+    "Holding a permit across a long unrelated operation (user interaction, retry loop with sleeps), which converts a resource bound into an accidental lock on capacity.",
+    "Acquiring several semaphores in inconsistent order, producing classic deadlock with a resource-exhaustion symptom.",
+    "Using asyncio.Semaphore in a threading context or threading.Semaphore inside an async coroutine without an executor, blocking the event loop."
+  ],
+  "design_principles": [
+    "Explicit resource budgeting: concurrency limits are declared numbers owned by the component that uses the resource, not emergent properties of thread creation.",
+    "Single responsibility at the admission point: the semaphore owns admission, the resource owner owns the resource, and neither needs to know the other's internals.",
+    "Fail-safe release: acquire/release must survive exceptions, cancellation and panics (finally, defer, RAII permit, withPermit), because a leaked permit is permanent capacity loss.",
+    "Bounded waiting: every wait has a deadline or a cancellation path; unbounded blocking is treated as a bug rather than as a queue.",
+    "Measure before sizing: the permit count is derived from the resource's real capacity and validated by load test, then revisited when capacity or traffic shape changes.",
+    "Bounded form by default: prefer semaphore implementations that detect over-release, so logic errors fail loudly rather than silently widening the concurrency ceiling.",
+    "Composition over configuration: combine semaphores with timeouts, circuit breakers and rate limiters rather than asking the semaphore to be all three."
+  ],
+  "best_practices": [
+    "Acquire immediately before using the resource and release in a finally/defer/RAII construct; never let the permit outlive the operation it protects.",
+    "Bound the wait: use try-acquire with a deadline (or cancellation-aware acquisition) and decide explicitly whether an unavailable permit means queueing, fast rejection or a degraded fallback.",
+    "Size the permit count from measured capacity - the resource's hard limit minus headroom - and keep it configurable instead of copying a number from an example.",
+    "Prefer a bounded/max-count form where the language offers one (Python BoundedSemaphore, C# SemaphoreSlim with maxCount, Java Semaphore, Go golang.org/x/sync/semaphore with release-time checks) so over-release fails loudly instead of silently widening the limit.",
+    "Keep one semaphore per bounded resource (or per keyed partition) and make it the only admission path to that resource.",
+    "Compose with timeouts and circuit breakers: the semaphore bounds how many callers are inside, the timeout bounds how long one may stay, the breaker stops calls that cannot succeed.",
+    "Instrument the semaphore - available permits, queue length, wait time - so saturation is visible before users notice it.",
+    "In Python, use asyncio.Semaphore for coroutine contexts and threading.Semaphore for thread contexts; never mix them. For cross-context limiting, use a shared lockable primitive designed for the target concurrency model.",
+    "In Go, prefer golang.org/x/sync/semaphore.Weighted with context for cancellation-aware weighted acquisition; fall back to a buffered channel (chan struct{}) for simple N-at-a-time limiting.",
+    "In Java, use Semaphore(N, fair=true) when starvation is unacceptable; use tryAcquire with timeout to implement shed-load behavior rather than unbounded queuing.",
+    "When using multiple semaphores, establish a global acquisition order and apply it consistently; or use try-acquire with exponential backoff to break potential deadlocks automatically."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Dijkstra, E. W. 'Cooperating Sequential Processes' (EWD 123), Technological University Eindhoven, 1965 - origin of the counting semaphore and its P/V operations. https://www.cs.utexas.edu/~EWD/transcriptions/EWD01xx/EWD123.html",
+    "Dijkstra, E. W. EWD 123 full source. https://www.cs.utexas.edu/users/EWD/transcriptions/EWD01xx/EWD123-2.html",
+    "'Semaphores' (Operating Systems: Three Easy Pieces lecture notes), University of Wisconsin-Madison. https://pages.cs.wisc.edu/~remzi/OSTEP/threads-sema.pdf",
+    "'Semaphores', Concurrency Deep Dives. https://concurrencydeepdives.com/semaphores/",
+    "'The Little Book of Semaphores', Allen B. Downey, Green Tea Press, 2nd edition - comprehensive treatment of semaphore patterns including bounded buffer, producer-consumer, readers-writer lock. https://greenteapress.com/semaphores/LittleBookOfSemaphores.pdf",
+    "'Synchronization Primitives', Python documentation (asyncio.Semaphore, threading.Semaphore, BoundedSemaphore). https://docs.python.org/3/library/asyncio-sync.html and https://docs.python.org/3/library/threading.html",
+    "'Semaphore (Java SE 21 & JDK 21)', Oracle Java documentation - covers acquire, tryAcquire, fairness, and connection pool patterns. https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Semaphore.html",
+    "'Semaphores in Java', Baeldung - Semaphore usage patterns including timed permits and mutex usage. https://www.baeldung.com/java-semaphore",
+    "'Semaphore Pattern in Go', Rafiul Alam - binary, counting, and weighted semaphores in Go. https://alamrafiul.com/posts/go-semaphore/",
+    "'Semaphore (Rate Limiting) - Go Patterns' - buffered channel as counting semaphore in Go. https://go-patterns.dev/sync/semaphore",
+    "'semaphore package', golang.org/x/sync/semaphore - weighted semaphore with context cancellation, TryAcquire, Release. https://pkg.go.dev/golang.org/x/sync/semaphore",
+    "'Backpressure for the impatient: channels vs. semaphores vs. tokens', Segflow - comparison of backpressure patterns in Go. https://segflow.github.io/post/backpressure-patterns/",
+    "'Limit goroutines with buffered channels', Redowan's Reflections - Go concurrency limiting with buffered channel semaphores. https://rednafi.com/go/limit-goroutines-with-buffered-channels/",
+    "'Python threading.Semaphore vs asyncio.Semaphore', Stack Overflow discussion on mixing paradigms. https://stackoverflow.com/questions/69698479/python-threading-semaphore-vs-asyncio-semaphore",
+    "'Bulkhead', Resilience4j documentation - SemaphoreBulkhead implements the concurrency cap with a counting semaphore: maxConcurrentCalls, maxWaitDuration and fair/unfair call-handling strategies. https://resilience4j.readme.io/docs/bulkhead",
+    "'Semaphore' (tokio::sync), tokio API documentation - fair counting semaphore for async Rust: acquire, acquire_many, add_permits, permits released on drop, MAX_PERMITS cap. https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html",
+    "'Semaphore and SemaphoreSlim', Microsoft Learn - .NET guidance on SemaphoreSlim vs kernel Semaphore, WaitAsync for thread-pool-friendly waits, and maxCount behavior on over-release. https://learn.microsoft.com/en-us/dotnet/standard/threading/semaphore-and-semaphoreslim",
+    "Chen, Raymond. 'Semaphores don't have owners', The Old New Thing - canonical misuse critique: a one-permit semaphore used as a mutex loses ownership checks and crash recovery. https://devblogs.microsoft.com/oldnewthing/20051123-14/?p=33233",
+    "'Origin of P-V', NYU CS resources - Dijkstra's 1963 P (proberen) and V (verhogen) operations: etymology and original semantics of the counting semaphore. https://cs.nyu.edu/~yap/classes/os/resources/origin_of_PV.html"
+  ],
+  "related_patterns_notes": {
+    "bounded-channel": "bounded-channel",
+    "token-bucket": "token-bucket",
+    "readers-writer-lock": "readers-writer-lock"
+  }
+}

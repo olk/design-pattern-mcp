@@ -1,0 +1,28 @@
+{
+  "pattern": "wire-tap",
+  "language": "javascript",
+  "support": "manual",
+  "idiom_name": "handler wrapper snapshotting with structuredClone into a bounded drop-oldest async-iterator queue",
+  "implementation_notes": "Node.js has no messaging layer to interpose, so the tap is a wrapper on the channel's dispatch function - and there is deliberately no core stream.duplicate/clone API, so the queue is hand-rolled. The event loop is single-threaded: anything the analyzer computes inside the handler's turn delays the primary flow (and all other work) just as much as blocking would, so the tap must copy and defer. The idiomatic runtime-level form: on each message call structuredClone (a global since Node v17.0.0) to get a genuine snapshot - passing the live object would alias it, because JavaScript values are references - then hand the copy to a bounded queue with an explicit overflow policy (drop-oldest with a published dropped counter is the honest best-effort choice; the alternative, backpressure, would violate the primary-never-blocked invariant). The consumer side is an async iterator (for await), so the analyzer runs as an independent task: when it is already awaiting, the resolver hands the copy off but its continuation still runs after the route() call has returned, keeping dispatch out-of-band. Bound the queue by count (payload objects of unknown size) or bytes, and export the counter so loss is visible. Two stream-native variants exist but both couple the analyzer to the primary flow and are only safe when it provably keeps up: (1) src.pipe(primary); src.pipe(tap) with a PassThrough - pipe manages one shared flow whose rate is set by the slowest destination, so a stalled tap pauses the source; (2) web-stream tee() (ReadableStream.prototype.tee, Node v16.5.0, byte-stream tee v18.10.0/v16.18.0, reachable from Node streams via Readable.toWeb) - the WHATWG spec aggregates the two branches' backpressure and an unread branch queues unbounded. Use them for byte-oriented pipelines with a fast drain; use the bounded queue for object messages; an EventEmitter registry also works but emit() is synchronous, so defer inside the listener with setImmediate and remove taps with off(). Heavy analysis belongs in a worker_thread either way - deferral changes ordering, not CPU cost.",
+  "code_sketch": "function wireTap(handler, { capacity = 1024 } = {}) {\n  const queue = [], pending = [];\n  let dropped = 0;\n  const tap = {\n    get dropped() { return dropped; },                     // visible loss counter\n    async *[Symbol.asyncIterator]() {\n      while (queue.length) yield queue.shift();\n      while (true) yield await new Promise((r) => pending.push(r));\n    },\n  };\n  return {\n    tap,\n    route(message) {\n      const copy = structuredClone(message);               // snapshot, not a reference\n      const waiter = pending.shift();\n      if (waiter) waiter(copy);                            // analyzer resumes after route() returns\n      else {\n        if (queue.length >= capacity) { queue.shift(); dropped++; }  // drop-oldest, counted\n        queue.push(copy);\n      }\n      return handler(message);                             // original to the primary, unchanged\n    },\n  };\n}\n// analyzer: for await (const msg of tap) analyze(msg);   removable: break the loop",
+  "pitfalls": [
+    "Piping one Readable to two destinations (primary + PassThrough tap) shares a single managed flow: if the tap is not drained, its buffer fills and backpressure pauses the source itself - in a live check a stalled tap let 3 of 1000 object chunks through before readableFlowing went false, and mixing fast and slow consumers on one source is a known Node buffering hazard (nodejs/node#16706).",
+    "Web-stream tee() couples its branches: the WHATWG spec aggregates backpressure from both branches to the source, and a branch nobody reads buffers every chunk in memory (200k enqueued objects with one unread branch retained tens of MB) - a tee is only a tap while the analyzer drains eagerly.",
+    "Object-mode streams hand the identical chunk reference to both consumers: the primary mutating a message after the tap sees it corrupts the analyzer's data (observed: primary's write showed up through the PassThrough); snapshot with structuredClone or serialize at tap time.",
+    "Registering taps as EventEmitter listeners is synchronous dispatch by default and trips the limit: more than defaultMaxListeners (10) listeners on one event emits a MaxListenersExceededWarning, 'possible EventEmitter memory leak' - defer work with setImmediate in the listener and remove taps with off(), or raise the per-emitter limit deliberately.",
+    "structuredClone is a data-only copy: it throws DataCloneError on functions and other non-serializable values, and class instances silently flatten - the prototype chain and class private fields are not duplicated, so methods are lost on the snapshot - analyze plain data or define an explicit serialization for rich objects."
+  ],
+  "sources": [
+    "https://nodejs.org/api/stream.html",
+    "https://nodejs.org/api/webstreams.html",
+    "https://streams.spec.whatwg.org/",
+    "https://nodejs.org/api/events.html",
+    "https://nodejs.org/api/globals.html",
+    "https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone",
+    "https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm",
+    "https://github.com/nodejs/node/issues/16706",
+    "https://www.bennadel.com/blog/2817-the-affect-of-back-pressure-when-piping-data-into-multiple-writable-streams-in-node-js.htm",
+    "https://nodejs.org/api/worker_threads.html"
+  ],
+  "version": "1.1"
+}

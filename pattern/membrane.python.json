@@ -1,0 +1,56 @@
+{
+  "pattern": "membrane",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "proxy class overriding __getattribute__/__setattr__/__delattr__ + WeakKeyDictionary identity map",
+  "implementation_notes": "Python has no interception hook beyond the attribute protocol: __getattr__ runs only after normal lookup fails, while __getattribute__ is called for every attribute access (datamodel), so the membrane is a proxy class overriding __getattribute__/__setattr__/__delattr__ whose returned attributes are wrapped - methods are wrapped in a function that wraps arguments and results. The identity map is a WeakKeyDictionary (or WeakValueDictionary for the other direction) so one target yields one proxy without being pinned, and revocation is a flag checked in the wrapper. The whole structure is hand-written; the classic form is justified when a mediated object graph must survive calls in both directions, while a decorator over one function or a narrow explicit interface is enough when a single operation crosses the boundary.",
+  "code_sketch": "class Membrane:\n    def __init__(self, policy):\n        self.revoked, self._proxies = False, WeakKeyDictionary()   # identity map\n    def wrap(self, obj):\n        if not isinstance(obj, (Graph, File)): return obj   # only capabilities\n        if obj not in self._proxies:\n            self._proxies[obj] = _Proxy(self, obj)          # one wrapper per raw\n        return self._proxies[obj]\nclass _Proxy:\n    def __getattribute__(self, name):                       # every attribute access\n        m = object.__getattribute__(self, '_m')\n        if m.revoked: raise PermissionError('revoked')\n        return m.wrap(getattr(object.__getattribute__(self, '_t'), name))",
+  "pitfalls": [
+    "__getattr__ is not __getattribute__: it fires only after normal lookup fails, so a proxy that defines only __getattr__ silently exposes its own attributes (and anything the proxy shares with the target) - total mediation needs __getattribute__.",
+    "Special methods are looked up on the type, not the instance: __add__, __iter__, __enter__ and friends must be defined on the proxy class itself, since __getattribute__ cannot intercept operators or protocol dispatch.",
+    "The identity map must be weakly keyed and the proxy must not strongly reference the target through the map's values, or the map pins the wrapped graph; plain dicts leak.",
+    "Every intercepted access costs a Python frame and isinstance/type checks see the proxy, not the target, unless __class__ is spoofed deliberately."
+  ],
+  "sources": [
+    "https://docs.python.org/3/reference/datamodel.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "dunder-proxy",
+      "name": "Transparent proxy via __getattribute__ (stdlib only)",
+      "paradigm": "oo",
+      "min_standard": "Python3.0",
+      "idiom_name": "proxy class overriding __getattribute__/__setattr__/__delattr__ + WeakKeyDictionary identity map",
+      "implementation_notes": "Python has no interception hook beyond the attribute protocol: __getattr__ runs only after normal lookup fails, while __getattribute__ is called for every attribute access (datamodel), so the membrane is a proxy class overriding __getattribute__/__setattr__/__delattr__ whose returned attributes are wrapped - methods are wrapped in a function that wraps arguments and results. The identity map is a WeakKeyDictionary (or WeakValueDictionary for the other direction) so one target yields one proxy without being pinned, and revocation is a flag checked in the wrapper. The whole structure is hand-written; the classic form is justified when a mediated object graph must survive calls in both directions, while a decorator over one function or a narrow explicit interface is enough when a single operation crosses the boundary.",
+      "code_sketch": "class Membrane:\n    def __init__(self, policy):\n        self.revoked, self._proxies = False, WeakKeyDictionary()   # identity map\n    def wrap(self, obj):\n        if not isinstance(obj, (Graph, File)): return obj   # only capabilities\n        if obj not in self._proxies:\n            self._proxies[obj] = _Proxy(self, obj)          # one wrapper per raw\n        return self._proxies[obj]\nclass _Proxy:\n    def __getattribute__(self, name):                       # every attribute access\n        m = object.__getattribute__(self, '_m')\n        if m.revoked: raise PermissionError('revoked')\n        return m.wrap(getattr(object.__getattribute__(self, '_t'), name))",
+      "pitfalls": [
+        "__getattr__ is not __getattribute__: it fires only after normal lookup fails, so a proxy that defines only __getattr__ silently exposes its own attributes (and anything the proxy shares with the target) - total mediation needs __getattribute__.",
+        "Special methods are looked up on the type, not the instance: __add__, __iter__, __enter__ and friends must be defined on the proxy class itself, since __getattribute__ cannot intercept operators or protocol dispatch.",
+        "The identity map must be weakly keyed and the proxy must not strongly reference the target through the map's values, or the map pins the wrapped graph; plain dicts leak.",
+        "Every intercepted access costs a Python frame and isinstance/type checks see the proxy, not the target, unless __class__ is spoofed deliberately."
+      ],
+      "sources": [
+        "https://docs.python.org/3/reference/datamodel.html"
+      ]
+    },
+    {
+      "variant_id": "wrapt-object-proxy",
+      "name": "wrapt.ObjectProxy subclass (library-assisted transparency)",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "class MembraneProxy(wrapt.ObjectProxy) overriding only the mediated members",
+      "implementation_notes": "The wrapt package provides a transparent object proxy: ObjectProxy passes attribute access through to the wrapped object, exposes it as __wrapped__, and handles the awkward parts of transparency (slots, descriptors, __class__ reporting) in a C extension, so a membrane only overrides the members it must mediate and calls self.__wrapped__ for the rest (wrapt documentation). That inverts the usual trade-off: less code to write, but the mediated surface is exactly the overridden set, so un-overridden members remain raw routes, and the membrane now depends on a third-party package. Use it when the mediation is selective (log or attenuate a handful of calls) and the surrounding stack already depends on wrapt - instrumentation, mocking and AspectJ-style libraries do; use the dunder-proxy variant when the interior of the wrapper must be fully controlled or dependencies must stay stdlib-only.",
+      "code_sketch": "import wrapt\n\nclass DirMembrane(wrapt.ObjectProxy):\n    def __init__(self, target, membrane):\n        super().__init__(target)\n        self._self_membrane = membrane          # wrapt convention: _self_* stays local\n\n    def open(self, path):                        # mediated member\n        m = self._self_membrane\n        if m.revoked:\n            raise PermissionError('revoked')\n        return m.wrap(self.__wrapped__.open(path))   # wrap the way out",
+      "pitfalls": [
+        "Only overridden members are mediated: like Kotlin's `by`, ObjectProxy forwards everything else transparently, so the mediated surface is what you explicitly write and nothing warns about the rest.",
+        "Names starting with _self_ are stored on the proxy rather than forwarded; anything else lands on the wrapped object through __setattr__, which is a silent way to write through the membrane.",
+        "The dependency and the C extension are part of the trust base now: a security boundary that relies on wrapt must pin and audit it, and the proxy still cannot intercept operators unless they are defined on the subclass."
+      ],
+      "sources": [
+        "https://wrapt.readthedocs.io/en/latest/wrappers.html"
+      ]
+    }
+  ],
+  "default_variant": "dunder-proxy"
+}

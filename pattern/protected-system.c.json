@@ -1,0 +1,72 @@
+{
+  "pattern": "protected-system",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "opaque struct + checked accessor functions (in-process); descriptor as capability (OS boundary)",
+  "implementation_notes": "C has no access control, so the pattern is hand-written twice over: the resource is named only by an incomplete type ('struct vault;', definition private to the guard's translation unit) and every operation is a function that consults the policy before touching it. That first form is a reviewable convention, not a boundary - any code in the same address space can call the resource's own API or the syscalls directly. Where the resource is an OS object the enforcement moves below the process: open(2) checks the permission bits and returns a descriptor (a reference to an open file description) that becomes the capability, so the descriptor is handed out instead of the path, and openat2() resolve flags make the open itself the decision instead of a separate test. access(2) is documented as racy ('creates a security hole ... short time interval') and warns it checks real IDs while the kernel uses effective IDs, so it must not be the guard.",
+  "code_sketch": "/* vault.h - representation is private to vault.c */\nstruct vault;                       /* incomplete type: callers cannot name fields */\nstruct vault *vault_open(const char *path, const struct subject *who);\nint vault_read(struct vault *v, const struct subject *who, void *buf, size_t n);\n\n/* vault.c */\nint vault_read(struct vault *v, const struct subject *who, void *buf, size_t n) {\n    if (!policy_allows(who, v->acl, OP_READ)) { errno = EACCES; return -1; }\n    return read(v->fd, buf, n);      /* the descriptor never leaves the vault */\n}",
+  "pitfalls": [
+    "An opaque pointer is not private state: anyone who can see a struct definition (a shared header, a cast) can reach the fields, and a caller that receives the raw descriptor bypasses the guard for good - keep the definition in the .c file and hand out wrapped handles only.",
+    "Compile/link-time device only: an incomplete type and static linkage stop accidental misuse in other translation units, but nothing in C prevents a caller from redeclaring the struct or calling the resource directly.",
+    "OS permission checks are evaluated when the handle is created and are bound to the file, not to the acting subject afterwards: the descriptor is the capability, so dup(), fork() and SCM_RIGHTS pass the ability to read and write regardless of the in-process policy.",
+    "access()/faccessat() before opening is a documented security hole (check-then-use race): open once with the intended flags or validate an O_PATH handle, and note that access() consults real IDs while the kernel uses effective IDs."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man2/open.2.html",
+    "https://man7.org/linux/man-pages/man2/access.2.html",
+    "https://man7.org/linux/man-pages/man2/openat2.2.html",
+    "https://man7.org/linux/man-pages/man7/capabilities.7.html",
+    "https://man7.org/linux/man-pages/man7/unix.7.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "opaque-handle-guard",
+      "name": "Opaque struct + checked accessors (portable in-process guard)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "opaque struct + checked accessor functions (in-process); descriptor as capability (OS boundary)",
+      "implementation_notes": "C has no access control, so the pattern is hand-written twice over: the resource is named only by an incomplete type ('struct vault;', definition private to the guard's translation unit) and every operation is a function that consults the policy before touching it. That first form is a reviewable convention, not a boundary - any code in the same address space can call the resource's own API or the syscalls directly. Where the resource is an OS object the enforcement moves below the process: open(2) checks the permission bits and returns a descriptor (a reference to an open file description) that becomes the capability, so the descriptor is handed out instead of the path, and openat2() resolve flags make the open itself the decision instead of a separate test. access(2) is documented as racy ('creates a security hole ... short time interval') and warns it checks real IDs while the kernel uses effective IDs, so it must not be the guard.",
+      "code_sketch": "/* vault.h - representation is private to vault.c */\nstruct vault;                       /* incomplete type: callers cannot name fields */\nstruct vault *vault_open(const char *path, const struct subject *who);\nint vault_read(struct vault *v, const struct subject *who, void *buf, size_t n);\n\n/* vault.c */\nint vault_read(struct vault *v, const struct subject *who, void *buf, size_t n) {\n    if (!policy_allows(who, v->acl, OP_READ)) { errno = EACCES; return -1; }\n    return read(v->fd, buf, n);      /* the descriptor never leaves the vault */\n}",
+      "pitfalls": [
+        "An opaque pointer is not private state: anyone who can see a struct definition (a shared header, a cast) can reach the fields, and a caller that receives the raw descriptor bypasses the guard for good - keep the definition in the .c file and hand out wrapped handles only.",
+        "Compile/link-time device only: an incomplete type and static linkage stop accidental misuse in other translation units, but nothing in C prevents a caller from redeclaring the struct or calling the resource directly.",
+        "OS permission checks are evaluated when the handle is created and are bound to the file, not to the acting subject afterwards: the descriptor is the capability, so dup(), fork() and SCM_RIGHTS pass the ability to read and write regardless of the in-process policy.",
+        "access()/faccessat() before opening is a documented security hole (check-then-use race): open once with the intended flags or validate an O_PATH handle, and note that access() consults real IDs while the kernel uses effective IDs."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/open.2.html",
+        "https://man7.org/linux/man-pages/man2/access.2.html",
+        "https://man7.org/linux/man-pages/man2/openat2.2.html",
+        "https://man7.org/linux/man-pages/man7/capabilities.7.html",
+        "https://man7.org/linux/man-pages/man7/unix.7.html"
+      ]
+    },
+    {
+      "variant_id": "os-capability",
+      "name": "Descriptor as capability, enforced by the OS (process boundary)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "posix-permissions",
+        "openat2",
+        "scm-rights"
+      ],
+      "idiom_name": "open(2)/openat2(2) permission checks + descriptor passing",
+      "implementation_notes": "The enforceable C variant delegates ownership to the operating system: the process opens the resource under the identity that is allowed to use it (open(2) checks the permission bits and fails with EACCES), keeps the returned descriptor as the capability, and hands that descriptor - not the path - to the code that may act on it; SCM_RIGHTS is how such a handle is granted to another process ('semantically equivalent to duplicating a file descriptor into the file descriptor table of another process'). openat2() resolve flags (RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_SYMLINKS) make the open itself the decision, so no check-then-use window exists between validating a path and opening it. Privileged processes bypass these checks entirely (capabilities(7)), so drop capabilities and privileges rather than re-checking in user space.",
+      "code_sketch": "/* the descriptor is the capability: grant access by passing it, not the path */\nint fd = open(\"/vault/secret\", O_RDONLY | O_CLOEXEC);   /* EACCES if not allowed */\nif (fd < 0) return -1;\n/* hand fd to the worker that may read it; across processes use SCM_RIGHTS */\n/* untrusted path components: make the open itself the decision */\nstruct open_how how = { .flags = O_RDONLY,\n                        .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS };\nsyscall(SYS_openat2, dirfd, relpath, &how, sizeof how);",
+      "pitfalls": [
+        "The permission check happens when the handle is created and the descriptor carries the access afterwards: dup(), fork() and SCM_RIGHTS transfer the capability, so revoking it means closing every copy or using a mechanism the OS can revoke.",
+        "A privileged process (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, a setuid helper) bypasses the checks entirely - drop privileges before opening, or the enforcement is nominal.",
+        "access(2)/faccessat(2) is advisory and racy and answers with real IDs, not the effective IDs open(2) uses; O_CREAT|O_EXCL is the atomic alternative when the operation is create-if-absent."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/open.2.html",
+        "https://man7.org/linux/man-pages/man2/openat2.2.html",
+        "https://man7.org/linux/man-pages/man7/capabilities.7.html",
+        "https://man7.org/linux/man-pages/man7/unix.7.html"
+      ]
+    }
+  ],
+  "default_variant": "opaque-handle-guard"
+}

@@ -1,0 +1,165 @@
+{
+  "category": "workflow-messaging",
+  "name": "scatter-gather",
+  "aliases": [
+    "fan-out-fan-in",
+    "broadcast-aggregate"
+  ],
+  "intent": "Send one request to several independent recipients in parallel and distill their replies into a single answer under an explicit completeness rule, so a caller gets the best answer a set of services can offer without serialising on the slowest of them.",
+  "problem": "The information a caller needs is held by several independent providers at once - quotes from suppliers, copies of a replicated shard, fragments of a composite answer - and no single service owns it. Asking them one after another makes the caller pay the sum of all latencies, and asking them in parallel without a rule for when to stop either waits for a straggler that may never answer or silently returns a partial answer that looks complete.",
+  "context": "Distributed request/response conversations across process or network boundaries where the recipient set is known or discoverable, the individual replies are independent of each other (no reply needs another to be produced), and the caller has a limited time budget whose expiry must still produce a usable - explicitly partial - result. Typical carriers are messaging channels with correlation identifiers and return addresses, or in-process fan-out primitives (futures, task groups, coroutines) in front of remote calls.",
+  "benefits": [
+    "End-to-end latency approaches the slowest useful reply instead of the sum of all replies, which is the whole point when the providers are independent.",
+    "The recipient set becomes data (a recipient list or a subscription), so providers can be added or withdrawn without touching the requestor's code.",
+    "Independent failures are isolated: with a per-recipient timeout and a tolerant merge, one dead provider degrades the answer instead of failing the request.",
+    "The best-of-N policies the pattern enables - cheapest quote, highest replica version, first healthy mirror - are impossible to express with a single addressed call.",
+    "The aggregation point is a natural place for correlation, deduplication and provenance: the answer can name which recipients contributed.",
+    "Read fan-out absorbs load spikes on individual providers by spreading requests over the whole recipient set."
+  ],
+  "tradeoffs": [
+    "Request amplification: one caller request becomes N outbound requests (plus N replies), so the load on shared dependencies and on the caller's connection budget multiplies.",
+    "A deadline must be designed, not inherited: per-hop timeouts do not compose, so the caller has to derive an absolute budget and decide what a partial answer means when it expires.",
+    "Partial failure has to be modelled explicitly - the merge must distinguish no answer, a late answer, a failed recipient and a successful empty answer - or the caller silently consumes incomplete data.",
+    "The aggregation point is stateful and is a new failure domain: it holds per-request correlation state, must expire it, and can leak if replies never arrive.",
+    "Determinism is lost: which replies are present at the cut-off depends on scheduling, so results are not reproducible and tests must pin the clock, the recipient set and the failure injection.",
+    "Cost scales with N even when one reply would have sufficed (a first-success policy still pays for all N requests unless the losers are cancelled).",
+    "Answers are not necessarily comparable: a fast reply may be stale (replicas), low-quality (auction) or from a degraded provider, so the merge needs a notion of acceptability, not just arrival time."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 8,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Scatter (Broadcaster / Requestor)",
+      "responsibility": "Resolves the recipient set (recipient list or publish-subscribe channel), stamps the request with a correlation identifier and a return address, issues the requests concurrently and starts the deadline clock."
+    },
+    {
+      "role": "Recipient (Responder)",
+      "responsibility": "An independent service that handles the request without knowing about the other recipients and replies to the return address, echoing the correlation identifier."
+    },
+    {
+      "role": "Reply Channel (Return Address)",
+      "responsibility": "The channel or endpoint where responses are delivered, decoupling the responders' execution from the gatherer's thread of control."
+    },
+    {
+      "role": "Correlation Store",
+      "responsibility": "Holds the per-request gathering state keyed by correlation identifier, attributes late and duplicate replies, and expires the state when the request is abandoned."
+    },
+    {
+      "role": "Gather (Aggregator)",
+      "responsibility": "Collects replies for one correlation identifier and applies the completeness condition (wait-for-all, first-success, k-of-n, deadline) to decide when the request may be answered."
+    },
+    {
+      "role": "Merge Policy",
+      "responsibility": "Distills the accepted replies into the single response - best quote, freshest version, concatenation, quorum vote - and declares the result partial when the completeness condition was not fully met."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Quoting and bidding: request prices from every supplier or bank in a list and answer with the best offer, as in the loan-broker example that the pattern was documented with.",
+    "Federated or multi-provider lookup: query several search indices, registries or catalogues and merge their hit lists under a latency budget.",
+    "Replica reads and tail-latency control: send the same read to a few replicas of a shard and use the first (or freshest) reply instead of waiting for a single unlucky one.",
+    "Composite backend-for-frontend calls: one user-facing page fans out to profile, recommendations, inventory and pricing services and merges the answers it received before the page deadline.",
+    "Distributed batch and map-style workflows: fan a dataset out to many workers (AWS Step Functions Map, Durable Functions fan-out/fan-in) and aggregate the partial results.",
+    "Health and capability probing: ask all members of a cluster for their version, load or feature flags and merge the responses into one view of the fleet.",
+    "Engine-level read fan-out: an Elasticsearch search is an explicit scatter-gather - the coordinating node forwards the request to every node holding a relevant shard, each data node answers locally, and the coordinator gathers and reduces those partial results into one globally sorted result set.",
+    "Composed inside integration frameworks rather than hand-built: Apache Camel's Scatter-Gather EIP combines Recipient List and Aggregate with a correlation expression and a completion timeout that discards late replies, and Spring Integration's ScatterGatherHandler pairs a PublishSubscribeChannel (auction) or RecipientListRouter (distribution) with an AggregatingMessageHandler."
+  ],
+  "avoid_when": [
+    "Exactly one recipient may handle the request (a Point-to-Point Channel command): a single addressed call or a queue is the honest design - broadcasting a command duplicates its effect.",
+    "The answer must be complete and consistent, with no time budget that allows a partial result (for example reading a quorum for correctness rather than latency): use a coordinated read or a transaction instead of a best-effort gather.",
+    "The 'many endpoints' are local CPU-bound units of work: a parallel map (rayon, parallel streams, a task pool) is the right primitive - messaging adds serialisation, not throughput.",
+    "The requests are side-effecting and non-idempotent: either make the responders Idempotent Receivers or send exactly one command and use an Aggregator for the replies of a known set of steps.",
+    "The infrastructure already exposes the pattern as a construct (a MuleSoft Scatter-Gather Router, a Step Functions Map state, an Akka ScatterGatherFirstCompleted router, an orchestration API): configure it instead of hand-building channels and correlation state.",
+    "One provider is authoritative and the others are merely fallbacks: a sequential call chain with a Retry and a circuit breaker is simpler than a fan-out."
+  ],
+  "language_files": {
+    "generic": "scatter-gather.generic.json",
+    "c": "scatter-gather.c.json",
+    "cplusplus": "scatter-gather.cplusplus.json",
+    "csharp": "scatter-gather.csharp.json",
+    "go": "scatter-gather.go.json",
+    "java": "scatter-gather.java.json",
+    "javascript": "scatter-gather.javascript.json",
+    "kotlin": "scatter-gather.kotlin.json",
+    "python": "scatter-gather.python.json",
+    "ruby": "scatter-gather.ruby.json",
+    "rust": "scatter-gather.rust.json",
+    "scala": "scatter-gather.scala.json",
+    "swift": "scatter-gather.swift.json",
+    "typescript": "scatter-gather.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "functional"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip",
+    "modern"
+  ],
+  "related_patterns": [
+    "recipient-list",
+    "aggregator",
+    "splitter",
+    "composed-message-processor",
+    "content-based-router",
+    "dynamic-router",
+    "routing-slip",
+    "process-manager"
+  ],
+  "anti_patterns": [
+    "Fire-and-wait fan-out: broadcasting to N recipients and then blocking on all of them with no deadline of its own, so the caller's latency is set by the slowest process in the fleet.",
+    "Silent partial answers: treating a missing or failed reply as an empty result and returning the merged answer as if it were complete, without marking it partial.",
+    "Broadcast commands: using scatter-gather for side-effecting operations (charging every payment provider 'to see which wins') without idempotency, so the fan-out multiplies the effect.",
+    "Unbounded fan-out width: one inbound request spawning N outbound calls with no concurrency limit, letting a single caller exhaust connection pools and rate limits shared by every other caller.",
+    "Immortal correlation state: an aggregator that keeps per-request state forever because late replies of abandoned requests are never expired.",
+    "Retrying the whole fan-out on timeout: each retry multiplies the outbound load by N and usually hits the same slow recipients, turning a latency problem into an outage."
+  ],
+  "design_principles": [
+    "Loose coupling through messages: recipients know only the request and the return address, never each other or the requestor's internals.",
+    "Separation of concerns: recipient resolution, fan-out transport, correlation and aggregation policy are distinct, independently replaceable responsibilities.",
+    "Design for partial failure: the completeness condition and the partial-result contract are part of the interface, not an implementation detail.",
+    "Bounded resources and explicit budgets: latency is a first-class design constraint, so the deadline is derived once and propagated to every hop.",
+    "Idempotency for fan-out: any operation that may reach multiple recipients must be safe to apply more than once (Idempotent Receiver).",
+    "Explicit consistency contract: since the answers may be stale or unequal, the merge policy must state what makes an answer acceptable."
+  ],
+  "best_practices": [
+    "Set one absolute deadline for the whole gather, derived from the caller's remaining budget, and pass the remaining time down as an absolute timestamp - never a fixed per-hop timeout.",
+    "Make the completeness condition and the merge policy explicit and observable (wait-for-all, first-acceptable, k-of-n, deadline), and return metadata about which recipients contributed.",
+    "Bound the fan-out: fixed or bounded recipient lists, a concurrency limit per request, and back-pressure so one caller cannot exhaust shared connections.",
+    "Reap losers deterministically: cancel in-flight requests when the policy is satisfied, drop late replies by correlation identifier, and expire aggregation state with a TTL.",
+    "Treat per-recipient failures individually (all-settled / per-task error inspection) so one failure does not abort a gather that tolerates partial answers.",
+    "Require idempotency or address-ability before broadcasting side effects, and prefer read-only fan-out for anything that cannot be made idempotent.",
+    "Test with an adversarial responder set: one slow, one failing, one duplicate and one empty reply, asserting the behaviour exactly at the deadline boundary."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Scatter-Gather (Message Routing), built on Recipient List, Publish-Subscribe Channel and Aggregator.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/BroadcastAggregate.html",
+    "https://docs.mulesoft.com/mule-runtime/latest/scatter-gather-concept",
+    "https://docs.aws.amazon.com/step-functions/latest/dg/state-map.html",
+    "https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-fan-in-fan-out",
+    "https://doc.akka.io/libraries/akka-core/current/routing.html",
+    "https://camel.apache.org/components/4.22.x/eips/scatter-gather.html",
+    "https://docs.enterprise.spring.io/spring-integration/reference/6.3-SNAPSHOT/scatter-gather.html",
+    "https://www.elastic.co/docs/deploy-manage/distributed-architecture/clusters-nodes-shards/node-roles",
+    "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/scatter-gather.html"
+  ]
+}

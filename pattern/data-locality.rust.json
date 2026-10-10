@@ -1,0 +1,63 @@
+{
+  "pattern": "data-locality",
+  "language": "rust",
+  "support": "native",
+  "idiom_name": "Vec<T> of records addressed by index (or generational) handles, swept by iter_mut",
+  "implementation_notes": "Vec<T> is 'a contiguous growable array type' and slices are views into it, so the packed layout is Rust's default: keep records by value, address them with a handle (u32/usize or a generational index), and let ownership prevent the aliasing that pointer graphs require. What replaces the classic structure: one Vec per record type plus handles replaces webs of Rc<RefCell<..>>, and the borrow checker enforces the split between storage and iteration that data-oriented code wants anyway. Layout is explicit when it is part of the contract - the default representation may reorder fields, while #[repr(C)] fixes the C ordering algorithm and #[repr(align(N))]/#[repr(packed)] adjust padding. swap_remove keeps the active prefix packed; split_at_mut/split_first_mut let two records be borrowed at once without handle indirection.",
+  "code_sketch": "struct Particle { x: f32, y: f32, vx: f32, vy: f32 }\nlet mut pool: Vec<Particle> = Vec::with_capacity(max);\npool.push(Particle { x: 0.0, y: 0.0, vx: 1.0, vy: 0.0 });\nfor p in pool.iter_mut() {            // contiguous, one bounds check for the slice\n    p.x += p.vx * dt;\n    p.y += p.vy * dt;\n}\n// handle: struct Handle(u32);  deactivate: pool.swap_remove(i as usize);",
+  "pitfalls": [
+    "The default representation may reorder fields, so anything that depends on the physical layout (FFI, serialization, a shipped hot/cold split) needs #[repr(C)] or explicit conversion.",
+    "Handles are not checked: after swap_remove or reordering, a stale index silently addresses another record - use a generational index/slot map when handles outlive the frame.",
+    "The borrow checker rejects iterating the pool while a distinct element is mutably borrowed; split the slice (split_at_mut) or index by handle instead of restructuring the data.",
+    "Vec reallocation invalidates any raw pointer or slice derived earlier; derive slices per access rather than storing them."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/vec/index.html",
+    "https://doc.rust-lang.org/reference/type-layout.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "vec-index-handles",
+      "name": "Vec<T> records with index handles (Rust 2021)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2021",
+      "idiom_name": "Vec<T> of records addressed by index (or generational) handles, swept by iter_mut",
+      "implementation_notes": "Vec<T> is 'a contiguous growable array type' and slices are views into it, so the packed layout is Rust's default: keep records by value, address them with a handle (u32/usize or a generational index), and let ownership prevent the aliasing that pointer graphs require. What replaces the classic structure: one Vec per record type plus handles replaces webs of Rc<RefCell<..>>, and the borrow checker enforces the split between storage and iteration that data-oriented code wants anyway. Layout is explicit when it is part of the contract - the default representation may reorder fields, while #[repr(C)] fixes the C ordering algorithm and #[repr(align(N))]/#[repr(packed)] adjust padding. swap_remove keeps the active prefix packed; split_at_mut/split_first_mut let two records be borrowed at once without handle indirection.",
+      "code_sketch": "struct Particle { x: f32, y: f32, vx: f32, vy: f32 }\nlet mut pool: Vec<Particle> = Vec::with_capacity(max);\npool.push(Particle { x: 0.0, y: 0.0, vx: 1.0, vy: 0.0 });\nfor p in pool.iter_mut() {            // contiguous, one bounds check for the slice\n    p.x += p.vx * dt;\n    p.y += p.vy * dt;\n}\n// handle: struct Handle(u32);  deactivate: pool.swap_remove(i as usize);",
+      "pitfalls": [
+        "The default representation may reorder fields, so anything that depends on the physical layout (FFI, serialization, a shipped hot/cold split) needs #[repr(C)] or explicit conversion.",
+        "Handles are not checked: after swap_remove or reordering, a stale index silently addresses another record - use a generational index/slot map when handles outlive the frame.",
+        "The borrow checker rejects iterating the pool while a distinct element is mutably borrowed; split the slice (split_at_mut) or index by handle instead of restructuring the data.",
+        "Vec reallocation invalidates any raw pointer or slice derived earlier; derive slices per access rather than storing them."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/vec/index.html",
+        "https://doc.rust-lang.org/reference/type-layout.html"
+      ]
+    },
+    {
+      "variant_id": "ecs-archetype-crate",
+      "name": "Archetype column storage in an ECS crate (hecs / bevy_ecs)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "archetype or sparse-set column storage",
+        "query iteration"
+      ],
+      "idiom_name": "hecs::World with per-type archetype columns (ArchetypeColumn) queried as (&mut Position, &Velocity)",
+      "implementation_notes": "Instead of hand-maintaining parallel vectors, delegate the layout to an ECS crate: hecs describes itself as 'a high-performance, minimalist entity-component-system (ECS) world', where an Archetype is 'a collection of entities having the same component types' and an ArchetypeColumn is a reference to a single column of component data - i.e. per-component-type packed storage with an entity handle (its Entity is a 'lightweight unique ID'). What replaces the classic structure: components become plain structs stored in columns, entities are ids, and the hot loop is a query that iterates only the archetypes holding the required components, skipping entities that lack them. Choose it when the entity set is dynamic (spawn/despawn changes the archetype mix), when several systems sweep overlapping component sets, or when bevy_ecs's scheduler/parallel iteration is wanted.",
+      "code_sketch": "let mut world = hecs::World::new();\nlet e = world.spawn((Position { x: 0.0 }, Velocity { vx: 1.0 }));\nfor (_, (pos, vel)) in world.query_mut::<(&mut Position, &Velocity)>() {\n    pos.x += vel.vx * dt;             // packed per-type columns, no chase\n}\n// handles: hecs::Entity; structural changes are world operations, not array surgery",
+      "pitfalls": [
+        "Component types are the storage key: one component of a given type per entity, so 'two of the same' must be modelled as a collection or a distinct type.",
+        "Structural changes (spawn/despawn, add/remove component) move entities between archetypes and are deferred or restricted while a query borrow is live.",
+        "Queries borrow the world, so systems that also read other entities must go through the world API again instead of holding two overlapping borrows.",
+        "Archetype count grows with the number of distinct component combinations; a highly fragmented entity mix produces many small columns and loses the locality the crates promise."
+      ],
+      "sources": [
+        "https://docs.rs/hecs/latest/hecs/"
+      ]
+    }
+  ],
+  "default_variant": "vec-index-handles"
+}

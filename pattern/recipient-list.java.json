@@ -1,0 +1,73 @@
+{
+  "pattern": "recipient-list",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "RecipientListRouter (Spring Integration routeToRecipients)",
+  "implementation_notes": "Java's ecosystem provides the pattern as a first-class EIP element: Spring Integration's RecipientListRouter sends each message to a list of channels, its Java DSL (routeToRecipients / <recipient-list-router>) configures recipients declaratively, and RecipientListRouterManagement exposes addRecipient/removeRecipient over the control bus or JMX so the list really is data at runtime. Send timeout, ignore-send-failures and apply-sequence make the per-recipient failure policy explicit rather than accidental. Reach for the plain JDK only when a full integration framework is already too much machinery; then ExecutorService/CompletableFuture with a dedicated pool is the manual realization.",
+  "code_sketch": "@Bean\nIntegrationFlow orders() {\n    return IntegrationFlow.from(\"orders\")\n        .routeToRecipients(r -> r\n            .applySequence(true)          // stamp sequence so downstream can correlate\n            .ignoreSendFailures(false)\n            .sendTimeout(1_000L)\n            .recipient(\"billing\")\n            .recipient(\"inventory\"))\n        .get();\n}",
+  "pitfalls": [
+    "A router that resolves no recipient throws MessageDeliveryException unless a defaultOutputChannel (or nullChannel, to drop silently) is configured.",
+    "ignoreSendFailures=true hides a dead recipient from the caller; pair it with an error channel or message history, or the loss is invisible.",
+    "Recipients added at runtime through RecipientListRouterManagement are not shared across a clustered deployment by themselves; the list lives in the instance unless the change is distributed."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-integration/reference/router/implementations.html",
+    "https://camel.apache.org/components/latest/eips/recipientList-eip.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "spring-integration-recipient-list-router",
+      "name": "Spring Integration RecipientListRouter",
+      "paradigm": "oo",
+      "min_standard": "Java17",
+      "idiom_name": "RecipientListRouter (Spring Integration routeToRecipients)",
+      "implementation_notes": "Java's ecosystem provides the pattern as a first-class EIP element: Spring Integration's RecipientListRouter sends each message to a list of channels, its Java DSL (routeToRecipients / <recipient-list-router>) configures recipients declaratively, and RecipientListRouterManagement exposes addRecipient/removeRecipient over the control bus or JMX so the list really is data at runtime. Send timeout, ignore-send-failures and apply-sequence make the per-recipient failure policy explicit rather than accidental. Reach for the plain JDK only when a full integration framework is already too much machinery; then ExecutorService/CompletableFuture with a dedicated pool is the manual realization.",
+      "code_sketch": "@Bean\nIntegrationFlow orders() {\n    return IntegrationFlow.from(\"orders\")\n        .routeToRecipients(r -> r\n            .applySequence(true)          // stamp sequence so downstream can correlate\n            .ignoreSendFailures(false)\n            .sendTimeout(1_000L)\n            .recipient(\"billing\")\n            .recipient(\"inventory\"))\n        .get();\n}",
+      "pitfalls": [
+        "A router that resolves no recipient throws MessageDeliveryException unless a defaultOutputChannel (or nullChannel, to drop silently) is configured.",
+        "ignoreSendFailures=true hides a dead recipient from the caller; pair it with an error channel or message history, or the loss is invisible.",
+        "Recipients added at runtime through RecipientListRouterManagement are not shared across a clustered deployment by themselves; the list lives in the instance unless the change is distributed."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-integration/reference/router/implementations.html",
+        "https://camel.apache.org/components/latest/eips/recipientList-eip.html"
+      ]
+    },
+    {
+      "variant_id": "camel-recipient-list",
+      "name": "Apache Camel recipientList EIP",
+      "paradigm": "oo",
+      "min_standard": "Java17",
+      "idiom_name": "recipientList(expression) with endpoint-URI list",
+      "implementation_notes": "Camel's recipientList computes the destinations from an expression (header, body, XPath, bean method) whose result may be a Collection, array, Iterator, NodeList or delimited String of endpoint URIs, then sends the same message to each - sequentially by default, concurrently with parallelProcessing and a thread pool. stopOnException selects fail-fast, an AggregationStrategy merges replies, and the allowedSchemes option restricts which URI schemes a dynamic recipient may resolve to. Choose it when routing lives in a Camel route; the Spring Integration router is the counterpart when the stack is Spring Integration.",
+      "code_sketch": "from(\"jms:queue:orders\")\n    .recipientList(header(\"recipients\"))    // Collection/array/iterator or comma-separated URIs\n        .delimiter(\",\")\n        .parallelProcessing()               // sequential by default\n        .stopOnException();                 // fail-fast instead of continuing",
+      "pitfalls": [
+        "The expression result must be iterable in Camel's sense; anything else is treated as a single endpoint, so a mistyped header quietly becomes a one-recipient list.",
+        "Each distinct endpoint URI resolved dynamically bypasses the producer cache (cacheSize) unless it is reused, which costs connections under high recipient churn.",
+        "A message-derived recipient list should be constrained with allowedSchemes; otherwise the producer chooses the protocol as well as the destination."
+      ],
+      "sources": [
+        "https://camel.apache.org/components/latest/eips/recipientList-eip.html"
+      ]
+    },
+    {
+      "variant_id": "jdk-completable-future-fanout",
+      "name": "Plain JDK fan-out with CompletableFuture and a dedicated executor",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.allOf over a computed recipient list",
+      "implementation_notes": "Without an integration framework the pattern is a computed collection plus a completion barrier: map every recipient to CompletableFuture.runAsync(deliver, pool) and await CompletableFuture.allOf(...). This is the manual realization - there is no EIP component, no sequence stamping and no management operations, so the per-recipient error policy and the recipient data source are entirely yours. Choose it for a library or service that must not pull in Spring Integration or Camel; prefer the framework variants whenever routing configuration, message history and control-bus operations are wanted.",
+      "code_sketch": "ExecutorService pool = Executors.newFixedThreadPool(8);\nList<CompletableFuture<Void>> sends = recipients.stream()\n        .map(r -> CompletableFuture.runAsync(() -> r.send(msg.copy()), pool))\n        .collect(Collectors.toList());\nCompletableFuture.allOf(sends.toArray(new CompletableFuture[0])).join();\n// continue-on-error: inspect each future instead of propagating the first failure",
+      "pitfalls": [
+        "allOf(...).join() throws a single CompletionException while the other sends keep running - a per-recipient outcome map is required for honest reporting.",
+        "runAsync without an executor uses the shared ForkJoinPool.commonPool(); blocking sends there starve unrelated parallel work in the same JVM.",
+        "Virtual threads (Java 21+) make blocking sends cheap, but an unbounded fan-out still multiplies downstream load, so the recipient count must be capped regardless of thread cost."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+      ]
+    }
+  ],
+  "default_variant": "spring-integration-recipient-list-router",
+  "version": "1.0"
+}

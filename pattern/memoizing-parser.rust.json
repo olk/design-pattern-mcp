@@ -1,0 +1,57 @@
+{
+  "pattern": "memoizing-parser",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "HashMap<Key, Memo> on the parser struct, entry cloned before the recursive call",
+  "implementation_notes": "The memo is a HashMap<(RuleId, usize), Memo> owned by the parser, with Memo an enum (Ok { node: NodeId, next: usize } | Fail) so a cached failure is a value and Option's 'missing' never has to double as 'failed'. The borrow checker dictates the shape of the rule wrapper: get() returns a reference into the map, so the hit must be cloned or copied out before the recursive call that needs &mut self again; holding the reference across the recursion does not compile, and wrapping the map in a RefCell trades that compile error for a runtime 'already borrowed' panic (the docs state borrow_mut panics while a borrow is active). What replaces the classic memo-table object is that the table is a field, the rules are methods, and one rule() wrapper performs lookup/store with a derived Hash/Eq key; HashMap's docs also pin the invariants - Eq and Hash must agree, and a key whose hash or equality changes while stored is a logic error.",
+  "code_sketch": "#[derive(Clone, Copy, PartialEq, Eq, Hash)]\nstruct Key { rule: u32, pos: usize }\nenum Memo { Ok { node: NodeId, next: usize }, Fail }\n\nimpl Parser<'_> {\n    fn rule(&mut self, key: Key) -> Memo {\n        if let Some(hit) = self.memo.get(&key) { return hit.clone(); } // borrow ends here\n        let m = self.rule_impl(key);        // recursion needs &mut self again\n        self.memo.insert(key, m.clone());   // failures become Memo::Fail entries\n        m\n    }\n}",
+  "pitfalls": [
+    "Holding the get() reference across the recursive rule call is a borrow error; the RefCell workaround compiles but panics at runtime when borrows overlap, so clone the entry out or split the borrow.",
+    "HashMap requires Eq + Hash to agree and treats a stored key whose hash or equality changes as a logic error: never key the memo on a type with interior mutability.",
+    "The default RandomState hasher (SipHash) is slower than needed for small integer keys; a cheaper BuildHasher or the dense-table variant is the usual fix."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+    "https://doc.rust-lang.org/std/cell/struct.RefCell.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "hashmap-memo",
+      "name": "HashMap<(RuleId, usize), Memo> with the hit cloned out before recursion",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "HashMap<Key, Memo> on the parser struct, entry cloned before the recursive call",
+      "implementation_notes": "The memo is a HashMap<(RuleId, usize), Memo> owned by the parser, with Memo an enum (Ok { node: NodeId, next: usize } | Fail) so a cached failure is a value and Option's 'missing' never has to double as 'failed'. The borrow checker dictates the shape of the rule wrapper: get() returns a reference into the map, so the hit must be cloned or copied out before the recursive call that needs &mut self again; holding the reference across the recursion does not compile, and wrapping the map in a RefCell trades that compile error for a runtime 'already borrowed' panic (the docs state borrow_mut panics while a borrow is active). What replaces the classic memo-table object is that the table is a field, the rules are methods, and one rule() wrapper performs lookup/store with a derived Hash/Eq key; HashMap's docs also pin the invariants - Eq and Hash must agree, and a key whose hash or equality changes while stored is a logic error.",
+      "code_sketch": "#[derive(Clone, Copy, PartialEq, Eq, Hash)]\nstruct Key { rule: u32, pos: usize }\nenum Memo { Ok { node: NodeId, next: usize }, Fail }\n\nimpl Parser<'_> {\n    fn rule(&mut self, key: Key) -> Memo {\n        if let Some(hit) = self.memo.get(&key) { return hit.clone(); } // borrow ends here\n        let m = self.rule_impl(key);        // recursion needs &mut self again\n        self.memo.insert(key, m.clone());   // failures become Memo::Fail entries\n        m\n    }\n}",
+      "pitfalls": [
+        "Holding the get() reference across the recursive rule call is a borrow error; the RefCell workaround compiles but panics at runtime when borrows overlap, so clone the entry out or split the borrow.",
+        "HashMap requires Eq + Hash to agree and treats a stored key whose hash or equality changes as a logic error: never key the memo on a type with interior mutability.",
+        "The default RandomState hasher (SipHash) is slower than needed for small integer keys; a cheaper BuildHasher or the dense-table variant is the usual fix."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+        "https://doc.rust-lang.org/std/cell/struct.RefCell.html"
+      ]
+    },
+    {
+      "variant_id": "dense-memo-table",
+      "name": "Flat Vec<Memo> indexed by rule and position with arena NodeIds",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2021",
+      "idiom_name": "flat Vec<Memo> (rules x (len + 1)) with a three-state enum, nodes in an arena",
+      "implementation_notes": "Positions are bounded by the input length, so the table can be a single Vec<Memo> of rules * (len + 1) cells addressed arithmetically, with a three-state Memo (Unknown | Ok { node, next } | Fail) so 'not computed' and 'failed' are distinct without a nested Option. Nodes live in an arena (Vec<Node> returning NodeId), which removes lifetimes from the memo entirely and keeps cached entries Copy - the reason this layout is common in Rust parser code. The trade is allocation shape: the table is allocated up front for every rule even where most rules are never attempted at most positions (Ford's per-category split is the escape), and the flat index must be computed in usize to avoid silent overflow.",
+      "code_sketch": "#[derive(Clone, Copy)]\nenum Memo { Unknown, Ok { node: NodeId, next: usize }, Fail }\n\nstruct Parser { memo: Vec<Memo>, cols: usize, arena: Vec<Node> }\n\nimpl Parser {\n    fn rule(&mut self, rule: usize, pos: usize) -> Memo {\n        let idx = rule * self.cols + pos;         // cols = len + 1\n        if !matches!(self.memo[idx], Memo::Unknown) { return self.memo[idx]; }\n        let m = self.rule_impl(rule, pos);\n        self.memo[idx] = m;                       // failures cached as Fail\n        m\n    }\n}",
+      "pitfalls": [
+        "The dense table costs rules x (len + 1) cells up front and can exceed the hash-map version for grammars with many rules that are never tried at most positions.",
+        "The parser owns both arena and memo, so a rule body must not hold &Node across a call that pushes into the arena (the Vec may reallocate): exchange NodeIds, not references.",
+        "Index arithmetic in a narrower integer type overflows for large inputs - compute rule * cols + pos in usize and size the vector from the actual input."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+        "https://bford.info/pub/lang/packrat-icfp02.pdf"
+      ]
+    }
+  ],
+  "default_variant": "hashmap-memo",
+  "version": "1.0"
+}

@@ -1,0 +1,209 @@
+{
+  "category": "interaction-boundary",
+  "name": "command-base",
+  "aliases": [
+    "distributed command",
+    "serializable command"
+  ],
+  "intent": "Encapsulate a request as a self-contained, serializable command object so it can be shipped across a process, queue or network boundary and executed there by an invoker that knows only the command's base contract.",
+  "problem": "Work must be performed in another process, on another machine, or later - but caller and executor share no call stack: the far side cannot see the caller's types, the two sides are not available at the same time, and the request must survive restarts or a disconnected client. A plain remote call couples both sides to one interface and one moment in time and leaves nothing inspectable when it fails.",
+  "context": "Applies at a process, machine or trust boundary where requests are queued, scheduled, retried or spread over workers; where producer and consumer can share only a data contract plus one execution entry point; and where the concrete work (render this report, open this valve, rebuild this index) is decided by the sender while the resources to perform it live on the far side.",
+  "benefits": [
+    "The invoker stays generic: it needs one execution entry point and a tag registry, so new work ships as a new command without changing the dispatcher.",
+    "The command is a durable value between the two sides - it can be queued, scheduled, prioritised, retried, audited or moved to another worker, none of which a live call frame allows.",
+    "Client and worker lifetimes decouple: an offline or restarting client does not lose work, and workers can be added, drained or upgraded while commands wait in the queue.",
+    "Behaviour travels with the request's data, so the far side needs no routing table of its own - the tag names the work and the command performs it.",
+    "Load smoothing: a burst queues instead of overloading the far side, and the consumption rate is set by the number of workers rather than by the caller.",
+    "The boundary becomes testable and auditable: both halves (codec and invoker) can be exercised with recorded envelopes, and the queue itself is the record of what was asked."
+  ],
+  "tradeoffs": [
+    "Concrete command classes must exist in compatible versions on both sides: adding a field or renaming a type is a two-sided deployment, and version skew surfaces only at deserialisation time on the far side.",
+    "Deserialising a command is executing code: platform serialisers (BinaryFormatter, Java serialization, pickle, Marshal) instantiate classes the payload names, so any unauthorised producer on the queue is a remote-code-execution risk unless codec and tag set are restricted.",
+    "Shipping behaviour removes the compiler from the contract: a missing registration, an unknown tag or a stale worker is a runtime failure - often a poison message that retries forever - instead of a build error.",
+    "Failures span four layers - codec, queue, dispatcher, receiver - and the sender's stack trace is gone, so diagnosis needs correlation identifiers and structured logging on the far side.",
+    "Queue delivery is at-least-once and unordered by default: duplicates, replays and out-of-order commands are normal, so receivers must be idempotent (or de-duplicated) and ordering must be designed per key.",
+    "Per-command overhead is real: every request pays serialisation, a queue round trip and deserialisation, which dominates for tiny commands and pushes large payloads out of the message (claim check) rather than into it.",
+    "Eventual consistency: the caller cannot observe the result synchronously, and read-model lag (milliseconds to hours) after command execution requires explicit user-experience design.",
+    "Schema evolution on a shared wire contract requires forward-compatibility planning: unknown fields must be tolerated, removed fields must not break old senders, and type changes require a migration strategy."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 5,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Command (base contract)",
+      "responsibility": "Declares the uniform execution entry point and is the serialisation root; carries only the state every command needs."
+    },
+    {
+      "role": "Concrete Command",
+      "responsibility": "Binds the parameters of one request to the action the far side performs; data-only and self-contained in the shared wire format."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Constructs the command, fills its state and hands it to the transport; holds no reference to the far side's receiver."
+    },
+    {
+      "role": "Transport (queue or channel)",
+      "responsibility": "Carries the serialised command durably between the two sides: addressing, store-and-forward, retry and delivery semantics live here."
+    },
+    {
+      "role": "Invoker",
+      "responsibility": "Reads envelopes, resolves the concrete command from its tag through an allow-list registry, and calls the execution entry point; knows nothing else about the concrete types."
+    },
+    {
+      "role": "Receiver",
+      "responsibility": "The resource or domain object the command acts on, resolved on the far side from the command's data."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Job queues behind web applications: rendering reports or documents, sending notifications, transcoding media - the request is enqueued as a command and executed by worker processes.",
+    "Device, shop-floor or plant control: a management station ships commands (open valve, run recipe, move axis) to a controller that executes them locally with its own resources.",
+    "Occasionally connected clients (POS, logistics, field inspections): commands queue offline and execute when the link returns.",
+    "Server-side batch and administrative work - backups, index rebuilds, cache flushes - triggered from a thin client or a scheduler.",
+    "Distributed build or test farms: a coordinator ships unit-of-work commands to agents that own the required toolchain.",
+    "Cross-language or cross-team integrations where the command envelope (tag plus payload schema) is the only shared contract.",
+    "Approval and audit workflows where each request must exist as an inspectable, replayable record before it executes.",
+    "Microservices sagas and long-running business processes: a process manager (saga orchestrator) issues commands to authoritative services, with compensation logic for rollback on failure.",
+    "Serverless function orchestration: step functions or workflow engines dispatch typed commands to Lambda/Functions workers that execute them against external resources.",
+    "IoT edge command dispatch: a cloud backend sends control commands to edge devices that may be intermittently connected, queued locally and executed when connectivity is available.",
+    "Multi-tenant SaaS back-offices: tenant-specific commands are routed to isolated workers, with command-level tenant isolation enforced at the queue and invoker layers.",
+    "Ruby/Rails background processing with Sidekiq: the job class name plus JSON arguments are stored as a Redis hash and executed by competing worker processes - the docs therefore mandate simple JSON-safe arguments and re-fetching ActiveRecord records by id inside perform.",
+    "Python distributed task queues with Celery: a producer dispatches by task name (app.send_task) so the sender needs no import of the worker's task code; the task-name registry is the tag table and the broker is the transport.",
+    ".NET service-bus endpoints with MassTransit: verb-noun command contracts are sent (never published) to a dedicated endpoint and consumed by exactly one consumer per command, with the JSON envelope carrying MessageId, CorrelationId and routing metadata."
+  ],
+  "avoid_when": [
+    "The caller needs the result or the exception now: use a request-reply call (Request-Reply over gRPC/HTTP) rather than a fire-and-forget command.",
+    "Both sides are the same process and codebase: a plain method call, or the local Command pattern when you need in-process undo or queueing, is simpler than a codec plus a registry.",
+    "The receiver already owns the behaviour: if the far side dispatches on message type itself (Command Message, Document Message), send data instead of executable command classes.",
+    "Commands would carry secrets or personal data into a durable queue: pass a claim check and let the worker fetch the data under its own authority.",
+    "The work is a stream or a large batch where per-command overhead dominates: batch the units or use a data-parallel job or stream processor.",
+    "There is exactly one operation and one worker: an endpoint plus a payload type (Gateway or Remote Facade) is less machinery for the same result.",
+    "The domain is collaborative and high-contention (multiple users modifying the same aggregate concurrently): CQRS and event sourcing add complexity that only pays off when audit history, temporal queries, and independent read/write scaling are genuine requirements.",
+    "The team lacks operational maturity for eventual consistency: schema evolution, projection rebuilds, snapshot strategy, and observable command processing lag require real engineering attention."
+  ],
+  "language_files": {
+    "generic": "command-base.generic.json",
+    "c": "command-base.c.json",
+    "cplusplus": "command-base.cplusplus.json",
+    "csharp": "command-base.csharp.json",
+    "go": "command-base.go.json",
+    "java": "command-base.java.json",
+    "javascript": "command-base.javascript.json",
+    "kotlin": "command-base.kotlin.json",
+    "python": "command-base.python.json",
+    "ruby": "command-base.ruby.json",
+    "rust": "command-base.rust.json",
+    "scala": "command-base.scala.json",
+    "swift": "command-base.swift.json",
+    "typescript": "command-base.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "gof"
+  ],
+  "related_patterns": [
+    "command",
+    "command-message",
+    "command-processor",
+    "method-object",
+    "data-transfer-object",
+    "service-stub",
+    "remote-facade",
+    "content-based-serializer",
+    "circuit-breaker",
+    "claim-check",
+    "dead-letter-channel",
+    "idempotent-receiver"
+  ],
+  "anti_patterns": [
+    "Late-bound or reflective commands that carry an assembly/class/method name plus arguments (the source article labels its own such variant quick and dirty): they turn the queue into an unauthenticated remote-code-execution interface and destroy the type contract.",
+    "Platform-native serialisation of arbitrary types (BinaryFormatter, Java serialization, pickle, Marshal) on a queue with more than one producer, so deserialisation instantiates attacker-named classes.",
+    "Commands that hold live references - a receiver instance, an open file handle, a database connection - so serialisation drags an object graph (or fails) instead of carrying the receiver's identity.",
+    "A god command base: Execute plus Undo, Retry, scheduling, logging and authorisation hooks, forcing every command to implement concerns only one of them has.",
+    "Unbounded payloads - whole documents or blobs in the message - instead of a claim check that passes a reference and a checksum.",
+    "Non-idempotent commands on an at-least-once queue with no de-duplication, so a retry charges a card twice or re-renders the same file.",
+    "Dispatch through a dynamic loader or reflection on the payload's type name, so adding a jar or assembly to the worker silently adds executable commands.",
+    "Polymorphic deserialization with enableDefaultTyping or @JsonTypeInfo using class-name resolution on untrusted input: re-introduces the arbitrary class instantiation risk that data-only formats are meant to eliminate."
+  ],
+  "design_principles": [
+    "Encapsulation of a request as a first-class object: the request becomes data plus behaviour instead of a stack frame.",
+    "Dependency inversion: the invoker depends only on the command contract and a tag registry, never on concrete command types.",
+    "Open/closed principle: new work arrives by adding a command and a registry entry on both sides; the invoker stays closed for modification.",
+    "Explicit boundary discipline: only serialisable data crosses; live references, handles and object graphs stay behind.",
+    "Separation of concerns: the client decides what to do, the queue decides when and where, the invoker decides with which resources.",
+    "Uniformity: one execution contract for every request, so queuing, retrying, auditing and monitoring are implemented once for all commands.",
+    "Command/Query separation: commands express intent to change state; queries express intent to read state; keeping them in separate models allows independent optimisation of each path."
+  ],
+  "best_practices": [
+    "Keep the command base narrow - one execution entry point plus the serialisation contract - and put per-command metadata in the concrete command or the envelope.",
+    "Use an explicit, versioned wire contract with stable tags (protobuf/JSON discriminator, @SerialName, serde rename) rather than class names, and let workers tolerate unknown fields.",
+    "Treat the queue as untrusted input: authenticate producers, encrypt the channel, allow-list the tag-to-implementation mapping and never deserialise a type the payload names.",
+    "Make commands immutable, data-only and self-contained; move large payloads behind a claim check (reference plus checksum).",
+    "Design for at-least-once delivery: idempotent receivers or a de-duplication key, a maximum-retry policy and a dead-letter channel for unknown tags and poison messages.",
+    "Keep the invoker generic and observable: structured logs with a correlation identifier, per-command metrics, no per-command branching outside the registry.",
+    "Test both halves with recorded envelopes (golden codec tests) and a fake transport, so a wire-format change is caught before it reaches a running queue.",
+    "Use data-only serialization formats (JSON, Protocol Buffers, MessagePack, CBOR) rather than code-bearing formats (Java Serialization, Python pickle, .NET BinaryFormatter). If native serialization cannot be avoided, enforce an explicit type allow-list at deserialization time.",
+    "Distinguish transient from permanent failures in handlers: throw or rethrow transient exceptions (database timeouts, network unavailable) so the transport retries; return normally or use a domain-specific permanent failure type for validation errors so the message is acknowledged and discarded rather than dead-lettered.",
+    "Attach correlation identifiers (UUID, trace ID) to every command envelope and propagate them through every log line and downstream call to reconstruct the distributed execution path from the sender's perspective.",
+    "Include a TTL or expiration timestamp on time-sensitive commands; handlers should check it and acknowledge without reprocessing if the action is no longer relevant.",
+    "Design command handlers to be idempotent using a natural idempotency key (order ID, customer ID) rather than a generated message ID, so that replay and retry produce the same outcome as a single execution.",
+    "Monitor dead-letter queue depth as a key operational metric: a rising DLQ indicates a systemic failure (bad deployment, poison message flood, downstream outage) requiring immediate attention.",
+    "For long-running workflows spanning multiple services, use a saga or process manager that issues individual commands and coordinates compensation (rollback commands) on failure, rather than embedding the entire workflow in a single god command.",
+    "Version the wire contract explicitly: bump a version field or use a schema identifier, and run old and new workers in parallel during rolling deployments so old commands can still be deserialised by new workers and vice versa."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Gamma, Helm, Johnson & Vlissides, Design Patterns: Elements of Reusable Object-Oriented Software (1995) - Command: encapsulate a request as an object, letting you parameterise clients, queue or log requests.",
+    "Brad King, \"Simplify Distributed System Design Using the Command Pattern, MSMQ, and .NET\", MSDN Magazine, September 2004 - a Command base class with one Execute method, queued to an invoker service that deserialises each message and calls Execute.",
+    "Martin Fowler, \"CQRS\", Martin Fowler's Bliki, 2011 - Command Query Responsibility Segregation: using separate models for updating and reading information, fitting naturally with event-based programming models and domain-driven design.",
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Command Message: encapsulating a request as a message so it can be transmitted to a receiver that will execute the requested action.",
+    "Amazon Web Services, \"Decompose Monoliths into Microservices by Using CQRS and Event Sourcing\", AWS Prescriptive Guidance - combining CQRS with event sourcing on AWS using Lambda, DynamoDB, SNS and SQS for independent read/write scaling.",
+    "Usama Qamar, \"CQRS + Event Sourcing: A Production Architecture Guide\", 2026 - practical production architecture combining CQRS and event sourcing: separate read/write models, event-store-as-truth, snapshots, projection rebuilds, and operational trade-offs.",
+    "OWASP, \"Deserialization Cheat Sheet\", OWASP Cheat Sheet Series - prevention and mitigation strategies for deserialization attacks, covering allow-listing, safe serializers, and gadget chain risks across Java, Python, .NET, and PHP.",
+    "Microsoft, \"Deserialization risks in use of BinaryFormatter and related types\", .NET Documentation, 2024 - BinaryFormatter is dangerous and cannot be secured; alternatives include System.Text.Json, XmlSerializer, and DataContractSerializer.",
+    "Safeguard.sh, \"Insecure Deserialization Explained: Gadget Chains & Fixes\" (CVE-502, OWASP A08:2021) - gadget chain exploitation via ysoserial for Java, pickle for Python, BinaryFormatter for .NET; safe alternatives including JSON, Protobuf, MessagePack, and ObjectInputFilter allow-listing.",
+    "SecureBlock, \"Deserialization of Untrusted Data — Critical Severity (CVSS 9.8)\" - language-agnostic deserialization risks in Java (ObjectInputStream), Python (pickle), .NET (BinaryFormatter), PHP (unserialize), Ruby (Marshal); ysoserial and gadget chain mitigation.",
+    "Nimbus, \"Commands Documentation\" - command semantics for queue-based fire-and-forget messaging: one handler per command, imperative naming, idempotent handler design, dead-letter queues, and retry policies.",
+    "Axon Framework, \"Command Dispatchers Reference\" - CommandBus, CommandGateway, and CommandDispatcher interfaces; ProcessingContext propagation for correlation; routing strategies for aggregate-aware command routing in CQRS applications.",
+    "NILUS, \"Command Routing Strategies in CQRS Microservices\" - authoritative bounded-context routing, layered command routing models, Kafka-based asynchronous routing, policy-based routing, anti-corruption layers, and saga orchestration for cross-context commands.",
+    "OneUptime, \"How to Implement Command Pattern with Dapr\" - command pattern with Dapr for microservices: command logging in state stores, idempotent handlers, and correlation ID propagation via Dapr service invocation.",
+    "sbooker/command-bus, \"Reliable Command Bus for PHP\" - persistent, transactional command bus with at-least-once delivery, declarative retry strategies, state tracking (created/pending/success/fail), and foundation for saga/process manager implementations.",
+    "FreeSideNomad/jrcmd, \"Reliable Command Bus for Spring Boot with PostgreSQL PGMQ\" - exactly-once delivery semantics via PGMQ, automatic retry with configurable backoff, troubleshooting queue (TSQ) for operator intervention, batch operations, and process manager for saga orchestration.",
+    "iluwatar/java-design-patterns, \"Commander Pattern\" - retry handling, idempotency checks, queue database, and failover across ShippingService, PaymentService, MessagingService, and EmployeeHandle for distributed transaction resilience.",
+    "Vegetam/Saga-pattern-architecture, \"Saga Pattern Architecture\" - production-grade saga orchestration with Kafka, distributed Redis locks for idempotency, exponential backoff retry, dead letter queues, compensation logic, and observability.",
+    "snatalenko/node-cqrs, \"CQRS Backbone with Event Sourcing for Node.js\" - pluggable RabbitMQ command and event buses, aggregate command handlers, event store with snapshots, distributed sagas with event correlation, and resilient projections with checkpoint and readiness gates.",
+    "MediatR library documentation - in-process mediator/dispatcher pattern for .NET: request/handler registration, pipeline behaviours for cross-cutting concerns (logging, validation, retry, audit), and notification-based publish/subscribe.",
+    "MassTransit, \"Messages\" documentation - https://masstransit.io/usage/messages.html - commands as data-only verb-noun contracts sent to one dedicated endpoint with exactly one consumer, versus published past-tense events; the envelope carries MessageId, CorrelationId and routing metadata.",
+    "Sidekiq, \"Best Practices\" wiki - https://github.com/sidekiq/sidekiq/wiki/Best-Practices - pass simple JSON-serialisable arguments (ids, not objects), fetch records inside perform, and design jobs idempotent against retries.",
+    "Sidekiq, \"Job Format\" wiki - https://sidekiq.org/wiki/Job-Format - a queued command on the wire: a Redis hash with class, jid, args and timestamps, executed by worker processes pulling from the queue.",
+    "GoatReview, \"Don't use MediatR by default on all .NET projects\" - https://goatreview.com/dont-use-mediatr-by-default-net-projects/ - criticism of defaulting every use case through a command/mediator bus: chained dispatch from handlers and pervasive indirection as over-engineering.",
+    "ddd-cqrs group, \"Why lots of developers use one-way command messaging (async handling) when it's not needed?\" - https://groups.google.com/g/dddcqrs/c/xhJHVxDx2pM - practitioner critique of asynchronous one-way commands when synchronous handling would return the answer to the caller immediately."
+  ],
+  "related_patterns_notes": {
+    "cqrs": "cqrs",
+    "event-sourcing": "event-sourcing",
+    "message-bus": "message-bus",
+    "saga-process-manager": "saga-process-manager",
+    "retry-pattern": "retry-pattern",
+    "competingconsumers": "CompetingConsumers"
+  }
+}

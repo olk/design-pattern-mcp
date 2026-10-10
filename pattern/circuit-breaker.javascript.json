@@ -1,0 +1,61 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "javascript",
+  "support": "library",
+  "idiom_name": "opossum CircuitBreaker(action, options).fire() with fallback and events",
+  "implementation_notes": "The Node-standard realization is opossum: new CircuitBreaker(asyncFn, options) executes asynchronous functions, counts failures over rolling buckets (rollingCountTimeout with rollingCountBuckets), opens once errorThresholdPercentage is exceeded above volumeThreshold requests, waits resetTimeout before entering halfOpen, and emits fire, success, failure, timeout, reject, open, close, halfOpen and fallback events; fire() returns a promise, fallback() registers the degradation path, and an optional AbortController cancels the in-flight request when the breaker's timeout fires. JavaScript has no breaker construct, so a library is the realization rather than a hand-written flag; the decisions are placement (one breaker per dependency, per endpoint when hosts fail independently), a duration bound on the guarded call, and a queue bound, because the breaker limits admission, not outstanding work.",
+  "code_sketch": "import CircuitBreaker from 'opossum';\n\nconst payments = new CircuitBreaker((order) => api.authorize(order), {\n  timeout: 500,                 // abort the in-flight request, not just the await\n  errorThresholdPercentage: 50, // failure rate that trips the circuit\n  rollingCountTimeout: 10_000,  // the failure window (ms)\n  rollingCountBuckets: 10,\n  volumeThreshold: 20,          // do not trip below this many requests\n  resetTimeout: 15_000,         // cooldown before the halfOpen trial\n}).fallback(() => Receipt.degraded());\n\npayments.on('open', () => metrics.increment('payments.circuit.open'));",
+  "pitfalls": [
+    "Node is single-threaded, so a hang occupies an outstanding-work slot rather than a thread: still pass timeout and an AbortSignal to the underlying client.",
+    "volumeThreshold defaults to 0, so a cold breaker can open on its first failures; raise it (and consider allowWarmUp) for low-traffic call sites.",
+    "Each breaker is an EventEmitter: creating them per request leaks listeners and resets statistics, so hoist them and call shutdown() when a breaker is retired.",
+    "While open, fire() rejects with the breaker's error: without a fallback or explicit error mapping the short circuit surfaces as a noisy server error.",
+    "One breaker per dependency: a single breaker for several endpoints merges unrelated failures, and its counters are process-global."
+  ],
+  "sources": [
+    "https://nodeshift.dev/opossum/",
+    "https://github.com/nodeshift/opossum"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "opossum",
+      "name": "opossum CircuitBreaker for async functions",
+      "paradigm": "oo",
+      "min_standard": "ES2017",
+      "idiom_name": "opossum CircuitBreaker(action, options).fire() with fallback and events",
+      "implementation_notes": "The Node-standard realization is opossum: new CircuitBreaker(asyncFn, options) executes asynchronous functions, counts failures over rolling buckets (rollingCountTimeout with rollingCountBuckets), opens once errorThresholdPercentage is exceeded above volumeThreshold requests, waits resetTimeout before entering halfOpen, and emits fire, success, failure, timeout, reject, open, close, halfOpen and fallback events; fire() returns a promise, fallback() registers the degradation path, and an optional AbortController cancels the in-flight request when the breaker's timeout fires. JavaScript has no breaker construct, so a library is the realization rather than a hand-written flag; the decisions are placement (one breaker per dependency, per endpoint when hosts fail independently), a duration bound on the guarded call, and a queue bound, because the breaker limits admission, not outstanding work.",
+      "code_sketch": "import CircuitBreaker from 'opossum';\n\nconst payments = new CircuitBreaker((order) => api.authorize(order), {\n  timeout: 500,                 // abort the in-flight request, not just the await\n  errorThresholdPercentage: 50, // failure rate that trips the circuit\n  rollingCountTimeout: 10_000,  // the failure window (ms)\n  rollingCountBuckets: 10,\n  volumeThreshold: 20,          // do not trip below this many requests\n  resetTimeout: 15_000,         // cooldown before the halfOpen trial\n}).fallback(() => Receipt.degraded());\n\npayments.on('open', () => metrics.increment('payments.circuit.open'));",
+      "pitfalls": [
+        "Node is single-threaded, so a hang occupies an outstanding-work slot rather than a thread: still pass timeout and an AbortSignal to the underlying client.",
+        "volumeThreshold defaults to 0, so a cold breaker can open on its first failures; raise it (and consider allowWarmUp) for low-traffic call sites.",
+        "Each breaker is an EventEmitter: creating them per request leaks listeners and resets statistics, so hoist them and call shutdown() when a breaker is retired.",
+        "While open, fire() rejects with the breaker's error: without a fallback or explicit error mapping the short circuit surfaces as a noisy server error.",
+        "One breaker per dependency: a single breaker for several endpoints merges unrelated failures, and its counters are process-global."
+      ],
+      "sources": [
+        "https://nodeshift.dev/opossum/",
+        "https://github.com/nodeshift/opossum"
+      ]
+    },
+    {
+      "variant_id": "cockatiel",
+      "name": "cockatiel policy composition with pluggable breakers",
+      "paradigm": "functional",
+      "idiom_name": "cockatiel circuitBreaker(handleX, {...}) composed through wrap(...)",
+      "implementation_notes": "cockatiel models the breaker as one policy among composable ones: circuitBreaker(handleAll, { halfOpenAfter, breaker: new ConsecutiveBreaker(5) }) returns an IPolicy whose execute(fn, signal) runs the call, and wrap(retryPolicy, breakerPolicy) stacks policies in a declared order. The failure rule is an explicit policy object (handleAll, handleType(...).orWhen(...), handleWhenResult(result => result.status >= 500)) and the trip strategy is pluggable (ConsecutiveBreaker, CountBreaker, SamplingBreaker), so the window is a strategy object instead of a bag of options; events (onBreak, onReset, onHalfOpen, onStateChange, onSuccess, onFailure) plus isolate() cover observability and a manual trip. Prefer it when policies should be composed and typed; opossum remains the alternative when an EventEmitter breaker with percentile statistics is preferred.",
+      "code_sketch": "const payments = circuitBreaker(handleAll, {\n  halfOpenAfter: 15_000,                  // cooldown before the trial call\n  breaker: new ConsecutiveBreaker(5),     // trip after 5 consecutive failures\n});\nconst pipeline = wrap(retry(handleAll, { maxAttempts: 2 }), payments);\n\npayments.onBreak(() => metrics.increment('payments.circuit.open'));\n\nconst receipt = await pipeline.execute(({ signal }) => api.authorize(order, signal));",
+      "pitfalls": [
+        "A policy created inside a request handler compiles fine and silently resets the breaker on every call; declare policies at module scope.",
+        "handleAll counts every rejection as a failure, so business errors trip the breaker unless handleType, handleWhen or handleWhenResult narrows the classification.",
+        "wrap(order matters): retry wrapped around the breaker retries the breaker's rejection unless the retry policy excludes the open-circuit error.",
+        "The AbortSignal passed to execute must be forwarded to fetch or the HTTP client, or the breaker's timeout rejects the promise while the request keeps running.",
+        "Breaker state is per process, so a multi-instance deployment must externalise it if all replicas are expected to trip together."
+      ],
+      "sources": [
+        "https://github.com/connor4312/cockatiel"
+      ]
+    }
+  ],
+  "default_variant": "opossum"
+}

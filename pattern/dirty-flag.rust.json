@@ -1,0 +1,67 @@
+{
+  "pattern": "dirty-flag",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "Cell<bool> dirty bit with a RefCell<Option<T>> cache behind &self",
+  "implementation_notes": "The borrow checker makes interior mutability the local idiom: the accessor takes &self, so a plain bool cannot be written there - the flag is a Cell<bool> (or Cell<f64> for the primary value) and the cache lives in a RefCell<Option<T>>, with get/set and borrow_mut as the primitives. OnceCell/OnceLock replace the pair for one-shot initialisation but cannot be invalidated (take() needs &mut self), so they serve lazy initialisation, not this pattern. The classic structure is still the right choice when several inputs feed one expensive value; a value with no mutation at all needs no cache.",
+  "code_sketch": "pub struct Node { x: Cell<f64>, dirty: Cell<bool>, world: RefCell<Option<World>> }\nimpl Node {\n    fn move_by(&self, dx: f64) { self.x.set(self.x.get() + dx); self.dirty.set(true); }\n\n    fn world(&self) -> World {\n        if self.dirty.get() {                       // recompute once\n            *self.world.borrow_mut() = Some(compute(self.x.get()));\n            self.dirty.set(false);\n        }\n        self.world.borrow().clone().unwrap()\n    }\n}",
+  "pitfalls": [
+    "Holding a RefCell borrow across the recomputation (which may call back into the same object) panics at runtime; copy the inputs out, drop the borrow, then rebuild.",
+    "Cell/RefCell make the type !Sync: sharing it across threads requires the atomic/mutex variants, and a CompileError names that directly.",
+    "OnceCell/OnceLock cannot be reset, and a panic in a lock's critical section poisons a Mutex - decide whether the cache should recover or propagate.",
+    "Clearing the flag before the cache is published leaves a permanently stale cache if the recomputation panics; set the flag false only after the write succeeds."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/cell/struct.Cell.html",
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "cell-refcell",
+      "name": "Cell + RefCell interior mutability (single-threaded)",
+      "paradigm": "oo",
+      "min_standard": "Rust1.0",
+      "requires_features": [
+        "Cell",
+        "RefCell"
+      ],
+      "idiom_name": "Cell<bool> dirty bit with a RefCell<Option<T>> cache behind &self",
+      "implementation_notes": "The borrow checker makes interior mutability the local idiom: the accessor takes &self, so a plain bool cannot be written there - the flag is a Cell<bool> (or Cell<f64> for the primary value) and the cache lives in a RefCell<Option<T>>, with get/set and borrow_mut as the primitives. OnceCell/OnceLock replace the pair for one-shot initialisation but cannot be invalidated (take() needs &mut self), so they serve lazy initialisation, not this pattern. The classic structure is still the right choice when several inputs feed one expensive value; a value with no mutation at all needs no cache.",
+      "code_sketch": "pub struct Node { x: Cell<f64>, dirty: Cell<bool>, world: RefCell<Option<World>> }\nimpl Node {\n    fn move_by(&self, dx: f64) { self.x.set(self.x.get() + dx); self.dirty.set(true); }\n\n    fn world(&self) -> World {\n        if self.dirty.get() {                       // recompute once\n            *self.world.borrow_mut() = Some(compute(self.x.get()));\n            self.dirty.set(false);\n        }\n        self.world.borrow().clone().unwrap()\n    }\n}",
+      "pitfalls": [
+        "Holding a RefCell borrow across the recomputation (which may call back into the same object) panics at runtime; copy the inputs out, drop the borrow, then rebuild.",
+        "Cell/RefCell make the type !Sync: sharing it across threads requires the atomic/mutex variants, and a CompileError names that directly.",
+        "OnceCell/OnceLock cannot be reset, and a panic in a lock's critical section poisons a Mutex - decide whether the cache should recover or propagate.",
+        "Clearing the flag before the cache is published leaves a permanently stale cache if the recomputation panics; set the flag false only after the write succeeds."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/cell/struct.Cell.html",
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-mutex",
+      "name": "AtomicBool flag with a Mutex-guarded cache",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.0",
+      "requires_features": [
+        "AtomicBool",
+        "Mutex"
+      ],
+      "idiom_name": "AtomicBool dirty flag plus Mutex<Option<T>> rebuild",
+      "implementation_notes": "For shared objects the flag and the cache must be synchronized: an AtomicBool gives the acquire/release pair that a plain bool lacks (Rust's atomics follow the C++20 memory model and data races are undefined behaviour), and the rebuild runs under a Mutex/RwLock with a re-check so only one thread computes. The publication order is the contract - rebuild, store the new value, then clear the flag with a release store. The atomics module is explicit that it is for low-level synchronization and that higher-level primitives are usually preferable, so the atomic flag is the fast-path check while the mutex remains the source of truth for the value.",
+      "code_sketch": "pub struct Node { x: Mutex<f64>, dirty: AtomicBool, world: Mutex<Option<World>> }\nfn world(&self) -> World {\n    if self.dirty.load(Ordering::Acquire) {              // cheap dirty check\n        let mut slot = self.world.lock().unwrap();\n        if self.dirty.load(Ordering::Acquire) {\n            *slot = Some(compute(*self.x.lock().unwrap()));   // publish\n            self.dirty.store(false, Ordering::Release);       // then clear\n        }\n    }\n    self.world.lock().unwrap().clone().unwrap()\n}",
+      "pitfalls": [
+        "Data races are undefined behaviour in Rust: reading the cache outside the mutex while the flag says clean is exactly that, no matter how readable it looks.",
+        "Ordering choices matter: a Relaxed flag store can be reordered before the cache write, so use Release on the clear (and Acquire on the check) unless you can prove otherwise.",
+        "A poisoned Mutex (a panic inside the rebuild) makes every later access return Err; unwrapping propagates the poison forever - handle or recover deliberately.",
+        "Locking two mutexes (primary and cache) in different orders across methods deadlocks; keep a single lock or a documented order."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/atomic/index.html"
+      ]
+    }
+  ],
+  "default_variant": "cell-refcell"
+}

@@ -1,0 +1,55 @@
+{
+  "pattern": "transactional-message-queue",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "sql.DB.BeginTx + outbox row + relay goroutine",
+  "implementation_notes": "Go has no ambient transaction and no framework that joins a database transaction to a broker send, so the unit of work is written by hand: BeginTx returns a *sql.Tx whose Commit/Rollback the caller must drive (the idiomatic pairing is defer tx.Rollback() plus an explicit checked Commit), and the message is written as an outbox row inside that transaction; a relay goroutine or a LISTEN/NOTIFY wakeup publishes committed rows and marks them sent. This is the mainstream Go answer because the language supplies no coordinator, and it keeps the database as the only hard dependency.",
+  "code_sketch": "tx, err := db.BeginTx(ctx, nil)\ndefer tx.Rollback()                    // no-op after Commit, safety net otherwise\ntx.ExecContext(ctx, \"INSERT INTO orders(id,total) VALUES($1,$2)\", id, total)\ntx.ExecContext(ctx, \"INSERT INTO outbox(topic,payload) VALUES($1,$2)\", \"orders\", ev)\nif err := tx.Commit(); err != nil { return err }   // state + announcement together\n// relay: SELECT ... FOR UPDATE SKIP LOCKED -> publish -> UPDATE sent_at",
+  "pitfalls": [
+    "An early return without Commit leaves the transaction open until the deferred Rollback runs, so always defer tx.Rollback() and check the Commit error rather than ignoring it.",
+    "*sql.Tx is bound to one connection and is not safe for concurrent use: goroutines that share the tx either corrupt or deadlock the transaction, so keep the unit of work on one goroutine (or serialise per key).",
+    "A relay that publishes and deletes in separate transactions re-publishes after a crash; keep the publish idempotent and delete only after the broker acknowledges."
+  ],
+  "sources": [
+    "https://go.dev/doc/database/execute-transactions"
+  ],
+  "variants": [
+    {
+      "variant_id": "sql-tx-outbox",
+      "name": "database/sql transaction + outbox table with a relay goroutine",
+      "paradigm": "procedural",
+      "min_standard": "Go1.18",
+      "idiom_name": "sql.DB.BeginTx + outbox row + relay goroutine",
+      "implementation_notes": "Go has no ambient transaction and no framework that joins a database transaction to a broker send, so the unit of work is written by hand: BeginTx returns a *sql.Tx whose Commit/Rollback the caller must drive (the idiomatic pairing is defer tx.Rollback() plus an explicit checked Commit), and the message is written as an outbox row inside that transaction; a relay goroutine or a LISTEN/NOTIFY wakeup publishes committed rows and marks them sent. This is the mainstream Go answer because the language supplies no coordinator, and it keeps the database as the only hard dependency.",
+      "code_sketch": "tx, err := db.BeginTx(ctx, nil)\ndefer tx.Rollback()                    // no-op after Commit, safety net otherwise\ntx.ExecContext(ctx, \"INSERT INTO orders(id,total) VALUES($1,$2)\", id, total)\ntx.ExecContext(ctx, \"INSERT INTO outbox(topic,payload) VALUES($1,$2)\", \"orders\", ev)\nif err := tx.Commit(); err != nil { return err }   // state + announcement together\n// relay: SELECT ... FOR UPDATE SKIP LOCKED -> publish -> UPDATE sent_at",
+      "pitfalls": [
+        "An early return without Commit leaves the transaction open until the deferred Rollback runs, so always defer tx.Rollback() and check the Commit error rather than ignoring it.",
+        "*sql.Tx is bound to one connection and is not safe for concurrent use: goroutines that share the tx either corrupt or deadlock the transaction, so keep the unit of work on one goroutine (or serialise per key).",
+        "A relay that publishes and deletes in separate transactions re-publishes after a crash; keep the publish idempotent and delete only after the broker acknowledges."
+      ],
+      "sources": [
+        "https://go.dev/doc/database/execute-transactions"
+      ]
+    },
+    {
+      "variant_id": "franz-go-transaction",
+      "name": "franz-go transactional producer",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.19",
+      "idiom_name": "kgo.Client.BeginTransaction / EndTransaction(kgo.TryCommit)",
+      "implementation_notes": "franz-go exposes Kafka transactions directly: a client configured with kgo.TransactionalID calls BeginTransaction, produces the records (passing the consumed offsets to the commit), and ends with EndTransaction using kgo.TryCommit or kgo.TryAbort, which makes the read-process-write cycle atomic - the Go equivalent of the EIP transactional client. It does not span a database, so database-coupled services either keep this for consume-transform-produce loops or pair it with an outbox.",
+      "code_sketch": "cl, _ := kgo.NewClient(kgo.TransactionalID(\"orders-0\"), kgo.SeedBrokers(brokers...))\nif err := cl.BeginTransaction(); err != nil { return err }\ncl.Produce(ctx, &kgo.Record{Topic: \"orders\", Value: ev}, nil)\nreturn cl.EndTransaction(ctx, kgo.TryCommit)   // or kgo.TryAbort",
+      "pitfalls": [
+        "A client can have only one transaction in flight: concurrent use of the same client breaks the transaction state, so use one client per processor key.",
+        "EndTransaction must be reached on every path or the broker aborts the transaction after its timeout, and the transactional id must be stable so the broker can fence zombies.",
+        "Produced records are invisible to consumers that do not read committed; a consumer without that isolation setting sees uncommitted data."
+      ],
+      "sources": [
+        "https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo",
+        "https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ],
+  "default_variant": "sql-tx-outbox",
+  "version": "1.0"
+}

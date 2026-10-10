@@ -1,0 +1,56 @@
+{
+  "pattern": "polling-consumer",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "std::sync::mpsc::Receiver::recv_timeout / try_recv",
+  "implementation_notes": "The standard library's channel receiver is already the pattern's endpoint: recv_timeout(idle) blocks at most the idle interval and returns Err(RecvTimeoutError::Timeout) for the idle tick, try_recv() is the non-blocking receiveNoWait, and Err(Disconnected) is the signal that no producer remains - all three outcomes in std, with no runtime. Acknowledgement is ownership: the value leaves the channel when it is received, so whenever the workload can fail after the receive, 'process before the value is dropped' or an explicit receipt has to model the ack point.",
+  "code_sketch": "loop {\n    match rx.recv_timeout(idle) {\n        Ok(msg) => handle(msg),                        // ack: message left the channel\n        Err(RecvTimeoutError::Timeout) => backoff(),   // idle tick\n        Err(RecvTimeoutError::Disconnected) => break,  // no producers left\n    }\n}",
+  "pitfalls": [
+    "recv_timeout reports 'nothing available' and 'channel closed' through one error type, so collapsing RecvTimeoutError's variants makes the consumer exit on the first quiet interval.",
+    "std::sync::mpsc is single-consumer by construction - sharing one Receiver across threads does not compile, so competing consumers need crossbeam or a runtime queue.",
+    "Reaching for try_recv in a spin loop without a sleep burns a core; the blocking-with-timeout call is the whole point of the pattern."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-mpsc-recv-timeout",
+      "name": "std::sync::mpsc receiver with recv_timeout (no runtime)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "std::sync::mpsc::Receiver::recv_timeout / try_recv",
+      "implementation_notes": "The standard library's channel receiver is already the pattern's endpoint: recv_timeout(idle) blocks at most the idle interval and returns Err(RecvTimeoutError::Timeout) for the idle tick, try_recv() is the non-blocking receiveNoWait, and Err(Disconnected) is the signal that no producer remains - all three outcomes in std, with no runtime. Acknowledgement is ownership: the value leaves the channel when it is received, so whenever the workload can fail after the receive, 'process before the value is dropped' or an explicit receipt has to model the ack point.",
+      "code_sketch": "loop {\n    match rx.recv_timeout(idle) {\n        Ok(msg) => handle(msg),                        // ack: message left the channel\n        Err(RecvTimeoutError::Timeout) => backoff(),   // idle tick\n        Err(RecvTimeoutError::Disconnected) => break,  // no producers left\n    }\n}",
+      "pitfalls": [
+        "recv_timeout reports 'nothing available' and 'channel closed' through one error type, so collapsing RecvTimeoutError's variants makes the consumer exit on the first quiet interval.",
+        "std::sync::mpsc is single-consumer by construction - sharing one Receiver across threads does not compile, so competing consumers need crossbeam or a runtime queue.",
+        "Reaching for try_recv in a spin loop without a sleep burns a core; the blocking-with-timeout call is the whole point of the pattern."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html"
+      ]
+    },
+    {
+      "variant_id": "tokio-interval-select",
+      "name": "tokio async consumer (interval tick + select!)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async-runtime"
+      ],
+      "idiom_name": "tokio::time::interval + tokio::select!",
+      "implementation_notes": "In an async service the idle interval is a timer future rather than a blocking receive: select! races the channel receive, the interval tick that drives the idle policy and the shutdown signal, so a consumer waiting on a channel never parks an OS thread. tokio::time::interval measures from the last tick and by default bursts missed ticks, which is exactly the pull-rate control a polling consumer exposes; blocking work must be handed to spawn_blocking or the runtime workers stall.",
+      "code_sketch": "let mut tick = tokio::time::interval(idle);\nloop {\n    tokio::select! {\n        Some(msg) = rx.recv() => handle(msg).await,   // ack after handling\n        _ = tick.tick() => backoff().await,           // idle tick\n        _ = shutdown.cancelled() => break,            // cooperative stop\n    }\n}",
+      "pitfalls": [
+        "Blocking calls (database, file I/O, a plain std channel) inside a select! arm block a runtime worker thread; blocking work belongs in spawn_blocking or behind the async client's own await points.",
+        "The default MissedTickBehavior::Burst delivers a burst of ticks to a consumer that fell behind, so the backoff policy can fire several times at once unless the missed-tick behaviour is chosen deliberately."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/time/fn.interval.html"
+      ]
+    }
+  ],
+  "default_variant": "std-mpsc-recv-timeout",
+  "version": "1.0"
+}

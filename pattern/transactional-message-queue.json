@@ -1,0 +1,165 @@
+{
+  "category": "workflow-messaging",
+  "name": "transactional-message-queue",
+  "aliases": [
+    "transactional client",
+    "transactional messaging"
+  ],
+  "intent": "Make the publication of a message atomic with the business unit of work, so that a message becomes visible only if the state change it announces was committed, and disappears if that state change was rolled back.",
+  "problem": "A component changes its own durable state and then tells other components about it through a queue, and the two steps fail independently: the transaction commits but the send fails, so downstream never learns about the change, or the send succeeds but the transaction rolls back, so downstream acts on a change that never happened.",
+  "context": "A component that both mutates durable state and notifies other components over a queue or topic, where at least one side of the pair is a resource manager with transaction support (a relational or embedded database, a transactional broker, or an XA/JTA resource) and where a consumer's correctness depends on never observing a message whose cause was rolled back. The pattern applies per endpoint, not per flow: sender and receiver may choose transaction scope independently.",
+  "benefits": [
+    "Closes the dual-write window: the state change and its announcement share one commit boundary, so neither a lost event (commit without send) nor a phantom event (send without commit) is possible.",
+    "Failure handling collapses to one decision point at the commit boundary instead of two independent retry-and-reconcile policies that must be kept consistent.",
+    "Transaction scope stays per endpoint: an explicitly transactional sender can be paired with an implicitly transactional receiver (and vice versa), so the whole flow does not have to live in one global transaction.",
+    "Several sends become atomic as a group (a transacted JMS session, a Kafka transaction, a Service Bus transaction scope), which lets a batch publish all-or-nothing.",
+    "Consume-transform-produce loops can commit the consumed offsets together with the produced messages, removing the reprocessing window that otherwise sits between processing and offset commit.",
+    "The rule is explicit and testable: rolling back the business step must make the message invisible, and that assertion can be exercised in an integration test."
+  ],
+  "tradeoffs": [
+    "The unit of work now spans remote I/O: the transaction stays open across broker round trips (prepare/commit, coordinator registration), so lock-hold time grows and the most common production failure is simply the transaction timing out.",
+    "Two-phase commit adds in-doubt states: a crash after the commit decision but before every resource applied it leaves heuristic outcomes that no local retry can repair, so a recovery log, a recovery pass and alerting become part of the design.",
+    "Transactional semantics are not universally available: many cloud queues omit them because they degrade badly in widely distributed systems (SQS replaces them with a visibility timeout), so the pattern may be unavailable or expensive exactly where the deployment is elastic.",
+    "The broker becomes a hard dependency of every business write: if the queue cannot be reached, the business transaction cannot commit, which changes availability and blast radius for the worse.",
+    "Duplicates are not removed end-to-end: the receiver's processing is still a separate transaction, so at-least-once delivery remains unless the consumer is idempotent and, in a stream, commits offsets inside the same transaction.",
+    "Throughput drops per transaction: coordinator registration, one open transaction per producer, atomic-id fencing of zombies and the single-in-flight restriction on a transactional producer all cost rate compared with plain sends.",
+    "Only the send and the state change are covered: side effects outside the transaction (email, HTTP calls, writes to other services) still need an outbox relay, compensation or idempotent replay."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 4,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Transactional Sender",
+      "responsibility": "Owns the business unit of work and decides the transaction boundary; stages one or more sends inside it and commits or rolls back the whole unit."
+    },
+    {
+      "role": "Business Resource Manager",
+      "responsibility": "Holds the durable business state (database, ledger, domain store) and enlists its own local transaction in the shared commit decision."
+    },
+    {
+      "role": "Transactional Channel (Queue)",
+      "responsibility": "The destination whose enqueue is staged until commit and discarded on rollback - a transacted session, a transactional queue or topic, or an outbox table inside the business store."
+    },
+    {
+      "role": "Transaction Coordinator",
+      "responsibility": "Drives begin, prepare, commit and rollback across the enlisted resources, fences zombie producers by transactional id, and re-drives recovery of in-doubt transactions."
+    },
+    {
+      "role": "Commit-time Publisher / Relay",
+      "responsibility": "In the local-transaction realization, turns a committed intention (a commit hook callback or an outbox row) into a real send, exactly once per intended message and only after the commit is durable."
+    },
+    {
+      "role": "Transactional Consumer",
+      "responsibility": "Reads only committed messages and, for consume-transform-produce, commits its input offsets inside the same transaction as its output, so the two can never disagree."
+    },
+    {
+      "role": "Transaction Log",
+      "responsibility": "Durable record of the participants and the decision, used after a crash to complete or compensate a transaction that was left in doubt."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "persistence-unit",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Order placement: the order row, its line items and the OrderPlaced event are committed in one boundary, so fulfilment never sees an order that was rolled back and never misses one that exists.",
+    "Payment capture: the ledger posting and the PaymentCaptured notification share a commit, so the notification service cannot invoice a payment that failed.",
+    "Consume-transform-produce pipelines: input offsets, the derived state and the output records commit together, giving exactly-once effects for the read-process-write cycle.",
+    "Batch or scheduled jobs that must publish a set of messages all-or-nothing, where a partially published batch would leave downstream consumers with an inconsistent slice.",
+    "Inventory reservation: decrement the stock row and enqueue the reservation event in one transaction, so oversell reconciliation is never needed for the happy path.",
+    "A legacy queue that has no transactions: write the message into an outbox table in the same local transaction as the business state and let a relay publish committed rows.",
+    "SQL Server Service Broker: SEND, RECEIVE and END CONVERSATION execute inside the same T-SQL transaction as the table writes, so the queue state can never diverge from the committed database state - a rolled-back transaction also withdraws its messages.",
+    "Azure Service Bus: a TransactionScope wrapping Complete on the received message and Send of the derived message gives atomic consume-and-publish against the broker; cross-entity scopes need EnableCrossEntityTransactions or a send-via transfer entity.",
+    "Apache Kafka transactions (KIP-98) as used by Kafka Streams: commitTransaction publishes output records and consumed input offsets atomically via sendOffsetsToTransaction, and downstream consumers configured with isolation.level=read_committed never observe output of aborted transactions."
+  ],
+  "avoid_when": [
+    "The consumer already tolerates loss and duplicates and a reconciliation job exists: a plain send with at-least-once delivery plus an idempotent receiver is simpler and far faster.",
+    "The queue cannot enlist in a transaction and sharing a database is not an option: use the outbox relay (which buys atomicity of publication, not atomicity with the broker) or a visibility-timeout based acknowledgement instead of pretending the send is transactional.",
+    "The message is pure telemetry or advice whose loss nobody observes: fire-and-forget sends do not justify coordinator overhead.",
+    "The business work itself spans several services: use a process manager or saga with compensations rather than stretching a transaction across a WAN.",
+    "The receiver's processing is the slow part and the queue must stay hot: measure first, because a transaction that stays open across the consumer's work turns latency into lock contention."
+  ],
+  "language_files": {
+    "generic": "transactional-message-queue.generic.json",
+    "c": "transactional-message-queue.c.json",
+    "cplusplus": "transactional-message-queue.cplusplus.json",
+    "csharp": "transactional-message-queue.csharp.json",
+    "go": "transactional-message-queue.go.json",
+    "java": "transactional-message-queue.java.json",
+    "javascript": "transactional-message-queue.javascript.json",
+    "kotlin": "transactional-message-queue.kotlin.json",
+    "python": "transactional-message-queue.python.json",
+    "ruby": "transactional-message-queue.ruby.json",
+    "rust": "transactional-message-queue.rust.json",
+    "scala": "transactional-message-queue.scala.json",
+    "swift": "transactional-message-queue.swift.json",
+    "typescript": "transactional-message-queue.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip",
+    "modern"
+  ],
+  "related_patterns": [
+    "guaranteed-delivery",
+    "idempotent-receiver",
+    "unit-of-work",
+    "store-and-forward",
+    "process-manager",
+    "message-store"
+  ],
+  "anti_patterns": [
+    "Dual write in disguise: send first and commit afterwards (or commit and then send) without either sharing a boundary with the other, hoping that reconciliation will repair the window.",
+    "One distributed transaction per business operation across process or service boundaries, so a WAN round trip and a second coordinator become part of every write.",
+    "Wrapping every send - including fire-and-forget notifications - in a transaction, paying coordinator and prepare costs for messages whose loss nobody notices.",
+    "Claiming end-to-end exactly-once because the send is transactional, while the consumer is not idempotent and offsets are committed outside the processing transaction.",
+    "Holding the transaction open across user interaction, slow calls or batch loops, so transaction timeouts and lock waits become the normal failure mode.",
+    "Swallowing a commit failure (logging 'send failed' and returning success), leaving the caller's state and the published fact silently disagreeing."
+  ],
+  "design_principles": [
+    "Atomicity over optimism: pay for a real commit boundary rather than reconcile the gaps afterwards.",
+    "One writer, one boundary: a single component owns the transaction; shared commit ownership recreates the dual-write problem.",
+    "Fail fast at the boundary: if the commit cannot happen, the business operation must fail visibly.",
+    "Separate what must be atomic from what may lag: only the state change and its announcement belong in the same transaction.",
+    "Idempotency as the residual defence: at-least-once delivery is the honest contract even after the send is transactional.",
+    "Keep the transaction short - remote I/O inside a transaction is a design smell, not a feature."
+  ],
+  "best_practices": [
+    "Prefer one resource: if the message can be written into the business database, use an outbox row in the same local transaction and let a relay publish it - no coordinator, no XA.",
+    "If two resources must commit together, let a transaction manager do the enlistment (UserTransaction/XAResource, TransactionScope, Service Bus transaction scope); never hand-roll prepared commits.",
+    "Make consumers idempotent, and in consume-transform-produce commit input offsets inside the same transaction as the output.",
+    "Bound the transaction: set transaction timeouts, keep external I/O and user interaction out of it, and monitor open-transaction counts, aborted transactions and transaction lifetime.",
+    "Log, alert and automate recovery for in-doubt and heuristic outcomes; make the recovery pass idempotent.",
+    "Use a stable transactional id per processor or partition so the broker can fence zombie producers, and configure consumers with read-committed isolation where available.",
+    "Test the rollback path deliberately: assert that no message is visible after a rolled-back business step and that no state survives a failed commit."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns (2003) - 'Transactional Client' (Messaging Endpoints): make the client's session with the messaging system transactional so the client can specify transaction boundaries; a sender's message is not really added to the channel until the sender commits, and these semantics can cause serious performance degradation in widely distributed systems.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/TransactionalClient.html",
+    "https://www.confluent.io/blog/transactions-apache-kafka/",
+    "https://kafka.apache.org/25/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html",
+    "https://microservices.io/patterns/data/transactional-outbox.html",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-transactions",
+    "https://learn.microsoft.com/en-us/sql/database-engine/service-broker/transactional-messaging?view=sql-server-ver17",
+    "https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging",
+    "https://rabbitmq.github.io/rabbitmq-java-client/api/4.x.x/com/rabbitmq/client/Channel.html"
+  ]
+}

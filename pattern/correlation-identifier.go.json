@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "mutex-guarded map[string]chan Reply + select on ctx.Done()",
+  "implementation_notes": "Go's answer is a per-request channel stored in a mutex-guarded map: the caller registers a channel under the correlation id, sends, then selects on the channel, the context deadline and the shutdown signal - channels and select are language-level, so the classic role structure collapses into that one function. context.Context carries the deadline end to end (context.WithTimeout) and is the idiomatic carrier for the request id across API boundaries, which is why tracing libraries stash the value there. The alternative idiomatic shape is a single goroutine owning the map and receiving replies over a channel (message passing), which suits a transport with one reader goroutine; the Go wiki's guidance - channels for communicating asynchronous results, mutexes for caches and state - points at the mutex-guarded map for the general case.",
+  "code_sketch": "type client struct {\n    mu      sync.Mutex\n    pending map[string]chan *Reply\n}\n\nfunc (c *client) Call(ctx context.Context, body string) (*Reply, error) {\n    id := uuid.NewString()\n    ch := make(chan *Reply, 1)           // buffered: the reader never blocks\n    c.mu.Lock(); c.pending[id] = ch; c.mu.Unlock()\n    defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()\n    if err := c.send(&Request{ID: id, Body: body}); err != nil { return nil, err }\n    select {\n    case r := <-ch:\n        return r, nil\n    case <-ctx.Done():                    // deadline from context.WithTimeout\n        return nil, ctx.Err()\n    }\n}",
+  "pitfalls": [
+    "An unbuffered channel combined with an entry the reader already deleted makes the reader block forever while holding the map lock; buffer the channel (capacity 1) or deliver with a non-blocking select plus default.",
+    "Maps are not safe for concurrent writes: every insert, lookup and delete must be under the mutex or the runtime panics with a concurrent map write.",
+    "The reply handler should delete the entry before sending into the channel so a duplicate reply can neither be delivered twice nor block the reader.",
+    "Forgetting the deferred delete leaks one channel per unanswered request - the classic leak of this pattern in Go, invisible until the process runs long enough."
+  ],
+  "sources": [
+    "https://go.dev/wiki/MutexOrChannel",
+    "https://go.dev/doc/effective_go"
+  ],
+  "version": "1.0"
+}

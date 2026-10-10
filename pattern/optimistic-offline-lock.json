@@ -1,0 +1,154 @@
+{
+  "category": "persistence-state",
+  "name": "optimistic-offline-lock",
+  "aliases": [
+    "optimistic locking",
+    "optimistic concurrency control"
+  ],
+  "intent": "Let a business transaction span several system transactions without holding a database lock by validating at commit that the records it read are still unchanged - and aborting or retrying the business transaction when they are not.",
+  "problem": "A business transaction (an edit session) spans several system transactions, so the database's own locking cannot protect it: two sessions read the same record, both modify it, and the second commit silently overwrites the first (lost update); a reader can likewise see another session's half-finished edits. Holding a database lock for the whole session is not acceptable because the session lasts minutes or hours while a conflict is unlikely.",
+  "context": "Editing shared persistent state where conflicts are rare, the edit session outlives a single database transaction, and every write path can be routed through the guarded statement - interactive forms, offline/mobile sync, batch jobs over shared records, and HTTP resource updates. The validation and the write must sit in one system transaction, so the mechanism is chosen together with the transaction boundary and the mapping.",
+  "benefits": [
+    "No lock is held between read and write: rows and connections stay available for the whole edit session, so throughput scales with the work actually performed rather than with the number of open sessions.",
+    "Stale writes are detected instead of silently overwriting: the second committer is told the record changed, so lost updates cannot pass unnoticed.",
+    "Deadlock- and lock-timeout-free for this check: because nothing is locked at read time, the classic lock-ordering deadlocks and 'session held a lock for hours' incidents cannot arise from the validation itself.",
+    "Cheap in the common (no-conflict) case: one extra predicate and an affected-row count, or one token compare, on the write that was going to happen anyway.",
+    "The check survives process restarts and spans services: the token is persisted with the record, not held in a connection, thread or lock manager.",
+    "Scales to long sessions and disconnected clients: the token travels with the data (form field, ETag, sync payload), so a session may last hours or survive offline."
+  ],
+  "tradeoffs": [
+    "Conflicts surface only at commit, when all the work of the session is already done - the pattern is usable only with a conflict-resolution story (re-read and merge, present both versions, or re-edit); without one it converts silent corruption into visible frustration.",
+    "It protects exactly the write paths that carry the version check: a bulk UPDATE, raw SQL, an admin script or an unguarded mapper method silently reintroduces lost updates on the same table.",
+    "The token is schema-level plumbing - every participating mapping needs a NOT NULL version/timestamp column, every write must increment it, and a forgotten migration or trigger disables detection without failing loudly.",
+    "Retries concentrate load at the moment of contention: under sustained conflict the optimistic assumption fails and a pessimistic or coarse-grained lock is cheaper than the retry storm.",
+    "Detection is coarse: any change to the row (or to every compared field) counts as a conflict, so edits to unrelated columns cause false conflicts and useless retries.",
+    "Failure handling is application work: the framework raises an exception and stops; deciding whether to merge, retry or fail is business logic someone must write, test and monitor."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "System Transaction",
+      "responsibility": "A short database transaction that reads or writes a record; the business transaction spans several of them, and the validation must run inside the same one as the write it protects."
+    },
+    {
+      "role": "Business Transaction",
+      "responsibility": "The logical unit of work that must leave the records consistent - the edit session, spanning one or many system transactions and possibly minutes, hours or a disconnection."
+    },
+    {
+      "role": "Change Token",
+      "responsibility": "The per-record value persisted alongside the data - version counter, timestamp, GUID/rowversion, or ETag - read into the session when the record is loaded and compared at commit."
+    },
+    {
+      "role": "Conflict Check",
+      "responsibility": "The pre-commit validation comparing the session's expected token with the stored one; classically folded into the write statement itself (UPDATE ... WHERE id = ? AND version = ?) and decided by the affected-row count."
+    },
+    {
+      "role": "Conflict Handler",
+      "responsibility": "The application logic that reacts to a detected conflict: abort/rollback, re-read and merge, retry the business transaction within a bounded budget, or report the conflict to the user."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Form-based editing of a shared record (product, customer, policy, invoice) where the user loads the values, thinks for minutes, then submits.",
+    "Offline or mobile clients that edit records locally and sync later: the version token travels in the sync payload and the server rejects a stale push.",
+    "Long-running batch jobs that re-read and update records other actors may touch, where holding row locks across the whole batch is unacceptable.",
+    "REST/HTTP resource updates with ETag and If-Match, so a stale representation cannot overwrite a newer one (412 Precondition Failed as the conflict signal).",
+    "Collaborative editing of case files, configuration or catalogue data where conflicts are rare but must never pass unnoticed.",
+    "Data-migration and repair scripts that must fail loudly rather than overwrite rows changed after they were read.",
+    "Jakarta Persistence entities annotated with @Version: the provider compares the stored revision and raises OptimisticLockException when a detached edit is stale.",
+    "EF Core entities configured with a concurrency token (SQL Server rowversion or an application-managed token): SaveChanges adds the token predicate and raises DbUpdateConcurrencyException when no row matches.",
+    "HTTP PUT, PATCH or DELETE guarded by a strong ETag in If-Match: the origin server rejects a stale representation with 412 Precondition Failed before applying the change."
+  ],
+  "avoid_when": [
+    "Conflicts are frequent or the record is a contended hotspot: pessimistic locking at the database level, Pessimistic Offline Lock or a Coarse-Grained Lock avoids wasted work and retry storms.",
+    "The whole operation fits in one database transaction: rely on the database's own isolation and row locking instead of inventing a token.",
+    "The record cannot be written through a single guarded statement (bulk updates, DB-side jobs, legacy code you cannot change) - fix the write path or pick a mechanism the database enforces, otherwise detection is illusory.",
+    "There is no way to resolve a conflict (no merge, no re-edit, no user interaction): the pattern would only replace a lost update with a failed operation.",
+    "The edit sessions are short and a plain row lock covers them, or the data is append-only / immutable so there is nothing to lose.",
+    "The state has no single owner for the token (many tables edited by many components): versioning every row of a cluster creates conflicts everywhere; use an aggregate-root token via Coarse-Grained Lock first."
+  ],
+  "language_files": {
+    "generic": "optimistic-offline-lock.generic.json",
+    "c": "optimistic-offline-lock.c.json",
+    "cplusplus": "optimistic-offline-lock.cplusplus.json",
+    "csharp": "optimistic-offline-lock.csharp.json",
+    "go": "optimistic-offline-lock.go.json",
+    "java": "optimistic-offline-lock.java.json",
+    "javascript": "optimistic-offline-lock.javascript.json",
+    "kotlin": "optimistic-offline-lock.kotlin.json",
+    "python": "optimistic-offline-lock.python.json",
+    "ruby": "optimistic-offline-lock.ruby.json",
+    "rust": "optimistic-offline-lock.rust.json",
+    "scala": "optimistic-offline-lock.scala.json",
+    "swift": "optimistic-offline-lock.swift.json",
+    "typescript": "optimistic-offline-lock.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "declarative"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "version-number",
+    "pessimistic-offline-lock",
+    "coarse-grained-lock",
+    "implicit-lock",
+    "unit-of-work",
+    "identity-map",
+    "idempotent-client"
+  ],
+  "anti_patterns": [
+    "Check-then-act: SELECT the version (or the whole row), then UPDATE in a later statement or transaction - the validation no longer protects the write and the pattern degenerates into optimistic-looking theatre.",
+    "Catching the concurrency exception and retrying with the stale values (or ignoring it and letting last-write-wins stand), which launders a lost update as resilience.",
+    "Adding a version column but never incrementing it on every write path (bulk updates, admin SQL, ORM bypasses), silently disabling detection for those rows.",
+    "Using optimistic locking as a general-purpose lock: wrapping read-modify-write hotspots in unbounded retry loops until they serialize - a pessimistic lock with worse failure modes.",
+    "One token per row of a large cluster edited together: every sibling edit produces a conflict on the parent; version the aggregate root instead (Coarse-Grained Lock).",
+    "Treating the token as a security mechanism: it detects concurrent edits, it does not authorize them."
+  ],
+  "design_principles": [
+    "Fail fast and loudly: a stale write must surface as an error at commit rather than corrupt data silently.",
+    "Atomic check-and-act: the validation predicate and the mutation must be evaluated in one atomic step (same statement, or the same lock scope).",
+    "Separation of concerns: detection (token + framework) is distinct from resolution (business rules), which is distinct from presentation of the conflict.",
+    "Optimise for the common case: the mechanism must cost almost nothing when there is no conflict, and only the rare conflict pays for resolution.",
+    "Single writer of the token: exactly one mechanism increments the version on every write to the record; duplicated increment logic is how detection breaks."
+  ],
+  "best_practices": [
+    "Put the token check inside the write statement (UPDATE ... WHERE id = ? AND version = ?) and derive the outcome from the affected-row count; never validate in a separate statement.",
+    "Give every participating mapping a NOT NULL token at schema level and increment it in the same statement as the data change, so detection cannot be forgotten.",
+    "Version the consistency boundary, not every table: one token on the aggregate root (Coarse-Grained Lock) keeps unrelated edits from producing false conflicts.",
+    "Design the conflict path first - re-read, merge or show both versions, then retry with a bounded attempt count and jitter; never silently re-apply the stale write.",
+    "Keep the failure visible in telemetry: count conflicts per operation, because a rising conflict rate means the pattern no longer matches the workload.",
+    "Route all writes through the guarded path and document (or forbid) the escape hatches: bulk statements, ORM bypasses and DB-side jobs must update the token or be excluded consciously."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Rice, D. - Optimistic Offline Lock, in Fowler, M., Patterns of Enterprise Application Architecture (Addison-Wesley, 2003), ch. 16 Offline Concurrency Patterns.",
+    "https://martinfowler.com/eaaCatalog/optimisticOfflineLock.html",
+    "https://martinfowler.com/eaaCatalog/pessimisticOfflineLock.html",
+    "https://learning.oreilly.com/library/view/patterns-of-enterprise/0321127420/ch16.html#ch16lev1sec1",
+    "https://jakarta.ee/specifications/persistence/4.0/apidocs/jakarta.persistence/jakarta/persistence/version",
+    "https://learn.microsoft.com/en-us/ef/core/saving/concurrency?tabs=data-annotations",
+    "https://www.rfc-editor.org/rfc/rfc7232.html",
+    "https://vladmihalcea.com/an-entity-modeling-strategy-for-scaling-optimistic-locking/",
+    "https://www.rfc-editor.org/info/rfc9110/"
+  ]
+}

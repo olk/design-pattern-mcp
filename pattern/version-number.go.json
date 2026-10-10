@@ -1,0 +1,53 @@
+{
+  "pattern": "version-number",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "database/sql ExecContext + Result.RowsAffected()",
+  "implementation_notes": "database/sql has no mapping layer, so the classic structure is written by hand: read the version with the row, run UPDATE ... SET version = version + 1 ... WHERE id = $1 AND version = $2 through Exec/ExecContext and test Result.RowsAffected(); zero means the row changed since the read. When the project already uses GORM, its official optimisticlock plugin supplies the token declaratively - the model embeds optimisticlock.Version and every Update appends version = version + 1 together with the version predicate - which replaces the hand-written WHERE clause. Keep the raw form in sqlc/database-sql code bases where each statement is reviewed explicitly; use the plugin when GORM owns the SQL, and keep the retry decision in the caller by returning a sentinel error such as ErrStaleCopy.",
+  "code_sketch": "res, err := db.ExecContext(ctx,\n    `UPDATE docs SET body = $1, version = version + 1\n      WHERE id = $2 AND version = $3`, body, id, seenVersion)\nif err != nil { return err }\nn, err := res.RowsAffected()\nif err != nil { return err }\nif n == 0 { return ErrStaleCopy }   // re-read, merge or fail\n// GORM equivalent:\n// type Doc struct { gorm.Model; Body string; Version optimisticlock.Version }",
+  "pitfalls": [
+    "RowsAffected() follows the driver's semantics, which are not identical across backends (and some statements cannot report a count at all); verify the contract before treating 0 as 'stale'.",
+    "GORM's plugin skips the predicate when the model's Version is zero or when Unscoped() is used, so a fresh struct or an escape hatch silently disables the check.",
+    "Reading the version in one pooled transaction and writing in another lets a writer slip in between; keep read and conditional write in the same transaction."
+  ],
+  "sources": [
+    "https://pkg.go.dev/database/sql#Result"
+  ],
+  "variants": [
+    {
+      "variant_id": "database-sql-conditional-update",
+      "name": "Raw conditional UPDATE over database/sql",
+      "paradigm": "data-oriented",
+      "min_standard": "Go1.22",
+      "idiom_name": "database/sql ExecContext + Result.RowsAffected()",
+      "implementation_notes": "database/sql has no mapping layer, so the classic structure is written by hand: read the version with the row, run UPDATE ... SET version = version + 1 ... WHERE id = $1 AND version = $2 through Exec/ExecContext and test Result.RowsAffected(); zero means the row changed since the read. When the project already uses GORM, its official optimisticlock plugin supplies the token declaratively - the model embeds optimisticlock.Version and every Update appends version = version + 1 together with the version predicate - which replaces the hand-written WHERE clause. Keep the raw form in sqlc/database-sql code bases where each statement is reviewed explicitly; use the plugin when GORM owns the SQL, and keep the retry decision in the caller by returning a sentinel error such as ErrStaleCopy.",
+      "code_sketch": "res, err := db.ExecContext(ctx,\n    `UPDATE docs SET body = $1, version = version + 1\n      WHERE id = $2 AND version = $3`, body, id, seenVersion)\nif err != nil { return err }\nn, err := res.RowsAffected()\nif err != nil { return err }\nif n == 0 { return ErrStaleCopy }   // re-read, merge or fail\n// GORM equivalent:\n// type Doc struct { gorm.Model; Body string; Version optimisticlock.Version }",
+      "pitfalls": [
+        "RowsAffected() follows the driver's semantics, which are not identical across backends (and some statements cannot report a count at all); verify the contract before treating 0 as 'stale'.",
+        "GORM's plugin skips the predicate when the model's Version is zero or when Unscoped() is used, so a fresh struct or an escape hatch silently disables the check.",
+        "Reading the version in one pooled transaction and writing in another lets a writer slip in between; keep read and conditional write in the same transaction."
+      ],
+      "sources": [
+        "https://pkg.go.dev/database/sql#Result"
+      ]
+    },
+    {
+      "variant_id": "gorm-optimisticlock-plugin",
+      "name": "GORM optimisticlock plugin (declarative version field)",
+      "paradigm": "oo",
+      "min_standard": "Go1.22",
+      "idiom_name": "gorm.io/plugin/optimisticlock Version field",
+      "implementation_notes": "GORM's first-party plugin moves the token into the model: embed optimisticlock.Version, and every Update through the model appends version = version + 1 to SET and version = ? to the WHERE clause, so the mapper owns the predicate the way JPA or ActiveRecord would. The plugin deliberately relaxes the check when the model's version is zero (treating it as an unversioned write) and when Unscoped() is used, so those escape hatches need review rather than being reached for casually. Choose it when GORM owns persistence anyway; the raw variant stays the default in code bases that hand write their SQL.",
+      "code_sketch": "type Doc struct {\n    ID      uint\n    Body    string\n    Version optimisticlock.Version\n}\n// db.Model(&doc).Update(\"body\", next) emits:\n// UPDATE docs SET body=?, version=version+1\n//   WHERE version = ? AND id = ?",
+      "pitfalls": [
+        "A zero-valued Version disables the predicate, so a freshly constructed model updates the row unconditionally.",
+        "Save() needs an explicit Select to include the version field, and Unscoped() drops the check entirely."
+      ],
+      "sources": [
+        "https://github.com/go-gorm/optimisticlock"
+      ]
+    }
+  ],
+  "default_variant": "database-sql-conditional-update",
+  "version": "1.0"
+}

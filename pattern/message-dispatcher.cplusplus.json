@@ -1,0 +1,81 @@
+{
+  "support": "library",
+  "idiom_name": "std::thread + std::mutex/std::condition_variable job queue (C++11 baseline)",
+  "implementation_notes": "The C++ baseline hand-rolls the dispatcher over the standard concurrency library: one queue guarded by std::mutex, N std::thread workers waiting on std::condition_variable with a predicate, and a submit() that pushes and notify_one(). What replaces the classic structure is std::condition_variable itself - the wait/notify pair is the hand-off - while Boost.Asio's thread_pool plus boost::asio::post() supplies a ready-made dispatcher and std::jthread (C++20) removes the join bookkeeping and adds cooperative cancellation. Keep the hand-rolled form when the dispatch policy must inspect each message before assignment or when the project cannot take Boost.",
+  "code_sketch": "std::mutex m; std::condition_variable cv; std::queue<Message> q; bool done = false;\nfor (int i = 0; i < n; ++i) pool.emplace_back([&] {\n    for (;;) {\n        Message msg;\n        { std::unique_lock lk(m); cv.wait(lk, [&] { return done || !q.empty(); });\n          if (q.empty()) return; msg = std::move(q.front()); q.pop(); }\n        handle(msg);                       // outside the lock\n    }\n});\n// dispatch: { std::lock_guard lk(m); q.push(std::move(msg)); } cv.notify_one();",
+  "pitfalls": [
+    "Work performed while holding the queue mutex serializes all performers and defeats the pattern; copy or move the message out, then release the lock.",
+    "Forgetting notify_all() (or the done flag) on shutdown leaves workers blocked forever in wait(); std::thread destruction without join() terminates the process.",
+    "std::condition_variable must be used with std::unique_lock and re-checked with a predicate; a bare wait() callback cannot see spurious wakeups or lost notifications.",
+    "The queue's lifetime must outlive all workers - joining before destruction is mandatory, otherwise workers touch a destroyed mutex."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/thread_pool.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "thread-pool-condition-variable",
+      "name": "std::thread pool over a condition-variable queue",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::thread + std::mutex/std::condition_variable job queue (C++11 baseline)",
+      "implementation_notes": "The C++ baseline hand-rolls the dispatcher over the standard concurrency library: one queue guarded by std::mutex, N std::thread workers waiting on std::condition_variable with a predicate, and a submit() that pushes and notify_one(). What replaces the classic structure is std::condition_variable itself - the wait/notify pair is the hand-off - while Boost.Asio's thread_pool plus boost::asio::post() supplies a ready-made dispatcher and std::jthread (C++20) removes the join bookkeeping and adds cooperative cancellation. Keep the hand-rolled form when the dispatch policy must inspect each message before assignment or when the project cannot take Boost.",
+      "code_sketch": "std::mutex m; std::condition_variable cv; std::queue<Message> q; bool done = false;\nfor (int i = 0; i < n; ++i) pool.emplace_back([&] {\n    for (;;) {\n        Message msg;\n        { std::unique_lock lk(m); cv.wait(lk, [&] { return done || !q.empty(); });\n          if (q.empty()) return; msg = std::move(q.front()); q.pop(); }\n        handle(msg);                       // outside the lock\n    }\n});\n// dispatch: { std::lock_guard lk(m); q.push(std::move(msg)); } cv.notify_one();",
+      "pitfalls": [
+        "Work performed while holding the queue mutex serializes all performers and defeats the pattern; copy or move the message out, then release the lock.",
+        "Forgetting notify_all() (or the done flag) on shutdown leaves workers blocked forever in wait(); std::thread destruction without join() terminates the process.",
+        "std::condition_variable must be used with std::unique_lock and re-checked with a predicate; a bare wait() callback cannot see spurious wakeups or lost notifications.",
+        "The queue's lifetime must outlive all workers - joining before destruction is mandatory, otherwise workers touch a destroyed mutex."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/thread_pool.html"
+      ]
+    },
+    {
+      "variant_id": "boost-asio-thread-pool",
+      "name": "Boost.Asio thread_pool with post()/executor hand-off",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "boost::asio::thread_pool + boost::asio::post() / dispatch()",
+      "implementation_notes": "Boost.Asio ships the dispatcher: boost::asio::thread_pool is an execution context with a fixed number of threads, boost::asio::post(pool, fn) is the submit step that queues a message for exactly one free thread, and pool.join()/pool.wait() are the shutdown contract. executor_type lets the dispatcher pass \"where to run\" to collaborators instead of hard-coding a pool. Choose it when the application already uses Asio for I/O or when the dispatch policy can be expressed as scheduling (strands for per-key serialization) rather than message inspection.",
+      "code_sketch": "boost::asio::thread_pool pool(8);\nfor (auto& msg : batch) {\n    boost::asio::post(pool, [&pool, msg] { handle(msg); });\n}\npool.join();   // drain: no work is accepted afterwards\n// per-key ordering instead of one global queue:\n// auto strand = boost::asio::make_strand(pool); boost::asio::post(strand, task);",
+      "pitfalls": [
+        "post() on a stopped or joined pool silently drops the work; stop accepting new messages before join().",
+        "Task lifetime is your responsibility: the posted functor and everything it captures must stay alive until the handler runs - capture by value or use shared ownership, never a reference to a stack object.",
+        "A single Asio strand serializes its tasks; posting a whole workload to one strand recreates a single-performer pipeline, which may be intended (ordering) but is not parallelism.",
+        "Blocking inside a pool thread starves the other tasks scheduled on that thread; blocking work needs its own pool or Asio's dedicated blocking facilities."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/thread_pool.html"
+      ]
+    },
+    {
+      "variant_id": "jthread-stop-token",
+      "name": "C++20 std::jthread workers with cooperative stop tokens",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "stop tokens",
+        "auto-joining threads"
+      ],
+      "idiom_name": "std::jthread + std::stop_token / request_stop()",
+      "implementation_notes": "C++20 std::jthread makes the pool's lifecycle automatic - destruction requests a stop and joins - and gives every worker a std::stop_token so shutdown can interrupt a waiting dispatcher or worker without a separate done flag. The queue and hand-off stay the same as the classic form; what changes is the cancellation contract: wait on the condition variable with an interruptible predicate (condition_variable_any::wait with the stop token) and check stop_requested() before long-running message processing. Choose it when the toolchain is C++20 and deterministic shutdown of a long-lived dispatcher matters.",
+      "code_sketch": "std::queue<Message> q; std::mutex m; std::condition_variable_any cv;\nauto worker = std::jthread([&](std::stop_token st) {\n    for (;;) {\n        Message msg;\n        { std::unique_lock lk(m);\n          if (!cv.wait(lk, st, [&] { return !q.empty(); })) return;  // stop aware\n          msg = std::move(q.front()); q.pop(); }\n        handle(msg);\n    }\n});\n// dispatch: { std::lock_guard lk(m); q.push(std::move(msg)); } cv.notify_one();\n// shutdown: worker.request_stop(); cv.notify_all();",
+      "pitfalls": [
+        "The stop token only sets a flag: a worker that never checks stop_requested() (or never waits on the token) still runs to completion, so shutdown timeouts must be enforced by the dispatcher.",
+        "condition_variable_any works with std::stop_token but is slower than std::condition_variable; mixing the two in one queue deadlocks the stop-aware waiters (notify_all on the wrong object).",
+        "std::jthread auto-joins on destruction, so a pool member that blocks forever makes destruction (and therefore process exit) hang; stop request plus notify are both required.",
+        "Stop tokens are not broadcast automatically: request_stop() on one worker does not stop the others, and the dispatcher must notify every waiter."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    }
+  ],
+  "default_variant": "thread-pool-condition-variable",
+  "pattern": "message-dispatcher",
+  "language": "cplusplus",
+  "version": "1.0"
+}

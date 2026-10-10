@@ -1,0 +1,81 @@
+{
+  "pattern": "backpressure",
+  "language": "java",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "flow-api",
+      "name": "java.util.concurrent.Flow / Reactive Streams demand protocol",
+      "paradigm": "concurrent",
+      "min_standard": "Java9",
+      "idiom_name": "Flow.Publisher/Subscriber + Subscription.request(n) (or bounded BlockingQueue for threads)",
+      "implementation_notes": "Java encodes backpressure as a protocol: java.util.concurrent.Flow (JDK 9, semantically 1:1 with the Reactive Streams specification) has the Subscriber request n items through its Subscription, and a conforming Publisher must never emit more than the outstanding demand, so the consumer's capacity is the signal and buffers stay bounded on both sides. The classic queue-plus-blocking-producer structure is not written by hand: SubmissionPublisher (or a reactive library) implements the mechanics, and the Subscriber only decides how much to request (a small initial demand re-requested as items are consumed, e.g. half the buffer). Where a protocol is overkill - plain threads - a java.util.concurrent.BlockingQueue with a fixed capacity gives the same bound: put() blocks when full, offer(timeout) bounds the wait, and put on an overloaded stage becomes the explicit stall.",
+      "code_sketch": "// demand protocol: the subscriber paces the publisher\nSubmissionPublisher<Integer> source = new SubmissionPublisher<>();\nsource.subscribe(new Flow.Subscriber<Integer>() {\n    private Flow.Subscription subscription;\n    public void onSubscribe(Flow.Subscription s) {\n        subscription = s;\n        s.request(16);                 // finite initial demand\n    }\n    public void onNext(Integer v) {\n        process(v);                    // only requested items arrive\n        subscription.request(1);       // replenish as work completes\n    }\n    public void onError(Throwable t) { t.printStackTrace(); }\n    public void onComplete() {}\n});\n// source.submit(value) feeds the subscriber\n// thread form: new ArrayBlockingQueue<>(256).put(task) blocks when full",
+      "pitfalls": [
+        "request(Long.MAX_VALUE) is unbounded demand: the API stops protecting you, and a publisher may accumulate or emit without a consumer-sized bound; request only what can be handled.",
+        "Blocking inside onNext (JDBC, file I/O, Thread.sleep) stalls the publisher's thread and silently breaks the demand protocol; hand work to a bounded executor instead.",
+        "Executors are the hidden unbounded queue in most Java services: a fixed thread pool with a LinkedBlockingQueue accepts unlimited tasks, so the source is never told to slow down.",
+        "A Subscription must be requested from onSubscribe before any item can arrive, and request(-1) is a spec violation that terminates the flow."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Flow.html",
+        "https://www.reactive-streams.org/"
+      ]
+    },
+    {
+      "variant_id": "reactive-library",
+      "name": "Project Reactor / RxJava operators (Java 8)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "onBackpressureBuffer/Drop/Latest + flatMap concurrency bound",
+      "implementation_notes": "On Java 8 the same demand protocol is supplied by a library rather than the JDK: Project Reactor and RxJava implement Reactive Streams, and operators are the policy surface - onBackpressureBuffer(n) bounds a local buffer and applies its configured overflow action when full; it does not make an already-unbounded upstream wait. Use limitRate or a naturally demand-aware source when pacing is required, and use onBackpressureDrop/onBackpressureLatest only when shedding is semantically valid. flatMap(..., concurrency) limits in-flight work. The classic structure is replaced by the operator that owns the queue, so the design work moves to choosing finite capacity, overflow policy and concurrency instead of writing a queue; when the source is cold and pull-based (Flux.fromIterable, generate) backpressure is structural, and none of the onBackpressure* operators are needed at all.",
+      "code_sketch": "Flux<Event> inbound = source();\n\ninbound.limitRate(256)                         // finite request batches preserve demand\n       .onBackpressureBuffer(256, BufferOverflowStrategy.ERROR) // overflow fails explicitly\n       .flatMap(e -> process(e), 8)             // at most 8 in-flight calls\n       .subscribe();\n\n// shedding instead of waiting (lossy by design):\n// inbound.onBackpressureLatest().subscribe(this::render);",
+      "pitfalls": [
+        "Operators that accept unbounded demand (onBackpressureBuffer() with no capacity, publish().onBackpressureBuffer(), or an unreviewed flatMap prefetch/concurrency) can recreate an unbounded queue; use finite capacity and configure concurrency explicitly.",
+        "Mixing blocking calls into a reactive chain holds the operator's thread and destroys the demand signal; wrap them in boundedElastic/subscribeOn with a bound.",
+        "onBackpressureDrop/Latest silently discard data - correct for telemetry, wrong for messages whose loss must be visible.",
+        "A hot shared publisher (Sinks.many().multicast()) is paced by its own buffering, not by the slowest subscriber, so per-subscriber backpressure must be added explicitly."
+      ],
+      "sources": [
+        "https://java-design-patterns.com/patterns/backpressure/",
+        "https://www.reactive-streams.org/"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "Virtual threads with bounded blocking queues (Loom)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "ArrayBlockingQueue capacity + blocking put on virtual threads",
+      "implementation_notes": "With virtual threads (JDK 21) the blocking form becomes the idiomatic one again: an ArrayBlockingQueue or LinkedBlockingQueue with a fixed capacity, plus a thread per request/handler, gives real backpressure because the blocked virtual thread costs almost nothing and unmounts from its carrier while waiting. The classic producer/consumer structure is unchanged - the queue and the blocking put - but the cost model that made callback/reactive flow control necessary disappears, so the simpler form is often the better engineering choice. The bound must be enforced on the queue (ArrayBlockingQueue capacity, Semaphore, or a bounded executor) because Executors.newVirtualThreadPerTaskExecutor() starts a new thread per task and therefore bounds nothing.",
+      "code_sketch": "var inbound = new ArrayBlockingQueue<Frame>(256);   // the bound\n\ntry (var exec = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (Frame f : source) {\n        inbound.put(f);                             // cheap block on a vthread\n        exec.submit(() -> handle(inbound.take()));  // no carrier is pinned\n    }\n}",
+      "pitfalls": [
+        "Executors.newVirtualThreadPerTaskExecutor() bounds nothing by itself: without a bounded queue or semaphore a slow consumer still gets an unbounded backlog of virtual threads.",
+        "Blocking on a bounded queue is only backpressure if the producer path is the one blocking; an intermediate executor re-introduces an unbounded hand-off.",
+        "synchronized blocks that pin the carrier (long-lived native/FFI sections) turn cheap blocking into platform-thread starvation.",
+        "Queue bounds must be sized against the downstream's real concurrency budget; a 100k-capacity queue just delays the failure and blows the latency target."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html"
+      ]
+    }
+  ],
+  "default_variant": "flow-api",
+  "idiom_name": "Flow.Publisher/Subscriber + Subscription.request(n) (or bounded BlockingQueue for threads)",
+  "implementation_notes": "Java encodes backpressure as a protocol: java.util.concurrent.Flow (JDK 9, semantically 1:1 with the Reactive Streams specification) has the Subscriber request n items through its Subscription, and a conforming Publisher must never emit more than the outstanding demand, so the consumer's capacity is the signal and buffers stay bounded on both sides. The classic queue-plus-blocking-producer structure is not written by hand: SubmissionPublisher (or a reactive library) implements the mechanics, and the Subscriber only decides how much to request (a small initial demand re-requested as items are consumed, e.g. half the buffer). Where a protocol is overkill - plain threads - a java.util.concurrent.BlockingQueue with a fixed capacity gives the same bound: put() blocks when full, offer(timeout) bounds the wait, and put on an overloaded stage becomes the explicit stall.",
+  "code_sketch": "// demand protocol: the subscriber paces the publisher\nSubmissionPublisher<Integer> source = new SubmissionPublisher<>();\nsource.subscribe(new Flow.Subscriber<Integer>() {\n    private Flow.Subscription subscription;\n    public void onSubscribe(Flow.Subscription s) {\n        subscription = s;\n        s.request(16);                 // finite initial demand\n    }\n    public void onNext(Integer v) {\n        process(v);                    // only requested items arrive\n        subscription.request(1);       // replenish as work completes\n    }\n    public void onError(Throwable t) { t.printStackTrace(); }\n    public void onComplete() {}\n});\n// source.submit(value) feeds the subscriber\n// thread form: new ArrayBlockingQueue<>(256).put(task) blocks when full",
+  "pitfalls": [
+    "request(Long.MAX_VALUE) is unbounded demand: the API stops protecting you, and a publisher may accumulate or emit without a consumer-sized bound; request only what can be handled.",
+    "Blocking inside onNext (JDBC, file I/O, Thread.sleep) stalls the publisher's thread and silently breaks the demand protocol; hand work to a bounded executor instead.",
+    "Executors are the hidden unbounded queue in most Java services: a fixed thread pool with a LinkedBlockingQueue accepts unlimited tasks, so the source is never told to slow down.",
+    "A Subscription must be requested from onSubscribe before any item can arrive, and request(-1) is a spec violation that terminates the flow."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Flow.html",
+    "https://www.reactive-streams.org/"
+  ],
+  "version": "1.1"
+}

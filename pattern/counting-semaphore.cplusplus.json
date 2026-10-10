@@ -1,0 +1,71 @@
+{
+  "pattern": "counting-semaphore",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::counting_semaphore<LeastMaxValue> with acquire / try_acquire_for",
+  "implementation_notes": "C++20 ships the pattern directly: std::counting_semaphore<LeastMaxValue> holds an internal counter that acquire() decrements (blocking when it is zero) and release(n) increments, with try_acquire()/try_acquire_for()/try_acquire_until() for the non-blocking and deadline forms; std::binary_semaphore is counting_semaphore<1>. Unlike std::mutex it is not tied to a thread of execution, so acquiring in one thread and releasing in another is legal, which is what makes the one-permit form usable as a signalling primitive. The classic hand-written structure (mutex + condition_variable + count) is only justified when the toolchain cannot provide <semaphore>, because it re-implements the waiter loop and the atomicity that the standard type already guarantees.",
+  "code_sketch": "std::counting_semaphore<8> slots{8};      // at most 8 concurrent users\n\nvoid handle(Request& r) {\n    if (!slots.try_acquire_for(std::chrono::milliseconds(250)))\n        return r.reject();                 // bounded wait, explicit shedding\n    struct Permit {                            // releases on return or throw\n        std::counting_semaphore<8>& s;\n        ~Permit() { s.release(); }\n    } permit{slots};\n    serve(r);\n}",
+  "pitfalls": [
+    "The template argument is a *least* maximum value, so max() may be larger; releasing beyond the implementation's counter limit is undefined behaviour and is not checked.",
+    "counting_semaphore is neither copyable nor movable and must outlive every waiter; destroying it while a thread is blocked in acquire() is undefined behaviour.",
+    "acquire() is not interruptible - a blocked thread ignores cancellation - so use try_acquire_for/until with a deadline wherever callers must be able to give up."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/counting_semaphore"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-counting-semaphore",
+      "name": "std::counting_semaphore (C++20)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "idiom_name": "std::counting_semaphore<LeastMaxValue> with acquire / try_acquire_for",
+      "implementation_notes": "C++20 ships the pattern directly: std::counting_semaphore<LeastMaxValue> holds an internal counter that acquire() decrements (blocking when it is zero) and release(n) increments, with try_acquire()/try_acquire_for()/try_acquire_until() for the non-blocking and deadline forms; std::binary_semaphore is counting_semaphore<1>. Unlike std::mutex it is not tied to a thread of execution, so acquiring in one thread and releasing in another is legal, which is what makes the one-permit form usable as a signalling primitive. The classic hand-written structure (mutex + condition_variable + count) is only justified when the toolchain cannot provide <semaphore>, because it re-implements the waiter loop and the atomicity that the standard type already guarantees.",
+      "code_sketch": "std::counting_semaphore<8> slots{8};      // at most 8 concurrent users\n\nvoid handle(Request& r) {\n    if (!slots.try_acquire_for(std::chrono::milliseconds(250)))\n        return r.reject();                 // bounded wait, explicit shedding\n    struct Permit {                            // releases on return or throw\n        std::counting_semaphore<8>& s;\n        ~Permit() { s.release(); }\n    } permit{slots};\n    serve(r);\n}",
+      "pitfalls": [
+        "The template argument is a *least* maximum value, so max() may be larger; releasing beyond the implementation's counter limit is undefined behaviour and is not checked.",
+        "counting_semaphore is neither copyable nor movable and must outlive every waiter; destroying it while a thread is blocked in acquire() is undefined behaviour.",
+        "acquire() is not interruptible - a blocked thread ignores cancellation - so use try_acquire_for/until with a deadline wherever callers must be able to give up."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/counting_semaphore"
+      ]
+    },
+    {
+      "variant_id": "posix-sem-raii",
+      "name": "POSIX sem_t wrapped in an RAII permit",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "sem_t + a scope-guard permit (sem_wait / sem_post)",
+      "implementation_notes": "Before C++20, the portable POSIX realization is sem_t (sem_init/sem_wait/sem_post) wrapped in a small RAII permit type so the release happens in the destructor on every exit path, including exceptions. It keeps the pattern's release discipline but adds the platform dependency and the EINTR retry loop around sem_wait; use it when the ABI or toolchain forbids <semaphore>, or when the semaphore must be shared with C code that already uses sem_t.",
+      "code_sketch": "class Permit {\n    sem_t& s_;\npublic:\n    explicit Permit(sem_t& s) : s_(s) { while (sem_wait(&s_) == -1 && errno == EINTR) {} }\n    ~Permit() { sem_post(&s_); }\n    Permit(const Permit&) = delete;\n    Permit& operator=(const Permit&) = delete;\n};\n\nsem_t slots; sem_init(&slots, 0, 8);\n{ Permit p{slots}; serve(request); }   // released on every exit path",
+      "pitfalls": [
+        "The retry loop around sem_wait() is mandatory: EINTR is a normal outcome, not an error.",
+        "sem_init/sem_destroy have no C++ constructor/destructor equivalent; without a wrapper the lifetime of the semaphore is easy to get wrong.",
+        "Mixing sem_t with std::thread is fine, but cancellation and exception paths must still pass through the RAII destructor - a raw sem_post in a catch block will be skipped by some unwinding paths."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/sem_overview.7.html",
+        "https://man7.org/linux/man-pages/man3/sem_wait.3.html"
+      ]
+    },
+    {
+      "variant_id": "boost-interprocess-semaphore",
+      "name": "Boost.Interprocess interprocess_semaphore",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "boost::interprocess::interprocess_semaphore / named_semaphore",
+      "implementation_notes": "Boost.Interprocess provides semaphores that live in shared memory (interprocess_semaphore) or are addressed by name across processes (named_semaphore), with wait()/try_wait()/timed_wait() and post(). This is the realization to use when the bound must hold across processes rather than threads, or when a C++03 codebase with Boost already in the stack needs the pattern; the scoped-lock machinery of Boost.Interprocess does not cover semaphores, so the permit still has to be released manually or through a custom guard.",
+      "code_sketch": "#include <boost/interprocess/sync/interprocess_semaphore.hpp>\nusing boost::interprocess::interprocess_semaphore;\n\n// the object must live in a shared-memory region mapped by all processes,\n// not on one process's stack:\ninterprocess_semaphore slots(8);   // placed in shared memory\nslots.wait();                      // acquire\nserve(request);\nslots.post();                      // release",
+      "pitfalls": [
+        "The semaphore object must be constructed in shared memory that all participating processes map; constructing it on the stack bounds only one process.",
+        "Boost.Interprocess semaphores have no RAII permit in the library, so an exception between wait() and post() leaks a permit unless a guard is written."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/interprocess/synchronization_mechanisms.html"
+      ]
+    }
+  ],
+  "default_variant": "std-counting-semaphore"
+}

@@ -1,0 +1,72 @@
+{
+  "pattern": "revocable-forwarder",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "one forwarding class per interface + std::shared_ptr<std::atomic<bool>> revoker",
+  "implementation_notes": "The classic structure is hand-written once per interface: a class implementing the target interface, holding std::shared_ptr<Target> and a revoker shared_ptr<std::atomic<bool>> that only the grantor keeps, where each member loads the flag and forwards or throws. The atomic makes the flag visible across threads, but the load and the forward are still two steps: either accept that a call already past the load may complete (the usual fail-fast policy) or switch to the drain variant. Choose this realization when revocation is explicit and one-way; the sibling variants trade the flag for reference lifetime (weak-capability) or for a wait (drain).",
+  "code_sketch": "class SessionFwd : public Session {          // one class per target interface\n    std::shared_ptr<Session> tgt_;\n    std::shared_ptr<std::atomic<bool>> live_;   // shared with the grantor's revoker\npublic:\n    void write(std::span<const char> b) override {\n        if (!live_->load(std::memory_order_acquire)) throw Revoked{};\n        tgt_->write(b);\n    }\n};\n// grantor: revoker->store(false, std::memory_order_release);",
+  "pitfalls": [
+    "A noexcept or non-throwing interface cannot report revocation: throwing from a member that must not throw terminates the process, so such interfaces need an error return or a policy object.",
+    "Copying the forwarding class copies the shared_ptr members, so all copies share one revocation state by design; a class that stores the atomic by value instead gets one flag per copy and revocation stops working.",
+    "Members added to the interface after the wrapper was written are pure virtual in the wrapper and the class stops compiling - good for completeness, but only if the wrapper actually implements the interface rather than a look-alike."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/atomic/atomic"
+  ],
+  "variants": [
+    {
+      "variant_id": "forwarding-class",
+      "name": "Hand-written forwarding class with an atomic revoker",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "one forwarding class per interface + std::shared_ptr<std::atomic<bool>> revoker",
+      "implementation_notes": "The classic structure is hand-written once per interface: a class implementing the target interface, holding std::shared_ptr<Target> and a revoker shared_ptr<std::atomic<bool>> that only the grantor keeps, where each member loads the flag and forwards or throws. The atomic makes the flag visible across threads, but the load and the forward are still two steps: either accept that a call already past the load may complete (the usual fail-fast policy) or switch to the drain variant. Choose this realization when revocation is explicit and one-way; the sibling variants trade the flag for reference lifetime (weak-capability) or for a wait (drain).",
+      "code_sketch": "class SessionFwd : public Session {          // one class per target interface\n    std::shared_ptr<Session> tgt_;\n    std::shared_ptr<std::atomic<bool>> live_;   // shared with the grantor's revoker\npublic:\n    void write(std::span<const char> b) override {\n        if (!live_->load(std::memory_order_acquire)) throw Revoked{};\n        tgt_->write(b);\n    }\n};\n// grantor: revoker->store(false, std::memory_order_release);",
+      "pitfalls": [
+        "A noexcept or non-throwing interface cannot report revocation: throwing from a member that must not throw terminates the process, so such interfaces need an error return or a policy object.",
+        "Copying the forwarding class copies the shared_ptr members, so all copies share one revocation state by design; a class that stores the atomic by value instead gets one flag per copy and revocation stops working.",
+        "Members added to the interface after the wrapper was written are pure virtual in the wrapper and the class stops compiling - good for completeness, but only if the wrapper actually implements the interface rather than a look-alike."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic"
+      ]
+    },
+    {
+      "variant_id": "weak-capability",
+      "name": "weak_ptr-backed grant (revocation = expiry of the strong reference)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::weak_ptr target handle: lock() per call, reset() on the grantor's shared_ptr",
+      "implementation_notes": "Instead of a flag, the grant is a reference lifetime: the forwarder holds std::weak_ptr<Target> and the grantor keeps the only std::shared_ptr. Every call does weak.lock() and fails once the strong reference is gone, and revocation is a single reset() on the grantor's side that cannot be reversed from the wrapper. This needs no flag and makes revocation race-free by construction, at the price of a lock() per call and of the revoker having to reach into the shared_ptr rather than an explicit gate.",
+      "code_sketch": "class SessionFwd : public Session {\n    std::weak_ptr<Session> grant_;              // no strong reference here\npublic:\n    void write(std::span<const char> b) override {\n        auto t = grant_.lock();                 // empty once the grant is dropped\n        if (!t) throw Revoked{};\n        t->write(b);\n    }\n};\n// grantor: strong_.reset();  -- everything handed out stops working",
+      "pitfalls": [
+        "Holding the strong shared_ptr anywhere else - including in the forwarder or in a cache - silently prevents revocation, because weak.lock() keeps succeeding.",
+        "weak.lock() promotes the target to a strong reference for the duration of a call, so a long-running call outlives revocation by design; if that is unacceptable, revoke through the drain variant instead."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/weak_ptr"
+      ]
+    },
+    {
+      "variant_id": "drain-shared-mutex",
+      "name": "Draining revocation under a shared_mutex",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "requires_features": [
+        "shared_mutex"
+      ],
+      "idiom_name": "std::shared_mutex grant: shared lock per call, exclusive lock to revoke",
+      "implementation_notes": "When revocation must wait for calls already in flight, guard the grant with std::shared_mutex (C++17): the forwarder takes a shared lock for the whole call and the revoker takes the exclusive lock, so revoke() returns only after every in-flight call has finished and no new call can start. This turns the revocation race into a bounded wait, but couples revocation latency to the slowest call, and a call that blocks forever blocks revocation - use it when 'access ends' must mean 'and no work is still running'.",
+      "code_sketch": "class SessionFwd : public Session {\n    std::shared_mutex m_;\n    Session* t_; bool live_ = true;\npublic:\n    void write(std::span<const char> b) override {\n        std::shared_lock g(m_);                  // many calls in parallel\n        if (!live_) throw Revoked{};\n        t_->write(b);\n    }\n    void revoke() { std::unique_lock g(m_); live_ = false; }  // waits for in-flight calls\n};",
+      "pitfalls": [
+        "A call that blocks while holding the shared lock (I/O, a callback into user code, a lock inversion) turns revocation into an unbounded wait, so pair it with timeouts or a separate cancellation channel.",
+        "Taking the exclusive lock from a thread that already holds the shared lock (for example a revoker invoked from inside a forwarded call) deadlocks, because std::shared_mutex is not recursive."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/shared_mutex"
+      ]
+    }
+  ],
+  "default_variant": "forwarding-class",
+  "version": "1.0"
+}

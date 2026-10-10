@@ -1,0 +1,57 @@
+{
+  "pattern": "content-enricher",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "Source/Flow.mapAsync(parallelism)(lookup)",
+  "implementation_notes": "Pekko Streams provides the enrichment stage directly: mapAsync(parallelism)(msg => lookup(msg.key)) passes each element to a Future-returning function, keeps at most n lookups in flight and preserves order, while Reactive Streams backpressure stops the source from outrunning the resource (it backpressures once n futures are pending). Failures fail the stream unless a supervision strategy or recover is attached, so the degraded path is explicit; mapAsyncUnordered is the variant when ordering does not matter. The resource client is an injected class, which keeps the stage testable.",
+  "code_sketch": "def lookup(id: String): Future[Customer] = customerClient.find(id)   // resource call\n\norders\n  .mapAsync(8)(o => lookup(o.customerId).map(c => o.copy(customerName = Some(c.name))))\n  .recover { case _: SourceError => Order.unenriched }   // explicit degraded path\n  .runWith(Sink.foreach(_.toString))",
+  "pitfalls": [
+    "mapAsync emits in input order, so one slow lookup stalls the stage even with free parallelism; use mapAsyncUnordered when order is irrelevant.",
+    "A failed Future fails the whole stream - attach recover/recoverWith or a supervision strategy if enrichment is optional.",
+    "parallelism is per stage, not per resource: raising it without bounding the client's connection pool just moves the queue into the resource."
+  ],
+  "sources": [
+    "https://pekko.apache.org/docs/pekko/current/stream/operators/Source-or-Flow/mapAsync.html",
+    "https://pekko.apache.org/docs/pekko/1.3/stream/stream-flows-and-basics.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "pekko-mapasync",
+      "name": "Pekko Streams mapAsync enrichment stage",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "idiom_name": "Source/Flow.mapAsync(parallelism)(lookup)",
+      "implementation_notes": "Pekko Streams provides the enrichment stage directly: mapAsync(parallelism)(msg => lookup(msg.key)) passes each element to a Future-returning function, keeps at most n lookups in flight and preserves order, while Reactive Streams backpressure stops the source from outrunning the resource (it backpressures once n futures are pending). Failures fail the stream unless a supervision strategy or recover is attached, so the degraded path is explicit; mapAsyncUnordered is the variant when ordering does not matter. The resource client is an injected class, which keeps the stage testable.",
+      "code_sketch": "def lookup(id: String): Future[Customer] = customerClient.find(id)   // resource call\n\norders\n  .mapAsync(8)(o => lookup(o.customerId).map(c => o.copy(customerName = Some(c.name))))\n  .recover { case _: SourceError => Order.unenriched }   // explicit degraded path\n  .runWith(Sink.foreach(_.toString))",
+      "pitfalls": [
+        "mapAsync emits in input order, so one slow lookup stalls the stage even with free parallelism; use mapAsyncUnordered when order is irrelevant.",
+        "A failed Future fails the whole stream - attach recover/recoverWith or a supervision strategy if enrichment is optional.",
+        "parallelism is per stage, not per resource: raising it without bounding the client's connection pool just moves the queue into the resource."
+      ],
+      "sources": [
+        "https://pekko.apache.org/docs/pekko/current/stream/operators/Source-or-Flow/mapAsync.html",
+        "https://pekko.apache.org/docs/pekko/1.3/stream/stream-flows-and-basics.html"
+      ]
+    },
+    {
+      "variant_id": "effect-typed-lookup",
+      "name": "cats-effect IO enrichment with parTraverse",
+      "paradigm": "functional",
+      "min_standard": "Scala3",
+      "idiom_name": "IO[Order] + parTraverse under Parallel[IO]",
+      "implementation_notes": "In an effect-typed codebase the enricher is a function returning IO: it reads the key, calls the resource through a client, merges, and the runtime supplies async, cancellation and the error channel - nothing blocks a thread. Independent lookups for a batch run with parTraverse/parSequence under the Parallel[IO] instance, and the effect can be memoized per key behind an explicit cache; 'resource unavailable' stays in the error type, so callers must choose between failing and degrading. Choose it when the service is already written against cats-effect or ZIO.",
+      "code_sketch": "def enrich(o: Order): IO[Order] =\n  customerClient.find(o.customerId)\n    .map(c => o.copy(customerName = Some(c.name), region = Some(c.region)))\n    .timeout(2.seconds)\n    .handleErrorWith(_ => IO.pure(o))          // degrade, but log/metric the failure\n\ndef enrichAll(os: List[Order]): IO[List[Order]] = os.parTraverse(enrich)",
+      "pitfalls": [
+        "parTraverse starts one effect per element with no bound, so a large batch becomes an unbounded fan-out - chunk it or gate it with a Semaphore.",
+        "IO is a description, not a value: memoizing by key needs an explicit cache (Ref/ConcurrentHashMap), otherwise every run re-executes the effect.",
+        "handleErrorWith into a default hides a broken resource; make the degradation visible (log, metric, or tag the message as unenriched)."
+      ],
+      "sources": [
+        "https://typelevel.org/cats-effect/docs/concepts",
+        "https://typelevel.org/cats/typeclasses/parallel.html"
+      ]
+    }
+  ],
+  "default_variant": "pekko-mapasync"
+}

@@ -1,0 +1,59 @@
+{
+  "pattern": "bulkhead",
+  "language": "csharp",
+  "support": "library",
+  "implementation_notes": "The bulkhead is a limiter object per dependency: in Polly v8 the v7 Bulkhead policy became the rate limiter strategy, and AddConcurrencyLimiter(permitLimit, queueLimit) wraps each dependency call with a bounded slot count and an optional queue, rejecting with RateLimiterRejectedException when both are full; the same effect without Polly is System.Threading.RateLimiting.ConcurrencyLimiter (PermitLimit, QueueLimit, QueueProcessingOrder) obtained through a lease that must be disposed. Use this form when dependency calls are already asynchronous; the bounded-channel variant is for blocking calls that need dedicated consumers.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "polly-concurrency-limiter",
+      "name": "Polly v8 concurrency limiter",
+      "paradigm": "concurrent",
+      "implementation_notes": "The bulkhead is a limiter object per dependency: in Polly v8 the v7 Bulkhead policy became the rate limiter strategy, and AddConcurrencyLimiter(permitLimit, queueLimit) wraps each dependency call with a bounded slot count and an optional queue, rejecting with RateLimiterRejectedException when both are full; the same effect without Polly is System.Threading.RateLimiting.ConcurrencyLimiter (PermitLimit, QueueLimit, QueueProcessingOrder) obtained through a lease that must be disposed. Use this form when dependency calls are already asynchronous; the bounded-channel variant is for blocking calls that need dedicated consumers.",
+      "min_standard": "C#8",
+      "idiom_name": "Polly v8 AddConcurrencyLimiter / RateLimiterRejectedException",
+      "code_sketch": "var dbBulkhead = new ResiliencePipelineBuilder()\n    .AddConcurrencyLimiter(permitLimit: 8, queueLimit: 16)\n    .Build();\n\nvar rows = await dbBulkhead.ExecuteAsync(\n    async ct => await db.QueryAsync(sql, ct), cancellationToken);\n// saturated (8 running + 16 queued): RateLimiterRejectedException -> map to 503",
+      "pitfalls": [
+        "The Polly v7 Bulkhead policy is gone in v8; new code must use the rate limiter strategy (AddConcurrencyLimiter), not Policy.Bulkhead.",
+        "Sharing one limiter instance across unrelated dependencies recreates the coupling; each dependency or tenant needs its own limiter.",
+        "QueueLimit and QueueProcessingOrder decide whether new or old requests wait; after the queue fills the limiter rejects, so the pair is the real capacity policy.",
+        "A concurrency limiter does not bound call duration: a hung call holds its permit forever unless a timeout strategy is layered around it."
+      ],
+      "sources": [
+        "https://www.pollydocs.org/strategies/rate-limiter.html",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.ratelimiting.concurrencylimiter"
+      ]
+    },
+    {
+      "variant_id": "bounded-channel-workers",
+      "name": "Bounded channel with dedicated consumer tasks (worker isolation)",
+      "paradigm": "concurrent",
+      "implementation_notes": "Worker-isolation variant: one bounded Channel<T> per dependency with N long-running consumer tasks; producers use TryWrite and treat a full channel as the saturation signal, so blocking dependency calls execute only on that dependency's dedicated tasks or dedicated TaskScheduler. This is the analogue of a thread-pool bulkhead and the right choice when the call is synchronous or blocking; the limiter variant is simpler when calls are already async.",
+      "min_standard": "C#8",
+      "idiom_name": "System.Threading.Channels BoundedChannel + consumer tasks",
+      "code_sketch": "var db = Channel.CreateBounded<Query>(new BoundedChannelOptions(16)\n{\n    FullMode = BoundedChannelFullMode.Wait,\n});\nfor (var i = 0; i < 8; i++)\n    _ = Task.Run(async () =>\n    {\n        await foreach (var q in db.Reader.ReadAllAsync()) await CallDependency(q);\n    });\n\nif (!db.Writer.TryWrite(query)) return Results.StatusCode(503);   // saturated",
+      "pitfalls": [
+        "Consumers started with Task.Run still run on the shared thread pool; use LongRunning tasks or a dedicated scheduler when the dependency call blocks.",
+        "BoundedChannelFullMode.Wait makes TryWrite fail immediately - choose Wait or DropWrite deliberately and make callers handle the false return.",
+        "Complete the channel on shutdown or consumer tasks keep waiting and can hang graceful termination.",
+        "A channel bounds pending work but not in-flight consumers; 8 consumers plus 16 queued is the real limit only if both are bounded."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/core/extensions/channels"
+      ]
+    }
+  ],
+  "default_variant": "polly-concurrency-limiter",
+  "idiom_name": "Polly v8 AddConcurrencyLimiter / RateLimiterRejectedException",
+  "code_sketch": "var dbBulkhead = new ResiliencePipelineBuilder()\n    .AddConcurrencyLimiter(permitLimit: 8, queueLimit: 16)\n    .Build();\n\nvar rows = await dbBulkhead.ExecuteAsync(\n    async ct => await db.QueryAsync(sql, ct), cancellationToken);\n// saturated (8 running + 16 queued): RateLimiterRejectedException -> map to 503",
+  "pitfalls": [
+    "The Polly v7 Bulkhead policy is gone in v8; new code must use the rate limiter strategy (AddConcurrencyLimiter), not Policy.Bulkhead.",
+    "Sharing one limiter instance across unrelated dependencies recreates the coupling; each dependency or tenant needs its own limiter.",
+    "QueueLimit and QueueProcessingOrder decide whether new or old requests wait; after the queue fills the limiter rejects, so the pair is the real capacity policy.",
+    "A concurrency limiter does not bound call duration: a hung call holds its permit forever unless a timeout strategy is layered around it."
+  ],
+  "sources": [
+    "https://www.pollydocs.org/strategies/rate-limiter.html",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.ratelimiting.concurrencylimiter"
+  ]
+}

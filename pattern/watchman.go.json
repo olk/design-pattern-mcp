@@ -1,0 +1,19 @@
+{
+  "pattern": "watchman",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "select on the arrival channel versus a resettable time.Timer (deadline, not ticker)",
+  "implementation_notes": "The classic structure collapses into one goroutine that owns a time.Timer: every arrival stops/drains and Resets the timer to the silence budget, and the expiry branch of the select is the absence alarm, so the last-seen state exists only for reporting rather than for detection. Keep the timer private to that goroutine - Go's documented Reset contract only holds when no other goroutine is receiving from the timer's channel - and select on ctx.Done() so the monitor dies with the service instead of paging during shutdown. A time.Ticker is the wrong primitive here: it fires on a schedule, while a watchman needs a deadline that each arrival pushes away.",
+  "code_sketch": "timer := time.NewTimer(budget)          // silence budget, not a heartbeat interval\ndefer timer.Stop()\nfor {\n    select {\n    case msg := <-arrivals:             // any message (or heartbeat) resets the deadline\n        handle(msg)\n        if !timer.Stop() { select { case <-timer.C: default: } }\n        timer.Reset(budget)\n    case <-timer.C:                     // no messages within budget\n        alert(subject, budget)\n        timer.Reset(budget)             // repeat while the silence persists\n    case <-ctx.Done():\n        return\n    }\n}",
+  "pitfalls": [
+    "Resetting a time.Timer whose channel has already fired but has not been drained is the classic Go race: follow the documented Stop-then-drain-then-Reset dance (Go 1.23+ made the unbuffered case safe, but the drain form remains the portable one).",
+    "A timer must not be Reset concurrently with a pending receive on its channel, and never from two goroutines: keep the timer in exactly one owner goroutine.",
+    "time.After allocates a new timer per call; inside a receive loop it becomes garbage pressure under load, so reuse a Timer instead.",
+    "A monitor goroutine that ignores ctx.Done() keeps alerting after shutdown and keeps the process alive in tests - and a time.Ticker is never garbage-collected until Stop()."
+  ],
+  "sources": [
+    "https://pkg.go.dev/time",
+    "https://pkg.go.dev/sync/atomic"
+  ],
+  "version": "1.0"
+}

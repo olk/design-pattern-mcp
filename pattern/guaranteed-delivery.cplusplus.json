@@ -1,0 +1,67 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "rd_kafka_producev with enable.idempotence=true and acks=all",
+  "implementation_notes": "Modern C++ default when the sink is Kafka: the broker log is the durable store, so the client's whole job is to configure idempotent production and to read the delivery report. enable.idempotence=true implies acks=all, bounded in-flight requests and retries, which is what makes a retry after a timeout safe instead of duplicating the record; rd_kafka_producev only enqueues, and the dr_msg_cb callback (or rd_kafka_flush plus the report) is the acknowledgement that the record is at rest. Use the transactional producer (rd_kafka_init_transactions + rd_kafka_send_offsets_to_transaction) to extend the guarantee across a consume-transform-produce cycle, and keep a hand-written spool only when no broker participates or the store must be application-owned (see the Asio variant).",
+  "code_sketch": "rd_kafka_conf_t* conf = rd_kafka_conf_new();\nrd_kafka_conf_set(conf, \"bootstrap.servers\", brokers, nullptr, 0);\nrd_kafka_conf_set(conf, \"enable.idempotence\", \"true\", nullptr, 0);\nrd_kafka_conf_set(conf, \"acks\", \"all\", nullptr, 0);\nrd_kafka_conf_set_dr_msg_cb(conf, on_delivery);   // ack path\nrd_kafka_t* p = rd_kafka_new(RD_KAFKA_PRODUCER, conf, nullptr, 0);\nrd_kafka_producev(p, RD_KAFKA_V_TOPIC(\"orders\"), RD_KAFKA_V_VALUE(buf, len),\n                  RD_KAFKA_V_END);\nif (rd_kafka_flush(p, 5000) != 0) spool(record);  // flush waits for the reports",
+  "pitfalls": [
+    "rd_kafka_producev returns success when the record was merely enqueued; only the delivery report (or a successful rd_kafka_flush) means the broker persisted it.",
+    "Configurations that silently disable idempotence: setting acks to anything other than all or raising max.in.flight beyond what idempotent production allows.",
+    "Exiting or forking without rd_kafka_flush loses the records buffered in the client, and a delivery report received after the record's memory was freed is a use-after-free.",
+    "A single producer shared across threads is safe, but the delivery callback runs on an internal thread - blocking in it stalls the whole producer."
+  ],
+  "sources": [
+    "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html",
+    "https://github.com/confluentinc/librdkafka"
+  ],
+  "variants": [
+    {
+      "variant_id": "librdkafka-idempotent",
+      "name": "librdkafka idempotent producer (broker log as the store)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "librdkafka"
+      ],
+      "idiom_name": "rd_kafka_producev with enable.idempotence=true and acks=all",
+      "implementation_notes": "Modern C++ default when the sink is Kafka: the broker log is the durable store, so the client's whole job is to configure idempotent production and to read the delivery report. enable.idempotence=true implies acks=all, bounded in-flight requests and retries, which is what makes a retry after a timeout safe instead of duplicating the record; rd_kafka_producev only enqueues, and the dr_msg_cb callback (or rd_kafka_flush plus the report) is the acknowledgement that the record is at rest. Use the transactional producer (rd_kafka_init_transactions + rd_kafka_send_offsets_to_transaction) to extend the guarantee across a consume-transform-produce cycle, and keep a hand-written spool only when no broker participates or the store must be application-owned (see the Asio variant).",
+      "code_sketch": "rd_kafka_conf_t* conf = rd_kafka_conf_new();\nrd_kafka_conf_set(conf, \"bootstrap.servers\", brokers, nullptr, 0);\nrd_kafka_conf_set(conf, \"enable.idempotence\", \"true\", nullptr, 0);\nrd_kafka_conf_set(conf, \"acks\", \"all\", nullptr, 0);\nrd_kafka_conf_set_dr_msg_cb(conf, on_delivery);   // ack path\nrd_kafka_t* p = rd_kafka_new(RD_KAFKA_PRODUCER, conf, nullptr, 0);\nrd_kafka_producev(p, RD_KAFKA_V_TOPIC(\"orders\"), RD_KAFKA_V_VALUE(buf, len),\n                  RD_KAFKA_V_END);\nif (rd_kafka_flush(p, 5000) != 0) spool(record);  // flush waits for the reports",
+      "pitfalls": [
+        "rd_kafka_producev returns success when the record was merely enqueued; only the delivery report (or a successful rd_kafka_flush) means the broker persisted it.",
+        "Configurations that silently disable idempotence: setting acks to anything other than all or raising max.in.flight beyond what idempotent production allows.",
+        "Exiting or forking without rd_kafka_flush loses the records buffered in the client, and a delivery report received after the record's memory was freed is a use-after-free.",
+        "A single producer shared across threads is safe, but the delivery callback runs on an internal thread - blocking in it stalls the whole producer."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html",
+        "https://github.com/confluentinc/librdkafka"
+      ]
+    },
+    {
+      "variant_id": "asio-fsync-spool",
+      "name": "Boost.Asio store-and-forward with an fsync'd spool file",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "requires_features": [
+        "boost-asio",
+        "filesystem"
+      ],
+      "idiom_name": "async_write/async_read chain gated on a durable spool entry",
+      "implementation_notes": "When the peer is a plain socket, HTTP endpoint or file drop with no durable broker behind it, the store must be the application's: write the frame to a spool file, fsync it (and the directory after the rename), and only then start the async_write; the completion handler of the ack read removes the spool entry. Boost.Asio supplies the completion handlers, executors and timers, not the durability, so the order of operations is the pattern. Use it when the sink is not a broker or when the sender must be able to prove a local at-rest copy; prefer a broker client variant whenever one is available, because the spool's replay, dedup and retention logic becomes your code.",
+      "code_sketch": "void send(Message m) {\n  spool_write_and_fsync(m);                       // durable before the wire\n  asio::async_write(sock, asio::buffer(m.bytes), [m](error_code ec, size_t) {\n    if (ec) return;\n    asio::async_read_until(sock, ack_buf, '\\n', [m](error_code ec2, size_t) {\n      if (!ec2) std::filesystem::remove(spool_path(m.id));  // ack -> forget\n    });\n  });\n}\n// recovery: iterate the spool directory on start-up and re-enter send()",
+      "pitfalls": [
+        "Capture the message by value (or in a shared handle) into the completion handlers: the async chain outlives the call that started it.",
+        "fsync must be called on the descriptor that wrote the bytes, and a rename-based publish needs a directory fsync as well; both calls block the calling thread unless run on a dedicated strand/thread pool.",
+        "The io_context must actually run (a thread that calls run()) - a completed write callback that is never dispatched looks like a hung peer.",
+        "Duplicate suppression stays your job: a replay after a crash redelivers the frame, so the peer must dedup on m.id."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio.html",
+        "https://man7.org/linux/man-pages/man2/fsync.2.html"
+      ]
+    }
+  ],
+  "default_variant": "librdkafka-idempotent",
+  "version": "1.0"
+}

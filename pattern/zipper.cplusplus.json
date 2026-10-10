@@ -1,0 +1,60 @@
+{
+  "pattern": "zipper",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::variant node + shared_ptr indirection, immutable rebuild",
+  "implementation_notes": "A closed node hierarchy is expressed as a std::variant whose recursive case needs indirection (std::shared_ptr keeps structural sharing, std::unique_ptr keeps it copy-hostile), so the classic virtual Node/Composite hierarchy is replaced by variant + std::visit / std::get_if. Edits rebuild only the nodes on the path because unchanged subtrees are shared through the smart pointer, and the context - a vector of frames holding the parent and the child index - is still hand-written: it is the part that makes the location movable, and it is what a variant cannot give you. Unique ownership with std::unique_ptr plus an out-of-line destructor is the cheaper alternative when versions do not need to coexist.",
+  "code_sketch": "struct Node;                                     /* recursive variant needs indirection */\nusing NodePtr = std::shared_ptr<Node>;\nstruct Node { std::variant<std::string, std::vector<NodePtr>> payload; };\n\nstruct Frame { NodePtr parent; std::size_t index; };          /* the hole at one level */\nstruct Loc   { NodePtr focus; std::vector<Frame> path; };\nLoc up(Loc l) {                                                 /* rebuild the parent once */\n    Frame f = l.path.back(); l.path.pop_back();\n    auto kids = std::get<std::vector<NodePtr>>(f.parent->payload);  /* copy of shared ptrs */\n    kids.at(f.index) = l.focus;                                  /* siblings stay shared */\n    return Loc{ f.parent, std::move(l.path) };\n}",
+  "pitfalls": [
+    "std::variant cannot contain itself: without the smart-pointer indirection the type is infinitely sized and does not compile, and the compiler will not choose the representation for you.",
+    "shared_ptr makes the tree immutable only by convention - one non-const reference or a mutable raw pointer into a node and every captured location changes with it.",
+    "Copying the parent's children vector into a frame is O(children) per step: store an index plus the parent pointer, or use an arena, when fan-out is large.",
+    "Deeply linked trees are recursively destroyed; the default destructor of a shared_ptr chain can overflow the stack on long, narrow trees."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/utility/variant",
+    "https://en.cppreference.com/w/cpp/memory/shared_ptr"
+  ],
+  "variants": [
+    {
+      "variant_id": "variant-persistent",
+      "name": "std::variant tree with shared_ptr spine (functional)",
+      "paradigm": "functional",
+      "min_standard": "C++17",
+      "idiom_name": "std::variant node + shared_ptr indirection, immutable rebuild",
+      "implementation_notes": "A closed node hierarchy is expressed as a std::variant whose recursive case needs indirection (std::shared_ptr keeps structural sharing, std::unique_ptr keeps it copy-hostile), so the classic virtual Node/Composite hierarchy is replaced by variant + std::visit / std::get_if. Edits rebuild only the nodes on the path because unchanged subtrees are shared through the smart pointer, and the context - a vector of frames holding the parent and the child index - is still hand-written: it is the part that makes the location movable, and it is what a variant cannot give you. Unique ownership with std::unique_ptr plus an out-of-line destructor is the cheaper alternative when versions do not need to coexist.",
+      "code_sketch": "struct Node;                                     /* recursive variant needs indirection */\nusing NodePtr = std::shared_ptr<Node>;\nstruct Node { std::variant<std::string, std::vector<NodePtr>> payload; };\n\nstruct Frame { NodePtr parent; std::size_t index; };          /* the hole at one level */\nstruct Loc   { NodePtr focus; std::vector<Frame> path; };\nLoc up(Loc l) {                                                 /* rebuild the parent once */\n    Frame f = l.path.back(); l.path.pop_back();\n    auto kids = std::get<std::vector<NodePtr>>(f.parent->payload);  /* copy of shared ptrs */\n    kids.at(f.index) = l.focus;                                  /* siblings stay shared */\n    return Loc{ f.parent, std::move(l.path) };\n}",
+      "pitfalls": [
+        "std::variant cannot contain itself: without the smart-pointer indirection the type is infinitely sized and does not compile, and the compiler will not choose the representation for you.",
+        "shared_ptr makes the tree immutable only by convention - one non-const reference or a mutable raw pointer into a node and every captured location changes with it.",
+        "Copying the parent's children vector into a frame is O(children) per step: store an index plus the parent pointer, or use an arena, when fan-out is large.",
+        "Deeply linked trees are recursively destroyed; the default destructor of a shared_ptr chain can overflow the stack on long, narrow trees."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/variant",
+        "https://en.cppreference.com/w/cpp/memory/shared_ptr"
+      ]
+    },
+    {
+      "variant_id": "arena-cursor",
+      "name": "Arena tree with index cursor (data-oriented)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "idiom_name": "std::vector<Node> arena + index path, no allocation per step",
+      "implementation_notes": "The same focus-plus-context split with indices instead of pointers: nodes live in a std::vector arena and the cursor is a node index plus the stack of ancestor indices, so moves are integer arithmetic with no allocation per step and the children are contiguous in cache. This is the form parsers, editors and engines reach for when the tree is large and owned by one writer, but it is a mutable structure: old versions survive only if the arena is copied or an undo log is kept, so the persistence guarantee of the functional variant is traded for speed.",
+      "code_sketch": "struct Node { int parent = -1; std::vector<int> kids; std::string label; };\nstruct Cursor { int at; std::vector<int> path; };   /* path = ancestors, root first */\n\nCursor down(const std::vector<Node>& a, Cursor c) {\n    c.path.push_back(c.at);\n    return Cursor{ a[c.at].kids.front(), std::move(c.path) };\n}\nCursor up(const std::vector<Node>&, Cursor c) {\n    int p = c.path.back(); c.path.pop_back();\n    return Cursor{ p, std::move(c.path) };\n}\nvoid retitle(std::vector<Node>& a, Cursor c, std::string v) { a[c.at].label = std::move(v); }",
+      "pitfalls": [
+        "Indices are stable only until the arena reallocates or a node is erased: removal invalidates stored indices, so deletion must tombstone slots or route through a free list.",
+        "This variant is mutable, so it is not a persistent zipper; keep an undo log or a copy-on-write snapshot whenever old versions must stay valid.",
+        "A cursor captured before a reallocation or removal is silently wrong - an index cannot be validated without a generation counter.",
+        "Holding a reference or iterator into the vector across an insertion is a dangling-reference bug; cursor code must pass the arena and indices, never node pointers."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/vector",
+        "https://en.cppreference.com/w/cpp/utility/variant"
+      ]
+    }
+  ],
+  "default_variant": "variant-persistent",
+  "version": "1.0"
+}

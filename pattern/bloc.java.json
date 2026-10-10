@@ -1,0 +1,75 @@
+{
+  "pattern": "bloc",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Sinks.Many<Event> + replay-last state sink exposed as Flux",
+  "implementation_notes": "Reactor supplies the exact two halves: a Sinks.Many<Event> (tryEmitNext) is the event sink and a replay-last or unicast Sinks.Many<State> exposed with asFlux() is the state stream - Sinks are documented as thread-safe constructs that detect concurrent access and fail fast unless built through unsafe(), and Sinks.One models the current value as a promise replayed to late subscribers. Handlers are switch-on-sealed-interface methods (Java 17+ pattern matching) or a map of consumers per event type, and Spring WebFlux and RSocket stacks already carry the runtime; keep states immutable records and emit them only from the reducer.",
+  "code_sketch": "sealed interface Event permits Submit, Failed {}\nrecord Submit(String user) implements Event {}\nrecord Failed(String reason) implements Event {}\nrecord State(boolean busy, String error) {}\n\nSinks.Many<Event> events = Sinks.many().unicast().onBackpressureBuffer();\nSinks.Many<State> states = Sinks.many().replay().latest();\nstates.tryEmitNext(new State(false, null));          // seed current state\nFlux<State> stream() { return states.asFlux(); }\n// wiring: events.asFlux().scan(new State(false, null), this::reduce)\n//            .subscribe(states::tryEmitNext);",
+  "pitfalls": [
+    "Emission results are values: tryEmitNext returns FAIL_NON_SERIALIZED, FAIL_OVERFLOW or FAIL_TERMINATED, and ignoring the result silently loses state changes.",
+    "Sinks are thread-safe only in the fail-fast sense; concurrent producers must use emitNext with an EmitFailureHandler or serialize dispatch themselves.",
+    "A replay-last sink retains the state forever and hands it to every new subscriber - never put one-shot effects (navigation, toasts) into it.",
+    "Terminal signals are permanent: tryEmitComplete or tryEmitError ends the state stream for every subscriber, so report failures as state values instead."
+  ],
+  "sources": [
+    "https://projectreactor.io/docs/core/release/api/reactor/core/publisher/Sinks.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "reactor-sinks",
+      "name": "Project Reactor Sinks (Flux/Mono)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "Sinks.Many<Event> + replay-last state sink exposed as Flux",
+      "implementation_notes": "Reactor supplies the exact two halves: a Sinks.Many<Event> (tryEmitNext) is the event sink and a replay-last or unicast Sinks.Many<State> exposed with asFlux() is the state stream - Sinks are documented as thread-safe constructs that detect concurrent access and fail fast unless built through unsafe(), and Sinks.One models the current value as a promise replayed to late subscribers. Handlers are switch-on-sealed-interface methods (Java 17+ pattern matching) or a map of consumers per event type, and Spring WebFlux and RSocket stacks already carry the runtime; keep states immutable records and emit them only from the reducer.",
+      "code_sketch": "sealed interface Event permits Submit, Failed {}\nrecord Submit(String user) implements Event {}\nrecord Failed(String reason) implements Event {}\nrecord State(boolean busy, String error) {}\n\nSinks.Many<Event> events = Sinks.many().unicast().onBackpressureBuffer();\nSinks.Many<State> states = Sinks.many().replay().latest();\nstates.tryEmitNext(new State(false, null));          // seed current state\nFlux<State> stream() { return states.asFlux(); }\n// wiring: events.asFlux().scan(new State(false, null), this::reduce)\n//            .subscribe(states::tryEmitNext);",
+      "pitfalls": [
+        "Emission results are values: tryEmitNext returns FAIL_NON_SERIALIZED, FAIL_OVERFLOW or FAIL_TERMINATED, and ignoring the result silently loses state changes.",
+        "Sinks are thread-safe only in the fail-fast sense; concurrent producers must use emitNext with an EmitFailureHandler or serialize dispatch themselves.",
+        "A replay-last sink retains the state forever and hands it to every new subscriber - never put one-shot effects (navigation, toasts) into it.",
+        "Terminal signals are permanent: tryEmitComplete or tryEmitError ends the state stream for every subscriber, so report failures as state values instead."
+      ],
+      "sources": [
+        "https://projectreactor.io/docs/core/release/api/reactor/core/publisher/Sinks.html"
+      ]
+    },
+    {
+      "variant_id": "rxjava3-subjects",
+      "name": "RxJava 3 subjects",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "BehaviorSubject<State> + PublishSubject<Event> (serialized)",
+      "implementation_notes": "In RxJava a BehaviorSubject is the state stream - it begins by emitting the most recently emitted item, or a seed value, to every new observer - and a PublishSubject (serialized) carries events into a scan reducer; the ReactiveX documentation states that a subject's observer side is not thread-safe while subscribe is, so producers must call toSerialized() or serialize dispatch. This remains the standard shape in large Android codebases (with observeOn at the UI boundary) and interoperates with coroutines or Reactor when a migration is in progress.",
+      "code_sketch": "BehaviorSubject<State> state =\n    BehaviorSubject.createDefault(new State(false, null));\nSubject<Event> events = PublishSubject.<Event>create().toSerialized();\n\nevents.scan(state.getValue(), this::reduce)     // pure reduction\n      .distinctUntilChanged()\n      .subscribe(state::onNext);                // serialized observer side\n// view: state.observeOn(AndroidSchedulers.mainThread())\n//             .subscribe(this::render);",
+      "pitfalls": [
+        "Two subjects and a middleman subscription mean state can be written from two places (events.onNext and state.onNext); keep the reducer the only writer and hide state.onNext.",
+        "CompositeDisposable discipline: subscriptions outlive Activity/Fragment destruction and leak the view unless cleared in onDestroy or onCleared.",
+        "A terminated BehaviorSubject rejects further items (RxJava 3 routes them to the global handler and drops them) - treat errors as state values rather than onError.",
+        "scan replays aggregated history only per subscriber chain; without shareReplay or the BehaviorSubject the UI recomputes the history on every re-subscription."
+      ],
+      "sources": [
+        "https://reactivex.io/documentation/subject.html"
+      ]
+    },
+    {
+      "variant_id": "flow-api",
+      "name": "JDK Flow API with SubmissionPublisher (no third-party library)",
+      "paradigm": "concurrent",
+      "min_standard": "Java9",
+      "idiom_name": "java.util.concurrent.Flow + SubmissionPublisher<T>",
+      "implementation_notes": "The JDK's Flow class (Java 9+) defines the reactive-streams interfaces - Publisher, Subscriber, Subscription, Processor - and SubmissionPublisher is a ready-made Publisher that delivers submitted items to current subscribers according to per-subscriber demand; a component becomes a SubmissionPublisher<State> plus a hand-written reducer that calls submit(state), with the current state held in a volatile field because Flow has no replay primitive. Choose it when no reactive library may be added: it is the standard, but the replay, the event queue and the operator set are yours to write.",
+      "code_sketch": "final SubmissionPublisher<State> states = new SubmissionPublisher<>();\nprivate volatile State current = new State(false, null);\n\nvoid dispatch(Event e) {\n    State next = reduce(current, e);\n    if (next.equals(current)) return;      // conflate equal states\n    current = next;\n    states.submit(next);                   // delivered per subscriber demand\n}\nState current() { return current; }        // Flow has no replay: expose it",
+      "pitfalls": [
+        "SubmissionPublisher.submit blocks when a subscriber's buffer is full (delivery obeys demand), so a slow UI subscriber stalls the dispatcher unless emission happens off the UI thread or buffers are sized deliberately.",
+        "There is no built-in state replay: new subscribers receive nothing until the next submit, so the current value must be exposed separately or pushed on subscribe.",
+        "Subscriber.onSubscribe must request items and re-request as they are consumed, or no item is ever delivered.",
+        "Each SubmissionPublisher owns an executor lifecycle: close() and awaitTermination before discarding it, or the executor's threads keep running."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Flow.html"
+      ]
+    }
+  ],
+  "default_variant": "reactor-sinks",
+  "version": "1.0"
+}

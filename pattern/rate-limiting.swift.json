@@ -1,0 +1,64 @@
+{
+  "pattern": "rate-limiting",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "actor-isolated token bucket over ContinuousClock",
+  "implementation_notes": "Swift has no rate limiter in the standard library, so the pattern is hand-written; Swift concurrency supplies the pieces: an actor serializes access to the token state without an explicit lock, and ContinuousClock is the monotonic clock Apple documents with sleep(for:)/sleep(until:) for suspending a task. A non-blocking acquire() returns false and lets the caller answer 429 or back-pressure; a pacing call awaits clock.sleep(until:) for the deficit. Use the actor form for async server or client code; the GCD timer variant remains for callback-based codebases.",
+  "code_sketch": "actor RateLimiter {\n  private let clock = ContinuousClock()\n  private var tokens: Double, last: ContinuousClock.Instant\n  private let rate: Double, burst: Double\n  init(rate: Double, burst: Double) {\n    self.rate = rate; self.burst = burst; self.tokens = burst; self.last = clock.now }\n  func acquire(_ cost: Double = 1) -> Bool {\n    let now = clock.now, e = now - last\n    tokens = min(tokens + rate * (Double(e.components.seconds) + Double(e.components.attoseconds) * 1e-18), burst)\n    last = now\n    guard tokens >= cost else { return false }     // caller: 429 / await sleep\n    tokens -= cost; return true\n  }\n}",
+  "pitfalls": [
+    "Actors serialize but do not throttle: an actor without a rate decision merely queues work, so the limit must be explicit in its state.",
+    "Date()/system time jumps under NTP; ContinuousClock is the documented monotonic basis for interval accounting.",
+    "Actor reentrancy: any await inside the method lets other messages interleave, so state must be updated before suspension points.",
+    "Task.sleep is cancellable and throws; ignoring cancellation in a pacing loop leaves pacing work running after the task is cancelled."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/swift/clock"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "actor-continuous-clock",
+      "name": "actor-isolated token bucket over ContinuousClock",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.7",
+      "requires_features": [
+        "actors",
+        "async-await",
+        "swift-concurrency"
+      ],
+      "idiom_name": "actor-isolated token bucket over ContinuousClock",
+      "implementation_notes": "Swift has no rate limiter in the standard library, so the pattern is hand-written; Swift concurrency supplies the pieces: an actor serializes access to the token state without an explicit lock, and ContinuousClock is the monotonic clock Apple documents with sleep(for:)/sleep(until:) for suspending a task. A non-blocking acquire() returns false and lets the caller answer 429 or back-pressure; a pacing call awaits clock.sleep(until:) for the deficit. Use the actor form for async server or client code; the GCD timer variant remains for callback-based codebases.",
+      "code_sketch": "actor RateLimiter {\n  private let clock = ContinuousClock()\n  private var tokens: Double, last: ContinuousClock.Instant\n  private let rate: Double, burst: Double\n  init(rate: Double, burst: Double) {\n    self.rate = rate; self.burst = burst; self.tokens = burst; self.last = clock.now }\n  func acquire(_ cost: Double = 1) -> Bool {\n    let now = clock.now, e = now - last\n    tokens = min(tokens + rate * (Double(e.components.seconds) + Double(e.components.attoseconds) * 1e-18), burst)\n    last = now\n    guard tokens >= cost else { return false }     // caller: 429 / await sleep\n    tokens -= cost; return true\n  }\n}",
+      "pitfalls": [
+        "Actors serialize but do not throttle: an actor without a rate decision merely queues work, so the limit must be explicit in its state.",
+        "Date()/system time jumps under NTP; ContinuousClock is the documented monotonic basis for interval accounting.",
+        "Actor reentrancy: any await inside the method lets other messages interleave, so state must be updated before suspension points.",
+        "Task.sleep is cancellable and throws; ignoring cancellation in a pacing loop leaves pacing work running after the task is cancelled."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/swift/clock"
+      ]
+    },
+    {
+      "variant_id": "gcd-timer-cadence",
+      "name": "DispatchSourceTimer cadence draining a queue",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5",
+      "requires_features": [
+        "dispatch"
+      ],
+      "idiom_name": "DispatchSourceTimer repeating cadence draining a work queue",
+      "implementation_notes": "For callback-era code without async/await, the limiter is a repeating DispatchSourceTimer: makeTimerSource(queue:) plus schedule(deadline:repeating:leeway:) invokes a handler at a fixed cadence, and the handler admits at most a fixed amount of work per tick - a leaky-bucket style pacing that needs no per-request clock math. Apple documents leeway as the window in which the system may coalesce the timer, so the cadence is approximate by design; the handler runs on the timer's queue and must stay cheap.",
+      "code_sketch": "let q = DispatchQueue(label: \"limiter\")\nlet timer = DispatchSource.makeTimerSource(queue: q)\ntimer.schedule(deadline: .now(), repeating: .milliseconds(10),\n               leeway: .milliseconds(1))          // ~100 batches/s\ntimer.setEventHandler { drainUpTo(10) }           // 10 admitted per tick\ntimer.activate()\n// on shutdown: timer.cancel()",
+      "pitfalls": [
+        "The timer retains its event handler and keeps firing until cancel(); forgetting it leaks the source and its queued work.",
+        "leeway and timer coalescing make the effective rate approximate - a hard quota must not rely on the nominal cadence alone.",
+        "Batch semantics differ from per-request limits: bursts of up to batch size appear at each tick, so smooth spacing requires a smaller batch."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/dispatch/dispatchsourcetimer"
+      ]
+    }
+  ],
+  "default_variant": "actor-continuous-clock"
+}

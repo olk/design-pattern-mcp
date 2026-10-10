@@ -1,0 +1,191 @@
+{
+  "category": "concurrency-resilience",
+  "name": "lazy-collection",
+  "aliases": [
+    "lazy sequence",
+    "lazy list"
+  ],
+  "intent": "Represent a sequence as a collection-like value whose elements are computed on demand, so an infinite or larger-than-memory sequence can be processed lazily - element work happens only when a consumer asks for it and stops when the consumer stops.",
+  "problem": "A sequence is unbounded, larger than memory, or expensive per element: materialising it up front (list, array, result set) either fails outright or pays for elements nobody will read, while exposing the production loop to each consumer (or hand-writing a cursor, cache and transformation logic in every call site) duplicates the same bookkeeping and leaks the producer's state. The decision is whether to expose a lazy, collection-shaped abstraction at all, and whether repeated access should recompute elements or memoize them.",
+  "context": "Applies to in-process sequence abstractions over sources that are produced or fetched rather than already resident - generated or infinite series, files and logs, pages of a remote API, wide query results, large trees and streams - where consumers may stop early or pull one element at a time, where transformations should compose without intermediate collections, and where the language or ecosystem offers a lazy sequence form (generators, iterator adapters, lazy views or collections, deferred query operators). It does not transfer across a process or network boundary: laziness there is pagination or backpressure, not a lazy collection.",
+  "benefits": [
+    "Sequences larger than memory, or unbounded, become processable: memory tracks the working element (plus whatever the memoization policy deliberately retains) instead of the whole sequence.",
+    "Work is proportional to demand: elements the consumer never asks for are never computed, fetched or allocated, and an early exit stops production at that point.",
+    "Composition keeps the declarative shape while costing a single pass: map/filter/take chains stay lazy and do not build intermediate collections.",
+    "Production policy and consumption policy decouple: one source plugs into any consumer or adapter vocabulary, and the consumer decides when to force.",
+    "Latency to the first element drops: streaming responses, first-match searches and paged reads hand results back before the source has been traversed.",
+    "Optional memoization makes repeated access cheap where recomputation is expensive (lazy list or cached sequence), without forcing eager materialisation up front."
+  ],
+  "tradeoffs": [
+    "Evaluation timing becomes implicit: side effects, I/O and exceptions happen at the consumer's pull, far from the code that created the sequence, which moves where failures surface and makes profiling and debugging harder.",
+    "Traversal semantics surprise: many realizations are single-use or re-evaluating (Java Stream and JS generators throw or yield nothing on a second pass; IEnumerable, Sequence and lazy views silently recompute), while memoizing realizations retain memory instead.",
+    "Retention and space leaks: a memoizing lazy list holds its head and therefore the whole realized prefix, and adapter chains retain their captured sources, closures and buffers for as long as the sequence lives.",
+    "Per-element overhead can beat the savings: closure dispatch, boxing and indirection make a lazy chain slower than an index loop for small or hot data - an effect the Kotlin documentation explicitly warns about for sequences.",
+    "Algorithms that need all elements (sort, reverse, group-by, count) force materialization and hang on unbounded sources, so laziness must be bounded before it meets them.",
+    "Abandoned sequences leak resources: generators, streams and channel-based producers keep frames, file handles or goroutines alive unless they are closed or cancelled deterministically."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Lazy sequence",
+      "responsibility": "The collection-shaped value the client holds: knows how to produce element N+1 on demand, keeps the production state private and exposes the traversal contract (single-use or re-iterable, memoized or recomputing)."
+    },
+    {
+      "role": "Deferred element computation",
+      "responsibility": "The thunk, generator frame or source read that produces one element when it is demanded, and only then - it is the unit of work that laziness defers."
+    },
+    {
+      "role": "Memo cell / cache",
+      "responsibility": "Optional: stores elements that have already been forced so repeat access does not recompute them; owns the retention policy and is therefore the source of the classic space leak."
+    },
+    {
+      "role": "Adapter / view",
+      "responsibility": "A lazy transformation (map/filter/take/zip/flatMap) attached between source and consumer: it wraps a sequence, applies per element on the way through, and never materializes an intermediate collection."
+    },
+    {
+      "role": "Consumer / terminal operation",
+      "responsibility": "Drives forcing, decides how many elements to take and when to stop, and owns resource release; it is the only participant that can turn laziness into actual work."
+    },
+    {
+      "role": "Source",
+      "responsibility": "The underlying data producer - an in-memory structure, file, query result, API pages, or an unbounded generative rule - which the lazy sequence reads or wraps."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "module",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Streaming files, logs and sockets where the input does not fit memory: hand out one line/record/chunk per pull, so a consumer that stops early also stops the reads.",
+    "Unbounded or generated series (counters, IDs, timestamps, simulation steps, sensor ticks, property-test inputs) consumed with take/limit/prefix.",
+    "Walking paginated remote APIs lazily: fetch page N+1 only when the consumer passes the current page, so a first-match search stops after the page that contains it.",
+    "Wide database or ORM result sets and derived projections: iterate rows or computed views without materializing the whole result set.",
+    "Composition-heavy transformation over big data: map/filter/flatMap chains that must not build intermediate collections (pairs with deforestation and transducers).",
+    "Expensive derived views over existing structures - filtered indices, projected tree walks, sparse-matrix rows - where only part of the result is ever needed.",
+    "Real-time log processing pipelines: tail -f style streaming of log lines through filter/map/alert chains where early-match exits prevent full file reads.",
+    "ETL and data pipeline ingestion: lazily consume CSV rows, JSON newline-delimited records, or database cursors where downstream transforms may short-circuit on data-quality signals.",
+    "Event-sourcing replay: lazily iterate an event store where replay may stop at a snapshot or checkpoint without reading the full history.",
+    "Graph traversal frontiers: BFS/DFS lazy frontier queues that never materialize all reachable nodes simultaneously, stopping when a target is found.",
+    "Java Stream API pipelines: compose filter/map stages over large or unbounded sources and let short-circuiting terminals consume only the demanded prefix.",
+    "C# LINQ IEnumerable queries: defer Where/Select projections until enumeration so a consumer can stop early without materializing the source.",
+    "Rust std::iter adapters and Python itertools: build memory-efficient map/filter/take chains over generated or file-backed records, then force them with a consuming operation."
+  ],
+  "avoid_when": [
+    "The collection is small and fully consumed: an eager list/array and a plain loop are simpler, faster and easier to test.",
+    "Consumers need random access, multiple independent passes or a stable snapshot: materialize deliberately (array/list) or use a persistent data structure.",
+    "Elements carry side effects whose order or completeness matters: an eager loop with an explicit sequence of operations does not hide evaluation timing.",
+    "The data crosses a process or service boundary: page or stream explicitly with backpressure instead of shipping a lazy handle whose laziness does not survive the wire.",
+    "The needed operations require all elements (sort, reverse, group-by, count, join): materialize at a chosen point or use a genuinely streaming algorithm; laziness cannot make those incremental."
+  ],
+  "language_files": {
+    "generic": "lazy-collection.generic.json",
+    "c": "lazy-collection.c.json",
+    "cplusplus": "lazy-collection.cplusplus.json",
+    "csharp": "lazy-collection.csharp.json",
+    "go": "lazy-collection.go.json",
+    "java": "lazy-collection.java.json",
+    "javascript": "lazy-collection.javascript.json",
+    "kotlin": "lazy-collection.kotlin.json",
+    "python": "lazy-collection.python.json",
+    "ruby": "lazy-collection.ruby.json",
+    "rust": "lazy-collection.rust.json",
+    "scala": "lazy-collection.scala.json",
+    "swift": "lazy-collection.swift.json",
+    "typescript": "lazy-collection.typescript.json"
+  },
+  "paradigm": [
+    "functional",
+    "declarative"
+  ],
+  "scope": "value",
+  "provenance": [
+    "functional-catalog",
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "generator",
+    "iterator",
+    "memoization",
+    "deforestation",
+    "transducer",
+    "lazy-initialization",
+    "collection-pipeline"
+  ],
+  "anti_patterns": [
+    "Laziness as a substitute for validation or cleanup: elements reach the consumer before the checks an eager pass would have performed, and early exit skips whatever cleanup that pass owned.",
+    "Treating a lazy collection as a re-iterable, thread-safe value: Java streams, JS generators and Go iterators are single-use, so a second traversal throws or silently yields nothing.",
+    "Forcing adapter chains over small data where a loop is faster, paying closure/boxing overhead for no memory benefit.",
+    "Memoizing every forced element of a huge or unbounded source while holding the head, turning laziness into a space leak.",
+    "Running a materializing operation (sorted, count, toList, spread) on an infinite source - a hang written as one line.",
+    "Hiding an unbounded lazy sequence behind an API whose other callers iterate it twice, silently duplicating work or losing elements.",
+    "Returning a lazy collection from a library API without documenting its traversal contract, leaving consumers unable to predict reuse behavior.",
+    "Using a single-use lazy sequence as a cache: repeating the traversal recomputes every element, defeating the purpose for expensive sources."
+  ],
+  "design_principles": [
+    "Separation of concerns: the sequence describes what the elements are; the consumer decides when they are computed.",
+    "Lazy evaluation as economic design: compute only what is demanded, so cost tracks the benefit actually taken (call-by-need).",
+    "Uniformity and composability: finite, infinite, generated and derived sequences share one protocol, so adapters compose without special cases.",
+    "Single responsibility: sources produce, adapters transform, terminals force, consumers own the exit policy and the memoization decision.",
+    "Information hiding: producer state, buffers and the caching policy stay behind the collection interface.",
+    "Explicit over implicit: the traversal contract (single-use vs re-iterable, memoized vs recomputing) must be documented; implicit contracts cause subtle bugs."
+  ],
+  "best_practices": [
+    "State the traversal contract explicitly: single-use or re-iterable, memoized or recomputing, thread-safe or not; prefer factories that return a fresh sequence per traversal.",
+    "Make cardinality visible: name unbounded sources, bound them at the consumer with take/limit/islice/prefix, and document which operations force everything.",
+    "Keep lazy stages pure; move side effects and validation to explicit boundaries so laziness cannot reorder or skip them.",
+    "Force deliberately at the orchestration layer: terminal operations belong where the result is needed, not inside adapters or shared helpers.",
+    "Release resources deterministically (close/aclose, using/Dispose, with or try/finally, defer plus context) instead of relying on garbage collection for abandoned sequences.",
+    "Memoize only when recomputation is expensive and retention is bounded; otherwise prefer recomputation or an explicit materialization point.",
+    "Measure before going lazy: for small or hot data an eager loop usually wins.",
+    "Profile memory with bounded retention: in memoizing realizations, track the realized prefix size and consider bounded LRU eviction or weak references for long-lived sequences over large data.",
+    "Handle exceptions at forcing boundaries: a lazy sequence that raises on the 1000th element surfaces the failure far from its creation site; wrap terminal operations with error context that includes the element index.",
+    "Validate inputs at sequence creation, not at forcing time: contract violations caught early are easier to debug than failures that surface mid-traversal.",
+    "Prefer language-native lazy forms over hand-rolled implementations: itertools in Python, Java Streams, LINQ in C#, Seq in F#, Rust iterators, and LazyList in Scala are optimized and well-tested; reinventing them risks subtle semantic differences.",
+    "Use lazy collections in API boundaries with caution: callers may not expect a sequence to be consumed on a different thread or at an unexpected time; prefer concrete return types where laziness would be surprising."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Abelson & Sussman, Structure and Interpretation of Computer Programs (MIT Press, 1985/1996) - section 3.5 Streams: delayed evaluation of list elements and infinite streams built from them.",
+    "https://mitp-content-server.mit.edu/books/content/sectbyfn/books_pres_0/6515/sicp.zip/full-text/book/book-Z-H-24.html",
+    "https://clojure.org/reference/sequences",
+    "https://en.wikipedia.org/wiki/Lazy_evaluation",
+    "https://kotlinlang.org/docs/sequences.html",
+    "https://scala-lang.org/api/3.5.2/scala/collection/immutable/LazyList.html",
+    "John Hughes, 'Why Functional Programming Matters' (1984) - discusses lazy evaluation as a key compositional advantage in functional languages, including infinite structures and modularity.",
+    "https://docs.python.org/3/library/itertools.html - Python itertools module: generator-based lazy sequence operators (islice, filterfalse, takewhile, dropwhile, map, starmap, chain, etc.).",
+    "https://docs.python.org/3/glossary.html#term-generator - Python generator expressions and generator functions as lazy iterator factories.",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/package-summary.html - Java Stream API: intermediate (lazy) vs terminal (eager) operations, pipelining, and short-circuiting.",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html - Java Stream single-use contract and lazy evaluation semantics.",
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/function* - JavaScript generator functions and generator objects: lazy production, single-use, and the distinction from iterators.",
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols - JavaScript iterator and iterable protocols underlying lazy sequences.",
+    "https://learn.microsoft.com/en-us/dotnet/csharp/linq/ - C# LINQ deferred execution: IEnumerable uses lazy evaluation; IQueryable adds expression trees and remote provider composability.",
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html - Rust Iterator trait: all adaptors are lazy and return new iterators; only consuming methods (collect, fold, etc.) trigger evaluation.",
+    "https://go.dev/blog/pipelines - Go blog: pipelines, concurrency, and the relationship between channels and streaming data processing.",
+    "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/swiftstandardlibrary/Sequence/ - Swift Sequence protocol: lazy collections via LazySequenceProtocol for on-demand evaluation.",
+    "Wadler & Gill, 'A Preview of the New Haskell' (1990) - early discussion of lazy evaluation space complexity and the importance of weak head normal form for streaming.",
+    "https://sicp.sourceacademy.org/chapters/3.5.4.html",
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/stream/Stream.html",
+    "https://learn.microsoft.com/en-us/dotnet/csharp/linq/get-started/introduction-to-linq-queries",
+    "https://doc.rust-lang.org/stable/std/iter/index.html",
+    "https://docs.python.org/3/library/itertools.html",
+    "https://github.com/python/peps/blob/b39aefe6614b4e8a925d07c4b3ed47e147236dbe/peps/pep-0533.rst"
+  ],
+  "related_patterns_notes": {
+    "coroutine": "coroutine"
+  }
+}

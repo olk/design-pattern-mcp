@@ -1,0 +1,56 @@
+{
+  "pattern": "plugin",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "cdylib + entry fn returning a repr(C) vtable",
+  "implementation_notes": "The portable baseline: the plugin crate is built as a cdylib and exports one #[no_mangle] extern \"C\" entry function returning a pointer to a #[repr(C)] struct of function pointers (or to a boxed object behind an opaque pointer), since Rust has no stable ABI and no runtime reflection. The host calls libloading::Library::new and Symbol::get to resolve the entry point, keeps the Library handle alive for as long as any code from it is reachable, and wraps every exported function with catch_unwind because unwinding across the C boundary is undefined behaviour. It is the only variant that lets plugins be written in other languages, at the price of hand-written marshalling and lifetime discipline.",
+  "code_sketch": "#[repr(C)]\npub struct FormatterVtable {\n    pub abi: u32,\n    pub format: unsafe extern \"C\" fn(doc: *const Doc) -> *mut c_char,\n}\n\nlet lib = unsafe { Library::new(\"./plugins/libcsv.so\")? };\nlet entry: Symbol<unsafe extern \"C\" fn() -> *const FormatterVtable> =\n    unsafe { lib.get(b\"plugin_entry\\0\")? };\nlet vt = unsafe { entry() };\n// `lib` must outlive `vt`: dropping Library unloads the code behind it",
+  "pitfalls": [
+    "Dropping the Library while a symbol or a value it created is still used segfaults; bundle the handle with the plugin object and order fields so the library is dropped last.",
+    "A panic that crosses the extern \"C\" boundary is undefined behaviour (abort at best), so every exported function needs catch_unwind or a panic-handling wrapper.",
+    "Rust types such as String, Vec and trait objects are not FFI-safe and their layout is unstable across compiler versions; only #[repr(C)] types and C-compatible pointers may cross."
+  ],
+  "sources": [
+    "https://nullderef.com/blog/plugin-abi-stable/",
+    "https://adhdecode.com/articles/rust/rust-plugin-system-dynamic-loading/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "libloading-c-abi",
+      "name": "libloading + #[repr(C)] function-table entry point",
+      "paradigm": "oo",
+      "implementation_notes": "The portable baseline: the plugin crate is built as a cdylib and exports one #[no_mangle] extern \"C\" entry function returning a pointer to a #[repr(C)] struct of function pointers (or to a boxed object behind an opaque pointer), since Rust has no stable ABI and no runtime reflection. The host calls libloading::Library::new and Symbol::get to resolve the entry point, keeps the Library handle alive for as long as any code from it is reachable, and wraps every exported function with catch_unwind because unwinding across the C boundary is undefined behaviour. It is the only variant that lets plugins be written in other languages, at the price of hand-written marshalling and lifetime discipline.",
+      "code_sketch": "#[repr(C)]\npub struct FormatterVtable {\n    pub abi: u32,\n    pub format: unsafe extern \"C\" fn(doc: *const Doc) -> *mut c_char,\n}\n\nlet lib = unsafe { Library::new(\"./plugins/libcsv.so\")? };\nlet entry: Symbol<unsafe extern \"C\" fn() -> *const FormatterVtable> =\n    unsafe { lib.get(b\"plugin_entry\\0\")? };\nlet vt = unsafe { entry() };\n// `lib` must outlive `vt`: dropping Library unloads the code behind it",
+      "pitfalls": [
+        "Dropping the Library while a symbol or a value it created is still used segfaults; bundle the handle with the plugin object and order fields so the library is dropped last.",
+        "A panic that crosses the extern \"C\" boundary is undefined behaviour (abort at best), so every exported function needs catch_unwind or a panic-handling wrapper.",
+        "Rust types such as String, Vec and trait objects are not FFI-safe and their layout is unstable across compiler versions; only #[repr(C)] types and C-compatible pointers may cross."
+      ],
+      "sources": [
+        "https://nullderef.com/blog/plugin-abi-stable/",
+        "https://adhdecode.com/articles/rust/rust-plugin-system-dynamic-loading/"
+      ],
+      "idiom_name": "cdylib + entry fn returning a repr(C) vtable",
+      "min_standard": "Rust2018"
+    },
+    {
+      "variant_id": "abi-stable-root-module",
+      "name": "abi_stable RootModule with load-time layout checking",
+      "paradigm": "oo",
+      "implementation_notes": "The Rust-to-Rust answer: the interface crate derives StableAbi on every type that crosses the boundary, the plugin implements RootModule (with declare_root_module_statics! and a shared BASE_NAME) and is loaded with RootModule::load_from_file, and the runtime checks the recorded layout of each type at load time so a plugin built against a different compiler or crate version is rejected instead of corrupting memory. abi_stable wraps libloading and adds sabi_trait for trait objects across the boundary, but its documented scope is plugin systems without support for unloading - it deliberately leaks the library on load to avoid use-after-free - so prefer it when correctness matters more than hot reload.",
+      "code_sketch": "#[repr(C)]\n#[derive(StableAbi)]\n#[sabi(kind(Prefix))]\npub struct FormatterMod {\n    pub create: extern \"C\" fn() -> BoxedFormatter,\n    #[sabi(last_prefix_field)]\n    pub abi: u32,\n}\n\nimpl RootModule for FormatterMod_Ref {\n    const BASE_NAME: &'static str = \"csv_formatter\";\n    declare_root_module_statics! {FormatterMod_Ref}\n}\n// host: FormatterMod_Ref::load_from_file(path)?",
+      "pitfalls": [
+        "Every type crossing the boundary must derive StableAbi and use abi_stable's FFI-safe standard library types; a plain Vec or String inside a prefix struct is a compile error, and getting the wrapper types right is the real cost.",
+        "The library is intentionally leaked to avoid use-after-free, so plugin reload means restarting the process; likewise the abi_stable ABI itself is versioned per release and mismatches are caught only at load time."
+      ],
+      "sources": [
+        "https://docs.rs/abi_stable/0.10.3/abi_stable/",
+        "https://nullderef.com/blog/plugin-abi-stable/"
+      ],
+      "idiom_name": "abi_stable RootModule + StableAbi layout checks",
+      "min_standard": "Rust2018"
+    }
+  ],
+  "default_variant": "libloading-c-abi"
+}

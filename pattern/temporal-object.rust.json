@@ -1,0 +1,65 @@
+{
+  "pattern": "temporal-object",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "immutable Version struct + Vec<(NaiveDate, Version)> with partition_point as-of lookup",
+  "implementation_notes": "The version role is a struct whose fields are owned values, so a snapshot is a value and publishing is a clone plus insert; the continuity owns a Vec ordered by effective date and the as-of lookup is slice::partition_point, which returns the index of the first version after the query so the version in force is one index back (checked_sub covers the before-the-first case). The standard library has no versioning machinery and there is no shared mutable graph to soften the design, so the continuity/version split is hand-written - which is also why it fits Rust: change is a new value and published values are simply not mutated. chrono::NaiveDate is the conventional effective-date key; the std-only variant uses Unix seconds when a dependency is unwanted.",
+  "code_sketch": "struct Version { fee: Decimal, terms: String }          // plain owned value, cloned to publish\nstruct Contract { id: ContractId, history: Vec<(NaiveDate, Version)> }   // ascending\nimpl Contract {\n    fn as_of(&self, on: NaiveDate) -> Option<&Version> {\n        let i = self.history.partition_point(|(eff, _)| *eff <= on);\n        i.checked_sub(1).map(|k| &self.history[k].1)        // None = Missing Version\n    }\n    fn amend(&mut self, effective: NaiveDate, working: Version) {\n        let at = self.history.partition_point(|(eff, _)| *eff <= effective);\n        self.history.insert(at, (effective, working));      // retroactive or scheduled\n    }\n}",
+  "pitfalls": [
+    "The snapshot is only as immutable as its fields: clone is shallow, so a Vec/HashMap/Rc field inside Version is shared with the previous version and interior mutability can still rewrite history - keep versions owned and plain.",
+    "partition_point requires the slice to be partitioned by the predicate (true run then false run); appending an out-of-order version breaks that invariant and returns a wrong index without any panic.",
+    "NaiveDate carries no time zone and no instant: mixing it with NaiveDateTime::now in local time shifts effective dates, so convert once at the boundary and store one representation.",
+    "Vec::insert shifts the tail and invalidates references taken earlier in the same function; do not hold &Version across an amendment."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/stable/std/primitive.slice.html",
+    "https://docs.rs/chrono/latest/chrono/struct.NaiveDate.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "chrono-dated-snapshots",
+      "name": "chrono calendar dates as effective-date keys",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "chrono"
+      ],
+      "idiom_name": "immutable Version struct + Vec<(NaiveDate, Version)> with partition_point as-of lookup",
+      "implementation_notes": "The version role is a struct whose fields are owned values, so a snapshot is a value and publishing is a clone plus insert; the continuity owns a Vec ordered by effective date and the as-of lookup is slice::partition_point, which returns the index of the first version after the query so the version in force is one index back (checked_sub covers the before-the-first case). The standard library has no versioning machinery and there is no shared mutable graph to soften the design, so the continuity/version split is hand-written - which is also why it fits Rust: change is a new value and published values are simply not mutated. chrono::NaiveDate is the conventional effective-date key; the std-only variant uses Unix seconds when a dependency is unwanted.",
+      "code_sketch": "struct Version { fee: Decimal, terms: String }          // plain owned value, cloned to publish\nstruct Contract { id: ContractId, history: Vec<(NaiveDate, Version)> }   // ascending\nimpl Contract {\n    fn as_of(&self, on: NaiveDate) -> Option<&Version> {\n        let i = self.history.partition_point(|(eff, _)| *eff <= on);\n        i.checked_sub(1).map(|k| &self.history[k].1)        // None = Missing Version\n    }\n    fn amend(&mut self, effective: NaiveDate, working: Version) {\n        let at = self.history.partition_point(|(eff, _)| *eff <= effective);\n        self.history.insert(at, (effective, working));      // retroactive or scheduled\n    }\n}",
+      "pitfalls": [
+        "The snapshot is only as immutable as its fields: clone is shallow, so a Vec/HashMap/Rc field inside Version is shared with the previous version and interior mutability can still rewrite history - keep versions owned and plain.",
+        "partition_point requires the slice to be partitioned by the predicate (true run then false run); appending an out-of-order version breaks that invariant and returns a wrong index without any panic.",
+        "NaiveDate carries no time zone and no instant: mixing it with NaiveDateTime::now in local time shifts effective dates, so convert once at the boundary and store one representation.",
+        "Vec::insert shifts the tail and invalidates references taken earlier in the same function; do not hold &Version across an amendment."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/stable/std/primitive.slice.html",
+        "https://docs.rs/chrono/latest/chrono/struct.NaiveDate.html"
+      ]
+    },
+    {
+      "variant_id": "std-unix-timestamps",
+      "name": "Dependency-free history keyed by std::time (Unix seconds)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "std::time"
+      ],
+      "idiom_name": "Vec<(i64, Version)> keyed by seconds since UNIX_EPOCH, partition_point lookup",
+      "implementation_notes": "When no third-party crates are allowed, the effective date is stored as seconds since UNIX_EPOCH obtained from SystemTime::duration_since, and the history is the same ordered Vec with partition_point or binary_search_by as the lookup - so the structure survives, only the key type changes. The trade-offs show up in the types: std has no calendar arithmetic (no 'first day of next month'), subtracting SystemTime values needs Duration arithmetic, and pre-epoch or platform-specific SystemTime ranges need explicit handling. Choose it for libraries and embedded crates with a no-dependency policy; use chrono when calendar semantics and formatting matter.",
+      "code_sketch": "type Effective = i64;                                  // seconds since UNIX_EPOCH, UTC\nstruct Contract { history: Vec<(Effective, Version)> } // ascending\n\nimpl Contract {\n    fn as_of(&self, on: SystemTime) -> Option<&Version> {\n        let t = on.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;\n        let i = self.history.partition_point(|(eff, _)| *eff <= t);\n        i.checked_sub(1).map(|k| &self.history[k].1)\n    }\n}",
+      "pitfalls": [
+        "SystemTime subtraction must go through duration_since (a Result): the Sub impl panics when the subtrahend is later, so pre-epoch or clock-skew inputs must be handled explicitly.",
+        "Unix seconds discard sub-second precision and the platform SystemTime range is not guaranteed to cover all representable i64 values, so far-future scheduled amendments need a documented bound.",
+        "Without a calendar type, month- and quarter-based amendment scheduling has to be hand-written and month-end arithmetic is easy to get wrong."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/stable/std/primitive.slice.html",
+        "https://doc.rust-lang.org/std/time/struct.SystemTime.html"
+      ]
+    }
+  ],
+  "default_variant": "chrono-dated-snapshots",
+  "version": "1.0"
+}

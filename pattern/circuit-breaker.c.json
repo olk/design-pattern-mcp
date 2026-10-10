@@ -1,0 +1,20 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread_mutex-protected state struct + CLOCK_MONOTONIC cooldown + counter window",
+  "implementation_notes": "C has no breaker library and no runtime to lean on, so the pattern is a struct plus a few functions: a state enum (closed/open/half-open), counters for failures and total calls, an int64 cooldown deadline computed from clock_gettime(CLOCK_MONOTONIC), and admission/recording helpers guarded by a pthread_mutex (or by C11 atomic counters with the transition done under the lock). Nothing replaces the classic structure here, so the classic form is always the choice; the real decisions are placement - one struct instance per dependency, initialized explicitly rather than hidden in a singleton - and keeping the protected call outside the lock so the breaker never serializes the dependency. Return a distinct status code for the short circuit (CB_OPEN versus the driver's error) so callers can branch instead of parsing errno.",
+  "code_sketch": "static struct cb pay_cb = { .m = PTHREAD_MUTEX_INITIALIZER };   /* one per dependency */\n\nif (cb_admit(&pay_cb) != CB_OK)         /* state + deadline checked under the mutex */\n    return reply_unavailable(c);        /* open: the dependency is never called */\n\nstruct timespec t0, t1;\nclock_gettime(CLOCK_MONOTONIC, &t0);    /* monotonic, never CLOCK_REALTIME */\nint rc = payment_authorize(&order);\nclock_gettime(CLOCK_MONOTONIC, &t1);\ncb_record(&pay_cb, rc, ms_between(&t0, &t1));   /* may trip the circuit */",
+  "pitfalls": [
+    "The cooldown must come from CLOCK_MONOTONIC; CLOCK_REALTIME (or time(NULL)) follows the wall clock and can open or close the circuit at the wrong moment.",
+    "The breaker lock must cover only state and counters, never the protected call, or every request serializes behind one mutex.",
+    "A breaker struct copied per thread stops aggregating failures (each copy sees only its own calls), which silently disables tripping; share it by reference.",
+    "Emitting logs or metrics callbacks while holding the breaker lock invites deadlock whenever the callback re-enters the breaker.",
+    "Counters of type int incremented from several threads race; use C11 atomics or keep every update under the same mutex."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man2/clock_gettime.2.html",
+    "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+  ],
+  "version": "1.0"
+}

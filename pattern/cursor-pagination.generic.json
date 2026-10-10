@@ -1,0 +1,31 @@
+{
+  "pattern": "cursor-pagination",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "opaque page token + keyset (seek) predicate + bounded page envelope",
+  "implementation_notes": "Language-neutral form: define a page envelope (items + next token) and derive the token from the ordering keys of the last returned item. Decode it into a strictly-after predicate on the same total order the query uses - order by a unique, immutable, non-null, indexed key, appending the primary key when the natural sort is not unique - and fetch page_size + 1 rows so a short page cannot be mistaken for the end. Keep only the responsibilities distinct: the token codec (opaque, URL-safe, signed or encrypted, versioned), the seek predicate, and the page assembler; validate that the pinned filter and ordering still match the request and reject mismatches. Bound the page size with a documented default and maximum, and define token expiry up front. Use base64url encoding (RFC 4648 §5) for URL-safe cursors - standard base64 uses +, / and = which require percent-encoding in query strings and create double-encoding bugs. Encode the cursor payload as JSON or a protobuf message, then sign (HMAC-SHA256) or use authenticated encryption rather than plain base64. Embed the filter hash or sort key in the token payload to make it self-validating. For bidirectional pagination, encode both forward and backward cursors per page, reverse the sort order and the inequality direction for the prev query, then reverse the result array back to forward order before returning.",
+  "code_sketch": "request:  list(filter, order, page_size, page_token?)\ncursor = decode(page_token) if page_token else START\nrows   = query(filter, order) where strictly_after(cursor) limit page_size + 1\npage   = rows[:page_size]\nnext   = page_token(keys(page[-1])) if more else NONE\nresponse: { items: page, next_page_token: next }\n# tokens are opaque, URL-safe, signed/encrypted, versioned and expiring",
+  "pitfalls": [
+    "Treating a short page as the end is wrong when the store may legitimately return fewer rows; only the extra row or the token signal proves the collection is exhausted.",
+    "Skipping parameter pinning lets a client change the filter or ordering mid-iteration and silently receive pages of a different sequence.",
+    "Using standard Base64 instead of base64url encoding: + and / require percent-encoding in URLs, causing double-encoding bugs.",
+    "Returning total_count on every response: a COUNT(*) on a large table negates the keyset performance advantage entirely.",
+    "Failing to encode the sort direction in the token: bidirectional cursors that encode only position but not ASC/DESC will reverse the wrong direction.",
+    "Not handling empty cursor strings: cursor='' is truthy in many languages; treat it as no cursor.",
+    "Using a mutable column (e.g., updated_at, float score) as the primary sort key: updates move rows across page boundaries, causing skips or duplicates.",
+    "Not clamping client-supplied page_size server-side: an adversarial client can request page_size=1000000 and exhaust server resources.",
+    "Silently falling back to page 1 on an invalid or expired cursor: this causes user-visible duplicate data and must return a 400 error instead.",
+    "Not testing the pagination contract under concurrent mutation: automated tests should insert, delete, and modify rows between page fetches.",
+    "Postgres sequence commits can land out-of-order near the cursor tail (no locks on sequences): a row with an older sequence value can commit after a row with a newer one, causing duplicate rows on a second pass; capture a cursor boundary before iterating to bound this window.",
+    "DynamoDB's 1 MB page boundary is applied BEFORE FilterExpression — a page can return zero results yet still carry a non-empty LastEvaluatedKey; testing only for presence of a token to detect 'more results' will spin forever when filters eliminate all items in a page.",
+    "Adding expiry to a cursor does not make live-data pagination stable — new inserts and updates can still shift rows across existing page boundaries; expiry only limits how long a tampered or forgotten token remains usable.",
+    "Reverse-cursor complexity: implementing both forward (first/after) AND backward (last/before) pagination doubles the encoding surface (position + sort direction must both be encoded), doubles test cases, and makes token formats harder to version; ship forward-only first.",
+    "Wrong move: using raw primary key values as visible cursors -> clients infer record counts and insertion rates and the format can never change -> instead encode sort values, tiebreaker and a version field into an opaque signed token.",
+    "Wrong move: rotating the cursor signing key or format in place -> every outstanding token held by a long-running consumer fails at once with no recovery signal -> instead keep a non-zero migration window accepting old and new keys and return explicit error codes (cursor_expired, cursor_signed_with_rotated_key) with a documented restart path.",
+    "Wrong move: documenting the cursor's internal structure so clients can parse or construct it -> client logic couples to the encoding and any server-side format change silently breaks consumers -> instead keep the cursor an opaque pass-through and expose traversal state in explicit fields like has_more."
+  ],
+  "sources": [
+    "https://google.aip.dev/158"
+  ],
+  "version": "1.0"
+}

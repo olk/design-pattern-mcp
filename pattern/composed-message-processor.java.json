@@ -1,0 +1,57 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "CompletableFuture.supplyAsync + allOf + reduce",
+  "implementation_notes": "CompletableFuture is the Java 8 realization: supplyAsync per part (async methods without an executor use ForkJoinPool.commonPool), a List<CompletableFuture<Result>> as the correlation state, CompletableFuture.allOf(...) as the completion barrier, then a stream over the futures that join()s and reduces the results into the reply. The routing decision is a branch over the part type inside the supplier, so no separate router object is needed in-process; the classic Aggregator keeps its value when parts travel over JMS/Kafka and the state must be durable.",
+  "code_sketch": "List<CompletableFuture<PartResult>> fs = parts.stream()\n    .map(p -> CompletableFuture.supplyAsync(() -> route(p)))     // fan-out\n    .toList();\nCompletableFuture.allOf(fs.toArray(CompletableFuture[]::new)).join();   // barrier\nOrderReport report = fs.stream().map(CompletableFuture::join)\n    .reduce(OrderReport.empty(), OrderReport::merge, OrderReport::merge);",
+  "pitfalls": [
+    "allOf().join() reports only the first failure as a CompletionException; a partial aggregate must inspect each future with handle()/isCompletedExceptionally().",
+    "Every async stage without an explicit executor shares ForkJoinPool.commonPool, so a blocking part (JDBC, HTTP) starves unrelated code in the same JVM - pass a dedicated executor.",
+    "join() inside the common pool's threads can deadlock when the pool is saturated by the very parts you are waiting for."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "completable-future",
+      "name": "CompletableFuture.allOf over per-part futures",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.supplyAsync + allOf + reduce",
+      "implementation_notes": "CompletableFuture is the Java 8 realization: supplyAsync per part (async methods without an executor use ForkJoinPool.commonPool), a List<CompletableFuture<Result>> as the correlation state, CompletableFuture.allOf(...) as the completion barrier, then a stream over the futures that join()s and reduces the results into the reply. The routing decision is a branch over the part type inside the supplier, so no separate router object is needed in-process; the classic Aggregator keeps its value when parts travel over JMS/Kafka and the state must be durable.",
+      "code_sketch": "List<CompletableFuture<PartResult>> fs = parts.stream()\n    .map(p -> CompletableFuture.supplyAsync(() -> route(p)))     // fan-out\n    .toList();\nCompletableFuture.allOf(fs.toArray(CompletableFuture[]::new)).join();   // barrier\nOrderReport report = fs.stream().map(CompletableFuture::join)\n    .reduce(OrderReport.empty(), OrderReport::merge, OrderReport::merge);",
+      "pitfalls": [
+        "allOf().join() reports only the first failure as a CompletionException; a partial aggregate must inspect each future with handle()/isCompletedExceptionally().",
+        "Every async stage without an explicit executor shares ForkJoinPool.commonPool, so a blocking part (JDBC, HTTP) starves unrelated code in the same JVM - pass a dedicated executor.",
+        "join() inside the common pool's threads can deadlock when the pool is saturated by the very parts you are waiting for."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+      ]
+    },
+    {
+      "variant_id": "structured-task-scope",
+      "name": "StructuredTaskScope fork/join (Java 21 structured concurrency)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "structured concurrency"
+      ],
+      "idiom_name": "StructuredTaskScope.ShutdownOnFailure + fork/join + Subtask.get",
+      "implementation_notes": "Java 21's structured concurrency maps the composite onto one lexical scope: fork one subtask per part, treat scope.join().throwIfFailed() as the completion barrier, then read each Subtask's value in part order and reduce; ShutdownOnFailure cancels the siblings on the first failure, and a custom scope overriding handleComplete is the documented extension point for partial results. The Oracle guide notes the API is a preview feature in Java 21 (compile with the preview flags), so the enclosed scope - and with it the composite - is guaranteed to finish before the enclosing task continues.",
+      "code_sketch": "OrderReport report;\ntry (var scope = new StructuredTaskScope.ShutdownOnFailure()) {\n    var subtasks = parts.stream().map(p -> scope.fork(() -> route(p))).toList();\n    scope.join().throwIfFailed();                     // barrier + fail-fast policy\n    report = subtasks.stream().map(Subtask::get)\n        .reduce(OrderReport.empty(), OrderReport::merge);\n}                                                     // scope shutdown = no orphan parts",
+      "pitfalls": [
+        "Subtask values belong to the scope: read them inside the try-with-resources block (the Oracle examples reduce inside), never after close().",
+        "throwIfFailed() is a fail-fast policy only; partial aggregation needs a custom scope that overrides handleComplete.",
+        "The API is a preview feature in Java 21: without the preview flags it does not compile, and its shape may change in later releases."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/core/structured-concurrency.html"
+      ]
+    }
+  ],
+  "default_variant": "completable-future",
+  "version": "1.0"
+}

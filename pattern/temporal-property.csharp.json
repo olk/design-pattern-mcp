@@ -1,0 +1,60 @@
+{
+  "pattern": "temporal-property",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "EF Core temporal tables (IsTemporal + TemporalAsOf/TemporalAll)",
+  "implementation_notes": "The dominant .NET realization delegates the history to the database: modelBuilder.Entity<Employee>().ToTable(\"Employees\", b => b.IsTemporal()) makes the table system-versioned with a paired history table whose period columns (datetime2, UTC, generated always as row start/end) are maintained by SQL Server, and LINQ exposes TemporalAsOf / TemporalAll / TemporalFromTo / TemporalBetween / TemporalContainedIn over the DbSet, so the pattern's date-parameterised read becomes a query operator instead of a domain member. What replaces the classic structure: the period columns, the history table and the FOR SYSTEM_TIME translation - the entity stays a plain class. Hand-roll the collection instead when the index is a domain (valid) date rather than system/transaction time, when the store is not SQL Server, or when history must be read without a database.",
+  "code_sketch": "// modelBuilder.Entity<Employee>().ToTable(\"Employees\", b => b.IsTemporal());\nvar lastMonth = DateTime.UtcNow.AddMonths(-1);\n\nvar asOfThen = await context.Employees\n    .TemporalAsOf(lastMonth)                     // SQL: FOR SYSTEM_TIME AS OF\n    .SingleAsync(e => e.EmployeeId == id);\n\nvar versions = await context.Employees\n    .TemporalAll()\n    .Where(e => e.EmployeeId == id)\n    .OrderBy(e => EF.Property<DateTime>(e, \"PeriodStart\"))\n    .ToListAsync();",
+  "pitfalls": [
+    "Temporal operators are always no-tracking and the period columns are UTC: passing a local DateTime shifts the instant silently, and a tracked entity from a temporal query must be re-added (_context.Add) to be restored.",
+    "The database records system (transaction) time, not business validity: a correction back-dated to last quarter is not visible AS OF last quarter unless the entity also carries its own valid-from column.",
+    "History tables are append-only and schema-coupled, and period columns are shadow properties (reachable only through EF.Property) until EF Core 11 maps them to CLR properties.",
+    "The feature is provider-specific: it exists for SQL Server temporal tables; other providers need their own history mechanism (PostgreSQL range types, triggers), which the LINQ operators will not translate."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/ef/core/providers/sql-server/temporal-tables",
+    "https://learn.microsoft.com/en-us/sql/relational-databases/tables/querying-data-in-a-system-versioned-temporal-table?view=sql-server-ver16"
+  ],
+  "variants": [
+    {
+      "variant_id": "efcore-temporal-tables",
+      "name": "EF Core over SQL Server system-versioned temporal tables",
+      "paradigm": "declarative",
+      "min_standard": "C#10",
+      "idiom_name": "EF Core temporal tables (IsTemporal + TemporalAsOf/TemporalAll)",
+      "implementation_notes": "The dominant .NET realization delegates the history to the database: modelBuilder.Entity<Employee>().ToTable(\"Employees\", b => b.IsTemporal()) makes the table system-versioned with a paired history table whose period columns (datetime2, UTC, generated always as row start/end) are maintained by SQL Server, and LINQ exposes TemporalAsOf / TemporalAll / TemporalFromTo / TemporalBetween / TemporalContainedIn over the DbSet, so the pattern's date-parameterised read becomes a query operator instead of a domain member. What replaces the classic structure: the period columns, the history table and the FOR SYSTEM_TIME translation - the entity stays a plain class. Hand-roll the collection instead when the index is a domain (valid) date rather than system/transaction time, when the store is not SQL Server, or when history must be read without a database.",
+      "code_sketch": "// modelBuilder.Entity<Employee>().ToTable(\"Employees\", b => b.IsTemporal());\nvar lastMonth = DateTime.UtcNow.AddMonths(-1);\n\nvar asOfThen = await context.Employees\n    .TemporalAsOf(lastMonth)                     // SQL: FOR SYSTEM_TIME AS OF\n    .SingleAsync(e => e.EmployeeId == id);\n\nvar versions = await context.Employees\n    .TemporalAll()\n    .Where(e => e.EmployeeId == id)\n    .OrderBy(e => EF.Property<DateTime>(e, \"PeriodStart\"))\n    .ToListAsync();",
+      "pitfalls": [
+        "Temporal operators are always no-tracking and the period columns are UTC: passing a local DateTime shifts the instant silently, and a tracked entity from a temporal query must be re-added (_context.Add) to be restored.",
+        "The database records system (transaction) time, not business validity: a correction back-dated to last quarter is not visible AS OF last quarter unless the entity also carries its own valid-from column.",
+        "History tables are append-only and schema-coupled, and period columns are shadow properties (reachable only through EF.Property) until EF Core 11 maps them to CLR properties.",
+        "The feature is provider-specific: it exists for SQL Server temporal tables; other providers need their own history mechanism (PostgreSQL range types, triggers), which the LINQ operators will not translate."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/ef/core/providers/sql-server/temporal-tables",
+        "https://learn.microsoft.com/en-us/sql/relational-databases/tables/querying-data-in-a-system-versioned-temporal-table?view=sql-server-ver16"
+      ]
+    },
+    {
+      "variant_id": "manual-effective-dated",
+      "name": "hand-rolled effective-dated collection",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "sorted List<(DateOnly From, T Value)> + latest-start lookup",
+      "implementation_notes": "When the store is not SQL Server temporal tables, or the index is a business validity date, keep the versions in a collection ordered by effective date and read the version in force by walking back to the last start not after the requested date. DateOnly makes the calendar-day granularity explicit and avoids DateTime's Kind/local-vs-UTC trap; SortedList<TKey,TValue> (binary search via IndexOfKey, keys already sorted) or a sorted List plus List<T>.BinarySearch scale better than the linear FindLastIndex shown in the sketch. Prefer this variant when validity differs from transaction time, when the history is small or portable, or when the domain must state its own bound convention.",
+      "code_sketch": "sealed class SalaryHistory\n{\n    private readonly List<(DateOnly From, decimal Amount)> _byStart = new();   // sorted\n    public decimal At(DateOnly when) {\n        var i = _byStart.FindLastIndex(v => v.From <= when);   // latest start <= when\n        if (i < 0) throw new KeyNotFoundException($\"no salary effective on {when}\");\n        return _byStart[i].Amount;\n    }\n    public void Put(DateOnly from, decimal amount) {\n        _byStart.RemoveAll(v => v.From == from); _byStart.Add((from, amount));\n        _byStart.Sort((a, b) => a.From.CompareTo(b.From));\n    }\n}",
+      "pitfalls": [
+        "DateTime carries a Kind (Utc/Local/Unspecified) and comparisons use ticks, so a local timestamp compared against a UTC one picks the wrong version; DateOnly removes the ambiguity but must not be mixed with DateTime keys.",
+        "The linear FindLastIndex is O(n) per read; for a long history keep a SortedList<DateOnly, decimal> (binary search via IndexOfKey, keys in sorted order) or bisect a plain sorted List instead.",
+        "Put removes any version with the same effective date, so two changes within one day (or one granularity unit) collapse into one unless the key includes a sequence/revision.",
+        "Values are references in C#: storing a mutable object and later mutating it changes the historical answer as well, so versions should hold immutable values or copies."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.sortedlist-2?view=net-8.0",
+        "https://martinfowler.com/eaaDev/TemporalProperty.html"
+      ]
+    }
+  ],
+  "default_variant": "efcore-temporal-tables",
+  "version": "1.0"
+}

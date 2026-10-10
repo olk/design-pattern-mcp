@@ -1,0 +1,155 @@
+{
+  "category": "concurrency-resilience",
+  "name": "monitor-object",
+  "aliases": [
+    "thread-safe passive object",
+    "monitor"
+  ],
+  "intent": "Serialise concurrent method invocations on a shared object by giving the object its own lock and condition variables, so that only one method executes inside it at a time and methods that cannot proceed wait cooperatively instead of polling.",
+  "problem": "Objects shared by several threads expose their state through ordinary methods, and nothing stops concurrent callers from interleaving inside those methods, corrupting the invariants they were written to maintain. The race is then papered over with ad-hoc locking, sleeps and busy-wait loops scattered through client code. The recurring decision is whether the object itself should own the serialisation (and the scheduling) of its methods instead of leaving that discipline to every caller.",
+  "context": "Shared-memory concurrency, where the mutable state of an object is reached by more than one thread and its methods must be atomic with respect to one another. It matters most when some methods cannot run to completion until another method changes the state - a queue that is full or empty, a resource that is not yet available, a phase that has not been reached - because then a method must suspend and later resume, which requires releasing the lock while it waits.",
+  "benefits": [
+    "The object's interface becomes the synchronisation boundary: callers invoke methods normally and cannot forget the lock, because acquiring and releasing it is an implementation detail of the object rather than a client responsibility.",
+    "Mutual exclusion is per object and automatic: at most one synchronised method runs inside a given instance at any time, so the object's invariants hold between calls and the class can be handed to any number of threads.",
+    "Cooperative scheduling replaces polling: a method that cannot proceed waits on a monitor condition and is notified by the method that changed the state, so waiting threads consume no CPU and the order of execution can be shaped by the object rather than by the OS.",
+    "It is cheaper than the Active Object alternative: methods run in the calling thread, so there is no per-request object, activation queue, dispatch or extra context switch - which is why bounded buffers, registries and shared counters are usually monitors rather than active objects.",
+    "Where the language implements monitors natively (Java intrinsic locks, C# Monitor, or a Swift actor) the runtime also supplies reentrancy and the memory-visibility guarantee (a happens-before edge between unlock and the next lock), so serialisation is observable in the data, not merely in the schedule.",
+    "Reasoning and review stay local: the unit of atomicity is a method of an object, which is small enough to document and test, unlike a lock protocol spread over callers."
+  ],
+  "tradeoffs": [
+    "Synchronisation and functionality are coupled: the wait and notify logic lives inside the very methods that implement the behaviour, so changing the locking policy - timeouts, fairness, non-blocking acquisition - means editing every method, whereas an active object can change its scheduler independently.",
+    "Nested monitor lockout: calling a blocking method of a second monitor while holding the first one can deadlock, because waiting releases only the inner lock while the outer lock stays held - the canonical Java example in the pattern's own description.",
+    "Coarse granularity: one lock per object also serialises methods that never touch the same field, so a busy monitor becomes a throughput bottleneck and restoring concurrency means lock striping, read-write locking or a redesign.",
+    "Blocked callers occupy threads: every thread waiting inside a monitor is a thread that cannot do other work, so monitor-heavy designs starve bounded thread pools and cannot be used from a single-threaded event loop or a non-blocking task runtime at all.",
+    "Signalling is limited and subtle: intrinsic monitors have one wait queue, so notifyAll plus repeated predicate checks are the norm, fairness is unspecified, and notifications can be lost, spurious or delivered to the wrong waiter.",
+    "Correctness is easy to violate in ways that only appear under load: a wait outside a predicate loop, a notify without the lock, or a callback invoked while holding the monitor all pass tests and fail in production."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 5,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 4
+  },
+  "participants": [
+    {
+      "role": "Monitor Object",
+      "responsibility": "Exports the object's services to clients and owns its state, its monitor lock and its monitor conditions; it has no thread of its own, so every method executes in the thread of the client that invoked it."
+    },
+    {
+      "role": "Synchronized Methods",
+      "responsibility": "The thread-safe services of the monitor object: each acquires the monitor lock on entry and releases it on exit, and at most one of them runs in the object at any point in time, however many threads call concurrently."
+    },
+    {
+      "role": "Monitor Lock",
+      "responsibility": "The per-object mutex (or the intrinsic object lock) that serialises method invocations; it is held while a method touches the object's state and released when the method returns or waits."
+    },
+    {
+      "role": "Monitor Condition",
+      "responsibility": "The condition variables a synchronized method waits on and notifies in order to schedule method execution cooperatively (not-empty and not-full in a bounded queue); waiting releases the monitor lock and re-acquires it before the method resumes."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Bounded buffers and work queues shared by producer and consumer threads, where producers wait while the queue is full and consumers wait while it is empty - the pattern's canonical example.",
+    "Session, connection or entity registries on a server, where lookups, insertion and eviction must be atomic and callers may have to wait for capacity or for an entry to reappear.",
+    "Caches with in-flight bookkeeping (single-flight computation), where a thread that requests an already-computed key waits for the first thread's result instead of recomputing it.",
+    "Shared configuration, counters or statistics objects read and updated by request threads, where each call must observe a consistent snapshot of the state.",
+    "State machines and simulators whose step methods block until another thread advances a transition, for example a test harness waiting for a worker to reach a known state.",
+    "In-process resource pools (connection, database or worker pools) where acquisition blocks until an entry is returned or a timeout expires.",
+    "Java's java.util.concurrent.ArrayBlockingQueue is a fixed-capacity monitor-style bounded buffer: put blocks while full and take blocks while empty, making the producer-consumer coordination explicit.",
+    ".NET's System.Collections.Concurrent.BlockingCollection<T> supplies bounded Add/Take blocking, cancellation and completion semantics around a producer-consumer collection; use it instead of hand-rolling Monitor.Wait/Pulse.",
+    "Python's queue.Queue provides a thread-safe multi-producer/multi-consumer boundary with blocking put/get operations and optional timeouts, a standard monitor-style primitive for worker pools."
+  ],
+  "avoid_when": [
+    "The shared state is read-mostly or written rarely: a read-write lock, an immutable snapshot behind an atomic reference, or copy-on-write gives far more concurrency than one lock per object.",
+    "The critical section is a single variable or counter: atomics (java.util.concurrent.atomic, Interlocked, std::atomic) remove the monitor entirely.",
+    "Ownership can be transferred instead of shared: channels, actors, or confinement to a single-threaded event loop give the same serialisation without locks, and should be preferred when the object does not have to be called synchronously from many threads.",
+    "Callers are asynchronous (async/await, coroutines, callbacks): blocking a thread inside a monitor burns a scheduler thread, so use the runtime's async mutex or queue, or confine the object to one executor.",
+    "The state is confined to one thread by construction (UI toolkit objects, request-scoped state, per-connection buffers): locking adds cost and hides the confinement invariant that made the code safe.",
+    "A framework already supplies the guarded object (java.util.concurrent collections, BlockingQueue, Channel, concurrent containers, database transactions): do not rebuild the monitor on top."
+  ],
+  "language_files": {
+    "generic": "monitor-object.generic.json",
+    "c": "monitor-object.c.json",
+    "cplusplus": "monitor-object.cplusplus.json",
+    "csharp": "monitor-object.csharp.json",
+    "go": "monitor-object.go.json",
+    "java": "monitor-object.java.json",
+    "javascript": "monitor-object.javascript.json",
+    "kotlin": "monitor-object.kotlin.json",
+    "python": "monitor-object.python.json",
+    "ruby": "monitor-object.ruby.json",
+    "rust": "monitor-object.rust.json",
+    "scala": "monitor-object.scala.json",
+    "swift": "monitor-object.swift.json",
+    "typescript": "monitor-object.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "active-object",
+    "guarded-suspension",
+    "producer-consumer",
+    "thread-safe-interface",
+    "scoped-locking",
+    "strategized-locking",
+    "lockable-object",
+    "actor"
+  ],
+  "anti_patterns": [
+    "Locking on a publicly reachable object (this, a Type, an interned String, a public field) so that foreign code can acquire the same lock and deadlock or block the object deliberately.",
+    "Busy-waiting inside a synchronised method - spinning or sleeping while still holding the lock - so no other thread can enter the monitor and the CPU is burned for nothing.",
+    "Calling out to listeners, callbacks or other monitors while holding the monitor lock, which holds the lock across unrelated code and invites deadlock.",
+    "Waiting with a single if instead of a loop, or signalling with notify when several predicates share one wait queue, producing lost and wrong-thread wakeups.",
+    "One global monitor for everything in the process, or one lock per field: the first destroys concurrency, the second creates lock-ordering deadlocks, and both lose the per-object granularity the pattern is about.",
+    "Rebuilding the pattern on a runtime that already serialises (a single-threaded event loop, an actor mailbox), producing locks that can never be contended and blocking that can never succeed."
+  ],
+  "design_principles": [
+    "Encapsulation and information hiding: the state and the operations that guard it live in the same object, and callers never see the lock.",
+    "Objects own their own synchronisation: acquiring and releasing the lock must not be a client responsibility, so the sync boundary is the object's method interface.",
+    "Separation of concerns: mutual exclusion and condition-based scheduling are designed apart, and interface methods that lock are separated from implementation methods that assume the lock is held.",
+    "Method-level atomicity: the public method is the unit of atomicity and of reasoning, which keeps the invariant checkable per call instead of per interleaving.",
+    "Cooperative progress: a method that cannot proceed releases the monitor so other methods can establish the condition that unblocks it; waiting must never hold the lock."
+  ],
+  "best_practices": [
+    "Acquire the monitor lock in the outermost interface method with a scoped guard (synchronized block, lock statement, with lock, lock_guard, Monitor synchronize) so that every exit path releases it, including exceptions.",
+    "Always wait in a loop that re-tests the predicate, and prefer broadcasting - or a separate condition per predicate where the platform supports it - so that a wakeup cannot be addressed to the wrong waiter.",
+    "Never hold the lock across blocking I/O, callbacks or another monitor's blocking method; notify after the state change is published, and let awakened threads re-acquire the lock themselves.",
+    "Keep the synchronised region as short as possible: compute and validate outside the lock, then re-check inside it, and avoid any dynamic dispatch while the monitor is held.",
+    "Use a private, dedicated lock object (or a System.Threading.Lock on modern .NET), never this, a Type or an interned string, and never a value type that would be boxed per call.",
+    "Bound every wait: provide timed waits, tryAcquire or cancellation where the platform offers them, and document for each method whether it can block, how long and what happens on timeout or interrupt.",
+    "Test the concurrency contract with stress or property-based tests and document the threading invariants next to the class, since these failures rarely reproduce deterministically."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (2000) - Monitor Object (Concurrency Patterns chapter).",
+    "Douglas C. Schmidt, 'Monitor Object: An Object Behavioral Pattern for Concurrent Programming' (pattern paper underlying the POSA2 chapter; describes participants, dynamics, variants, known uses and consequences).",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/monitor.pdf",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/pattern-abstracts.html",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html",
+    "https://www.dre.vanderbilt.edu/~schmidt/cs891s/2020-PDFs/8.5.1-monitor-object-usage-considerations.pdf",
+    "https://dl.acm.org/doi/10.1145/355620.361161",
+    "https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/concurrent/ArrayBlockingQueue.html",
+    "https://learn.microsoft.com/en-us/standard/collections/thread-safe/blockingcollection-overview",
+    "https://docs.python.org/3/library/queue.html",
+    "https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/lang/Object.html",
+    "https://learn.microsoft.com/en-us/dotnet/fundamentals/runtime-libraries/system-threading-monitor-wait",
+    "https://www.dre.vanderbilt.edu/~schmidt/cs254/2021-PDFs/8.5.1-monitor-object-usage-considerations.pdf"
+  ]
+}

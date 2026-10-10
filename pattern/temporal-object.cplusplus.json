@@ -1,0 +1,77 @@
+{
+  "pattern": "temporal-object",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "continuity class owning std::map<system_clock::time_point, Version> with upper_bound as-of lookup",
+  "implementation_notes": "The continuity is an ordinary class owning a std::map keyed by a std::chrono time point whose values are immutable Version objects: as-of is one std::map::upper_bound() call stepped back one element and current is the last entry, so the temporal collection collapses into the ordered container and no search code remains. A new version is built as a value copy of the one in force (Version working = current(); working.setFee(...)) and inserted at its effective date, which keeps every published state frozen while retroactive and future-dated amendments stay ordinary inserts. Choose this node-based form when history is sparse; the flat-vector variant wins when the whole history is traversed repeatedly (reports, period enumeration).",
+  "code_sketch": "using Clock = std::chrono::system_clock;\nclass Contract {                                    // continuity\npublic:\n  const Terms& current() const { return history_.rbegin()->second; }\n  const Terms* as_of(Clock::time_point on) const {\n    auto it = history_.upper_bound(on);             // first version after 'on'\n    return it == history_.begin() ? nullptr : &std::prev(it)->second;   // nullptr = Missing\n  }\n  void amend(Clock::time_point eff, const Terms& t) { history_[eff] = t; }\nprivate:\n  std::map<Clock::time_point, Terms> history_;      // ordered version history\n};",
+  "pitfalls": [
+    "Boundary error: the version in force is the greatest key <= date, i.e. upper_bound() stepped back; lower_bound() silently returns the next version when the query date is exactly an effective date.",
+    "A member accessor that hands out Terms& lets callers mutate published history; return const& or values and always edit a copy (working copy, then insert).",
+    "std::map allocates a node per version and has poor cache locality; recording many versions for one object should use the flat-vector variant or a coarser effective-date granularity.",
+    "Changing the key granularity is a semantic change: converting timestamps to day keys (std::chrono::floor<days>) can move an effective moment into the previous version, so the floor/ceil rule must be explicit and shared."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/container/map/upper_bound",
+    "https://en.cppreference.com/w/cpp/chrono/time_point"
+  ],
+  "variants": [
+    {
+      "variant_id": "map-by-time-point",
+      "name": "Continuity + std::map keyed by a chrono time point (classic)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "continuity class owning std::map<system_clock::time_point, Version> with upper_bound as-of lookup",
+      "implementation_notes": "The continuity is an ordinary class owning a std::map keyed by a std::chrono time point whose values are immutable Version objects: as-of is one std::map::upper_bound() call stepped back one element and current is the last entry, so the temporal collection collapses into the ordered container and no search code remains. A new version is built as a value copy of the one in force (Version working = current(); working.setFee(...)) and inserted at its effective date, which keeps every published state frozen while retroactive and future-dated amendments stay ordinary inserts. Choose this node-based form when history is sparse; the flat-vector variant wins when the whole history is traversed repeatedly (reports, period enumeration).",
+      "code_sketch": "using Clock = std::chrono::system_clock;\nclass Contract {                                    // continuity\npublic:\n  const Terms& current() const { return history_.rbegin()->second; }\n  const Terms* as_of(Clock::time_point on) const {\n    auto it = history_.upper_bound(on);             // first version after 'on'\n    return it == history_.begin() ? nullptr : &std::prev(it)->second;   // nullptr = Missing\n  }\n  void amend(Clock::time_point eff, const Terms& t) { history_[eff] = t; }\nprivate:\n  std::map<Clock::time_point, Terms> history_;      // ordered version history\n};",
+      "pitfalls": [
+        "Boundary error: the version in force is the greatest key <= date, i.e. upper_bound() stepped back; lower_bound() silently returns the next version when the query date is exactly an effective date.",
+        "A member accessor that hands out Terms& lets callers mutate published history; return const& or values and always edit a copy (working copy, then insert).",
+        "std::map allocates a node per version and has poor cache locality; recording many versions for one object should use the flat-vector variant or a coarser effective-date granularity.",
+        "Changing the key granularity is a semantic change: converting timestamps to day keys (std::chrono::floor<days>) can move an effective moment into the previous version, so the floor/ceil rule must be explicit and shared."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/map/upper_bound",
+        "https://en.cppreference.com/w/cpp/chrono/time_point"
+      ]
+    },
+    {
+      "variant_id": "flat-vector-history",
+      "name": "Sorted value vector with std::upper_bound (contiguous, scan-friendly)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "idiom_name": "std::vector<std::pair<system_clock::time_point, Version>> ascending, std::upper_bound lookup",
+      "implementation_notes": "Store the history as one contiguous ascending vector of (effective, Version) pairs: as-of is std::upper_bound over the whole vector (one comparison per probe, cache-friendly), current is back(), and period enumeration is a plain loop - the form reports, deltas and proration want. The price is insertion: a retroactive amendment memmoves the tail and invalidates every iterator, pointer and reference into the vector, so the continuity must publish snapshots by value (or re-fetch after mutating) and should reserve capacity for the expected version count. Prefer it over the map variant when reads dominate writes and whole-history scans are common.",
+      "code_sketch": "using Clock = std::chrono::system_clock;\nstd::vector<std::pair<Clock::time_point, Terms>> history_;   // ascending by effective\nconst Terms* as_of(Clock::time_point on) const {\n  auto it = std::upper_bound(history_.begin(), history_.end(), on,\n      [](Clock::time_point v, const std::pair<Clock::time_point, Terms>& e) { return v < e.first; });\n  return it == history_.begin() ? nullptr : &std::prev(it)->second;\n}\n// amend: auto at = std::upper_bound(history_.begin(), history_.end(), eff, cmp);\n//        history_.insert(at, {eff, working});",
+      "pitfalls": [
+        "Insertion is O(n) and invalidates every pointer, reference and iterator into the vector - never hold &Version across an amendment.",
+        "Contiguous storage rewards compact version types; string-heavy snapshots reallocate large blocks per insert, which is the case the map variant handles better.",
+        "The vector must stay ascending by effective date: a blind push_back of a retroactive amendment breaks std::upper_bound's precondition and yields a wrong version without any error."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/algorithm/upper_bound",
+        "https://en.cppreference.com/w/cpp/container/vector"
+      ]
+    },
+    {
+      "variant_id": "chrono-calendar-keys",
+      "name": "C++20 calendar dates as history keys (sys_days / year_month_day)",
+      "paradigm": "oo",
+      "min_standard": "C++20",
+      "idiom_name": "std::chrono::sys_days keys with std::chrono::year_month_day at the API edge",
+      "implementation_notes": "C++20's calendar types make the effective date a calendar fact instead of an instant: key the history by std::chrono::sys_days (or take std::chrono::year_month_day in the API) so a version is 'in force from 2024-02-01' rather than 'from an arbitrary timestamp', and use calendar arithmetic (ymd + std::chrono::months{3}, normalization through sys_days) for proration and period enumeration. As-of stays a transparent-comparator map lookup. Two traps: local_days and sys_days share a representation but not a meaning, and calendar support is not uniform across standard libraries, so the build must actually require C++20.",
+      "code_sketch": "using namespace std::chrono;\nstd::map<sys_days, Terms> history_;                       // effective day -> version\nconst Terms* as_of(year_month_day on) const {\n  auto it = history_.upper_bound(sys_days{on});\n  return it == history_.begin() ? nullptr : &std::prev(it)->second;\n}\n// year_month_day d{2024y/February/1d}; d += months{3}; history_[sys_days{d}] = working;",
+      "pitfalls": [
+        "local_days and sys_days have the same underlying representation but different meaning; building keys from local_days puts the whole history in a timezone-dependent frame.",
+        "year_month_day{2024y/February/30d} is constructible but invalid: converting it to sys_days normalizes to March 1 instead of rejecting the date, quietly shifting an effective date.",
+        "Day keys discard the time of day, so two amendments on the same day collapse to one entry unless the model defines a within-day tie-break rule."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/chrono/year_month_day/operator_days",
+        "https://en.cppreference.com/w/cpp/chrono/year_month_day/year_month_day"
+      ]
+    }
+  ],
+  "default_variant": "map-by-time-point",
+  "version": "1.0"
+}

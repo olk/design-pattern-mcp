@@ -1,0 +1,65 @@
+{
+  "pattern": "reference-monitor",
+  "language": "javascript",
+  "support": "idiomatic",
+  "idiom_name": "module-scoped monitor with #private fields and one exported entry point per mediated operation",
+  "implementation_notes": "The language's own encapsulation is the hash-prefixed private element: a # field or method cannot be referenced outside the class that declares it - writing instance.#field elsewhere is a syntax error - and private elements cannot be proxied, enumerated or reached with any Object method, which makes them the strongest privacy JavaScript has. The monitor is therefore an ES module whose exports are exactly the mediated operations, with the decision state in #private fields of a class (or in module-scope closures), so callers cannot read or edit the policy from outside. Tamper resistance is still absent: the module can be replaced by a loader hook or an edit to the module cache before or after it loads, Object.freeze does not protect the values held in private fields, and anything holding a reference to the resource bypasses the monitor entirely - which is why Node's own permission model is described by Node as a seat belt against accidents, not protection against malicious code.",
+  "code_sketch": "// monitor.js - the exported functions are the enumeration of mediated operations\nlet policy;                                // module-private; installed once, never handed out\nclass Ledger {\n  #records = new Map();                    // #private: unreachable and unproxyable\n  read(subject, id) {\n    if (!subject?.principal) throw new Deny(\"no principal\");          // fail closed\n    if (!policy.allows(subject.principal, \"read\", id)) throw new Deny(\"no rule\");\n    return structuredClone(this.#records.get(id));  // never hand out the live object\n  }\n}\nexport const ledger = Object.freeze(new Ledger());                  // the only way in\nexport const installPolicy = (p) => { if (policy) throw new Error(\"already set\"); policy = p; };",
+  "pitfalls": [
+    "Object.freeze is shallow and does not cover private fields: the values inside #records can still be mutated, and freezing only fixes property attributes - deep-freeze what you return, not just the object that holds it.",
+    "The monitor is only as strong as the module graph: a loader hook (node:module register), a patched global or an edit to the require cache can replace it, and the Node permission model is documented as a seat belt that does not resist malicious code.",
+    "structuredClone and JSON round-trips silently drop private state and methods, so cloning a monitored object produces a plain object with no enforcement attached.",
+    "A module-level policy set once is convenient but must be set before the first decision; a monitor that starts with policy === undefined and then decides is fail-open unless the undefined case throws."
+  ],
+  "sources": [
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Classes/Private_elements",
+    "https://nodejs.org/api/permissions.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "private-field-monitor",
+      "name": "Module-scoped monitor with #private state",
+      "paradigm": "oo",
+      "min_standard": "ES2022",
+      "requires_features": [
+        "private-fields"
+      ],
+      "idiom_name": "module-scoped monitor with #private fields and one exported entry point per mediated operation",
+      "implementation_notes": "The language's own encapsulation is the hash-prefixed private element: a # field or method cannot be referenced outside the class that declares it - writing instance.#field elsewhere is a syntax error - and private elements cannot be proxied, enumerated or reached with any Object method, which makes them the strongest privacy JavaScript has. The monitor is therefore an ES module whose exports are exactly the mediated operations, with the decision state in #private fields of a class (or in module-scope closures), so callers cannot read or edit the policy from outside. Tamper resistance is still absent: the module can be replaced by a loader hook or an edit to the module cache before or after it loads, Object.freeze does not protect the values held in private fields, and anything holding a reference to the resource bypasses the monitor entirely - which is why Node's own permission model is described by Node as a seat belt against accidents, not protection against malicious code.",
+      "code_sketch": "// monitor.js - the exported functions are the enumeration of mediated operations\nlet policy;                                // module-private; installed once, never handed out\nclass Ledger {\n  #records = new Map();                    // #private: unreachable and unproxyable\n  read(subject, id) {\n    if (!subject?.principal) throw new Deny(\"no principal\");          // fail closed\n    if (!policy.allows(subject.principal, \"read\", id)) throw new Deny(\"no rule\");\n    return structuredClone(this.#records.get(id));  // never hand out the live object\n  }\n}\nexport const ledger = Object.freeze(new Ledger());                  // the only way in\nexport const installPolicy = (p) => { if (policy) throw new Error(\"already set\"); policy = p; };",
+      "pitfalls": [
+        "Object.freeze is shallow and does not cover private fields: the values inside #records can still be mutated, and freezing only fixes property attributes - deep-freeze what you return, not just the object that holds it.",
+        "The monitor is only as strong as the module graph: a loader hook (node:module register), a patched global or an edit to the require cache can replace it, and the Node permission model is documented as a seat belt that does not resist malicious code.",
+        "structuredClone and JSON round-trips silently drop private state and methods, so cloning a monitored object produces a plain object with no enforcement attached.",
+        "A module-level policy set once is convenient but must be set before the first decision; a monitor that starts with policy === undefined and then decides is fail-open unless the undefined case throws."
+      ],
+      "sources": [
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Classes/Private_elements",
+        "https://nodejs.org/api/permissions.html"
+      ]
+    },
+    {
+      "variant_id": "proxy-interposition",
+      "name": "Revocable Proxy interposition",
+      "paradigm": "oo",
+      "min_standard": "ES2015",
+      "requires_features": [
+        "proxy"
+      ],
+      "idiom_name": "new Proxy(resource, handler) with get/set/apply traps, Proxy.revocable for withdrawal",
+      "implementation_notes": "Proxy is the language's interposition primitive: every operation on the object - property read, write, delete, call, construct - goes through an internal method, and a handler trap runs instead, so the monitor can decide per operation without asking callers to use a guarded API. Use Proxy.revocable when a grant should end: revoking the proxy makes every subsequent operation throw, which is the closest JavaScript gets to withdrawing a capability. The trap set defines the mediated surface - an untrapped operation (deleteProperty, ownKeys, defineProperty, apply, construct) simply passes through - and the target must be reachable only through the proxy, otherwise the wrapper is decoration.",
+      "code_sketch": "function mediate(target, subject, policy) {\n  const check = (act, prop) => {\n    if (!policy.allows(subject.principal, act, prop)) throw new Deny(act);  // fail closed\n  };\n  const handler = {\n    get(t, prop, recv) { check(\"read\", prop); return Reflect.get(t, prop, recv); },\n    set(t, prop, value) { check(\"write\", prop); return Reflect.set(t, prop, value); },\n    deleteProperty(t, prop) { check(\"delete\", prop); return Reflect.deleteProperty(t, prop); },\n  };\n  const { proxy, revoke } = Proxy.revocable(target, handler);  // revoke() ends the grant\n  return { proxy, revoke };                                    // never hand out the target\n}",
+      "pitfalls": [
+        "The trap set is the policy surface: operations you did not trap pass through unmediated and silently, so the enumeration of traps is the enumeration of mediated operations.",
+        "A Proxy cannot intercept a target's private elements or internal slots, and a method obtained through a get trap can be called on the target - return wrappers rather than raw methods for objects with internal slots (Map, Date, DOM nodes).",
+        "Proxy invariants are checked against the target: a get trap that reports a different value for a non-configurable, non-writable property throws a TypeError, so the monitor must not lie about a frozen target.",
+        "Reflect calls inside a trap that are themselves intercepted recurse; call Reflect on the target (never on the proxy) and keep the handler thin."
+      ],
+      "sources": [
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy"
+      ]
+    }
+  ],
+  "default_variant": "private-field-monitor"
+}

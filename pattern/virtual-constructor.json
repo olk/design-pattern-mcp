@@ -1,0 +1,147 @@
+{
+  "category": "construction-composition",
+  "name": "virtual-constructor",
+  "aliases": [
+    "virtual constructor idiom",
+    "virtual copy constructor"
+  ],
+  "intent": "Duplicate an object through a pointer or reference to its base type by delegating the copy to a virtual member function that each concrete class implements for its own type, so the copy keeps the dynamic type instead of being sliced.",
+  "problem": "Code holds a polymorphic object - a base pointer, an interface value, a trait object - and must produce an independent copy of it, but the compiler only knows the static base type: `new Base(*ptr)` copy-constructs just the base sub-object (slicing), an abstract base cannot be constructed at all, and clients that work around this with a type tag plus a factory table re-implement dispatch and break whenever a new subtype appears.",
+  "context": "Applies wherever objects are referenced polymorphically and also need to be duplicated: heterogeneous containers of base pointers or interface values that must be deep-copied, prototype registries, undo/memento snapshots of polymorphic state, type-erased value types that deep-copy through an implementation pointer, and plugin or extension objects reached through an interface whose concrete type is not visible at the call site. It matters most in languages whose heap objects have reference semantics and no usable built-in copy protocol, and wherever the decision to copy is taken at run time rather than compile time.",
+  "benefits": [
+    "Polymorphic copies keep their dynamic type: no slicing, and the caller never has to know or test the concrete class.",
+    "Open for extension: a new subclass participates in copying by implementing the one operation; existing client code stays unchanged (it is the subclass set that varies, not the call sites).",
+    "The class that owns the representation owns the copy semantics, so invariants and internal state (caches, back-pointers, resource handles) are duplicated deliberately instead of by field-by-field reflection.",
+    "Makes otherwise impossible copies possible: heterogeneous containers of base pointers or interface values, prototype registries and type-erased value types become copyable as a whole.",
+    "Composes with allocation and lifetime policy: the same hook can allocate from a pool or arena, return a smart pointer, or hand back a shallow copy-on-write handle.",
+    "Works across module and binary boundaries: clients that cannot see the concrete type (plugins, serialized boundaries, framework extension points) can still duplicate objects."
+  ],
+  "tradeoffs": [
+    "Per-class boilerplate and a real correctness risk: every concrete class must implement the copy operation, and the shallow-versus-deep decision is invisible in the type, so a missed mutable field silently aliases state between original and copy.",
+    "Ownership and lifetime: the operation returns a new heap object, the caller must take ownership, and a hierarchy that declares clone() without a virtual destructor makes deleting the result through the base type undefined behaviour.",
+    "The representation coupling is injected into every class of the hierarchy: each class must know how to copy its complete state, which fights refactoring and can duplicate logic that a copy constructor or serialization boundary would centralise.",
+    "Runtime cost: a virtual dispatch plus at least one heap allocation per copy, and deep recursion for composite objects - often more expensive than sharing immutable data or copying the value.",
+    "Copy semantics are only documented, never checked: nothing in the type system says whether clone() is shallow or deep, so callers cannot discover it and mistakes show up as aliasing bugs rather than compile errors.",
+    "Intermediate abstract layers that forget to re-declare the operation pure allow a subclass to inherit a wrong implementation that silently returns the wrong dynamic type."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 5,
+    "reliability": 7,
+    "security": 5,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Base (declaring type)",
+      "responsibility": "Declares the copy operation as a pure virtual/abstract, read-only member returning an owning handle to the base type, and provides the virtual destructor that makes the returned object destroyable through that handle."
+    },
+    {
+      "role": "Concrete type",
+      "responsibility": "Overrides the copy operation to copy-construct an instance of itself (using its own copy constructor, `copy()`/`with`/`dup` helper or field-by-field code) and returns it as the base handle - covariant where the language allows it."
+    },
+    {
+      "role": "Copy constructor / field copier",
+      "responsibility": "Performs the actual state duplication for one class: copying value fields, deep-copying owned reference fields and deliberately sharing immutable ones; this is where shallow-versus-deep is decided."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Holds only the base type, invokes the copy operation, and takes ownership of the result without ever naming or testing the concrete type."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Deep-copying a heterogeneous container (`std::vector<std::unique_ptr<Shape>>`, `List<Shape>` of interface values, `Vec<Box<dyn Shape>>`) without knowing the concrete element types.",
+    "Prototype registries: keep configured exemplar objects and create new instances by cloning the registered prototype instead of re-running the construction path.",
+    "Undo/snapshot (Memento): capture the polymorphic state of a document or model object and restore it later, with each class responsible for its own state.",
+    "Type-erased value types: give value semantics (copy means deep copy) to a handle that owns a polymorphic implementation object (envelope/letter handles, `polymorphic_value` style wrappers).",
+    "Plugin and extension points: duplicate an object supplied through an interface implemented in another module or binary where the concrete type is not visible.",
+    "Warm-starting expensive objects: clone a fully initialised configuration/parsed template and mutate the copy, instead of re-parsing or re-validating.",
+    "Boost.Pointer Container: boost::ptr_vector<animal> owns a heterogeneous sequence of polymorphic objects and deep-copies it via each element's clone() - the tutorial's animal hierarchy implements clone() by delegating to a private virtual do_clone() and exposes the pair to the container through a free new_clone() in the hierarchy's namespace, so zoo.clone() copies every element without slicing.",
+    "Rust's dyn-clone crate: std::clone::Clone is not object-safe, so Box<dyn Trait> cannot implement it; the crate spells this pattern as a DynClone super-trait plus clone_box(), which clones through &dyn Trait and returns Box<dyn Trait> holding the concrete type's copy, with the clone_trait_object! macro wiring Clone for Box<dyn MyTrait> to it.",
+    "The JDK's java.awt.geom.Path2D: the abstract class declares `public abstract Object clone()` (overriding Object.clone) and each concrete subclass (Path2D.Double, Path2D.Float) implements it to return a new object of its own runtime class, so code holding only a Shape/Path2D reference can duplicate a path without knowing its precision."
+  ],
+  "avoid_when": [
+    "There is no polymorphism in the copy: a copy constructor, record `with` expression, `copy()`/`dup` on data classes or case classes, or the language's own value semantics already copies correctly without a virtual hook.",
+    "The values are immutable or cheap to share: hand out a reference or a reference-counted handle (structural sharing) instead of duplicating the graph.",
+    "The concrete type set is closed and known at compile time: `std::variant` plus `std::visit`, a sealed hierarchy with an exhaustive switch, or a discriminated union copies with compiler-checked coverage and no vtable.",
+    "The objects are identity-bearing (sessions, sockets, file handles, entities with identity): there is no meaningful copy - model lifetime with a handle, registry or explicit re-creation.",
+    "Copy semantics cannot be defined defensibly (unshareable resources, cycles, external side effects): design an explicit snapshot/serialization boundary instead of a generic clone."
+  ],
+  "language_files": {
+    "generic": "virtual-constructor.generic.json",
+    "c": "virtual-constructor.c.json",
+    "cplusplus": "virtual-constructor.cplusplus.json",
+    "csharp": "virtual-constructor.csharp.json",
+    "go": "virtual-constructor.go.json",
+    "java": "virtual-constructor.java.json",
+    "javascript": "virtual-constructor.javascript.json",
+    "kotlin": "virtual-constructor.kotlin.json",
+    "python": "virtual-constructor.python.json",
+    "ruby": "virtual-constructor.ruby.json",
+    "rust": "virtual-constructor.rust.json",
+    "scala": "virtual-constructor.scala.json",
+    "swift": "virtual-constructor.swift.json",
+    "typescript": "virtual-constructor.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "prototype",
+    "factory-method",
+    "envelope-letter",
+    "nvi",
+    "crtp",
+    "type-erasure"
+  ],
+  "anti_patterns": [
+    "A clone operation that returns the base type **by value** and therefore slices: the derived state is silently dropped and the copy is not equal to the original.",
+    "A shallow clone of a class that owns raw pointers or mutable collections: original and copy share state, producing double mutation or a double free.",
+    "Declaring the virtual copy without a virtual destructor - and so deleting either object through the base type is undefined behaviour.",
+    "Client-side type dispatch (`if (kind == CIRCLE) copy = new Circle(...)`) or `memcpy`-style copies: both re-implement the dispatch the pattern removes, and both break on the next subtype or the next non-trivial field.",
+    "Adopting a language's legacy cloning protocol merely because it exists (`Cloneable`/`Object.clone`, `ICloneable`) even though its shallow-versus-deep semantics are unspecified.",
+    "Using clone() as the everyday way to pass objects around: defensive copying everywhere allocates and copies where a reference or an immutable value would do."
+  ],
+  "design_principles": [
+    "Polymorphism instead of type tests: the object, not the caller, knows how to copy itself (open/closed principle).",
+    "Encapsulation: the copy is produced by the class that owns the representation; clients never reach into fields to duplicate them.",
+    "Liskov substitution: a clone must have the same dynamic type and the same value as the source, without strengthening invariants or dropping state.",
+    "Non-virtual interface where available: expose a public read-only copy entry point that can assert the dynamic type and delegate to a protected virtual hook.",
+    "Single responsibility and dependency inversion: clients depend on one abstract copy operation, while creation, allocation and destruction policy stay behind the hierarchy."
+  ],
+  "best_practices": [
+    "Pair the virtual copy with a virtual destructor in languages that need one, and keep the copy operation `const`/non-mutating so it can be called on shared references.",
+    "Return an owning handle (unique_ptr, owning interface, `this` type) rather than a raw pointer, and document ownership of the returned object precisely.",
+    "Re-declare the copy operation pure virtual at every abstract level so a forgotten override fails to compile, and (where the language allows) assert the dynamic type of the result in a non-virtual wrapper.",
+    "Decide shallow versus deep per class and write it down: deep-copy every owned reference member explicitly, share only immutable state on purpose.",
+    "Prefer copy constructors, `copy()`/`with`/`dup` for statically typed copies and restrict the virtual copy to call sites that only hold the base type.",
+    "Test the observable contract: `clone()` through the base type must preserve the dynamic type, equal the source, and mutate independently of it."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Coplien, Advanced C++ Programming Styles and Idioms, Addison-Wesley (1992) - the idiom's origin in the C++ community (the handle/body family of idioms from which the Virtual Constructor comes).",
+    "https://www.laputan.org/pub/sag/coplien-idioms.pdf - idiom index with the entry \"Virtual Constructor: how to build an object of known abstract type, but of unknown concrete type, without violating the encapsulation of the inheritance hierarchy\".",
+    "https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Virtual_Constructor",
+    "https://cpppatterns.com/patterns/virtual-constructor.html",
+    "https://github.com/isocpp/cppcoreguidelines/blob/master/CppCoreGuidelines.md",
+    "http://www.parashift.com/c++-faq/virtual-ctors.html",
+    "https://www.boost.org/doc/libs/master/libs/ptr_container/doc/tutorial.html - Boost.Pointer Container tutorial, Cloneability section: ptr_vector deep-copies polymorphic elements via a virtual clone()/do_clone() pair exposed through new_clone().",
+    "https://docs.rs/dyn-clone/latest/dyn_clone/ - dyn-clone crate documentation: DynClone, clone_box() and clone_trait_object! as the object-safe spelling of polymorphic copy for Box<dyn Trait>.",
+    "https://docs.oracle.com/en/java/javase/17/docs/api/java.desktop/java/awt/geom/Path2D.html - JDK Path2D declares abstract clone() on the abstract class; each concrete subclass returns a copy of its own runtime class.",
+    "https://stackoverflow.com/questions/26578517/should-i-use-clone-method-in-java - criticism of the Java Cloneable/Object.clone protocol: a marker interface with a protected clone() cannot be invoked polymorphically, the case for an explicitly declared copy operation instead."
+  ]
+}

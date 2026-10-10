@@ -1,0 +1,80 @@
+{
+  "pattern": "double-buffer",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::array<Buffer, 2> + std::atomic<std::size_t> release/acquire publication",
+  "implementation_notes": "The default C++ realization keeps both buffers in one contiguous pair and publishes an index: the writer fills `buffers[1 - current]` and publishes with `current.store(next, std::memory_order_release)`, while readers (any thread, or the next frame) load with `memory_order_acquire` and index the array. The swap is a single store regardless of buffer size, nothing is allocated after construction, and the two buffers stay adjacent - the form Nystrom's framebuffer example uses. Assume exactly one writer: several concurrent publishers must go through the atomic shared_ptr variant or a lock, because a lost index update silently drops a frame.",
+  "code_sketch": "std::array<Frame, 2> buffers;\nstd::atomic<std::size_t> current{0};\n\nFrame& back()  { return buffers[1 - current.load(std::memory_order_relaxed)]; }\nvoid publish() { current.store(1 - current.load(std::memory_order_relaxed),\n                               std::memory_order_release); }\nFrame& front() { return buffers[current.load(std::memory_order_acquire)]; }",
+  "pitfalls": [
+    "Single-writer assumption: two threads publishing concurrently overwrite each other's index update - serialize the swap or use compare_exchange.",
+    "Loading the index relaxed on the reader side and then reading the buffer is a data race; the reader's load must be acquire.",
+    "Buffers must be fully constructed before the first publish and never resized afterwards - the index re-points, it never moves storage."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/atomic/atomic/exchange"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "index-toggle-pair",
+      "name": "Atomic index toggle over a fixed pair of buffers",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "requires_features": [
+        "atomic"
+      ],
+      "idiom_name": "std::array<Buffer, 2> + std::atomic<std::size_t> release/acquire publication",
+      "implementation_notes": "The default C++ realization keeps both buffers in one contiguous pair and publishes an index: the writer fills `buffers[1 - current]` and publishes with `current.store(next, std::memory_order_release)`, while readers (any thread, or the next frame) load with `memory_order_acquire` and index the array. The swap is a single store regardless of buffer size, nothing is allocated after construction, and the two buffers stay adjacent - the form Nystrom's framebuffer example uses. Assume exactly one writer: several concurrent publishers must go through the atomic shared_ptr variant or a lock, because a lost index update silently drops a frame.",
+      "code_sketch": "std::array<Frame, 2> buffers;\nstd::atomic<std::size_t> current{0};\n\nFrame& back()  { return buffers[1 - current.load(std::memory_order_relaxed)]; }\nvoid publish() { current.store(1 - current.load(std::memory_order_relaxed),\n                               std::memory_order_release); }\nFrame& front() { return buffers[current.load(std::memory_order_acquire)]; }",
+      "pitfalls": [
+        "Single-writer assumption: two threads publishing concurrently overwrite each other's index update - serialize the swap or use compare_exchange.",
+        "Loading the index relaxed on the reader side and then reading the buffer is a data race; the reader's load must be acquire.",
+        "Buffers must be fully constructed before the first publish and never resized afterwards - the index re-points, it never moves storage."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic/exchange"
+      ]
+    },
+    {
+      "variant_id": "atomic-shared-ptr",
+      "name": "std::atomic<std::shared_ptr<const T>> publication",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "atomic-shared-ptr"
+      ],
+      "idiom_name": "std::atomic<std::shared_ptr<const Buffer>> load/store swap",
+      "implementation_notes": "When frames outlive a pass - readers on other threads, deferred consumers, resources that must stay alive until every reader is done - own them with `std::shared_ptr` and swap through the C++20 specialization `std::atomic<std::shared_ptr<const Buffer>>`: `store` atomically replaces the pointer and the associated use_count update is part of the atomic operation, while `load` returns a copy that keeps the old frame alive as long as the reader holds it. This removes the lifetime hazard of the raw-pointer pair at the price of an atomic shared_ptr, which is not guaranteed lock-free (check `is_lock_free()`). Pre-C++20 code used the free `std::atomic_*` functions on shared_ptr, deprecated in C++20.",
+      "code_sketch": "std::atomic<std::shared_ptr<const Frame>> current{std::make_shared<const Frame>()};\n\nvoid publish(std::shared_ptr<const Frame> done) { current.store(std::move(done)); }\nstd::shared_ptr<const Frame> snapshot() { return current.load(); }  // keeps it alive\n\n// current.is_lock_free() tells you whether the swap is lock-free on this target.",
+      "pitfalls": [
+        "`std::atomic<std::shared_ptr>` is not guaranteed lock-free: it may take a lock per load/store, so measure before putting it in a hot frame loop.",
+        "All non-const access to a shared_ptr must go through the atomic instance - mixing plain and atomic accesses to the same shared_ptr is a data race.",
+        "Readers that keep their copy delay reclamation of the old frame even though the swap itself was cheap."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/shared_ptr/atomic2"
+      ]
+    },
+    {
+      "variant_id": "locked-swap",
+      "name": "Mutex-guarded pair (portable pre-C++20 form)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "mutex"
+      ],
+      "idiom_name": "std::mutex + std::swap of two containers",
+      "implementation_notes": "When the buffer is a container pair and the swap is not a single store (or the toolchain predates C++20), guard the swap and the readers with a mutex: the writer finishes the back container, then `std::swap(current, next)` under `std::lock_guard`, and readers take the same lock long enough to copy the snapshot out. This is the simplest correct form and the right reach for application code that swaps rarely; it costs a coarse critical section and does not scale to many readers the way the atomic variants do.",
+      "code_sketch": "std::mutex m;\nstd::vector<Sample> current, next;\n\nvoid swap() {\n    std::lock_guard<std::mutex> g(m);\n    std::swap(current, next);\n    next.clear();          // scratch ready for the next fill\n}\nstd::vector<Sample> snapshot() { std::lock_guard<std::mutex> g(m); return current; }",
+      "pitfalls": [
+        "Holding the lock while building the next buffer turns the swap into a long critical section; build outside, swap inside.",
+        "`std::shared_mutex` (C++17) readers can still starve a waiting writer; do not treat a reader lock as free.",
+        "Copying the snapshot out under the lock makes readers O(size) - only worth it when readers cannot tolerate a reference into the pair."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/mutex"
+      ]
+    }
+  ],
+  "default_variant": "index-toggle-pair"
+}

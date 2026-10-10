@@ -1,0 +1,246 @@
+{
+  "category": "persistence-state",
+  "name": "caching",
+  "aliases": [
+    "cache",
+    "temporary storage"
+  ],
+  "intent": "Retain the result of an expensive acquisition in fast storage under a canonical request key, so equivalent requests reuse a disposable copy instead of re-acquiring it; bound the copy and define how freshness, validation, and invalidation limit how long it may be trusted.",
+  "problem": "The same resource or computed result is requested repeatedly, each acquisition is expensive (remote call, database round trip, parse/compile/render, rate-limited API), and a prior result can often satisfy an equivalent request. Without retention every request pays the full acquisition cost; with naive retention the process accumulates unbounded copies, serves representations under incomplete keys, or answers from values that are no longer true. The recurring decision is whether to retain the resource after use, which request dimensions form its key, how much storage and staleness are acceptable, and which event or validator makes a held copy unusable.",
+  "context": "Read-heavy paths where requests have stable, canonical identities and acquisition cost dominates lookup cost: per-component in-process caches, shared Redis or Memcached tiers in front of databases or services, memoized pure functions, HTTP response caches, and ORM second-level regions. It applies when the working set fits the fast tier, the value is reconstructible from an authoritative provider, and bounded staleness or revalidation is acceptable; it presupposes that every answer-changing dimension (tenant, authorization, locale, representation, schema version) participates in the key and that writers or protocol validators can bound stale reuse.",
+  "benefits": [
+    "Repeated requests are served from a lookup instead of the provider, so latency and provider load fall in proportion to the hit ratio — and the effect is largest on exactly the hot keys that drive traffic.",
+    "The provider is shielded from bursts and quotas: an expensive or rate-limited back-end sees one acquisition per key per validity window instead of one per request.",
+    "Availability improves, because a warm copy can answer while the provider is degraded or unreachable (stale-serving), giving the read path a second source.",
+    "Retained resources keep their identity: parsed documents, compiled patterns, prepared statements, sessions and initialised connections are reused with their setup already paid for, not only raw values.",
+    "Reuse becomes uniform: memoized pure functions, parsed configuration, rendered fragments and remote lookups all follow one retention rule instead of each call site inventing its own.",
+    "Cost decouples from traffic: capacity planning moves to memory or a cache tier, and the cache can be retuned (size, TTL, admission policy) without touching the provider or its callers."
+  ],
+  "tradeoffs": [
+    "Bounded staleness is inherent: between the change and the invalidation or expiry that removes the copy, readers can see the previous value — so every writer must participate in the invalidation protocol, and a path that bypasses it (bulk update, direct SQL, another service) silently extends the staleness.",
+    "The miss path concentrates load: when a hot key expires, or the cache is cold after a deploy or scale-out, every concurrent reader re-acquires the same value at once unless the cache adds single-flight, refresh-ahead or jittered expiry.",
+    "Memory cost competes with the working set: an unbounded cache is a leak, a bounded one evicts entries that may be needed again, and in both cases the capacity must be measured rather than guessed.",
+    "Key identity becomes a correctness contract: the key must cover everything that changes the answer (tenant, locale, version, flags) and must be immutable — incomplete or mutable keys return another caller's value, which is also a data-leak path.",
+    "A shared cache is a second failure domain and a second consistency surface: its outage must degrade to the provider, its serialized format must be versioned, and its eviction waves hit the provider at the worst possible moment.",
+    "Concurrency is not free: making the store thread-safe reintroduces contention (a lock around every hit) or forces lock-free structures, and recency bookkeeping turns reads into writes.",
+    "Lifetime coupling: retained objects outlive the code path that produced them — cached entities, listeners and handles keep resources alive, and eviction or expiry may remove a value while a caller still uses it (weak/soft references mitigate at the cost of nondeterministic availability).",
+    "Without hit-ratio and eviction metrics the pattern cannot be shown to pay for itself: a cache that mostly misses adds a lookup, a copy and an invalidation surface for nothing.",
+    "The cache miss path is a concurrency amplification point: one hot key expiry or cold-start can generate N simultaneous provider calls, overwhelming the backend. Stampede protection (single-flight, probabilistic early refresh, jittered TTLs) is required at production traffic levels.",
+    "Synchronized expiration is the default failure mode: a fleet that warms at the same instant produces cache entries with identical TTLs that all expire together, generating a coordinated miss storm at the next expiry window."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 7,
+    "maintainability": 5,
+    "simplicity": 6,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Resource user (client)",
+      "responsibility": "Requests the resource by its key; on a hit receives the retained copy, on a miss acquires it from the provider and offers it to the cache; never treats the cache as authoritative."
+    },
+    {
+      "role": "Cache (store)",
+      "responsibility": "Bounded key-value store holding entries with their metadata (insertion/access time, size, expiry); answers lookups and applies the replacement policy when the bound is reached."
+    },
+    {
+      "role": "Key derivation",
+      "responsibility": "Turns a request into the canonical key — covering every dimension that changes the answer (identity, tenant, locale, schema version) — so lookups and invalidations cannot disagree."
+    },
+    {
+      "role": "Replacement (eviction) policy",
+      "responsibility": "Decides which entry leaves when capacity is exceeded (LRU, LFU, FIFO, size- or weight-based) and what may be admitted in the first place."
+    },
+    {
+      "role": "Invalidation / refresh policy",
+      "responsibility": "Decides when a retained entry stops being usable: TTL, write-through update, explicit purge on change events, or refresh-ahead before expiry."
+    },
+    {
+      "role": "Resource provider (origin)",
+      "responsibility": "The authoritative producer of the resource — database, remote service, expensive computation. It stays unchanged by the cache and remains the only source of correctness."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "object",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Metadata that changes rarely and is read constantly: user profiles, feature flags, catalog entries and reference data held in a database or an admin service.",
+    "Results of expensive derivations inside one process: parsed templates and configuration, compiled regular expressions and JSON schemas, aggregated reports, rendered fragments.",
+    "Remote calls with latency or quota limits — geocoding, pricing, tax, third-party APIs — whose answers are stable for minutes to hours.",
+    "Authentication and authorisation lookups in a request-heavy tier: token introspection results, permission sets and session records keyed by subject.",
+    "HTTP responses and static assets served through a protocol cache (URLCache, reverse proxy, CDN), with TTL and revalidation driven by response headers (RFC 9111 Cache-Control, stale-while-revalidate per RFC 5861).",
+    "Read-heavy services caching behind a shared store (Redis, Memcached) so every instance reuses the same copy and the invalidation happens once.",
+    "CDN edge caching of public API responses and static content with separate CDN-Cache-Control and Cache-Control headers (RFC 9213) for differentiated edge vs browser TTLs.",
+    "Database query result sets for read-heavy analytical queries where staleness of minutes is acceptable.",
+    "Session storage in distributed web applications: session records keyed by session ID with TTL matching session lifetime.",
+    "Write-behind buffering for high-volume append-only counters (view counts, metrics, leaderboards) with asynchronous flush to the authoritative store.",
+    "Near-cache (L1 in-process + L2 distributed) topologies for hot keys that dominate traffic: the in-process L1 absorbs the majority of reads without network hops.",
+    "Stale-while-revalidate serving at CDN edge: serve stale content immediately while revalidating in the background, hiding origin latency from the user (RFC 5861).",
+    "Redis cache-aside for product catalogs and user profiles: GET/SET with per-key TTL and DEL after the primary update provides a shared, disposable copy for read-heavy services (Redis documentation).",
+    "Memcached shared object caching in a web farm: independent application workers reuse one distributed in-memory pool to reduce database load, while eviction and restart remain acceptable because the database is authoritative (memcached documentation).",
+    "Hibernate second-level caching behind a SessionFactory: entity and query regions reduce repeated database loads across sessions, but region concurrency and invalidation strategy must match the transaction model (Hibernate ORM User Guide).",
+    "In-process object caches with near-optimal admission: Caffeine as the JVM's local cache layer — W-TinyLFU (a 4-bit count-min frequency sketch gating a small LRU admission window) plus size-based eviction, time-based expiry, asynchronous refresh and removal listeners — absorbs the hot working set without a network hop (Caffeine documentation).",
+    "Declarative method-level retention in enterprise frameworks: the Spring Framework cache abstraction binds @Cacheable, @CachePut, @CacheEvict and @Caching to a pluggable CacheManager, so the retention policy lives behind annotations and proxy interception instead of at every call site, and the backing store (Caffeine, Redis, JCache) stays swappable (Spring Framework Reference Documentation).",
+    "HTTP response retention in a reverse-proxy accelerator tier: nginx proxy_cache shared zones or Varnish VCL policies store backend responses keyed by URL and Vary, honor backend Cache-Control for freshness, serve stale on origin failure (use_stale / grace), and invalidate by purge or ban instead of TTL alone (nginx and Varnish Users Guide documentation)."
+  ],
+  "avoid_when": [
+    "The data is unique per request or changes on every read (hit ratio near zero): the cache adds a copy, a lookup and a consistency question without reuse — compute or serve directly.",
+    "Correctness cannot tolerate any staleness and no invalidation trigger can be guaranteed (balances, inventory decrements, lease coordination): read the authoritative store, or let it expose a consistent materialized view.",
+    "Acquisition is already cheap relative to the lookup (an in-memory field, an indexed primary-key read on a warm database): the second copy and the invalidation code cost more than they save.",
+    "The value is large, or the key space is unbounded with no admission control: memory pressure without reuse — bound it, shard it, or skip it.",
+    "Writers exist outside your control and bypass the invalidation protocol: the retained copy will drift, and only a short TTL can bound the damage — prefer a store-side view or the provider's own cache.",
+    "The retention is really ownership of a non-shareable resource (connections, transactions, buffers): use Pooling or a scope-based release (RAII/Dispose) instead of caching.",
+    "The access pattern is perfectly uniform and the working set fits in memory: no hot keys, no skew, no benefit from deduplication — a cache adds complexity without measurable gain.",
+    "Security-sensitive data where caching would create a second exposure surface: credentials, payment tokens, personally identifiable information that must not outlive the authoritative request path.",
+    "The key has no stable canonical representation or omits a dimension that changes the answer (tenant, authorization, locale, content negotiation, schema version): a hit can return the wrong representation or leak another principal's data.",
+    "A write-behind cache is being proposed for non-idempotent or loss-intolerant state: eviction, restart, or a cache outage can lose acknowledged writes — use transactional persistence or an explicitly durable log."
+  ],
+  "language_files": {
+    "generic": "caching.generic.json",
+    "c": "caching.c.json",
+    "cplusplus": "caching.cplusplus.json",
+    "csharp": "caching.csharp.json",
+    "go": "caching.go.json",
+    "java": "caching.java.json",
+    "javascript": "caching.javascript.json",
+    "kotlin": "caching.kotlin.json",
+    "python": "caching.python.json",
+    "ruby": "caching.ruby.json",
+    "rust": "caching.rust.json",
+    "scala": "caching.scala.json",
+    "swift": "caching.swift.json",
+    "typescript": "caching.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "module",
+  "provenance": [
+    "posa3"
+  ],
+  "related_patterns": [
+    "cache-aside",
+    "memoization",
+    "lazy-acquisition",
+    "weak-reference",
+    "object-pool",
+    "proxy",
+    "flyweight",
+    "circuit-breaker",
+    "retry",
+    "bulkhead",
+    "publisher-subscriber"
+  ],
+  "anti_patterns": [
+    "Cache-as-a-HashMap: the store is created without capacity, TTL or admission control, so it only ever grows until the process runs out of memory.",
+    "Cache as the source of truth: the only copy of the data lives in the cache, so an eviction, restart or eviction wave loses something that cannot be rebuilt.",
+    "Invalidation by convention: writers are expected to remember to purge entries, so one forgotten write path leaves stale values that look exactly like fresh ones.",
+    "Keying by mutable or partial identity: the key omits tenant, locale or version, or mutates after insertion, so a request receives another caller's answer — a correctness bug and often a privacy incident.",
+    "Negative caching without expiry: a transient failure is remembered forever and the system keeps reporting a fault long after the provider recovered.",
+    "Cache-first optimisation without measurement: no hit ratio and no eviction metrics, so nobody can tell whether the cache helps while its cost is paid regardless.",
+    "Double-write inconsistency: updating cache and database in the wrong order (cache before database) leaves the cache holding values that the database will never confirm, especially dangerous under partial failure.",
+    "SET-on-write instead of DELETE-on-write: concurrent writers arriving at the cache in a different order than at the database permanently cache stale data. DELETE is commutative; SET is not.",
+    "Synchronized expiration: bulk-loading a cache at startup with uniform TTLs causes all entries to expire simultaneously, generating a thundering herd at the next expiry window."
+  ],
+  "design_principles": [
+    "Separation of concerns: acquisition, retention and replacement are distinct responsibilities; the provider stays authoritative and unchanged.",
+    "Information hiding: callers ask for the resource by key and never see the store, the eviction structure or the policy internals.",
+    "Single responsibility per policy: the replacement policy decides capacity, the invalidation policy decides validity — conflating them is how TTL and capacity bugs appear.",
+    "Open/closed principle: the store and the policies can be replaced (in-process, shared tier, weak references) without changing a single caller.",
+    "Fail-safe defaults: a miss or a cache outage degrades to the provider — never to a wrong answer and never to an outage of the cache's own making.",
+    "Explicit ownership: whoever changes the resource owns its invalidation, and the rule is defined once instead of at every call site.",
+    "Delete-on-write (not SET-on-write): DELETE is commutative, making it safe under concurrent writers with different arrival orders at cache vs. database.",
+    "TTL as safety net: every entry carries a TTL regardless of whether explicit invalidation is implemented — the TTL bounds the blast radius of any invalidation bug.",
+    "Jittered expiry: add random noise (±10%) to TTLs so entries populated together do not expire in lockstep, preventing synchronized miss storms."
+  ],
+  "best_practices": [
+    "Bound every cache by entries and by weight, and choose the replacement policy from the measured access distribution (LRU for recency-heavy sets, LFU/W-TinyLFU for stable popularity). W-TinyLFU (Caffeine's default) is within a few percent of Belady's optimal on real-world traces and significantly beats plain LRU.",
+    "Keep the provider authoritative and the cache disposable: every entry must be recomputable, and losing the whole cache must only cost latency.",
+    "Derive a canonical, immutable key that covers every dimension of the answer, and version the serialized form for shared caches so a deploy cannot misread entries.",
+    "Centralise invalidation per key family (delete-after-commit for cache-aside, write-through for update-heavy paths, event-driven purge for shared tiers, CDC-driven invalidation for database changes) and test the write paths, not just the read paths.",
+    "Protect hot keys: single-flight the miss path (e.g., Go's singleflight package), refresh ahead of expiry for predictable hot keys, and add jitter to TTLs so entries do not expire in lockstep.",
+    "Measure hit ratio, eviction rate, latency and memory, and alert on them; a cache with a persistently low hit ratio should be removed, not tuned forever. A hit ratio below 80% indicates a key-design problem, working-set overflow, or overly aggressive TTLs.",
+    "Prefer weak or soft references (or explicit eviction hooks) for derived data whose lifetime must not exceed its owner's, and never store request-scoped objects in a process-wide cache.",
+    "Always add TTL jitter: set `TTL = base ± base * 0.1` so that entries created together (e.g., after a deploy) expire at different times and do not generate synchronized miss storms.",
+    "For cache stampede (thundering herd) protection on hot keys, layer multiple defences: jittered TTLs as baseline, single-flight coalescing to deduplicate concurrent misses, and probabilistic early expiration (XFetch algorithm) for the hottest keys. At Facebook scale, leases cap recomputation to one per key per 10 ms.",
+    "Prefer DELETE-on-write over SET-on-write: the DELETE operation is commutative, so concurrent writers arriving at cache and database in different orders produce the same eventual state. SET is not commutative — last write wins at the cache, which may be a stale value.",
+    "Use versioned keys (`user:{id}:v{version}`) for data that undergoes schema or content changes: invalidation becomes a no-op because the old key ages out naturally, eliminating mass-delete operations.",
+    "Implement CDC-driven (Change Data Capture) invalidation for database-backed caches: tools like Debezium, AWS DMS or Maxwell tail the binlog and emit cache invalidation events, decoupling writers from cache topology and scaling across services.",
+    "Configure separate CDN-Cache-Control and Cache-Control response headers (RFC 9213) to allow different TTLs at CDN edge vs. browser: e.g., `Cache-Control: max-age=60, s-maxage=3600` with `CDN-Cache-Control: max-age=600` for long CDN edge retention with short browser freshness.",
+    "Use stale-while-revalidate (RFC 5861) at CDN edge: serve stale content immediately while revalidating asynchronously, hiding origin round-trip latency from users. Combine with stale-if-error for origin-outage resilience (serve stale for hours during a 5xx incident).",
+    "Implement a two-tier near-cache topology (L1 in-process LRU + L2 distributed cache like Redis): the hot working set is served from L1 without network hops; cross-tier invalidation propagates via pub/sub.",
+    "For high-volume write workloads that tolerate bounded loss (counters, metrics, view counts), use write-behind with a coalescing window: batch multiple writes to the same key before flushing to the authoritative store, reducing database write pressure dramatically.",
+    "Monitor per-shard hit ratio and per-key eviction rate in distributed caches: global metrics can mask hot-key skew where one shard is overloaded while overall hit ratio looks healthy.",
+    "Set a lock timeout on distributed cache locks that exceeds expected computation time: if the recomputation takes 2 seconds, a 1-second lock timeout expires mid-computation and allows duplicate backend calls.",
+    "For caches with large value size variation, use size-aware admission or weighted eviction rather than entry-count limits alone, to prevent one giant value from crowding out many useful small keys.",
+    "Separate batch and interactive cache pools: run batch workloads against a dedicated cache pool so they cannot evict the hot interactive working set during heavy jobs."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Kircher & Jain, Pattern-Oriented Software Architecture, Volume 3: Patterns for Resource Management (Wiley, 2004) — Caching, the resource-lifecycle pattern that keeps an acquired resource instead of releasing it immediately, so it is reused while its identity and state remain valid.",
+    "Nix & Sharma, 'Caching: From Browser to Database — The HLD Handbook', HLD Handbook Academy (2026) — Comprehensive treatment of cache-aside, read-through, write-through, write-behind, refresh-ahead, LRU/LFU/TinyLFU eviction, jittered TTLs, stale-while-revalidate, Facebook's lease mechanism, Netflix EVCache, and distributed cache topologies including L1+L2 near-cache. https://hld.handbook.academy/curriculum/building-blocks/caching/",
+    "Vattani, Chierichetti & Lowenstern, 'Optimal Probabilistic Cache Stampede Prevention', VLDB 2015 — The XFetch algorithm: proves the exponential distribution is optimal for probabilistic early expiration, derives the optimal stampede size of O(log n) with early expiration gap O(log n), and shows the exponential distribution is optimal among all gap distributions. https://www.vldb.org/pvldb/vol8/p886-vattani.pdf",
+    "Koller & Friedman, 'Probabilistic Cache Stampede Prevention', ACM TOCS 13:4 (2017) — W-TinyLFU: combines count-min sketch frequency tracking with an LRU admission window; within a few percent of Belady's optimal on Wikipedia and ARC traces; implemented as Caffeine's default eviction policy.",
+    "Meyerovich, Guha & Nawab, 'Plan: Understanding Caching and Performance' and related Memcache fleet analysis — Facebook's Memcache fleet: billions of requests/second across trillions of items; lease mechanism throttling recomputation to one per key per 10 ms; stale-value serving for availability under backend failure.",
+    "AWS Architecture Blog, 'Caching Best Practices' (2023) — Cache-aside as the default pattern tolerating cache unavailability; soft-TTL plus hard-TTL for graceful degradation; Bloom filters for cache penetration; AWS's recommended invalidation strategies including delete-on-write and CDC.",
+    "Azure Architecture Center, 'Cache-Aside Pattern' (Microsoft Learn) — Explicit guidance on expiry policy sizing, eviction configuration, cache priming, local vs. distributed caching tradeoffs, and the order-of-operations requirement: update database before removing cache entry to prevent the last-writer-wins race.",
+    "Sujeet Jaiswal, 'Caching Fundamentals and Strategies' and 'Distributed Cache Design' (2026) — In-depth coverage of TTL-based, event-driven, and probabilistic early refresh invalidation; LRU scan-pollution failure mode; LFU staleness and decay requirements; TinyLFU/W-TinyLFU admission control; CDC invalidation via Debezium/Kafka; per-workload eviction policy defaults. https://sujeet.pro/articles/caching-fundamentals-and-strategies",
+    "RFC 9111 — HTTP Caching (Std 98, June 2022, Reschke et al.) — The canonical HTTP cache semantics specification: freshness calculation, validation (If-None-Match/If-Modified-Since), stale response serving rules, Cache-Control directives (max-age, s-maxage, no-store, no-cache, must-revalidate, public, private). Obsoletes RFC 7234. https://www.rfc-editor.org/rfc/rfc9111.html",
+    "RFC 5861 — HTTP Cache-Control Extensions for Stale Content (May 2010) — Defines stale-while-revalidate (serve stale while revalidating asynchronously) and stale-if-error (serve stale when origin returns 5xx). The foundational directives for CDN edge cache resilience.",
+    "RFC 9213 — Targeted HTTP Cache Control (June 2022, Wu) — Defines CDN-Cache-Control response header for differentiating CDN edge TTLs from browser TTLs independently of Cache-Control: enables 'Cache-Control: max-age=60, s-maxage=3600' with 'CDN-Cache-Control: max-age=600' for separate edge and browser freshness windows.",
+    "Cloudflare Cache Documentation — stale-while-revalidate mechanics at CDN edge: UPDATING status, background fetch deduplication, interaction with must-revalidate and s-maxage. https://developers.cloudflare.com/cache/concepts/revalidation/",
+    "Codably, 'Caching Patterns Explained: A Practical Catalogue with Code Examples' (2026) — Decision matrix for cache-aside vs read-through vs write-through vs write-behind vs refresh-ahead; double-write trap; negative caching; probabilistic early expiration; production checklist.",
+    "Antirez (Salvatore Sanfilippo), 'Cache Stampede Prevention — Redis Patterns' — Mutex locking with SET NX PX, XFetch exponential formula, decision matrix for protection strategies. http://redis.antirez.com/fundamental/cache-stampede-prevention.html",
+    "ContentBuffer, 'Cache Stampede: Beat the Thundering Herd in Redis' (2026) — Combined strategy: jitter on all TTLs + distributed lock with stale fallback + load shedding as safety net; recommended combinations by scenario.",
+    "Redisson, 'Cache Invalidation: Strategies and Redis Examples' — Distributed cache invalidation patterns including Redis-based implementation strategies.",
+    "TheLinuxCode, 'Cache Eviction Policies in System Design: Practical Selection, Hybrid Strategies, and Operations' (2026) — Runbook for policy selection: admission control, frequency sketches, decay windows, multi-queue segments; offline replay testing methodology; burst-aware tuning reducing incident frequency 20-50%.",
+    "OneUptime, 'How to Build Cache Stampede Prevention' (2026) — XFetch algorithm implementation, distributed locking with stale fallback, combined defence-in-depth approach. https://oneuptime.com/blog/post/2026-01-30-cache-stampede-prevention/view",
+    "Mdsanwarhossain, 'Cache Stampede Prevention in High-Traffic Microservices' (2026) — Mutex lock, probabilistic early expiry, request coalescing, TTL jitter and cache warming: decision matrix by complexity, effectiveness and use case.",
+    "BlazingCDN Blog, 'Cache-Control and stale-while-revalidate for CDN Caching' (2026) — Per-directive CDN interpretation table (Cloudflare, Fastly, CloudFront, Akamai); combination patterns for CDN edge vs browser TTL differentiation; stale-if-error for outage resilience. https://blog.blazingcdn.com/en-us/cache-control-stale-while-revalidate-cdn-caching",
+    "Microsoft Azure Architecture Center, 'Circuit Breaker Pattern' (Microsoft Learn) — Complements caching by protecting the backend from overload during cache miss storms; three-state machine (Closed/Open/Half-Open); retry-through-circuit-breaker composition pattern. https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker",
+    "Handbook Academy Engineering Handbook, 'Resilience Patterns: Timeouts, Retries, Circuit Breakers, and Bulkheads' (2026) — Timeout configuration, exponential backoff with full jitter, circuit breaker thresholds (50% failure rate over 20 requests), bulkhead isolation via thread pools and semaphores; library vs service mesh implementation tradeoffs. https://github.com/handbook-academy/engineering-handbook",
+    "System Design Space, 'Fault Tolerance Patterns: Circuit Breaker, Bulkhead, Retry' (2026) — Combines circuit breakers, bulkheads, retries, fail-fast, fallback and async recovery into one blast-radius-control model; retry amplification risk across stacked layers; adaptive concurrency limits (Netflix concurrency-limits). https://system-design.space/en/chapter/resilience-patterns/",
+    "ATAM Tactics Chapter (dmccreary/atam GitHub) — Architectural tactics catalog: caching as a performance tactic, circuit breaker and bulkhead as availability tactics; ATAM tradeoff analysis for caching vs. consistency scenarios.",
+    "Java Design Patterns, 'Caching Pattern' — Pattern catalogue entry with language-specific implementations and known uses. https://java-design-patterns.com/patterns/caching/",
+    "Software Patterns Lexicon, 'Caching Patterns and Invalidation' — Pattern taxonomy and invalidation strategy catalogue: https://softwarepatternslexicon.com/caching-patterns-and-invalidation",
+    "Martin Fowler, 'Catalog of Patterns of Enterprise Application Architecture' (2003) — the PoEAA catalog frames caching-related retention alongside Lazy Load and Offline Concurrency patterns: https://martinfowler.com/eaaCatalog/",
+    "Martin Fowler, 'Two Hard Things' (2009) — records cache invalidation as a coordination-heavy problem rather than a free correctness guarantee: https://martinfowler.com/bliki/TwoHardThings.html",
+    "Redis, 'Redis cache-aside' — official guidance for TTL-bounded database-read caching, origin-first writes, explicit DEL invalidation, and stampede protection: https://redis.io/docs/latest/develop/use-cases/cache-aside/",
+    "memcached, 'About memcached' — official overview of a distributed in-memory object cache used to reduce dynamic-application database load: https://memcached.org/about",
+    "Hibernate ORM User Guide 6.5, caching — official guidance for SessionFactory-managed second-level caches and their concurrency strategies: https://docs.hibernate.org/orm/6.5/userguide/html_single/Hibernate_User_Guide.html#caching",
+    "Kircher & Schwanninger, 'Caching' — POSA3 pattern paper (Pattern-Oriented Software Architecture Volume 3: Patterns for Resource Management, Wiley 2004): acquire the resource once, retain it under its identity instead of releasing, reuse while identity and state remain valid, and release via an Evictor policy; the paper's canonical contrast with Pooling is that Caching preserves resource identity across uses: http://www.kircher-schwanninger.de/michael/publications/Caching.pdf",
+    "ben-manes/caffeine — high-performance Java in-memory cache: Guava-inspired API with automatic (optionally async) loading, size-based W-TinyLFU eviction, access/write expiry, asynchronous refresh, weak/soft references and statistics; the reference implementation of a production near-optimal in-process cache: https://github.com/ben-manes/caffeine",
+    "Caffeine Wiki, 'Efficiency' — Window-TinyLFU mechanics: 4-bit CountMinSketch frequency estimation, small LRU admission window for recency bursts, hill-climbing window tuning; near-optimal hit rate at roughly 2 bytes/entry of sketch overhead, well above plain LRU and competitive with ARC/LIRS at lower memory: https://github.com/ben-manes/caffeine/wiki/Efficiency",
+    "Spring Framework Reference, 'Cache Abstraction' and 'Declarative Annotation-based Caching' — official docs for transparent method-result caching: Cache/CacheManager interfaces decouple policy from store, @Cacheable/@CachePut/@CacheEvict/@Caching with SpEL key expressions, JSR-107 (JCache) integration, and per-provider caveats on sync loading: https://docs.spring.io/spring-framework/reference/integration/cache.html and https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html",
+    "Varnish Users Guide 8.0 — official guide to a reverse caching HTTP proxy: VCL governs what is cached and for how long, backend Cache-Control is honored by default, hit-ratio tuning, Vary handling, purging and banning as the invalidation toolset, and ESI composition of cached fragments: https://www.varnish-cache.org/docs/8.0/users-guide/",
+    "nginx, 'Module ngx_http_proxy_module' — official proxy_cache documentation: shared-memory cache zones (proxy_cache_path with max size and inactive cleanup), proxy_cache_key default of scheme+host+request_uri, method filtering, use_stale serving of expired entries, and cache revalidation/bypass controls: https://nginx.org/en/docs/http/ngx_http_proxy_module.html",
+    "golang.org/x/sync/singleflight — official package docs for duplicate function call suppression: Group.Do/DoChan run one in-flight call per key and share the result with all waiters (with a shared flag), Forget abandons tracking; the standard miss-path stampede guard in Go caches: https://pkg.go.dev/golang.org/x/sync/singleflight",
+    "Nemorize, 'When Caching Makes Things Worse' (Cache is King roadmap) — misuse catalogue: cargo-cult caching without proof of need, TTL-only staleness after user actions, invalidation dependency webs, and the read/write-ratio heuristic (~10:1) for choosing cache targets; recommends start-without-caching and measure-first: https://nemorize.com/roadmaps/cache-is-king/lessons/when-caching-makes-things-worse",
+    "Bhavyansh, 'Why I Remove Caching First When Debugging' — practitioner critique: caches hide bugs behind stale copies; disable-the-cache as the first debug step; guidance to cache at one layer only, prefer short TTLs, make invalidation explicit on writes, and expose a cache-bypass for debugging: https://bhavyansh001.medium.com/why-i-remove-caching-first-when-debugging-saves-days-d4a489e67b9b"
+  ],
+  "related_patterns_notes": {
+    "cache-aside": "the application explicitly reads the cache, loads the provider on a miss, and invalidates after a write; Caching is the broader retention policy.",
+    "memoization": "caches a deterministic function result by arguments, whereas Caching also covers mutable resources, shared tiers, and explicit invalidation.",
+    "lazy-acquisition": "delays obtaining a resource until first use; Caching additionally retains that acquired resource for later requests.",
+    "weak-reference": "lets reachability or garbage collection end retention, whereas Caching uses an explicit bound and freshness policy.",
+    "object-pool": "reuses resettable owned resources such as connections, whereas Caching reuses results or state that remain valid for equivalent requests.",
+    "proxy": "interposes on access and can hide a cache, but a Proxy is structural while Caching is the retention policy behind the access boundary.",
+    "flyweight": "shares intrinsic immutable state among many objects, whereas Caching retains results selected by request keys and freshness.",
+    "circuit-breaker": "stops calls to a failing provider, while Caching may serve a valid or explicitly stale retained copy as a fallback.",
+    "retry": "repeats a failed provider operation, while Caching avoids an operation on a hit and must not turn stale data into an implicit retry substitute.",
+    "bulkhead": "isolates resource capacity and failure domains, while Caching controls retained copies and can require a separate pool to avoid eviction interference.",
+    "publisher-subscriber": "distributes change events that can drive invalidation, whereas Caching consumes the event to remove or refresh retained copies.",
+    "change-data-capture": "observes committed origin changes to automate invalidation, whereas Caching is the retained-store policy that reacts to those events."
+  }
+}

@@ -1,0 +1,213 @@
+{
+  "category": "interaction-boundary",
+  "name": "converter",
+  "aliases": [
+    "translator"
+  ],
+  "intent": "Give a pair of corresponding representations one owner that maps them into each other in both directions, so every caller converts through one place and neither representation has to import, know or be aware of the other.",
+  "problem": "The same information lives in two representations - domain object and DTO, in-memory value and wire or column format, internal model and third-party schema - and both directions are exercised in production. Hand-written field copying at each call site duplicates the mapping rules, drifts whenever either representation changes, and forces at least one side (or every caller) to import the other.",
+  "context": "Component boundaries where an internal model meets an external representation: service or API layers exchanging DTOs, persistence layers mapping values to column formats, integration seams facing a third-party or legacy schema, and codec layers mapping typed values to a wire format. It applies whenever both directions are needed (read and write, decode and encode) and either side must stay independent of the other - different modules, teams, release cycles or libraries.",
+  "benefits": [
+    "One owner per representation pair: the mapping rules exist once and both directions change together, so the two representations never have to reference each other.",
+    "Both representations stay clean - no mapping constructors, transport annotations or foreign types inside the model.",
+    "New pairs are additive: a converter for a new representation is registered without editing existing types or call sites (open/closed).",
+    "The mapping becomes directly testable with round-trip tests (value -> representation -> value), which expose lossy or asymmetric conversions that field-by-field copying hides.",
+    "Collection and stream mapping lives inside the converter, so batching, empty and null handling are decided once instead of per call site."
+  ],
+  "tradeoffs": [
+    "A converter plus its registration is more machinery than an inline expression; for one or two trivial fields the class is heavier than the assignment it replaces.",
+    "The mapping duplicates the shape of both representations, so a field added on one side stays silently unmapped until a round-trip test or a strict unknown-field policy catches it.",
+    "Two-way pairs are rarely exact inverses: normalization, defaults injected while reading and fields dropped while writing cause drift that only a round trip reveals.",
+    "Per-item conversion allocates and copies, which is visible on hot paths, per-row persistence loops and large streamed batches.",
+    "Failure semantics have to be decided deliberately (raise, return a result or option, fall back to a default), otherwise every call site invents its own reaction to an unconvertible value.",
+    "A converter filters nothing by default; explicit mapping is the place where it must be decided which internal fields are allowed to leave the component.",
+    "Bidirectional converters must choose between being lawful isomorphisms (perfect round-trips) or explicitly lossy transformations; this contract must be documented and tested, or callers assume the wrong semantics."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 5,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Converter (two-way mapper)",
+      "responsibility": "Owns both directions of one representation pair and is the only place the mapping rules live; stateless with respect to the mapped values."
+    },
+    {
+      "role": "Source and target representations",
+      "responsibility": "The two types being mapped (domain value and wire, column or DTO type); each is unaware of the other and of the converter's existence."
+    },
+    {
+      "role": "Conversion registry (optional)",
+      "responsibility": "Resolves the applicable converter from the (source, target) pair - a ConversionService, a serializer module, an attribute-driven type converter - so callers ask for conversion rather than for a concrete converter."
+    },
+    {
+      "role": "Delegating client",
+      "responsibility": "The component that needs the other representation (repository, service, endpoint); it injects or looks up the converter instead of copying fields."
+    },
+    {
+      "role": "Collection mapper (optional)",
+      "responsibility": "Applies the pair-wise converter to whole collections and streams, keeping the element loop out of call sites."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Domain object <-> DTO at a service or API boundary, where the transport shape must not leak into the model.",
+    "Value object <-> database column representation (JPA AttributeConverter, EF Core ValueConverter, Rails custom attribute type).",
+    "Third-party or legacy schema <-> internal model at an integration seam, including versioned wire formats.",
+    "Typed value <-> JSON, XML or protobuf payload with a custom codec when the default mapping is wrong (formats, units, enums).",
+    "Query rows or record sets <-> domain objects, where a full mapper framework would be oversized.",
+    "Single-value wrappers such as identifiers, money or unit-carrying quantities mapped to and from their primitive form.",
+    "Palindrome conversion chain (Entity -> DAO -> DTO -> Controller -> DTO -> DAO -> Entity) where each layer owns exactly one transformation direction, making the data flow explicit and each boundary independently testable.",
+    "Versioned API contracts: a DTO for API v1 and a separate DTO for API v2 coexist; a converter pair maps each version's DTO to the shared internal model, isolating API consumers from internal changes.",
+    "API gateway transformation: external third-party API payloads are normalized into an internal canonical format at the gateway, and outbound responses are converted back to the third-party schema; converters live at the seam.",
+    "Event-driven payload normalization: domain events carry one representation (e.g., enriched entity) while the event bus transports a flattened wire format (e.g., protobuf); converters at producer and consumer ends keep the two shapes in sync.",
+    "ORM entity vs. read-model DTO at the query boundary: a repository executes a query and the row-set converter maps each row to a read-model DTO, avoiding the entity in read-only paths entirely.",
+    "Anti-corruption layer at legacy integration seams: external system payloads are translated into the internal domain model at the boundary, and responses translated back; the converter owns the translation vocabulary, protecting the domain model from foreign concepts (Eric Evans, Domain-Driven Design; Microsoft Azure Architecture Center; AWS Prescriptive Guidance).",
+    "Immutable value type <-> wire format for cryptographic or financial domains: the converter is a lawful isomorphism ensuring every wire value round-trips to an identical object (tested via property-based round-trip laws, as in the lawful-conversions Haskell library and Higher-Kinded-J Iso optics library).",
+    "Strangler-fig migration seam: new microservice functionality is accessed through an ACL that converts legacy system payloads to the new domain model and back, keeping the legacy interface unchanged while the new service evolves behind the seam.",
+    "Guava com.google.common.base.Converter<F, T>: an abstract bidirectional function with convert()/reverse(), automatic reverse() derivation for subclasses, mapAll() for whole iterables and Converter.normalize() to lift a converter into a function converter - the pattern as a shipped JDK-adjacent library type (Google Guava).",
+    "Go database/sql custom types: a type implementing both sql.Scanner (Scan(src any) error) and driver.Valuer (Value() (driver.Value, error)) owns the Go value <-> database column pair in both directions; the standard library's NullString, NullInt64 and NullTime are built-in pairs of exactly this shape.",
+    "Rails custom attribute types: subclass ActiveModel::Type::Value, override serialize (Ruby value -> database value) and deserialize (database value -> Ruby value) and bind with attribute :col, MyType.new - the converter pair at the ORM seam, with cast_value kept separate for user-input coercion."
+  ],
+  "avoid_when": [
+    "Only one direction is ever needed: a serializer, a formatter or a factory method is the honest shape.",
+    "The conversion is a single expression on one field; keep it at the call site and skip the abstraction.",
+    "A framework already maps the pair (Jackson, System.Text.Json, serde, Codable, circe, cattrs) and its defaults are correct - configure it instead of writing a parallel mapper.",
+    "Both sides are the same type or share a deliberately published model; a converter between identical shapes is ceremony.",
+    "The conversion needs I/O (loading missing references, calling services); that belongs in a repository or assembler, not in a mapping object.",
+    "The conversion is inherently lossy and the lossy direction is never needed in reverse: a one-way transformation (serialization, projection) does not need a bidirectional converter; name it as a serializer or projector instead."
+  ],
+  "language_files": {
+    "generic": "converter.generic.json",
+    "c": "converter.c.json",
+    "cplusplus": "converter.cplusplus.json",
+    "csharp": "converter.csharp.json",
+    "go": "converter.go.json",
+    "java": "converter.java.json",
+    "javascript": "converter.javascript.json",
+    "kotlin": "converter.kotlin.json",
+    "python": "converter.python.json",
+    "ruby": "converter.ruby.json",
+    "rust": "converter.rust.json",
+    "scala": "converter.scala.json",
+    "swift": "converter.swift.json",
+    "typescript": "converter.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "message-translator",
+    "mapper",
+    "adapter",
+    "data-transfer-object",
+    "anti-corruption-layer",
+    "data-mapper",
+    "gateway",
+    "facade"
+  ],
+  "anti_patterns": [
+    "God converter: one type switch over dozens of unrelated pairs instead of one converter per representation pair.",
+    "Leaky converter that reaches into privates, mutates its input or returns half-initialised objects.",
+    "Half converter: only the write direction exists and the read direction is reconstructed ad hoc by callers.",
+    "Converter that performs I/O (loading references, calling services) while mapping, turning a pure boundary into a hidden transaction.",
+    "Copy-paste converter families per layer (web DTO <-> service DTO <-> entity) with no round-trip tests, so the layers drift apart.",
+    "Framework-configured converter masquerading as a custom converter: a Jackson ObjectMapper or serde serializer configured to behave like a converter without an explicit registration, so callers cannot find or test the conversion contract.",
+    "Lossy converter with no documentation: a converter that normalizes, drops fields, or injects defaults without any annotation or comment, so future maintainers cannot tell which asymmetries are intentional."
+  ],
+  "design_principles": [
+    "Single responsibility: the mapping rules have exactly one owner; the representations own their invariants, not the translation.",
+    "Open/closed: a new representation pair adds a converter or registration and edits neither existing types nor call sites.",
+    "Dependency inversion and least knowledge: callers depend on a converter or registry abstraction, and neither representation depends on the other.",
+    "DRY: one mapping rule per pair, exercised in both directions, instead of field copying spread over call sites.",
+    "Isomorphism where possible, explicit lossy otherwise: when both directions can be made exact inverses, make them lawful; when they cannot, name and document the lossy fields explicitly so maintainers understand the asymmetry without guessing."
+  ],
+  "best_practices": [
+    "Keep both directions in the same unit and test them as a round trip (value -> representation -> value), naming the lossy fields explicitly.",
+    "Make converters pure and stateless: no I/O, no lazy access, no caches keyed on external state.",
+    "Register by the (source, target) pair (ConversionService, serializer module, attribute or annotation) and let callers request conversion by types rather than by converter instance.",
+    "Map collections and streams inside the converter so batching, empty and null handling are decided once.",
+    "Define the failure mode once - raise, result type or documented default - and make the reverse direction reject anything the forward direction could not have produced.",
+    "Treat unknown and missing fields as an explicit contract decision (reject, ignore or preserve) and keep tolerant reading separate from the mapping itself.",
+    "Handle null and Optional explicitly: decide whether the converter tolerates null inputs (returns null or a default), and whether the reverse direction can produce null; document and test both outcomes.",
+    "Prefer compile-time mapping (MapStruct, code generation) over runtime reflection for performance-critical paths; use reflection-based mappers only for genuinely dynamic, low-volume mappings where boilerplate reduction outweighs the cost.",
+    "Test round-trips as first-class citizens: for every representation pair write a round-trip property test (value -> forward -> backward -> original value) to catch lossy or asymmetric conversions before they reach production.",
+    "Name and document lossy fields: any field that is dropped, defaulted, or normalized in one direction must be annotated or documented so a future maintainer knows the asymmetry is intentional.",
+    "Use collection helpers consistently: always map collections through the converter's element-wise helper rather than looping at call sites, so null-empty semantics and batching are handled uniformly.",
+    "Isolate framework-specific mapping: when a framework handles a pair automatically (Jackson, serde, Codable), configure it rather than wrapping it in a parallel converter; only write a custom converter when the framework defaults are wrong for the domain.",
+    "Prefer pure functions: a converter should have no observable side effects and its output should depend only on its input; any caching, delegation to services, or I/O belongs in an assembler or repository layer, not in the mapping step.",
+    "For isomorphic (lossless) converters, verify both round-trip laws in tests: forward(backward(x)) == x and backward(forward(x)) == x; use property-based testing (e.g., QuickCheck, Hypothesis) to exercise a wide value domain and catch law violations before production (see lawful-conversions Haskell library, Higher-Kinded-J Iso optics).",
+    "For mutable collection types in EF Core or similar ORMs, always pair the ValueConverter with a ValueComparer that implements sequence-equality (c.Aggregate(0, (a, v) => HashCode.Combine(a, v.GetHashCode())) and c.SequenceEqual(c2)), otherwise change tracking uses reference equality and silently misses updates.",
+    "Document the conversion direction as part of the method name: to_wire/from_wire, to_payload/from_payload, to_domain/from_legacy — naming the direction explicitly prevents callers from assuming the wrong transformation.",
+    "In an anti-corruption layer (ACL), keep the converter small and singularly responsible: one converter per external schema, not one converter that handles all external systems; the ACL is the seam, not the entire service (Eric Evans, DDD; Microsoft Azure Architecture Center; Stéphane Erard, ACL best practices)."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Java Design Patterns (Ilkka Seppala and contributors), Converter: https://java-design-patterns.com/patterns/converter/ - generic, systematic bidirectional conversion between corresponding types with neither type aware of the other; originating catalog entry (also known as Mapper / Translator).",
+    "Spring Framework reference, Type Conversion (Converter SPI, ConverterRegistry, ConversionService): https://docs.spring.io/spring-framework/reference/core/validation/convert.html - Converter<S,T> interface with convert() method; ConfigurableConversionService as the unified SPI-and-API facade; GenericConversionService as the stateless default implementation; converters registered once at startup and shared across threads.",
+    "Java EE Persistence API, AttributeConverter<X,Y> (convertToDatabaseColumn / convertToEntityAttribute): https://docs.oracle.com/javaee/7/api/javax/persistence/AttributeConverter.html - Interface for JPA attribute conversion between entity attribute type X and database column type Y; autoApply=true makes the converter universal for the target type; @Convert annotation for per-attribute override.",
+    "Jakarta Persistence API, Converter and AttributeConverter<X,Y>: https://jakarta.ee/specifications/persistence/4.0/apidocs/jakarta.persistence/jakarta/persistence/attributeconverter - Jakarta EE successor to Java EE AttributeConverter; @Converter(autoApply) annotation; converters are stateless; null values are never passed to either direction.",
+    "Microsoft Learn, Value Conversions - EF Core (ValueConverter<TModel,TProvider>, HasConversion, ValueComparer): https://learn.microsoft.com/en-us/ef/core/modeling/value-conversions - Official EF Core documentation: ValueConverter is stateless; conversions defined via two Expression<Func> trees compiled into database access delegates; ValueComparer required for mutable types (List<T>, byte[]) to enable correct change tracking via deep equality; built-in converters for enums, bool, DateTime, JSON serialization; ConverterMappingHints for database column facets (size, unicode).",
+    "Microsoft Learn, Value Comparers - EF Core: https://learn.microsoft.com/en-us/ef/core/modeling/value-comparers - ValueComparer<T> constructor takes three expressions: equality check, hash code, snapshot; deep vs shallow comparison; structural equivalence for collections; key comparers for FK/PK semantics; SetKeyValueComparer for overriding default key comparison.",
+    "Converter Design Pattern in Java (Java Guides): https://www.javaguides.net/2018/08/converter-design-pattern-in-java.html - Bidirectional, type-safe conversion between isomorphic types (DTOs and domain entities) with generic Converter base class and Java 8 stream-based collection helpers.",
+    "java-design-patterns / converter (iluwatar): https://github.com/iluwatar/java-design-patterns/tree/master/converter - Reference open-source implementation with UserDto <-> User example; method-reference-based mapping functions, collection helpers createFromDtos/createFromEntities.",
+    "The Palindrome Pattern: Entity -> DAO -> DTO -> Controller -> DTO -> DAO -> Entity (unixy.io): https://unixy.io/blog/palindrome-pattern-dao-dto/ - Layered conversion chain where each layer owns exactly one transformation direction; forces each layer boundary to have a named converter; makes data flow explicit and each boundary independently testable.",
+    "Bidirectional Data Transformations (ACM): https://doi.org/10.1145/3677998.3678224 - Academic treatment of keeping multiple data representations in sync efficiently; bidirectional transformations as the mechanism for maintaining consistency across serialization, storage, and processing.",
+    "MapStruct - Compile-Time Bean Mapping: https://mapstruct.github.io/mapstruct.org.new/ - Compile-time Java bean mapping code generator producing plain getter/setter code with no reflection; benchmarks show MapStruct runs ~300x faster than reflection-based ModelMapper; catches missing mappings at compile time.",
+    "Mapping with Orika (Baeldung): https://www.baeldung.com/orika-mapping - Runtime bytecode-generation mapping framework (Javassist); performance between MapStruct and ModelMapper but unmaintained since 2019; not recommended for new projects.",
+    "A Guide to Mapping With Dozer (Baeldung): https://www.baeldung.com/dozer - Recursive Java Bean to Bean mapper with convention-based field matching; supports out-of-the-box type conversions but increasingly stale; reflection overhead similar to ModelMapper.",
+    "Performance of Java Mapping Frameworks (Baeldung): https://www.baeldung.com/java-performance-mapping-frameworks - Comprehensive JMH benchmarks across ModelMapper, MapStruct, Orika, Dozer, JMapper; MapStruct and JMapper consistently fastest across average time, throughput, and single-shot benchmarks; reflection mappers 300x+ slower on hot paths; Dozer consistently slowest.",
+    "zod-mapper: Type-Safe Zod-Based Data Mappers (ivan-dalmet): https://github.com/ivan-dalmet/zod-mapper/ - TypeScript library combining Zod validation with mapper pattern; transformIn/transformOut with safeIn/safeOut discriminated unions for error handling.",
+    "Mapper (Patterns of Enterprise Application Architecture, Martin Fowler): https://www.martinfowler.com/eaaCatalog/mapper.html - Catalog definition: a Mapper connects two independent subsystems without either knowing about the other; Converter is a specialized, bidirectional Mapper for equal-cardinality representations.",
+    "Data Transfer Object (Patterns of Enterprise Application Architecture, Martin Fowler): https://www.martinfowler.com/eaaCatalog/dataTransferObject.html - DTO carries data between processes to reduce remote calls; the Assembler maps between DTO and domain objects bidirectionally; Converter subsumes and generalizes the Assembler.",
+    "Data Mapper (Patterns of Enterprise Application Architecture, Martin Fowler): https://www.martinfowler.com/eaaCatalog/dataMapper.html - Separates in-memory objects from relational database schema; unlike Converter (equal-cardinality bidirectional map), Data Mapper mediates between fundamentally different shapes (object vs. relational).",
+    "MapStruct vs ModelMapper vs Orika: I Measured the Mapping Tax (Viktar Patotski): https://patotski.com/blog/mapstruct-vs-modelmapper-vs-orika/ - JMH benchmark on AMD Ryzen 9 7950X3D: MapStruct 13.5 ns/mapping (176 bytes allocated, indistinguishable from hand-written), Orika 174.8 ns (744 bytes, 13.5x slower, broken by JDK module system since JDK 16), ModelMapper 4,074.9 ns (12,560 bytes, 315x slower); Orika unmaintained since 2019.",
+    "Anti-Corruption Layer Pattern - Azure Architecture Center (Microsoft): https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer - Eric Evans DDD origin; ACL as a facade or adapter layer between subsystems with different semantics; translates requests between systems protecting the new domain model; latency, single point of failure, and observability considerations; implemented as in-process class or independent service.",
+    "Anti-Corruption Layer System Design (Vidhya Sagar Thakur): https://www.vidhyasagarthakur.engineer/blog/anti-corruption-layer-system-design - Practical ACL implementation in Python with to_domain() and to_legacy() methods; bidirectional translation with explicit status code mapping; Stripe payment gateway ACL example; step-by-step guide to building, wiring, and testing ACL translators.",
+    "Anti-Corruption Layer Pattern - AWS Prescriptive Guidance (Amazon): https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/acl.html - ACL between monolith and migrated microservice; IUserServiceACL adapter translating call semantics and interface; reduces transformation risk and business disruption; must be decommissioned after migration; circuit breaker and retry considerations.",
+    "Fix and Formalize ACLs (Stéphane Erard): https://serard.dev/content/blog/mud-to-ddd/07-acls.html - Comprehensive ACL practitioner guide: mapping inventory table (name, cardinality, identity, state, null/default, units, validation, errors, ownership, versioning, reversibility); translator, validator, and error mapper sub-responsibilities; six ACL responsibilities: vocabulary, shape, behavioral translation; characterization tests, routing reversibility, observability with correlation IDs; ACL is a seam, not a wrapper.",
+    "Mapping in DDD - Context Mapping and Object Mapping (Basti): https://apunti.basti.cl/en/investigacion/arquitectura/domain-driven-design/mapping/ - Strategic DDD context mapping patterns (Shared Kernel, Customer-Supplier, Conformist, Anti-Corruption Layer, Open Host Service, Published Language); explicit mapping over auto-mapping; ACL as the most powerful context mapping pattern; map at layer boundaries, not everywhere.",
+    "Isomorphisms - Higher-Kinded-J: Composable Effects and Advanced Optics for Java: https://higher-kinded-j.github.io/latest/optics/iso.html - Iso as a lawful, lossless bidirectional optic with get (forward) and reverseGet (backward); round-trip assertion assert(original.equals(convertedBack)); Iso.compose with lenses for chained transformations; For comprehension with through() for keeping both representations in scope.",
+    "lawful-conversions Haskell library (Nikita Volkov): https://github.com/nikita-volkov/lawful-conversions - Lawful typeclass hierarchy for bidirectional conversion: Isomorphism (Is) requires both round-trip laws, Smart Constructor (IsSome) is partial inverse, Canonicalization (IsMany) is surjective; property-based testing to verify law compliance; mathematical foundation from set theory and category theory.",
+    "isomorphism-class Haskell library: https://hackage.haskell.org/package/isomorphism-class - Isomorphism typeclass as a lawful solution to the conversion problem; key insight: lossless bidirectional conversions usually have exactly one lawful definition; property-test for validating instances; lawful instances are evident to users.",
+    "tasty-groundhog-converters: Round-trip and golden SQL testing for Haskell database converters: https://github.com/plow-technologies/tasty-groundhog-converters - roundTripConverter test combinator verifies isomorphism law; goldenSqlConverter for golden file regression testing of serialization format; Converter as Isomorphism claim verified by tests.",
+    "roundtrip Haskell package - Bidirectional (de-)serialization: https://hackage.haskell.org/package/roundtrip - Bidirectional serialization specifications based on Invertible Syntax Descriptions (Rendel and Ostermann, Haskell Symposium 2010); unifying parsing and pretty-printing as one bidirectional specification.",
+    "Composing Bidirectional Programs Monadically (Springer's 2019 Haskell Symposium paper): https://link.springer.com/chapter/10.1007/978-3-030-17184-1_6 - Bidirectional transformations and round-tripping laws; compositional verification of round-trip properties; forward-then-backward and backward-then-forward round-trip laws; property-based testing (QuickCheck) for soundness and completeness of bidirectional generators.",
+    "Custom serialization - Serde: https://serde.rs/custom-serialization.html - Serde Serialize/Deserialize trait pair as the Rust idiom for converter pattern; Serialize and Deserialize implemented separately but composable; format-agnostic (JSON, Postcard, bincode); serde_with crate provides serde_conv! macro for creating custom conversion adapters without boilerplate.",
+    "serde_with guide - serde_as and serde_conv macro: https://docs.rs/serde_with/latest/serde_with/guide/serde_as/ - SerializeAs/DeserializeAs trait pair for composable conversion types; #[serde_as] proc-macro for declaration; serde_conv! macro for simple (serialize_fn, deserialize_fn) -> conversion adapter; remote types support; orphan rule workaround via local adapter type.",
+    "Assembler vs Entity Translator and Entities vs DTO (Stack Overflow): https://softwareengineering.stackexchange.com/questions/298552/assembler-vs-entity-translator-and-entities-vs-dto - Mapper/Assembler/Translator are variations of the same pattern; Assembler often one-way paired with Disassembler; Translator implies expected two-way; AutoMapper implies dynamic late-bound convention; explicit mapping is safer and more transparent.",
+    "DTO Design Guide - bookforge-ai: https://github.com/bookforge-ai/bookforge-skills/blob/main/books/patterns-of-enterprise-application-architecture/skills/distribution-boundary-designer/references/dto-design-guide.md - Fowler DTO concepts mapped to modern equivalents (DTO class -> Java record/Kotlin data class, Assembler -> MapStruct/AutoMapper, XML -> JSON); anti-patterns: DTO mirrors domain 1:1, domain object in DTO field, behavior in DTO, over-split DTOs.",
+    "Best Practices For Mapping DTO to Domain Object? (Stack Overflow): https://stackoverflow.com/questions/678217/best-practices-for-mapping-dto-to-domain-object - Mapping should live at the boundary, not inside entities; DTOs should not contain domain object references; explicit mapper or extension method preferred over automapper for transparency; automapper implicit mappings hide bugs and make them hard to locate; consider mapping inside DTO as an implementation detail of the boundary.",
+    "Guava Converter<F, T> API (Google Core Libraries for Java 31.0-jre): https://guava.dev/releases/31.0-jre/api/docs/com/google/common/base/Converter.html - Abstract class for a bidirectional conversion between corresponding types F and T: convert()/reverse() pair, subclasses declare only one direction and reverse() is derived automatically, mapAll() maps whole iterables in either direction, Converter.normalize() lifts a converter into a Function between collections of the pair.",
+    "Go database/sql and database/sql/driver documentation (Scanner / Valuer): https://pkg.go.dev/database/sql and https://pkg.go.dev/database/sql/driver - sql.Scanner's Scan(src any) error governs decoding a database value into the Go type; driver.Valuer's Value() (driver.Value, error) governs encoding it back; types without a Valuer fall through to DefaultParameterConverter; nil-pointer receivers become NULL instead of panicking; NullString/NullInt64/NullTime are the standard library's own converter pairs.",
+    "ActiveModel::Type::Value - Rails API documentation: https://api.rubyonrails.org/v8.1/classes/ActiveModel/Type/Value.html - Base class for custom attribute types: deserialize converts a database value to the Ruby type (delegating to cast by default), serialize converts a Ruby value to a database-understandable form, serializable? checks convertibility; subclasses own the pair by overriding serialize and deserialize.",
+    "Pitfalls of AutoMapper (Gigi Labs): https://gigi.nullneuron.net/gigilabs/pitfalls-of-automapper/ - Criticism of runtime auto-mapping: mapping errors surface only at runtime, renamed properties silently break mappings as models evolve, declarative configuration proliferates, and startup plus per-mapping overhead accrue; recommends explicit mapping or code generation over convention-based mappers.",
+    "On Automappers (Enterprise Craftsmanship): https://enterprisecraftsmanship.com/posts/on-automappers/ - Automappers are only safe for DTO <-> DTO pairs without invariants; mapping DTOs onto domain classes with an automapper bypasses domain validation, and as the two representations diverge the automapper's conventions degrade into hand-written per-member configuration anyway."
+  ],
+  "related_patterns_notes": {
+    "assembler": "assembler",
+    "entity-translator": "entity-translator",
+    "translator": "translator",
+    "strangler-fig": "strangler-fig",
+    "isomorphism": "isomorphism"
+  }
+}

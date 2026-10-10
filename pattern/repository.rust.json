@@ -1,0 +1,60 @@
+{
+  "pattern": "repository",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "struct holding a PgPool; async query_as::<_, T> + FromRow",
+  "implementation_notes": "The repository is a struct owning a connection pool (PgPool) with async methods returning Result<Option<Invoice>, sqlx::Error>; sqlx::query_as::<_, Invoice> with #[derive(FromRow)] replaces the hand-written mapper, and query_as! checks statements against a live schema at compile time. Model the interface as a trait (InvoiceRepository: Send + Sync) only when tests need an in-memory double, and prefer a concrete struct plus a narrow consumer-side trait otherwise. Transactions stay explicit: take &mut PgConnection or a Transaction by parameter so the repository never commits behind the caller's back.",
+  "code_sketch": "#[derive(sqlx::FromRow)]\npub struct Invoice { pub id: i64, pub amount: Decimal, pub due: NaiveDate }\n\npub struct PgInvoiceRepository { pool: PgPool }   // Send + Sync, cloneable handle\n\nimpl PgInvoiceRepository {\n    pub async fn find_overdue(&self, on: NaiveDate) -> Result<Vec<Invoice>, sqlx::Error> {\n        sqlx::query_as::<_, Invoice>(\"SELECT id, amount, due FROM invoice WHERE due < $1\")\n            .bind(on)                              // SQL never leaves this module\n            .fetch_all(&self.pool)\n            .await\n    }\n}",
+  "pitfalls": [
+    "sqlx::Error and row types must not leak into the domain: map them to a domain error at the boundary, or domain code depends on the driver crate.",
+    "Keep the Transaction on the caller's stack: it borrows a connection exclusively, and holding one across unrelated awaits starves the pool.",
+    "query_as! (compile-time checked) needs a live database or a prepared offline .sqlx cache in CI; without it clean checkouts fail to build."
+  ],
+  "sources": [
+    "https://docs.rs/sqlx/latest/sqlx/",
+    "https://docs.rs/sqlx/latest/sqlx/trait.FromRow.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "sqlx-async-repository",
+      "name": "Repository struct over sqlx (async, pool-backed)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async-await"
+      ],
+      "idiom_name": "struct holding a PgPool; async query_as::<_, T> + FromRow",
+      "implementation_notes": "The repository is a struct owning a connection pool (PgPool) with async methods returning Result<Option<Invoice>, sqlx::Error>; sqlx::query_as::<_, Invoice> with #[derive(FromRow)] replaces the hand-written mapper, and query_as! checks statements against a live schema at compile time. Model the interface as a trait (InvoiceRepository: Send + Sync) only when tests need an in-memory double, and prefer a concrete struct plus a narrow consumer-side trait otherwise. Transactions stay explicit: take &mut PgConnection or a Transaction by parameter so the repository never commits behind the caller's back.",
+      "code_sketch": "#[derive(sqlx::FromRow)]\npub struct Invoice { pub id: i64, pub amount: Decimal, pub due: NaiveDate }\n\npub struct PgInvoiceRepository { pool: PgPool }   // Send + Sync, cloneable handle\n\nimpl PgInvoiceRepository {\n    pub async fn find_overdue(&self, on: NaiveDate) -> Result<Vec<Invoice>, sqlx::Error> {\n        sqlx::query_as::<_, Invoice>(\"SELECT id, amount, due FROM invoice WHERE due < $1\")\n            .bind(on)                              // SQL never leaves this module\n            .fetch_all(&self.pool)\n            .await\n    }\n}",
+      "pitfalls": [
+        "sqlx::Error and row types must not leak into the domain: map them to a domain error at the boundary, or domain code depends on the driver crate.",
+        "Keep the Transaction on the caller's stack: it borrows a connection exclusively, and holding one across unrelated awaits starves the pool.",
+        "query_as! (compile-time checked) needs a live database or a prepared offline .sqlx cache in CI; without it clean checkouts fail to build."
+      ],
+      "sources": [
+        "https://docs.rs/sqlx/latest/sqlx/",
+        "https://docs.rs/sqlx/latest/sqlx/trait.FromRow.html"
+      ]
+    },
+    {
+      "variant_id": "diesel-repository",
+      "name": "Diesel repository (sync DSL over a generated schema)",
+      "paradigm": "declarative",
+      "min_standard": "Rust2021",
+      "idiom_name": "struct holding a connection; Diesel DSL queries returning QueryResult<T>",
+      "implementation_notes": "Diesel puts the mapping in a code-generated schema module and the queries in a typed DSL: invoices::table.filter(invoices::due.lt(on)).load::<Invoice>(&mut conn), with #[derive(Queryable, Selectable, Insertable)] replacing the mapper. It is synchronous and connection-centric, which suits workers, CLIs and batch jobs but needs a blocking pool (tokio::task::spawn_blocking) inside async servers; the repository becomes a thin struct wrapping the connection with domain-language methods.",
+      "code_sketch": "pub struct DieselInvoiceRepository<C> { conn: C }        // C: Connection\n\nimpl<C: Connection<Backend = Pg>> DieselInvoiceRepository<C> {\n    pub fn find_overdue(&mut self, on: NaiveDate) -> QueryResult<Vec<Invoice>> {\n        use crate::schema::invoices::dsl::*;              // generated schema, no hand SQL\n        invoices.filter(due.lt(on)).select(Invoice::as_select()).load(&mut self.conn)\n    }\n}",
+      "pitfalls": [
+        "The generated schema ties the repository to the database layout at compile time: a migration without regenerating fails the build, which is intended but is real coupling.",
+        "Diesel is synchronous: calling it directly from async code blocks the executor; wrap it in a blocking pool.",
+        "Generic over Connection makes the repository testable on SQLite, but backend-specific SQL (RETURNING, ON CONFLICT) does not port - keep such queries behind a backend-specific impl."
+      ],
+      "sources": [
+        "https://docs.rs/diesel/latest/diesel/",
+        "https://doc.rust-lang.org/book/ch10-02-traits.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlx-async-repository",
+  "version": "1.0"
+}

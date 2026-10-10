@@ -1,0 +1,184 @@
+{
+  "category": "concurrency-resilience",
+  "name": "intrusive-reference-counting",
+  "aliases": [
+    "counted body"
+  ],
+  "intent": "Give the shared body its own reference count so that many cheap handles can share it at the cost of one increment per copy, with the body destroyed deterministically when the last handle is released.",
+  "problem": "A body - string, buffer, node, kernel object, framework object - must be shared by many handles, but copying the body is expensive and a separate control block either costs an extra allocation or is impossible because the object comes from a C API or an OS that already counts. Without a count owned by the object itself, either bodies are copied gratuitously or nobody can tell when the last user is finished with them.",
+  "context": "Applies where handles are copied and passed far more often than bodies change, where the body's type can be edited by its owners (the count becomes part of its layout), where destruction must be deterministic rather than scheduled by a collector, and where objects may cross a C or ABI boundary whose protocol already defines add-ref/release (COM IUnknown, Core Foundation, GObject, kernel krefs). Once handles can cross threads the count must become atomic or externally synchronised.",
+  "benefits": [
+    "Copying or assigning a handle is a single count increment - no allocation, no body copy - so sharing becomes the default and gratuitous copying disappears.",
+    "The handle is one pointer wide: no separate control block, no extra allocation per body, and the count sits next to the payload it protects (better locality than an out-of-line count).",
+    "Destruction is deterministic: the release hook runs when the last handle goes away, in environments without a garbage collector (kernels, embedded systems, C ABI boundaries).",
+    "Objects that already own their count - COM objects, Core Foundation types, GObject instances, kernel krefs - can be carried by a smart handle instead of being copied, leaked or wrapped in a second count.",
+    "One count per body is a single source of truth for liveness, which makes 'is anyone else still holding this?' answerable and enables further sharing patterns such as copy-on-write and flyweight registries.",
+    "Buys value-like semantics for large bodies: a counted string or buffer can be passed by value, stored in containers and compared without paying the copy cost of the classic handle/body pair."
+  ],
+  "tradeoffs": [
+    "The count lives inside the body, so the body's type must be editable - a class you do not own cannot be counted intrusively; a detached count or a control block (shared_ptr) is the fallback.",
+    "Lifetime mistakes are silent and unrecoverable: two independently created counts for one body produce undefined double deletion, and a missed increment frees memory that is still in use.",
+    "Cycles are never freed: the count cannot reach zero for objects that reference each other, so counted graphs keep leaking unless back-edges are weak.",
+    "Thread safety is a design decision, not a given: a plain integer count shared across threads is a data race, while atomic counting pays a contended read-modify-write on every handle copy even when the object ends up thread-confined.",
+    "Interop hazards: an intrusive handle and a control-block owner must not both own the same body, and mixed ownership silently double-frees or leaks.",
+    "The count occupies space in every instance and its position becomes part of the object's layout, fixing the representation across library versions.",
+    "Sharing must be broken explicitly: every mutating operation has to detach (copy) a shared body or prove the count is one, adding copy-on-write logic and another concurrency rule."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 5,
+    "simplicity": 4,
+    "performance": 9,
+    "reliability": 5,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Counted Body",
+      "responsibility": "The shared representation: payload plus the reference count that decides when the payload dies; owning the count is what makes the counting intrusive."
+    },
+    {
+      "role": "Handle",
+      "responsibility": "The small value clients copy and pass; holds one reference, increments on copy and assignment, decrements on destruction, and triggers the release hook at zero."
+    },
+    {
+      "role": "Reference Count",
+      "responsibility": "The embedded counter and the increment/decrement discipline (plain or atomic, relaxed or acquire/release) chosen for the threading model."
+    },
+    {
+      "role": "Release Hook",
+      "responsibility": "The operation run exactly once when the count reaches zero - destructor, deleter or release function - freeing the body's resources without throwing."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "persistence-unit",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Copy-on-write strings and buffers whose copies stay cheap until one of them is mutated (the classic String/StringRep pair, Qt's implicit sharing, historical std::string implementations).",
+    "Kernel and driver objects that must outlive the code path that created them and are passed between subsystems (krefs on device, file and memory objects).",
+    "Framework object models where the object carries its own count and handles cross module boundaries: GObject/GTK, COM/WinRT and Core Foundation objects.",
+    "Servers handing one received payload to several downstream stages and returning it to a buffer pool when the last stage releases it.",
+    "Objects allocated in a slab or arena that cannot be given a separate control block but are shared by many subsystems (symbols, descriptors, session state).",
+    "Caches sharing one immutable body across many entries where duplication would dominate memory and no garbage collector is available.",
+    "GPU resources (Vulkan device memory, CUDA device pointers) where the driver manages an internal reference count and client code wraps handles in intrusive smart pointers to control lifetime deterministically.",
+    "POSIX file descriptors and struct file descriptions in the Linux kernel, where a shared file description is reference-counted while each fd is a separate handle pointing into it.",
+    "RDMA memory regions and queue pairs in high-performance networking, where a memory region must stay valid while any hardware queue holds a reference to it.",
+    "WebAssembly linear memory blocks managed without a GC: objects crossing the host/guest boundary use reference counts to ensure the host keeps the block alive until all host handles are released.",
+    " unikernel and bare-metal environments where no allocator exists for a separate control block, so every shared object carries its own count in a known memory region.",
+    "Qt's QSharedData/QSharedDataPointer uses an embedded count for implicitly shared value types: copies stay shallow and a write detaches the body before mutation.",
+    "Chromium's base::RefCounted and RefCountedThreadSafe pair an object-owned count with scoped_refptr, making sequence confinement versus cross-thread ownership an explicit choice.",
+    "Linux kernel subsystems embed struct kref in shared objects and pair kref_get/kref_put with a release callback; concurrent lookup paths can use kref_get_unless_zero under the documented locking discipline."
+  ],
+  "avoid_when": [
+    "The body type cannot be modified (library code, third-party struct): use a control-block owner such as std::shared_ptr or the language's collector - Boost's own guidance is to try a shared_ptr-based design first.",
+    "Lifetime is single-owner or scoped: a unique_ptr/RAII member or a plain value is simpler and safer, and a count buys nothing.",
+    "The object graph can contain cycles (parent/child back-references, observer registries): counting alone leaks - use tracing collection or weak references for the back-edges.",
+    "The language manages memory itself (Java, C#, Go, Kotlin, Scala, Ruby, JavaScript/TypeScript): the runtime owns lifetime; only FFI boundaries need counted handles.",
+    "The body is large and mutated often while shared: detach copies will dominate whatever the sharing saved.",
+    "Handle copies are not on the hot path: the extra field and the increment/decrement discipline cost more than the copies they avoid."
+  ],
+  "language_files": {
+    "generic": "intrusive-reference-counting.generic.json",
+    "c": "intrusive-reference-counting.c.json",
+    "cplusplus": "intrusive-reference-counting.cplusplus.json",
+    "csharp": "intrusive-reference-counting.csharp.json",
+    "go": "intrusive-reference-counting.go.json",
+    "java": "intrusive-reference-counting.java.json",
+    "javascript": "intrusive-reference-counting.javascript.json",
+    "kotlin": "intrusive-reference-counting.kotlin.json",
+    "python": "intrusive-reference-counting.python.json",
+    "ruby": "intrusive-reference-counting.ruby.json",
+    "rust": "intrusive-reference-counting.rust.json",
+    "scala": "intrusive-reference-counting.scala.json",
+    "swift": "intrusive-reference-counting.swift.json",
+    "typescript": "intrusive-reference-counting.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "copy-on-write",
+    "smart-pointer",
+    "flyweight",
+    "pimpl",
+    "copy-and-swap",
+    "dispose"
+  ],
+  "anti_patterns": [
+    "Hand-rolling reference counts in a GC language to 'make deallocation deterministic' - counts cannot force collection and fight the collector (resurrection, finalizer ordering).",
+    "Two counts for one body: building an intrusive handle from a raw pointer that is owned elsewhere, or wrapping a control-block-owned object in an intrusive handle - undefined double deletion.",
+    "Plain (non-atomic) counts shared across threads to save the atomic operation, producing a data race that only shows up under load.",
+    "Keeping cycles alive and calling the design leak-free: reference counting is not cycle collection.",
+    "Branching on use_count()/count in code that other threads can observe; the value is stale the moment it is read.",
+    "Adopting a borrowed raw pointer as if it were an owned reference and releasing something the caller still uses."
+  ],
+  "design_principles": [
+    "One count per body, owned by the body's type: a single source of truth for liveness.",
+    "Ownership as a value (RAII): lifetime follows handle scope, and the last handle out performs the release.",
+    "Separate interface from implementation (handle/body) while making the sharing cost explicit instead of hiding it inside copies.",
+    "Do not allocate or copy on the sharing path: a handle copy is one increment.",
+    "Thread safety by construction: choose the counter policy (single-threaded vs atomic) deliberately rather than relying on the environment.",
+    "Do not pay for what you do not use: no count when no sharing exists."
+  ],
+  "best_practices": [
+    "Prefer a vetted realization (boost::intrusive_ptr, GObject ref/unref, kernel kref) over hand-rolled counters.",
+    "Keep the count private and expose increment/release as free functions next to the type (ADL) so generic smart handles keep working unchanged.",
+    "Create handles only from an existing handle or from the body's creation function, never from an arbitrary raw pointer, so a body can never end up with two counts.",
+    "Start the count at 1 in the single creation point, make release idempotent and non-throwing, and destroy the body exactly once at zero.",
+    "Choose and document the counter policy: thread_unsafe_counter for confined objects, thread_safe_counter with acquire/release ordering once handles can migrate.",
+    "Use non-owning or weak handles for back-edges and observers instead of counting references.",
+    "Treat use_count() as a diagnostic and never branch on it under concurrency.",
+    "At FFI boundaries forward increment/release to the foreign protocol (AddRef/Release, CFRetain/CFRelease, g_object_ref/unref) instead of adding a second count.",
+    "For mutable shared bodies implement detach-on-write explicitly and document the thread-safety rule that makes it correct.",
+    "Use thread-safe RefCounted types (e.g. Chromium's ThreadSafeRefCounted, Android's sp) once a handle can be accessed from multiple threads; use the thread-unsafe variant when objects are confined to a single thread to avoid the atomic overhead.",
+    "In Chromium-style RefCounted, subclass from RefCountedData or RefCountedThreadSafe and implement OnThreadPoolDestructionRefCounted when the object must outlive its creating thread.",
+    "In Android's sp<T>/wp<T> model, upcast from wp to sp only after confirming the object is still alive (via wp.promote()) and handle the null case explicitly; never store an sp across a process boundary.",
+    "Prefer kref_put_mutex when the release path needs to hold a lock (e.g. struct kref with a containing mutex) to avoid races between the decrement and the mutex being torn down.",
+    "For Vulkan/GPU handles, query the driver for the correct AddRef-style entry point (vkGetInstanceProcAddr / vkGetDeviceProcAddr) and forward the intrusive handle's release to it instead of using a custom deleter that bypasses the driver.",
+    "In Rust, use Arc (atomic reference count) for thread-safe sharing and Rc (non-atomic) for single-threaded cases; neither is intrusive — the count lives in a separate heap allocation — so prefer them when you cannot modify the body's type.",
+    "Implement a compile-time or static_assert that the count field is truly embedded (sizeof(count) > 0) to catch accidental slicing that would create a body without a count.",
+    "Expose increment and release as ADL-discoverable free functions (e.g. ref_count_inc(obj) and ref_count_dec(obj)) so generic code and smart handles work without being recompiled against each concrete type.",
+    "In multi-module systems, define one and only one intrusive-wrapper translation unit that implements the release hook; all other translation units include only the forward declarations, preventing ODR violations in the release path."
+  ],
+  "version": "1.2",
+  "sources": [
+    "James O. Coplien, C++ Idioms (EuroPLoP '98), Counted Body - recasts the idiom of Advanced C++ Programming Styles and Idioms (1992): a reference count is added to the body and memory management moves into the handle's init/assign/copy/destroy.",
+    "https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Counted_Body",
+    "https://www.boost.org/doc/libs/1_86_0/libs/smart_ptr/doc/html/smart_ptr.html",
+    "https://www.kernel.org/doc/html/latest/core-api/kref.html",
+    "https://docs.gtk.org/gobject/method.Object.ref.html",
+    "https://source.chromium.org/chromium/chromium/src/+/main:base/memory/ref_counted.h",
+    "https://cs.android.com/android/platform/superproject/main/+/main:system/core/libutils/StrongPointer.h",
+    "https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#Rr-smartptrparams",
+    "https://learn.microsoft.com/en-us/windows/win32/com/component-object-model--com--portal",
+    "https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFMemoryMgmt/CFMemoryMgmt.html",
+    "https://registry.khronos.org/Vulkan/specs/1.3-extensions/man/html/vkDestroyInstance.html",
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html",
+    "https://www.laputan.org/pub/sag/coplien-idioms.pdf",
+    "https://doc.qt.io/qt-6/qshareddatapointer.html",
+    "https://chromium.googlesource.com/chromium/src.git/+/a7b13da0ce3c2a57eae58499b1e8c13e8432baa7/base/memory/ref_counted.h",
+    "https://docs.kernel.org/core-api/kref.html",
+    "https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1351r0.html"
+  ],
+  "related_patterns_notes": {
+    "weak-pointer": "weak-pointer",
+    "enable-shared-from-this": "enable-shared-from-this",
+    "read-copy-update": "read-copy-update",
+    "hazard-pointer": "hazard-pointer",
+    "atomic-reference-counting": "atomic-reference-counting"
+  }
+}

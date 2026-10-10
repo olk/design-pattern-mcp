@@ -1,0 +1,68 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "SolidQueue queue tables + perform_later inside the business transaction",
+  "implementation_notes": "Rails' default queue backend keeps jobs in the application database (solid_queue_jobs plus ready/scheduled/failed execution tables), so enqueueing inside the same transaction as the business write commits both or neither and the RDBMS is the durable store; workers claim rows with FOR UPDATE SKIP LOCKED, and failed executions stay in the database until they are retried or discarded. Retry policy is Active Job's (retry_on/discard_on) - Solid Queue itself deliberately adds none - and the job should carry a business id so a redelivery after a crash is idempotent. This is the idiomatic Ruby realization: the durable channel is a table, not a separate broker.",
+  "code_sketch": "class Order < ApplicationRecord\n  def place!(payload)\n    transaction do                       # state and enqueue commit together\n      save!\n      SendOrderJob.perform_later(id, payload)\n    end\n  end\nend\nclass SendOrderJob < ApplicationJob\n  retry_on Net::OpenTimeout, wait: :polynomially_longer, attempts: 10\n  def perform(order_id, payload) = Gateway.deliver(order_id, payload)  # idempotent\nend",
+  "pitfalls": [
+    "Redis-backed Sidekiq is not a durable store unless Redis itself persists and is configured for it - enqueueing there is not guaranteed delivery, however reliable it feels in development.",
+    "Solid Queue performs no automatic retry: without Active Job's retry_on/discard_on, failures accumulate in solid_queue_failed_executions and are only visible in mission control.",
+    "A job enqueued inside a transaction that later rolls back would never run; keep enqueue and state in one transaction deliberately (or use enqueue_after_transaction_commit) rather than relying on accident.",
+    "Long-running jobs holding the same database as the app contend with web traffic; Solid Queue's own polling (SKIP LOCKED) needs the database to support row locking (Postgres/MySQL, not every adapter)."
+  ],
+  "sources": [
+    "https://github.com/rails/solid_queue",
+    "https://guides.rubyonrails.org/active_job_basics.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "solid-queue-database-store",
+      "name": "Solid Queue (database-backed Active Job) with transactional enqueue",
+      "paradigm": "oo",
+      "min_standard": "Ruby3.1",
+      "requires_features": [
+        "rails",
+        "solid-queue"
+      ],
+      "idiom_name": "SolidQueue queue tables + perform_later inside the business transaction",
+      "implementation_notes": "Rails' default queue backend keeps jobs in the application database (solid_queue_jobs plus ready/scheduled/failed execution tables), so enqueueing inside the same transaction as the business write commits both or neither and the RDBMS is the durable store; workers claim rows with FOR UPDATE SKIP LOCKED, and failed executions stay in the database until they are retried or discarded. Retry policy is Active Job's (retry_on/discard_on) - Solid Queue itself deliberately adds none - and the job should carry a business id so a redelivery after a crash is idempotent. This is the idiomatic Ruby realization: the durable channel is a table, not a separate broker.",
+      "code_sketch": "class Order < ApplicationRecord\n  def place!(payload)\n    transaction do                       # state and enqueue commit together\n      save!\n      SendOrderJob.perform_later(id, payload)\n    end\n  end\nend\nclass SendOrderJob < ApplicationJob\n  retry_on Net::OpenTimeout, wait: :polynomially_longer, attempts: 10\n  def perform(order_id, payload) = Gateway.deliver(order_id, payload)  # idempotent\nend",
+      "pitfalls": [
+        "Redis-backed Sidekiq is not a durable store unless Redis itself persists and is configured for it - enqueueing there is not guaranteed delivery, however reliable it feels in development.",
+        "Solid Queue performs no automatic retry: without Active Job's retry_on/discard_on, failures accumulate in solid_queue_failed_executions and are only visible in mission control.",
+        "A job enqueued inside a transaction that later rolls back would never run; keep enqueue and state in one transaction deliberately (or use enqueue_after_transaction_commit) rather than relying on accident.",
+        "Long-running jobs holding the same database as the app contend with web traffic; Solid Queue's own polling (SKIP LOCKED) needs the database to support row locking (Postgres/MySQL, not every adapter)."
+      ],
+      "sources": [
+        "https://github.com/rails/solid_queue",
+        "https://guides.rubyonrails.org/active_job_basics.html"
+      ]
+    },
+    {
+      "variant_id": "bunny-publisher-confirms",
+      "name": "Bunny publisher confirms with durable queues",
+      "paradigm": "oo",
+      "min_standard": "Ruby2.7",
+      "requires_features": [
+        "bunny",
+        "rabbitmq"
+      ],
+      "idiom_name": "Bunny::Channel#confirm_select + publish(persistent: true) + manual_ack",
+      "implementation_notes": "With RabbitMQ the broker is the store: channel.confirm_select turns publishing into a confirmed operation, queue.publish(payload, persistent: true) marks the message persistent, and channel.wait_for_confirms returns only after the broker persisted it to a durable queue. Consumption uses queue.subscribe(manual_ack: true) and channel.ack(delivery_info.delivery_tag) after the business commit, with channel.prefetch bounding in-flight deliveries. Choose this over Solid Queue when other services (not just this Rails app) consume the channel or when the queue must outlive the application database.",
+      "code_sketch": "conn = Bunny.new(automatically_recover: true); conn.start\nch = conn.create_channel\nch.confirm_select\nq = ch.queue(\"orders\", durable: true)            # survives broker restart\nq.publish(payload, persistent: true, message_id: order_id)\nraise \"not persisted\" unless ch.wait_for_confirms    # broker fsync'd it\nq.subscribe(manual_ack: true) do |info, _props, body|\n  save_order(body)                               # business commit\n  ch.ack(info.delivery_tag)                      # then the delivery ack\nend",
+      "pitfalls": [
+        "persistent: true is ignored unless the queue is durable and the message is routed through a durable exchange; the half-configuration still loses messages on a broker restart.",
+        "Automatic connection recovery recreates topology but does not replay unconfirmed publishes - the application must re-publish messages it never saw confirmed.",
+        "manual_ack without an ack on every path (including exceptions) stalls the prefetch window and the consumer silently stops making progress.",
+        "A process killed between publish and confirm cannot know the outcome; a retry duplicates, so the consumer must dedup on message_id."
+      ],
+      "sources": [
+        "https://github.com/ruby-amqp/bunny",
+        "https://www.rabbitmq.com/docs/confirms"
+      ]
+    }
+  ],
+  "default_variant": "solid-queue-database-store",
+  "version": "1.0"
+}

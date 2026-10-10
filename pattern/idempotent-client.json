@@ -1,0 +1,195 @@
+{
+  "category": "persistence-state",
+  "name": "idempotent-client",
+  "aliases": [
+    "idempotency key",
+    "request identification"
+  ],
+  "intent": "Give every logical write a stable identity - a client-minted idempotency key or a naturally idempotent operation form - and reuse it on every attempt, so a retry sent after an unknown outcome is recognised as the same operation and cannot apply the change twice.",
+  "problem": "A write that crosses a network boundary has three outcomes for the caller: committed, not committed, or unknown - a timeout or dropped connection after the server may already have committed. Because retry middleware, SDK auto-retry, at-least-once brokers and human resubmission all replay the call, the unknown case turns into a duplicate effect (a second charge, order, notification or increment) unless the receiver can recognise the replay as the same logical operation.",
+  "context": "Write paths over a network or a redelivering broker where the caller or its transport owns the retries and the effect is not idempotent on its own: endpoints that create or mutate (POST, PATCH, delta updates), message handlers under at-least-once delivery, job runners replaying after a crash, and offline clients resubmitting queued edits. It matters most when the effect escapes the database - payments, e-mails, webhooks, inventory holds - or when the operation's cost or audit trail makes a duplicate unacceptable.",
+  "benefits": [
+    "Duplicate attempts collapse to one logical effect: create, charge, increment and notify happen once even when the request is replayed.",
+    "Retries become safe by default, so middleware, SDK auto-retry and user resubmission need no per-call exception list.",
+    "Unknown-outcome failures become resolvable: replaying with the same key returns the recorded outcome instead of guessing whether the first attempt landed.",
+    "Side effects outside the transaction (payments, e-mails, webhooks, reservations) stop being a source of double execution that no rollback can undo.",
+    "The key doubles as a stable correlation id for logs, audit and cross-service propagation, and makes duplicate rates measurable.",
+    "At-least-once delivery becomes usable end to end - effectively-once processing - without distributed transactions."
+  ],
+  "tradeoffs": [
+    "The receiver needs a durable key -> outcome record with an index and a retention policy at least as long as a retry can arrive; that store is new infrastructure to operate and pay for.",
+    "Correctness depends on writing the key and the business effect in one atomic step; a naive check-then-write leaves a crash window in which the effect is applied but the key is not recorded (or the reverse).",
+    "Key generation becomes a correctness dependency: minting the key inside the retry loop, deriving it from the payload, or holding it only in memory disables the guarantee while the code still looks protected.",
+    "Concurrent duplicates must be arbitrated by the store (unique constraint, conditional upsert, lock), which serialises them on one key and can create hot rows or contention.",
+    "Naturally idempotent forms change the API contract: absolute writes and conditional updates reject edits that a blind retry used to clobber, so callers must handle the conflict.",
+    "Retained key/outcome data is a privacy and storage liability - keys can leak payload information, and an unbounded retention window grows without limit.",
+    "Idempotency is not freshness: replaying an absolute value can still overwrite newer state unless the write is guarded by a version or ETag, and the guarantee does not extend downstream unless the key is propagated."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 9,
+    "security": 6,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Client / Caller",
+      "responsibility": "Owns the identity of the logical operation: mints the key before the first attempt, reuses it verbatim on every retry, persists it across process restarts, and restricts automatic retries to operations it may replay."
+    },
+    {
+      "role": "Idempotency Key",
+      "responsibility": "The stable name of one logical operation - a random UUID or request id with enough entropy to be unique, never derived from retry-varying state and never reused for different work."
+    },
+    {
+      "role": "Operation Descriptor",
+      "responsibility": "The parameters the key is bound to; the receiver compares them (or a hash) on a replay, so a reused key with different content is reported as misuse instead of silently returning an unrelated outcome."
+    },
+    {
+      "role": "Retry Policy",
+      "responsibility": "Decides which failures are worth replaying, with what backoff and what attempt bound, and only replays operations that are declared idempotent or carry a key."
+    },
+    {
+      "role": "Idempotent Endpoint",
+      "responsibility": "Accepts the key, records key -> outcome atomically with the business effect, replays the recorded outcome for a duplicate, and answers 'already applied' as success rather than as an error."
+    },
+    {
+      "role": "Deduplication Store",
+      "responsibility": "The durable inbox/keyset holding the key, a request fingerprint, the outcome or an in-progress marker, and an expiry; its uniqueness constraint arbitrates two simultaneous duplicates."
+    },
+    {
+      "role": "Outcome Recorder",
+      "responsibility": "Keeps the result (status and body, or an in-progress marker for work that cannot join the transaction) so that a replay returns the original answer instead of re-executing."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "persistence-unit",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Payments and refunds: a charge call times out, the client replays it with the same idempotency key, the account is debited once and the original response is returned.",
+    "Order or booking creation over a flaky mobile link: the app mints the operation id, stores it with the queued submission and resubmits until it sees the recorded outcome.",
+    "Queue consumers under at-least-once delivery: a handler that applied the command but crashed before acknowledging deduplicates on the command id after redelivery.",
+    "Offline-first field clients: queued edits are replayed after reconnect, each carrying an operation id and a version guard, so replays neither double-apply nor clobber newer data.",
+    "Batch and cron jobs: a failed step re-runs from the last checkpoint and replays keyed operations instead of repeating increments or re-sending notifications.",
+    "Webhook and double-submitted forms: the same logical submission forwarded twice by a browser retry or a gateway is applied once, and the id is propagated to downstream services so each tier deduplicates its own work.",
+    "Notification and messaging systems: a notification service that resends an e-mail or push notification after a timeout deduplicates by a message-level idempotency ID; the handler is idempotent (no-op if already delivered).",
+    "Pub/Sub message handling: Google Cloud Pub/Sub and Amazon SQS provide at-least-once delivery by default; Cloud Run handlers or SQS consumers must deduplicate by message ID or an embedded idempotency key to achieve effectively-once semantics.",
+    "Cross-service state propagation: a hotel-booking service emits a 'booking confirmed' event to a loyalty-point service; the loyalty service deduplicates by the booking event ID and only credits points once.",
+    "Saga pattern compensation: in a distributed hotel+flight booking saga, the compensate-flight step is idempotent – it checks whether the flight was already cancelled before cancelling; the saga retry with the same step ID does not double-cancel.",
+    "Financial reconciliation: a nightly reconciliation job detects duplicate charge entries by idempotency key and flags them for refund rather than assuming every logged charge is a valid one.",
+    "API gateway rate limiting with idempotency: a gateway that rate-limits by (client-id, idempotency-key) treats retries of the same logical operation as a single request, preventing retry storms from exhausting rate-limit buckets.",
+    "Kafka's idempotent producer (enable.idempotence=true, the default since Kafka 3.0): the producer obtains a Producer ID for its session and stamps every batch with a per-(partition, Producer ID) sequence number, so the broker - not application code - discards batches that were already appended when the client retries, giving exactly-once writes into the log without an application-level key. The guarantee holds only within one producer session; a transactional.id is needed to recover idempotence across restarts.",
+    "AWS EC2 RunInstances ClientToken: the caller supplies a unique case-sensitive token (up to 64 ASCII characters) and a retried launch returns the original result instead of starting a second instance; if the caller omits the token EC2 generates one, so the protection is on by default. Tokens are scope-bound - zonal idempotency when an Availability Zone or SubnetId is given, otherwise regional - so a retry that changes zone or parameters fails with IdempotentParameterMismatch instead of deduplicating.",
+    "MDN / IETF Idempotency-Key header: the emerging standard for client-minted keys on POST and PATCH - a replay returns the first recorded result, a key still being processed answers 409, and a key replayed with a different payload fingerprint answers 422 Unprocessable Content, so the client can distinguish 'already done' from 'still in flight' from 'key misused'."
+  ],
+  "avoid_when": [
+    "The operation is already naturally idempotent - a PUT that sets absolute state, a DELETE, or an update guarded by a version/ETag: use plain optimistic concurrency (Version Number) and skip the key store.",
+    "A duplicate is genuinely harmless (pure reads, recomputable projections, counters that tolerate a double count): the store costs more than the anomaly it prevents.",
+    "At-most-once is the honest requirement (an irreversible external action the business prefers to miss rather than repeat): fail visibly and reconcile by hand instead.",
+    "The transport already covers it: a broker with duplicate detection, a transactional consumer checkpoint, or an exactly-once stream processor may make an application key unnecessary - though none of them covers effects outside that transaction.",
+    "The server contract cannot be changed (a third-party API without key support): use client-side single-flight plus an explicit reconciliation query instead of pretending the retry is safe."
+  ],
+  "anti_patterns": [
+    "Minting the key inside the retry loop: every attempt becomes a new logical operation and the pattern silently does nothing.",
+    "Deriving the key from the payload or the attempt number: corrected parameters produce a new key (so the retry duplicates) while two identical legitimate submissions collide on one key.",
+    "Check-then-insert without a unique constraint or an atomic conditional write, so two concurrent duplicates both pass the check.",
+    "Expiring deduplication records faster than a retry can arrive - including manual replays from a dead-letter queue - which reopens the duplicate window.",
+    "Retrying every failure, including validation errors and business rejections, and storing the rejection as 'the outcome', so permanently failing calls look like successful replays.",
+    "Recording an in-progress marker and never reconciling it, leaving operations that can neither be safely replayed nor completed after a crash between the external call and the completion update.",
+    "Reusing one key for a batch or for unrelated operations, which makes the store collapse distinct work into a single recorded outcome."
+  ],
+  "design_principles": [
+    "Design for the unknown: because 'no response' does not mean 'no effect', every replayable write needs an identity the receiver can recognise.",
+    "Single responsibility: the caller owns the operation identity, the receiver owns detection and the recorded outcome, and neither infers it from the other.",
+    "Atomicity as a boundary: the deduplication marker and the business effect commit together or not at all.",
+    "Idempotency by construction: prefer naturally idempotent forms (absolute upserts, conditional writes) over bookkeeping, and keep keys for operations that cannot be expressed that way.",
+    "End-to-end propagation: a guarantee that stops at the first hop is not a guarantee - pass the operation id down the call chain.",
+    "Explicitness over magic: declare which operations are retryable instead of letting middleware infer it from HTTP verbs or naming conventions."
+  ],
+  "best_practices": [
+    "Mint the key once per logical operation, before the first attempt, from a cryptographically secure random source (UUIDv4), and persist it with the pending work so a restart resumes the same operation.",
+    "Bind the key to the request content – store a fingerprint (SHA-256 of the business-meaningful fields plus method and path, excluding volatile headers and timestamps) alongside the key and compare it on replay; per the IETF idempotency-key draft, a replay whose fingerprint differs is key misuse (422 Unprocessable Content) and a replay while the first attempt is still in flight is a conflict (409 with Retry-After) - neither should silently return the recorded outcome.",
+    "Commit the marker and the effect in the same transaction, and let a uniqueness constraint arbitrate concurrent duplicates instead of a read-check in application code.",
+    "Return the original recorded outcome for duplicates (or the current state with a documented note), and answer 'already applied' as success.",
+    "Retry only replay-safe calls: RFC 9110 idempotent methods, or operations explicitly declared idempotent; disable blanket auto-retry for unsafe methods and rely on the key when a POST must be replayed.",
+    "Propagate the key to downstream calls made while processing, and log detected duplicates as a metric so a rising duplicate rate is visible.",
+    "Size the deduplication window to the worst-case replay horizon: broker redelivery delay + dead-letter queue TTL + manual resubmission latency; expire keys deliberately rather than never, but never before that horizon.",
+    "Distinguish permanent failures (400, 401, 403, 404, 409, 422) – which must never be retried with the same key – from transient failures (408, 429, 500, 502, 503, 504) – which should be retried with back-off.",
+    "For batch or multi-item operations, assign one key per logical item so that one item's failure retries without re-executing unrelated items in the same logical batch.",
+    "Keep the idempotency store transactionally coupled to the business data: write the key record and the business effect in the same DB transaction so a crash cannot apply the effect without recording the key.",
+    "Instrument duplicate detection as a metric (e.g. `idempotency.duplicates_detected` counter) and alert when the duplicate rate exceeds a threshold – it signals upstream retry storms or broker misconfiguration.",
+    "For global or high-stakes financial operations, use a strongly consistent store (e.g. Cloud Spanner) rather than an eventually consistent one; a stale read of the key set can let a duplicate execute before the prior write is visible."
+  ],
+  "language_files": {
+    "generic": "idempotent-client.generic.json",
+    "c": "idempotent-client.c.json",
+    "cplusplus": "idempotent-client.cplusplus.json",
+    "csharp": "idempotent-client.csharp.json",
+    "go": "idempotent-client.go.json",
+    "java": "idempotent-client.java.json",
+    "javascript": "idempotent-client.javascript.json",
+    "kotlin": "idempotent-client.kotlin.json",
+    "python": "idempotent-client.python.json",
+    "ruby": "idempotent-client.ruby.json",
+    "rust": "idempotent-client.rust.json",
+    "scala": "idempotent-client.scala.json",
+    "swift": "idempotent-client.swift.json",
+    "typescript": "idempotent-client.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "eip",
+    "modern"
+  ],
+  "related_patterns": [
+    "idempotent-receiver",
+    "retry",
+    "retry-with-backoff",
+    "guaranteed-delivery",
+    "version-number",
+    "optimistic-offline-lock",
+    "transactional-message-queue",
+    "circuit-breaker",
+    "claim-check"
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe, G. & Woolf, B., Enterprise Integration Patterns (2003) – Idempotent Receiver: duplicates are inevitable in messaging, and idempotency is achieved either by explicit de-duping or by defining message semantics to be idempotent.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/IdempotentReceiver.html",
+    "https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods",
+    "https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/",
+    "https://google.aip.dev/155",
+    "https://docs.stripe.com/api/idempotent_requests",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/retry",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/idempotent-consumer",
+    "Amazon Web Services, 'Amazon SQS FIFO Queues – Deduplication and Exactly-Once Processing' (2023): content-based deduplication via SHA-256 hash of message body, or explicit deduplication ID; guarantees each message is delivered exactly once and processed exactly once.",
+    "Oskar Dudycz, 'Outbox, Inbox Patterns and Delivery Guarantees Explained' (Event-Driven.io, Dec 2020): at-least-once delivery requires either the Outbox pattern (producer side) or Inbox pattern (consumer side); both use a transactional table as the durable log and enable idempotent processing by recording processed message IDs.",
+    "Google Cloud, 'What is Idempotency? A Guide to API Reliability' (Cloud Google Discover, 2024): covers Cloud Run + Pub/Sub at-least-once delivery requiring idempotent handlers, Memorystore (Redis) for short-term key caching, Cloud Spanner for globally consistent high-stakes financial idempotency keys.",
+    "ByteByteGo, 'Mastering Idempotency: Building Reliable APIs' (Feb 2025): elevator-button analogy; payment processing double-charge prevention; idempotent vs non-idempotent HTTP methods; implementation walkthrough with idempotency key header.",
+    "Zuplo, 'Implementing Idempotency Keys in REST APIs – A Complete Guide' (Aug 2025): parameter-drift detection, conflict resolution (409 vs cached response), key lifecycle management, and integration with API gateways and client SDKs.",
+    "PayPal API Reference, 'Idempotency' (PayPal Developer Docs): use of PayPal-Request-Id header for POST requests; covers retry behavior, outcome caching, and the 24-hour idempotency window.",
+    "MDN Web Docs, 'Idempotency-Key header': client-side contract for POST/PATCH - unique key per logical request, same key on retry; 400 when a required key is missing, 409 while the first attempt is still processing, 422 when fingerprinting detects a different payload.",
+    "IETF, 'The Idempotency-Key HTTP Request Header' (draft-ietf-httpapi-idempotency-key-header-07): normative retry semantics - replay returns the previously completed result (success or error), 409 for an in-flight key, 422 for key reuse with a different payload, key fingerprint derived from the request, and server-managed key expiry.",
+    "Apache Kafka, 'Producer Configs': enable.idempotence (default true since 3.0) gives exactly-once semantics per partition within a producer session; requires acks=all, retries > 0 and max.in.flight.requests.per.connection <= 5, and conflicts throw ConfigException; transactional.id extends idempotence across sessions.",
+    "Amazon Web Services, 'Ensuring idempotency in Amazon EC2 API requests': ClientToken (unique, case-sensitive, up to 64 ASCII characters, auto-generated if omitted) and the distinction between zonal idempotency (explicit Availability Zone or SubnetId) and regional idempotency, including IdempotentParameterMismatch when a token is replayed with different parameters.",
+    "InfoWorld, 'Why an idempotency key isn't an idempotency guarantee': the four-assumptions test (claim, intent, memory, boundary) - a key yields exactly-once effects, not exactly-once delivery, and fails when the claim races, the fingerprint ignores meaningful fields, the cached outcome is unsafe to replay, or an external provider sits outside the key's boundary."
+  ],
+  "related_patterns_notes": {
+    "outbox-pattern": "outbox-pattern",
+    "inbox-pattern": "inbox-pattern",
+    "saga-pattern": "saga-pattern"
+  }
+}

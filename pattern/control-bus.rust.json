@@ -1,0 +1,56 @@
+{
+  "pattern": "control-bus",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "tokio watch/broadcast/mpsc + oneshot replies + tokio_util CancellationToken + tracing",
+  "implementation_notes": "In an async Rust service the control bus is a set of tokio channels: a watch channel publishes the current configuration and shutdown state (only the latest value matters, and every receiver sees each change), broadcast fans a command out to all subscribers, and an mpsc channel paired with a oneshot reply carries point-to-point commands to a component's supervisor task - the tokio docs' own example pairs mpsc commands with oneshot responses. tokio_util::sync::CancellationToken cancels a whole component tree in one call (child tokens follow the parent), which is the stop command, and tracing supplies the status and telemetry half. The classic broker form returns only when components live in different processes and a broker is already deployed.",
+  "code_sketch": "enum Command { Suspend(String), Resume(String), Snapshot(oneshot::Sender<Status>) }\n\nlet (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);\nlet (config_tx, mut config_rx) = watch::channel(Config::default());\nlet shutdown = CancellationToken::new();\n\ntokio::spawn(async move {\n    loop {\n        tokio::select! {\n            Some(cmd) = cmd_rx.recv() => apply(cmd).await,\n            _ = shutdown.cancelled() => break,                 // stop: child tokens cancel too\n            _ = config_rx.changed() => reconfigure(config_rx.borrow().clone()).await,\n        }\n    }\n});",
+  "pitfalls": [
+    "watch coalesces: a component that is slow to react sees only the latest value and misses intermediate configurations - right for settings, wrong for command streams, which belong on mpsc or broadcast.",
+    "Cancellation lands on await points, so a stop can interrupt a partially applied command (a drain that acknowledged but had not flushed); stop sequences must be built from idempotent steps.",
+    "broadcast receivers that fall behind get RecvError::Lagged and silently miss commands unless the error is handled by re-synchronising or escalating."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/index.html",
+    "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tokio-control-channels",
+      "name": "tokio command channels plus CancellationToken and tracing",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "tokio watch/broadcast/mpsc + oneshot replies + tokio_util CancellationToken + tracing",
+      "implementation_notes": "In an async Rust service the control bus is a set of tokio channels: a watch channel publishes the current configuration and shutdown state (only the latest value matters, and every receiver sees each change), broadcast fans a command out to all subscribers, and an mpsc channel paired with a oneshot reply carries point-to-point commands to a component's supervisor task - the tokio docs' own example pairs mpsc commands with oneshot responses. tokio_util::sync::CancellationToken cancels a whole component tree in one call (child tokens follow the parent), which is the stop command, and tracing supplies the status and telemetry half. The classic broker form returns only when components live in different processes and a broker is already deployed.",
+      "code_sketch": "enum Command { Suspend(String), Resume(String), Snapshot(oneshot::Sender<Status>) }\n\nlet (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);\nlet (config_tx, mut config_rx) = watch::channel(Config::default());\nlet shutdown = CancellationToken::new();\n\ntokio::spawn(async move {\n    loop {\n        tokio::select! {\n            Some(cmd) = cmd_rx.recv() => apply(cmd).await,\n            _ = shutdown.cancelled() => break,                 // stop: child tokens cancel too\n            _ = config_rx.changed() => reconfigure(config_rx.borrow().clone()).await,\n        }\n    }\n});",
+      "pitfalls": [
+        "watch coalesces: a component that is slow to react sees only the latest value and misses intermediate configurations - right for settings, wrong for command streams, which belong on mpsc or broadcast.",
+        "Cancellation lands on await points, so a stop can interrupt a partially applied command (a drain that acknowledged but had not flushed); stop sequences must be built from idempotent steps.",
+        "broadcast receivers that fall behind get RecvError::Lagged and silently miss commands unless the error is handled by re-synchronising or escalating."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/index.html",
+        "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html"
+      ]
+    },
+    {
+      "variant_id": "actor-supervision-messages",
+      "name": "Actor supervision protocol (ractor) as the control channel",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "ractor Actor::handle with Signal::Kill / Stop / SupervisionEvent priority classes + RpcReplyPort",
+      "implementation_notes": "In an actor system the control bus is the actor protocol: ractor actors receive four message classes in priority order - Signal (Signal::Kill, immediate), Stop (graceful, applied after the current work), SupervisionEvent (lifecycle notifications from children) and ordinary messages - so lifecycle control is a first-class message rather than an API call, and supervisors implement restart/stop policies for their children. Status is collected with request-style messages carrying an RpcReplyPort, which gives a correlated acknowledgement per command. Choose this when the component tree already is an actor system; a plain tokio service gets the same effect with watch/mpsc channels and far less machinery.",
+      "code_sketch": "enum Control { Suspend, Resume, Snapshot(RpcReplyPort<Status>) }\n\nimpl Actor for Adapter {\n    type Msg = Control;\n    type State = AdapterState;\n    type Arguments = ();\n\n    async fn handle(&self, _myself: ActorRef<Self::Msg>, msg: Control, st: &mut Self::State)\n        -> Result<(), ActorProcessingErr> {\n        match msg {\n            Control::Suspend => st.paused = true,\n            Control::Resume => st.paused = false,\n            Control::Snapshot(reply) => { let _ = reply.send(st.snapshot()); }\n        }\n        Ok(())\n    }\n}\n// actor.stop(None) is graceful; Signal::Kill interrupts immediately and skips cleanup",
+      "pitfalls": [
+        "Signal::Kill terminates immediately and skips Drop-based cleanup, so an in-flight flush is lost; it belongs to wedged actors only, while graceful control uses Stop.",
+        "A supervision restart policy is itself a control decision: 'restart on panic' around a persistent-state bug turns one crash into a restart loop, so children must report state before the supervisor acts.",
+        "Actors do not stop when they are no longer referenced (the ractor docs state this explicitly): an unreachable control reference means the actor keeps running invisibly until the runtime is shut down."
+      ],
+      "sources": [
+        "https://docs.rs/ractor/latest/ractor/"
+      ]
+    }
+  ],
+  "default_variant": "tokio-control-channels"
+}

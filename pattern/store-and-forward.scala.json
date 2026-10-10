@@ -1,0 +1,65 @@
+{
+  "pattern": "store-and-forward",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "AtLeastOnceDelivery mix-in on a PersistentActor (deliver/confirmDelivery)",
+  "implementation_notes": "Akka - and its Apache-licensed fork Apache Pekko, which keeps org.apache.pekko.persistence.AtLeastOnceDelivery - implements the pattern directly: a persistent actor mixes in AtLeastOnceDelivery, calls deliver(destination)(deliveryId => message) so the pending delivery is written to the journal before the send, and the destination confirms with confirmDelivery(deliveryId) to remove it. The journal is the local store and recovery re-sends every unconfirmed delivery with the same deliveryId, which is exactly why the receiver must deduplicate on that id. The journal plugin has to be durable (a replicated journal for clustered deployments); swapping in an in-memory journal for tests and forgetting to swap it back is the classic way to lose the backlog.",
+  "code_sketch": "class Forwarder extends PersistentActor with AtLeastOnceDelivery {\n  override def persistenceId = \"outbound-1\"\n  private var order = Vector.empty[Cmd]\n  def receiveCommand = {\n    case cmd: Cmd => persist(cmd) { e => order :+= e; deliver(peer)(id => Envelope(id, e)) }\n    case Ack(id)  => confirmDelivery(id)\n  }\n  def receiveRecover = {\n    case e: Cmd   => order :+= e\n    case Ack(id)  => confirmDelivery(id)\n  }\n}",
+  "pitfalls": [
+    "An in-memory journal or snapshot store loses pending deliveries on restart; the pattern needs a durable journal plugin.",
+    "The deliveryId must travel in the payload and be confirmed by the receiver - without confirmDelivery the actor re-sends the message forever.",
+    "persist() completes asynchronously: side effects belong in the persist callback (thenRun), not next to the call.",
+    "At-least-once delivery assumes a stable destination actor path; sharding or rebalancing can leave pending deliveries addressed to an actor that moved."
+  ],
+  "sources": [
+    "https://doc.akka.io/libraries/akka-core/current/persistence.html",
+    "https://pekko.apache.org"
+  ],
+  "variants": [
+    {
+      "variant_id": "journal-at-least-once-delivery",
+      "name": "Persistent actor journal + AtLeastOnceDelivery (Akka / Apache Pekko)",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "akka-persistence"
+      ],
+      "idiom_name": "AtLeastOnceDelivery mix-in on a PersistentActor (deliver/confirmDelivery)",
+      "implementation_notes": "Akka - and its Apache-licensed fork Apache Pekko, which keeps org.apache.pekko.persistence.AtLeastOnceDelivery - implements the pattern directly: a persistent actor mixes in AtLeastOnceDelivery, calls deliver(destination)(deliveryId => message) so the pending delivery is written to the journal before the send, and the destination confirms with confirmDelivery(deliveryId) to remove it. The journal is the local store and recovery re-sends every unconfirmed delivery with the same deliveryId, which is exactly why the receiver must deduplicate on that id. The journal plugin has to be durable (a replicated journal for clustered deployments); swapping in an in-memory journal for tests and forgetting to swap it back is the classic way to lose the backlog.",
+      "code_sketch": "class Forwarder extends PersistentActor with AtLeastOnceDelivery {\n  override def persistenceId = \"outbound-1\"\n  private var order = Vector.empty[Cmd]\n  def receiveCommand = {\n    case cmd: Cmd => persist(cmd) { e => order :+= e; deliver(peer)(id => Envelope(id, e)) }\n    case Ack(id)  => confirmDelivery(id)\n  }\n  def receiveRecover = {\n    case e: Cmd   => order :+= e\n    case Ack(id)  => confirmDelivery(id)\n  }\n}",
+      "pitfalls": [
+        "An in-memory journal or snapshot store loses pending deliveries on restart; the pattern needs a durable journal plugin.",
+        "The deliveryId must travel in the payload and be confirmed by the receiver - without confirmDelivery the actor re-sends the message forever.",
+        "persist() completes asynchronously: side effects belong in the persist callback (thenRun), not next to the call.",
+        "At-least-once delivery assumes a stable destination actor path; sharding or rebalancing can leave pending deliveries addressed to an actor that moved."
+      ],
+      "sources": [
+        "https://doc.akka.io/libraries/akka-core/current/persistence.html",
+        "https://pekko.apache.org"
+      ]
+    },
+    {
+      "variant_id": "streams-committable-offsets",
+      "name": "Streams with Kafka committable offsets (commit after the downstream ack)",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "alpakka-kafka"
+      ],
+      "idiom_name": "Consumer.committableSource + commit offsets after the effect",
+      "implementation_notes": "For a consume-forward chain the durable store is the Kafka log and the forwarder is the stream: Alpakka/Pekko Kafka's committableSource delivers CommittableMessage values whose offsets are committed explicitly, so the pipeline commits only after the downstream stage confirmed the effect - an uncommitted offset means the record is replayed after a restart, the same store-then-forward discipline applied to the read side. The stream's restart and flow-control machinery replaces the hand-written drain loop, but the commit must be sequenced after the effect (no auto-commit, no commit-before-process), or the guarantee inverts into at-most-once.",
+      "code_sketch": "Consumer.committableSource(settings, Subscriptions.topics(\"inbound\"))\n  .mapAsync(1) { msg =>\n    deliver(msg.record.value()).map(_ => msg.committableOffset)\n  }\n  .mapAsync(1)(_.commitScaladsl())     // commit only after deliver() succeeded\n  .runWith(Sink.ignore)",
+      "pitfalls": [
+        "enable.auto.commit (or committing before the downstream confirms) turns the pipeline into at-most-once delivery.",
+        "Parallelism above one commits offsets out of order and can skip records after a restart; the commit must follow the effect for the same record.",
+        "Offset retention limits the store: if the group is offline longer than the log's retention the records are gone, so the backlog is not unbounded."
+      ],
+      "sources": [
+        "https://doc.akka.io/libraries/alpakka-kafka/current/consumer.html",
+        "https://doc.akka.io/libraries/akka-core/current/persistence.html"
+      ]
+    }
+  ],
+  "default_variant": "journal-at-least-once-delivery",
+  "version": "1.0"
+}

@@ -1,0 +1,58 @@
+{
+  "pattern": "caching",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "IMemoryCache.GetOrCreate + MemoryCacheEntryOptions",
+  "implementation_notes": "The platform ships the pattern: IMemoryCache.GetOrCreate/GetOrCreateAsync hide the miss path, MemoryCacheEntryOptions carries AbsoluteExpirationRelativeToNow, SlidingExpiration, ExpirationTokens, Priority, Size and PostEvictionCallbacks (the invalidation hook), and the default MemoryCache enforces a configured SizeLimit with a compaction percentage. Because the cache is registered in dependency injection (services.AddMemoryCache()), it is injected like any dependency instead of being hidden static state, and IDistributedCache exposes the same entry-option shape over Redis or SQL when the copy must be shared across instances. The hand-written hash-table-plus-recency-list structure is only justified for a single-purpose, allocation-tight store that the framework cache cannot express.",
+  "code_sketch": "public sealed class ProductService(IMemoryCache cache, CatalogDb db) {\n    public Task<Product?> GetAsync(int id) =>\n        cache.GetOrCreateAsync($\"product:{id}\", async e => {\n            e.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);\n            e.SlidingExpiration = TimeSpan.FromMinutes(2);\n            e.SetSize(1);              // cache must be configured with SizeLimit\n            return await db.Products.FindAsync(id);\n        });\n}",
+  "pitfalls": [
+    "GetOrCreate is not single-flight: concurrent misses of the same key each run the factory, so the provider sees a burst - coalesce the factory or use HybridCache.",
+    "Size accounting is all-or-nothing: once SizeLimit is configured, every entry must call SetSize, otherwise insertions fail with InvalidOperationException.",
+    "Caching scoped entities (DbContext-bound objects) or request state in the process-wide IMemoryCache keeps them alive after the request and serves stale graphs.",
+    "PostEvictionCallbacks run on the eviction path; throwing or blocking inside them interferes with the cache's compaction."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.memory.imemorycache",
+    "https://learn.microsoft.com/en-us/aspnet/core/performance/caching/memory"
+  ],
+  "variants": [
+    {
+      "variant_id": "memorycache-expiration",
+      "name": "Microsoft.Extensions.Caching.Memory IMemoryCache (expiration + size limit)",
+      "paradigm": "oo",
+      "min_standard": "NET6.0",
+      "idiom_name": "IMemoryCache.GetOrCreate + MemoryCacheEntryOptions",
+      "implementation_notes": "The platform ships the pattern: IMemoryCache.GetOrCreate/GetOrCreateAsync hide the miss path, MemoryCacheEntryOptions carries AbsoluteExpirationRelativeToNow, SlidingExpiration, ExpirationTokens, Priority, Size and PostEvictionCallbacks (the invalidation hook), and the default MemoryCache enforces a configured SizeLimit with a compaction percentage. Because the cache is registered in dependency injection (services.AddMemoryCache()), it is injected like any dependency instead of being hidden static state, and IDistributedCache exposes the same entry-option shape over Redis or SQL when the copy must be shared across instances. The hand-written hash-table-plus-recency-list structure is only justified for a single-purpose, allocation-tight store that the framework cache cannot express.",
+      "code_sketch": "public sealed class ProductService(IMemoryCache cache, CatalogDb db) {\n    public Task<Product?> GetAsync(int id) =>\n        cache.GetOrCreateAsync($\"product:{id}\", async e => {\n            e.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);\n            e.SlidingExpiration = TimeSpan.FromMinutes(2);\n            e.SetSize(1);              // cache must be configured with SizeLimit\n            return await db.Products.FindAsync(id);\n        });\n}",
+      "pitfalls": [
+        "GetOrCreate is not single-flight: concurrent misses of the same key each run the factory, so the provider sees a burst - coalesce the factory or use HybridCache.",
+        "Size accounting is all-or-nothing: once SizeLimit is configured, every entry must call SetSize, otherwise insertions fail with InvalidOperationException.",
+        "Caching scoped entities (DbContext-bound objects) or request state in the process-wide IMemoryCache keeps them alive after the request and serves stale graphs.",
+        "PostEvictionCallbacks run on the eviction path; throwing or blocking inside them interferes with the cache's compaction."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.memory.imemorycache",
+        "https://learn.microsoft.com/en-us/aspnet/core/performance/caching/memory"
+      ]
+    },
+    {
+      "variant_id": "hybridcache",
+      "name": "HybridCache (ASP.NET Core 9 L1 + L2 with stampede protection)",
+      "paradigm": "concurrent",
+      "min_standard": "NET9.0",
+      "idiom_name": "HybridCache.GetOrCreateAsync (IMemoryCache L1 over IDistributedCache L2)",
+      "implementation_notes": "HybridCache (ASP.NET Core 9) layers the pattern twice: an in-process L1 IMemoryCache over an optional L2 IDistributedCache, and its single GetOrCreateAsync serializes concurrent misses of the same key so the factory runs once - the stampede protection that plain IMemoryCache lacks. Entries can be tagged for bulk invalidation (RemoveByTagAsync), and options set a factory timeout and separate local/distributed expirations. Choose it when one cache must be both fast locally and shared across instances; without a configured L2 it degenerates to a local cache with extra API surface.",
+      "code_sketch": "public sealed class Catalog(HybridCache cache) {\n    public ValueTask<Product> GetAsync(int id, CancellationToken ct) =>\n        cache.GetOrCreateAsync($\"product:{id}\", id,\n            async (key, token) => await LoadAsync(id, token),\n            new HybridCacheEntryOptions {\n                Expiration = TimeSpan.FromMinutes(10),\n                LocalCacheExpiration = TimeSpan.FromMinutes(2)\n            },\n            tags: [\"catalog\"], cancellationToken: ct);\n}",
+      "pitfalls": [
+        "L1 and L2 can disagree: LocalCacheExpiration is per-instance, so a short local expiry plus RemoveByTagAsync is what keeps nodes near-consistent.",
+        "Expiration is the only correctness bound for tags on other nodes: tagging without an L2-aware invalidation strategy leaves remote copies alive until they expire."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/aspnet/core/performance/caching/hybrid",
+        "https://learn.microsoft.com/en-us/aspnet/core/performance/caching/memory"
+      ]
+    }
+  ],
+  "default_variant": "memorycache-expiration",
+  "version": "1.0"
+}

@@ -1,0 +1,56 @@
+{
+  "pattern": "observer",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "Arc<RwLock<Vec<(u64, Arc<dyn Fn(&Event) + Send + Sync>)>>>",
+  "implementation_notes": "Rust has no observer type and the borrow checker forbids a subject holding &mut Observer, so the realization is hand-written: the registry stores Arc'd closures (or trait objects) behind an Arc<RwLock<...>>, subscribe() inserts and returns an id, and notify() clones the handler Arcs under a short read lock, releases the lock and only then calls them. This ownership discipline is the price of the pattern in Rust: no garbage collector, no implicit weak listeners, no ambient mutability. Channels (std::sync::mpsc, tokio broadcast) are the alternative when subscribers are tasks rather than objects.",
+  "code_sketch": "type Handler = Arc<dyn Fn(&Event) + Send + Sync>;\n#[derive(Clone, Default)]\npub struct Subject(Arc<RwLock<Vec<(u64, Handler)>>>);\nimpl Subject {\n    pub fn subscribe(&self, h: Handler) -> u64 {\n        let mut s = self.0.write().unwrap(); let id = s.len() as u64; s.push((id, h)); id\n    }\n    pub fn notify(&self, e: &Event) {\n        let hs: Vec<Handler> = self.0.read().unwrap().iter().map(|(_, h)| Arc::clone(h)).collect();\n        for h in hs { h(e); }   // read lock already released\n    }\n}",
+  "pitfalls": [
+    "A closure that captures an Arc to the subject (or a strong reference to it) creates a reference cycle: the subject owns the handler and the handler owns the subject - capture Weak or break the cycle in unsubscribe.",
+    "Holding the RwLock guard across the callback deadlocks as soon as a handler subscribes or notifies; clone the handles and drop the guard first (as above).",
+    "Unsubscribe only removes the entry, so a handler can still run once from an in-flight notification snapshot: a subscription handle should be documented as best-effort, and re-entrant subscriptions must be idempotent.",
+    "Unbounded registries leak silently: forgetting to unsubscribe (or dropping a subscription handle without running its Drop, e.g. after mem::forget) keeps the closure and its captures alive."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.RwLock.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "closure-registry",
+      "name": "Arc'd closures behind RwLock + subscription ids",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "Arc<RwLock<Vec<(u64, Arc<dyn Fn(&Event) + Send + Sync>)>>>",
+      "implementation_notes": "Rust has no observer type and the borrow checker forbids a subject holding &mut Observer, so the realization is hand-written: the registry stores Arc'd closures (or trait objects) behind an Arc<RwLock<...>>, subscribe() inserts and returns an id, and notify() clones the handler Arcs under a short read lock, releases the lock and only then calls them. This ownership discipline is the price of the pattern in Rust: no garbage collector, no implicit weak listeners, no ambient mutability. Channels (std::sync::mpsc, tokio broadcast) are the alternative when subscribers are tasks rather than objects.",
+      "code_sketch": "type Handler = Arc<dyn Fn(&Event) + Send + Sync>;\n#[derive(Clone, Default)]\npub struct Subject(Arc<RwLock<Vec<(u64, Handler)>>>);\nimpl Subject {\n    pub fn subscribe(&self, h: Handler) -> u64 {\n        let mut s = self.0.write().unwrap(); let id = s.len() as u64; s.push((id, h)); id\n    }\n    pub fn notify(&self, e: &Event) {\n        let hs: Vec<Handler> = self.0.read().unwrap().iter().map(|(_, h)| Arc::clone(h)).collect();\n        for h in hs { h(e); }   // read lock already released\n    }\n}",
+      "pitfalls": [
+        "A closure that captures an Arc to the subject (or a strong reference to it) creates a reference cycle: the subject owns the handler and the handler owns the subject - capture Weak or break the cycle in unsubscribe.",
+        "Holding the RwLock guard across the callback deadlocks as soon as a handler subscribes or notifies; clone the handles and drop the guard first (as above).",
+        "Unsubscribe only removes the entry, so a handler can still run once from an in-flight notification snapshot: a subscription handle should be documented as best-effort, and re-entrant subscriptions must be idempotent.",
+        "Unbounded registries leak silently: forgetting to unsubscribe (or dropping a subscription handle without running its Drop, e.g. after mem::forget) keeps the closure and its captures alive."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.RwLock.html"
+      ]
+    },
+    {
+      "variant_id": "broadcast-channel",
+      "name": "tokio::sync::broadcast (bounded multi-consumer channel)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "broadcast::channel(capacity) + Sender::subscribe per subscriber",
+      "implementation_notes": "In async Rust the structure is usually replaced by a channel: broadcast::channel(capacity) returns a Sender that can be cloned, every subscriber gets its own Receiver via Sender::subscribe(), each sent value is delivered to all active receivers in send order, and a receiver that falls behind is told through RecvError::Lagged instead of blocking the publisher. Notification becomes pull-from-a-stream (select! or StreamExt::next), which fits ownership, gives explicit backpressure semantics and removes the mutable registry entirely. Use the closure registry when notification must be synchronous; use broadcast when subscribers are tasks.",
+      "code_sketch": "let (tx, mut rx1) = broadcast::channel::<Event>(16);\nlet mut rx2 = tx.subscribe();                       // second subscriber\ntokio::spawn(async move {\n    while let Ok(e) = rx1.recv().await { handle(e) }\n});\ntx.send(Event::Price(77.0)).unwrap();               // both receivers see it\n// no receivers left => send() returns Err(SendError)",
+      "pitfalls": [
+        "A slow receiver lags and misses messages (RecvError::Lagged) rather than applying backpressure; capacity is rounded up to a power of two and is the only buffer, so size it for the worst subscriber.",
+        "Subscribing after a send misses earlier values: a receiver is a stream, not a snapshot of current state.",
+        "Dropping every Sender closes the channel and ends all receivers with RecvError::Closed; send() returns Err(SendError) when no receiver exists, which is a normal condition, not a panic."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/broadcast/fn.channel.html"
+      ]
+    }
+  ],
+  "default_variant": "closure-registry",
+  "version": "1.0"
+}

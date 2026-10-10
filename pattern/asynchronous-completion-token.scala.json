@@ -1,0 +1,77 @@
+{
+  "pattern": "asynchronous-completion-token",
+  "language": "scala",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "future-promise-callbacks",
+      "name": "scala.concurrent Promise + Future callbacks",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "idiom_name": "Promise.complete + Future.onComplete",
+      "implementation_notes": "The standard library supplies both halves of the pattern: a Promise is a writable, single-assignment token that the completing side (service callback, actor, timer) fills in with success/failure, and the client's Future.onComplete/foreach callbacks are the demultiplexed completion actions, so no registry keyed on request identity is needed. In protocols without a reply address, keep a Map[requestId, Promise] - that map is exactly the client-side token table of the classic pattern. Where the service is an actor or an effect, the token travels with the request instead (see the Akka ask and cats-effect variants).",
+      "code_sketch": "val token = Promise[Reply]()                 // the ACT the service will complete\noutstanding.put(req.id, token)               // only for protocols without a replyTo\ntoken.future.onComplete {\n  case Success(r) => handle(req, r)\n  case Failure(e) => fail(req, e)\n}\ntransport.send(req)",
+      "pitfalls": [
+        "A Promise is single-assignment: success/failure/complete on a completed promise throws IllegalStateException, so racing completers must use trySuccess/tryFailure/tryComplete and accept schedule-dependent outcomes.",
+        "Callbacks on one future are unordered and may run concurrently, and blocking inside them starves the ExecutionContext (ForkJoinPool) unless wrapped in blocking - completion handlers must stay non-blocking.",
+        "There is no leak of callbacks once they have run, but a promise that is never completed and never removed from the registry retains its state forever."
+      ],
+      "sources": [
+        "https://docs.scala-lang.org/overviews/core/futures.html"
+      ]
+    },
+    {
+      "variant_id": "akka-typed-ask",
+      "name": "Akka/Pekko typed ask with a replyTo address",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "akka-typed"
+      ],
+      "idiom_name": "ActorRef[Response] replyTo / context.ask / AskPattern.ask",
+      "implementation_notes": "In an actor system the token is the reply address: a typed ask creates a temporary ActorRef[Response] and embeds it in the request as replyTo, so the response is delivered straight to the requester's continuation - the pattern's object-reference representation, and the reason the protocol needs no correlation ids. Inside an actor, context.ask adapts the reply into a message; outside, AskPattern.ask returns a Future. Choose it where blocking on a Future inside an actor is unacceptable; the cost is a temporary actor and a mandatory timeout per request.",
+      "code_sketch": "implicit val timeout: Timeout = 3.seconds\nval f: Future[Metrics] = metricsActor.ask(MetricsQuery(_, maxBytes))  // replyTo = ACT\nf.onComplete { case Success(m) => report(m); case Failure(e) => reportUnavailable(e) }",
+      "pitfalls": [
+        "Every ask needs an implicit Timeout: without it, no response means an indefinitely pending token (the ask itself fails with TimeoutException when the timeout fires).",
+        "The reply-adaptation function may run after the actor's state changed - close over immutable values, not over mutable fields.",
+        "Asking from inside an actor in a request/response cycle creates the actor equivalent of a callback chain: unbounded outstanding asks turn into memory growth and deadlock risk."
+      ],
+      "sources": [
+        "https://doc.akka.io/libraries/akka-core/current/typed/interaction-patterns.html"
+      ]
+    },
+    {
+      "variant_id": "effect-io-async",
+      "name": "cats-effect IO.async callback registration",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "cats-effect"
+      ],
+      "idiom_name": "IO.async / IO.cancelable completion callback",
+      "implementation_notes": "Effect systems express the same registration functionally: IO.async hands the producer a completion callback (Either[Throwable, A] => Unit) that must be run exactly once, and IO.cancelable adds the cancellation half, so the token is the callback plus a finalizer that tries to abandon the outstanding operation. ZIO's Promise plus fiber is the equivalent shape. Choose it when the program is already written in an effect; the discipline is stricter than Future (exactly-once completion, explicit cancellation) but you own the runtime and its scheduler.",
+      "code_sketch": "val reply: IO[Reply] =\n  IO.async[Reply] { cb =>                 // cb is the completion callback token\n    service.register(req, cb)             // call cb(Right(reply)) or cb(Left(error)) exactly once\n  }",
+      "pitfalls": [
+        "The callback must be invoked exactly once: a timeout path that also completes it breaks the runtime's contract, so guard completion with an atomic/cas.",
+        "Without IO.cancelable or a finalizer, abandoning the fiber leaves the registration and its state alive in the service."
+      ],
+      "sources": [
+        "https://typelevel.org/cats-effect/docs/datatypes/io",
+        "https://zio.dev/reference/concurrency/"
+      ]
+    }
+  ],
+  "version": "1.1",
+  "idiom_name": "Promise.complete + Future.onComplete",
+  "implementation_notes": "The standard library supplies both halves of the pattern: a Promise is a writable, single-assignment token that the completing side (service callback, actor, timer) fills in with success/failure, and the client's Future.onComplete/foreach callbacks are the demultiplexed completion actions, so no registry keyed on request identity is needed. In protocols without a reply address, keep a Map[requestId, Promise] - that map is exactly the client-side token table of the classic pattern. Where the service is an actor or an effect, the token travels with the request instead (see the Akka ask and cats-effect variants).",
+  "code_sketch": "val token = Promise[Reply]()                 // the ACT the service will complete\noutstanding.put(req.id, token)               // only for protocols without a replyTo\ntoken.future.onComplete {\n  case Success(r) => handle(req, r)\n  case Failure(e) => fail(req, e)\n}\ntransport.send(req)",
+  "pitfalls": [
+    "A Promise is single-assignment: success/failure/complete on a completed promise throws IllegalStateException, so racing completers must use trySuccess/tryFailure/tryComplete and accept schedule-dependent outcomes.",
+    "Callbacks on one future are unordered and may run concurrently, and blocking inside them starves the ExecutionContext (ForkJoinPool) unless wrapped in blocking - completion handlers must stay non-blocking.",
+    "There is no leak of callbacks once they have run, but a promise that is never completed and never removed from the registry retains its state forever."
+  ],
+  "sources": [
+    "https://docs.scala-lang.org/overviews/core/futures.html"
+  ],
+  "default_variant": "future-promise-callbacks"
+}

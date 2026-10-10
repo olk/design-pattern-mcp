@@ -1,0 +1,55 @@
+{
+  "pattern": "control-bus",
+  "language": "kotlin",
+  "support": "library",
+  "idiom_name": "MutableSharedFlow<ControlCommand> + StateFlow status + coroutineContext.cancelChildren()",
+  "implementation_notes": "A Kotlin service usually does not need an external control channel: a MutableSharedFlow<ControlCommand> (or a Channel for point-to-point commands) inside a CoroutineScope is the control bus, one collector dispatches commands to the component's internals, and a StateFlow<ComponentState> is the status half that a health endpoint or console reads. Lifecycle control is structured concurrency: cancelling the scope's children (coroutineContext.cancelChildren() or Job.cancel()) closes the channels, terminates collectors and replaces 'stop the worker' commands with a deterministic shutdown. JVM JMX stays available for external control (see the sibling variant) and is the right choice when the operator is not part of the application.",
+  "code_sketch": "class ControlBus(private val scope: CoroutineScope) {\n    private val commands = MutableSharedFlow<ControlCommand>(extraBufferCapacity = 64)\n    val state = MutableStateFlow(ComponentState.RUNNING)\n\n    fun send(cmd: ControlCommand): Boolean = commands.tryEmit(cmd)\n\n    fun start(handler: suspend (ControlCommand) -> Unit) = scope.launch {\n        commands.collect { cmd ->                       // channel closes when the scope is cancelled\n            handler(cmd)\n        }\n    }\n}\n// stop: scope.coroutineContext.cancelChildren()  -> collectors finish, channels close, state updated",
+  "pitfalls": [
+    "A MutableSharedFlow with no replay and no buffer drops or suspends: emit() can wait forever when no collector is active, so command entry points should use tryEmit with a bounded buffer and report rejection.",
+    "Cancellation is cooperative: a component that never checks isActive or blocks in a non-cancellable call (JDBC, Thread.sleep) ignores the stop command until that call returns.",
+    "Collectors must not launch unbounded child coroutines per command, or the 'stop' cancels the dispatcher while its children keep running."
+  ],
+  "sources": [
+    "https://kotlinlang.org/docs/channels.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "coroutine-control-flow",
+      "name": "kotlinx.coroutines SharedFlow/Channel command bus with structured cancellation",
+      "paradigm": "concurrent",
+      "min_standard": "Kotlin1.6",
+      "idiom_name": "MutableSharedFlow<ControlCommand> + StateFlow status + coroutineContext.cancelChildren()",
+      "implementation_notes": "A Kotlin service usually does not need an external control channel: a MutableSharedFlow<ControlCommand> (or a Channel for point-to-point commands) inside a CoroutineScope is the control bus, one collector dispatches commands to the component's internals, and a StateFlow<ComponentState> is the status half that a health endpoint or console reads. Lifecycle control is structured concurrency: cancelling the scope's children (coroutineContext.cancelChildren() or Job.cancel()) closes the channels, terminates collectors and replaces 'stop the worker' commands with a deterministic shutdown. JVM JMX stays available for external control (see the sibling variant) and is the right choice when the operator is not part of the application.",
+      "code_sketch": "class ControlBus(private val scope: CoroutineScope) {\n    private val commands = MutableSharedFlow<ControlCommand>(extraBufferCapacity = 64)\n    val state = MutableStateFlow(ComponentState.RUNNING)\n\n    fun send(cmd: ControlCommand): Boolean = commands.tryEmit(cmd)\n\n    fun start(handler: suspend (ControlCommand) -> Unit) = scope.launch {\n        commands.collect { cmd ->                       // channel closes when the scope is cancelled\n            handler(cmd)\n        }\n    }\n}\n// stop: scope.coroutineContext.cancelChildren()  -> collectors finish, channels close, state updated",
+      "pitfalls": [
+        "A MutableSharedFlow with no replay and no buffer drops or suspends: emit() can wait forever when no collector is active, so command entry points should use tryEmit with a bounded buffer and report rejection.",
+        "Cancellation is cooperative: a component that never checks isActive or blocks in a non-cancellable call (JDBC, Thread.sleep) ignores the stop command until that call returns.",
+        "Collectors must not launch unbounded child coroutines per command, or the 'stop' cancels the dispatcher while its children keep running."
+      ],
+      "sources": [
+        "https://kotlinlang.org/docs/channels.html"
+      ]
+    },
+    {
+      "variant_id": "jmx-mbeans",
+      "name": "JMX MBeans from Kotlin (platform MBean server)",
+      "paradigm": "oo",
+      "min_standard": "Kotlin1.5",
+      "idiom_name": "StandardMBean over a Kotlin control interface registered in the platform MBeanServer",
+      "implementation_notes": "Kotlin runs on the JVM, so the platform MBean server is available unchanged: a Kotlin class implementing a control interface is wrapped in StandardMBean (or annotated with Spring's @ManagedResource/@ManagedOperation) and registered under an ObjectName, which makes status available as attributes and commands as operations to jconsole, JMX connectors and monitoring agents. This is the interoperability choice for a mixed JVM fleet; the coroutine variant is better when lifecycle is hierarchical and the operator is the application itself.",
+      "code_sketch": "interface RouteControlMBean {\n    val status: String                       // read-only attribute\n    fun suspend(reason: String)              // command\n    fun resume()\n}\n\nclass RouteControl(private val route: Route) : RouteControlMBean {\n    override val status: String get() = route.state.name\n    override fun suspend(reason: String) { route.suspend(reason) }\n    override fun resume() { route.resume() }\n}\n\nManagementFactory.getPlatformMBeanServer().registerMBean(\n    StandardMBean(RouteControl(route), RouteControlMBean::class.java),\n    ObjectName(\"app.routes:type=Route,name=orders\"))",
+      "pitfalls": [
+        "A Kotlin `var` in an MBean interface becomes a remotely writable attribute, which bypasses command validation; expose state as `val` and change it only through operations.",
+        "Nullability does not survive JMX: nullable Kotlin types can raise OpenDataException when the attribute is unset, so MBean interfaces should use non-null types or Optional wrappers.",
+        "Registering the MBean in a lifecycle-aware component is easy to forget, and a duplicate ObjectName fails with InstanceAlreadyExistsException - a silently swallowed exception means the component has no control surface at all."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/jmx/index.html",
+        "https://kotlinlang.org/docs/channels.html"
+      ]
+    }
+  ],
+  "default_variant": "coroutine-control-flow"
+}

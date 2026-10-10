@@ -1,0 +1,186 @@
+{
+  "category": "concurrency-resilience",
+  "name": "event-based-asynchronous",
+  "aliases": [
+    "event-based asynchronous pattern",
+    "EAP"
+  ],
+  "intent": "Let a caller start a long-running operation without blocking and keep its own thread free, delivering the outcome later as exactly one completion notification - an event or callback carrying result, error or cancellation - marshalled back to the context the caller lives in.",
+  "problem": "A component must expose an operation that takes seconds or longer - a download, a database round trip, report generation, a device transfer - but its callers run on a thread that must stay responsive: a UI event loop, a single-threaded server, a request dispatcher. Calling it synchronously freezes everything queued behind it; spawning a bare worker thread and returning leaves the caller with nothing that observes the result, no error path, no progress and no way to stop the work. The recurring decision is how a caller starts work now and learns the outcome later - without polling a flag and without ever blocking its own thread.",
+  "context": "Applies wherever an operation outlives one call frame yet must not occupy the caller's thread: UI components and desktop frameworks, component libraries that ship asynchronous operations, single-threaded event loops (browser, Node.js, Swing), and runtimes whose only way to signal an outcome is a notification callback. It presumes a host event mechanism (event loop, dispatch queue, synchronization context, executor thread) able to deliver the completion on the caller's context, and callers designed to act on a result that arrives after the start call has already returned.",
+  "benefits": [
+    "Caller threads stay responsive: the operation runs elsewhere - a pool thread, a worker goroutine, a kernel I/O completion - and the caller returns to its loop immediately, so a UI keeps painting and a server keeps accepting work.",
+    "One component, many hosts: because completion delivery is delegated to the ambient dispatcher (SynchronizationContext, event loop, executor), the same asynchronous API works unchanged in a UI app, a console tool and a service instead of assuming a threading model.",
+    "The outcome gets a formal home: result, error, cancellation and caller state travel together in the completion payload, so a failure cannot be silently dropped by ignoring a return value and callers can match notifications to requests.",
+    "Progress, cancellation and completion stay separate concerns: an optional progress channel, an advisory cancel request and exactly one completion let a long operation report, stop and finish without polluting the result path.",
+    "Concurrent invocations are usable: a per-call state token (userState and friends) lets a single handler serve many outstanding operations of the same kind without ordering assumptions.",
+    "Latency hiding for composite work: several independent operations start now and complete independently, so the slowest one - not their sum - sets the wall-clock time."
+  ],
+  "tradeoffs": [
+    "Inversion of control splits one logical call across two program points: the outcome arrives in an event payload instead of a return value or a thrown exception, so every consumer must rebuild the sequence in a handler and cannot read the result where it asked for it.",
+    "Exactly-once delivery is a design obligation, not a property of the shape: a completion raised before the caller subscribes, skipped on an exceptional path or raised twice is a lost wakeup or a duplicated effect - and it stays invisible until some caller waits forever.",
+    "Marshalling is mandatory and costs latency: the notification must be posted back to the initiator's context (UI thread, event loop, dispatch queue), and on a single-threaded host blocking that context while waiting for a completion deadlocks the delivery of the very thing being waited for.",
+    "Subscription lifecycle becomes a resource: per-operation handlers registered on a long-lived component keep the subscriber alive until unsubscribed - the classic event-based leak - and double subscription runs the handler twice per completion.",
+    "The shape does not compose: sequencing, joining, racing, timeouts and error propagation are hand-wired at every call site, which is the documented reason task/promise/coroutine models superseded the event form for new APIs.",
+    "Progress reporting is a second asynchronous channel that floods easily: progress events vastly outnumber results, compete for the same dispatcher and must be coalesced or they dominate the context they were meant to keep free.",
+    "Cancellation is advisory and races success: the request travels on another thread, the operation must poll it, and the completion still fires - with a cancelled flag - so callers handle a third outcome whose ordering against success is not deterministic."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 5,
+    "simplicity": 4,
+    "performance": 7,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Initiator (caller)",
+      "responsibility": "Calls the start method on its own thread or context, receives no result from it, and owns the handlers (or await points) that consume completion and progress notifications."
+    },
+    {
+      "role": "Start method (MethodNameAsync)",
+      "responsibility": "The non-blocking entry point: validates arguments, allocates a per-call operation record (result slot, cancellation flag, caller state), schedules the work and returns immediately - at most a handle or the caller's state, never the result."
+    },
+    {
+      "role": "Asynchronous operation",
+      "responsibility": "The background work itself (pool thread, goroutine, coroutine, kernel I/O): runs off the initiator's context, may emit progress, polls the cancellation request and produces exactly one outcome."
+    },
+    {
+      "role": "Completion notification (event / callback)",
+      "responsibility": "Delivers the single outcome to the registered handler. Its payload distinguishes success, failure and cancellation and carries the per-call state that identifies which invocation completed."
+    },
+    {
+      "role": "Progress channel",
+      "responsibility": "Optional, separate, many-shot notification for incremental results or percentage complete; it never carries the final outcome and may be coalesced or dropped."
+    },
+    {
+      "role": "Cancellation request",
+      "responsibility": "An advisory stop signal (cancel method, token, flag) that the operation polls at safe points; it terminates nothing by itself and still ends in a completion marked cancelled."
+    },
+    {
+      "role": "Dispatcher / synchronization context",
+      "responsibility": "The host-provided mechanism (event loop, UI thread, dispatch queue, executor, SynchronizationContext) that marshals completion and progress onto the initiator's context and thereby keeps the component host-agnostic."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Desktop and mobile UI work: a download, image decode, index rebuild or file scan runs off the event dispatch thread while the interface keeps painting, and the completion returns to the UI context for a state update.",
+    "Component libraries that must serve several hosts: a control or service exposes MethodNameAsync plus a completion event and works unchanged in a UI application, a console tool and a server because the host supplies the synchronization context.",
+    "Single-threaded runtimes and event loops: browser/Node.js style loops, Swing/JavaFX and WinForms hosts where blocking the loop would stall every other subscriber; the operation completes off-loop and is dispatched back.",
+    "Device, sensor and network I/O: a serial, USB, socket or database transfer that is started now and whose completion arrives as an interrupt, kernel completion record or callback on the API's own thread.",
+    "Long operations that must show progress and remain stoppable: report generation, indexing, batch uploads — progress notifications keep the user informed, cancel requests stop wasted work, and exactly one completion closes the operation.",
+    "Bridging callback-only APIs into a host's async model: wrapping a native library that offers only 'call me back when done' so its completion becomes an event, a promise or an awaitable without blocking the caller.",
+    "Real-time audio, streaming and media processing: Web Audio API decodeAudioData, MediaRecorder, or camera capture — the operation outlives the call frame, posts progress as data chunks, and completes with the final encoded buffer.",
+    "Database connection or resource pool handoff: checking a connection out of a pool, starting a query and receiving the rows as a completion event on the caller's dispatch context, without blocking the pool thread.",
+    "Microservice request-response with callback address: a service initiates an outbound HTTP call and registers a completion handler that is dispatched back when the response arrives, keeping the service thread free for other work.",
+    ".NET's reference EAP components: WebClient's DownloadStringAsync/DownloadStringCompleted and BackgroundWorker's RunWorkerAsync/DoWork/ProgressChanged/RunWorkerCompleted are the implementations Microsoft docs name as canonical — single-invocation starts throw InvalidOperationException while an operation is in progress, and the userState overload is what licenses concurrent invocations.",
+    "Java Swing background tasks: SwingWorker runs doInBackground on a worker thread, publishes interim results to process on the Event Dispatch Thread, fires PropertyChangeEvents on its progress and state bound properties and delivers done() on the EDT — the EAP shape wrapped in a Future.",
+    "Event-loop runtimes as leak observatories: Node.js EventEmitter components warn (MaxListenersExceededWarning) past a default of 10 listeners per event, so per-operation handler accumulation on the completion event becomes visible in production instead of silently retaining subscribers."
+  ],
+  "avoid_when": [
+    "The runtime already offers a composable awaitable abstraction (TAP, promises, futures with continuations, coroutines, async/await): use it and keep events for genuinely multi-consumer streams - the classic event shape is strictly harder to sequence, time out and test.",
+    "The caller can simply block: CLI tools, batch jobs and dedicated worker threads with nothing else to do are clearer with a synchronous call, and one thread per operation may even be cheaper than the event machinery.",
+    "The operation finishes in microseconds to low milliseconds: the dispatch hop and handler registration dwarf the work, so a plain call or a lock-free value exchange is simpler.",
+    "The intent is fire-and-forget with no outcome (log shipping, telemetry, cache warmup): no completion is needed - a queue or a task with no result is the right shape.",
+    "Many long-lived consumers must observe state changes rather than one operation's outcome: that is Observer/pub-sub, and reusing a one-shot completion as a broadcast bus breaks late and absent subscribers."
+  ],
+  "language_files": {
+    "generic": "event-based-asynchronous.generic.json",
+    "c": "event-based-asynchronous.c.json",
+    "cplusplus": "event-based-asynchronous.cplusplus.json",
+    "csharp": "event-based-asynchronous.csharp.json",
+    "go": "event-based-asynchronous.go.json",
+    "java": "event-based-asynchronous.java.json",
+    "javascript": "event-based-asynchronous.javascript.json",
+    "kotlin": "event-based-asynchronous.kotlin.json",
+    "python": "event-based-asynchronous.python.json",
+    "ruby": "event-based-asynchronous.ruby.json",
+    "rust": "event-based-asynchronous.rust.json",
+    "scala": "event-based-asynchronous.scala.json",
+    "swift": "event-based-asynchronous.swift.json",
+    "typescript": "event-based-asynchronous.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "async-method-invocation",
+    "future-promise",
+    "observer",
+    "callback",
+    "asynchronous-completion-token",
+    "proactor",
+    "reactor",
+    "cancellation-token",
+    "event-queue",
+    "producer-consumer",
+    "active-object",
+    "structured-concurrency"
+  ],
+  "anti_patterns": [
+    "Fire and block: calling the asynchronous method and then waiting for it anyway (polling a flag, Task.Wait()/.Result, a blocking future get) - the caller blocks regardless, gains an extra failure mode, and deadlocks whenever the completion must be delivered on the context that is now blocked.",
+    "Completion event as a broadcast bus: treating the one-shot completion of one operation as a general event stream open to any number of unrelated subscribers - late subscribers miss it, early ones observe another operation's result.",
+    "Skipping the dispatcher: raising completion straight from the worker thread while consumers are bound to a UI loop or a single-threaded context - intermittent cross-thread violations that vanish under the debugger.",
+    "Handler accumulation: subscribing a fresh handler per call on a long-lived component and never unsubscribing (the classic event-based leak), or subscribing twice so one completion triggers its effect twice.",
+    "Outcome amnesia: ignoring the error and cancelled fields of the completion payload and continuing with a partial or null result, so a failure surfaces later as corrupted data rather than as an error.",
+    "Cancellation theatre: exposing a cancel method that sets a flag the worker never reads, or that kills a thread instead of asking it to stop - cancellation either never lands or lands mid-update and leaves inconsistent state."
+  ],
+  "design_principles": [
+    "Inversion of control (don't call us, we'll call you): the component owns execution and invokes the caller's registered handler, so the caller never waits inline for a result.",
+    "Separation of concerns: initiation, execution, progress reporting, completion delivery and context marshalling are distinct responsibilities, each with a named owner.",
+    "Keep the caller's context free: blocking an event loop to wait for a completion can prevent that same completion from ever being delivered - non-blocking is a correctness requirement, not a nicety.",
+    "Exactly-once, explicitly typed outcome: every started operation produces one - and only one - completion that states success, failure or cancellation, so callers never have to guess.",
+    "Host independence through abstraction: delegating delivery to a dispatcher or synchronization context lets one component run under any host instead of assuming a threading model.",
+    "Lifecycle discipline: subscriptions and operation records are resources - created per call and released on completion or unsubscribe, never shared between operations."
+  ],
+  "best_practices": [
+    "Name the pair consistently (a MethodNameAsync start method, a MethodNameCompleted event with an AsyncCompletedEventArgs-shaped payload) and document the thread or context on which completion and progress are raised.",
+    "Deliver exactly one completion per started operation and carry the whole outcome in it — result, error, cancelled flag and caller state — then make double delivery and missed delivery tested invariants.",
+    "Marshal completion and progress through the host's synchronization context or dispatcher explicitly, and never block that context anywhere on the completion path.",
+    "Give every outstanding call its own operation record, and surface its state token in the completion payload so one handler can match notifications to requests without ordering assumptions.",
+    "Report progress on a separate, optional channel: coalesce or throttle it, keep it monotonic where possible, and never let progress substitute for completion.",
+    "Support cancellation cooperatively — an advisory request polled at safe points that still ends in a completion marked cancelled — and never a forced thread kill.",
+    "Unsubscribe handlers and release operation records on completion, or expose a single-shot subscription helper; treat per-operation subscriptions on long-lived components as leaks waiting to happen.",
+    "For new APIs on runtimes with awaitable types, expose the task/promise/coroutine form and keep the event shape for genuinely multi-consumer streams; where an event-based API must stay, ship an interop layer that lets callers await it.",
+    "Prefer the async Task form (or its language equivalent) over async void / fire-and-forget: unhandled exceptions in async void are silently swallowed and crash the process, while async Task surfaces them in the returned Task.",
+    "When bridging an event-based API into a task-based runtime, use TaskCompletionSource to wire the completion event to the task — never block the caller's thread waiting for the event.",
+    "Use single-shot subscription helpers (once(), off(), removeEventListener) for one-shot completions; avoid manual unsubscribe which is error-prone and easy to forget on the error path.",
+    "Validate the operation is not already running before allowing a new start on the same handle, or document clearly whether concurrent calls are permitted and how their completions are ordered.",
+    "Adopt structured concurrency primitives (TaskGroup, nurseries, cancel scopes) where available: they own child-task lifetimes, cancelling them on failure or scope exit, preventing orphaned background work that outlasts its logical parent."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Schmidt et al., POSA2 — Chapter 4 'Event Handling Patterns': Reactor, Proactor, Acceptor-Connector, and Asynchronous Completion Token — the academic backbone of EAP. Covers motivation, applicability, structure, participants, collaborations, consequences, implementation trade-offs, and C++/Java variants. http://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/event-patterns.html",
+    "Schmidt, 'Proactor Pattern' (PDF) — explains how the Proactor pattern performs asynchronous demultiplexing and dispatching of completion handlers, contrasting with Reactor's synchronous event demultiplexing. http://www.dre.vanderbilt.edu/~schmidt/PDF/Proactor.pdf",
+    "Microsoft, .NET asynchronous programming patterns documentation — the pattern's canonical catalog entry: MethodNameAsync start methods, a MethodNameCompleted event carrying AsyncCompletedEventArgs, optional progress events and AsyncCancel, with completion marshalled through AsyncOperationManager and SynchronizationContext; TAP is documented as its successor. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/",
+    "Microsoft, 'Implementing the Event-based Asynchronous Pattern' — detailed guidance on wiring up a MethodNameAsync / MethodNameCompleted pair, thread-affinity, cross-thread marshalling, CancellationToken integration, and migrating from EAP to TAP via TaskCompletionSource. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/implementing-the-event-based-asynchronous-pattern",
+    "Microsoft .NET Blog, 'Async/Await FAQ' — explains Task-based Asynchronous Pattern (TAP) as the recommended successor to EAP, covers adapting EAP to TAP with TaskCompletionSource, and why async Task is preferred over async void. https://devblogs.microsoft.com/dotnet/asyncawait-faq/",
+    "Microsoft, Reactive Extensions (Rx) — IObservable/IObserver as a composable, LINQ-queriable generalisation of the event-based pattern; extends Observer with time-based operators, backpressure, and error handling for asynchronous event streams. Invented by Erik Meijer. https://learn.microsoft.com/en-us/previous-versions/dotnet/reactive-extensions/hh242985(v=vs.103)",
+    "Python Software Foundation, 'Coroutines and tasks — asyncio.TaskGroup' — Python 3.11+ structured concurrency with TaskGroup, providing deterministic child-task cancellation and exception propagation as a safer alternative to unstructured asyncio.gather. https://docs.python.org/3/library/asyncio-task.html",
+    "AgileSoftLabs, 'Node.js Memory Leaks: Production Debug Guide 2026' — covers event-emitter-centric memory leaks from accumulating listeners, unremoved handlers, unclosed streams, and unbounded caches in Node.js async code. https://www.agilesoftlabs.com/blog/2026/03/nodejs-memory-leaks-production-debug",
+    "AnyIO documentation, 'Why AnyIO' — cancel scopes and structured concurrency concepts (inspired by Trio) as a safer model for asynchronous work than bare callback/continuation chaining; level vs edge cancellation semantics. https://anyio.readthedocs.io/en/stable/why.html",
+    "Florian Rappl, 'Asynchronous models and patterns' — comparative overview of APM (IAsyncResult), EAP (BackgroundWorker), and TAP (Task-based), with applicability guidance and migration rationale. https://www.florian-rappl.de/Articles/Page/165/async-models-patterns",
+    "Microsoft, 'Event-based Asynchronous Pattern Overview' — names SoundPlayer, PictureBox, WebClient and BackgroundWorker as the reference EAP implementations and defines the single-invocation vs multiple-invocation contract (InvalidOperationException on overlap; userState distinguishes concurrent completions). https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/event-based-asynchronous-pattern-overview",
+    "Microsoft, 'Best Practices for Implementing the Event-based Asynchronous Pattern' — the canonical implementation contract: MethodNameAsync/MethodNameCompleted naming, raising events on the correct context via AsyncOperation/AsyncOperationManager, and behavioral rules that make an EAP component work across app models. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/best-practices-for-implementing-the-event-based-asynchronous-pattern",
+    "Microsoft, 'How to: Wrap EAP Patterns in a Task' — the canonical interop recipe: TaskCompletionSource bridging WebClient's DownloadStringCompleted (with cancellation via token.Register and TrySetException/TrySetCanceled) into an awaitable Task, including aggregating multiple EAP calls into one task. https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/how-to-wrap-eap-patterns-in-a-task",
+    "Joseph Albahari, 'Threading in C# — Part 3: Using Threads' — maps EAP onto its threading responsibilities and notes only a few framework classes (BackgroundWorker, WebClient) implement EAP directly; documents BackgroundWorker's DoWork/ProgressChanged/RunWorkerCompleted marshalling and subclassing reuse. https://www.albahari.com/threading/part3.aspx",
+    "Node.js project, 'Events' (official docs) — EventEmitter as the runtime substrate for completion callbacks: the default 10-listener-per-event cap and MaxListenersExceededWarning exist precisely to surface the handler-accumulation leak that per-operation subscriptions on long-lived emitters cause. https://nodejs.org/api/events.html",
+    "Oracle, 'Worker Threads and SwingWorker' (Java Tutorials, Concurrency in Swing) — SwingWorker as Java's EAP-shaped worker: doInBackground off the EDT, publish/process for interim results, progress and state bound properties delivered as PropertyChangeEvents on the EDT, done() as the one-shot completion. https://docs.oracle.com/javase/tutorial/uiswing/concurrency/worker.html",
+    "Ardalis (Mark Michaelis-adjacent practitioner critique), 'Avoid Using C# Events in ASP.NET Core Applications' — misuse/criticism: publisher strong references make unsubscribed-handler leaks the default outcome on transient objects, events are not thread-safe by default, and tight publisher/subscriber coupling argues for mediator/event-aggregator in DI-heavy hosts. https://ardalis.com/avoid-using-csharp-events-in-aspnetcore-apps/"
+  ]
+}

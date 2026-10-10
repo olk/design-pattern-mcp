@@ -1,0 +1,59 @@
+{
+  "pattern": "pessimistic-offline-lock",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "lock record row claimed with SELECT ... FOR UPDATE (libpqxx 7 transactions) or BEGIN IMMEDIATE (SQLite)",
+  "implementation_notes": "The default C++ realization keeps lock records in the same database as the business data: a libpqxx transaction (or the sqlite3 C API) selects the lock row FOR UPDATE, inserts it when absent and updates owner/acquired_at when it is free or expired, then commits immediately so the lease - not the transaction - protects the aggregate. C++ has no ORM to lean on, so this is Fowler's classic structure written by hand; it is still the right form whenever the store supports transactions, because the lock manager can then rely on the engine for the atomic claim.",
+  "code_sketch": "pqxx::work tx{conn};                       // one short transaction\nauto r = tx.exec(\"SELECT owner, acquired_at FROM lock_record WHERE lockable = $1 FOR UPDATE\", pqxx::params{key});\nif (r.empty())\n    tx.exec(\"INSERT INTO lock_record(lockable, owner, acquired_at) VALUES ($1, $2, now())\", pqxx::params{key, session});\nelse if (r[0][\"owner\"].as<std::string>() != session)\n    throw LockBusy{r[0][\"owner\"].as<std::string>()};\ntx.commit();                               // the lease outlives the transaction",
+  "pitfalls": [
+    "A lock record row that does not exist yet is not protected by FOR UPDATE: insert-on-missing and update-on-expired must happen inside the same transaction, otherwise two sessions both read 'free'.",
+    "Keep the transaction short: a libpqxx work object left alive during user think time holds a connection and its locks, which is exactly what the offline pattern exists to avoid.",
+    "SQLite has no row locks, so the sqlite3 flavour uses BEGIN IMMEDIATE and serialises writers - the lock record there is a convention, not an engine-enforced lock."
+  ],
+  "sources": [
+    "https://libpqxx.readthedocs.io/stable/",
+    "https://www.postgresql.org/docs/current/explicit-locking.html",
+    "https://sqlite.org/lang_transaction.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "db-lock-table",
+      "name": "Database lock record (libpqxx / sqlite3)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "lock record row claimed with SELECT ... FOR UPDATE (libpqxx 7 transactions) or BEGIN IMMEDIATE (SQLite)",
+      "implementation_notes": "The default C++ realization keeps lock records in the same database as the business data: a libpqxx transaction (or the sqlite3 C API) selects the lock row FOR UPDATE, inserts it when absent and updates owner/acquired_at when it is free or expired, then commits immediately so the lease - not the transaction - protects the aggregate. C++ has no ORM to lean on, so this is Fowler's classic structure written by hand; it is still the right form whenever the store supports transactions, because the lock manager can then rely on the engine for the atomic claim.",
+      "code_sketch": "pqxx::work tx{conn};                       // one short transaction\nauto r = tx.exec(\"SELECT owner, acquired_at FROM lock_record WHERE lockable = $1 FOR UPDATE\", pqxx::params{key});\nif (r.empty())\n    tx.exec(\"INSERT INTO lock_record(lockable, owner, acquired_at) VALUES ($1, $2, now())\", pqxx::params{key, session});\nelse if (r[0][\"owner\"].as<std::string>() != session)\n    throw LockBusy{r[0][\"owner\"].as<std::string>()};\ntx.commit();                               // the lease outlives the transaction",
+      "pitfalls": [
+        "A lock record row that does not exist yet is not protected by FOR UPDATE: insert-on-missing and update-on-expired must happen inside the same transaction, otherwise two sessions both read 'free'.",
+        "Keep the transaction short: a libpqxx work object left alive during user think time holds a connection and its locks, which is exactly what the offline pattern exists to avoid.",
+        "SQLite has no row locks, so the sqlite3 flavour uses BEGIN IMMEDIATE and serialises writers - the lock record there is a convention, not an engine-enforced lock."
+      ],
+      "sources": [
+        "https://libpqxx.readthedocs.io/stable/",
+        "https://www.postgresql.org/docs/current/explicit-locking.html",
+        "https://sqlite.org/lang_transaction.html"
+      ]
+    },
+    {
+      "variant_id": "os-file-lock",
+      "name": "Process-scoped advisory lock on a lock file",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Interprocess file_lock / flock(2) on one lock file per lockable",
+      "implementation_notes": "For deployments where the store cannot lock rows (embedded databases, shared file stores, or a vendor API with no FOR UPDATE), the lease is a lock file per lockable held by the owner process: Boost.Interprocess file_lock or flock(2) gives an RAII acquire/release that survives individual requests and is dropped automatically when the process dies. It differs from the database variant in where the truth lives - the operating system, not a table - so visibility (who holds what) and timeouts have to be recorded next to it whenever they are needed.",
+      "code_sketch": "namespace bip = boost::interprocess;\nbip::file_lock lease{\"/var/lib/app/locks/order-4711.lock\"};\nif (!lease.try_lock())\n    return LockBusy{};                     // or lease.lock() to block\n// hold the file_lock object for the whole edit session;\n// its destructor releases the lease\nreturn Acquired{std::move(lease)};",
+      "pitfalls": [
+        "The lease is scoped to the open file/handle: a crash drops it (good for availability, bad if the operation must be resumed) and a leaked RAII object keeps it until the process ends.",
+        "Do not use fcntl(F_SETLK) record locks here - they are per-process and are dropped when any descriptor to the file is closed; flock(2) or Boost.Interprocess file locks have per-open-description semantics that model a session better.",
+        "Record the owner and acquisition time separately: the operating system will not tell a support engineer who holds a lock or for how long."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/interprocess/synchronization_mechanisms.html",
+        "https://man7.org/linux/man-pages/man2/fcntl.2.html"
+      ]
+    }
+  ],
+  "default_variant": "db-lock-table"
+}

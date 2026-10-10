@@ -1,0 +1,86 @@
+{
+  "pattern": "memento",
+  "language": "cplusplus",
+  "support": "idiomatic",
+  "idiom_name": "copyable state value + std::vector/std::stack caretaker",
+  "implementation_notes": "C++ gives Memento away through value semantics: a class copy is a complete state copy, so the snapshot is the state object itself, stored in a std::vector<State> or std::stack<State> that plays the caretaker. The GoF friend/nested-class trick (private state, wide interface for the originator, narrow interface for everyone else) is only needed when the state is private and the class as a whole is not copyable as a value; the modern answer is to extract the state into a copyable value member and snapshot that. Move semantics keep saving cheap for large states, and std::variant or std::any carries heterogeneous snapshots when the originator's state is a union of shapes.",
+  "code_sketch": "struct DocState { std::string text; int caret = 0; };\n\nclass Editor {\n  DocState state_;\n  std::vector<DocState> history_;            // caretaker: bounded undo stack\npublic:\n  void save() { history_.push_back(state_); } // value copy == memento\n  void undo() {\n    if (history_.empty()) return;\n    state_ = std::move(history_.back());\n    history_.pop_back();\n  }\n};",
+  "pitfalls": [
+    "A state with raw pointers or unique_ptr members is not copyable (or copies the pointer): give it a deep copy constructor or move the owned data into values, otherwise the snapshot aliases live memory.",
+    "push_back can throw after the originator was mutated: take the snapshot before applying the change, or store the copy you already made, to keep the strong exception guarantee.",
+    "Snapshots of objects owning resource handles (FILE*, sockets, mutexes) cannot be restored - a copy of the handle is not a copy of the resource; snapshot data, not resources.",
+    "The undo stack keeps whole states alive: cap its size or erase old entries explicitly, since clear() only releases the buffers when the elements are destroyed."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/copy_constructor",
+    "https://en.cppreference.com/w/cpp/memory/shared_ptr"
+  ],
+  "variants": [
+    {
+      "variant_id": "value-copy-state",
+      "name": "Value-semantics state copy + std::vector history",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "copy constructors",
+        "move semantics"
+      ],
+      "idiom_name": "copyable state value + std::vector/std::stack caretaker",
+      "implementation_notes": "C++ gives Memento away through value semantics: a class copy is a complete state copy, so the snapshot is the state object itself, stored in a std::vector<State> or std::stack<State> that plays the caretaker. The GoF friend/nested-class trick (private state, wide interface for the originator, narrow interface for everyone else) is only needed when the state is private and the class as a whole is not copyable as a value; the modern answer is to extract the state into a copyable value member and snapshot that. Move semantics keep saving cheap for large states, and std::variant or std::any carries heterogeneous snapshots when the originator's state is a union of shapes.",
+      "code_sketch": "struct DocState { std::string text; int caret = 0; };\n\nclass Editor {\n  DocState state_;\n  std::vector<DocState> history_;            // caretaker: bounded undo stack\npublic:\n  void save() { history_.push_back(state_); } // value copy == memento\n  void undo() {\n    if (history_.empty()) return;\n    state_ = std::move(history_.back());\n    history_.pop_back();\n  }\n};",
+      "pitfalls": [
+        "A state with raw pointers or unique_ptr members is not copyable (or copies the pointer): give it a deep copy constructor or move the owned data into values, otherwise the snapshot aliases live memory.",
+        "push_back can throw after the originator was mutated: take the snapshot before applying the change, or store the copy you already made, to keep the strong exception guarantee.",
+        "Snapshots of objects owning resource handles (FILE*, sockets, mutexes) cannot be restored - a copy of the handle is not a copy of the resource; snapshot data, not resources.",
+        "The undo stack keeps whole states alive: cap its size or erase old entries explicitly, since clear() only releases the buffers when the elements are destroyed."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/copy_constructor",
+        "https://en.cppreference.com/w/cpp/memory/shared_ptr"
+      ]
+    },
+    {
+      "variant_id": "cow-shared-const-state",
+      "name": "Copy-on-write shared immutable state",
+      "paradigm": "functional",
+      "min_standard": "C++11",
+      "requires_features": [
+        "shared_ptr",
+        "const-correctness"
+      ],
+      "idiom_name": "std::shared_ptr<const State> swapped on every mutation",
+      "implementation_notes": "Instead of copying the whole state per snapshot, make the state immutable and hold it behind std::shared_ptr<const State>: every mutation allocates a fresh state that shares the untouched parts with its predecessor, and a memento is just the shared pointer value. Snapshots become O(1) to take and cost only what changes - the standard answer for large editor, document or graph state. The price is discipline: nothing may mutate a shared state through a non-const path, and each retained snapshot keeps its whole lineage alive. std::make_shared keeps the allocation count low, and reference counting gives lifetime management for free.",
+      "code_sketch": "struct DocState { std::vector<Line> lines; int caret; };\nusing StatePtr = std::shared_ptr<const DocState>;\n\nclass Editor {\n  StatePtr state_ = std::make_shared<const DocState>();\n  std::vector<StatePtr> history_;      // snapshots share structure\npublic:\n  void save() { history_.push_back(state_); }        // O(1) memento\n  void insert(Line l) { state_ = std::make_shared<const DocState>(edit(*state_, l)); }\n};",
+      "pitfalls": [
+        "A non-const pointer to the pointee copied out anywhere breaks the sharing invariant; keep the state type const-correct and construct new values instead of editing in place.",
+        "Sharing keeps whole state lineages alive as long as any snapshot is retained, so dropping undo entries is the only way to release memory.",
+        "shared_ptr control-block operations are thread-safe, but concurrent access to the *state* still races; snapshotting is not synchronization."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/shared_ptr"
+      ]
+    },
+    {
+      "variant_id": "boost-serialization-archives",
+      "name": "Boost.Serialization archives as durable mementos",
+      "paradigm": "declarative",
+      "min_standard": "C++11",
+      "requires_features": [
+        "Boost.Serialization"
+      ],
+      "idiom_name": "boost::archive::binary_oarchive / iarchive round-trip",
+      "implementation_notes": "When snapshots must outlive the process or the history must be versioned, serialize the originator's state through Boost.Serialization: a member or free `serialize` function declares which members constitute the state (`ar & member;`), and text/binary/XML archives read and write whole object graphs including STL collections and pointers. Loading an archive yields an independent copy, so the round-trip doubles as the deep-copy mechanism for states containing pointers, and the archive carries class version numbers so old snapshots remain loadable after the state evolves. Prefer it over the in-memory variants when undo history is persisted - autosave, session restore, undo across restarts.",
+      "code_sketch": "class DocState {\n  friend class boost::serialization::access;\n  template <class Ar> void serialize(Ar &ar, unsigned) { ar & text_; ar & caret_; }\n  std::string text_; int caret_ = 0;\n};\n\nvoid checkpoint(const DocState &s) {          // durable memento\n  std::ofstream f(\"undo-7.bin\", std::ios::binary);\n  boost::archive::binary_oarchive ar(f);\n  ar << s;\n}",
+      "pitfalls": [
+        "Archives preserve pointer identity rather than pointer values: a graph with a shared object restores as one shared object, which is usually wanted but is not a naive deep copy.",
+        "A class must have a serialize function and, for loading, a default constructor; omitting either turns a snapshot into a runtime failure instead of a compile-time one.",
+        "Archive formats change across library versions, so persisted history needs stable version numbers and a migration story - never rewrite old snapshots in place."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/libs/serialization/doc/tutorial.html"
+      ]
+    }
+  ],
+  "default_variant": "value-copy-state",
+  "version": "1.0"
+}

@@ -1,0 +1,54 @@
+{
+  "pattern": "counting-semaphore",
+  "language": "swift",
+  "support": "library",
+  "idiom_name": "DispatchSemaphore(value:) with wait(timeout:) and defer signal()",
+  "implementation_notes": "DispatchSemaphore is Swift's realization of the counting semaphore: DispatchSemaphore(value: 8) sets the permit count, wait() blocks (and wait(timeout:) returns .timedOut instead of blocking forever), signal() returns a permit, and defer { sem.signal() } is the release-on-every-exit-path idiom. It calls into the kernel only when a thread actually has to block, which makes it cheap for bounding blocking work; for structured concurrency it is the wrong tool because it occupies a cooperative thread while waiting, so bound the work with a task group plus an actor/continuation-based limiter instead.",
+  "code_sketch": "let slots = DispatchSemaphore(value: 8)\n\nfunc handle(_ request: Request) {\n    if slots.wait(timeout: .now() + .milliseconds(250)) == .timedOut {\n        return reject(request)\n    }\n    defer { slots.signal() }          // released on every exit path\n    serve(request)\n}",
+  "pitfalls": [
+    "Never call wait() on the main thread or on a Swift-concurrency executor thread: it blocks a thread the runtime expects to stay free, and a signal scheduled behind it can deadlock.",
+    "signal() is unbounded; an extra signal raises the count above the initial value and silently widens the bound.",
+    "DispatchSemaphore is not an actor: state around it is still shared mutable state and needs its own synchronisation, or the semaphore should be an immutable let used only as a gate."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/dispatch/dispatchsemaphore"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "dispatch-semaphore",
+      "name": "DispatchSemaphore (GCD)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift3.0",
+      "idiom_name": "DispatchSemaphore(value:) with wait(timeout:) and defer signal()",
+      "implementation_notes": "DispatchSemaphore is Swift's realization of the counting semaphore: DispatchSemaphore(value: 8) sets the permit count, wait() blocks (and wait(timeout:) returns .timedOut instead of blocking forever), signal() returns a permit, and defer { sem.signal() } is the release-on-every-exit-path idiom. It calls into the kernel only when a thread actually has to block, which makes it cheap for bounding blocking work; for structured concurrency it is the wrong tool because it occupies a cooperative thread while waiting, so bound the work with a task group plus an actor/continuation-based limiter instead.",
+      "code_sketch": "let slots = DispatchSemaphore(value: 8)\n\nfunc handle(_ request: Request) {\n    if slots.wait(timeout: .now() + .milliseconds(250)) == .timedOut {\n        return reject(request)\n    }\n    defer { slots.signal() }          // released on every exit path\n    serve(request)\n}",
+      "pitfalls": [
+        "Never call wait() on the main thread or on a Swift-concurrency executor thread: it blocks a thread the runtime expects to stay free, and a signal scheduled behind it can deadlock.",
+        "signal() is unbounded; an extra signal raises the count above the initial value and silently widens the bound.",
+        "DispatchSemaphore is not an actor: state around it is still shared mutable state and needs its own synchronisation, or the semaphore should be an immutable let used only as a gate."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/dispatch/dispatchsemaphore"
+      ]
+    },
+    {
+      "variant_id": "async-actor-semaphore",
+      "name": "Actor + continuation async semaphore (structured concurrency)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "idiom_name": "actor holding a permit count with CheckedContinuation waiters",
+      "implementation_notes": "Inside Swift concurrency the semaphore form is rebuilt as an actor that owns the permit count and the queue of suspended tasks: acquire() suspends the current task by storing its CheckedContinuation when no permit is available, release() resumes exactly one stored continuation, and the continuation must be resumed exactly once on every path or the task leaks forever (CheckedContinuation logs violations). This is the structured-concurrency realization - no thread is blocked - and it is the one to use in async code; DispatchSemaphore stays for bridging GCD and legacy APIs.",
+      "code_sketch": "actor AsyncSemaphore {\n    private var permits: Int\n    private var waiters: [CheckedContinuation<Void, Never>] = []\n    init(_ n: Int) { permits = n }\n\n    func acquire() async {\n        if permits > 0 { permits -= 1; return }\n        await withCheckedContinuation { waiters.append($0) }\n    }\n    func release() {\n        if waiters.isEmpty { permits += 1 } else { waiters.removeFirst().resume() }\n    }\n}",
+      "pitfalls": [
+        "A continuation that is never resumed (a bug in release) leaks the waiting task forever; CheckedContinuation detects it only in debug builds.",
+        "Resuming the same continuation twice is undefined behaviour, so the actor must remove it from the queue before resuming.",
+        "Fairness is not automatic: withCheckedContinuation queues in insertion order only because the actor's array preserves it - reordering the array silently breaks FIFO."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/swift/checkedcontinuation"
+      ]
+    }
+  ],
+  "default_variant": "dispatch-semaphore"
+}

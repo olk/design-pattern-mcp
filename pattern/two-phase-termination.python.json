@@ -1,0 +1,85 @@
+{
+  "pattern": "two-phase-termination",
+  "language": "python",
+  "support": "library",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "threading-event-join",
+      "name": "threading.Event latch + Thread.join()",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.0",
+      "requires_features": [
+        "threading.Event",
+        "threading.Thread.join"
+      ],
+      "idiom_name": "threading.Event stop latch + Thread.join()",
+      "implementation_notes": "The threading documentation is the source of the doctrine: threads cannot be destroyed, stopped, suspended, resumed or interrupted, and daemon threads are stopped abruptly at interpreter shutdown with resources possibly unreleased - so the protocol is hand-rolled from stdlib parts, with threading.Event as the safely published latch (set() is idempotent and wakes Event.wait()) and Thread.join() as the completion step. The worker polls the Event at safe points, uses Event.wait(timeout) instead of sleep so the request is noticed immediately, and cleans up after the loop. The classic structure is justified here because Python offers no cooperative cancellation for threads at all.",
+      "code_sketch": "class Worker(threading.Thread):\n    def __init__(self):\n        super().__init__()\n        self._stop = threading.Event()          # phase-1 latch\n\n    def shutdown(self):\n        self._stop.set()                        # idempotent request\n\n    def run(self):\n        while not self._stop.wait(1.0):         # bounded wait sees stop\n            self.handle_once()\n        self.flush_and_release()                # phase 2 cleanup\n\nw = Worker(); w.start()\nw.shutdown(); w.join()                          # wait for phase 2",
+      "pitfalls": [
+        "A worker parked in a blocking C-level call (time.sleep, a socket read, a driver without timeouts) only checks the Event when the call returns; bound those calls with timeouts or use Event.wait/sockets with timeouts.",
+        "Daemon threads are not a shutdown protocol: the interpreter stops them abruptly and open files, transactions and locks may not be released, which is why the docs recommend an explicit signalling mechanism instead.",
+        "The latch must be checked by the loop itself; setting an attribute while the worker sleeps gives no wake-up, so there is no guarantee when (or whether) the phase-2 cleanup starts.",
+        "join() with no timeout blocks forever if the worker is wedged: always pair the join with a timeout and a forced fallback decision."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/threading.html"
+      ]
+    },
+    {
+      "variant_id": "executor-shutdown-wait",
+      "name": "concurrent.futures Executor.shutdown(wait=True)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.2",
+      "requires_features": [
+        "concurrent.futures.ThreadPoolExecutor / ProcessPoolExecutor"
+      ],
+      "idiom_name": "Executor.shutdown(wait=True[, cancel_futures=True])",
+      "implementation_notes": "The futures API collapses both phases into one library call: shutdown() signals that no new work is accepted (submit/map raise RuntimeError afterwards) and with wait=True it returns only when pending futures are done and the executor's resources are freed - the docs also guarantee the interpreter does not exit before pending futures finish, context-manager exit behaving as wait=True. cancel_futures=True is the forced part, and it cancels only futures that have not started, so a job that must react to a stop still needs its own Event/token inside.",
+      "code_sketch": "with ThreadPoolExecutor(max_workers=4) as pool:   # __exit__ == shutdown(wait=True)\n    futures = [pool.submit(work, i) for i in range(4)]\n\n# explicit form: no new submissions, join the workers, free resources\npool.shutdown(wait=True, cancel_futures=True)      # running futures still finish\n# ProcessPoolExecutor has no _wait for hard kills: terminate_workers()/kill_workers()\n# are its forced fallback (Python 3.14+).",
+      "pitfalls": [
+        "shutdown(wait=False) does not stop anything: running futures continue and are only reaped later, so code that treats the call as a stop request leaks work into a process that may already be exiting.",
+        "cancel_futures=True cancels queued futures only - a running job is not stopped, which surprises code that trusts the name; the job itself must observe a stop flag.",
+        "A job blocked forever (no timeout, non-cancellable C call) makes shutdown(wait=True) hang; the caller needs its own deadline and a decision about what happens to abandoned work."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/concurrent.futures.html"
+      ]
+    },
+    {
+      "variant_id": "asyncio-cancel-await",
+      "name": "asyncio.Event / Task.cancel() + await task",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "asyncio",
+        "CancelledError handling"
+      ],
+      "idiom_name": "asyncio.Event flag or task.cancel() + await the task",
+      "implementation_notes": "On the event loop the same two phases are an asyncio.Event (cooperative flag: set() wakes waiters, the loop checks is_set()) or Task.cancel() (which throws CancelledError into the task at its next await point), with awaiting the task as the completion step. Cleanup in a finally block runs before the task finishes; stopping a cancelled task then requires contextlib.suppress(asyncio.CancelledError) around the await so the caller's own cancellation is not confused with the worker's. Prefer the Event when the worker should finish its current item; use cancel() when the wait itself must be abandoned promptly.",
+      "code_sketch": "async def worker(stop: asyncio.Event):\n    try:\n        while not stop.is_set():                # safe point\n            await handle_next()\n    finally:\n        await flush_and_release()               # phase 2 cleanup\n\ntask = asyncio.create_task(worker(stop))\nstop.set()                                      # phase 1: cooperative\ntask.cancel()                                   # or: interrupt the wait itself\nwith contextlib.suppress(asyncio.CancelledError):\n    await task                                  # phase 2: cleanup finished",
+      "pitfalls": [
+        "Since Python 3.8 asyncio.CancelledError derives from BaseException: cleanup code that only catches Exception misses it, and a bare except that swallows it breaks the cancellation contract for everything above.",
+        "Awaiting a cancelled task raises CancelledError in the caller too, so the stop helper must suppress it (contextlib.suppress) or the caller's shutdown sequence fails even though cleanup succeeded.",
+        "Cancellation is delivered at await points only: a coroutine stuck in a synchronous CPU loop or a blocking library call ignores both the Event and cancel() and must be moved to a thread/process executor."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://docs.python.org/3/library/asyncio-sync.html"
+      ]
+    }
+  ],
+  "default_variant": "threading-event-join",
+  "idiom_name": "threading.Event stop latch + Thread.join()",
+  "implementation_notes": "The threading documentation is the source of the doctrine: threads cannot be destroyed, stopped, suspended, resumed or interrupted, and daemon threads are stopped abruptly at interpreter shutdown with resources possibly unreleased - so the protocol is hand-rolled from stdlib parts, with threading.Event as the safely published latch (set() is idempotent and wakes Event.wait()) and Thread.join() as the completion step. The worker polls the Event at safe points, uses Event.wait(timeout) instead of sleep so the request is noticed immediately, and cleans up after the loop. The classic structure is justified here because Python offers no cooperative cancellation for threads at all.",
+  "code_sketch": "class Worker(threading.Thread):\n    def __init__(self):\n        super().__init__()\n        self._stop = threading.Event()          # phase-1 latch\n\n    def shutdown(self):\n        self._stop.set()                        # idempotent request\n\n    def run(self):\n        while not self._stop.wait(1.0):         # bounded wait sees stop\n            self.handle_once()\n        self.flush_and_release()                # phase 2 cleanup\n\nw = Worker(); w.start()\nw.shutdown(); w.join()                          # wait for phase 2",
+  "pitfalls": [
+    "A worker parked in a blocking C-level call (time.sleep, a socket read, a driver without timeouts) only checks the Event when the call returns; bound those calls with timeouts or use Event.wait/sockets with timeouts.",
+    "Daemon threads are not a shutdown protocol: the interpreter stops them abruptly and open files, transactions and locks may not be released, which is why the docs recommend an explicit signalling mechanism instead.",
+    "The latch must be checked by the loop itself; setting an attribute while the worker sleeps gives no wake-up, so there is no guarantee when (or whether) the phase-2 cleanup starts.",
+    "join() with no timeout blocks forever if the worker is wedged: always pair the join with a timeout and a forced fallback decision."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/threading.html"
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "pattern": "lock-free-queue",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "boost::lockfree::queue<> (MPMC) / spsc_queue (wait-free ring)",
+  "implementation_notes": "Boost.Lockfree ships the whole structure: boost::lockfree::queue is the Michael-Scott MPMC queue, bounded_ticket_queue the Vyukov bounded variant, and spsc_queue a wait-free single-producer/single-consumer ringbuffer; the library's own documentation warns that node-pool exhaustion falls back to the OS allocator (blocking, unless fixed_sized/capacity is configured) and that the lock-free guarantee bounds operation cost only in the worst case, so benchmark against a mutex first. Use it as the default. The hand-rolled std::atomic realization is the fallback when Boost cannot be linked and the reclamation scheme can be owned, and folly::MPMCQueue when the codebase is already on folly and a bounded, futex-blocking ticket ring fits.",
+  "code_sketch": "boost::lockfree::queue<Job, boost::lockfree::capacity<1024>> q;  // bounded, no runtime allocation\nif (!q.push(job)) { /* full: caller applies the backpressure policy */ }\nJob next;\nwhile (q.pop(next)) consume(next);            // non-blocking: false when empty\n// SPSC hot path: boost::lockfree::spsc_queue<Job, boost::lockfree::capacity<4096>> ring; ring.push(job);",
+  "pitfalls": [
+    "boost::lockfree::queue allocates nodes from a pool; when it is exhausted it calls the OS allocator, which is not lock-free - configure capacity<>/fixed_sized for real-time use.",
+    "Boost.Lockfree deliberately avoids exceptions in lock-free code; a throwing payload constructor or allocator breaks the real-time claim.",
+    "The hand-rolled variants still need a reclamation scheme: C++26 brings std::hazard_pointer, before it epochs or a type-stable pool must be owned."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/lockfree.html",
+    "https://en.cppreference.com/w/cpp/atomic/atomic"
+  ],
+  "variants": [
+    {
+      "variant_id": "boost-lockfree",
+      "name": "Boost.Lockfree queue family (Michael-Scott / Vyukov / SPSC)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "Boost.Lockfree"
+      ],
+      "idiom_name": "boost::lockfree::queue<> (MPMC) / spsc_queue (wait-free ring)",
+      "implementation_notes": "Boost.Lockfree ships the whole structure: boost::lockfree::queue is the Michael-Scott MPMC queue, bounded_ticket_queue the Vyukov bounded variant, and spsc_queue a wait-free single-producer/single-consumer ringbuffer; the library's own documentation warns that node-pool exhaustion falls back to the OS allocator (blocking, unless fixed_sized/capacity is configured) and that the lock-free guarantee bounds operation cost only in the worst case, so benchmark against a mutex first. Use it as the default. The hand-rolled std::atomic realization is the fallback when Boost cannot be linked and the reclamation scheme can be owned, and folly::MPMCQueue when the codebase is already on folly and a bounded, futex-blocking ticket ring fits.",
+      "code_sketch": "boost::lockfree::queue<Job, boost::lockfree::capacity<1024>> q;  // bounded, no runtime allocation\nif (!q.push(job)) { /* full: caller applies the backpressure policy */ }\nJob next;\nwhile (q.pop(next)) consume(next);            // non-blocking: false when empty\n// SPSC hot path: boost::lockfree::spsc_queue<Job, boost::lockfree::capacity<4096>> ring; ring.push(job);",
+      "pitfalls": [
+        "boost::lockfree::queue allocates nodes from a pool; when it is exhausted it calls the OS allocator, which is not lock-free - configure capacity<>/fixed_sized for real-time use.",
+        "Boost.Lockfree deliberately avoids exceptions in lock-free code; a throwing payload constructor or allocator breaks the real-time claim.",
+        "The hand-rolled variants still need a reclamation scheme: C++26 brings std::hazard_pointer, before it epochs or a type-stable pool must be owned."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/lockfree.html",
+        "https://en.cppreference.com/w/cpp/atomic/atomic"
+      ]
+    },
+    {
+      "variant_id": "std-atomic-michael-scott",
+      "name": "Hand-rolled Michael-Scott queue over std::atomic",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::atomic<Node*> compare_exchange_weak + hazard pointers/epochs",
+      "implementation_notes": "std::atomic<Node*> with compare_exchange_weak is enough for the link and endpoint swaps, but not for freeing: before C++26's std::hazard_pointer the queue must ship its own epoch or hazard reclamation (or use a type-stable pool), and the memory orders - release on publication, acquire on the claim - carry the correctness. Choose this only when Boost or folly cannot be added, or when the structure must be tuned to a specific workload; reproduce the published pseudocode rather than improvising the tail-advance step.",
+      "code_sketch": "std::atomic<Node*> head_, tail_;\nvoid push(T v) {\n    Node* n = pool_.allocate(v);                        // bounded pool, not new[]\n    Node* t = tail_.load(std::memory_order_acquire);\n    Node* expected = nullptr;\n    while (!t->next.compare_exchange_weak(expected, n,\n            std::memory_order_release, std::memory_order_relaxed)) {\n        if (expected) { tail_.compare_exchange_strong(t, expected); t = expected; expected = nullptr; }\n    }\n}",
+      "pitfalls": [
+        "Getting the tail-advance step wrong leaves the queue correct but progressively slower as the tail lags behind.",
+        "Without epochs or hazard pointers the first concurrent dequeue is a use-after-free; there is no standard reclamation before C++26."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic",
+        "https://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html"
+      ]
+    },
+    {
+      "variant_id": "folly-mpmc-ring",
+      "name": "folly::MPMCQueue bounded ticket ring",
+      "paradigm": "data-oriented",
+      "min_standard": "C++17",
+      "requires_features": [
+        "folly"
+      ],
+      "idiom_name": "folly::MPMCQueue<T> (ticket dispenser + per-slot CAS + futex blocking)",
+      "implementation_notes": "folly::MPMCQueue is a fixed-capacity ring whose head and tail are ticket dispensers (atomic increment, more robust under contention than a CAS loop) and whose slots each own a single-element queue with an adaptive spin then futex block; the header documents linearizability and requires T to be nothrow-move-constructible. Capacity is fixed and every byte is allocated up front, so it is the allocation-free choice - at the price of a folly dependency (C++17 toolchain) and a hard bound: write() returns false when full, so a backpressure policy must exist above it.",
+      "code_sketch": "folly::MPMCQueue<Job> q(4096);            // bounded, all memory allocated up front\nif (!q.write(job)) { /* full: apply policy */ }\nJob next;\nif (q.read(next)) consume(next);          // or q.blockingRead() to park on a futex",
+      "pitfalls": [
+        "Capacity is a hard limit and write() fails rather than growing, so backpressure policy is mandatory.",
+        "The queue statically requires nothrow-move-constructible payloads; a throwing move is a compile error, not a runtime surprise."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/facebook/folly/main/folly/MPMCQueue.h"
+      ]
+    }
+  ],
+  "default_variant": "boost-lockfree",
+  "version": "1.0"
+}

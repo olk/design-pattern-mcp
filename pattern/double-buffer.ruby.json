@@ -1,0 +1,57 @@
+{
+  "pattern": "double-buffer",
+  "language": "ruby",
+  "support": "manual",
+  "idiom_name": "two buffers + Thread::Mutex#synchronize around swap and snapshot",
+  "implementation_notes": "Ruby's stdlib has no buffer abstraction, so the pair is hand-written: keep two `Array`/`String`/custom buffers, mutate the back one, and swap the references inside `Thread::Mutex#synchronize` - the stdlib semaphore that 'implements a simple semaphore that can be used to coordinate access to shared data from multiple concurrent threads'. Readers take the same lock just long enough to read or copy the current reference; a `Queue` handoff is better when readers should block instead of seeing the latest state. Do not rely on MRI's GVL for atomicity: JRuby and TruffleRuby execute Ruby bytecode in parallel and the same code tears there.",
+  "code_sketch": "class Screen\n  def initialize\n    @lock = Mutex.new\n    @buffers = [[], []]\n    @current = 0\n  end\n\n  def back;    @buffers[1 - @current]; end\n  def current; @buffers[@current];     end\n  def swap;    @lock.synchronize { @current = 1 - @current }; end\nend",
+  "pitfalls": [
+    "Toggling `@current` outside the lock (or reading it without one) makes reader and writer disagree about which buffer is current on runtimes without the GVL.",
+    "`String#<<` and `Array#push` mutate in place: a published buffer the writer keeps mutating is visible to readers mid-change.",
+    "Ruby's `Mutex` is not reentrant (`ThreadError: deadlock; recursive locking`) - a locked helper calling another locked helper deadlocks.",
+    "Forking servers duplicate the buffers per process; the pattern is per-process state, not state shared across workers."
+  ],
+  "sources": [
+    "https://docs.ruby-lang.org/en/3.3/Thread/Mutex.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutex-guarded-swap",
+      "name": "Mutex-guarded buffer pair",
+      "paradigm": "oo",
+      "idiom_name": "two buffers + Thread::Mutex#synchronize around swap and snapshot",
+      "implementation_notes": "Ruby's stdlib has no buffer abstraction, so the pair is hand-written: keep two `Array`/`String`/custom buffers, mutate the back one, and swap the references inside `Thread::Mutex#synchronize` - the stdlib semaphore that 'implements a simple semaphore that can be used to coordinate access to shared data from multiple concurrent threads'. Readers take the same lock just long enough to read or copy the current reference; a `Queue` handoff is better when readers should block instead of seeing the latest state. Do not rely on MRI's GVL for atomicity: JRuby and TruffleRuby execute Ruby bytecode in parallel and the same code tears there.",
+      "code_sketch": "class Screen\n  def initialize\n    @lock = Mutex.new\n    @buffers = [[], []]\n    @current = 0\n  end\n\n  def back;    @buffers[1 - @current]; end\n  def current; @buffers[@current];     end\n  def swap;    @lock.synchronize { @current = 1 - @current }; end\nend",
+      "pitfalls": [
+        "Toggling `@current` outside the lock (or reading it without one) makes reader and writer disagree about which buffer is current on runtimes without the GVL.",
+        "`String#<<` and `Array#push` mutate in place: a published buffer the writer keeps mutating is visible to readers mid-change.",
+        "Ruby's `Mutex` is not reentrant (`ThreadError: deadlock; recursive locking`) - a locked helper calling another locked helper deadlocks.",
+        "Forking servers duplicate the buffers per process; the pattern is per-process state, not state shared across workers."
+      ],
+      "sources": [
+        "https://docs.ruby-lang.org/en/3.3/Thread/Mutex.html"
+      ]
+    },
+    {
+      "variant_id": "concurrent-atomic-reference",
+      "name": "Concurrent::AtomicReference lock-free swap",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "concurrent-ruby"
+      ],
+      "idiom_name": "Concurrent::AtomicReference#get/#update",
+      "implementation_notes": "When readers must not block, publish through `Concurrent::AtomicReference` from concurrent-ruby: 'an object reference that may be updated atomically' whose reads and writes have volatile semantics, with `update` wrapping a compare-and-set loop so the next frame can be built from the previous snapshot. It gives the same publication discipline as Java's `AtomicReference` and removes the mutex from the reader path; on MRI the difference is small because of the GVL, but on JRuby/TruffleRuby it is the honest way to publish state across threads.",
+      "code_sketch": "require \"concurrent/atomic/atomic_reference\"\n\nframe = Concurrent::AtomicReference.new(Frame.new)\n\nframe.update { |old| build_next(old) }   # atomic swap (retries if it loses a CAS)\ncurrent = frame.get                      # lock-free read of a whole frame",
+      "pitfalls": [
+        "`update` may retry its block: keep the block pure, or a build with side effects (allocation, I/O, logging) runs several times.",
+        "It is a gem dependency, not stdlib - confirm concurrent-ruby is in the deployment before relying on it.",
+        "Atomicity covers the reference only; a frame mutated after publication still tears, and nested mutable structures are shared between snapshots."
+      ],
+      "sources": [
+        "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/AtomicReference.html"
+      ]
+    }
+  ],
+  "default_variant": "mutex-guarded-swap"
+}

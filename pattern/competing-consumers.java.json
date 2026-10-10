@@ -1,0 +1,78 @@
+{
+  "pattern": "competing-consumers",
+  "language": "java",
+  "support": "native",
+  "idiom_name": "ThreadPoolExecutor + BlockingQueue (Java 8 baseline)",
+  "implementation_notes": "java.util.concurrent ships the structure: messages are put on a BlockingQueue (ArrayBlockingQueue for a hard bound) whose take() delivers each element to exactly one of N worker threads, or are submitted directly to a fixed ThreadPoolExecutor, which is a ready-made competing-consumer pool with bounded queueing and a rejection policy. What replaces the classic dispatcher is the queue's atomic take plus the executor's own worker management.",
+  "code_sketch": "BlockingQueue<Job> queue = new ArrayBlockingQueue<>(100);\nExecutorService pool = Executors.newFixedThreadPool(n);\nfor (int i = 0; i < n; i++) {\n    pool.submit(() -> {\n        while (!Thread.currentThread().isInterrupted()) {\n            Job job = queue.take();          // exactly one worker gets each job\n            try { process(job); }            // ack AFTER success\n            catch (Exception e) { requeueOrDeadLetter(job, e); }\n        }\n    });\n}",
+  "pitfalls": [
+    "take() throws InterruptedException: a consumer that swallows the interrupt breaks orderly shutdown - drain the queue and exit instead.",
+    "ThreadPoolExecutor's queue is implicit; sizing the core/max pool and the queue bound wrongly either rejects work or buffers without limit, so prefer an explicit BlockingQueue when redelivery policy matters.",
+    "A slow handler holds its thread; with a small fixed pool one bad job type starves the rest, so isolate queues per workload or use per-task timeouts."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "fixed-pool",
+      "name": "ThreadPoolExecutor + BlockingQueue (Java 8 baseline)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "ThreadPoolExecutor + BlockingQueue (Java 8 baseline)",
+      "implementation_notes": "java.util.concurrent ships the structure: messages are put on a BlockingQueue (ArrayBlockingQueue for a hard bound) whose take() delivers each element to exactly one of N worker threads, or are submitted directly to a fixed ThreadPoolExecutor, which is a ready-made competing-consumer pool with bounded queueing and a rejection policy. What replaces the classic dispatcher is the queue's atomic take plus the executor's own worker management.",
+      "code_sketch": "BlockingQueue<Job> queue = new ArrayBlockingQueue<>(100);\nExecutorService pool = Executors.newFixedThreadPool(n);\nfor (int i = 0; i < n; i++) {\n    pool.submit(() -> {\n        while (!Thread.currentThread().isInterrupted()) {\n            Job job = queue.take();          // exactly one worker gets each job\n            try { process(job); }            // ack AFTER success\n            catch (Exception e) { requeueOrDeadLetter(job, e); }\n        }\n    });\n}",
+      "pitfalls": [
+        "take() throws InterruptedException: a consumer that swallows the interrupt breaks orderly shutdown - drain the queue and exit instead.",
+        "ThreadPoolExecutor's queue is implicit; sizing the core/max pool and the queue bound wrongly either rejects work or buffers without limit, so prefer an explicit BlockingQueue when redelivery policy matters.",
+        "A slow handler holds its thread; with a small fixed pool one bad job type starves the rest, so isolate queues per workload or use per-task timeouts."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "One virtual thread per task (Java 21)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual threads"
+      ],
+      "idiom_name": "One virtual thread per task (Java 21)",
+      "implementation_notes": "With virtual threads the pool becomes cheap: submit one virtual thread per message (or use Executors.newVirtualThreadPerTaskExecutor()) and let the JDK multiplex them onto carrier threads, so blocking receives and blocking I/O no longer pin platform threads. The competing-consumer contract is unchanged - the queue still hands each message to exactly one task - but the concurrency headroom shifts from 'as many workers as threads' to 'bounded by downstream resources', so bounds must be enforced at the queue and the downstream service instead of by the pool size.",
+      "code_sketch": "try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (var msg : consumer.poll(msgs)) {          // broker client in the consumer\n        executor.submit(() -> {\n            try { process(msg); ack(msg); }\n            catch (Exception e) { nack(msg, e); }\n        });\n    }\n}\n// no fixed pool size: bound concurrency at the queue and the downstream service",
+      "pitfalls": [
+        "Unbounded virtual threads can overwhelm a database or downstream API: add a semaphore or limit the queue, since the thread count no longer limits concurrency.",
+        "synchronized blocks and other pinning constructs still block carrier threads on some JDK versions; prefer ReentrantLock in handlers that block."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html"
+      ]
+    },
+    {
+      "variant_id": "jms-mdb",
+      "name": "JMS queue with N message listeners / MDBs (brokered)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "Jakarta Messaging"
+      ],
+      "idiom_name": "JMS queue with N message listeners / MDBs (brokered)",
+      "implementation_notes": "The brokered Java form: several MessageListener instances (or message-driven beans in an application server, or Spring listeners with concurrency > 1) consume one JMS queue; the provider guarantees that each message is delivered to exactly one listener and redelivers unacknowledged messages after a rollback or session failure. The container handles acknowledgement modes, sessions and pooling - which is also where the operational tuning lives (session pool size, prefetch, redelivery limits).",
+      "code_sketch": "@MessageDriven(activationConfig = {\n    @ActivationConfigProperty(propertyName = \"destinationType\", propertyValue = \"jakarta.jms.Queue\"),\n    @ActivationConfigProperty(propertyName = \"destination\", propertyValue = \"java:/jms/queue/Orders\")\n})\npublic class OrderWorker implements MessageListener {\n    public void onMessage(Message m) { process(m); }   // container acks on return\n}\n// deploy M instances / set the listener concurrency; the queue redelivers on rollback",
+      "pitfalls": [
+        "Container-managed acknowledgement ties delivery to method return: a handler that returns normally while its work is still enqueued elsewhere loses the message.",
+        "Redelivery caps are provider settings - without them a poison message loops through the listener pool indefinitely.",
+        "Container session/thread pools are shared across queues: one slow destination can exhaust them and starve other listeners."
+      ],
+      "sources": [
+        "https://jakarta.ee/specifications/messaging/3.1/"
+      ]
+    }
+  ],
+  "default_variant": "fixed-pool"
+}

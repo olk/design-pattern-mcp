@@ -1,0 +1,85 @@
+{
+  "pattern": "command-base",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Command interface + Jackson @JsonTypeInfo/@JsonSubTypes discriminator",
+  "implementation_notes": "The safe default: a one-method Command interface, concrete command classes (or records), and Jackson writing the discriminator with @JsonTypeInfo(use = Id.NAME, property = \"kind\") plus an explicit @JsonSubTypes list - the invoker reads the tag, resolves the concrete class and calls execute(). The envelope travels as a JMS TextMessage (Jakarta Messaging), a Kafka/RabbitMQ payload or an HTTP body, so the broker never deserialises Java objects. Blanket default typing must stay off: the per-hierarchy subtype list is the allow-list.",
+  "code_sketch": "@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = \"kind\")\n@JsonSubTypes(@JsonSubTypes.Type(value = RenderCommand.class, name = \"render\"))\npublic interface Command { void execute(); }\n\npublic record RenderCommand(int reportId) implements Command {\n    public void execute() { renderer.render(reportId); }\n}\n// invoker:\nCommand c = mapper.readValue(envelope, Command.class);   // tag decides the class\nc.execute();",
+  "pitfalls": [
+    "Jackson's global default typing resolves classes named by the payload and is a gadget-chain vector: use per-hierarchy @JsonTypeInfo with an explicit subtype list, never blanket default typing.",
+    "The discriminator property name and subtype names are the wire contract; renaming a class without keeping its @JsonSubTypes name breaks every queued message.",
+    "Records need jackson-databind 2.12+ (with parameter names) to deserialise; the older bean-style requirement is a silent failure mode for mixed-version producers."
+  ],
+  "sources": [
+    "https://github.com/FasterXML/jackson/wiki/Jackson-Polymorphic-Deserialization-CVE-Criteria",
+    "https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "jackson-json-envelope",
+      "name": "Jackson polymorphic JSON envelope over JMS or HTTP",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "Command interface + Jackson @JsonTypeInfo/@JsonSubTypes discriminator",
+      "implementation_notes": "The safe default: a one-method Command interface, concrete command classes (or records), and Jackson writing the discriminator with @JsonTypeInfo(use = Id.NAME, property = \"kind\") plus an explicit @JsonSubTypes list - the invoker reads the tag, resolves the concrete class and calls execute(). The envelope travels as a JMS TextMessage (Jakarta Messaging), a Kafka/RabbitMQ payload or an HTTP body, so the broker never deserialises Java objects. Blanket default typing must stay off: the per-hierarchy subtype list is the allow-list.",
+      "code_sketch": "@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = \"kind\")\n@JsonSubTypes(@JsonSubTypes.Type(value = RenderCommand.class, name = \"render\"))\npublic interface Command { void execute(); }\n\npublic record RenderCommand(int reportId) implements Command {\n    public void execute() { renderer.render(reportId); }\n}\n// invoker:\nCommand c = mapper.readValue(envelope, Command.class);   // tag decides the class\nc.execute();",
+      "pitfalls": [
+        "Jackson's global default typing resolves classes named by the payload and is a gadget-chain vector: use per-hierarchy @JsonTypeInfo with an explicit subtype list, never blanket default typing.",
+        "The discriminator property name and subtype names are the wire contract; renaming a class without keeping its @JsonSubTypes name breaks every queued message.",
+        "Records need jackson-databind 2.12+ (with parameter names) to deserialise; the older bean-style requirement is a silent failure mode for mixed-version producers."
+      ],
+      "sources": [
+        "https://github.com/FasterXML/jackson/wiki/Jackson-Polymorphic-Deserialization-CVE-Criteria",
+        "https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1"
+      ]
+    },
+    {
+      "variant_id": "jdk-serialization-jms",
+      "name": "JDK serialisation + JMS ObjectMessage / RMI (classic form)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "java.io.Serializable",
+        "ObjectOutputStream",
+        "Jakarta Messaging ObjectMessage or RMI"
+      ],
+      "idiom_name": "Serializable command + ObjectMessage / RMI dispatch",
+      "implementation_notes": "The platform's original answer: `implements Serializable` on the command, `ObjectOutputStream`/RMI or a JMS ObjectMessage to ship it, and `readObject` on the far side reconstructing the object graph before the invoker calls execute(). It is short and needs no codec code, but it is also the canonical insecure-deserialization surface: any class on the consumer's classpath can be instantiated from a crafted message, so this variant belongs behind an authenticated broker with a single trusted producer, or in a migration path toward a JSON/protobuf envelope.",
+      "code_sketch": "public interface Command extends Serializable { void execute(); }\n\ntry (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(spool))) {\n    out.writeObject(new RenderCommand(42));       // ships the object graph\n}\n// invoker:\ntry (ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {\n    ((Command) in.readObject()).execute();\n}",
+      "pitfalls": [
+        "Deserialising untrusted bytes executes gadgets: JMS ObjectMessage plus a message converter that trusts a typeId header is a documented CVE class.",
+        "serialVersionUID drift and class evolution produce InvalidClassException on messages that are already in the queue; serialisation also bypasses constructors, so invariants never hold.",
+        "The serialised graph is far larger than the data it carries - sending a command that references other objects drags them along."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/specs/serialization/index.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/Serializable.html"
+      ]
+    },
+    {
+      "variant_id": "sealed-records-switch",
+      "name": "Sealed interface + records with a pattern-matching switch dispatcher",
+      "paradigm": "data-oriented",
+      "min_standard": "Java21",
+      "requires_features": [
+        "records",
+        "sealed interfaces",
+        "pattern matching for switch"
+      ],
+      "idiom_name": "sealed interface Command + records + exhaustive switch",
+      "implementation_notes": "Modern Java closes the hierarchy instead of registering it: a `sealed interface Command permits ...` with one record per command makes the set known to the compiler, and the invoker is a `switch` over the sealed type with pattern matching - exhaustiveness is checked, no registry and no reflection. Jackson (2.15+) or a protobuf oneof can still produce the wire envelope, and records give correct equals/hashCode for free, which matters when commands are de-duplicated on the queue.",
+      "code_sketch": "public sealed interface Command permits RenderCommand, FlushCommand {\n    void execute();\n}\npublic record RenderCommand(int reportId) implements Command {\n    public void execute() { renderer.render(reportId); }\n}\n// invoker:\nCommand c = mapper.readValue(envelope, Command.class);\nswitch (c) {                       // exhaustive: a missing case is a compile error\n    case RenderCommand r -> r.execute();\n    case FlushCommand f -> f.execute();\n}",
+      "pitfalls": [
+        "A sealed set is closed per package/module: a command added elsewhere cannot be deserialised through the base type without reopening the hierarchy.",
+        "Jackson needs the sealed subtype list (or @JsonSubTypes) to map the discriminator onto the permitted records; deriving it from the payload's class name reintroduces the gadget risk.",
+        "Java 21 is required for pattern matching in switch after the preview cycle - pin the toolchain or keep an if/else instanceof chain for older runtimes."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/language/pattern-matching-switch.html",
+        "https://docs.oracle.com/en/java/javase/21/language/records.html"
+      ]
+    }
+  ],
+  "default_variant": "jackson-json-envelope"
+}

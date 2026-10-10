@@ -1,0 +1,21 @@
+{
+  "pattern": "leader-followers",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-written pthread pool over epoll_wait/select(2) with a mutex plus condition-variable leader token",
+  "implementation_notes": "POSIX supplies only the pieces: pthread_create for the fixed pool, pthread_mutex_t/pthread_cond_t for the leader token and the waiting followers, and epoll_wait/kqueue/select for readiness. join() locks, waits while a leader exists, claims the leader slot, unlocks, blocks in the demultiplexer, then re-locks, clears the slot, signals a follower and processes the ready handle as the former leader. Two details decide correctness: the deactivate/reactivate protocol around the ready descriptor (remove it or run it one-shot before dispatch and rearm it afterwards, so the promoted leader cannot demultiplex the same event twice), and the fact that select(2)/poll(2) must not be called by several threads on one descriptor set - with epoll(7) the kernel hands an edge-triggered event to a single waiting thread, so several pool members may block in the same epoll_wait and the user-space promotion protocol becomes optional.",
+  "code_sketch": "void *pool_thread(void *arg) {          /* pool mutex m, condvar cv, int leader */\n  for (;;) {\n    pthread_mutex_lock(&m);\n    while (leader) pthread_cond_wait(&cv, &m);  /* follower */\n    leader = 1; pthread_mutex_unlock(&m);       /* become leader */\n    int n = epoll_wait(epfd, evs, MAX, -1);     /* demultiplex, unlocked */\n    pthread_mutex_lock(&m);\n    leader = 0; pthread_cond_signal(&cv);       /* promote a follower */\n    pthread_mutex_unlock(&m);\n    dispatch(evs, n);                           /* process as ex-leader */\n  }\n}",
+  "pitfalls": [
+    "Calling select(2)/poll(2) from several threads on the same descriptor set produces duplicate readiness notifications; either serialise the pool or move to epoll/kqueue with a one-shot or edge-triggered mode that is rearmed after each dispatch.",
+    "Holding the pool mutex while blocked in epoll_wait/select freezes every follower; the leader must release the lock before waiting.",
+    "Forgetting to deactivate/rearm a ready descriptor before dispatching lets the promoted leader demultiplex the same event twice.",
+    "pthread_cond_signal restarts exactly one waiting thread but does not say which, so the promotion order is implementation-defined unless the pool keeps its own stack or priority queue.",
+    "Registering or deregistering descriptors from non-leader threads requires an explicit wakeup (eventfd or self-pipe) or the sleeping leader never sees the new interest set."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man7/epoll.7.html",
+    "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/lf.pdf"
+  ],
+  "version": "1.0"
+}

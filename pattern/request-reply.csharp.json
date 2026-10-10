@@ -1,0 +1,54 @@
+{
+  "pattern": "request-reply",
+  "language": "csharp",
+  "support": "idiomatic",
+  "idiom_name": "TaskCompletionSource in a ConcurrentDictionary + Task.WaitAsync deadline",
+  "implementation_notes": "async/await plus TaskCompletionSource replaces the callback registry: the caller parks a TaskCompletionSource in a ConcurrentDictionary keyed by the request's correlation id and awaits it, while the reply pump looks the id up and calls SetResult/SetException. Task.WaitAsync supplies the deadline and the caller's CancellationToken supplies cancellation; System.Threading.Channels gives the same shape in-process, where the reply channel can simply be a ChannelWriter handed to the requester. The classic reply queue survives as the dictionary plus the reply subscription.",
+  "code_sketch": "static readonly ConcurrentDictionary<Guid, TaskCompletionSource<Reply>> Pending = new();\nasync Task<Reply> CallAsync(Request request, CancellationToken ct)\n{\n    var id = Guid.NewGuid();\n    var tcs = new TaskCompletionSource<Reply>(\n        TaskCreationOptions.RunContinuationsAsynchronously);\n    Pending[id] = tcs;\n    try {\n        await transport.SendAsync(new Envelope(id, request), ct);\n        return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);\n    }\n    finally { Pending.TryRemove(id, out _); }   // abandon on timeout/cancel\n}",
+  "pitfalls": [
+    "Create the TaskCompletionSource with RunContinuationsAsynchronously; otherwise the reply-pump thread runs the caller's continuation inline and a slow continuation stalls every other reply.",
+    "Complete the source on the reply pump and never block there: a consumer thread calling .Result or .Wait() deadlocks under a SynchronizationContext.",
+    "An entry not removed in a finally block leaks, and a duplicate or late reply then completes a TaskCompletionSource nobody observes."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1"
+  ],
+  "variants": [
+    {
+      "variant_id": "tcs-correlation-table",
+      "name": "TaskCompletionSource correlation table with WaitAsync",
+      "paradigm": "concurrent",
+      "min_standard": "C#10",
+      "idiom_name": "TaskCompletionSource in a ConcurrentDictionary + Task.WaitAsync deadline",
+      "implementation_notes": "async/await plus TaskCompletionSource replaces the callback registry: the caller parks a TaskCompletionSource in a ConcurrentDictionary keyed by the request's correlation id and awaits it, while the reply pump looks the id up and calls SetResult/SetException. Task.WaitAsync supplies the deadline and the caller's CancellationToken supplies cancellation; System.Threading.Channels gives the same shape in-process, where the reply channel can simply be a ChannelWriter handed to the requester. The classic reply queue survives as the dictionary plus the reply subscription.",
+      "code_sketch": "static readonly ConcurrentDictionary<Guid, TaskCompletionSource<Reply>> Pending = new();\nasync Task<Reply> CallAsync(Request request, CancellationToken ct)\n{\n    var id = Guid.NewGuid();\n    var tcs = new TaskCompletionSource<Reply>(\n        TaskCreationOptions.RunContinuationsAsynchronously);\n    Pending[id] = tcs;\n    try {\n        await transport.SendAsync(new Envelope(id, request), ct);\n        return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);\n    }\n    finally { Pending.TryRemove(id, out _); }   // abandon on timeout/cancel\n}",
+      "pitfalls": [
+        "Create the TaskCompletionSource with RunContinuationsAsynchronously; otherwise the reply-pump thread runs the caller's continuation inline and a slow continuation stalls every other reply.",
+        "Complete the source on the reply pump and never block there: a consumer thread calling .Result or .Wait() deadlocks under a SynchronizationContext.",
+        "An entry not removed in a finally block leaks, and a duplicate or late reply then completes a TaskCompletionSource nobody observes."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1"
+      ]
+    },
+    {
+      "variant_id": "masstransit-request-client",
+      "name": "MassTransit IRequestClient request/response",
+      "paradigm": "oo",
+      "min_standard": "C#10",
+      "idiom_name": "IRequestClient.GetResponse<TResponse> over the service bus",
+      "implementation_notes": "MassTransit owns the whole pattern: GetResponse<TResponse>(request, cancellationToken, timeout) returns a Task, the bus carries the response address and request id, a consumer failure comes back as a Fault<T> and surfaces as a RequestFaultException, and the request timeout (default 30 seconds) also sets the message time-to-live. Use it when the service bus is already in the stack; the trade is a framework and DI-based configuration for what is otherwise a few lines of correlation-table code.",
+      "code_sketch": "public class OrderController(IRequestClient<CheckOrderStatus> client) : ControllerBase\n{\n    [HttpGet(\"{id}\")]\n    public async Task<IActionResult> Get(string id, CancellationToken ct)\n    {\n        var response = await client.GetResponse<OrderStatusResult>(new { id }, ct);\n        return Ok(response.Message);\n    }\n}",
+      "pitfalls": [
+        "A cancelled GetResponse stops the wait but leaves the request in the queue until it is consumed or its TTL expires, so the consumer must be idempotent.",
+        "Faults arrive as a Fault<T> message and surface as RequestFaultException; catching only timeouts hides the domain-error path."
+      ],
+      "sources": [
+        "https://masstransit.io/documentation/concepts/requests",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1"
+      ]
+    }
+  ],
+  "default_variant": "tcs-correlation-table",
+  "version": "1.0"
+}

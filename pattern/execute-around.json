@@ -1,0 +1,171 @@
+{
+  "category": "construction-composition",
+  "name": "execute-around",
+  "aliases": [
+    "execute around method",
+    "around method"
+  ],
+  "intent": "Give one method ownership of a pair of actions that must happen together - acquire/release, open/close, begin/commit-or-rollback, push/pop - and let it take the work in between as an argument, so the second action cannot be forgotten and the body cannot run outside the bracket.",
+  "problem": "The same setup and teardown statements bracket every piece of work a resource or protocol requires, yet each caller writes the pair itself. Every new call site is a chance to skip the second half on an early return or an exception (the code-sandwich defect studied by Elder, Jackson and Liblit), the pairing policy cannot be changed in one place, and the resource's protocol leaks into code that only wanted to do the work.",
+  "context": "Resource and protocol pairs that must be balanced - file descriptors, locks, transactions, temporary global state, observability brackets - especially when the work between them can exit early or throw, when several call sites repeat the same pair, or when the pairing policy (timeouts, retries, admission, metrics) has to be centralized. It applies wherever the body can be expressed as a function value, a block, or a lexical scope, and the resource's lifetime can be bounded by the call.",
+  "benefits": [
+    "Correct pairing by construction: because the wrapper owns every exit path, the after-code cannot be skipped by an early return, a break or an exception - the defect class the pattern exists to remove.",
+    "Single point of change: retries, timeouts, tracing, admission checks and policy changes are made once in the wrapper instead of at every call site.",
+    "Call sites shrink to their intent: the caller supplies only what is done with the resource, which is also what the method is named after (openDuring:, withTransaction, readStreamWhile:).",
+    "The protocol stops leaking: the paired primitives can be hidden or made private, so callers cannot invoke them out of order or forget the second half.",
+    "It works in languages with no bracket of their own, and gives one uniform shape across languages once one exists; the same structure also underlies around advice in aspect-oriented systems and the scoped-access APIs of standard libraries.",
+    "Testable seam: the setup/teardown policy is exercised once by the wrapper, while the body becomes a plain function that can be tested with a stub or fake resource."
+  ],
+  "tradeoffs": [
+    "Inversion of control: the body becomes a closure, so control transfers that used to be local - break, continue, return, yield - no longer cross the boundary, and generators, iterators or multi-entry protocols are hard or impossible to wrap.",
+    "The closure captures its environment and may allocate (std::function, delegates, boxed captures, Go interface values), which lengthens object lifetimes and can matter in hot paths.",
+    "The failure policy has to be invented: when the body throws and the teardown also throws, something must be chosen (suppress, aggregate, log or replace) and the languages differ - C++ terminates when a destructor throws during unwinding, Java and Python suppress, Go has to merge the error into a named result.",
+    "Parameter creep: wrappers attract modes, retry counts, timeouts and visitor callbacks until they are a different pattern wearing the wrapper's name, and the body's signature becomes control coupling.",
+    "Body lifetime must be bounded by the call: resources that must be acquired conditionally, reused after the call, or handed to another component do not fit the shape and get hidden instead of returned.",
+    "Wrapper zoo: several one-line wrappers for the same pair make the API larger than the protocol they hide, which costs more than it saves below two or three call sites."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 6,
+    "maintainability": 8,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Execute-Around Method",
+      "responsibility": "Owns the pair: performs setup, invokes the body exactly once while the resource is live, then teardown on every exit path, and defines the policy for the case where both the body and the teardown fail."
+    },
+    {
+      "role": "Body (Block / Callback / closure)",
+      "responsibility": "The caller-supplied code executed between setup and teardown; it receives whatever the setup produced (resource, handle, context) and must not keep it after returning."
+    },
+    {
+      "role": "Resource Host",
+      "responsibility": "The object or API exposing the paired primitives the wrapper invokes (open/close, lock/unlock, begin/commit-rollback, push/pop); it may be handed to the body or hidden behind the wrapper."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Supplies the body, chooses which wrapper expresses the protocol, and no longer issues the paired primitives itself."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "File, stream and connection handling where open/close must be balanced and the caller only reads or writes: File.open with a block, try-with-resources, using, defer, Closeable.use.",
+    "Lock bracketing around a critical section, including recursive and scoped-locking cases: std::lock_guard, Rust MutexGuard, synchronized with a callback, withLock.",
+    "Database or messaging transactions: the wrapper owns begin/commit/rollback around the unit of work and chooses the outcome from whether the body threw.",
+    "Temporary global or ambient state: locale, current directory, log context, signal mask, GUI busy cursor, security context or elevated privilege — set it, run the body, restore it.",
+    "Observability brackets: timing, tracing spans, metrics, profiler zones and log-context push/pop around a block of work.",
+    "Test fixtures and scoped test resources: setup registers teardown, the body is the test, and cleanup still runs when an assertion fails (Go's t.Cleanup, pytest yield fixtures, withTempDir helpers).",
+    "Authorization and permission scopes: acquire elevated privileges, run the body, revoke privileges — the wrapper guarantees revocation even on exception (e.g., POSIX setuid/unsetuid, security token acquisition).",
+    "Retry and timeout wrappers around unreliable operations: open connection, attempt body, on transient failure reconnect and retry, finally close — the wrapper encodes the retry policy in one place.",
+    "I/O buffering: flush-before-close or read-ahead buffering wrapped as an execute-around so callers cannot access the buffer before it is flushed or after it is closed.",
+    "Connection and thread pool leasing: acquire a connection or worker from a pool, run the body, return it to the pool — the wrapper guarantees return even on exception, preventing pool starvation.",
+    "Framework transaction templates that name themselves after the pattern: Spring's TransactionTemplate.execute(TransactionCallback) is documented as an execute-around callback — begin, run the callback, then commit or roll back based on whether the callback threw a runtime exception.",
+    "Generator-based context managers as the standard-library realization: Python's contextlib.contextmanager puts acquisition before the yield and release in a finally after it, and Rails' ActiveRecord::Base.transaction commits or rolls back around the block depending on whether it raises.",
+    "Scoped-close helpers in typed standard libraries: Kotlin's Closeable.use/AutoCloseable.use extension runs a block on the resource and closes it even when the block throws, adding a failing close() as a suppressed exception to the propagating one."
+  ],
+  "avoid_when": [
+    "A native bracket already expresses the pairing and no policy is added (with, using, try-with-resources, defer, RAII): wrapping it adds indirection without a guarantee the language was not already giving.",
+    "The resource must outlive the call or be used by the caller after setup: return the resource instead of wrapping it, because the wrapper would hide exactly the handle the caller needs.",
+    "The body is not a single function invocation: multi-entry protocols, event handlers, iterators and generators, coroutines or interactive sessions cannot be expressed as one closure without inverting their control flow.",
+    "There is exactly one call site and no policy to centralize: an inline try/finally, or the plain pair with a goto-cleanup label in C, is smaller and clearer.",
+    "The concern is genuinely cross-cutting over many unrelated methods (logging every public method, security checks for a whole layer): use an interceptor, dynamic proxy, decorator or around advice instead of wrapping each caller by hand."
+  ],
+  "language_files": {
+    "generic": "execute-around.generic.json",
+    "c": "execute-around.c.json",
+    "cplusplus": "execute-around.cplusplus.json",
+    "csharp": "execute-around.csharp.json",
+    "go": "execute-around.go.json",
+    "java": "execute-around.java.json",
+    "javascript": "execute-around.javascript.json",
+    "kotlin": "execute-around.kotlin.json",
+    "python": "execute-around.python.json",
+    "ruby": "execute-around.ruby.json",
+    "rust": "execute-around.rust.json",
+    "scala": "execute-around.scala.json",
+    "swift": "execute-around.swift.json",
+    "typescript": "execute-around.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional"
+  ],
+  "scope": "object",
+  "provenance": [
+    "smalltalk",
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "callback",
+    "template-method",
+    "strategy",
+    "raii",
+    "scope-guard",
+    "scoped-locking",
+    "proxy",
+    "decorator",
+    "interceptor"
+  ],
+  "anti_patterns": [
+    "Publishing an open/close protocol as two public methods while the wrapper would be a one-liner: every caller must balance the pair correctly and nothing enforces it.",
+    "Swallowing teardown failures (an empty catch around close, rollback or unlock) so the bracket looks tidy - the original defect simply disappears from the logs.",
+    "Catching and suppressing the body's exception inside the wrapper so that cleanup runs: the pattern's job is to guarantee teardown, not to change the program's failure semantics.",
+    "Parameter creep: the wrapper grows a mode flag, a retry count, an isolation level and a callback until it is a different pattern wearing the wrapper's name.",
+    "Wrapper zoo: a second wrapper for every variation of the same pair (withFile, withFileForWriting, withFileWithTimeout) instead of one parameterized wrapper or plain protocol calls.",
+    "Wrapping work that must be interactive or long-lived - an event handler, a session, an iterator - in a callback whose body cannot suspend, return a stream, or outlive the call."
+  ],
+  "design_principles": [
+    "DRY and single point of change: the pairing exists once, so a fix or a policy change applies everywhere.",
+    "Fail-safe cleanup: the after-code must be guaranteed (postdominate) for every path out of the body - the invariant the pattern trades its indirection for.",
+    "Separation of concerns: protocol mechanics (setup, teardown, policy) versus what the caller actually wants done.",
+    "Inversion of control: the wrapper calls the caller's body - don't call us, we'll call you - so the body's interface is the wrapper's promise.",
+    "Intention-revealing names: name the method after the pair or the guarantee it provides (openDuring:, withTransaction, synchronized, use), never after the mechanism."
+  ],
+  "best_practices": [
+    "Invoke the body exactly once, between setup and teardown, and hand its result back unchanged; make accidental double execution impossible.",
+    "Decide and document the failure policy: if the body threw and the teardown also throws, say which exception survives (suppress, aggregate, log) and never lose the original.",
+    "Keep teardown infallible where the platform insists: destructors and deferred cleanup must not throw (C++ terminates during unwinding, a panicking Rust destructor aborts), so report flush or close errors through a channel that can carry them — a named error result, a Result type, a log line.",
+    "Stay on one abstraction level: the wrapper reads setup -> body -> teardown; retries with back-off, branching on the body's content or business decisions belong in the body or in a differently named wrapper.",
+    "Prefer the language's own bracket and its contract (Closeable, IDisposable, AutoCloseable, Drop, with, using, defer) over a hand-written copy of it; hand-rolled brackets layered over native ones are the usual source of leaks.",
+    "State the body's contract: what it may do (return a value, throw) and what it must not do (keep the resource, spawn work that outlives the call, close the resource itself).",
+    "Parameterize instead of duplicating: one wrapper plus arguments beats withFile, withFileForWriting and withFileWithTimeout; add a new name only when the guarantee differs, not when a value differs.",
+    "Pair with structured concurrency: in async or concurrent code, ensure the execute-around scope is the same lexical scope as the concurrency boundary — crossing task boundaries risks the body outliving the resource.",
+    "Propagate cancellation: if the body is async or cancellable, pass the cancellation token through so the wrapper's teardown runs when the caller cancels, not just on normal return.",
+    "Instrument the wrapper, not the body: timing, metrics and tracing spans belong in the wrapper as policy, not scattered across every body; keep the body focused on its single responsibility.",
+    "Prefer reentrant or thread-safe wrappers for pooled resources: a wrapper that hands a pooled connection to the body must either serialize concurrent access or document that the body must not share the handle."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Kent Beck, Smalltalk Best Practice Patterns (Prentice Hall, 1997) — Execute Around Method (Behavior: Methods). The originating description: a method takes a block and appends While:/During: to the name of the first action. https://www.informit.com/store/smalltalk-best-practice-patterns-9780134769042",
+    "Kurt Wallingford (University of New Hampshire), SBPP Draft Chapter — online copy of the Execute Around Method section with Smalltalk examples. http://faculty.chas.uni.edu/~wallingf/teaching/cs4550/media/textbooks/sbpp-draft.pdf",
+    "Matt Elder, Steve Jackson & Ben Liblit, Code Sandwiches (University of Wisconsin-Madison, Computer Sciences Technical Report 1647, 2008) — before/body/after code sandwiches, postdomination, and the defects that arise under exceptions and early returns. https://research.cs.wisc.edu/techreports/2008/TR1647.pdf",
+    "Kevlin Henney, C++ Patterns: Executing Around Sequences (EuroPLoP 2000) — formalizes the pattern in C++ as a pair of actions bracketing a sequence, contrasting with RAII and discussing exception safety. https://hillside.net/europlop/HillsideEurope/Papers/EuroPLoP2000/2000_Henney_ExecutingAroundSequences.pdf",
+    "Alexandrescu & Marginean, Scope Guard pattern — C++ idiom that ties deferred cleanup to scope exit via a lightweight guard object; the direct RAII-based realization of execute-around in C++. https://dalerank.github.io/en/articles/cpp101-part1.html",
+    "WikiBooks, More C++ Idioms — Execute-Around Object and Execute-Around Pointer entries, with SCOPE_EXIT and scoped-locking; connects RAII, Scope Guard, and Execute-Around as a family. https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms",
+    "Chris Oldwood, Execute Around Method — The Subsystem Boundary Workhorse (2011) — real-world use of execute-around at subsystem boundaries for instrumentation, retry and failover around SQL queries and remote service calls. https://chrisoldwood.blogspot.com/2011/07/execute-around-method-subsystem.html",
+    "Vladimir Keleshev, Python Best Practice Patterns — execute-around as Python context managers; notes on the pattern's application to Python's with statement with concrete examples. https://stevenloria.com/python-best-practice/",
+    "ACCU Overload 88, Griffiths — Execute Around Method and Proxy Goulash — batch update workflow using Director/Broker/Proxy to orchestrate lifecycle around a command, with analysis of complexity and encapsulation tradeoffs. https://www.accu.org/journals/overload/10/50/griffiths_388/",
+    "Java Design Patterns, Execute Around — Java-specific treatment with try-with-resources and Closeable use cases, contrasting with execute-around idiom. https://java-design-patterns.com/patterns/execute-around/",
+    "golang.design, Deferred Statements — Go's defer mechanism analyzed as an execute-around variant, contrasting with Python context managers and C++/Rust RAII; covers the three-generation cost model (open coding, stack allocation, heap allocation). https://golang.design/under-the-hood/en/part2lang/ch06func/defer/",
+    "Grokipedia, Resource Leak — survey of resource management across languages; discusses execute-around in Python, Go's defer, Rust's Drop, and RAII as related cleanup patterns. https://grokipedia.com/page/Resource_leak",
+    "Wikipedia, Execute Around Method — community-curated description of the pattern with Smalltalk examples and variations in Java, C#, Python and Ruby. https://en.wikipedia.org/wiki/Execute_Around_Method",
+    "Spring Framework reference, Programmatic Transaction Management — TransactionTemplate.execute(TransactionCallback) explicitly described as implementing the execute-around (callback) pattern: the template owns begin/commit/rollback and exception translation around the caller's callback. https://docs.spring.io/spring-framework/reference/data-access/transaction/programmatic.html",
+    "Python official documentation, contextlib — Utilities for with-statement contexts — the canonical realization of execute-around as a generator: setup before yield, body at the yield point (exceptions re-raised there), teardown in finally; documents the single-use generator caveat and ContextDecorator. https://docs.python.org/3/library/contextlib.html",
+    "Kotlin Core API, kotlin.io.use — stdlib extension that executes a block on a Closeable/AutoCloseable and closes it afterwards even on exception, adding a close failure as a suppressed exception to the propagating one. https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.io/use.html",
+    "Rails API documentation, ActiveRecord::Transactions::ClassMethods — transaction(&block) as an execute-around over begin/commit/rollback: commit iff the block returns without raising, ActiveRecord::Rollback rolls back without re-raising, requires_new subtransactions for nesting. https://api.rubyonrails.org/classes/ActiveRecord/Transactions/ClassMethods.html",
+    "Kyle Simpson, You-Dont-Know-JS ch. 2 'Callbacks' — the inversion-of-control criticism of handing control to third-party callback-invokers: the body can be called too early, multiple times, or not at all; a trust hazard for wrapper-owns-the-body designs. https://github.com/getify/You-Dont-Know-JS/blob/1st-ed/async%20%26%20performance/ch2.md"
+  ]
+}

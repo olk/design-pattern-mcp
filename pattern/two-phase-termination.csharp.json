@@ -1,0 +1,67 @@
+{
+  "pattern": "two-phase-termination",
+  "language": "csharp",
+  "support": "library",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "cancellation-token-await",
+      "name": "CancellationTokenSource + awaiting the worker Task",
+      "paradigm": "concurrent",
+      "min_standard": "C#5",
+      "requires_features": [
+        "System.Threading.CancellationTokenSource",
+        "async/await"
+      ],
+      "idiom_name": "CancellationTokenSource.Cancel() + await worker task",
+      "implementation_notes": ".NET ships the two phases as a cooperative model: CancellationTokenSource.Cancel() is phase 1 (it sets IsCancellationRequested, runs registered callbacks and signals the token's WaitHandle), and awaiting the worker's Task is phase 2 - the documentation is explicit that tasks are not abandoned after cancellation is requested, the caller awaits them to completion. Cleanup belongs after the cancellation check inside the task (or in a finally/await using block). The classic manual structure is still justified for legacy thread-based code that has no Task to await, where a ManualResetEventSlim plus Thread.Join takes the place of the token and the await.",
+      "code_sketch": "sealed class Worker\n{\n    readonly CancellationTokenSource _cts = new();\n    Task? _run;\n\n    public void Start() => _run = Task.Run(() => LoopAsync(_cts.Token));\n\n    public async Task StopAsync()          // phase 1 + phase 2\n    {\n        _cts.Cancel();\n        if (_run is not null) await _run;  // cleanup has finished here\n        _cts.Dispose();\n    }\n\n    async Task LoopAsync(CancellationToken ct)\n    {\n        while (!ct.IsCancellationRequested) await HandleNextAsync(ct);\n        await FlushAndReleaseAsync();      // cleanup on the worker's path\n    }\n}",
+      "pitfalls": [
+        "A token is only a request: code that never observes IsCancellationRequested, does not pass the token to inner calls and registers no callback keeps running after Cancel().",
+        "Cancel() does not wait: only awaiting the worker task (or a WaitHandle/Join with a timeout) makes the second phase observable, and a caller that fires and forgets can dispose resources still in use.",
+        "Registered callbacks run synchronously on the thread calling Cancel(); a blocking or throwing callback delays or breaks the shutdown path, and CancellationTokenSource.Dispose() must not race with other users of the source.",
+        "Thread.Abort/Thread.Interrupt are not a substitute: Thread.Abort is unsupported on .NET Core/.NET 5+ and can leave locks held, so thread-based legacy workers must be made to poll a flag with a wake-up signal."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-in-managed-threads",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.cancellationtokensource"
+      ]
+    },
+    {
+      "variant_id": "background-service-stopasync",
+      "name": "BackgroundService / IHostedService host-managed shutdown",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "Microsoft.Extensions.Hosting",
+        "generic host"
+      ],
+      "idiom_name": "BackgroundService.ExecuteAsync + host StopAsync",
+      "implementation_notes": "The generic host runs the protocol for you: BackgroundService.StopAsync cancels the stopping token and then awaits the ExecuteAsync task (returning when it completes or the shutdown timeout expires), so the two phases are framework-owned and the worker only has to observe the token, finish safely and return. The same shape appears in ASP.NET Core's graceful host shutdown. Choose it for services that live in a host; write the token/await pair yourself when the participant is not a hosted service.",
+      "code_sketch": "sealed class Consumer : BackgroundService\n{\n    protected override async Task ExecuteAsync(CancellationToken stoppingToken)\n    {\n        while (!stoppingToken.IsCancellationRequested)\n            await HandleNextAsync(stoppingToken);   // safe point\n\n        await FlushAndReleaseAsync();               // phase 2 cleanup\n    }\n}\n// Host: StopAsync() cancels the token, then awaits ExecuteAsync\n// until the configured shutdown timeout expires.",
+      "pitfalls": [
+        "StopAsync's own cancellation token is the shutdown deadline, not the worker's stop signal: mixing the two either cancels cleanup early or lets a stuck worker run past the host's grace period.",
+        "ExecuteAsync must actually return when the stopping token fires - the host blocks in StopAsync waiting for it, so a loop that ignores the token turns a clean shutdown into the forced timeout path.",
+        "Long blocking startup work inside ExecuteAsync delays host start-up (the host waits for the first await), which is unrelated to termination but commonly confused with a hanging shutdown."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/aspnet/core/fundamentals/host/hosted-services",
+        "https://source.dot.net/Microsoft.Extensions.Hosting.Abstractions/BackgroundService.cs.html"
+      ]
+    }
+  ],
+  "default_variant": "cancellation-token-await",
+  "idiom_name": "CancellationTokenSource.Cancel() + await worker task",
+  "implementation_notes": ".NET ships the two phases as a cooperative model: CancellationTokenSource.Cancel() is phase 1 (it sets IsCancellationRequested, runs registered callbacks and signals the token's WaitHandle), and awaiting the worker's Task is phase 2 - the documentation is explicit that tasks are not abandoned after cancellation is requested, the caller awaits them to completion. Cleanup belongs after the cancellation check inside the task (or in a finally/await using block). The classic manual structure is still justified for legacy thread-based code that has no Task to await, where a ManualResetEventSlim plus Thread.Join takes the place of the token and the await.",
+  "code_sketch": "sealed class Worker\n{\n    readonly CancellationTokenSource _cts = new();\n    Task? _run;\n\n    public void Start() => _run = Task.Run(() => LoopAsync(_cts.Token));\n\n    public async Task StopAsync()          // phase 1 + phase 2\n    {\n        _cts.Cancel();\n        if (_run is not null) await _run;  // cleanup has finished here\n        _cts.Dispose();\n    }\n\n    async Task LoopAsync(CancellationToken ct)\n    {\n        while (!ct.IsCancellationRequested) await HandleNextAsync(ct);\n        await FlushAndReleaseAsync();      // cleanup on the worker's path\n    }\n}",
+  "pitfalls": [
+    "A token is only a request: code that never observes IsCancellationRequested, does not pass the token to inner calls and registers no callback keeps running after Cancel().",
+    "Cancel() does not wait: only awaiting the worker task (or a WaitHandle/Join with a timeout) makes the second phase observable, and a caller that fires and forgets can dispose resources still in use.",
+    "Registered callbacks run synchronously on the thread calling Cancel(); a blocking or throwing callback delays or breaks the shutdown path, and CancellationTokenSource.Dispose() must not race with other users of the source.",
+    "Thread.Abort/Thread.Interrupt are not a substitute: Thread.Abort is unsupported on .NET Core/.NET 5+ and can leave locks held, so thread-based legacy workers must be made to poll a flag with a wake-up signal."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-in-managed-threads",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.cancellationtokensource"
+  ]
+}

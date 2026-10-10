@@ -1,0 +1,59 @@
+{
+  "pattern": "load-leveller",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::deque + std::mutex + std::condition_variable (predicated wait)",
+  "implementation_notes": "The standard library supplies the parts but not the whole: std::queue/std::deque are neither thread-safe nor bounded, so the classic bounded blocking queue is hand-written from a container, a std::mutex and two std::condition_variable instances, with predicated wait overloads that re-check the condition (cppreference documents the required lock/modify/notify sequence and the spurious-wakeup rule). Worker threads call pop() and block while empty; producers call push() and block while full. Prefer std::jthread (C++20) for workers so stop_token and joining are automatic, and keep the critical section short because every producer and consumer serializes on it.",
+  "code_sketch": "template <class T, std::size_t N> class BoundedQueue {\n  std::deque<T> q_; std::mutex m_; std::condition_variable notEmpty_, notFull_;\npublic:\n  void push(T v) {\n    std::unique_lock lk(m_);\n    notFull_.wait(lk, [&]{ return q_.size() < N; });   // the bound\n    q_.push_back(std::move(v)); notEmpty_.notify_one(); }\n  T pop() {\n    std::unique_lock lk(m_);\n    notEmpty_.wait(lk, [&]{ return !q_.empty(); });    // waits while empty\n    T v = std::move(q_.front()); q_.pop_front(); notFull_.notify_one(); return v; }\n};",
+  "pitfalls": [
+    "wait without a predicate converts spurious wakeups into overruns or lost notifications; always use the predicated overload.",
+    "Notifying after releasing the lock is a common micro-optimization, but notifying before unlocking is required if the waiter might already be gone - pick one policy and apply it consistently.",
+    "A single mutex serializes all producers and consumers; at high message rates the queue becomes the bottleneck, which is when a semaphore- or lock-free design is justified.",
+    "Workers blocked forever in pop() never exit: the shutdown path needs a stop flag plus notify_all or a poison value."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable"
+  ],
+  "variants": [
+    {
+      "variant_id": "mutex-condvar-queue",
+      "name": "std::deque guarded by std::mutex and std::condition_variable",
+      "paradigm": "concurrent",
+      "implementation_notes": "The standard library supplies the parts but not the whole: std::queue/std::deque are neither thread-safe nor bounded, so the classic bounded blocking queue is hand-written from a container, a std::mutex and two std::condition_variable instances, with predicated wait overloads that re-check the condition (cppreference documents the required lock/modify/notify sequence and the spurious-wakeup rule). Worker threads call pop() and block while empty; producers call push() and block while full. Prefer std::jthread (C++20) for workers so stop_token and joining are automatic, and keep the critical section short because every producer and consumer serializes on it.",
+      "min_standard": "C++11",
+      "idiom_name": "std::deque + std::mutex + std::condition_variable (predicated wait)",
+      "code_sketch": "template <class T, std::size_t N> class BoundedQueue {\n  std::deque<T> q_; std::mutex m_; std::condition_variable notEmpty_, notFull_;\npublic:\n  void push(T v) {\n    std::unique_lock lk(m_);\n    notFull_.wait(lk, [&]{ return q_.size() < N; });   // the bound\n    q_.push_back(std::move(v)); notEmpty_.notify_one(); }\n  T pop() {\n    std::unique_lock lk(m_);\n    notEmpty_.wait(lk, [&]{ return !q_.empty(); });    // waits while empty\n    T v = std::move(q_.front()); q_.pop_front(); notFull_.notify_one(); return v; }\n};",
+      "pitfalls": [
+        "wait without a predicate converts spurious wakeups into overruns or lost notifications; always use the predicated overload.",
+        "Notifying after releasing the lock is a common micro-optimization, but notifying before unlocking is required if the waiter might already be gone - pick one policy and apply it consistently.",
+        "A single mutex serializes all producers and consumers; at high message rates the queue becomes the bottleneck, which is when a semaphore- or lock-free design is justified.",
+        "Workers blocked forever in pop() never exit: the shutdown path needs a stop flag plus notify_all or a poison value."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "semaphore-ring-buffer",
+      "name": "std::counting_semaphore slot/item pair over a ring buffer",
+      "paradigm": "concurrent",
+      "implementation_notes": "C++20 provides std::counting_semaphore, which cppreference describes as an alternative to std::condition_variable, often with better performance. Two counters model the bounded queue directly: slots{N} acquired by producers before writing and released by consumers after reading, and items{0} acquired by consumers before reading and released by producers after writing. With one producer and one consumer the cursor indices need no extra lock, so the hot path is two semaphore operations instead of a mutex plus notification. Multi-producer or multi-consumer use requires atomic cursors or a CAS discipline, and try_acquire can fail spuriously, so it must be retried.",
+      "min_standard": "C++20",
+      "requires_features": [
+        "semaphores"
+      ],
+      "idiom_name": "std::counting_semaphore<N> slots/items over a ring buffer",
+      "code_sketch": "template <class T, std::size_t N> class Ring {\n  std::array<T, N> buf_; std::size_t r_ = 0, w_ = 0;\n  std::counting_semaphore<N> slots_{N}, items_{0};\npublic:\n  void push(T v) { slots_.acquire(); buf_[w_++ % N] = std::move(v); items_.release(); }\n  T pop() { items_.acquire(); T v = std::move(buf_[r_++ % N]); slots_.release(); return v; }\n};   // single-producer/single-consumer: cursors need no lock",
+      "pitfalls": [
+        "The ring is only lock-free for one producer and one consumer; sharing it with several threads requires atomic cursors or an external CAS, otherwise items are overwritten.",
+        "std::counting_semaphore::try_acquire may spuriously fail, so a try-based shed path must loop or fall back to acquire.",
+        "Releasing the wrong counter (or releasing before the item is published) breaks the bound silently: the semaphore protocol is the correctness argument."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/counting_semaphore"
+      ]
+    }
+  ],
+  "default_variant": "mutex-condvar-queue",
+  "version": "1.0"
+}

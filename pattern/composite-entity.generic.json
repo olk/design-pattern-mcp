@@ -1,0 +1,26 @@
+{
+  "pattern": "composite-entity",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "one coarse-grained owner for the cluster, persisted by a single unit of work",
+  "implementation_notes": "Give the cluster exactly one coarse-grained object that owns the dependents and is the only entry point; let each dependent carry its own mapping knowledge instead of leaking it into clients. Load the graph through the root, mutate dependents only through root-level operations, and flush everything inside one transaction or unit of work, with the add/remove lifecycle of dependents expressed in the relationship so that removal deletes the orphan. Behind the relationship, declare the foreign key with ON DELETE CASCADE (or an equivalent) so a partially persisted graph cannot survive a crash, and hand clients a coarse-grained transfer object rather than the live cluster.",
+  "code_sketch": "root = new CompositeEntity(id)\nroot.load()                       # dependents materialised as one unit\nroot.removeDependent(x)           # lifecycle owned by the root\nunit_of_work.begin()\nmapper.save(root)                 # root + dependents, one transaction\nunit_of_work.commit()             # nothing partial survives\n# clients: coarse_grained = root.toTransferObject()",
+  "pitfalls": [
+    "Splitting the save across several transactions: the pattern's guarantee is the single unit of work, not the object shape.",
+    "Exposing the dependents (getters returning live children) lets callers save them individually and recreate the desynchronised graph the composite was meant to prevent.",
+    "Forgetting the dependent-removal rule (orphanRemoval / delete-orphan / cascade delete): rows stay in the store while the domain object believes they are gone.",
+    "Optimistic concurrency explosion: applying @Version or rowversion to the root causes conflicts when concurrent transactions modify different, unrelated dependents — the whole cluster is treated as one conflict unit.",
+    "N+1 in reverse: eager-loading the composite in one query cascades the join across all dependents, materialising the entire graph when only one dependent is needed.",
+    "Broken invariant at the cluster boundary: allowing callers to mutate dependent fields without going through the root's operation means consistency rules enforced only at the root are silently bypassed.",
+    "Cascade wildcard abuse: cascade=ALL persists any object that happens to be attached to the relationship at flush time, including objects the caller never intended to save.",
+    "Serialized LOB bloat: serialising a large or unbounded dependent graph into a single BLOB column defeats the purpose of the composite and creates garbage-collection and indexing problems.",
+    "Domain event handler outside the transaction boundary: firing events from within a dependent's setter rather than from the root's post-commit hook means subscribers see stale or rolled-back state.",
+    "Test fixture graph sharing: reusing the same in-memory composite instance across multiple test cases without deep-cloning causes non-deterministic test ordering and cross-test state leakage.",
+    "Aggregate divorce: the domain model declares one aggregate boundary but the persistence layer (or a developer bypass) splits the graph across multiple Unit-of-Work commits, violating the transactional invariant.",
+    "Wrong move: fold entities into the composite just because they are related; failure: a god aggregate with unbounded collections causes lock contention, long transactions and write amplification on every unrelated edit; instead: shrink the boundary to the invariant that must hold in one transaction and reference other clusters by id with eventual consistency.",
+    "Wrong move: update two composites inside one SaveChanges/Unit-of-Work commit; failure: the commit boundary silently spans clusters, so a rolled-back second aggregate reverts the first one's accepted invariants; instead: commit one composite per transaction and coordinate the rest with domain events.",
+    "Wrong move: navigate dependent collections solely through eagerly loaded navigation properties (Customer -> Orders -> OrderLines chains); failure: loading one root materialises an ever-growing graph and the composite degenerates into distributed-chatty object fetches; instead: keep references to other composites as ids and load them through their own root."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

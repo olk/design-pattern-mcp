@@ -1,0 +1,59 @@
+{
+  "pattern": "retry",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "RetryLayer::new(Policy) around a Service, with clone_request for replay",
+  "implementation_notes": "In async Rust the retry policy is middleware around a Service: implement tower::retry::Policy<Req, Res, E> (retry() decides from the result whether to try again and clone_request() says how the request is reproduced) and wrap the service with RetryLayer - the layer owns the attempt loop, so callers keep using the service normally and the policy composes with timeout, rate-limit and load-shed layers from the same crate. tower also ships a backoff module for delay strategies and a budget module that caps how many retries a fleet performs over time, which is the sanctioned answer to retry storms. The trade-off is structural: the request type must be clonable or reconstructible and the operation must be expressed as a Service, which is natural in tonic or hyper stacks and heavy for a one-off call.",
+  "code_sketch": "impl<E> Policy<Request, Response, E> for Attempts {\n    type Future = future::Ready<()>;\n    fn retry(&mut self, _req: &mut Request, result: &mut Result<Response, E>) -> Option<Self::Future> {\n        match result { Ok(_) => None, Err(_) if self.0 > 0 => { self.0 -= 1; Some(future::ready(())) }, Err(_) => None }\n    }\n    fn clone_request(&mut self, req: &Request) -> Option<Request> { Some(req.clone()) }\n}\nlet svc = ServiceBuilder::new().layer(RetryLayer::new(Attempts(3))).service(client);",
+  "pitfalls": [
+    "clone_request returns Option: a policy that cannot reproduce the request (a consumed body, a non-clonable type) silently stops retrying, so the request type must be designed for replay.",
+    "Policy::retry is called with the inner call's result and must not block: sleeping belongs in the returned future, not inside retry().",
+    "Layer order decides semantics: a retry layer outside a load-shedding or timeout layer multiplies attempts through the whole stack.",
+    "No retry budget is implied: without tower::retry::budget or a backoff strategy, N clients retrying in lockstep can still hammer a recovering dependency."
+  ],
+  "sources": [
+    "https://docs.rs/tower/latest/tower/retry/index.html",
+    "https://docs.rs/tower/latest/tower/retry/trait.Policy.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tower-retry-middleware",
+      "name": "tower::retry RetryLayer with a Policy implementation",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "RetryLayer::new(Policy) around a Service, with clone_request for replay",
+      "implementation_notes": "In async Rust the retry policy is middleware around a Service: implement tower::retry::Policy<Req, Res, E> (retry() decides from the result whether to try again and clone_request() says how the request is reproduced) and wrap the service with RetryLayer - the layer owns the attempt loop, so callers keep using the service normally and the policy composes with timeout, rate-limit and load-shed layers from the same crate. tower also ships a backoff module for delay strategies and a budget module that caps how many retries a fleet performs over time, which is the sanctioned answer to retry storms. The trade-off is structural: the request type must be clonable or reconstructible and the operation must be expressed as a Service, which is natural in tonic or hyper stacks and heavy for a one-off call.",
+      "code_sketch": "impl<E> Policy<Request, Response, E> for Attempts {\n    type Future = future::Ready<()>;\n    fn retry(&mut self, _req: &mut Request, result: &mut Result<Response, E>) -> Option<Self::Future> {\n        match result { Ok(_) => None, Err(_) if self.0 > 0 => { self.0 -= 1; Some(future::ready(())) }, Err(_) => None }\n    }\n    fn clone_request(&mut self, req: &Request) -> Option<Request> { Some(req.clone()) }\n}\nlet svc = ServiceBuilder::new().layer(RetryLayer::new(Attempts(3))).service(client);",
+      "pitfalls": [
+        "clone_request returns Option: a policy that cannot reproduce the request (a consumed body, a non-clonable type) silently stops retrying, so the request type must be designed for replay.",
+        "Policy::retry is called with the inner call's result and must not block: sleeping belongs in the returned future, not inside retry().",
+        "Layer order decides semantics: a retry layer outside a load-shedding or timeout layer multiplies attempts through the whole stack.",
+        "No retry budget is implied: without tower::retry::budget or a backoff strategy, N clients retrying in lockstep can still hammer a recovering dependency."
+      ],
+      "sources": [
+        "https://docs.rs/tower/latest/tower/retry/index.html",
+        "https://docs.rs/tower/latest/tower/retry/trait.Policy.html"
+      ]
+    },
+    {
+      "variant_id": "backon-builder",
+      "name": "backon Retryable combinator with ExponentialBuilder and a Sleeper",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "idiom_name": "fetch.retry(ExponentialBuilder::default()).when(...).notify(...).await",
+      "implementation_notes": "backon adds retry to any function returning a Result: fetch.retry(ExponentialBuilder::default()).sleep(tokio::time::sleep).when(|e| ...).notify(|err, dur| ...).await - the Retryable and BlockingRetryable traits build a Retry combinator over the future (or the blocking call), the BackoffBuilder decides the delay (ConstantBuilder, ExponentialBuilder, FibonacciBuilder, all supporting jitter) and the Sleeper decides how the wait happens (tokio, futures-timer, embassy for no_std, or std::thread::sleep). Because the policy is a value built at the call site, this is the natural form outside a Service stack - scripts, CLI tools, background workers - and the blocking variant covers synchronous code with the same policy vocabulary. It replaces the hand-written loop with a combinator, at the cost of a trait-based call chain that has to be read as a pipeline.",
+      "code_sketch": "let content = fetch\n    .retry(ExponentialBuilder::default().with_jitter())\n    .when(|e| matches!(e, Error::Transient(_)))     // classify\n    .notify(|err, dur| tracing::warn!(?err, ?dur, \"retrying\"))\n    .await?;",
+      "pitfalls": [
+        "A Sleeper must be chosen: with no sleeper feature enabled and no custom implementation the crate fails to compile with the 'PleaseEnableAFeatureOrProvideACustomSleeper' error.",
+        "Closures that capture mutable state cannot be retried directly (the FnMut borrow escapes the async block); RetryableWithContext exists to pass ownership through the attempts.",
+        "when() inspects only the error value, so classification needs an error type that carries the reason - a boxed dyn Error makes the predicate stringly-typed.",
+        "Each attempt re-runs the whole future, so work performed before the failure is repeated and the operation must be idempotent."
+      ],
+      "sources": [
+        "https://docs.rs/backon/latest/backon/"
+      ]
+    }
+  ],
+  "default_variant": "tower-retry-middleware"
+}

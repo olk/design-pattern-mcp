@@ -1,0 +1,59 @@
+{
+  "pattern": "deadline-propagation",
+  "language": "cplusplus",
+  "support": "library",
+  "implementation_notes": "C++20 replaces the classic hand-rolled arrangement (an atomic cancel flag plus a condition-variable notification) with two stdlib pieces: std::chrono::steady_clock::time_point as the monotonic deadline value and std::stop_token/stop_source as the cooperative cancellation handle. The coupling point is the interruptible wait - condition_variable_any::wait_until(lock, stoken, abs_time, pred) registers for the stop request and the deadline at once, so a cancelled or expired request wakes even without a notification. Forward the same time_point plus a stop_token across call boundaries (bridge the parent signal with a stop_callback into a child stop_source) and never compute a fresh full timeout per hop. Sibling variant: when the hop's transport is already gRPC, prefer the runtime-provided deadline propagation on ClientContext instead of hand-wiring the tokens.",
+  "idiom_name": "std::chrono::steady_clock deadline + std::stop_token / stop_source",
+  "code_sketch": "struct Ctx { std::chrono::steady_clock::time_point deadline; std::stop_token stop; };\n\nlong remaining_ms(const Ctx& c) {\n  return std::chrono::duration_cast<std::chrono::milliseconds>(\n      c.deadline - std::chrono::steady_clock::now()).count();\n}\n// hop: forward the same deadline, never a fresh timeout\nif (remaining_ms(ctx) <= 0) throw DeadlineExceeded{};\nstd::unique_lock lk(m);\ncv.wait_until(lk, ctx.stop, ctx.deadline, [] { return ready; });  // C++20",
+  "pitfalls": [
+    "std::stop_token only interrupts waits that accept it (condition_variable_any::wait_until, jthread, the std::execution library); a plain std::future::get() or blocking socket read ignores it and still needs the remaining time as its own timeout.",
+    "The wait_until overload converts abs_time internally and implementations fall back to system-clock-based pthread_cond_timedwait, so a system clock adjustment can produce a spurious timeout even when steady_clock was passed.",
+    "A stop_source must outlive the tokens taken from it; keeping only a stop_token in a long-lived continuation after the source dies leaves a token that can never be stopped.",
+    "Requesting stop on the parent does not stop child sources automatically: create a child stop_source per hop and bridge it with std::stop_callback, or cancellation dies at the boundary."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/stop_token",
+    "https://en.cppreference.com/w/cpp/thread/condition_variable_any/wait_until"
+  ],
+  "variants": [
+    {
+      "variant_id": "cxx20-stop-token-steady-clock",
+      "name": "steady_clock deadline + std::stop_token with interruptible waits (C++20)",
+      "paradigm": "concurrent",
+      "implementation_notes": "C++20 replaces the classic hand-rolled arrangement (an atomic cancel flag plus a condition-variable notification) with two stdlib pieces: std::chrono::steady_clock::time_point as the monotonic deadline value and std::stop_token/stop_source as the cooperative cancellation handle. The coupling point is the interruptible wait - condition_variable_any::wait_until(lock, stoken, abs_time, pred) registers for the stop request and the deadline at once, so a cancelled or expired request wakes even without a notification. Forward the same time_point plus a stop_token across call boundaries (bridge the parent signal with a stop_callback into a child stop_source) and never compute a fresh full timeout per hop. Sibling variant: when the hop's transport is already gRPC, prefer the runtime-provided deadline propagation on ClientContext instead of hand-wiring the tokens.",
+      "min_standard": "C++20",
+      "idiom_name": "std::chrono::steady_clock deadline + std::stop_token / stop_source",
+      "code_sketch": "struct Ctx { std::chrono::steady_clock::time_point deadline; std::stop_token stop; };\n\nlong remaining_ms(const Ctx& c) {\n  return std::chrono::duration_cast<std::chrono::milliseconds>(\n      c.deadline - std::chrono::steady_clock::now()).count();\n}\n// hop: forward the same deadline, never a fresh timeout\nif (remaining_ms(ctx) <= 0) throw DeadlineExceeded{};\nstd::unique_lock lk(m);\ncv.wait_until(lk, ctx.stop, ctx.deadline, [] { return ready; });  // C++20",
+      "pitfalls": [
+        "std::stop_token only interrupts waits that accept it (condition_variable_any::wait_until, jthread, the std::execution library); a plain std::future::get() or blocking socket read ignores it and still needs the remaining time as its own timeout.",
+        "The wait_until overload converts abs_time internally and implementations fall back to system-clock-based pthread_cond_timedwait, so a system clock adjustment can produce a spurious timeout even when steady_clock was passed.",
+        "A stop_source must outlive the tokens taken from it; keeping only a stop_token in a long-lived continuation after the source dies leaves a token that can never be stopped.",
+        "Requesting stop on the parent does not stop child sources automatically: create a child stop_source per hop and bridge it with std::stop_callback, or cancellation dies at the boundary."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/stop_token",
+        "https://en.cppreference.com/w/cpp/thread/condition_variable_any/wait_until"
+      ]
+    },
+    {
+      "variant_id": "grpc-cxx-from-server-context",
+      "name": "gRPC C++ deadline propagation via ClientContext::FromServerContext",
+      "paradigm": "oo",
+      "implementation_notes": "When the hop's transport is gRPC, its runtime already carries deadlines: the client sets one on grpc::ClientContext (set_deadline), the server receives the incoming call's budget, and grpc::ClientContext::FromServerContext(server_ctx, PropagationOptions) forks a client context from the incoming server call so its deadline and cancellation follow - the gRPC deadlines guide notes that C++ requires this explicit enablement where Java and Go propagate by default. Use set_deadline for hand-rolled call sites and TryCancel() to signal a local give-up back into the call. Bounds and the remaining-time conversion stay inside the runtime, which is why this variant wins whenever the stack is already gRPC.",
+      "idiom_name": "grpc::ClientContext::FromServerContext + set_deadline / TryCancel",
+      "code_sketch": "grpc::Status GetUser(grpc::ServerContext* sc, const GetReq* req, GetResp* resp) {\n  // child client context inherits the incoming call's deadline + cancellation\n  auto cc = grpc::ClientContext::FromServerContext(*sc);\n  auto status = user_stub_->Get(cc.get(), *req, resp);\n  return status;   // runtime enforces expiry; TryCancel() for a local give-up\n}",
+      "pitfalls": [
+        "C++ does not enable automatic propagation by default (the gRPC guide names C++ explicitly): without FromServerContext() or set_deadline each outgoing call starts with no deadline and the chain degrades into fresh timeouts.",
+        "A ClientContext must not be reused across RPCs and must stay alive and valid for the lifetime of the call; storing or sharing a FromServerContext result beyond the handler is a lifetime bug.",
+        "Server-side cancellation is only visible to code that checks it or passes it down: the runtime aborts the call, not the application's work.",
+        "Hand-written interceptors must subtract elapsed time before setting a deadline on the outgoing call rather than copying the incoming instant blindly."
+      ],
+      "sources": [
+        "https://grpc.github.io/grpc/cpp/classgrpc_1_1_client_context.html",
+        "https://github.com/grpc/grpc/tree/master/examples/cpp/deadline"
+      ]
+    }
+  ],
+  "default_variant": "cxx20-stop-token-steady-clock",
+  "version": "1.0"
+}

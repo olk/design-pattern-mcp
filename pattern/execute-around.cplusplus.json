@@ -1,0 +1,73 @@
+{
+  "pattern": "execute-around",
+  "language": "cplusplus",
+  "support": "native",
+  "idiom_name": "std::lock_guard / std::scoped_lock / std::unique_ptr<T, D> bracket",
+  "implementation_notes": "The pattern is absorbed into the language: the guard's constructor is the setup, its destructor is the teardown, and the body is the ordinary scope in between, so no wrapper method is needed and an exception, early return or break cannot skip the after-code. std::lock_guard and std::scoped_lock (C++17) wrap mutex ownership, std::unique_ptr<T, D> wraps arbitrary close or free functions through a custom deleter, and std::jthread applies the same shape to joining a thread. Reach for the body-as-argument form only when several calls belong to the protocol (begin/commit/rollback) or when the resource must stay hidden from the body, because a bare guard deliberately hands the resource to the surrounding code.",
+  "code_sketch": "void publish(Item item) {\n    const std::lock_guard<std::mutex> lock(mutex_);   // setup\n    mutate_index(item);                               // body: ordinary scope\n}                                                     // teardown: unlock, also on exception\n\nauto file = std::unique_ptr<FILE, int (*)(FILE *)>(fopen(path, \"r\"), &fclose);\nif (file) read_all(*file);       // fclose runs on every exit path, including early return",
+  "pitfalls": [
+    "A guard that is not given a name - std::lock_guard{mtx}; or std::lock_guard(mtx); - is destroyed immediately and locks nothing for the rest of the scope; always bind it to a variable.",
+    "A destructor must not throw while another exception is unwinding: a teardown that reports flush or close failures by throwing terminates the program, so such errors must be handled or recorded outside the destructor.",
+    "Guard scope is the brace block, not the statement you care about: declaring the guard too early or in an outer scope holds the resource far longer than intended."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/lock_guard"
+  ],
+  "variants": [
+    {
+      "variant_id": "raii-guard",
+      "name": "RAII guard object (lock_guard, unique_ptr with custom deleter)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::lock_guard / std::scoped_lock / std::unique_ptr<T, D> bracket",
+      "implementation_notes": "The pattern is absorbed into the language: the guard's constructor is the setup, its destructor is the teardown, and the body is the ordinary scope in between, so no wrapper method is needed and an exception, early return or break cannot skip the after-code. std::lock_guard and std::scoped_lock (C++17) wrap mutex ownership, std::unique_ptr<T, D> wraps arbitrary close or free functions through a custom deleter, and std::jthread applies the same shape to joining a thread. Reach for the body-as-argument form only when several calls belong to the protocol (begin/commit/rollback) or when the resource must stay hidden from the body, because a bare guard deliberately hands the resource to the surrounding code.",
+      "code_sketch": "void publish(Item item) {\n    const std::lock_guard<std::mutex> lock(mutex_);   // setup\n    mutate_index(item);                               // body: ordinary scope\n}                                                     // teardown: unlock, also on exception\n\nauto file = std::unique_ptr<FILE, int (*)(FILE *)>(fopen(path, \"r\"), &fclose);\nif (file) read_all(*file);       // fclose runs on every exit path, including early return",
+      "pitfalls": [
+        "A guard that is not given a name - std::lock_guard{mtx}; or std::lock_guard(mtx); - is destroyed immediately and locks nothing for the rest of the scope; always bind it to a variable.",
+        "A destructor must not throw while another exception is unwinding: a teardown that reports flush or close failures by throwing terminates the program, so such errors must be handled or recorded outside the destructor.",
+        "Guard scope is the brace block, not the statement you care about: declaring the guard too early or in an outer scope holds the resource far longer than intended."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/lock_guard"
+      ]
+    },
+    {
+      "variant_id": "callback-wrapper",
+      "name": "template wrapper taking the body as a callable (lambda form)",
+      "paradigm": "functional",
+      "min_standard": "C++17",
+      "idiom_name": "template<class F> auto with_resource(args, F&& body) with std::invoke",
+      "implementation_notes": "The direct form of the pattern in modern C++: a function template takes the body as a callable, does setup, calls std::invoke(std::forward<F>(body), handle), then commits or rolls back, and returns the body's result through decltype or auto. Use it when the protocol is more than the lifetime of one object - transactions, retries, metrics brackets - or when the resource must not leak out to the body, which an RAII guard cannot prevent. Keep the wrapper a template so the callable is inlined and no std::function allocation is imposed, and prefer a named RAII type when the same cleanup is reused.",
+      "code_sketch": "template <class F>\nauto in_transaction(Db& db, F&& body) -> decltype(std::forward<F>(body)()) {\n    db.begin();                                            // setup\n    try {\n        auto result = std::invoke(std::forward<F>(body));  // body\n        db.commit();                                       // teardown: success\n        return result;\n    } catch (...) {\n        db.rollback();                                     // teardown: failure\n        throw;\n    }\n}",
+      "pitfalls": [
+        "Storing the callable beyond the call (in the wrapper object, a thread or a callback list) dangles every reference it captured; the wrapper must invoke the body before returning.",
+        "A teardown that throws while the body's exception is propagating must be planned: a second exception escaping commit/rollback during unwinding terminates the process.",
+        "The resource must be passed by reference or pointer, never copied into the body, or the teardown closes a different object than the one the body used."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/functional/invoke",
+        "https://en.cppreference.com/w/cpp/thread/lock_guard"
+      ]
+    },
+    {
+      "variant_id": "scope-guard",
+      "name": "scope-exit guard library (Boost.Scope / BOOST_SCOPE_EXIT)",
+      "paradigm": "declarative",
+      "min_standard": "C++17",
+      "idiom_name": "boost::scope::scope_exit / make_scope_exit, BOOST_SCOPE_EXIT macro",
+      "implementation_notes": "Register the teardown as a lambda immediately after the setup, at the same level as the body; the guard object runs it when the scope exits, including during unwinding, and set_active(false) disarms it on the success path. This is the pattern in its body-as-scope form for one-off cleanups where writing a class is not worth it (rollback a provisional change, restore a flag, delete a partial file), and it also allows condition-dependent variants (scope_success, scope_fail). Boost.Scope provides it in the style of the C++ Library Fundamentals TS; the older Boost.ScopeExit library offers the same guarantee through macros and is portable as far back as C++03. Prefer it for one-off cleanup, and write a named RAII type when the cleanup is reusable or owns state that deserves a name.",
+      "code_sketch": "bool committed = false;\nauto rollback = boost::scope::make_scope_exit([&] {   // teardown registered next to setup\n    if (!committed) cache_.erase(key);\n});\ncache_.put(key, value);                                // body\ncommitted = true;                                      // disarm on the success path",
+      "pitfalls": [
+        "The action runs during unwinding, so it must not throw: a throwing scope-exit body inside an active exception can terminate the program.",
+        "The macros of Boost.ScopeExit need their own terminator (BOOST_SCOPE_EXIT_END, and _TPL inside templates) and their capture syntax differs from lambdas; mixing the two styles produces confusing compile errors.",
+        "Guard objects are move-only and the action may run on a moved-from temporary; returning one from a factory or storing it in a container can fire the cleanup earlier than intended."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/libs/scope/doc/html/index.html",
+        "https://www.boost.org/doc/libs/latest/libs/scope_exit/doc/html/index.html"
+      ]
+    }
+  ],
+  "default_variant": "raii-guard",
+  "version": "1.0"
+}

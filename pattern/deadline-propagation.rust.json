@@ -1,0 +1,19 @@
+{
+  "pattern": "deadline-propagation",
+  "language": "rust",
+  "support": "library",
+  "implementation_notes": "std::time::Instant is monotonic but has no timer, so the async runtime supplies both halves: tokio::time::timeout_at(Instant, future) fails with Elapsed when a future outlives an absolute instant - the right shape for propagation, since the instant is computed once and passed down - and tokio_util::sync::CancellationToken is the cancellation carrier, with child_token() producing descendants that are cancelled when the parent is. A hop wraps each downstream future in timeout_at(deadline) and selects on token.cancelled() for the caller-driven path; the docs note that cancelling a timeout is done by dropping the future, with no additional cleanup. The classic thread-plus-channel shutdown dance is replaced by structured cancellation around the request.",
+  "idiom_name": "tokio::time::timeout_at(Instant) + tokio_util CancellationToken",
+  "code_sketch": "let deadline = tokio::time::Instant::now() + budget;   // once, at ingress\nlet token = CancellationToken::new();                // child_token() propagates\n\ntokio::select! {\n    _ = token.cancelled() => Err(DeadlineExceeded),  // caller gave up\n    r = tokio::time::timeout_at(deadline, call_downstream(req)) => {\n        r.map_err(|_| DeadlineExceeded)?\n    }\n}",
+  "pitfalls": [
+    "timeout_at requires a Tokio timer context: calling it outside a runtime (or with time disabled on the Builder) panics, so enable_time/enable_all and keep the call inside the runtime.",
+    "Dropping the future is the cancellation mechanism, but futures spawned with tokio::spawn keep running unless they hold their own token - keep the work structured (JoinSet/TaskTracker) or pass the token explicitly.",
+    "CancellationToken is clonable and child_token() propagates downward: a clone stored in a task that is never cancelled leaks work, so cancel the root at the request scope.",
+    "Blocking calls (std::fs, blocking database drivers) ignore the async deadline and hold the worker; move them to spawn_blocking with an explicit remaining-time timeout."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/time/fn.timeout_at.html",
+    "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,242 @@
+---
+# pipeline_control.fizz — pipeline control logic (fizzbee plan §3.6, phase F2).
+deadlock_detection: true
+options:
+  max_concurrent_actions: 2
+action_options:
+  "Pipeline.Start":
+    max_actions: 3             # model bound: at most 3 pipeline runs explored
+---
+
+# Element→code map (ledger: verify/fizz/README.md):
+#   role Pipeline             ↔ DesignPipeline.run_design (src/pipeline.py)
+#   role Llm                  ↔ LiteLLM transport (unreliable environment)
+#   (Stage D's weight extraction is one batched call over all decision
+#    parts, abstracted by this same LlmCall environment: the call count per
+#    stage is not modelled, and the stage/attempt order is unchanged.
+#    Since 2026-09-25: (a) Stage D overlaps Stage C via asyncio.gather —
+#    the join precedes the deterministic per-part selection loop, so the
+#    stage order and its per-stage call kinds are unchanged; (b) inside
+#    GENERATE, batches are dispatched bounded-concurrent
+#    (generation_max_concurrency) and concatenated in batch order — the
+#    phase still issues its batched generate calls before EVALUATE.)
+#   atomic action Start       ↔ design_job start (submit_design_design)
+#   atomic action Advance     ↔ stage boundary between ANALYZE/GENERATE/EVALUATE/REFINE
+#   oneof respond/fail        ↔ implicit fault injection: LLM call fails or times out
+#   fair action RetryTick     ↔ design_loop retry scheduling (fairness: progress)
+#   atomic action DeadlineExpire ↔ tasks.deadline_seconds expiry (ERR_014):
+#                              run_with_deadline cancels the in-flight pipeline
+#                              (src/tools/_execution.py), so the run ends there
+#
+# MAX_ATTEMPTS mirrors design_loop max_tries=3 (src/pipeline.py); STAGES
+# mirrors the ANALYZE -> GENERATE -> EVALUATE -> REFINE order (FR-214).
+#
+# Since 2026-10-01 DesignPipeline is a llama-index Workflow subclass; the
+# modelled stage/attempt order and the deadline path are unchanged — the
+# E12 loop back-edge now rides the SelectionReady event
+# (refine_step -> generate_step) instead of a Python loop, and the whole
+# run is bounded by the workflow timeout (deadline_seconds * 0.9) whose
+# WorkflowTimeoutError the public wrappers translate to TimeoutError
+# (then ERR_014 at the tool seam).
+
+MAX_ATTEMPTS = 3        # model bound == protocol limit (design_loop max_tries)
+STAGES = ["ANALYZE", "GENERATE", "EVALUATE", "REFINE"]
+TERMINAL_OUTCOMES = ["COMPLETED", "FAILED", "CANCELLED", "DEADLINE"]
+MAX_TICKS = 3           # model bound on the retry scheduler's idle ticks; the
+                        # bound keeps the non-terminal region cycle-free so
+                        # FP5's liveness check is sound — an unbounded fair
+                        # tick would self-loop with outcome == None (FG-17).
+
+role Pipeline:
+    action Init:
+        self.started = False
+        self.stage_idx = 0
+        self.attempts = 0
+        self.cancelled = False
+        self.outcome = None
+        self.ticks = 0
+        self.stage_at_cancel = 0   # FP2 witness: stage index when cancel was observed
+        self._order_violation = False   # ghost: set if a stage runs out of order
+        self.deadline = False   # FP8 witness: the whole-run deadline expired
+
+    atomic func Advance():
+        # stage order is structural here (single stage_idx counter); the ghost
+        # witness guards future decompositions of Advance into per-stage actions
+        # (J4-tripwire pattern: the require makes the boundary unreachable in
+        # the reference — found reachable on the first real fizz run, v0.5.3 —
+        # so FP3 fires only under mutation, e.g. FG-08 dropping this guard)
+        require self.stage_idx < len(STAGES)
+        if self.stage_idx >= len(STAGES):
+            self._order_violation = True
+            return
+        self.stage_idx = self.stage_idx + 1
+
+    atomic func FailAttempt():
+        # LLM failure burns an attempt; design_loop retries while attempts < MAX
+        # (the bound is in the guard, mirroring design_loop max_tries: without
+        # it attempts reaches MAX+1 before FailRun fires and P1 is genuinely
+        # violated — found on the first real fizz run, v0.5.3)
+        require self.attempts < MAX_ATTEMPTS
+        self.attempts = self.attempts + 1
+
+    atomic func Cancelled():
+        self.cancelled = True
+        self.stage_at_cancel = self.stage_idx
+
+    atomic func Finish():
+        require self.stage_idx == len(STAGES)
+        self.outcome = "COMPLETED"
+
+    atomic func FailRun():
+        require self.attempts >= MAX_ATTEMPTS
+        self.outcome = "FAILED"
+
+    atomic func CancelRun():
+        require self.cancelled
+        self.outcome = "CANCELLED"
+
+    atomic func DeadlineExpire():
+        # tasks.deadline_seconds expires while the run is live: the in-flight
+        # coroutine (including the provider call) is cancelled and the run ends
+        # with the DEADLINE terminal outcome (ERR_014). Bounded and one-shot —
+        # the witness and the terminal write are one atomic transition, which is
+        # what FG-35 removes.
+        require self.outcome == None
+        require not self.deadline
+        self.deadline = True
+        self.outcome = "DEADLINE"
+
+    atomic func Start():
+        require not self.started
+        self.started = True
+
+    atomic func Tick():
+        require self.outcome == None
+        require self.ticks < MAX_TICKS
+        self.ticks = self.ticks + 1
+
+    # Terminal-state relief valve (fizzbee MODELING_GUIDE NoOp idiom):
+    # enabled only once this run has a terminal outcome, so the bounded
+    # model's legitimate end states are not flagged as deadlocks while
+    # mid-run wedges still are. Non-fair (review-checklist §3.7).
+    action Idle:
+        require self.outcome != None
+        pass
+
+role Llm:
+    action Init:
+        pass
+
+atomic fair action LlmCall:
+    # the environment: a call responds, fails, or times out — oneof is the
+    # abstraction of the unreliable LLM environment (implicit fault injection).
+    # Fair: the design loop always schedules the next LLM call while the run
+    # is live (progress assumption, FC-liveness-assumption class) — load-
+    # bearing for FP5: the only other fair action (RetryTick) is bounded.
+    require any([p.outcome == None for p in pipelines])
+    oneof:
+        pipeline.Advance()
+        pipeline.FailAttempt()
+
+atomic fair action RetryTick:
+    # fairness: the design loop keeps scheduling retries — progress assumption,
+    # ledgered as FC-liveness-assumption in verify/fizz/README.md
+    # (`pass` body required: body-less actions do not register as
+    # schedulable transitions — found on the first real fizz run, v0.5.3).
+    # The tick is bounded (MAX_TICKS) so the non-terminal region stays
+    # cycle-free: an unbounded fair tick self-loops with outcome == None
+    # and violates FP5 (FG-17).
+    pipeline.Tick()
+
+atomic action UserCancel:
+    require any([p.outcome == None for p in pipelines])
+    pipeline.Cancelled()
+    pipeline.CancelRun()
+
+atomic action DeadlineTick:
+    # environment: the whole-run deadline expires. Non-fair — a run that settles
+    # inside tasks.deadline_seconds never reaches it (the 120 s provider-call
+    # timeout and the whole-run deadline are independent bounds).
+    require any([p.outcome == None for p in pipelines])
+    pipeline.DeadlineExpire()
+
+atomic fair action RunFinish:
+    # fair: the pipeline always eventually commits its terminal outcome
+    # once it is reachable (FP5 progress assumption, FC-liveness-assumption
+    # class; dropping the fairness lets a stutter-only behaviour keep
+    # outcome == None forever — see the FP5 garden row).
+    require any([p.outcome == None for p in pipelines])
+    oneof:
+        pipeline.Finish()
+        pipeline.FailRun()
+
+action Init:
+    pipeline = Pipeline()
+    pipeline.Start()
+    llm = Llm()
+    pipelines = [pipeline]
+
+# ---- assertions (ledger §3.4) ----
+
+always assertion P1_AttemptBound:
+    # P-1: the attempt loop is bounded — 1 <= attempts <= MAX_ATTEMPTS
+    return pipeline.attempts >= 0 and pipeline.attempts <= MAX_ATTEMPTS
+
+always assertion FP2_CancelStopsPipeline:
+    # FP-2: no stage advance after cancellation was observed — the ghost
+    # stage_at_cancel is the witness; in the reference UserCancel sets the
+    # flag and the terminal outcome atomically, so the conditional fires
+    # only under mutation (FG-07: a cancel that leaves the run alive).
+    if pipeline.cancelled and pipeline.outcome == None:
+        return pipeline.stage_idx <= pipeline.stage_at_cancel
+    return True
+
+always assertion FP3_StageOrder:
+    # FP-3: the stage index never exceeds the stage count (order witness)
+    return not pipeline._order_violation
+
+always assertion FP4_TotalOutcome:
+    # FP-4: every run ends in exactly one terminal outcome
+    return pipeline.outcome in TERMINAL_OUTCOMES or pipeline.outcome == None
+
+always assertion FP6_NoPrematureFailure:
+    # FP-6: a run only ends FAILED after exhausting its attempts — the
+    # bound is the only path to FAILED (FG-09: dropping the FailRun guard
+    # must violate).
+    if pipeline.outcome == "FAILED":
+        return pipeline.attempts >= MAX_ATTEMPTS
+    return True
+
+always assertion FP7_NoPrematureCompletion:
+    # FP-7: a run only ends COMPLETED after all stages ran — the stage
+    # count is the only path to COMPLETED (FG-10: dropping the Finish
+    # guard must violate).
+    if pipeline.outcome == "COMPLETED":
+        return pipeline.stage_idx >= len(STAGES)
+    return True
+
+always eventually assertion FP5_EventualOutcome:
+    # FP-5: every run eventually reaches a terminal outcome. The progress
+    # witnesses are the fair LlmCall/RunFinish actions and the bounded
+    # RetryTick (MAX_TICKS): the non-terminal region has no self-loops, so
+    # no infinite schedule can keep outcome == None. FG-17 (unbounded tick)
+    # must violate.
+    return pipeline.outcome != None
+
+always assertion FP8_DeadlineEndsRun:
+    # the whole-run deadline is terminal: once tasks.deadline_seconds expired the
+    # run has ended with DEADLINE (ERR_014) — it never stays alive, never finishes
+    # COMPLETED and never retries. FG-35 (drop the terminal write) must violate.
+    if pipeline.deadline:
+        return pipeline.outcome == "DEADLINE"
+    return True
+
+exists assertion FP8_Coverage:
+    # coverage witness: the deadline path is actually explored, so FP-8 is not
+    # vacuously true because the expiry action was never fireable.
+    return pipeline.deadline
+
+exists assertion FP5_Coverage:
+    # coverage witness: the checker did explore non-terminal states — FP-5
+    # is not vacuously true because the pipeline never leaves Init.
+    return pipeline.outcome == None

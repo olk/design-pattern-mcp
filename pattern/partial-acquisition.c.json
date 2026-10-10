@@ -1,0 +1,60 @@
+{
+  "pattern": "partial-acquisition",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "staged POSIX access: open plus pread for the cheap part, mmap window for the expensive part",
+  "implementation_notes": "C gives every stage its own primitive but no composition: open() returns a cheap descriptor for the whole resource, pread() reads the small self-describing part (header, index, table of contents) without disturbing a shared file offset, and the expensive part is mapped with mmap() so that the kernel supplies pages only as they are touched. The same shape covers code as a resource: dlopen(path, RTLD_LAZY) loads the shared object and resolves function symbols only when referencing code first executes, so an optional feature that is never called never pays for that part. Because C has neither destructors nor resource types, the plan and the reverse-order release (munmap before close, dlclose for the object) must be written at every call site or hidden behind a small staged struct with a matching release function; the classic hand-written form is therefore justified whenever the resource does not fit in memory or when the provider must not be touched beyond its first part.",
+  "code_sketch": "int fd = open(\"pack.bin\", O_RDONLY);              /* stage 1: cheap descriptor */\nstruct idx ix; pread(fd, &ix, sizeof ix, 0);      /* stage 1: header, unshared  */\nvoid *part = mmap(NULL, ix.len, PROT_READ, MAP_PRIVATE, fd, ix.off);\nif (part == MAP_FAILED) { close(fd); return -1; } /* stage 2: mapping created */\nconsume(part, ix.len);        /* pages faulted in only as they are touched */\nmunmap(part, ix.len); close(fd);                  /* staged release, reverse    */",
+  "pitfalls": [
+    "Short reads: read()/pread() may return fewer bytes than requested, so a stage that assumes a full transfer silently produces a truncated part; loop until the stage size is reached and treat a premature 0 as end-of-resource.",
+    "A mapping is not a snapshot: if the file is truncated or replaced while the window is mapped the access fault is SIGBUS rather than an errno, so partial mapping requires a provider guaranteed stable for the lifetime of the window.",
+    "Nothing releases for you: address space (munmap) and descriptor (close) are separate stages and both must run on every exit path, including the error path where the mapping succeeded but the caller gave up.",
+    "dlopen with RTLD_LAZY defers function-symbol resolution only - the manual notes that references to variables are always bound immediately - so a plugin relying on lazy binding of globals can still fail at load time."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/dlopen.3.html",
+    "https://man7.org/linux/man-pages/man2/mmap.2.html",
+    "https://man7.org/linux/man-pages/man2/open.2.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "fd-mmap-window",
+      "name": "Descriptor first, mmap window for the expensive part",
+      "paradigm": "procedural",
+      "min_standard": "C11",
+      "idiom_name": "staged POSIX access: open plus pread for the cheap part, mmap window for the expensive part",
+      "implementation_notes": "C gives every stage its own primitive but no composition: open() returns a cheap descriptor for the whole resource, pread() reads the small self-describing part (header, index, table of contents) without disturbing a shared file offset, and the expensive part is mapped with mmap() so that the kernel supplies pages only as they are touched. The same shape covers code as a resource: dlopen(path, RTLD_LAZY) loads the shared object and resolves function symbols only when referencing code first executes, so an optional feature that is never called never pays for that part. Because C has neither destructors nor resource types, the plan and the reverse-order release (munmap before close, dlclose for the object) must be written at every call site or hidden behind a small staged struct with a matching release function; the classic hand-written form is therefore justified whenever the resource does not fit in memory or when the provider must not be touched beyond its first part.",
+      "code_sketch": "int fd = open(\"pack.bin\", O_RDONLY);              /* stage 1: cheap descriptor */\nstruct idx ix; pread(fd, &ix, sizeof ix, 0);      /* stage 1: header, unshared  */\nvoid *part = mmap(NULL, ix.len, PROT_READ, MAP_PRIVATE, fd, ix.off);\nif (part == MAP_FAILED) { close(fd); return -1; } /* stage 2: mapping created */\nconsume(part, ix.len);        /* pages faulted in only as they are touched */\nmunmap(part, ix.len); close(fd);                  /* staged release, reverse    */",
+      "pitfalls": [
+        "Short reads: read()/pread() may return fewer bytes than requested, so a stage that assumes a full transfer silently produces a truncated part; loop until the stage size is reached and treat a premature 0 as end-of-resource.",
+        "A mapping is not a snapshot: if the file is truncated or replaced while the window is mapped the access fault is SIGBUS rather than an errno, so partial mapping requires a provider guaranteed stable for the lifetime of the window.",
+        "Nothing releases for you: address space (munmap) and descriptor (close) are separate stages and both must run on every exit path, including the error path where the mapping succeeded but the caller gave up.",
+        "dlopen with RTLD_LAZY defers function-symbol resolution only - the manual notes that references to variables are always bound immediately - so a plugin relying on lazy binding of globals can still fail at load time."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/dlopen.3.html",
+        "https://man7.org/linux/man-pages/man2/mmap.2.html",
+        "https://man7.org/linux/man-pages/man2/open.2.html"
+      ]
+    },
+    {
+      "variant_id": "dlopen-lazy-binding",
+      "name": "dlopen with RTLD_LAZY symbol binding",
+      "paradigm": "procedural",
+      "min_standard": "C11",
+      "idiom_name": "dlopen(path, RTLD_LAZY) plus dlsym per symbol",
+      "implementation_notes": "The stages are load and resolve: dlopen() returns a handle to the shared object while function symbols are resolved only as the code that references them executes, so a program can offer optional subsystems and pay for each only when it is used. dlsym() is the second stage per symbol; dlclose() (or RTLD_NODELETE when the object must stay mapped) releases the stage. Keep the resolved function pointers in a small struct filled on first use so the binding policy stays in one place; use RTLD_NOW instead when a missing symbol must be a load-time failure rather than a first-use one.",
+      "code_sketch": "void *h = dlopen(\"libpack.so\", RTLD_LAZY);   /* stage 1: load, symbols lazy */\nif (!h) return fail(dlerror());\n/* stage 2, per symbol, on first use: */\nstatic part_fn *part;\nif (!part) part = (part_fn *)dlsym(h, \"pack_part\");\nif (!part) { dlclose(h); return fail(dlerror()); }\nconsume(part(...));\ndlclose(h);                                  /* release the loaded object */",
+      "pitfalls": [
+        "RTLD_LAZY defers only function symbols; data symbols are bound when the object is loaded, so a plugin that reads globals at load time can still fail immediately.",
+        "Dangling function pointers: the resolved symbols become invalid once dlclose() drops the reference count, so the caller must not keep them beyond the handle lifetime.",
+        "RTLD_NODELETE and reference counts interact: reopening the same object returns the same handle (documented), so a stage that believes it loaded a private copy may share state with another component."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/dlopen.3.html"
+      ]
+    }
+  ],
+  "default_variant": "fd-mmap-window",
+  "version": "1.0"
+}

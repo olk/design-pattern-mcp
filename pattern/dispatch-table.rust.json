@@ -1,0 +1,85 @@
+{
+  "pattern": "dispatch-table",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "HashMap<Key, fn(..)> handler table",
+  "implementation_notes": "A Rust dispatch table is a collection of function pointers: `HashMap<Op, fn(&mut Vm, u8) -> Result<(), Trap>>` (or a slice/array when the key space is dense), filled with `table.insert(Op::Add, add)` and dispatched with `table.get(&op).ok_or(Trap::UnknownOpcode(op))?(&mut vm, arg)`. What replaces the classic structure is the built-in collections plus the `fn` pointer primitive: non-capturing functions coerce to `fn`, so no boxing or trait objects are needed, and the table participates in ownership like any other value. When handlers need captured state, use a table of `Box<dyn Fn(..)>` or of trait objects; when the opcode set is a closed enum, `match` is exhaustive and the compiler already emits a jump table, so the table earns its place only for open, sparse or runtime-registered key spaces.",
+  "code_sketch": "type Handler = fn(&mut Vm, u8) -> Result<(), Trap>;\n\nfn dispatch(vm: &mut Vm, table: &HashMap<u8, Handler>, op: u8, arg: u8) -> Result<(), Trap> {\n    let handler = table.get(&op).ok_or(Trap::UnknownOpcode(op))?;\n    handler(vm, arg)\n}\n// registration: table.insert(OP_ADD, add);",
+  "pitfalls": [
+    "Only non-capturing functions coerce to `fn`; a closure that captures anything needs `Box<dyn Fn(..)>`, which allocates and moves the table to the heap - the compiler error is clear, the fix is easy to misread.",
+    "Function pointers implement PartialEq but comparing them is unreliable (duplicated codegen units can make equal functions compare unequal), so never key or deduplicate registry entries by fn identity.",
+    "`HashMap` pays a hash and a bounds check per dispatch and cannot be const-evaluated; a dense `[fn(..); N]` array indexed by opcode stays in static memory and predicts better in hot loops.",
+    "A table of `Box<dyn Handler>` adds a vtable indirection per call and one allocation per entry, so trait objects are for dependency-carrying handlers, not for opcode dispatch."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/stable/std/primitive.fn.html",
+    "https://doc.rust-lang.org/book/ch06-02-match.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "fn-pointer-table",
+      "name": "HashMap<Key, fn(..)> handler table",
+      "paradigm": "procedural",
+      "min_standard": "Rust2015",
+      "requires_features": [
+        "fn pointer types",
+        "HashMap"
+      ],
+      "idiom_name": "HashMap<Key, fn(..)> handler table",
+      "implementation_notes": "A Rust dispatch table is a collection of function pointers: `HashMap<Op, fn(&mut Vm, u8) -> Result<(), Trap>>` (or a slice/array when the key space is dense), filled with `table.insert(Op::Add, add)` and dispatched with `table.get(&op).ok_or(Trap::UnknownOpcode(op))?(&mut vm, arg)`. What replaces the classic structure is the built-in collections plus the `fn` pointer primitive: non-capturing functions coerce to `fn`, so no boxing or trait objects are needed, and the table participates in ownership like any other value. When handlers need captured state, use a table of `Box<dyn Fn(..)>` or of trait objects; when the opcode set is a closed enum, `match` is exhaustive and the compiler already emits a jump table, so the table earns its place only for open, sparse or runtime-registered key spaces.",
+      "code_sketch": "type Handler = fn(&mut Vm, u8) -> Result<(), Trap>;\n\nfn dispatch(vm: &mut Vm, table: &HashMap<u8, Handler>, op: u8, arg: u8) -> Result<(), Trap> {\n    let handler = table.get(&op).ok_or(Trap::UnknownOpcode(op))?;\n    handler(vm, arg)\n}\n// registration: table.insert(OP_ADD, add);",
+      "pitfalls": [
+        "Only non-capturing functions coerce to `fn`; a closure that captures anything needs `Box<dyn Fn(..)>`, which allocates and moves the table to the heap - the compiler error is clear, the fix is easy to misread.",
+        "Function pointers implement PartialEq but comparing them is unreliable (duplicated codegen units can make equal functions compare unequal), so never key or deduplicate registry entries by fn identity.",
+        "`HashMap` pays a hash and a bounds check per dispatch and cannot be const-evaluated; a dense `[fn(..); N]` array indexed by opcode stays in static memory and predicts better in hot loops.",
+        "A table of `Box<dyn Handler>` adds a vtable indirection per call and one allocation per entry, so trait objects are for dependency-carrying handlers, not for opcode dispatch."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/stable/std/primitive.fn.html",
+        "https://doc.rust-lang.org/book/ch06-02-match.html"
+      ]
+    },
+    {
+      "variant_id": "opcode-array",
+      "name": "Dense array of fn pointers indexed by opcode",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2015",
+      "requires_features": [
+        "static arrays of fn pointers"
+      ],
+      "idiom_name": "static [fn(&mut Cpu, u16); N] indexed by opcode nibble",
+      "implementation_notes": "When the opcode space is a small dense integer range, the table is a static array rather than a map: each nibble/byte indexes a `fn` pointer directly (`self.table[(op >> 12) as usize](self, op)`), which is branch-free, allocation-free and cache-friendly, and secondary tables can handle the opcodes that share a prefix. What replaces the classic structure is the same fn-pointer primitive, only indexed rather than hashed - it is the Rust form of the interpreter jump table and it keeps everything in static memory, so there is no registry to initialise and nothing to synchronise. Use it for VM/emulator cores; use the map as soon as keys are sparse, textual or added at runtime.",
+      "code_sketch": "type Op = fn(&mut Chip8, u16);\nstatic TABLE: [Op; 0x10] = [op_err, op_jp, op_call, /* ... */ op_draw, op_err];\n\nfn cycle(&mut self, word: u16) {\n    (TABLE[((word & 0xF000) >> 12) as usize])(self, word);\n}",
+      "pitfalls": [
+        "Every slot must be filled, including the unused ones - an error handler has to occupy the holes, because there is no 'missing key' in an array.",
+        "The index is derived from untrusted input, so mask and bound it explicitly; a bad shift or an array indexed by a full word panics at runtime.",
+        "The signature is fixed for every opcode, so opcodes needing different state must smuggle it through the CPU struct instead of getting their own arguments."
+      ],
+      "sources": [
+        "https://www.mintlify.com/Ferryistaken/CHIP8-rs/advanced/function-tables"
+      ]
+    },
+    {
+      "variant_id": "trait-object-table",
+      "name": "Table of boxed trait objects for stateful handlers",
+      "paradigm": "oo",
+      "min_standard": "Rust2015",
+      "requires_features": [
+        "dyn trait objects"
+      ],
+      "idiom_name": "HashMap<Key, Box<dyn Handler>>",
+      "implementation_notes": "Handlers that carry state or span several methods cannot be `fn` pointers, so the table stores trait objects: `HashMap<String, Box<dyn Handler + Send + Sync>>` with `trait Handler { fn handle(&self, req: &Request) -> Response; }`, looked up and invoked through the vtable. What replaces the classic structure is dynamic dispatch over the collection - the closest Rust analogue of the object-oriented command/strategy registry, and the right shape for plugin registration because each entry may own configuration or dependencies. Use it when state justifies the allocation and the indirection; use plain `fn` pointers or an enum with `match` when it does not.",
+      "code_sketch": "trait Handler { fn handle(&self, req: &Request) -> Response; }\n\nfn dispatch(table: &HashMap<String, Box<dyn Handler>>, key: &str, req: &Request)\n    -> Option<Response> {\n    table.get(key).map(|h| h.handle(req))\n}",
+      "pitfalls": [
+        "`Box<dyn Handler>` is not `Send`/`Sync` unless the trait object adds those bounds, so a registry shared across threads fails to compile until the bounds (and any interior mutability) are declared.",
+        "One allocation per registered handler plus a vtable call per dispatch - the price of state, not something to pay for stateless opcode tables.",
+        "Object safety: methods with generics or returning `Self` make the trait not dyn-compatible, forcing an enum or a different decomposition."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/reference/types/trait-object.html"
+      ]
+    }
+  ],
+  "default_variant": "fn-pointer-table",
+  "version": "1.0"
+}

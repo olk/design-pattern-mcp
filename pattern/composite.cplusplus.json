@@ -1,0 +1,76 @@
+{
+  "pattern": "composite",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "abstract Component + std::vector<std::unique_ptr<Component>> children",
+  "implementation_notes": "The default C++ realization keeps the GoF roles literal: an abstract Component declares the virtual operations, leaf classes override them, and a container stores std::vector<std::unique_ptr<Component>> and forwards the operation to each child. unique_ptr encodes the tree's single-ownership invariant in the type system, so a node cannot be owned twice; the base needs a virtual destructor or deleting through a base pointer is undefined behaviour. Use this form when node kinds are open (plugins, external code) or when nodes are long-lived objects with identity; prefer the std::variant variant when the node set is closed and the tree is traversed heavily.",
+  "code_sketch": "struct Component { virtual ~Component() = default; virtual long size() const = 0; };\nstruct File : Component { long bytes; long size() const override { return bytes; } };\nstruct Dir : Component {\n    std::vector<std::unique_ptr<Component>> children;\n    void add(std::unique_ptr<Component> c) { children.push_back(std::move(c)); }\n    long size() const override { long s = 0; for (auto& c : children) s += c->size(); return s; }\n};",
+  "pitfalls": [
+    "A missing virtual destructor on Component makes unique_ptr<Component> delete through the base pointer undefined behaviour.",
+    "Child management on the Component interface forces leaves into no-op add/remove stubs; keep it on the container and downcast at the few sites that edit structure.",
+    "unique_ptr children cannot be shared: if two parents need the same subtree the structure is a DAG and needs a shared-ownership variant."
+  ],
+  "sources": [
+    "https://en.cppreference.com/cpp/memory/unique_ptr"
+  ],
+  "variants": [
+    {
+      "variant_id": "oo-unique-ptr",
+      "name": "Virtual Component hierarchy with unique_ptr children (classic OO)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "abstract Component + std::vector<std::unique_ptr<Component>> children",
+      "implementation_notes": "The default C++ realization keeps the GoF roles literal: an abstract Component declares the virtual operations, leaf classes override them, and a container stores std::vector<std::unique_ptr<Component>> and forwards the operation to each child. unique_ptr encodes the tree's single-ownership invariant in the type system, so a node cannot be owned twice; the base needs a virtual destructor or deleting through a base pointer is undefined behaviour. Use this form when node kinds are open (plugins, external code) or when nodes are long-lived objects with identity; prefer the std::variant variant when the node set is closed and the tree is traversed heavily.",
+      "code_sketch": "struct Component { virtual ~Component() = default; virtual long size() const = 0; };\nstruct File : Component { long bytes; long size() const override { return bytes; } };\nstruct Dir : Component {\n    std::vector<std::unique_ptr<Component>> children;\n    void add(std::unique_ptr<Component> c) { children.push_back(std::move(c)); }\n    long size() const override { long s = 0; for (auto& c : children) s += c->size(); return s; }\n};",
+      "pitfalls": [
+        "A missing virtual destructor on Component makes unique_ptr<Component> delete through the base pointer undefined behaviour.",
+        "Child management on the Component interface forces leaves into no-op add/remove stubs; keep it on the container and downcast at the few sites that edit structure.",
+        "unique_ptr children cannot be shared: if two parents need the same subtree the structure is a DAG and needs a shared-ownership variant."
+      ],
+      "sources": [
+        "https://en.cppreference.com/cpp/memory/unique_ptr"
+      ]
+    },
+    {
+      "variant_id": "variant-closed-set",
+      "name": "Closed node set as std::variant visited with std::visit (value semantics)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::variant",
+        "structured bindings"
+      ],
+      "idiom_name": "std::variant node alternatives + std::visit dispatch",
+      "implementation_notes": "When the node kinds are fixed at compile time, a std::variant of those kinds replaces the class hierarchy: nodes are held by value, dispatch is std::visit over a jump table, and a visitor that does not handle an alternative fails to compile, so exhaustiveness is enforced by the compiler rather than by discipline. Recursive alternatives still need indirection - a variant cannot contain itself - so the container's children are boxed (std::unique_ptr or a small deep-copying box type). Choose this for ASTs, expression trees and render trees that are built and traversed often; keep the virtual form when third-party code must add node kinds.",
+      "code_sketch": "struct Dir;\nusing Node = std::variant<File, std::unique_ptr<Dir>>;   // closed node set\nstruct Dir { std::vector<Node> children; };\nlong size(const Node& n) {\n    return std::visit(overloaded{\n        [](const File& f) { return f.bytes; },\n        [](const std::unique_ptr<Dir>& d) {\n            long s = 0; for (auto& c : d->children) s += size(c); return s; }\n    }, n);\n}",
+      "pitfalls": [
+        "A variant cannot contain itself: the recursive alternative must be boxed or the type is ill-formed.",
+        "Adding a node kind breaks every std::visit without a matching overload - that is the guarantee, but it means one edit per traversal site.",
+        "std::visit over several variants generates an N-ary dispatch table; keep the alternative count modest or code size grows quickly."
+      ],
+      "sources": [
+        "https://en.cppreference.com/cpp/utility/variant/visit",
+        "https://en.cppreference.com/w/cpp/utility/variant"
+      ]
+    },
+    {
+      "variant_id": "shared-ptr-graph",
+      "name": "shared_ptr children for shared subtrees and DAGs",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::shared_ptr<Component> child collections with weak_ptr parent links",
+      "implementation_notes": "When the same subtree legitimately appears under several parents - a DAG rather than a tree - children are held as std::shared_ptr<Component>: shared ownership keeps a shared node alive while any parent references it, at the cost of an atomic reference count per node and the loss of the single-owner invariant. Back-pointers must be std::weak_ptr, because a child holding a shared_ptr to its parent keeps the entire structure alive. Reach for this deliberately; for a genuine tree the unique_ptr form is smaller, faster and easier to reason about.",
+      "code_sketch": "struct Component { virtual ~Component() = default; virtual long size() const = 0; };\nstruct Dir : Component {\n    std::vector<std::shared_ptr<Component>> children;   // shared subtrees = DAG\n    std::weak_ptr<Component> parent;                    // never a strong back-edge\n    long size() const override { long s = 0; for (auto& c : children) s += c->size(); return s; }\n};",
+      "pitfalls": [
+        "shared_ptr cycles: parent and child holding each other keep the structure alive forever; use weak_ptr for the back edge.",
+        "Copying a node with shared_ptr children aliases the subtree - deep copies require an explicit clone operation.",
+        "Per-node control blocks and atomic refcounts cost more than the unique_ptr tree, and const-correctness suffers because shared_ptr propagates constness only to the pointer."
+      ],
+      "sources": [
+        "https://open-std.org/jtc1/sc22/wg21/docs/papers/2024/p3019r7.html"
+      ]
+    }
+  ],
+  "default_variant": "oo-unique-ptr",
+  "version": "1.0"
+}

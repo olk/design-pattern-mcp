@@ -1,0 +1,61 @@
+{
+  "pattern": "splitter",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "generator function / itertools.batched for chunked parts",
+  "implementation_notes": "The splitter is a generator: the function takes the composite and yields one derived message per element, so parts are produced lazily and only the current part is held in memory, while itertools.batched (Python 3.12) yields the same split in fixed-size chunks when the channel wants batches. Correlation and sequence metadata are explicit header entries - no framework adds them - and a generator is single-use, which matters for retries. A Splitter class is only justified when the boundary rule must be selected at runtime from a table of formats.",
+  "code_sketch": "def split_order(msg: OrderMessage) -> Iterator[PartMessage]:\n    for seq, item in enumerate(msg.items):\n        yield PartMessage(headers={**msg.headers, \"corr\": msg.id,\n                                   \"seq\": seq, \"size\": len(msg.items)},\n                          body=item)\n\nfor part in split_order(msg):        # lazy: nothing materialised\n    producer.send(part.topic, part.serialize())",
+  "pitfalls": [
+    "A generator is exhausted after one pass and is not picklable, so tasks that must be replayed need a list or a re-creatable iterable.",
+    "Sharing one mutable headers dict across all parts aliases state between messages; copy the mapping per part.",
+    "Collecting the parts (list(split(...))) defeats the streaming advantage and can exhaust memory on a large composite.",
+    "An exception after some parts were sent leaves the composite half-published - handle errors per part instead of letting the generator abort the loop."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/itertools.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "generator-parts",
+      "name": "Generator function yielding one part per element",
+      "paradigm": "functional",
+      "min_standard": "Python3.0",
+      "requires_features": [],
+      "idiom_name": "generator function / itertools.batched for chunked parts",
+      "implementation_notes": "The splitter is a generator: the function takes the composite and yields one derived message per element, so parts are produced lazily and only the current part is held in memory, while itertools.batched (Python 3.12) yields the same split in fixed-size chunks when the channel wants batches. Correlation and sequence metadata are explicit header entries - no framework adds them - and a generator is single-use, which matters for retries. A Splitter class is only justified when the boundary rule must be selected at runtime from a table of formats.",
+      "code_sketch": "def split_order(msg: OrderMessage) -> Iterator[PartMessage]:\n    for seq, item in enumerate(msg.items):\n        yield PartMessage(headers={**msg.headers, \"corr\": msg.id,\n                                   \"seq\": seq, \"size\": len(msg.items)},\n                          body=item)\n\nfor part in split_order(msg):        # lazy: nothing materialised\n    producer.send(part.topic, part.serialize())",
+      "pitfalls": [
+        "A generator is exhausted after one pass and is not picklable, so tasks that must be replayed need a list or a re-creatable iterable.",
+        "Sharing one mutable headers dict across all parts aliases state between messages; copy the mapping per part.",
+        "Collecting the parts (list(split(...))) defeats the streaming advantage and can exhaust memory on a large composite.",
+        "An exception after some parts were sent leaves the composite half-published - handle errors per part instead of letting the generator abort the loop."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/itertools.html"
+      ]
+    },
+    {
+      "variant_id": "celery-canvas",
+      "name": "Celery canvas primitives (group / chord / chunks)",
+      "paradigm": "declarative",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "Celery",
+        "result backend"
+      ],
+      "idiom_name": "group / chord / task.chunks() as splitter plus aggregator",
+      "implementation_notes": "In a Celery system the split is a canvas composition rather than a loop: group applies one task per element in parallel, chord adds the fan-in callback, and chunks splits a long argument list into N tasks that each process a part of it, which is the framework-native Splitter plus Aggregator. Signatures (task.s(...)) are the parts: they are serialised, routed and retried independently, and the result backend supplies the correlation. Keep the generator form for in-process splitting; canvas is what distributes the parts across workers.",
+      "code_sketch": "from celery import chord, group\nchord(group(process_item.s(order_id, item) for item in items))(\n    collect.s(order_id))          # fan-out + fan-in\n# batched: process_batch.chunks(items, 10).apply_async()",
+      "pitfalls": [
+        "Every canvas element is a separate broker message and result: splitting a 100k-element batch multiplies broker traffic and result-backend writes, which is exactly what chunks exists to bound.",
+        "Extra arguments are prepended to a signature's args, so a reducer that also takes partial arguments can silently receive them in the wrong order.",
+        "Chords need a result backend; without one the fan-in callback never fires."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/canvas.html"
+      ]
+    }
+  ],
+  "default_variant": "generator-parts"
+}

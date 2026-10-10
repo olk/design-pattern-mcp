@@ -1,0 +1,80 @@
+{
+  "pattern": "lazy-initialization",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "@cached_property descriptor storing into the instance __dict__",
+  "implementation_notes": "The standard library provides the descriptor: functools.cached_property (3.8) computes on the first attribute access and stores the result in the instance __dict__, after which the descriptor is bypassed and reads are plain attribute lookups - the marker is the absence of the dict key, so no flag or None test is needed. It replaces the classic `self._x = None; if self._x is None:` guard (which cannot distinguish an unset cell from a cached None) and it is reset by deleting the attribute or by mutating __dict__. Requirements: the class must have a __dict__ (no __slots__), and instances must keep their state mutable.",
+  "code_sketch": "from functools import cached_property\n\nclass Report:\n    @cached_property\n    def summary(self) -> Summary:      # built on first access, then cached\n        return build_summary(self.rows)\n\n    # invalidation: del report.summary  (or self.__dict__.pop('summary', None))",
+  "pitfalls": [
+    "cached_property is not thread-safe: Python 3.12 removed its undocumented locking behaviour (which had locked across all instances of the class), so concurrent first accesses can run the getter more than once for a single instance - guard shared state with a lock or a memoising decorator.",
+    "Assigning to the attribute shadows the descriptor permanently (the value lands in __dict__ and the property never runs again), which is the documented way to override but a silent trap when it happens by accident.",
+    "Classes using __slots__ (or other classes without a dict, e.g. some frozen/attrs configurations) cannot use cached_property - it raises rather than silently recomputing."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/functools.html#functools.cached_property",
+    "https://docs.python.org/3/whatsnew/3.12.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "cached-property-descriptor",
+      "name": "functools.cached_property",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "@cached_property descriptor storing into the instance __dict__",
+      "implementation_notes": "The standard library provides the descriptor: functools.cached_property (3.8) computes on the first attribute access and stores the result in the instance __dict__, after which the descriptor is bypassed and reads are plain attribute lookups - the marker is the absence of the dict key, so no flag or None test is needed. It replaces the classic `self._x = None; if self._x is None:` guard (which cannot distinguish an unset cell from a cached None) and it is reset by deleting the attribute or by mutating __dict__. Requirements: the class must have a __dict__ (no __slots__), and instances must keep their state mutable.",
+      "code_sketch": "from functools import cached_property\n\nclass Report:\n    @cached_property\n    def summary(self) -> Summary:      # built on first access, then cached\n        return build_summary(self.rows)\n\n    # invalidation: del report.summary  (or self.__dict__.pop('summary', None))",
+      "pitfalls": [
+        "cached_property is not thread-safe: Python 3.12 removed its undocumented locking behaviour (which had locked across all instances of the class), so concurrent first accesses can run the getter more than once for a single instance - guard shared state with a lock or a memoising decorator.",
+        "Assigning to the attribute shadows the descriptor permanently (the value lands in __dict__ and the property never runs again), which is the documented way to override but a silent trap when it happens by accident.",
+        "Classes using __slots__ (or other classes without a dict, e.g. some frozen/attrs configurations) cannot use cached_property - it raises rather than silently recomputing."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/functools.html#functools.cached_property",
+        "https://docs.python.org/3/whatsnew/3.12.html"
+      ]
+    },
+    {
+      "variant_id": "memoizing-decorator",
+      "name": "functools.cache / lru_cache on a callable",
+      "paradigm": "functional",
+      "min_standard": "Python3.9",
+      "requires_features": [
+        "functools.cache"
+      ],
+      "idiom_name": "functools.cache (or lru_cache(maxsize=None)) on the builder",
+      "implementation_notes": "When the expensive value is the result of a function of arguments, the lazy cell is the callable's cache: functools.cache (3.9, unbounded wrapper around lru_cache) or lru_cache(maxsize=None) memoises on the arguments and is thread-safe in the sense that the underlying dict operations are guarded, at the cost of one entry per distinct argument tuple. This replaces the per-instance attribute cell for module-level or stateless builders; cache_clear() gives the reset the descriptor form lacks, which makes it the better fit when the value must be invalidated.",
+      "code_sketch": "from functools import cache\n\n@cache\ndef tenant_config(tenant_id: str) -> Config:\n    return Config.load(tenant_id)   # one build per distinct tenant\n\n# invalidation: tenant_config.cache_clear()",
+      "pitfalls": [
+        "Arguments become part of the key: unhashable arguments raise TypeError, and mutable/default-argument surprises (mutable defaults, objects with identity-based hashing) can produce unbounded caches or cache misses forever.",
+        "cached decorators keep strong references to arguments and results: caching per request or per large object turns the cache into a memory leak (use weakref-based caches or a bounded TTL for those).",
+        "Bound methods under @cache keep self alive in the class-level cache, so instances are never collected unless the cache is per-instance or keyed by a weak reference."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/functools.html#functools.cache",
+        "https://docs.python.org/3/library/functools.html#functools.lru_cache"
+      ]
+    },
+    {
+      "variant_id": "module-getattr-pep562",
+      "name": "Lazy module attributes via module __getattr__ (PEP 562)",
+      "paradigm": "declarative",
+      "min_standard": "Python3.7",
+      "requires_features": [
+        "module __getattr__"
+      ],
+      "idiom_name": "module-level __getattr__ performing the import on first access",
+      "implementation_notes": "For whole modules, PEP 562 (3.7) makes the module object itself the lazy cell: defining __getattr__(name) on the module lets a submodule or heavyweight object be imported on first attribute access, so import time and memory are paid only by users of that attribute (this is what lazy-import patterns and namespace shims are built on). It replaces the eager `from .heavy import Thing` at module top-level; the cache is the ordinary module attribute namespace, so assigning the attribute on first access makes later reads fast.",
+      "code_sketch": "import importlib\n\ndef __getattr__(name):\n    if name == \"codec\":\n        mod = importlib.import_module(\"pkg.codec\")\n        globals()[\"codec\"] = mod.codec\n        return mod.codec\n    raise AttributeError(f\"module {__name__!r} has no attribute {name!r}\")",
+      "pitfalls": [
+        "__getattr__ is only consulted for missing attributes, so a stale binding (globals()[name] = ...) must be assigned deliberately - otherwise the expensive import runs on every access.",
+        "Every failure path must raise AttributeError, or hasattr()/getattr(x, name, default) and type checkers will crash instead of reporting absence.",
+        "It is module-global, not thread-safe: two threads can import/initialise concurrently, and the lazy attribute hides an import that may raise ImportError deep inside an unrelated call site (PEP 562 is documented as an advanced feature for exactly this reason)."
+      ],
+      "sources": [
+        "https://peps.python.org/pep-0562/"
+      ]
+    }
+  ],
+  "default_variant": "cached-property-descriptor",
+  "version": "1.0"
+}

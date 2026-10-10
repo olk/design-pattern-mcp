@@ -1,0 +1,56 @@
+{
+  "pattern": "request-reply",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "asyncio.Future + dict keyed by correlation id + asyncio.wait_for",
+  "implementation_notes": "asyncio.Future is the per-request reply channel: the caller creates a future, registers it under a fresh correlation id, publishes reply_to/correlation_id with the request, and awaits asyncio.wait_for(future, timeout) so a missing reply raises TimeoutError; the reply handler resolves the future, using loop.call_soon_threadsafe when the transport is threaded. Broker clients rebuild the same dict internally - the aio-pika RPC tutorial declares an exclusive callback queue, subscribes, and dispatches on_response by properties.correlation_id, and pika does the same with basic_consume.",
+  "code_sketch": "pending: dict[str, asyncio.Future[bytes]] = {}\nasync def call(payload: bytes, timeout: float = 5.0) -> bytes:\n    corr = str(uuid.uuid4())\n    fut = asyncio.get_running_loop().create_future()\n    pending[corr] = fut\n    await publish(payload, reply_to=reply_queue, correlation_id=corr)\n    try:\n        return await asyncio.wait_for(fut, timeout)   # TimeoutError if no reply\n    finally:\n        pending.pop(corr, None)                       # abandon on timeout/cancel",
+  "pitfalls": [
+    "asyncio.wait_for cancels the future on timeout, so a reply arriving later raises InvalidStateError in the handler unless it checks fut.done() first.",
+    "Resolving the future from a pika consumer thread requires loop.call_soon_threadsafe; set_result from another thread is not thread-safe.",
+    "Entries that are not removed leak and make id reuse dangerous; treat unknown correlation ids as noise and log them."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+  ],
+  "variants": [
+    {
+      "variant_id": "asyncio-future-correlation",
+      "name": "asyncio.Future per request in a correlation dict",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "idiom_name": "asyncio.Future + dict keyed by correlation id + asyncio.wait_for",
+      "implementation_notes": "asyncio.Future is the per-request reply channel: the caller creates a future, registers it under a fresh correlation id, publishes reply_to/correlation_id with the request, and awaits asyncio.wait_for(future, timeout) so a missing reply raises TimeoutError; the reply handler resolves the future, using loop.call_soon_threadsafe when the transport is threaded. Broker clients rebuild the same dict internally - the aio-pika RPC tutorial declares an exclusive callback queue, subscribes, and dispatches on_response by properties.correlation_id, and pika does the same with basic_consume.",
+      "code_sketch": "pending: dict[str, asyncio.Future[bytes]] = {}\nasync def call(payload: bytes, timeout: float = 5.0) -> bytes:\n    corr = str(uuid.uuid4())\n    fut = asyncio.get_running_loop().create_future()\n    pending[corr] = fut\n    await publish(payload, reply_to=reply_queue, correlation_id=corr)\n    try:\n        return await asyncio.wait_for(fut, timeout)   # TimeoutError if no reply\n    finally:\n        pending.pop(corr, None)                       # abandon on timeout/cancel",
+      "pitfalls": [
+        "asyncio.wait_for cancels the future on timeout, so a reply arriving later raises InvalidStateError in the handler unless it checks fut.done() first.",
+        "Resolving the future from a pika consumer thread requires loop.call_soon_threadsafe; set_result from another thread is not thread-safe.",
+        "Entries that are not removed leak and make id reuse dangerous; treat unknown correlation ids as noise and log them."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+      ]
+    },
+    {
+      "variant_id": "aio-pika-rpc",
+      "name": "aio-pika RPC over an exclusive callback queue",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "idiom_name": "exclusive callback queue + on_response dispatch by correlation_id",
+      "implementation_notes": "The aio-pika and pika RPC patterns put the correlation table in the client library: declare an exclusive, auto-delete callback queue once, subscribe, publish with reply_to and correlation_id (or use RabbitMQ's direct reply-to pseudo-queue), and dispatch each delivery in the response callback to the future registered under properties.correlation_id. Choose it when requests must cross processes; the cost is a broker dependency plus the connection-recovery policy - a reconnected client gets a new callback queue and must re-declare it before any new request.",
+      "code_sketch": "async def main():\n    conn = await aio_pika.connect_robust(BROKER_URL)\n    channel = await conn.channel()\n    callback = await channel.declare_queue(exclusive=True)\n    futures: dict[str, asyncio.Future] = {}\n    async def on_response(message):\n        fut = futures.pop(message.correlation_id, None)   # late/unknown: dropped\n        if fut and not fut.done():\n            await message.ack()\n            fut.set_result(message.body)",
+      "pitfalls": [
+        "An exclusive callback queue lives only as long as its connection: reconnection logic must re-declare it before any new request.",
+        "Acking automatically loses replies on failure; ack after resolving the future and make the handler idempotent for redeliveries."
+      ],
+      "sources": [
+        "https://docs.aio-pika.com/rabbitmq-tutorial/6-rpc.html",
+        "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-future-correlation",
+  "version": "1.0"
+}

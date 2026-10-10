@@ -1,0 +1,65 @@
+{
+  "pattern": "watchman",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "tokio::select! racing arrivals against tokio::time::sleep (or std::sync::mpsc::recv_timeout in the sync stack)",
+  "implementation_notes": "In the async stack the watchman is a select: each iteration awaits either an arrival or a sleep for the silence budget, so the pending future - not a timestamp - is the last-seen state, and the timeout branch is the alarm; tokio::time::sleep and its Instant are monotonic and runtime-driven. The sync stack gets the same semantics with std::sync::mpsc::Receiver::recv_timeout, which turns 'nothing within the budget' into Err(RecvTimeoutError::Timeout) on a dedicated thread. What remains hand-written is the expectation registry and the escalation (alert routing, debounce, repeat-while-silent), typically with tracing or metrics as the alert sink.",
+  "code_sketch": "let budget = Duration::from_secs(60);\nloop {\n    tokio::select! {\n        Some(msg) = arrivals.recv() => handle(msg).await,   // arrival restarts the deadline\n        _ = tokio::time::sleep(budget) => {\n            tracing::error!(subject, \"no messages for {:?}\", budget);\n        }\n    }\n}",
+  "pitfalls": [
+    "tokio::time::sleep must be created and awaited inside the runtime, and blocking std::thread::sleep inside an async task parks a worker thread and stalls every other task on it; use the sync variant only on a dedicated thread.",
+    "select! drops the losing branch: a half-consumed receive or a non-cancellation-safe future (e.g. a partially written send) loses data when the timeout arm wins - keep arrivals on a cancellation-safe recv and never pair the deadline with a non-cancellation-safe future.",
+    "State that lives only in the task (rather than in a shared AtomicU64 stamp) is lost when the monitor restarts with the process, which re-opens the silence window exactly when a crash-looping service most needs watching.",
+    "The first sleep is armed only after the first loop iteration: if no message ever arrives the alarm is correct, but in the std variant recv_timeout's Err(Disconnected) means the producer is gone - a different, usually worse condition than silence and worth its own alert text.",
+    "A closed channel makes recv() return None immediately forever: the select spins on the arrival arm and the deadline never fires - match on the closed case explicitly and alarm."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/time/index.html",
+    "https://doc.rust-lang.org/std/time/struct.Instant.html",
+    "https://doc.rust-lang.org/std/thread/fn.sleep.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "rust-tokio-select",
+      "name": "tokio select! against a sleep deadline",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async/await",
+        "tokio"
+      ],
+      "idiom_name": "tokio::select! racing arrivals against tokio::time::sleep (or std::sync::mpsc::recv_timeout in the sync stack)",
+      "implementation_notes": "In the async stack the watchman is a select: each iteration awaits either an arrival or a sleep for the silence budget, so the pending future - not a timestamp - is the last-seen state, and the timeout branch is the alarm; tokio::time::sleep and its Instant are monotonic and runtime-driven. The sync stack gets the same semantics with std::sync::mpsc::Receiver::recv_timeout, which turns 'nothing within the budget' into Err(RecvTimeoutError::Timeout) on a dedicated thread. What remains hand-written is the expectation registry and the escalation (alert routing, debounce, repeat-while-silent), typically with tracing or metrics as the alert sink.",
+      "code_sketch": "let budget = Duration::from_secs(60);\nloop {\n    tokio::select! {\n        Some(msg) = arrivals.recv() => handle(msg).await,   // arrival restarts the deadline\n        _ = tokio::time::sleep(budget) => {\n            tracing::error!(subject, \"no messages for {:?}\", budget);\n        }\n    }\n}",
+      "pitfalls": [
+        "tokio::time::sleep must be created and awaited inside the runtime, and blocking std::thread::sleep inside an async task parks a worker thread and stalls every other task on it; use the sync variant only on a dedicated thread.",
+        "select! drops the losing branch: a half-consumed receive or a non-cancellation-safe future (e.g. a partially written send) loses data when the timeout arm wins - keep arrivals on a cancellation-safe recv and never pair the deadline with a non-cancellation-safe future.",
+        "State that lives only in the task (rather than in a shared AtomicU64 stamp) is lost when the monitor restarts with the process, which re-opens the silence window exactly when a crash-looping service most needs watching.",
+        "The first sleep is armed only after the first loop iteration: if no message ever arrives the alarm is correct, but in the std variant recv_timeout's Err(Disconnected) means the producer is gone - a different, usually worse condition than silence and worth its own alert text.",
+        "A closed channel makes recv() return None immediately forever: the select spins on the arrival arm and the deadline never fires - match on the closed case explicitly and alarm."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/time/index.html",
+        "https://doc.rust-lang.org/std/time/struct.Instant.html",
+        "https://doc.rust-lang.org/std/thread/fn.sleep.html"
+      ]
+    },
+    {
+      "variant_id": "rust-std-recv-timeout",
+      "name": "std threads with mpsc recv_timeout",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "std::sync::mpsc::Receiver::recv_timeout + Instant stamp",
+      "implementation_notes": "For services without an async runtime: a dedicated monitor thread loops on recv_timeout(budget) and treats RecvTimeoutError::Timeout as silence; Instant::now() provides the monotonic stamp for the alert text, and join/shutdown uses a dedicated control channel or an AtomicBool.",
+      "code_sketch": "let budget = Duration::from_secs(60);\nloop {\n    match rx.recv_timeout(budget) {\n        Ok(msg) => handle(msg),\n        Err(RecvTimeoutError::Timeout) => alert(subject, budget),\n        Err(RecvTimeoutError::Disconnected) => { alert_producer_gone(subject); break }\n    }\n}",
+      "pitfalls": [
+        "recv_timeout restarts the budget on every message, so a chatty producer hides a stalled consumer that shares the channel - watch the consumer's own progress, not the raw arrival stream."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/time/struct.Instant.html",
+        "https://doc.rust-lang.org/std/thread/fn.sleep.html"
+      ]
+    }
+  ],
+  "default_variant": "rust-tokio-select",
+  "version": "1.0"
+}

@@ -1,0 +1,153 @@
+{
+  "category": "persistence-state",
+  "name": "resource-return",
+  "aliases": [],
+  "intent": "Hand a resource back to the entity that owns it, and make that hand-back explicit in the interface - usually in the return type of the function that hands the resource out - so receivers cannot leak what they were given nor destroy what they only borrowed.",
+  "problem": "A resource crosses an interface: a factory returns a freshly created object, handle or cursor, or a manager lends one it owns. The release consequence stays implicit - a raw pointer, a bare handle, a close() whose meaning depends on the producer - so receivers leak what they were given, invent their own destroy path for something they only borrowed, or return it twice. The recurring decision is who hands the resource back, how the interface says so, and how 'return to owner' is kept distinct from 'destroy'.",
+  "context": "Applies wherever resources are handed over rather than consumed locally: factories that create and return objects, handles, buffers, cursors or connections; pools, registries and caches that lend instances they own; APIs whose release operation has to mean 'return to the owner' rather than 'destroy'. It matters most when the resource is expensive or scarce, when the owner must observe the return (pool accounting, reset-on-return, quota, invalidation), and when the hand-over interface can carry the ownership policy in its type - smart pointers, IDisposable, AutoCloseable, context managers, drop guards - instead of in a comment.",
+  "benefits": [
+    "Ownership transfer becomes part of the interface, so the type system documents who releases what; the classic failure mode - a caller who does not know, or forgets, that the returned pointer is theirs to release - disappears from review and from call sites.",
+    "The release runs on every exit path: a returned wrapper (smart pointer, IDisposable, context manager, drop guard) performs the hand-back on normal return as well as on exceptions, so the leak class of bugs is removed instead of documented away.",
+    "Release policy lives with the owner: whether a resource is returned to a pool or actually destroyed is decided once, in the deleter/close/check-in implementation, instead of being re-derived by every call site.",
+    "Callers cannot pick the wrong destruction - delete versus delete[], free versus fclose, closing something the owner still tracks - because the wrapper performs the release and the raw handle is not part of the public surface.",
+    "Call-site code is identical whether the resource came from a factory, a pool or a cache, so resources can be sourced differently later without touching clients.",
+    "Testing and review get cheaper: one release implementation with one set of tests, and no cleanup logic scattered through call sites to audit."
+  ],
+  "tradeoffs": [
+    "The return type fixes the ownership policy before the client's sharing need is known; shared ownership costs a control block and atomic traffic, and converting a shared resource back to exclusive ownership is unsafe because you cannot know you are the last holder.",
+    "Every hand-over passes through a wrapper: an extra type in the signature, one indirection per use, and a changed API/ABI surface compared with handing out the raw handle.",
+    "The decision 'return to owner or destroy' moves out of sight - into a deleter, close override or pool reset hook - so a wrong policy is no longer visible at the release site and becomes a silent bug.",
+    "Escape hatches reintroduce the original problem without a diagnostic: unique_ptr::release(), mem::forget/Box::leak, storing the resource in a longer-lived structure, or passing it on as a borrowed reference all defeat the hand-back.",
+    "In languages without deterministic destruction or scope-bound release (C, Go, JavaScript without using, Ruby without blocks) the guarantee degrades to convention - defer/finally/release must be written at each call site, and a missed one leaks exactly as before.",
+    "Wrapping an existing raw-handle API creates two representations of the same resource; keeping clients away from the raw one, and the two in sync, is ongoing maintenance cost."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Resource",
+      "responsibility": "The scarce entity being handed over - heap object, connection, cursor, buffer, lock, file handle - with a release obligation attached to it."
+    },
+    {
+      "role": "Provider / Factory",
+      "responsibility": "Creates or checks out the resource and hands it over, choosing the return type (wrapper or bare handle) that states who must hand it back."
+    },
+    {
+      "role": "Return Type / Handle",
+      "responsibility": "The value the client receives - smart pointer, IDisposable, context manager, drop guard, typed loan - which carries the ownership contract and performs the hand-back when it is done."
+    },
+    {
+      "role": "Release Policy",
+      "responsibility": "The deleter, Close/Dispose/Release implementation or check-in hook that decides whether the resource goes back to its owner or is actually destroyed."
+    },
+    {
+      "role": "Owner / Resource Manager",
+      "responsibility": "The pool, registry or cache that supplies the resource, receives it back, resets it, and alone decides whether it is re-lent or destroyed."
+    },
+    {
+      "role": "Client / Borrower",
+      "responsibility": "Uses the resource while it is held and triggers - never implements - the hand-back, typically by letting the returned wrapper leave scope."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Factory functions that hand out dynamically allocated objects or buffers: return a smart pointer (or the language's equivalent) instead of a raw pointer, so a temporary result inside a larger expression cannot be leaked.",
+    "Connection and object pools: checkout returns a borrowed handle whose release returns it to the pool - SQLAlchemy's transparent proxy turns close() into a return, Go's database/sql Conn.Close returns the connection to the pool, Microsoft.Extensions.ObjectPool exposes Get/Return, r2d2 returns a PooledConnection on drop.",
+    "Cursors, streams and buffers over a shared source: the consumer hands the view back and the owner decides between reuse and destruction instead of the consumer closing it.",
+    "Locks, leases and sessions: the guard hands the lock back to its manager on scope exit rather than unlocking or destroying it ad hoc.",
+    "Scoped or request-bound services from a container: the scope owns the instance, callers borrow it for the request and must not dispose it themselves.",
+    "APIs layered over a third-party or C-ABI library whose objects must be given back to that library rather than freed generically.",
+    "SQLAlchemy Engine.connect() returns a proxy whose close() checks the DBAPI connection back into the pool and applies reset-on-return; callers use a context manager instead of destroying the underlying connection.",
+    "Microsoft.Extensions.ObjectPool makes Get()/Return(T) an explicit owner-side protocol: the borrower uses the object, then returns it so the pool can reset or discard it according to its policy.",
+    "Go database/sql DB.Conn(ctx) hands out a dedicated pooled connection whose Conn.Close() returns it to the DB pool, while Rust r2d2's PooledConnection returns or invalidates its connection when the guard is dropped."
+  ],
+  "avoid_when": [
+    "The resource is created and destroyed inside the same scope: RAII / a scope guard (with/using/use/defer) is the smaller pattern, because no hand-over exists to make explicit.",
+    "The resource is pure managed memory with no release obligation: a wrapper adds ceremony without a hand-back to enforce.",
+    "The interface is a fixed C ABI that cannot carry a wrapper type and cannot be changed; keep the raw handle, document the contract, and wrap on the caller's side only.",
+    "The 'resource' is a freely copyable value (money, a data class): ownership transfer is meaningless, so value semantics and ordinary assignment are the right tools.",
+    "Only one caller ever touches the resource and it is also the creator and the destroyer: returning the raw handle is clearer and cheaper."
+  ],
+  "language_files": {
+    "generic": "resource-return.generic.json",
+    "c": "resource-return.c.json",
+    "cplusplus": "resource-return.cplusplus.json",
+    "csharp": "resource-return.csharp.json",
+    "go": "resource-return.go.json",
+    "java": "resource-return.java.json",
+    "javascript": "resource-return.javascript.json",
+    "kotlin": "resource-return.kotlin.json",
+    "python": "resource-return.python.json",
+    "ruby": "resource-return.ruby.json",
+    "rust": "resource-return.rust.json",
+    "scala": "resource-return.scala.json",
+    "swift": "resource-return.swift.json",
+    "typescript": "resource-return.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "raii",
+    "smart-pointer",
+    "dispose",
+    "scope-guard",
+    "object-pool",
+    "factory-method",
+    "execute-around"
+  ],
+  "anti_patterns": [
+    "Returning a raw pointer or bare handle from a factory and documenting the release obligation in a comment or wiki: the interface stays easy to misuse, and every new caller is another chance to leak.",
+    "Letting the client choose between 'release back' and 'destroy' on a borrowed resource - two public methods, or an exposed pool - so the wrong one is eventually called and the owner's bookkeeping no longer matches reality.",
+    "Using the garbage collector or finalizers as the hand-back mechanism: release becomes non-deterministic, pools starve, and shutdown failures turn order-dependent.",
+    "Returning shared ownership by default ('everything is a shared_ptr') to avoid deciding ownership: cycles leak, reference counting costs accumulate, and the owner loses track of when resources come back."
+  ],
+  "design_principles": [
+    "Make interfaces easy to use correctly and hard to use incorrectly: the hand-back should be the path of least resistance, not a documented obligation (Meyers).",
+    "Make ownership explicit - the return type, or the single release function, carries who must hand the resource back.",
+    "Separation of concerns: the client decides when it is finished, the owner decides what happens then (re-lend, reset, destroy).",
+    "Single responsibility and a single release point: one implementation performs the hand-back, so there is one place to get the policy right.",
+    "Information hiding: the borrower should not need to know whether the resource came from a pool, a cache or a freshly allocated factory result."
+  ],
+  "best_practices": [
+    "Return the narrowest wrapper that states the ownership: exclusive smart pointer by default, shared only when sharing is real, custom deleter when the release is a hand-back to an owner.",
+    "Keep 'return to owner' and 'destroy' as distinct, non-overlapping operations, and expose only the one the receiver is supposed to use.",
+    "Make the release idempotent and non-throwing, and let the returned wrapper - not the call site - decide when it runs.",
+    "Document the hand-back where it is implemented (deleter, close override, check-in hook), not in comments at each call site, and keep the raw handle out of the published surface.",
+    "Close the escape hatches on published interfaces: no release()/leak()/forget() in the same API surface, and no borrowed reference that can outlive the wrapper.",
+    "Choose the ownership shape from the client's real need at review time; when unsure, prefer exclusive, because moving exclusive ownership into shared is easy while the reverse is unsafe."
+  ],
+  "version": "1.1",
+  "sources": [
+    "More C++ Idioms (Wikibooks) - 'Resource Return' (idiom 74 of the catalog, 2007): convey ownership transfer explicitly in the return type of a factory function; return a resource-managing smart pointer (std::unique_ptr, std::shared_ptr, user-defined Handle/Body) instead of a raw pointer.",
+    "Scott Meyers, 'The Resource Return Problem' (draft 20 November 2004, annotated 14 September 2005): factory interfaces should be easy to use correctly and hard to use incorrectly; exclusive (auto_ptr/unique_ptr) versus shared (shared_ptr) returns, and why exclusive is the better default.",
+    "https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Resource_Return",
+    "https://www.aristeia.com/Papers/resourceReturnProblem.txt",
+    "https://en.cppreference.com/w/cpp/memory/unique_ptr",
+    "SQLAlchemy, Connection Pooling (2.1): close() returns proxied DBAPI connections to the pool and reset-on-return restores clean state: https://docs.sqlalchemy.org/en/21/core/pooling.html",
+    "Microsoft Learn, ObjectPool<T> Class: Get() obtains an item and Return(T) gives it back to the pool for reuse: https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.objectpool.objectpool-1?view=net-11.0-pp",
+    "Go Packages, database/sql: DB.Conn obtains a dedicated connection and Conn.Close returns it to the pool: https://pkg.go.dev/database/sql",
+    "r2d2 API documentation, PooledConnection: the pooled smart pointer owns a checked-out connection and implements Drop: https://docs.rs/r2d2/latest/r2d2/struct.PooledConnection.html",
+    "SQLAlchemy, Error Messages (2.0): failing to return pooled connections can exhaust the pool and cause timeouts, so use explicit close or context managers: https://docs.sqlalchemy.org/en/20/errors.html"
+  ]
+}

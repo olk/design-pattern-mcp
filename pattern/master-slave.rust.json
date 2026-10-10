@@ -1,0 +1,84 @@
+{
+  "pattern": "master-slave",
+  "language": "rust",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "std-scoped-threads",
+      "name": "std::thread::scope workers + mpsc job queue (Rust 1.63+)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.63",
+      "idiom_name": "std::thread::scope + mpsc::sync_channel + ScopedJoinHandle::join",
+      "implementation_notes": "Rust's literal realization is std::thread::scope plus channels: scope guarantees every spawned thread is joined before the scope returns and lets workers borrow the master's non-'static data (input slices) without Arc, sync_channel(bound) is the work queue and gives backpressure, and dropping the sender after the last job makes the workers' recv loop end (a disconnect is a normal result, not an error). Each ScopedJoinHandle::join returns the worker's partial result ready for a deterministic combine, and a panic inside a worker is re-raised by join (or by scope), so failure handling is explicit. Std has no pool, no queue type and no work stealing; share the Receiver through a Mutex, or move to rayon/tokio when the workload justifies a real scheduler.",
+      "code_sketch": "let (tx, rx) = mpsc::sync_channel::<Job>(64);          // bounded work queue\nlet rx = Mutex::new(rx);                               // Receiver is not Sync\nlet partials = thread::scope(|s| {\n    let ws: Vec<_> = (0..n).map(|_| s.spawn(|| {       // identical workers\n        let mut sum = 0.0;\n        while let Ok(j) = { rx.lock().unwrap().recv() } { sum += compute(&data, j); }\n        sum\n    })).collect();\n    for j in jobs { tx.send(j).expect(\"worker alive\"); }   // dispatch\n    drop(tx);                                          // end of work\n    ws.into_iter().map(|w| w.join().unwrap()).collect::<Vec<_>>()   // results\n});\nlet total: f64 = partials.into_iter().sum();           // combine",
+      "pitfalls": [
+        "std's Receiver is not Sync: share it as Mutex<Receiver> (serialising only the pop) or give each worker its own channel; a naive Arc<Receiver> does not compile.",
+        "join().unwrap() turns a panicking worker into a master panic, and dropping unjoined handles abandons their results - define whether one failed worker fails the batch.",
+        "Any live sender (for example one cloned into a worker) keeps recv() from returning None, so the worker loop never ends.",
+        "Scoped borrows forbid the master mutating shared data while workers run: all combination happens after the scope, which is also the synchronisation point."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/thread/fn.scope.html",
+        "https://doc.rust-lang.org/std/sync/mpsc/index.html"
+      ]
+    },
+    {
+      "variant_id": "rayon-scope",
+      "name": "Rayon work-stealing pool with par_iter / scope",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "rayon"
+      ],
+      "idiom_name": "rayon::iter::IntoParallelIterator (par_iter) + rayon::scope",
+      "implementation_notes": "Rayon is the dominant library realization: par_iter converts a sequential iterator into a parallel one, the global work-stealing pool schedules the split work across the cores, and the reduce/collect that ends the chain is the master's combine - the coordinator role disappears into the runtime. rayon::scope is the escape hatch when the number of tasks is dynamic or tasks must borrow local data, and ThreadPoolBuilder builds a private pool when the master needs isolation from other rayon users. Use it when sub-tasks are uniform, independent and expressed naturally as an iteration; the central work queue, admission control and heterogeneous job types of the classic master are not part of this variant.",
+      "code_sketch": "use rayon::prelude::*;\n\nlet total: f64 = (0..n)\n    .into_par_iter()                     // work-stealing workers\n    .map(|i| compute_part(i))\n    .sum();                              // rayon combines the partials",
+      "pitfalls": [
+        "The global pool is shared process-wide: blocking or sleeping inside a parallel closure starves every other rayon user.",
+        "Side effects inside par_iter closures run in unspecified order and across threads; keep the closures pure and the reduce operation associative.",
+        "Nested parallelism is managed by rayon - do not spawn ad hoc threads or private pools per call, which oversubscribes and loses work stealing.",
+        "For heterogeneous jobs, an explicit queue and rayon::scope (or crossbeam channels) is a better fit than par_iter over an index range."
+      ],
+      "sources": [
+        "https://docs.rs/rayon/latest/rayon/"
+      ]
+    },
+    {
+      "variant_id": "tokio-joinset",
+      "name": "Tokio JoinSet fan-out for I/O-bound sub-tasks",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async",
+        "tokio"
+      ],
+      "idiom_name": "tokio::task::JoinSet::spawn + join_next/join_all",
+      "implementation_notes": "JoinSet<T> is a collection of tasks spawned on the Tokio runtime and is itself the join handle set: join_next().await yields results in completion order (aggregate as they arrive), join_all consumes the set, and dropping the set aborts every task - Tokio's cancellation discipline, which is exactly the master's shutdown lever. Use it when sub-tasks are I/O-bound and each awaits sockets or files; CPU-bound sub-tasks must go through spawn_blocking or leave the runtime entirely, because they block a worker thread. All tasks in one set share the result type, so heterogeneous partials need an enum wrapper.",
+      "code_sketch": "let mut set = tokio::task::JoinSet::new();\nfor i in 0..n {\n    set.spawn(async move { compute_part(i).await });   // dispatch\n}\nlet mut parts = Vec::with_capacity(n);\nwhile let Some(res) = set.join_next().await { parts.push(res?); }  // join as they finish\nlet total: f64 = parts.into_iter().sum();              // combine",
+      "pitfalls": [
+        "Dropping the JoinSet aborts every running task silently - keep it alive until the aggregate is complete, or results vanish.",
+        "CPU-bound code on the async runtime blocks a worker thread; use spawn_blocking or a dedicated thread pool.",
+        "A panicking task surfaces as a JoinError from join_next, so panic policy (resume vs fail the batch) is an explicit master decision.",
+        "All tasks in a set share one result type: wrap heterogeneous partials in an enum or use separate sets."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html"
+      ]
+    }
+  ],
+  "default_variant": "std-scoped-threads",
+  "idiom_name": "std::thread::scope + mpsc::sync_channel + ScopedJoinHandle::join",
+  "implementation_notes": "Rust's literal realization is std::thread::scope plus channels: scope guarantees every spawned thread is joined before the scope returns and lets workers borrow the master's non-'static data (input slices) without Arc, sync_channel(bound) is the work queue and gives backpressure, and dropping the sender after the last job makes the workers' recv loop end (a disconnect is a normal result, not an error). Each ScopedJoinHandle::join returns the worker's partial result ready for a deterministic combine, and a panic inside a worker is re-raised by join (or by scope), so failure handling is explicit. Std has no pool, no queue type and no work stealing; share the Receiver through a Mutex, or move to rayon/tokio when the workload justifies a real scheduler.",
+  "code_sketch": "let (tx, rx) = mpsc::sync_channel::<Job>(64);          // bounded work queue\nlet rx = Mutex::new(rx);                               // Receiver is not Sync\nlet partials = thread::scope(|s| {\n    let ws: Vec<_> = (0..n).map(|_| s.spawn(|| {       // identical workers\n        let mut sum = 0.0;\n        while let Ok(j) = { rx.lock().unwrap().recv() } { sum += compute(&data, j); }\n        sum\n    })).collect();\n    for j in jobs { tx.send(j).expect(\"worker alive\"); }   // dispatch\n    drop(tx);                                          // end of work\n    ws.into_iter().map(|w| w.join().unwrap()).collect::<Vec<_>>()   // results\n});\nlet total: f64 = partials.into_iter().sum();           // combine",
+  "pitfalls": [
+    "std's Receiver is not Sync: share it as Mutex<Receiver> (serialising only the pop) or give each worker its own channel; a naive Arc<Receiver> does not compile.",
+    "join().unwrap() turns a panicking worker into a master panic, and dropping unjoined handles abandons their results - define whether one failed worker fails the batch.",
+    "Any live sender (for example one cloned into a worker) keeps recv() from returning None, so the worker loop never ends.",
+    "Scoped borrows forbid the master mutating shared data while workers run: all combination happens after the scope, which is also the synchronisation point."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/thread/fn.scope.html",
+    "https://doc.rust-lang.org/std/sync/mpsc/index.html"
+  ],
+  "version": "1.0"
+}

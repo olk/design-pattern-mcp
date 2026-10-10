@@ -1,0 +1,23 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "dedicated dead-letter channel + undeliverability trigger + owned triage and replay path",
+  "implementation_notes": "Language-neutral form: define what makes a message undeliverable (retry budget exhausted, TTL expired, unroutable destination, rejected by validation, MaxDeliver exceeded), let the transport or handler move it to a dedicated dead-letter channel, and give that channel an owner. The parked record must keep the payload plus the failure context - original destination, routing key or partition/offset, timestamps, attempt count, failure reason or exception - because that context is what makes triage and replay possible. The channel must be durable, bounded by retention or quota, and monitored on arrivals rather than only on depth; the replay path must be documented and idempotent, because replay is a re-delivery. Where the transport has no dead-letter support (Kafka without a framework, JetStream, plain sockets) the consumer publishes to the dead-letter channel explicitly and confirms that publish before committing the source offset; where the transport does (AMQP, JMS, SQS, Service Bus) prefer its declarative dead-letter mechanism and keep application code out of the routing decision. Alert on arrival events, not only on queue depth - a single dead-lettered message after a period of clean processing is more actionable than a slowly growing graveyard.",
+  "code_sketch": "on_permanent_failure(msg, reason):\n    dead_letter(msg, reason)      # policy-declared channel, or explicitly published\n# rules:\n#  1. retry with backoff first - dead-letter only the terminal failure\n#  2. keep payload + original destination + reason + attempt count + timestamp\n#  3. durable, retention-bounded channel; alert on arrivals, not just depth\n#  4. replay only after the fix, idempotently, following a runbook\n#  5. for Kafka/JetStream: publish to DLT before committing source offset",
+  "pitfalls": [
+    "A dead-letter channel with no consumer, no alert and no runbook is indistinguishable from a black hole: the message is preserved but the failure is invisible.",
+    "Republishing without the original metadata (destination, routing key, attempt count, reason) leaves a channel of orphans that cannot be replayed safely.",
+    "Using the dead-letter channel as the retry path turns every transient failure into a manual operation and hides the ones that need code fixes.",
+    "If the dead-letter target is unavailable when the message is dead-lettered, the hop is the lossy step; it needs the same durability and monitoring as the working channel.",
+    "Kafka: publishing to DLT after committing the source offset loses the message if the DLT publish fails - always write to DLT first, then commit the source offset.",
+    "Kafka: forgetting to disable DLT auto-consumption (autoStartDltHandler=true by default in Spring Kafka) causes a DLT message to be immediately processed by the same failing handler that produced it, creating an instant loop.",
+    "NATS JetStream: treating MaxDeliver as an automatic DLQ - it merely drops the message from the pending list; a DLQ requires subscribing to advisories and republishing to a catch stream, which must be built explicitly.",
+    "Azure Service Bus: enabling dead-lettering on filter evaluation exceptions without a subscriber can flood the DLQ with every mis-routed message - ensure subscriptions exist before enabling this.",
+    "Wrong move: assuming the dead-letter target will always be there -> IBM MQ stops the whole channel and the message stays stuck on the transmission queue when the DLQ is full, too small or undefined, and a missing RabbitMQ dead-letter exchange drops the message silently -> declare, size for the largest message and monitor the dead-letter target with the same rigor as the source channel.",
+    "Wrong move: taking Apache Camel's DeadLetterChannel defaults (maximumRedeliveries=0, activity logging off) -> every single failure jumps straight to the dead-letter endpoint with no retry and no log line -> configure the redelivery policy and retriesExhaustedLogLevel explicitly before wiring a DLQ endpoint.",
+    "Wrong move: bulk-replaying aged DLQ messages after an incident -> downstream state, dependencies and partial effects have moved on, so replay produces duplicates, double charges and inconsistent state -> bound DLQ age, classify by failure reason, and replay only fresh, idempotent-safe batches under rate limits."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

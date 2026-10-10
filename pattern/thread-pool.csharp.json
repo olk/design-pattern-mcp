@@ -1,0 +1,72 @@
+{
+  "pattern": "thread-pool",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "Task.Run + await / Task.WhenAll over System.Threading.ThreadPool",
+  "implementation_notes": "The process-wide System.Threading.ThreadPool is the pool, and Task.Run is its idiomatic submission API: it queues a work item on a pooled thread and returns a Task for the result, so no worker loop, queue or thread object is written. The runtime grows the pool itself and SetMinThreads/SetMaxThreads tune it, but the same pool serves timers, async continuations and registered waits, so it is shared infrastructure - keep items short, use async I/O instead of blocking, and move long-blocking work onto dedicated threads. This replaces the classic structure for both fire-and-forget and result-bearing tasks; the classic class only reappears for custom policies (see the Channel<T> variant).",
+  "code_sketch": "var pages = await Task.WhenAll(urls.Select(u => Task.Run(() => Fetch(u))));\nvar digest = await Task.Run(() => Compress(payload));   // one item, one pool thread\n// Parallel.ForEach / Parallel.For reuse the same pool for CPU-bound batches",
+  "pitfalls": [
+    "The pool is process-wide: a burst of long-blocking Task.Run items starves timers, continuations and unrelated requests - isolate blocking work on dedicated threads.",
+    "Pooled threads keep ThreadStatic/thread-local data between tasks (documented behaviour), so per-task state must be reset or avoided.",
+    "ThreadPool threads are background threads: they do not keep the process alive, so a fire-and-forget item can be cut off at exit."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool"
+  ],
+  "variants": [
+    {
+      "variant_id": "task-run-tpl",
+      "name": "Task.Run / TPL over the shared ThreadPool",
+      "paradigm": "concurrent",
+      "min_standard": "C#5",
+      "idiom_name": "Task.Run + await / Task.WhenAll over System.Threading.ThreadPool",
+      "implementation_notes": "The process-wide System.Threading.ThreadPool is the pool, and Task.Run is its idiomatic submission API: it queues a work item on a pooled thread and returns a Task for the result, so no worker loop, queue or thread object is written. The runtime grows the pool itself and SetMinThreads/SetMaxThreads tune it, but the same pool serves timers, async continuations and registered waits, so it is shared infrastructure - keep items short, use async I/O instead of blocking, and move long-blocking work onto dedicated threads. This replaces the classic structure for both fire-and-forget and result-bearing tasks; the classic class only reappears for custom policies (see the Channel<T> variant).",
+      "code_sketch": "var pages = await Task.WhenAll(urls.Select(u => Task.Run(() => Fetch(u))));\nvar digest = await Task.Run(() => Compress(payload));   // one item, one pool thread\n// Parallel.ForEach / Parallel.For reuse the same pool for CPU-bound batches",
+      "pitfalls": [
+        "The pool is process-wide: a burst of long-blocking Task.Run items starves timers, continuations and unrelated requests - isolate blocking work on dedicated threads.",
+        "Pooled threads keep ThreadStatic/thread-local data between tasks (documented behaviour), so per-task state must be reset or avoided.",
+        "ThreadPool threads are background threads: they do not keep the process alive, so a fire-and-forget item can be cut off at exit."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool"
+      ]
+    },
+    {
+      "variant_id": "threadpool-queueuserworkitem",
+      "name": "Raw ThreadPool.QueueUserWorkItem",
+      "paradigm": "oo",
+      "min_standard": "C#1",
+      "idiom_name": "ThreadPool.QueueUserWorkItem(callback, state)",
+      "implementation_notes": "The pre-TPL API: ThreadPool.QueueUserWorkItem(callback, state) posts one item to the shared pool. There is no Task to await, no result and no way to cancel a queued item, so completion has to be signalled by hand with CountdownEvent or ManualResetEventSlim. Use it only in code that cannot take a TPL dependency: Task.Run is the same mechanism with results, composition and cancellation layered on top.",
+      "code_sketch": "ThreadPool.QueueUserWorkItem(static state => Process((Job)state!), job);\n// completion must be signalled by hand: CountdownEvent / ManualResetEventSlim",
+      "pitfalls": [
+        "A raw pool callback that throws crashes the process: wrap the body in try/catch and report failures explicitly.",
+        "SetMaxThreads and SetMinThreads are process-global and can degrade unrelated components that share the pool."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool"
+      ]
+    },
+    {
+      "variant_id": "channel-worker-pool",
+      "name": "Dedicated bounded pool with Channel<T>",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "System.Threading.Channels"
+      ],
+      "idiom_name": "bounded Channel<T> + Task.Factory.StartNew(LongRunning) consumers",
+      "implementation_notes": "When the shared pool must stay free, or concurrency must be exactly N with a bounded, policy-controlled queue, build a private pool: a bounded Channel<T> as the task queue plus N consumers started with Task.Factory.StartNew(..., TaskCreationOptions.LongRunning) so they get dedicated threads instead of shared pool slots. ChannelOptions control capacity and full-mode (wait/drop/drop-oldest) and Complete() is the shutdown signal; this is the modern replacement for a hand-rolled BlockingCollection pool.",
+      "code_sketch": "var ch = Channel.CreateBounded<Job>(new BoundedChannelOptions(1_000)\n        { FullMode = BoundedChannelFullMode.Wait });\nvar workers = Enumerable.Range(0, 4).Select(_ => Task.Factory.StartNew(async () =>\n{\n    await foreach (var job in ch.Reader.ReadAllAsync()) Process(job);\n}, TaskCreationOptions.LongRunning)).ToArray();\nawait ch.Writer.WriteAsync(job);     // waits when the bounded queue is full\nch.Writer.Complete(); await Task.WhenAll(workers);",
+      "pitfalls": [
+        "LongRunning tasks are threads you now own: forgetting Complete() and awaiting the workers leaks them past shutdown.",
+        "An unbounded channel is the unbounded-queue trap again; size it and pick the full-mode behaviour deliberately so overload has a defined outcome."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/core/extensions/channels"
+      ]
+    }
+  ],
+  "default_variant": "task-run-tpl",
+  "version": "1.0"
+}

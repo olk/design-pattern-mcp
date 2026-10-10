@@ -1,0 +1,55 @@
+{
+  "pattern": "optimistic-offline-lock",
+  "language": "go",
+  "variants": [
+    {
+      "variant_id": "database-sql-rowcount-guard",
+      "name": "Hand-written database/sql guard",
+      "paradigm": "procedural",
+      "idiom_name": "db.ExecContext + Result.RowsAffected()",
+      "implementation_notes": "database/sql deliberately exposes no version tracking, so the guard is hand-written: Exec/ExecContext the conditional UPDATE and let Result.RowsAffected() decide - it returns the row count reported by the driver. Add RETURNING version on PostgreSQL to learn the new token in the same round trip, and keep the statement inside one tx (sql.Tx) so validation and write share a system transaction. The classic structure is replaced by one guarded statement plus an error value for the conflict.",
+      "code_sketch": "res, err := db.ExecContext(ctx,\n    `UPDATE account SET balance=$1, version=version+1\n      WHERE id=$2 AND version=$3`, newBalance, id, expected)\nif err != nil { return err }\nn, err := res.RowsAffected()\nif err != nil { return err }\nif n == 0 { return ErrStaleRow }   // someone else committed first",
+      "pitfalls": [
+        "Row counts are driver-dependent: MySQL reports 0 for an UPDATE that sets identical values unless CLIENT_FOUND_ROWS is set, so pair the guard with a version increment that always changes the row.",
+        "Ignoring RowsAffected()'s error hides drivers that refuse to report counts, and the conflict then goes undetected.",
+        "Without the version = version + 1 in the SET list the row keeps its token, so the next stale writer succeeds - a silent lost update."
+      ],
+      "sources": [
+        "https://pkg.go.dev/database/sql",
+        "https://go.dev/doc/database/execute-transactions"
+      ]
+    },
+    {
+      "variant_id": "gorm-optimisticlock-plugin",
+      "name": "GORM optimistic lock plugin",
+      "paradigm": "oo",
+      "idiom_name": "gorm.io/plugin/optimisticlock Version field + ErrOptimisticLock",
+      "implementation_notes": "GORM's optimisticlock plugin embeds a Version field (optimisticlock.Version) in the model; GORM then adds the version predicate to the UPDATE/DELETE it generates and increments the token, returning gorm.ErrOptimisticLock when no row matched. It moves the token into the struct, which is the idiomatic Go form of the EAA version column and needs no hand-written SQL for ordinary model writes.",
+      "code_sketch": "type Account struct {\n    ID      uint\n    Balance int\n    Version optimisticlock.Version\n}\n// ...\nif err := db.Save(&acct).Error; errors.Is(err, gorm.ErrOptimisticLock) {\n    // stale: re-read the row and retry or report\n}",
+      "pitfalls": [
+        "Only statements the plugin generates are guarded: db.Exec/Raw bypass the token entirely.",
+        "Save writes the whole struct while Update skips zero-value fields and does not update the version the same way - mixing the two produces spurious conflicts or unguarded writes.",
+        "The token is only as reliable as the struct it lives in: a model that forgets the Version field silently writes without any check."
+      ],
+      "sources": [
+        "https://pkg.go.dev/gorm.io/plugin/optimisticlock",
+        "https://github.com/go-gorm/optimisticlock"
+      ]
+    }
+  ],
+  "default_variant": "database-sql-rowcount-guard",
+  "idiom_name": "db.ExecContext + Result.RowsAffected()",
+  "implementation_notes": "database/sql deliberately exposes no version tracking, so the guard is hand-written: Exec/ExecContext the conditional UPDATE and let Result.RowsAffected() decide - it returns the row count reported by the driver. Add RETURNING version on PostgreSQL to learn the new token in the same round trip, and keep the statement inside one tx (sql.Tx) so validation and write share a system transaction. The classic structure is replaced by one guarded statement plus an error value for the conflict.",
+  "code_sketch": "res, err := db.ExecContext(ctx,\n    `UPDATE account SET balance=$1, version=version+1\n      WHERE id=$2 AND version=$3`, newBalance, id, expected)\nif err != nil { return err }\nn, err := res.RowsAffected()\nif err != nil { return err }\nif n == 0 { return ErrStaleRow }   // someone else committed first",
+  "pitfalls": [
+    "Row counts are driver-dependent: MySQL reports 0 for an UPDATE that sets identical values unless CLIENT_FOUND_ROWS is set, so pair the guard with a version increment that always changes the row.",
+    "Ignoring RowsAffected()'s error hides drivers that refuse to report counts, and the conflict then goes undetected.",
+    "Without the version = version + 1 in the SET list the row keeps its token, so the next stale writer succeeds - a silent lost update."
+  ],
+  "sources": [
+    "https://pkg.go.dev/database/sql",
+    "https://go.dev/doc/database/execute-transactions"
+  ],
+  "support": "library",
+  "version": "1.0"
+}

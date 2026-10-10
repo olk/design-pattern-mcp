@@ -1,0 +1,53 @@
+{
+  "pattern": "symbol-table-for-nested-scopes",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "Vec<HashMap<interned Symbol, Def>> as the open-scope stack",
+  "implementation_notes": "std ships the containers but not the pattern: the usual realization is a Vec<HashMap<Symbol, Def>> used as the open-scope stack (or parent-linked scopes in an arena) with interned symbols (a Symbol newtype over u32 plus a string interner) so keys are Copy and hashing is cheap; define inserts into the last frame, lookup iterates the frames in reverse, and Result or a bool carries duplicate and unresolved findings. What replaces the classic structure is the standard collections plus Rust's ownership discipline - scopes are owned values, the resolver owns them while walking, and later phases receive an immutable arena rather than a live stack. Keep the hand-written resolver for Rust-hosted compilers and tools; rustc's per-namespace rib stacks (Resolver::visit_scopes, arena-backed scopes addressed by IndexVec, separate ribs for types, values, macros and lifetimes) are the production-scale shape of the same idea, mirroring the second variant.",
+  "code_sketch": "type Symbol = u32;                                   // interned identifier\nstruct Resolver { scopes: Vec<HashMap<Symbol, Def>>, global: HashMap<Symbol, Def> }\nimpl Resolver {\n    fn define(&mut self, name: Symbol, def: Def) -> bool {\n        self.scopes.last_mut().unwrap().insert(name, def).is_none()   // dup -> false\n    }\n    fn lookup(&self, name: Symbol) -> Option<&Def> {                   // inner -> outer\n        self.scopes.iter().rev().find_map(|frame| frame.get(&name))\n            .or_else(|| self.global.get(&name))\n    }\n}",
+  "pitfalls": [
+    "The borrow checker fights a naive resolver: define needs &mut self while a lookup result borrows &self, so resolve to owned values or ids instead of holding references across a definition in the same pass.",
+    "Interning ties symbol identity to the interner's lifetime: the arena must outlive the resolver and every stored Def, and the default SipHash is wasteful for small integer ids - use an identity or FxHash-style hasher.",
+    "Collapsing name spaces breaks correctness: rustc keeps separate ribs for types, values, macros and lifetimes, so a single map per scope reports false duplicate definitions when a type and a value share a name."
+  ],
+  "sources": [
+    "https://rustc-dev-guide.rust-lang.org/name-resolution.html",
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "hashmap-scope-stack",
+      "name": "HashMap scope stack",
+      "paradigm": "oo",
+      "idiom_name": "Vec<HashMap<interned Symbol, Def>> as the open-scope stack",
+      "implementation_notes": "std ships the containers but not the pattern: the usual realization is a Vec<HashMap<Symbol, Def>> used as the open-scope stack (or parent-linked scopes in an arena) with interned symbols (a Symbol newtype over u32 plus a string interner) so keys are Copy and hashing is cheap; define inserts into the last frame, lookup iterates the frames in reverse, and Result or a bool carries duplicate and unresolved findings. What replaces the classic structure is the standard collections plus Rust's ownership discipline - scopes are owned values, the resolver owns them while walking, and later phases receive an immutable arena rather than a live stack. Keep the hand-written resolver for Rust-hosted compilers and tools; rustc's per-namespace rib stacks (Resolver::visit_scopes, arena-backed scopes addressed by IndexVec, separate ribs for types, values, macros and lifetimes) are the production-scale shape of the same idea, mirroring the second variant.",
+      "code_sketch": "type Symbol = u32;                                   // interned identifier\nstruct Resolver { scopes: Vec<HashMap<Symbol, Def>>, global: HashMap<Symbol, Def> }\nimpl Resolver {\n    fn define(&mut self, name: Symbol, def: Def) -> bool {\n        self.scopes.last_mut().unwrap().insert(name, def).is_none()   // dup -> false\n    }\n    fn lookup(&self, name: Symbol) -> Option<&Def> {                   // inner -> outer\n        self.scopes.iter().rev().find_map(|frame| frame.get(&name))\n            .or_else(|| self.global.get(&name))\n    }\n}",
+      "pitfalls": [
+        "The borrow checker fights a naive resolver: define needs &mut self while a lookup result borrows &self, so resolve to owned values or ids instead of holding references across a definition in the same pass.",
+        "Interning ties symbol identity to the interner's lifetime: the arena must outlive the resolver and every stored Def, and the default SipHash is wasteful for small integer ids - use an identity or FxHash-style hasher.",
+        "Collapsing name spaces breaks correctness: rustc keeps separate ribs for types, values, macros and lifetimes, so a single map per scope reports false duplicate definitions when a type and a value share a name."
+      ],
+      "sources": [
+        "https://rustc-dev-guide.rust-lang.org/name-resolution.html",
+        "https://doc.rust-lang.org/std/collections/struct.HashMap.html"
+      ]
+    },
+    {
+      "variant_id": "arena-indexed-resolver",
+      "name": "rustc-style arena and rib stack",
+      "paradigm": "data-oriented",
+      "idiom_name": "rustc-style rib stack over IndexVec arenas (one rib per namespace)",
+      "implementation_notes": "rustc's resolver models the same pattern data-oriented instead of with nested maps: resolution runs in phases with a hierarchical, per-namespace rib stack (each scope pushes a Rib and lookups walk from the innermost rib outward), scope data lives in arenas addressed by ids, and Resolver::visit_scopes is the generic outward walk behind identifier resolution. Choosing this variant means ids instead of references (no borrow tangles, cheap to store in the HIR), compact per-namespace ribs, and a resolver that scales to a whole crate. The cost is more machinery before the first symbol is defined, plus id-validity discipline: ids must not outlive the arena generation they came from, and every lookup must filter by namespace or it will find the wrong kind of name.",
+      "code_sketch": "struct Resolver { ribs: IndexVec<RibId, Rib>, scopes: IndexVec<ScopeId, ScopeData> }\nstruct Rib { namespace: Namespace, bindings: Vec<(Symbol, DefId)>, parent: Option<RibId> }\nfn resolve(&self, from: RibId, ns: Namespace, name: Symbol) -> Option<DefId> {\n    std::iter::successors(Some(from), |r| self.ribs[*r].parent)\n        .filter(|r| self.ribs[*r].namespace == ns)\n        .find_map(|r| self.ribs[r].bindings.iter().rev()\n            .find(|(n, _)| *n == name).map(|(_, d)| *d))\n}",
+      "pitfalls": [
+        "Ids must be validated by construction: a stale RibId from an earlier expansion or phase resolves against the wrong frame, so ids must not outlive their arena.",
+        "Per-namespace ribs duplicate the traversal: a lookup that forgets to filter by namespace finds a type where a value was meant, which is exactly why rustc's scope sets carry the namespace."
+      ],
+      "sources": [
+        "https://rustc-dev-guide.rust-lang.org/name-resolution.html"
+      ]
+    }
+  ],
+  "default_variant": "hashmap-scope-stack",
+  "version": "1.0"
+}

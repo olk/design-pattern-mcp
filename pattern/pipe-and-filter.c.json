@@ -1,0 +1,56 @@
+{
+  "pattern": "pipe-and-filter",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pipe(2) + fork(2)/dup2(2) stages, one process per filter",
+  "implementation_notes": "C has no pipeline abstraction: the classic POSA structure is hand-built from pipe(2) file-descriptor pairs, fork(2), dup2(2) onto stdin/stdout and exec, so each filter is a real process connected to its neighbours by kernel pipes. The pipe buffer is the only backpressure mechanism (writes block when the buffer is full, PIPE_BUF guarantees atomicity for small writes) and the record contract is an undelimited byte stream, which the filters must frame themselves. Prefer this form when stage isolation, unprivileged service accounts, existing executables or crash containment matter; use an in-process filter chain when the fork/exec cost per record is not affordable.",
+  "code_sketch": "int fds[2];\npipe(fds);                    /* fds[0] = read end, fds[1] = write end */\nif (fork() == 0) {            /* child becomes the next filter */\n    dup2(fds[0], STDIN_FILENO);\n    close(fds[1]); close(fds[0]);\n    execlp(\"gzip\", \"gzip\", \"-c\", (char *)NULL);\n}\nclose(fds[0]);                /* parent = source stage */\nwrite(fds[1], buf, n);\nclose(fds[1]);                /* EOF downstream */\nwait(NULL);",
+  "pitfalls": [
+    "Every process must close the end of the pipe it does not use; an open write end keeps the reader from ever seeing EOF and the pipeline hangs.",
+    "write(2) may write fewer bytes than requested, and a reader that exited early turns further writes into SIGPIPE/EPIPE - both conditions have to be handled explicitly.",
+    "A pipe carries bytes without record framing, so filters must agree on a delimiter or length prefix, and PIPE_BUF (often 4 KiB) is the limit for atomic interleaved writes."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man2/pipe.2.html",
+    "https://man7.org/linux/man-pages/man3/popen.3.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "posix-process-pipeline",
+      "name": "POSIX process pipeline (pipe/fork/dup2/exec)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "pipe(2) + fork(2)/dup2(2) stages, one process per filter",
+      "implementation_notes": "C has no pipeline abstraction: the classic POSA structure is hand-built from pipe(2) file-descriptor pairs, fork(2), dup2(2) onto stdin/stdout and exec, so each filter is a real process connected to its neighbours by kernel pipes. The pipe buffer is the only backpressure mechanism (writes block when the buffer is full, PIPE_BUF guarantees atomicity for small writes) and the record contract is an undelimited byte stream, which the filters must frame themselves. Prefer this form when stage isolation, unprivileged service accounts, existing executables or crash containment matter; use an in-process filter chain when the fork/exec cost per record is not affordable.",
+      "code_sketch": "int fds[2];\npipe(fds);                    /* fds[0] = read end, fds[1] = write end */\nif (fork() == 0) {            /* child becomes the next filter */\n    dup2(fds[0], STDIN_FILENO);\n    close(fds[1]); close(fds[0]);\n    execlp(\"gzip\", \"gzip\", \"-c\", (char *)NULL);\n}\nclose(fds[0]);                /* parent = source stage */\nwrite(fds[1], buf, n);\nclose(fds[1]);                /* EOF downstream */\nwait(NULL);",
+      "pitfalls": [
+        "Every process must close the end of the pipe it does not use; an open write end keeps the reader from ever seeing EOF and the pipeline hangs.",
+        "write(2) may write fewer bytes than requested, and a reader that exited early turns further writes into SIGPIPE/EPIPE - both conditions have to be handled explicitly.",
+        "A pipe carries bytes without record framing, so filters must agree on a delimiter or length prefix, and PIPE_BUF (often 4 KiB) is the limit for atomic interleaved writes."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/pipe.2.html",
+        "https://man7.org/linux/man-pages/man3/popen.3.html"
+      ]
+    },
+    {
+      "variant_id": "in-process-filter-chain",
+      "name": "In-process filter chain (function-pointer stages)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "array of int (*stage)(FILE *in, FILE *out) driven by a loop",
+      "implementation_notes": "The same pattern without processes: every filter is a function with the uniform signature int stage(FILE *in, FILE *out), the driver loops over an array of stage descriptors and hands each stage's output to the next through tmpfile(), a memstream or a bounded ring buffer, so the pipe becomes an in-memory buffer. It removes fork/exec cost and works where processes are unavailable (embedded, freestanding), at the price of one address space: a buggy stage can corrupt or crash the whole pipeline and there is no privilege or resource isolation between stages.",
+      "code_sketch": "typedef int (*stage_fn)(FILE *in, FILE *out);\nstruct stage { stage_fn run; const char *name; };\nstatic const struct stage chain[] = {\n    {drop_comments, \"drop-comments\"},\n    {normalise,     \"normalise\"},\n};\nFILE *buf = fopen(input_path, \"r\");\nfor (size_t i = 0; i < sizeof chain / sizeof *chain; i++) {\n    FILE *next = tmpfile();\n    if (chain[i].run(buf, next) != 0) die(chain[i].name);\n    rewind(next); fclose(buf); buf = next;\n}",
+      "pitfalls": [
+        "tmpfile()-based hand-off materialises each stage's whole output, so memory or disk grows with the data set - use real pipes or a bounded ring buffer when streaming matters.",
+        "Reporting failure only by return code loses the cause: agree on an error channel (stderr convention, out-of-band result struct) before the chain grows, or every stage invents its own."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/tmpfile.3.html",
+        "https://man7.org/linux/man-pages/man2/pipe.2.html"
+      ]
+    }
+  ],
+  "default_variant": "posix-process-pipeline"
+}

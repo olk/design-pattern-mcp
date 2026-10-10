@@ -1,0 +1,207 @@
+{
+  "category": "interaction-boundary",
+  "name": "correlation-identifier",
+  "aliases": [
+    "correlation id",
+    "correlation-id",
+    "request id",
+    "trace id"
+  ],
+  "intent": "Give every request a unique request id and have the replier echo it as the correlation id of the reply, so a requestor with many requests in flight can match each reply to the request that caused it without per-request channels, sessions or shared state.",
+  "problem": "A requestor multiplexes several requests over one shared channel or connection — or one reply queue serves many clients — so replies can arrive out of order, on an arbitrary thread and with nothing in the transport that says which request they answer. Without an identifier the requestor cannot tell which waiting caller should receive a reply, or silently mis-delivers it, and a late reply to an abandoned request corrupts the next one.",
+  "context": "Message-based request-reply over a shared reply path: one callback queue per client (AMQP/JMS), one duplex connection carrying many concurrent exchanges (JSON-RPC over WebSocket, a custom TCP or binary protocol), an actor mailbox, or an in-process dispatch loop with many outstanding calls. It also applies when replies traverse intermediaries that do not preserve ordering, and to distributed tracing, where the identifier travels in a header so spans in different services can be stitched into one trace. In event-driven systems the same pattern stitches commands to their resulting events across service boundaries.",
+  "benefits": [
+    "One reply channel or connection serves arbitrarily many concurrent requestors: no per-request queue, port or temporary actor has to be created, named and torn down.",
+    "Replies may arrive out of order, from any worker or replica and on any thread — the identifier, not the transport, carries the association, so repliers stay free to answer with whatever capacity they have.",
+    "The replier stays stateless with respect to the requestor: it copies one field and needs no session, no knowledge of who is waiting and no coupling to the requestor's concurrency model.",
+    "Unknown and duplicate replies become handleable events instead of corruption: an id with no pending entry is logged and dropped, and a re-delivered reply is recognisable, which is what makes a redelivering replier safe.",
+    "The identifier is copyable into logs, metrics and traces, so one logical request can be followed across hops and correlated between systems.",
+    "Because the association is data rather than topology, requestors and repliers scale out independently: adding a requestor does not change the routing configuration.",
+    "In event-driven systems, the same identifier chains events to their originating command, enabling full causation and effect tracing across topics and services."
+  ],
+  "tradeoffs": [
+    "The identifier becomes part of the wire contract: every message shape and every intermediary must carry it, and a hop that strips or renames the field breaks matching silently — the failure shows up as a timeout or a wrong payload, not as a connection error.",
+    "Pending state must be reclaimed: each outstanding request owns an entry in the requestor's table, and a reply that never arrives leaves it behind unless a deadline removes it, so an unbounded map is a real failure mode.",
+    "Uniqueness discipline is mandatory: ids recycled after a restart, or generated per connection instead of per request, let a stale reply satisfy a fresh request — a substitution that is very hard to diagnose in production.",
+    "A timeout policy stops being optional: the requestor must define the missing-reply outcome (fail the caller, raise a domain error, cancel), and the pattern adds that bookkeeping to every call site.",
+    "Late replies must be tolerated after the caller gave up: the id has to stay reserved long enough (or delivery made idempotent) so a reply arriving after the deadline is dropped rather than handed to a subsequent request.",
+    "A correlation id is easily mistaken for a credential — a guessable id lets a foreign reply be routed into a waiting caller, so the field must never be treated as proof of ownership.",
+    "Debugging moves from connectivity to data: transport logs look healthy while the actual fault is a rewritten id, a duplicate reply or an entry that was never registered.",
+    "In async messaging (Kafka, SQS), the id must be placed in message headers or envelope metadata — not only in the payload — so brokers and consumers can read it without deserializing the full body."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 7,
+    "performance": 8,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Requestor",
+      "responsibility": "Allocates the request id, keeps the correlation table (id -> waiting caller), applies the deadline and decides what a missing reply means."
+    },
+    {
+      "role": "Replier",
+      "responsibility": "Receives the request, fulfils it and copies the request id into the reply's correlation field; holds no state about the requestor."
+    },
+    {
+      "role": "Request",
+      "responsibility": "The message sent by the requestor, carrying the request id and the address the reply must go to."
+    },
+    {
+      "role": "Reply",
+      "responsibility": "The message sent by the replier, carrying a correlation id whose value equals the request id."
+    },
+    {
+      "role": "Request ID",
+      "responsibility": "Token that uniquely identifies the request — unique per requestor at least, globally if replies from different peers could collide."
+    },
+    {
+      "role": "Correlation ID",
+      "responsibility": "The same token carried back in the reply; the key that selects the waiting caller and the single-delivery gate for the reply."
+    },
+    {
+      "role": "Causation ID",
+      "responsibility": "(Event-driven systems) Points to the immediate parent message's id: a command's id becomes the causation_id of the event it produces, and an event's id becomes the causation_id of the next command. Enables walking the full causal chain. contrast with correlation_id which stays constant across the entire business operation."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "RPC over a shared queue: one callback queue per client and the AMQP correlation_id (or JMS JMSCorrelationID) property selecting the pending call — the mechanism the RabbitMQ RPC tutorial is built around.",
+    "Multiplexing thousands of request/response exchanges over one duplex connection — JSON-RPC over WebSocket, a binary protocol, or a database driver pipelining statements — where a request id in each frame is the only association available.",
+    "Actor ask: a temporary actor (Akka ask, Erlang-style reply ref) or a request id echoed in the protocol ties the response back to the sender's future when the protocol has no reply correlation of its own.",
+    "Batched or long-polling transports that pack several requests into one round trip and dispatch the responses by identifier.",
+    "Distributed tracing: the W3C trace-context header carries trace-id and parent-id across service hops so spans produced by different processes can be stitched into a single trace.",
+    "In-process hand-off between callers and a shared dispatch loop: a promise/future/continuation table keyed by the id (tokio oneshot senders in a map, TaskCompletionSource in a dictionary, CompletableDeferred in a coroutine map) when one reader serves many waiters.",
+    "Event-driven choreography: a command event carries a correlation_id (constant across the entire operation) and a causation_id (pointing to the immediate parent). The responding service echoes the correlation_id in the reply event, preserving the chain across Kafka topics or message buses.",
+    "Saga orchestration: each step of a saga carries the saga's correlation id so compensating transactions can be identified and correlated to the original saga instance even across service restarts.",
+    "Webhook and callback integrations: an external service calls back with a correlation id that the original sender minted, so the callback can be routed to the right pending handler without a registered endpoint.",
+    "Database driver request pipelining: multiple SQL statements are sent in one network round-trip and responses are dispatched back to the correct awaiter by the server-supplied request id.",
+    "Azure Service Bus makes the pattern a broker feature: the sender sets MessageId and ReplyTo, the consumer replies to the ReplyTo destination and copies the request's MessageId into the reply's CorrelationId (correlation-id header) — the documented simple request/reply mechanic.",
+    "Envoy mints a UUID x-request-id for every external request, preserves it on internal hops (governed by generate_request_id, use_remote_address and preserve_external_request_id) and binds it to access logs and trace sampling — the request id generated once at the edge and propagated by every host."
+  ],
+  "avoid_when": [
+    "The transport already pairs responses with requests — a dedicated channel per call, an HTTP exchange, a gRPC stream — then the association is provided and an extra identifier only adds protocol weight.",
+    "Only one request is ever in flight per channel (blocking client, request-then-receive loop): sequential receive logic is simpler and cannot mis-correlate.",
+    "A framework already correlates for you (Spring AMQP convertSendAndReceive, Camel request-reply, gRPC, RMI, most RPC stubs): a hand-written pending table duplicates its bookkeeping and can disagree with it.",
+    "The messages are fire-and-forget events with no reply: correlation ids add contract surface for nothing, and a trace id is the right instrument for observability instead.",
+    "A natural domain key is already unique per outstanding request (per order, per job, per device): reuse it as the correlation key rather than minting a synthetic id and maintaining a second identity space.",
+    "The system is strictly synchronous with no async boundaries: a direct function call needs no correlation — the call stack already provides the association."
+  ],
+  "language_files": {
+    "generic": "correlation-identifier.generic.json",
+    "c": "correlation-identifier.c.json",
+    "cplusplus": "correlation-identifier.cplusplus.json",
+    "csharp": "correlation-identifier.csharp.json",
+    "go": "correlation-identifier.go.json",
+    "java": "correlation-identifier.java.json",
+    "javascript": "correlation-identifier.javascript.json",
+    "kotlin": "correlation-identifier.kotlin.json",
+    "python": "correlation-identifier.python.json",
+    "ruby": "correlation-identifier.ruby.json",
+    "rust": "correlation-identifier.rust.json",
+    "scala": "correlation-identifier.scala.json",
+    "swift": "correlation-identifier.swift.json",
+    "typescript": "correlation-identifier.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "request-reply",
+    "return-address",
+    "message",
+    "message-sequence",
+    "message-expiration",
+    "timeout",
+    "aggregator",
+    "idempotent-receiver",
+    "process-manager",
+    "dead-letter-channel",
+    "circuit-breaker"
+  ],
+  "anti_patterns": [
+    "Using the correlation id as an authorization or ownership token: any peer that can guess, observe or replay the id can have its reply routed into a waiting caller.",
+    "A dedicated reply queue or connection per request where one shared reply path plus a correlation id would do — recreating exactly the resource churn the pattern removes.",
+    "Registering the pending entry after sending the request, so a fast reply arrives before the table knows the id and is discarded as unknown.",
+    "Correlation entries with no deadline and no removal path: the requestor's table grows with every unanswered request.",
+    "Falling back to 'the most recent outstanding request' when an id does not resolve, which converts out-of-order arrival into silent mis-delivery instead of a visible drop.",
+    "Trusting the correlation field from an untrusted peer without validating its form or binding it to a pending request (log injection, cross-subsystem id collisions).",
+    "Conflating correlation id with trace id: a correlation id groups a business conversation; a trace id links execution spans in a distributed trace. Using them interchangeably loses the hierarchy that trace id provides and the business continuity that correlation id provides.",
+    "Conflating correlation id with message id: message ids are per-message and change when intermediaries insert new messages; correlation ids are conversation-scoped and travel with the business flow regardless of hops.",
+    "Inventing custom headers (e.g., X-Company-Trace) without a translation plan at every edge: breaks propagation through proxies, service meshes and third-party consumers. Prefer W3C traceparent.",
+    "Generating a new correlation id at every service hop instead of propagating the inbound one: fragments the trace and breaks end-to-end correlation.",
+    "Using sequential counters as request ids without a process-unique prefix: after a restart the counter resets and late replies can collide with fresh requests."
+  ],
+  "design_principles": [
+    "Information hiding: the association between a reply and its request travels in the message, so no participant needs to know another's internal waiting state.",
+    "Single responsibility: the replier's only duty towards correlation is copying the request id; it stores nothing about the requestor.",
+    "Loose coupling: requestor and replier share one field of a message contract instead of a channel topology, a session or a connection.",
+    "Statelessness of the replier as a scaling principle: any replica can answer any request because the pending state stays on the requestor side.",
+    "Explicit failure contract: every request carries its own deadline and the requestor defines the missing-reply outcome.",
+    "Propagate, do not regenerate: the correlation id generated at the system boundary must reach every downstream service unchanged; each service is a steward, not an origin.",
+    "Separate concerns: the return address says where the reply goes; the correlation id says which request it answers; the causation id says what triggered this message — three distinct fields serving distinct purposes."
+  ],
+  "best_practices": [
+    "Put the identifier in a reserved header or message property (AMQP correlation_id, JMS JMSCorrelationID, MSMQ CorrelationId, HTTP traceparent, or Kafka/NATS message headers) rather than inside the payload, so brokers, proxies and tracing tools can see it without deserializing the body.",
+    "Generate ids that are unique per requestor and never reused across restarts (UUIDv4, ULID, snowflake, or a counter with a process-unique prefix) and copy them verbatim into the reply. Prefer cryptographic randomness over sequential counters for unguessability.",
+    "Register the pending entry before publishing the request and remove it in a finally/defer block so timeout and cancellation cannot leak it.",
+    "Pair every entry with a deadline and a defined timeout outcome; treat a reply that arrives after the timeout as an expected event (log and drop, or keep the id reserved for a short grace period).",
+    "Discard unknown correlation ids gracefully instead of failing, and make repliers idempotent so a redelivered request cannot produce a second logical result.",
+    "Keep the return address and the correlation id as separate concerns: the address says where the reply goes, the id says which request it answers.",
+    "Bind the id to logs, metrics and traces the moment it enters the system, so every line and span of that request inherits it. Use structured logging fields (trace_id, span_id, correlation_id) rather than embedding in free-text log messages.",
+    "In event-driven systems, propagate both correlation_id (constant for the whole business operation) and causation_id (immediate parent) through Kafka/NATS message headers so the full causal chain is reconstructable.",
+    "Prefer W3C trace-context headers (traceparent/tracestate) as the correlation vehicle for HTTP-based flows and OpenTelemetry instrumentation; fall back to X-Correlation-ID only when W3C headers are not supported.",
+    "Generate the correlation id at the edge (API gateway or first service) if no valid inbound id exists; reuse an inbound id from a trusted caller to preserve end-to-end traceability.",
+    "Treat the correlation id as non-sensitive but unguessable: do not embed PII, session secrets or authorization tokens in it, and validate its format when received from an untrusted source.",
+    "When using OpenTelemetry, rely on the SDK's built-in context propagation via W3C Trace Context propagators rather than manually threading ids through call sites; configure the propagator to inject/extract in HTTP headers and messaging carriers uniformly.",
+    "For long-running workflows (sagas, batch pipelines), attach the correlation id to every step so compensating transactions and retry cycles can be correlated back to the originating request even after a service restart."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) — Message Construction chapter, Correlation Identifier; the pattern is documented there as six participants (Requestor, Replier, Request, Reply, Request ID, Correlation ID).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/CorrelationIdentifier.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/RequestReply.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/RequestReplyNetExample.html",
+    "https://www.enterpriseintegrationpatterns.com/ramblings/09_correlation.html — Correlation and Conversations: why Message ID is not sufficient when intermediaries are present.",
+    "https://www.rabbitmq.com/tutorials/tutorial-six-python",
+    "https://www.w3.org/TR/trace-context/ — W3C Trace Context Level 1: traceparent and tracestate headers for distributed tracing.",
+    "https://www.w3.org/TR/trace-context-2/ — W3C Trace Context Level 2: propagation requirements, trace-id generation guidance, privacy and security considerations.",
+    "https://opentelemetry.io/docs/concepts/context-propagation/ — OpenTelemetry context propagation: inject/extract pattern, W3C Trace Context as default propagator, baggage for cross-service context.",
+    "https://developer.confluent.io/patterns/event/correlation-identifier/ — Correlation Identifier pattern applied to Kafka: request event header correlation in an event-driven architecture.",
+    "https://docs.proteanhq.com/patterns/message-tracing/ — Two-field tracing in event-driven systems: correlation_id (business-operation constant) and causation_id (immediate parent), with trace_causation and trace_effects utilities.",
+    "https://docs.axonframework.org/5.3/messaging-concepts/message-correlation/ — Axon Framework correlationId (traceId equivalent) and causationId for event-sourced workflow tracing.",
+    "https://microsoft.github.io/code-with-engineering-playbook/observability/correlation-id/ — Microsoft Engineering Playbook: correlation ID best practices, OpenTelemetry alignment, early generation and propagation.",
+    "https://alokknight.com/blog/system-design-correlation-id — Correlation ID in system design: generation at edge, W3C traceparent propagation, structured logging, distinction from trace id and span id.",
+    "https://blog.miszczak.dev/post/logs-correlation/ — Log correlation via traceId: structured logging injection, IoC/request-scoped context, AsyncLocal and AsyncHooks patterns.",
+    "https://last9.io/blog/correlation-id-vs-trace-id/ — Correlation ID vs Trace ID: when each applies, common pitfalls of interchangeability, combined usage with OpenTelemetry.",
+    "https://www.mytheon.dev/blog/trace-id-is-not-transaction-id/ — Trace ID vs Transaction ID: don't conflate business keys with execution tracing keys; anti-patterns of custom header proliferation.",
+    "https://codelit.io/blog/distributed-tracing-context-propagation — W3C Trace Context propagation across HTTP, gRPC, Kafka and AMQP; cross-service correlation strategies.",
+    "https://www.informit.com/articles/article.aspx?p=1398616&seqNum=6 — EIP chapter excerpt (Message Construction): Correlation Identifier mechanics, and its reading as the messaging form of the POSA2 Asynchronous Completion Token pattern.",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-messages-payloads — Azure Service Bus message properties: CorrelationId (correlation-id header) with MessageId and ReplyTo implementing request/reply correlation.",
+    "https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/headers — Envoy HTTP header manipulation: x-request-id generation, preservation and use for stable access logging and trace sampling.",
+    "https://codenotes.tech/blog/correlation-ids-in-microservices — Correlation IDs in microservices: failure patterns (local id mistaken for workflow id, queue/DLQ propagation gaps), validation at trust boundaries, and why correlation alone cannot explain latency or causality.",
+    "https://abstractopedia.org/mechanisms/correlation_trace_header/ — Correlation Trace Header: strict propagate-through-middleware discipline, correlation id as non-deduplicable metadata, and the false-confidence failure when propagation silently breaks."
+  ],
+  "related_patterns_notes": {
+    "event-choreography": "event-choreography",
+    "event-sourcing": "event-sourcing",
+    "outbox": "outbox"
+  }
+}

@@ -1,0 +1,158 @@
+{
+  "category": "interaction-boundary",
+  "name": "message-expiration",
+  "aliases": [
+    "message TTL",
+    "expiring message"
+  ],
+  "intent": "Attach a time limit to a message so that the messaging system and the receiver can discard it once it is no longer viable, instead of delivering work whose result has stopped being meaningful.",
+  "problem": "A message that arrived too late is worse than no message: its data or request no longer describes reality, yet the receiver cannot tell 'late' from 'still valid' unless the sender said so. Queues, retry cycles and durable subscriptions therefore keep carrying work nobody wants, and request-reply partners wait for answers that no longer matter.",
+  "context": "Asynchronous messaging where delivery is not real-time: brokers with backlog and dead-letter paths, retry pipelines, durable subscriptions, off-peak batching, and any request-reply exchange with a bounded waiting period. Applying it requires a sender that can state the freshness requirement, an enforcement point (broker TTL or consumer check), and - to stay observable - a destination for expired messages.",
+  "benefits": [
+    "Bounds staleness at the source: the sender declares how long its data stays meaningful, so consumers never have to guess whether an old message is still worth processing.",
+    "Turns 'too late' from a receiver-side judgement call into a policy the messaging system enforces once, for every consumer of the channel.",
+    "Protects channel and consumer resources: expired work is dropped or dead-lettered instead of being processed, replayed or retried forever.",
+    "Keeps request-reply bounded: paired with Request-Reply and Correlation Identifier, expiry lets the sender stop waiting and lets a late reply be discarded instead of misapplied.",
+    "Makes lateness observable: routing expired messages to a Dead Letter Channel (or emitting a TTL notice) yields metrics and an audit trail, where an overloaded queue otherwise shows only growing depth.",
+    "Bounds retry policies with a single absolute deadline, so requeued work cannot outlive its usefulness."
+  ],
+  "tradeoffs": [
+    "Choosing the TTL is a guess and both errors are real: too short discards work that would still have been useful, too long lets stale work through, and the right value drifts with load.",
+    "Expiry is only as good as its clock discipline: a wire deadline must be an absolute timestamp against bounded skew, while a process-local monotonic deadline cannot be serialized - mixing the two yields random drops or immortal messages.",
+    "Broker enforcement is lazy and coarse: RabbitMQ removes expired messages only when they reach the queue head and the JMS specification defines no accuracy guarantee, so expired payloads still occupy queue memory until they surface.",
+    "Silent discard is the default failure mode: without a Dead Letter Channel, reason code or metric, an expired message is indistinguishable from a lost one, and the pattern quietly converts delivery into data loss.",
+    "Dead-letter queues are not an exit: they accumulate on their own (Azure Service Bus does not evaluate TTL inside the DLQ), so expiry without a reconciliation process just moves the backlog.",
+    "In-flight windows suspend expiry (Azure Service Bus does not expire a locked message), so a slow consumer still processes stale work unless it re-checks expiration itself.",
+    "Enforcement machinery has a cost: per-message timers or an expiry index add wakeups, memory and their own failure modes (timer drift, bursty expiry, unbounded index growth) that can outweigh the pattern for short-lived local queues."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 5,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Sender",
+      "responsibility": "Stamps the message with its expiration - a duration or, preferably, an absolute deadline - or relies on the destination default; owns the freshness requirement because only the sender knows how long the content stays true."
+    },
+    {
+      "role": "Message",
+      "responsibility": "Carries the expiration as metadata (JMSExpiration, the AMQP expiration/ttl header, a deadline field in the payload); once the time has passed it is semantically void and must not be processed."
+    },
+    {
+      "role": "Messaging System (Channel)",
+      "responsibility": "Enforces expiry at entity or message level - discarding the message or routing it to a dead-letter path - and may suspend expiry while a message is locked for delivery."
+    },
+    {
+      "role": "Receiver (Consumer)",
+      "responsibility": "Last line of defence: re-checks the expiration on arrival and again before irreversible side effects, discarding messages that expired in queue or in flight, because a transport cannot revoke a message it already delivered."
+    },
+    {
+      "role": "Dead Letter Channel and Operations",
+      "responsibility": "Receives expired messages with a distinguishable reason (TTLExpiredException, expired-reason) and provides the visibility - alerts, inspection, replay decisions - without which expiry is silent data loss."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Request-reply over messaging: quotes, confirmations or RPC-style answers that must not be applied after the waiting period has ended.",
+    "Market data, telemetry and sensor readings where a late value is not merely old but wrong (price ticks, positions, bidding rounds).",
+    "Time-boxed workflow steps: approvals, SLA escalations and reservations whose window closes at a known instant.",
+    "Cache or read-model update messages that must not overwrite newer state once superseded.",
+    "Poison-message and retry handling that bounds the total age of a message so it cannot be requeued past its usefulness.",
+    "Publish-subscribe retention for durable subscribers, where a backlog is kept only as long as replaying it is legitimate (Google Pub/Sub message_retention_duration).",
+    "In-process work queues (thread pools, actor mailboxes, async mailboxes) where an item produced by a request that has already timed out must not be executed.",
+    "RabbitMQ queues with x-message-ttl or per-message expiration plus a dead-letter exchange, where queue-head evaluation and per-queue copies make the expiry enforcement boundary explicit.",
+    "Azure Service Bus queues and topics with per-message TimeToLive bounded by DefaultTimeToLive and TTLExpiredException dead-lettering, for commands or replies whose usefulness ends at an enqueue-time deadline.",
+    "Google Cloud Pub/Sub subscriptions with message-retention-duration (and optional acknowledged-message retention), for bounded replay of durable-subscription backlogs; pair retention with consumer-side freshness checks when old events must not be applied."
+  ],
+  "avoid_when": [
+    "Late delivery is still valuable (event logs, audit trails, archival ingestion): expiry silently deletes history - use durable channels and archive instead.",
+    "The real requirement is a caller-side timeout, not a message policy: if the sender merely wants to stop waiting, use Request-Reply with a timeout and cancellation, so a late answer is still recorded.",
+    "Messages are idempotent and their value does not decay (recompute notifications, configuration pushes): a version check is cheaper than a temporal policy.",
+    "Relevance is not a function of time: when the consumer can decide from content (version, sequence, supersedes field), use optimistic concurrency instead of clocks.",
+    "There is no enforcement point and no destination for expired messages: silent drops hide bugs, so prefer backpressure, bounded queues and explicit load shedding."
+  ],
+  "language_files": {
+    "generic": "message-expiration.generic.json",
+    "c": "message-expiration.c.json",
+    "cplusplus": "message-expiration.cplusplus.json",
+    "csharp": "message-expiration.csharp.json",
+    "go": "message-expiration.go.json",
+    "java": "message-expiration.java.json",
+    "javascript": "message-expiration.javascript.json",
+    "kotlin": "message-expiration.kotlin.json",
+    "python": "message-expiration.python.json",
+    "ruby": "message-expiration.ruby.json",
+    "rust": "message-expiration.rust.json",
+    "scala": "message-expiration.scala.json",
+    "swift": "message-expiration.swift.json",
+    "typescript": "message-expiration.typescript.json"
+  },
+  "paradigm": [
+    "declarative",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "dead-letter-channel",
+    "invalid-message-channel",
+    "guaranteed-delivery",
+    "durable-subscriber",
+    "request-reply",
+    "correlation-identifier",
+    "deadline-propagation",
+    "timeout"
+  ],
+  "anti_patterns": [
+    "TTL as load shedding: shortening expiration to drop work under pressure instead of applying backpressure or scaling, so the queue looks healthy while results are lost.",
+    "Wall-clock deadlines compared across machines with no clock discipline, turning expiry into random drops and random stale processing.",
+    "One entity-level default TTL for every message class, silently capping per-message values, so long- and short-lived messages both get the wrong policy.",
+    "Expiring messages with no dead-letter channel, reason code or metric, then treating the vanished work as handled.",
+    "\"Just this once\" processing of a message already found to be expired, which reintroduces exactly the staleness the pattern exists to prevent.",
+    "Mixing clocks inside one system - broker TTL on the broker's wall clock, consumer check on a monotonic deadline - so the two disagree about what is expired."
+  ],
+  "design_principles": [
+    "Explicit freshness contract: the sender states the requirement, the transport enforces it, the consumer verifies it - policy separated from mechanism.",
+    "Fail closed on staleness: a message past its deadline is treated as never sent, never as 'probably still fine'.",
+    "Single source of time per comparison: monotonic locally, absolute UTC on the wire, with skew an explicit and documented allowance.",
+    "Observability of loss: every discarded message must be countable and attributable (reason code, dead-letter destination), because expiry deliberately creates losses.",
+    "Bounded resources: expiry keeps queues, retries and consumer capacity proportional to the work that still matters."
+  ],
+  "best_practices": [
+    "Derive the expiration from the message's semantic deadline, not from an arbitrary default, and document the policy per message type.",
+    "Put an absolute UTC deadline (epoch milliseconds or ISO-8601) on the wire and convert to a monotonic local deadline once per hop, recording the skew that is accepted.",
+    "Configure a Dead Letter Channel with a distinguishable reason (TTLExpiredException, expired) and alert on its growth; expiry without a destination is data loss.",
+    "Re-check expiration at the consumer before processing and again before irreversible side effects, because locks and in-flight windows suspend broker expiry.",
+    "Bound retries by the same deadline, so a requeued message cannot outlive its usefulness.",
+    "Test expiry paths with an injected clock (TimeProvider, paused runtimes, fake timers) so timing behaviour is deterministic in CI.",
+    "Treat clock synchronisation as an operational dependency: NTP-synchronised hosts, or a documented maximum skew within which late processing is still acceptable."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Messaging Solutions (2003) - Message Expiration (Message Construction chapter, pp. 176-179).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageExpiration.html",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-expiration",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/enable-dead-letter",
+    "https://www.rabbitmq.com/docs/ttl",
+    "https://www.rabbitmq.com/docs/dlx",
+    "https://www.informit.com/articles/article.aspx?p=1398616&seqNum=8",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-dead-letter-queues",
+    "https://docs.cloud.google.com/pubsub/docs/subscription-message-retention",
+    "https://adhdecode.com/debugging/amqp/amqp-message-ttl/"
+  ]
+}

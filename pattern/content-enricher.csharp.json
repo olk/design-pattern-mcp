@@ -1,0 +1,56 @@
+{
+  "pattern": "content-enricher",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "IMutateIncomingMessages / IMutateOutgoingMessages mutator",
+  "implementation_notes": "In .NET the enrichment hook is the messaging framework's pipeline: NServiceBus message mutators (IMutateIncomingMessages/IMutateOutgoingMessages) and MassTransit-style filters run after deserialization and before the handlers, which is where looked-up data or context is merged into the message. The framework owns only the insertion point - the lookup and merge are hand-written - so inject the resource accessor (DbContext, HttpClient, IMemoryCache) into the mutator and keep it unit-testable. Serilog's Enrich.With... pipeline is the same idea applied to log events, which is why 'enricher' is familiar vocabulary in .NET.",
+  "code_sketch": "class CustomerEnricher : IMutateIncomingMessages {\n    readonly ICustomerSource source;\n    public CustomerEnricher(ICustomerSource source) => this.source = source;\n\n    public async Task MutateIncoming(MutateIncomingMessageContext context) {\n        var order = (OrderPlaced)context.Message;\n        order.CustomerName = await source.NameOfAsync(order.CustomerId);\n        context.Message = order;      // pipeline continues with the enriched instance\n    }\n}\n// endpointConfiguration.RegisterMessageMutator(new CustomerEnricher(source));",
+  "pitfalls": [
+    "A mutator runs for every message of the endpoint, so an uncached lookup there becomes a hidden round trip per message - put IMemoryCache or a hybrid cache in front of the resource.",
+    "Replacing context.Message with a different type breaks the handlers' expected contract; enrich the same type (or set properties on it).",
+    "An exception in a mutator fails the whole message; a missing lookup must not silently become a poison message unless that is the deliberate policy."
+  ],
+  "sources": [
+    "https://docs.particular.net/nservicebus/pipeline/message-mutators",
+    "https://github.com/serilog/serilog/wiki/Enrichment"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutator-pipeline",
+      "name": "NServiceBus message mutator in the endpoint pipeline",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "IMutateIncomingMessages / IMutateOutgoingMessages mutator",
+      "implementation_notes": "In .NET the enrichment hook is the messaging framework's pipeline: NServiceBus message mutators (IMutateIncomingMessages/IMutateOutgoingMessages) and MassTransit-style filters run after deserialization and before the handlers, which is where looked-up data or context is merged into the message. The framework owns only the insertion point - the lookup and merge are hand-written - so inject the resource accessor (DbContext, HttpClient, IMemoryCache) into the mutator and keep it unit-testable. Serilog's Enrich.With... pipeline is the same idea applied to log events, which is why 'enricher' is familiar vocabulary in .NET.",
+      "code_sketch": "class CustomerEnricher : IMutateIncomingMessages {\n    readonly ICustomerSource source;\n    public CustomerEnricher(ICustomerSource source) => this.source = source;\n\n    public async Task MutateIncoming(MutateIncomingMessageContext context) {\n        var order = (OrderPlaced)context.Message;\n        order.CustomerName = await source.NameOfAsync(order.CustomerId);\n        context.Message = order;      // pipeline continues with the enriched instance\n    }\n}\n// endpointConfiguration.RegisterMessageMutator(new CustomerEnricher(source));",
+      "pitfalls": [
+        "A mutator runs for every message of the endpoint, so an uncached lookup there becomes a hidden round trip per message - put IMemoryCache or a hybrid cache in front of the resource.",
+        "Replacing context.Message with a different type breaks the handlers' expected contract; enrich the same type (or set properties on it).",
+        "An exception in a mutator fails the whole message; a missing lookup must not silently become a poison message unless that is the deliberate policy."
+      ],
+      "sources": [
+        "https://docs.particular.net/nservicebus/pipeline/message-mutators",
+        "https://github.com/serilog/serilog/wiki/Enrichment"
+      ]
+    },
+    {
+      "variant_id": "handler-local-http",
+      "name": "Enrich inside the consumer with HttpClient + IMemoryCache",
+      "paradigm": "oo",
+      "min_standard": "C#9",
+      "idiom_name": "typed HttpClient + IMemoryCache, merge into a record with 'with'",
+      "implementation_notes": "Without a messaging pipeline to hook (plain queue or HTTP consumer, background service) the enrichment happens at the top of the consumer: resolve the key, read the resource through a typed HttpClient or repository, merge into an immutable record with 'with', and hand the enriched object to the domain logic. IMemoryCache/HybridCache absorbs repeated keys and a resilience policy (timeout, circuit breaker) keeps a dead resource from turning into a dead consumer. Choose it for services that have no framework-provided message pipeline.",
+      "code_sketch": "record Order(string CustomerId, string? CustomerName = null, string? Region = null);\n\nasync Task<Order> EnrichAsync(Order order, CancellationToken ct) {\n    var c = await cache.GetOrCreateAsync(order.CustomerId, async e => {\n        e.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);\n        return await customers.GetAsync(order.CustomerId, ct);   // typed HttpClient\n    });\n    return c is null ? order : order with { CustomerName = c.Name, Region = c.Region };\n}",
+      "pitfalls": [
+        "GetOrCreateAsync happily caches nulls and failures unless the factory signals them; a resource outage then poisons the cache with the failure for the whole TTL.",
+        "Awaiting the resource inside the handler widens its latency budget - pass the cancellation token, set a timeout and define the degraded path.",
+        "Records are immutable: discarding the value returned by 'with' silently drops the enrichment, a classic copy-paste bug."
+      ],
+      "sources": [
+        "https://docs.particular.net/nservicebus/pipeline/message-mutators"
+      ]
+    }
+  ],
+  "default_variant": "mutator-pipeline"
+}

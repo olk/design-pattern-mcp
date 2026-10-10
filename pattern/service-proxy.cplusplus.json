@@ -1,0 +1,56 @@
+{
+  "pattern": "service-proxy",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "class ServiceProxy final : public ServiceApi forwarding every member",
+  "implementation_notes": "There is no automatic forwarding in C++, so the classic structure is written by hand: derive the proxy from the service's abstract base class, hold the real service by shared_ptr (or by value), and forward each member with the policy around it. The compiler still enforces equivalence - a missing member leaves the class abstract and a changed signature stops overriding - which is why the wrapper is the right form for an in-process interface. For an RPC service, prefer the framework's interception point (gRPC C++ interceptors) or an IDL-generated proxy, and let an out-of-process service proxy such as Envoy handle control that must be language-agnostic.",
+  "code_sketch": "class ServiceProxy final : public ServiceApi {        // same interface\n public:\n  ServiceProxy(std::shared_ptr<ServiceApi> real, Tracer& tracer)\n      : real_(std::move(real)), tracer_(tracer) {}\n  Response Call(const Request& r) override {          // delegate + policy\n    auto span = tracer_.Start(\"Call\");\n    auto resp = real_->Call(r);                       // same contract\n    return resp;\n  }\n private:\n  std::shared_ptr<ServiceApi> real_;  Tracer& tracer_;\n};",
+  "pitfalls": [
+    "Wrapper lifetime: holding the service by reference or raw pointer lets the proxy dangle when the service is re-wired; shared_ptr or by-value ownership keeps the delegation sound.",
+    "Forwarding must preserve const-ness, noexcept and default arguments - each is part of the contract callers compiled against even though the override still compiles.",
+    "Each forwarded call costs one virtual dispatch; on hot in-process paths use a template wrapper over the concrete service so the call can be devirtualised."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/virtual"
+  ],
+  "variants": [
+    {
+      "variant_id": "delegating-wrapper",
+      "name": "Delegating wrapper class over the service's abstract interface",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "class ServiceProxy final : public ServiceApi forwarding every member",
+      "implementation_notes": "There is no automatic forwarding in C++, so the classic structure is written by hand: derive the proxy from the service's abstract base class, hold the real service by shared_ptr (or by value), and forward each member with the policy around it. The compiler still enforces equivalence - a missing member leaves the class abstract and a changed signature stops overriding - which is why the wrapper is the right form for an in-process interface. For an RPC service, prefer the framework's interception point (gRPC C++ interceptors) or an IDL-generated proxy, and let an out-of-process service proxy such as Envoy handle control that must be language-agnostic.",
+      "code_sketch": "class ServiceProxy final : public ServiceApi {        // same interface\n public:\n  ServiceProxy(std::shared_ptr<ServiceApi> real, Tracer& tracer)\n      : real_(std::move(real)), tracer_(tracer) {}\n  Response Call(const Request& r) override {          // delegate + policy\n    auto span = tracer_.Start(\"Call\");\n    auto resp = real_->Call(r);                       // same contract\n    return resp;\n  }\n private:\n  std::shared_ptr<ServiceApi> real_;  Tracer& tracer_;\n};",
+      "pitfalls": [
+        "Wrapper lifetime: holding the service by reference or raw pointer lets the proxy dangle when the service is re-wired; shared_ptr or by-value ownership keeps the delegation sound.",
+        "Forwarding must preserve const-ness, noexcept and default arguments - each is part of the contract callers compiled against even though the override still compiles.",
+        "Each forwarded call costs one virtual dispatch; on hot in-process paths use a template wrapper over the concrete service so the call can be devirtualised."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/virtual"
+      ]
+    },
+    {
+      "variant_id": "grpc-interceptors",
+      "name": "gRPC C++ interceptor chain in front of the service",
+      "paradigm": "oo",
+      "idiom_name": "grpc::experimental::Interceptor around method dispatch",
+      "implementation_notes": "When the service is a gRPC service the framework already owns the equivalent interface (generated stub and service base) and offers the interception point: a grpcpp interceptor is invoked around every RPC and can inspect metadata, mutate headers, measure and map status before or after the call, so policy is written once for all methods. Use it instead of a hand-written wrapper whenever the contract is an IDL; keep the wrapper class for in-process interfaces that gRPC cannot see, and use an out-of-process service proxy such as Envoy when the control must apply to callers in other languages or to the process as a whole.",
+      "code_sketch": "class PolicyInterceptor final : public grpc::experimental::Interceptor {\n public:\n  void Intercept(grpc::experimental::InterceptorBatchMethods* m) override {\n    if (m->QueryInterceptionHookPoint(\n            grpc::experimental::InterceptionHookPoints::PRE_SEND_INITIAL_METADATA)) {\n      m->GetSendInitialMetadata()->insert({\"x-tenant\", tenant_});\n    }\n    m->Proceed();                        // continue as if nothing happened\n  }\n private:\n  std::string tenant_;\n};",
+      "pitfalls": [
+        "Interceptors are per channel or per server and are ordered: a policy registered on one client does not protect another, and putting auth after retry changes the semantics of both.",
+        "One interceptor instance is created per RPC, so shared counters and limiters must live in a synchronised object outside it.",
+        "The interceptor API has been labelled experimental for years: pin the gRPC version and expect signature changes on upgrade."
+      ],
+      "sources": [
+        "https://github.com/grpc/grpc/blob/master/include/grpcpp/support/interceptor.h",
+        "https://grpc.io/docs/guides/interceptors",
+        "https://grpc.io/docs/languages/cpp/",
+        "https://www.envoyproxy.io/docs/envoy/latest/intro/life_of_a_request"
+      ]
+    }
+  ],
+  "default_variant": "delegating-wrapper",
+  "version": "1.0"
+}

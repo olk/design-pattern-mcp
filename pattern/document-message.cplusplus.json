@@ -1,0 +1,79 @@
+{
+  "pattern": "document-message",
+  "language": "cplusplus",
+  "support": "library",
+  "version": "1.0",
+  "idiom_name": "protobuf generated class + SerializeToString/ParseFromString",
+  "implementation_notes": "The document is a .proto message and protoc generates a class per message with typed accessors (set_/mutable_/clear_, add_/size_ helpers for repeated fields) plus SerializeToString/ParseFromString, SerializeToOstream/ParseFromIstream and PackFrom/UnpackTo for Any. Field numbers rather than names form the contract, so additive changes stay compatible in both directions and unknown fields survive a round trip; the .proto file is the versioned artifact shared with the other languages. Current protobuf C++ requires a C++17 compiler, which is the floor of this variant; it is the default because schema-first documents scale to several languages and consumers.",
+  "code_sketch": "OrderShipped doc;\ndoc.set_version(3);\ndoc.set_order_id(order.id());\nfor (const auto& line : order.lines()) *doc.add_lines() = to_proto(line);\nstd::string wire;\nif (!doc.SerializeToString(&wire)) throw std::runtime_error(\"encode failed\");\n// receiver: OrderShipped in; in.ParseFromString(wire); decide(in);",
+  "pitfalls": [
+    "Field numbers, wire types and presence rules are the compatibility contract - renaming a field is safe, renumbering or reusing a tag is not.",
+    "Accessor results returned by const reference (name(), lines(i)) are invalidated by any subsequent non-const call on the message; never cache them across mutation.",
+    "The codegen toolchain is part of the build: a stale generated header against a newer runtime fails at link time or at runtime."
+  ],
+  "sources": [
+    "https://protobuf.dev/reference/cpp/cpp-generated",
+    "https://protobuf.dev/getting-started/cpptutorial"
+  ],
+  "variants": [
+    {
+      "variant_id": "protobuf-schema-first",
+      "name": "protoc-generated message classes (schema-first)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "requires_features": [
+        "code-generation"
+      ],
+      "idiom_name": "protobuf generated class + SerializeToString/ParseFromString",
+      "implementation_notes": "The document is a .proto message and protoc generates a class per message with typed accessors (set_/mutable_/clear_, add_/size_ helpers for repeated fields) plus SerializeToString/ParseFromString, SerializeToOstream/ParseFromIstream and PackFrom/UnpackTo for Any. Field numbers rather than names form the contract, so additive changes stay compatible in both directions and unknown fields survive a round trip; the .proto file is the versioned artifact shared with the other languages. Current protobuf C++ requires a C++17 compiler, which is the floor of this variant; it is the default because schema-first documents scale to several languages and consumers.",
+      "code_sketch": "OrderShipped doc;\ndoc.set_version(3);\ndoc.set_order_id(order.id());\nfor (const auto& line : order.lines()) *doc.add_lines() = to_proto(line);\nstd::string wire;\nif (!doc.SerializeToString(&wire)) throw std::runtime_error(\"encode failed\");\n// receiver: OrderShipped in; in.ParseFromString(wire); decide(in);",
+      "pitfalls": [
+        "Field numbers, wire types and presence rules are the compatibility contract - renaming a field is safe, renumbering or reusing a tag is not.",
+        "Accessor results returned by const reference (name(), lines(i)) are invalidated by any subsequent non-const call on the message; never cache them across mutation.",
+        "The codegen toolchain is part of the build: a stale generated header against a newer runtime fails at link time or at runtime."
+      ],
+      "sources": [
+        "https://protobuf.dev/reference/cpp/cpp-generated",
+        "https://protobuf.dev/getting-started/cpptutorial"
+      ]
+    },
+    {
+      "variant_id": "nlohmann-json-document",
+      "name": "nlohmann::json dynamic document tree",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "nlohmann::json basic_json tree + operator[] access",
+      "implementation_notes": "When the document is JSON and its shape is decided at runtime, the single-header nlohmann::json library supplies the document type itself: basic_json is default-constructible to null, buildable from literals, navigable with operator[] and iterators, and convertible to the other formats it speaks (from_cbor/from_msgpack and friends). Wire names come from the object keys rather than an IDL, NLOHMANN_JSON_SERIALIZE_ENUM maps enums to strings, and the receiver inspects keys and types to decide what to do. Choose it when no schema registry exists and the peer only speaks JSON; the absence of a compiled contract is the trade.",
+      "code_sketch": "nlohmann::json doc = {{\"version\", 3}, {\"order_id\", order.id()},\n                             {\"lines\", lines}};\nstd::string wire = doc.dump();                     // producer\nnlohmann::json got = nlohmann::json::parse(body);  // throws on malformed input\nif (!got.contains(\"order_id\")) return invalid(body);\nhandle(got);                                       // receiver decides",
+      "pitfalls": [
+        "parse() throws on malformed input and operator[] on a const tree throws out_of_range for a missing key; both must be handled or one bad document crashes the consumer.",
+        "The document schema lives only in code, so producer and consumer drift silently until a field turns out to be missing at runtime.",
+        "The tree owns a copy of every string, so large documents pay for two representations (wire buffer plus tree)."
+      ],
+      "sources": [
+        "https://json.nlohmann.me/api/basic_json"
+      ]
+    },
+    {
+      "variant_id": "flatbuffers-zero-copy",
+      "name": "FlatBuffers zero-copy documents",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "requires_features": [
+        "code-generation"
+      ],
+      "idiom_name": "FlatBufferBuilder + generated accessors on the wire buffer",
+      "implementation_notes": "FlatBuffers compiles a .fbs schema into accessors that read fields directly out of the serialized buffer, so the receiver never parses: FlatBufferBuilder builds the document from native types, GetRoot<T>() returns a typed view and flatbuffers::Verifier validates an untrusted buffer before it is dereferenced. That removes the parse step and the document-wide allocation, which is why it wins where volume and latency dominate (telemetry, game-style payloads); the price is a rigid schema-evolution discipline plus a build-time code generator.",
+      "code_sketch": "flatbuffers::FlatBufferBuilder fbb;\nauto doc = CreateOrderShipped(fbb, 3, fbb.CreateString(order.id()),\n                             fbb.CreateVector(line_offsets));\nfbb.Finish(doc);\n// receiver: verify first, then read fields without parsing\nflatbuffers::Verifier v(buf, len);\nif (!VerifyOrderShippedBuffer(v)) return invalid(buf, len);\nauto got = GetOrderShipped(buf);   // got->order_id(), got->lines()",
+      "pitfalls": [
+        "An unverified buffer is a security hole: always run the Verifier before touching a document that arrived from outside.",
+        "The buffer must outlive every accessor view - returning a table whose storage died with a local DetachedBuffer is a use-after-free.",
+        "Schema evolution has to be additive and defaulted; reordering or removing fields corrupts readers compiled against the old schema."
+      ],
+      "sources": [
+        "https://flatbuffers.dev/languages/cpp"
+      ]
+    }
+  ],
+  "default_variant": "protobuf-schema-first"
+}

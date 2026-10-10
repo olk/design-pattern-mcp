@@ -1,0 +1,75 @@
+{
+  "pattern": "active-object",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::thread scheduler loop + std::queue of std::packaged_task",
+  "implementation_notes": "The default modern C++ realization: the proxy wraps each servant call in a std::packaged_task, pushes it onto a std::queue guarded by std::mutex/std::condition_variable, and returns the std::future obtained from get_future(); a dedicated std::thread pops and executes tasks, so only that thread touches the servant and no locks are needed inside it. std::async exists but leaves the execution policy unspecified, so a dedicated scheduler thread is the predictable form; use it when Asio or ACE are not already in the stack.",
+  "code_sketch": "// client thread: queue the request, keep its future\nstd::future<void> Proxy::put(Message m) {\n    std::packaged_task<void()> t([this, m] { servant_.put_i(m); });\n    auto f = t.get_future();\n    { std::lock_guard lk(m_); q_.push(std::move(t)); } cv_.notify_one(); return f;\n}\n// scheduler thread: dequeue and run on the servant\nfor (std::packaged_task<void()> t; !stop_; ) {\n    std::unique_lock lk(m_);\n    cv_.wait(lk, [&] { return stop_ || !q_.empty(); });\n    t = std::move(q_.front()); q_.pop(); lk.unlock(); t();\n}",
+  "pitfalls": [
+    "std::packaged_task is move-only: it needs std::queue<std::packaged_task<..>> or a heap wrapper; std::function cannot store it.",
+    "std::future::get() blocks; calling it from the scheduler thread (for example inside another method request) is an immediate self-deadlock.",
+    "Exceptions land in the future and only surface at get(); a future that nobody reads silently swallows the failure."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/packaged_task",
+    "https://en.cppreference.com/w/cpp/thread/async",
+    "https://en.cppreference.com/w/cpp/thread/future"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-thread-packaged-task",
+      "name": "std::thread + std::packaged_task/std::future (classic)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::thread scheduler loop + std::queue of std::packaged_task",
+      "implementation_notes": "The default modern C++ realization: the proxy wraps each servant call in a std::packaged_task, pushes it onto a std::queue guarded by std::mutex/std::condition_variable, and returns the std::future obtained from get_future(); a dedicated std::thread pops and executes tasks, so only that thread touches the servant and no locks are needed inside it. std::async exists but leaves the execution policy unspecified, so a dedicated scheduler thread is the predictable form; use it when Asio or ACE are not already in the stack.",
+      "code_sketch": "// client thread: queue the request, keep its future\nstd::future<void> Proxy::put(Message m) {\n    std::packaged_task<void()> t([this, m] { servant_.put_i(m); });\n    auto f = t.get_future();\n    { std::lock_guard lk(m_); q_.push(std::move(t)); } cv_.notify_one(); return f;\n}\n// scheduler thread: dequeue and run on the servant\nfor (std::packaged_task<void()> t; !stop_; ) {\n    std::unique_lock lk(m_);\n    cv_.wait(lk, [&] { return stop_ || !q_.empty(); });\n    t = std::move(q_.front()); q_.pop(); lk.unlock(); t();\n}",
+      "pitfalls": [
+        "std::packaged_task is move-only: it needs std::queue<std::packaged_task<..>> or a heap wrapper; std::function cannot store it.",
+        "std::future::get() blocks; calling it from the scheduler thread (for example inside another method request) is an immediate self-deadlock.",
+        "Exceptions land in the future and only surface at get(); a future that nobody reads silently swallows the failure."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/packaged_task",
+        "https://en.cppreference.com/w/cpp/thread/async",
+        "https://en.cppreference.com/w/cpp/thread/future"
+      ]
+    },
+    {
+      "variant_id": "asio-strand",
+      "name": "Boost.Asio strand + post() method requests",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "boost::asio::strand + post() handlers",
+      "implementation_notes": "When Asio already drives the application, the io_context is the activation queue and the scheduler, and a strand gives the servant its serialization guarantee: Asio defines a strand as a strictly sequential invocation of its event handlers, with no concurrent invocation, so posting a method request to the servant's strand replaces both the request queue and the servant's locking. The proxy posts a handler that captures the arguments plus a std::promise and returns its future; every servant member runs only inside strand-bound handlers.",
+      "code_sketch": "boost::asio::strand<boost::asio::io_context::executor_type> strand_{io_.get_executor()};\nstd::deque<Message> q_;\nstd::future<void> put(Message m) {                       // proxy\n    auto p = std::make_shared<std::promise<void>>();\n    boost::asio::post(strand_, [this, m, p] {\n        q_.push_back(m);                                 // serialized by the strand\n        p->set_value();\n    });\n    return p->get_future();\n}",
+      "pitfalls": [
+        "A strand serializes handlers, not threads: shared state touched outside the strand still races, so every access must be posted through the same strand.",
+        "Blocking inside a strand handler - including waiting on the returned future - stalls all handlers on that strand and can deadlock the io_context.",
+        "Handler captures must outlive the post; objects owned by the handler need shared ownership or an executor-aware guard."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/strands.html"
+      ]
+    },
+    {
+      "variant_id": "ace-active-object",
+      "name": "ACE Method Request / Activation Queue / Future (classic reference)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "ACE_Method_Request + ACE_Activation_Queue + ACE_Future",
+      "implementation_notes": "The pattern's home implementation ships with ACE and is the one shown in the pattern's own documentation: subclasses of ACE_Method_Request carry each method's guard() and call(), ACE_Activation_Queue is the request buffer, an ACE_Task-based scheduler thread runs the dequeue/dispatch loop, and ACE_Future carries results back through the proxy. Choose it only when ACE's service-configuration and threading layers are already part of the system, since it pulls in ACE's task and policy machinery.",
+      "code_sketch": "class Put : public ACE_Method_Request {\npublic:\n    Put(MQ_Servant *s, const Message &m) : servant_(s), msg_(m) {}\n    int call() override  { return servant_->put_i(msg_); }\n    int guard() override { return !servant_->full_i(); }\nprivate:\n    MQ_Servant *servant_;\n    Message msg_;\n};\n// proxy: future = result; activation_queue.enqueue(new Put(servant_, m));\n// scheduler thread: while ((r = aq.dequeue())) if (r->guard()) r->call();",
+      "pitfalls": [
+        "Method requests are heap-allocated and must be deleted or reference-counted along the scheduler path; the leak is silent until load rises.",
+        "ACE's own threads and policies must not be mixed casually with another framework's threading: the synchronization the pattern hides comes back at the seams."
+      ],
+      "sources": [
+        "https://www.dre.vanderbilt.edu/~schmidt/PDF/Act-Obj.pdf",
+        "https://www.dre.vanderbilt.edu/~schmidt/ACE.html"
+      ]
+    }
+  ],
+  "default_variant": "std-thread-packaged-task",
+  "version": "1.1"
+}

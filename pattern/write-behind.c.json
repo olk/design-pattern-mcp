@@ -1,0 +1,18 @@
+{
+  "pattern": "write-behind",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "dirty-row table + flush thread + sqlite3 batched transaction",
+  "implementation_notes": "C provides no persistence context, so the classic structure is fully hand-written: a dirty table keyed by row id (one entry per key, so staging coalesces), a mutex that guards it, and a dedicated flush thread that waits on a condition variable, drains the table, and writes the batch in a single sqlite3 transaction using prepared statements (sqlite3_prepare_v2/sqlite3_bind/sqlite3_step). What replaces the classic structure: nothing - only statement batching and transactions are provided, not change tracking or deferral - and that is justified whenever per-change round trips dominate the workload. For low-volume writes, write straight through instead.",
+  "code_sketch": "/* producer */\npthread_mutex_lock(&q.mtx);\nq.rows[key] = value;                  /* one entry per key: coalesced */\npthread_cond_signal(&q.cv);\npthread_mutex_unlock(&q.mtx);\n/* flusher thread */\npthread_mutex_lock(&q.mtx);\nwhile (!q.dirty && !q.stop) pthread_cond_wait(&q.cv, &q.mtx);\nint n = snapshot(&q, batch);\npthread_mutex_unlock(&q.mtx);\nflush_batch(db, batch, n);            /* BEGIN; prepared UPDATE; COMMIT */",
+  "pitfalls": [
+    "The queue lives only in process memory: a crash before a flush loses every staged change unless the buffer is logged first.",
+    "Forgetting to re-check the predicate around pthread_cond_wait (or signalling without the mutex) deadlocks or spins the flusher.",
+    "sqlite3 handles are serialized only when compiled thread-safe: confine the flush to one thread or enable SQLITE_THREADSAFE=1 and expect lock contention."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_create.3.html",
+    "https://sqlite.org/c3ref/prepare.html"
+  ],
+  "version": "1.0"
+}

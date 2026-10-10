@@ -1,0 +1,58 @@
+{
+  "pattern": "memoizing-parser",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::unordered_map memo keyed by (rule_id << 32 | pos), parser as a class",
+  "implementation_notes": "The standard library supplies the table and not the pattern: a std::unordered_map<std::uint64_t, Memo> on a packed key (or a small key struct) holds one entry per attempted rule/position pair, and Memo carries both the success (node plus end offset) and the recorded failure, because find() only distinguishes 'not computed'. What replaces the classic memo-table object is one lookup/store pair around each rule member function while the parser class owns the table, so the table dies with the parser. reserve() the map from rules * (input_length + 1) - growing it during the parse is the common performance mistake - and remember that element references and pointers survive rehashing while iterators do not, so an iterator held across a recursive rule call is a latent bug. Choose this hashed form when rule/position pairs are sparse; choose the dense-vector variant when the whole in-memory input is parsed in one pass.",
+  "code_sketch": "struct Parser {\n  std::unordered_map<std::uint64_t, Memo> memo;   // key = (rule_id << 32) | pos\n  std::optional<Node> rule(RuleId r, std::size_t pos) {\n    const std::uint64_t key = (static_cast<std::uint64_t>(r) << 32) | pos;\n    auto it = memo.find(key);\n    if (it != memo.end()) return it->second.node;  // already computed: success or failure\n    Memo m{rule_impl(r, pos)};                     // may backtrack speculatively\n    memo.emplace(key, m);                          // failures are memoized too\n    return m.node;\n  }\n};",
+  "pitfalls": [
+    "Packing rule id and position into one 64-bit key breaks silently when the input exceeds 2^32 positions or the rule count exceeds 2^16 - use a pair key or assert the bounds.",
+    "Iterators into the map are invalidated when an insert rehashes while element references stay valid: never keep an iterator across a recursive rule call, keep the key or a copy instead.",
+    "Every boxed key/value pair is a separate allocation and growth rehashes repeatedly; reserve() up front and prefer a small struct key (or the dense variant) in parsers that run hot."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/container/unordered_map"
+  ],
+  "variants": [
+    {
+      "variant_id": "unordered-map-memo",
+      "name": "unordered_map memo behind a per-rule accessor (callbacks-free classic)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::unordered_map memo keyed by (rule_id << 32 | pos), parser as a class",
+      "implementation_notes": "The standard library supplies the table and not the pattern: a std::unordered_map<std::uint64_t, Memo> on a packed key (or a small key struct) holds one entry per attempted rule/position pair, and Memo carries both the success (node plus end offset) and the recorded failure, because find() only distinguishes 'not computed'. What replaces the classic memo-table object is one lookup/store pair around each rule member function while the parser class owns the table, so the table dies with the parser. reserve() the map from rules * (input_length + 1) - growing it during the parse is the common performance mistake - and remember that element references and pointers survive rehashing while iterators do not, so an iterator held across a recursive rule call is a latent bug. Choose this hashed form when rule/position pairs are sparse; choose the dense-vector variant when the whole in-memory input is parsed in one pass.",
+      "code_sketch": "struct Parser {\n  std::unordered_map<std::uint64_t, Memo> memo;   // key = (rule_id << 32) | pos\n  std::optional<Node> rule(RuleId r, std::size_t pos) {\n    const std::uint64_t key = (static_cast<std::uint64_t>(r) << 32) | pos;\n    auto it = memo.find(key);\n    if (it != memo.end()) return it->second.node;  // already computed: success or failure\n    Memo m{rule_impl(r, pos)};                     // may backtrack speculatively\n    memo.emplace(key, m);                          // failures are memoized too\n    return m.node;\n  }\n};",
+      "pitfalls": [
+        "Packing rule id and position into one 64-bit key breaks silently when the input exceeds 2^32 positions or the rule count exceeds 2^16 - use a pair key or assert the bounds.",
+        "Iterators into the map are invalidated when an insert rehashes while element references stay valid: never keep an iterator across a recursive rule call, keep the key or a copy instead.",
+        "Every boxed key/value pair is a separate allocation and growth rehashes repeatedly; reserve() up front and prefer a small struct key (or the dense variant) in parsers that run hot."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/unordered_map"
+      ]
+    },
+    {
+      "variant_id": "dense-vector-memo",
+      "name": "Dense per-rule std::vector<std::optional<Memo>> indexed by position",
+      "paradigm": "data-oriented",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::optional"
+      ],
+      "idiom_name": "std::vector<std::vector<Memo>> addressed as memo[rule][pos], optional for not-computed",
+      "implementation_notes": "Because positions are bounded by the input length the memo needs no hashing at all: allocate std::vector<std::vector<Memo>> memo(rules, std::vector<Memo>(len + 1)) and index it as memo[rule][pos], with std::optional (or a three-state enum) separating 'not computed' from 'computed and failed'. What replaces the classic structure is arithmetic indexing: one contiguous row per rule, no key hashing, no per-entry node allocation and better cache behaviour for batch parsing - at the cost of allocating rules x (len + 1) cells up front even where a rule is never tried at most positions. Ford's category split (grouping rules into a few levels) is the middle ground for grammars with many rules.",
+      "code_sketch": "struct Parser {\n  std::vector<std::vector<Memo>> memo;             // memo[rule][pos]\n  Parser(std::size_t rules, std::size_t len)\n      : memo(rules, std::vector<Memo>(len + 1)) {}\n  const Memo &rule(RuleId r, std::size_t pos) {\n    Memo &cell = memo[r][pos];                     // arithmetic index, no hash\n    if (!cell.done) cell = rule_impl(r, pos);      // failures cached in the same cell\n    return cell;\n  }\n};",
+      "pitfalls": [
+        "rules x (len + 1) cells are allocated even for positions a rule never visits; for many-rule grammars the sparse map is smaller (split the table into rule categories, as Ford suggests).",
+        "std::vector<std::vector<...>> means one heap allocation per rule and a reallocation of the outer vector can move rows; a flat std::vector<Memo> of size rules*(len+1) with index arithmetic avoids both but gives up independent rows."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/vector",
+        "https://en.cppreference.com/w/cpp/utility/optional",
+        "https://bford.info/pub/lang/packrat-icfp02.pdf"
+      ]
+    }
+  ],
+  "default_variant": "unordered-map-memo",
+  "version": "1.0"
+}

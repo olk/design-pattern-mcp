@@ -1,0 +1,75 @@
+{
+  "pattern": "lazy-collection",
+  "language": "go",
+  "support": "native",
+  "idiom_name": "func(yield func(T) bool) as iter.Seq[T], driven by for range",
+  "implementation_notes": "Go 1.23 makes a lazy sequence an ordinary function: an iterator passes successive elements to a yield callback, stops when yield returns false, and for-range drives it, so an unbounded or generated sequence is bounded by demand (the iter package defines Seq/Seq2 plus Pull for the pull-shaped view). The standard library has no memoizing lazy collection - iterators are single-use and recompute on every call - so caching requires an explicit closure or materializing with slices.Collect; the classic loop over a concrete slice stays preferable when all elements are needed anyway.",
+  "code_sketch": "func Fib() iter.Seq[uint64] {              // lazy, unbounded, single-use\n    return func(yield func(uint64) bool) {\n        for a, b := uint64(0), uint64(1); yield(a); a, b = b, a+b {\n        }\n    }\n}\n\nfor n := range Fib() {                     // Go 1.23 range-over-func\n    if n > 1000 { break }                  // early stop ends production\n}",
+  "pitfalls": [
+    "The yield contract is mandatory: a callback that returns false means the iterator must return immediately, and an iterator that keeps producing after being stopped wastes work and can leak goroutines.",
+    "Iterators are single-use by convention - calling range twice over one stored Seq value works only because range re-invokes the function; sharing a partially consumed iterator between goroutines races.",
+    "Blocking inside yield (network, locks) blocks the producer's goroutine, and a channel- or lock-based source can deadlock when the consumer stops early without signalling."
+  ],
+  "sources": [
+    "https://go.dev/blog/range-functions",
+    "https://pkg.go.dev/iter"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "iter-seq",
+      "name": "iter.Seq push iterator with range-over-func (Go 1.23)",
+      "paradigm": "functional",
+      "min_standard": "Go1.23",
+      "idiom_name": "func(yield func(T) bool) as iter.Seq[T], driven by for range",
+      "implementation_notes": "Go 1.23 makes a lazy sequence an ordinary function: an iterator passes successive elements to a yield callback, stops when yield returns false, and for-range drives it, so an unbounded or generated sequence is bounded by demand (the iter package defines Seq/Seq2 plus Pull for the pull-shaped view). The standard library has no memoizing lazy collection - iterators are single-use and recompute on every call - so caching requires an explicit closure or materializing with slices.Collect; the classic loop over a concrete slice stays preferable when all elements are needed anyway.",
+      "code_sketch": "func Fib() iter.Seq[uint64] {              // lazy, unbounded, single-use\n    return func(yield func(uint64) bool) {\n        for a, b := uint64(0), uint64(1); yield(a); a, b = b, a+b {\n        }\n    }\n}\n\nfor n := range Fib() {                     // Go 1.23 range-over-func\n    if n > 1000 { break }                  // early stop ends production\n}",
+      "pitfalls": [
+        "The yield contract is mandatory: a callback that returns false means the iterator must return immediately, and an iterator that keeps producing after being stopped wastes work and can leak goroutines.",
+        "Iterators are single-use by convention - calling range twice over one stored Seq value works only because range re-invokes the function; sharing a partially consumed iterator between goroutines races.",
+        "Blocking inside yield (network, locks) blocks the producer's goroutine, and a channel- or lock-based source can deadlock when the consumer stops early without signalling."
+      ],
+      "sources": [
+        "https://go.dev/blog/range-functions",
+        "https://pkg.go.dev/iter"
+      ]
+    },
+    {
+      "variant_id": "pull-closure",
+      "name": "Closure pull-iterator (pre-1.23 classic)",
+      "paradigm": "procedural",
+      "min_standard": "Go1.0",
+      "idiom_name": "func() (T, bool) with captured state",
+      "implementation_notes": "The long-standing Go idiom for a lazy sequence is a closure that captures the cursor state and returns the next element with an ok flag, so consumers drive demand with a plain for loop and a false return means exhaustion; it compiles on every Go version and keeps destruction deterministic (the captured state dies with the closure). It lacks range support and needs an explicit stop method when the source is a resource that must be closed before exhaustion, so use iter.Seq on modern toolchains and keep a close/error path visible.",
+      "code_sketch": "func pages(url string) func() (Page, bool) {\n    next := url\n    return func() (Page, bool) {\n        if next == \"\" { return Page{}, false }\n        p := fetch(next)                 // computed only when pulled\n        next = p.Next\n        return p, true\n    }\n}\n\nnext := pages(seed)\nfor p, ok := next(); ok; p, ok = next() {   // consumer drives demand\n    if p.Match { break }                    // early stop, nothing else fetched\n}",
+      "pitfalls": [
+        "Captured state is shared mutable state: calling the closure from two goroutines races, and an abandoned closure that holds a file/connection has no close hook.",
+        "There is no standard protocol, so every package invents its own next signature and combinators cannot be shared across libraries.",
+        "Termination is signalled by the zero value plus false, which silently conflates 'empty element' with 'done' for types where the zero value is meaningful."
+      ],
+      "sources": [
+        "https://go.dev/blog/range-functions",
+        "https://pkg.go.dev/iter"
+      ]
+    },
+    {
+      "variant_id": "channel-generator",
+      "name": "Goroutine plus channel generator",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.0",
+      "idiom_name": "goroutine writing into an unbuffered channel, cancelled by context",
+      "implementation_notes": "A goroutine producing elements into a channel gives a lazy sequence that also crosses goroutine boundaries: the consumer ranges over the channel and each receive pulls one element, which is convenient when production is I/O-bound or parallel. It is the most expensive realization - a goroutine per sequence plus channel hand-off per element - and the one with the worst failure mode, because a producer blocked on send is never collected when the consumer stops unless it selects on a done/context channel; use it when concurrency is the point, not merely for laziness.",
+      "code_sketch": "func Fib(ctx context.Context) <-chan uint64 {\n    ch := make(chan uint64)\n    go func() {\n        defer close(ch)\n        for a, b := uint64(0), uint64(1); ; a, b = b, a+b {\n            select {\n            case ch <- a:                  // demand pulls one element\n            case <-ctx.Done():\n                return                     // consumer left: stop, no leak\n            }\n        }\n    }()\n    return ch\n}",
+      "pitfalls": [
+        "A producer blocked on send leaks the goroutine (and everything it captured) forever when the consumer abandons the channel; every generator needs a done/context path.",
+        "Per-element channel hand-off costs a scheduling round-trip, making this the slowest realization for cheap elements; buffering trades memory for throughput.",
+        "Channels have no notion of a lazy cache: values pulled and discarded are gone, so shared or repeated traversal needs a different structure."
+      ],
+      "sources": [
+        "https://go.dev/blog/range-functions",
+        "https://go.dev/talks/2012/concurrency.slide"
+      ]
+    }
+  ],
+  "default_variant": "iter-seq"
+}

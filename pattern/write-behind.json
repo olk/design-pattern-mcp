@@ -1,0 +1,157 @@
+{
+  "category": "persistence-state",
+  "name": "write-behind",
+  "aliases": [
+    "write-back",
+    "write-behind caching"
+  ],
+  "intent": "Accumulate in-memory changes and flush them to the data store as coalesced batches at a commit or trigger boundary, so intermediate states never reach the database and repeated writes to the same row collapse into a single statement.",
+  "problem": "The application writes each object change to the database as it happens: one logical operation fires many tiny statements against the same rows, opens or holds transactions repeatedly, and exposes intermediate states that no consumer ever needed. The recurring decision is when a change to in-memory state should become a database write.",
+  "context": "Persistence-bound code in which several changes hit the same rows within one logical operation or session, in which write throughput and transaction economy matter more than immediate durability, and in which a usable boundary for writing the accumulated changes exists (a transaction commit, an explicit flush call, a timer tick, or a queue watermark). It presupposes that store latency dominates the workload and that the last unflushed window may be lost - or can be made safe with a write-ahead log, outbox, or synchronous fallback.",
+  "benefits": [
+    "Write count collapses: repeated modifications of the same row are coalesced into one statement, and many rows are flushed in one batch, cutting round trips and per-statement overhead.",
+    "Intermediate states never reach the store, so database consumers never observe half-finished work and the persisted history records only committed outcomes.",
+    "Latency decoupling: buffered and cache-fronted variants acknowledge the caller from memory while persistence happens asynchronously, so request latency stops tracking store latency.",
+    "Transaction economy: the flush can be planned - grouped by table, ordered for referential integrity, executed as one transaction per batch - reducing lock churn and deadlock exposure.",
+    "A single write-out point concentrates cross-cutting work (version checks, retries, auditing of final states, batching) in the flusher instead of scattering it across call sites."
+  ],
+  "tradeoffs": [
+    "Durability window: changes acknowledged in memory are lost if the process dies before a flush; closing the window needs a write-ahead log, outbox, or synchronous fallback, which re-introduces the writes the pattern removed.",
+    "Invisible state: failures surface at flush time, far from the code that staged the change, and debugging means tracing the accumulator instead of watching SQL.",
+    "Unbounded growth risk: sustained write pressure that outpaces the flusher grows the dirty set or queue; without a watermark and a decided overflow policy, overload becomes an out-of-memory failure.",
+    "Read-your-writes violations: other sessions, other processes, and even queries inside the same unit of work can read stale rows until the flush, so reads may need an explicit flush-first rule.",
+    "Semantics change: database constraints, triggers, and audit trails observe only the final coalesced state, and last-writer resolution replaces per-change conflict detection.",
+    "The flush becomes a failure domain of its own: a failed batch must retry or roll back consistently, and one poisoned row can fail the whole batch."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 9,
+    "reliability": 4,
+    "security": 6,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Change Tracker / Unit of Work",
+      "responsibility": "Registers the persisted objects touched during the logical operation, records which identities changed, and exposes the accumulated change set to the flusher."
+    },
+    {
+      "role": "Dirty Set / Write-Behind Queue",
+      "responsibility": "Holds one entry per identity with the latest staged values (and enough original state to compute the delta); coalescing happens here because a new stage replaces the previous entry."
+    },
+    {
+      "role": "Flush Trigger",
+      "responsibility": "Decides when pending state becomes SQL: at the commit boundary, on an explicit flush, at a size/watermark threshold, or on a timer."
+    },
+    {
+      "role": "Flusher / Background Writer",
+      "responsibility": "Drains the queue, resolves it to one operation per identity, groups and orders the batch, executes it inside one transaction, and owns retry and failure policy."
+    },
+    {
+      "role": "Mapper / Persister",
+      "responsibility": "Translates the staged object state into statements for the concrete store (insert, update, upsert, delete) and applies version checks and optimistic concurrency."
+    },
+    {
+      "role": "Store",
+      "responsibility": "The database or data source that receives only coalesced, committed batches; it never sees the intermediate states."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "High-frequency counters, metrics, and telemetry endpoints where thousands of increments per second collapse into one row update per tick.",
+    "Request-scoped ORM persistence contexts that touch the same aggregate several times but must write once at commit.",
+    "Cache-fronted write-heavy workloads (in-memory data grids, write-behind cache stores) where the cache acknowledges and the backing store is updated asynchronously.",
+    "Edit buffers in interactive or offline clients: changes accumulate while the user works and flush as one batch on save or on reconnect.",
+    "Bulk import and ETL pipelines that stage row changes and merge them into the target with multi-row upserts.",
+    "Hibernate ORM's persistence context is a built-in write-behind unit of work: FlushMode.AUTO stages entity changes and flushes at EntityTransaction.commit(), the ActionQueue orders statements (inserts, then updates, then deletes), and hibernate.jdbc.batch_size with hibernate.order_inserts/order_updates coalesces them into per-table batches.",
+    "Infinispan persistent stores run write-behind via AsyncStoreConfiguration: modifications queue in a bounded modificationQueueSize and are applied to the backing store on a separate thread; when the queue fills, further cache writes block until space frees.",
+    "NCache write-behind providers acknowledge Add/Update/Remove in the cache and replay them to the SQL data source in the background with configurable batching intervals, operations-per-second throttling, and a failed-operations retry queue."
+  ],
+  "avoid_when": [
+    "Every change must be durable at the moment it is acknowledged (ledger entries, audit records, payment state): write through and add a durable log or transactional outbox instead.",
+    "Other processes must observe the change immediately (cross-process read-your-writes, cache invalidation contracts): defer only reads, never the writes they depend on.",
+    "Write volume is low and rows rarely repeat: immediate writes, with a bulk API where it helps, are simpler and leave no buffer to lose.",
+    "Intermediate states are themselves meaningful to consumers (event sourcing, change data capture, per-change triggers): coalescing destroys the information they need.",
+    "No safe boundary or scheduler exists for the flush, or the process can be killed without a shutdown hook and the buffer cannot be made crash-safe."
+  ],
+  "language_files": {
+    "generic": "write-behind.generic.json",
+    "c": "write-behind.c.json",
+    "cplusplus": "write-behind.cplusplus.json",
+    "csharp": "write-behind.csharp.json",
+    "go": "write-behind.go.json",
+    "java": "write-behind.java.json",
+    "javascript": "write-behind.javascript.json",
+    "kotlin": "write-behind.kotlin.json",
+    "python": "write-behind.python.json",
+    "ruby": "write-behind.ruby.json",
+    "rust": "write-behind.rust.json",
+    "scala": "write-behind.scala.json",
+    "swift": "write-behind.swift.json",
+    "typescript": "write-behind.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa",
+    "modern"
+  ],
+  "related_patterns": [
+    "unit-of-work",
+    "identity-map",
+    "data-mapper",
+    "lazy-load",
+    "version-number",
+    "dirty-flag",
+    "store-and-forward",
+    "repository"
+  ],
+  "anti_patterns": [
+    "An unbounded dirty set or queue with no watermark and no overflow policy, presented as a performance feature.",
+    "Treating the buffer acknowledgement as durability, so the pattern silently becomes a data-loss generator.",
+    "Deferring writes in front of consumers that require read-your-writes, so queries intermittently miss changes the same process just made.",
+    "Flushing only on the happy path: exceptions and shutdown paths leave staged changes unflushed forever.",
+    "Using write-behind to hide a missing transaction boundary or to avoid designing idempotent, retriable writes."
+  ],
+  "design_principles": [
+    "Separation of concerns: change tracking and change writing are distinct responsibilities with distinct lifetimes.",
+    "Explicit boundary: the pattern is safe only when the commit/flush boundary is named and owned.",
+    "Bounded resources: every buffer needs a size, a watermark, and an overflow decision.",
+    "Honest durability: the accepted loss window is a documented contract, not an implementation accident.",
+    "Single writer: one flusher serializes write-out so ordering and coalescing rules are enforceable."
+  ],
+  "best_practices": [
+    "Define the flush triggers up front (commit, explicit flush, watermark, timer) and document which reads require a flush first.",
+    "Bound the buffer and choose an overflow policy (block, reject, spill, or write through) instead of allowing unbounded growth.",
+    "Keep one entry per identity so coalescing is structural rather than accidental.",
+    "Flush deterministically on shutdown and on error, and make the flush idempotent so a replayed batch is safe.",
+    "Group and order the batch (inserts before foreign-key dependents, one transaction per batch) and re-check version numbers at flush time.",
+    "Instrument queue depth, flush latency, batch size, and failure count: a write-behind system is observable only through its flusher."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (2002) - Unit of Work (ch. 11): changes are accumulated during a business transaction and written out at its end; write-behind is the deferred, coalescing write-out discipline of that unit of work.",
+    "https://martinfowler.com/eaaCatalog/unitOfWork.html",
+    "https://docs.hibernate.org/core/3.6/reference/en-US/html_single",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside",
+    "https://infinispan.org/docs/stable/titles/configuring/configuring.html",
+    "https://www.ibm.com/docs/en/bigmemory-max/4.4.1?topic=caches-about-write-through-write-behind",
+    "https://infinispan.org/docs/stable/titles/tuning/tuning.html",
+    "https://www.alachisoft.com/resources/docs/ncache/prog-guide/write-behind-basic-ops.html",
+    "https://learn.microsoft.com/en-us/ef/core/saving/",
+    "https://www.techinterview.org/post/3233469260/lld-write-behind-cache/"
+  ]
+}

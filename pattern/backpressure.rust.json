@@ -1,0 +1,77 @@
+{
+  "pattern": "backpressure",
+  "language": "rust",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "tokio-mpsc",
+      "name": "tokio::sync::mpsc bounded channel (async)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "idiom_name": "tokio::sync::mpsc::channel(n) + send().await",
+      "implementation_notes": "The async realization is a bounded channel: tokio::sync::mpsc::channel(n) buffers n messages and send(msg).await does not complete while the buffer is full, so the backpressure propagates into the producer task without blocking the executor - the classic queue-plus-mutex-plus-condvar structure is replaced by the channel's internal synchronization plus a future. The bound is mandatory (capacity 0 panics, unlike std's rendezvous channel), and try_send's TrySendError::Full is the explicit shed path. For a slow consumer that is not the same task, an unbounded channel plus an await on the consumer's completion is not an alternative: choose the bound and let the producer wait.",
+      "code_sketch": "let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);   // bounded\n\ntokio::spawn(async move {\n    for f in source {\n        if tx.send(f).await.is_err() { break; }   // waits while full; Err = rx gone\n    }\n});\nwhile let Some(f) = rx.recv().await {\n    process(f).await;                             // the consumer sets the pace\n}",
+      "pitfalls": [
+        "Sending on a full bounded channel parks the task: if the consumer runs in the same task (or the producer awaits the consumer), the pipeline deadlocks.",
+        "Ignoring the Err from send() hides the case where the consumer died and work is silently dropped.",
+        "A blocking send or a std::sync channel inside an async runtime stalls the worker thread; move blocking producers into spawn_blocking.",
+        "try_send returning Full is load shedding, not backpressure - choosing it must be explicit and measured."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/mpsc/fn.channel.html",
+        "https://tokio.rs/tokio/tutorial/channels"
+      ]
+    },
+    {
+      "variant_id": "std-sync-channel",
+      "name": "std::sync::mpsc::sync_channel (threads)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.0",
+      "idiom_name": "std::sync::mpsc::sync_channel(bound) with a blocking send",
+      "implementation_notes": "For thread-based code the standard library already has the pattern: std::sync::mpsc::sync_channel(bound) returns a SyncSender whose send blocks when the internal buffer is full, and a bound of 0 makes it a rendezvous channel where every send waits for a matching recv - the classic queue is not hand-written. Use it when the stages are OS threads (or inside spawn_blocking), and prefer it over a Mutex<VecDeque> plus Condvar unless you need multi-consumer semantics or a priority policy. The bound is a real memory bound: n * size_of::<T>() plus bookkeeping is the worst case.",
+      "code_sketch": "use std::sync::mpsc::sync_channel;\n\nlet (tx, rx) = sync_channel::<Frame>(64);   // bounded; 0 = rendezvous\nstd::thread::spawn(move || {\n    for f in source {\n        if tx.send(f).is_err() { break; }   // blocks while the buffer is full\n    }\n});\nfor frame in rx {                           // consumer\n    process(frame);\n}",
+      "pitfalls": [
+        "std::sync::mpsc supports a single consumer: a second Receiver clone is not possible, so fan-out needs a different structure.",
+        "sync_channel's blocking send is still a blocking call - calling it from async code parks a runtime worker thread.",
+        "Dropping the Receiver makes every later send return Err, and dropping the Sender ends the consumer's iterator; lifecycle must be deliberate.",
+        "A rendezvous bound (0) maximises pressure and can deadlock pipelines whose stages are not concurrently scheduled."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html"
+      ]
+    },
+    {
+      "variant_id": "futures-sink",
+      "name": "futures::Sink poll_ready contract",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "idiom_name": "Sink::poll_ready/start_send + send_all/forward",
+      "implementation_notes": "Streaming APIs express the same handshake as a trait contract: futures::Sink::poll_ready must return Poll::Ready before each start_send, and Pending means 'full, wait for a wake-up' - that is the backpressure signal, and combinators such as send_all/forward propagate it through a whole stream-to-sink graph. Implementations buffer internally and usually flush to make room, so a bounded sink value (or one wrapping a bounded channel) is what keeps memory predictable. This is the classic pattern restated as a polling protocol: the bound lives inside the sink, the readiness poll is the blocking wait, and flush/close define the drain semantics.",
+      "code_sketch": "// The Sink contract: readiness before data.\n// fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>>\n//   Poll::Pending  => full: yield until woken (backpressure)\n//   Poll::Ready(Ok(())) => start_send may be called now\n\nsink.send(item).await?;          // futures::SinkExt: poll_ready + start_send\nsink.send_all(&mut stream).await?;   // propagates backpressure end to end\nsink.close().await?;                 // flush the tail",
+      "pitfalls": [
+        "Calling start_send without a successful poll_ready is a contract violation; implementations may silently reorder, drop or panic.",
+        "A Sink with an internal unbounded buffer (a Vec sink, some adapters) never applies pressure; wrap the real endpoint instead.",
+        "poll_ready's wake-up must be registered before returning Pending, otherwise the task is never rescheduled.",
+        "Mixing a bounded upstream channel with an unbounded sink buffer just moves the queue; the effective bound is the smallest one in the chain."
+      ],
+      "sources": [
+        "https://docs.rs/futures/latest/futures/sink/trait.Sink.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-mpsc",
+  "idiom_name": "tokio::sync::mpsc::channel(n) + send().await",
+  "implementation_notes": "The async realization is a bounded channel: tokio::sync::mpsc::channel(n) buffers n messages and send(msg).await does not complete while the buffer is full, so the backpressure propagates into the producer task without blocking the executor - the classic queue-plus-mutex-plus-condvar structure is replaced by the channel's internal synchronization plus a future. The bound is mandatory (capacity 0 panics, unlike std's rendezvous channel), and try_send's TrySendError::Full is the explicit shed path. For a slow consumer that is not the same task, an unbounded channel plus an await on the consumer's completion is not an alternative: choose the bound and let the producer wait.",
+  "code_sketch": "let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);   // bounded\n\ntokio::spawn(async move {\n    for f in source {\n        if tx.send(f).await.is_err() { break; }   // waits while full; Err = rx gone\n    }\n});\nwhile let Some(f) = rx.recv().await {\n    process(f).await;                             // the consumer sets the pace\n}",
+  "pitfalls": [
+    "Sending on a full bounded channel parks the task: if the consumer runs in the same task (or the producer awaits the consumer), the pipeline deadlocks.",
+    "Ignoring the Err from send() hides the case where the consumer died and work is silently dropped.",
+    "A blocking send or a std::sync channel inside an async runtime stalls the worker thread; move blocking producers into spawn_blocking.",
+    "try_send returning Full is load shedding, not backpressure - choosing it must be explicit and measured."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/mpsc/fn.channel.html",
+    "https://tokio.rs/tokio/tutorial/channels"
+  ],
+  "version": "1.0"
+}

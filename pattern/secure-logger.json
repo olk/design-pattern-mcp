@@ -1,0 +1,160 @@
+{
+  "category": "security-verification",
+  "name": "secure-logger",
+  "aliases": [
+    "tamper-evident logging",
+    "secure audit log"
+  ],
+  "intent": "Record security-relevant events through a single logging chokepoint and chain every record's authenticator to its predecessor, so that altering, deleting, reordering or truncating the log is detectable by an independent verifier rather than merely inconvenient for the party being recorded.",
+  "problem": "The audit trail exists, but the party it records - a privileged operator, a compromised service, the application itself - can also rewrite it: files are appendable and rotatable by the same process that writes them, there is no gap detection when a record or a whole file disappears, and nobody can prove after the fact that a log line is the line that was written. The log answers questions only as long as everyone trusts the host that produced it.",
+  "context": "Systems where a security-relevant event stream has evidentiary or compliance weight - privileged action and break-glass accounts, authentication and authorisation decisions, regulated transaction trails - and where an adversary on the recording host (or the recorded subject itself) is inside the threat model. It applies to a component boundary: the application writes through one logger, the store is append-only for that application, and verification happens elsewhere, so key custody and the trust anchor are part of the design rather than an afterthought.",
+  "benefits": [
+    "Turns the log into evidence: modification, deletion, insertion, reordering and truncation of records are detectable by a verifier that never has to trust the recording host.",
+    "The recorded subject cannot silently rewrite its own history: with the key material and the anchor held by another role, recomputing a consistent chain is out of reach.",
+    "One chokepoint for security logging: sanitisation, redaction, canonical serialisation and structured fields live in the logger, so callers cannot bypass the audit path or log a secret by accident.",
+    "Forensic and compliance value: sequence continuity and gap detection answer which events are missing, which is what audit requirements (PCI DSS 10.x, HIPAA, NIST SP 800-92) actually ask for.",
+    "Integrity is decoupled from the destination: the same chain logic works over a local file, signed syslog (RFC 5848), a sealed journal or a remote collector with published digests."
+  ],
+  "tradeoffs": [
+    "Hashing alone does not cover truncation: deleting the newest records leaves a valid prefix, so the guarantee depends on publishing the head authenticator out of band - and on doing that before every rotation or pruning.",
+    "Key custody decides the strength: if the writer holds the MAC key, a compromised writer can recompute the chain from any point; forward-integrity key schedules or remote signing close that gap at the price of extra keys, rotation and availability engineering.",
+    "Fail-open versus fail-closed tension: making a log failure fatal hands an attacker a denial-of-service lever, while ignoring failures silently destroys the audit guarantee - the choice has to be made per event class and must never be implicit.",
+    "Canonical serialisation becomes a long-lived compatibility commitment: verification re-derives the authenticator, so field order, encoding, number formatting and timestamp precision can never change without invalidating history.",
+    "Append-only, long-retention evidence collides with erasure duties: a personal-data field inside a chained record cannot be deleted without breaking the chain, so such fields must live off-chain or under per-subject keys.",
+    "Cost and operational weight: one HMAC plus a durable append per record, a second deployment for the verifier, key rotation and gap alerting - far more than plain structured logging, which is why teams usually chain only the security-relevant subset."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 5,
+    "simplicity": 3,
+    "performance": 4,
+    "reliability": 6,
+    "security": 9,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Secure Logger (Log Facade)",
+      "responsibility": "Single chokepoint through which application code records security-relevant events; owns the audit API, redaction and deterministic serialisation, and hands the canonical record to the chain."
+    },
+    {
+      "role": "Log Record",
+      "responsibility": "Structured event data (when, where, who, what, outcome) with every field treated as untrusted data, never as format."
+    },
+    {
+      "role": "Integrity Chain (Authenticator Builder)",
+      "responsibility": "Owns the sequence number and the previous authenticator; computes mac = MAC(key, prev || seq || canonical(record)) and stores the authenticator with the record."
+    },
+    {
+      "role": "Log Store (Append-only Sink)",
+      "responsibility": "Durable destination the application can only append to (append-mode file, signed syslog, sealed journal, remote collector); carries retention, permissions, rotation and durability policy."
+    },
+    {
+      "role": "Key and Time Authority",
+      "responsibility": "Supplies and rotates the MAC or signing keys and a trusted time source; administered separately from the application, so the recorded subject does not hold the means to rewrite."
+    },
+    {
+      "role": "Head Anchor Store",
+      "responsibility": "Out-of-band copy of the latest authenticator and sequence number (remote collector, signed digest file, hardware token) that bounds how far a rewrite or truncation can go undetected."
+    },
+    {
+      "role": "Verifier (Auditor)",
+      "responsibility": "Independent tool on a different host and identity that replays the chain, compares record authenticators with the anchor, and reports modification, gaps, reordering and truncation."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Privileged and administrative activity: break-glass accounts, role and policy changes, configuration and key operations that must remain provable after the fact.",
+    "Regulated transaction audit trails (PCI DSS 10.x, HIPAA, SOX) where an independently verifiable sequence of attributable events is the compliance artefact.",
+    "Authentication and authorisation decision records: who was denied, by which rule, in which service - the evidence security operations triages incidents from.",
+    "Cloud and API activity logging built the CloudTrail way: per-file digests plus signed digest files that chain the previous digest, so a customer can verify what the provider delivered.",
+    "Edge and IoT devices that can be physically captured: the device keeps chaining into a remote anchor, so records written before an attack stay trustworthy after it.",
+    "systemd-journald Forward Secure Sealing: journalctl --setup-keys keeps a sealing key on the host that derives forward-securely per epoch while the verification key is stored externally; per-epoch SHA-256 HMAC tags seal the journal file, and journalctl --verify with the external key detects alteration, removal or reordering of records.",
+    "Certificate Transparency (RFC 6962) generalises the chain into an append-only Merkle tree: the log signs each tree head within the Maximum Merge Delay, and auditors verify with Merkle consistency proofs that newer heads preserve every earlier entry - the anchor is published and independently checked rather than merely kept.",
+    "Google Pixel Binary Transparency: factory images are leaves of a tile-based Merkle tree whose signed checkpoint roots are published, and witness monitors routinely verify consistency between checkpoints so a rolled-back or rewritten log is detected by third parties, not just the log operator."
+  ],
+  "avoid_when": [
+    "Debug, diagnostic or access logs with no evidentiary purpose: structured logging to a central collector is cheaper and has no key custody to get wrong.",
+    "A managed append-only service already provides the guarantee (write-once storage, signed digest files, immutable archive): consume that integrity instead of re-implementing chaining locally.",
+    "Nothing inside the trust boundary is in the threat model (no privileged attacker on the recording host): ordinary access-controlled logging plus off-host shipping is the simpler alternative.",
+    "Individual records must be erasable on demand and sensitive fields cannot be kept off-chain: a hash chain makes deletion itself evidence of tampering, so settle the data-protection requirement first."
+  ],
+  "language_files": {
+    "generic": "secure-logger.generic.json",
+    "c": "secure-logger.c.json",
+    "cplusplus": "secure-logger.cplusplus.json",
+    "csharp": "secure-logger.csharp.json",
+    "go": "secure-logger.go.json",
+    "java": "secure-logger.java.json",
+    "javascript": "secure-logger.javascript.json",
+    "kotlin": "secure-logger.kotlin.json",
+    "python": "secure-logger.python.json",
+    "ruby": "secure-logger.ruby.json",
+    "rust": "secure-logger.rust.json",
+    "scala": "secure-logger.scala.json",
+    "swift": "secure-logger.swift.json",
+    "typescript": "secure-logger.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "security-patterns"
+  ],
+  "related_patterns": [
+    "audit-interceptor",
+    "obfuscated-transfer-object",
+    "immutable-object",
+    "decorator",
+    "separation-of-duties"
+  ],
+  "anti_patterns": [
+    "Self-verified integrity: the writer and the verifier run in the same process or on the same host with the same key, so the attacker who is supposed to be caught can recompute the chain.",
+    "Chaining over an ambiguous encoding (unkeyed string concatenation with user-controlled fields, locale-dependent timestamps, unordered maps), which permits splicing and replay even though every authenticator verifies.",
+    "Rotation and pruning without anchoring: each new file starts a fresh chain, so whole files can be deleted without leaving a detectable break.",
+    "The secure log as a secret store: writing tokens, session identifiers or passwords into records that must be kept forever turns the most-protected artefact into the most attractive target.",
+    "Crypto without access control: hash-chaining a world-writable file and calling it tamper-proof while any process on the host can truncate or replace it.",
+    "Unbounded blocking: fsyncing every debug record on the request path until the logging channel itself becomes the outage."
+  ],
+  "design_principles": [
+    "Complete mediation at one chokepoint: every security-relevant record passes the secure logger, and nothing bypasses the chain.",
+    "Separation of duties: the recording party must not hold the means to rewrite, truncate or verify away the evidence - keys, anchors and verification belong to other roles.",
+    "Defence in depth: the chain is one layer above access control, transport security and immutable storage, never a replacement for them.",
+    "Data minimisation and least privilege: the store is append-only for the application, and deciding what is never logged is part of the pattern.",
+    "Open design: the guarantee rests on key custody and chaining, not on the format or the algorithm being secret."
+  ],
+  "best_practices": [
+    "Authenticate prev || sequence number || canonical(record), and keep a trusted timestamp inside the authenticated bytes.",
+    "Anchor the current head authenticator out of band at a fixed cadence (remote collector, signed digest file, hardware token) and always anchor immediately before rotation or pruning.",
+    "Keep MAC or signing keys out of the log store and out of application configuration; rotate them, record the key id in each record, and prefer asymmetric signing so verifiers hold only a public key.",
+    "Run verification on a different host and identity from the writer; alert on sequence gaps, authenticator mismatches and verification failures, and keep the verifier independent of the write path.",
+    "Reject or redact before chaining: secrets, tokens and personal data never enter an append-only store, and every logged field is handled as data so CRLF and delimiters cannot forge records.",
+    "Decide per event class whether a logging failure fails the operation or drops the event, count every drop, and never lose a failure silently.",
+    "Bind the key id and key epoch into the authenticated bytes and verify their ordering against sequence position: journald's Forward Secure Sealing shipped for years accepting old entries sealed with newer keys (CVE-2023-31439), which let a compromised host forge arbitrary past entries until patched in systemd 255."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Nagappan & Steel, Core Security Patterns: Best Practices and Strategies for J2EE, Web Services and Identity Management (Prentice Hall, 2005) - Secure Logger pattern of the Sun Java Center catalogue (listed among the security patterns documented for the catalogue in docs/design-patterns.md section 8).",
+    "Schumacher, Fernandez-Buglioni, Hybertson, Buschmann & Sommerlad, Security Patterns: Integrating Security and Systems Engineering (Wiley Series in Software Design Patterns, 2005) - the unified security-pattern catalogue cited as provenance for docs/design-patterns.md section 8.",
+    "Schneier & Kelsey, Secure Audit Logs to Support Computer Forensics, ACM Transactions on Information and System Security 2(2), 1999 - https://doi.org/10.1145/317087.317089",
+    "Kelsey, Callas & Clemm, Signed Syslog Messages, IETF RFC 5848 (2010) - origin authentication, message integrity, replay resistance, sequencing and missing-message detection for syslog - https://www.rfc-editor.org/rfc/rfc5848.html",
+    "https://csrc.nist.gov/pubs/sp/800/92/final - NIST SP 800-92, Guide to Computer Security Log Management (2006).",
+    "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html - OWASP Logging Cheat Sheet: what to log, what must never be logged, log injection and failure handling.",
+    "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-log-file-validation-intro.html - AWS CloudTrail log file integrity validation (per-file SHA-256 digests, signed digest files chaining the previous digest) as a production realisation of the pattern.",
+    "https://downloads.distrinet-research.be/software/securitypatterns/catalog-html/Secure%20Logger.html - Core Security Patterns (Sun Java Centre) Secure Logger catalogue page: the Secure Log Store and Secure Data Logger strategies with signed digests and embedded sequence numbers that are this pattern's canonical origin.",
+    "https://www.rfc-editor.org/rfc/rfc6962.html - Certificate Transparency: append-only Merkle-tree log with Signed Tree Heads within the Maximum Merge Delay and Merkle consistency proofs that let third-party auditors verify tamper-evidence of a log they do not trust.",
+    "https://systemd.io/JOURNAL_FILE_FORMAT/ - systemd journal file format: Forward Secure Sealing TAG objects as per-epoch SHA-256 HMACs with an externally held verification key and a full-file verification pass.",
+    "https://www.freedesktop.org/software/systemd/man/254/journalctl.html - journalctl Forward Secure Sealing interface: --setup-keys keeps the sealing key on the host and instructs storing the verification key externally; --verify/--verify-key check journal authenticity.",
+    "https://eprint.iacr.org/2023/867 - Dorre & Ottenhues, Secure Logging in between Theory and Practice: Security Analysis of the Implementation of Forward Secure Log Sealing in Journald (ACNS 2025) - how accepting old entries sealed with newer keys (CVE-2023-31439) broke forward-secure sealing in practice."
+  ]
+}

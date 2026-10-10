@@ -1,0 +1,60 @@
+{
+  "pattern": "splitter",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "for-range over the decoded parts + per-part Send",
+  "implementation_notes": "The smallest complete Go splitter is a for-range over the decoded slice with one publish per element: there is no role structure to replace, and the messaging client (Kafka, NATS, AMQP) only needs a per-part Send. Concurrency is added with goroutines plus a channel and an errgroup rather than with a Splitter object, and correlation/sequence headers are set explicitly on every part because nothing in the runtime fills them in. A splitter type is justified only when the boundary rule itself must be pluggable (a map from payload kind to a split function).",
+  "code_sketch": "func split(ctx context.Context, m Order, out Publisher) error {\n    for i, item := range m.Items {\n        p := Part{Corr: m.ID, Seq: i, Size: len(m.Items), Item: item}\n        if err := out.Publish(ctx, p); err != nil {\n            return fmt.Errorf(\"part %d of %s: %w\", i, m.ID, err)\n        }\n    }\n    return nil\n}",
+  "pitfalls": [
+    "Before Go 1.22 the loop variable was shared across iterations: a goroutine per part captured the last element unless the value was copied or passed as an argument.",
+    "Publishing without honouring ctx or back-pressure turns a slow broker into unbounded memory growth.",
+    "A single shared error variable (or an ignored Send error) reports success after a partial publication; collect per-part errors and decide whether the composite failed.",
+    "Sequence metadata must come from the composite, not from a package-level counter shared by concurrent splits."
+  ],
+  "sources": [
+    "https://go.dev/blog/range-functions"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "loop-publish",
+      "name": "Range loop with one publish per part",
+      "paradigm": "procedural",
+      "min_standard": "Go1.0",
+      "idiom_name": "for-range over the decoded parts + per-part Send",
+      "implementation_notes": "The smallest complete Go splitter is a for-range over the decoded slice with one publish per element: there is no role structure to replace, and the messaging client (Kafka, NATS, AMQP) only needs a per-part Send. Concurrency is added with goroutines plus a channel and an errgroup rather than with a Splitter object, and correlation/sequence headers are set explicitly on every part because nothing in the runtime fills them in. A splitter type is justified only when the boundary rule itself must be pluggable (a map from payload kind to a split function).",
+      "code_sketch": "func split(ctx context.Context, m Order, out Publisher) error {\n    for i, item := range m.Items {\n        p := Part{Corr: m.ID, Seq: i, Size: len(m.Items), Item: item}\n        if err := out.Publish(ctx, p); err != nil {\n            return fmt.Errorf(\"part %d of %s: %w\", i, m.ID, err)\n        }\n    }\n    return nil\n}",
+      "pitfalls": [
+        "Before Go 1.22 the loop variable was shared across iterations: a goroutine per part captured the last element unless the value was copied or passed as an argument.",
+        "Publishing without honouring ctx or back-pressure turns a slow broker into unbounded memory growth.",
+        "A single shared error variable (or an ignored Send error) reports success after a partial publication; collect per-part errors and decide whether the composite failed.",
+        "Sequence metadata must come from the composite, not from a package-level counter shared by concurrent splits."
+      ],
+      "sources": [
+        "https://go.dev/blog/range-functions"
+      ]
+    },
+    {
+      "variant_id": "slices-chunk-iterator",
+      "name": "Range-over-func iterator (slices.Chunk + iter.Seq)",
+      "paradigm": "functional",
+      "min_standard": "Go1.23",
+      "requires_features": [
+        "range over func",
+        "iterators"
+      ],
+      "idiom_name": "slices.Chunk / iter.Seq as a composed split stage",
+      "implementation_notes": "Go 1.23's range-over-func plus the iter package make the splitter an iterator: slices.Chunk returns an iterator over consecutive sub-slices of up to n elements, and a hand-written iter.Seq can lazily yield one part per element, so the split becomes a composable stage that the consumer ranges over instead of a loop that owns the fan-out. This is the idiomatic Go analogue of a stream operator and the right shape when several stages (decode, chunk, publish) should stay separate; the plain loop stays simpler for a one-off split.",
+      "code_sketch": "for batch := range slices.Chunk(m.Items, 100) {   // Go 1.23\n    if err := out.Publish(ctx, Part{Corr: m.ID, Items: batch}); err != nil {\n        return err\n    }\n}",
+      "pitfalls": [
+        "slices.Chunk yields sub-slices that alias the original backing array: mutating a part mutates the composite, and concurrent consumers then race on shared memory.",
+        "An iterator is a stateful single-use value - ranging the same iter.Seq twice publishes nothing the second time unless it is rebuilt.",
+        "A yield function that is not called on every element (early return without draining) can leak the producer goroutine when the iterator is channel-backed."
+      ],
+      "sources": [
+        "https://go.dev/doc/go1.23"
+      ]
+    }
+  ],
+  "default_variant": "loop-publish"
+}

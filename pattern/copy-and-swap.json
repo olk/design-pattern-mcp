@@ -1,0 +1,177 @@
+{
+  "category": "construction-composition",
+  "name": "copy-and-swap",
+  "aliases": [
+    "copy and swap idiom",
+    "create-temporary-and-swap"
+  ],
+  "intent": "Implement assignment (and any in-place state replacement) so that a failure while producing the new state leaves the target untouched: build the complete replacement off to the side, commit it with operations that cannot fail, and let the temporary's destructor or the garbage collector release the old state.",
+  "problem": "A hand-written assignment has to tear down the old state and build a copy of the new one, but only the build can fail: destroying before allocating exposes a half-updated object when the allocation or the element copy throws, and the usual repair -- a self-assignment check plus manual rollback -- duplicates the per-member copying that already lives in the copy constructor. The trigger is an assignment (or, in a garbage-collected language, an in-place state replacement) that must satisfy the strong exception guarantee: either it completes, or the target still holds its previous value.",
+  "context": "Types that own resources -- heap buffers, handles, file descriptors, trees, containers -- in a language where the programmer controls copy semantics: C++ special member functions, a C ADT with error codes, Rust with panic/abort failure modes. The same ordering also applies in garbage-collected languages whenever published state must never be mutated in place: building the complete replacement and publishing it once keeps readers consistent and moves the release of the old state to the collector. The precondition is a commit step that genuinely cannot fail -- a noexcept member swap, one reference or pointer store, or an atomic publish.",
+  "benefits": [
+    "Strong exception guarantee for assignment: if building the replacement fails, the target has not changed, so callers see commit or rollback instead of a half-updated object.",
+    "Copy logic lives in exactly one place: the assignment delegates to the copy constructor instead of repeating (and drifting from) the per-member copying, while the destructor owns release -- the rule of three/five satisfied by construction.",
+    "Self-assignment needs no branch and no special case: a redundant self-copy followed by a swap of identical contents is correct, so the check that is easy to omit (or to get wrong) disappears.",
+    "No rollback code, no try/catch and no partially undone mutations: fallible work first, non-failing commit second is the entire mechanism, which makes the operator small and reviewable.",
+    "In C++11 and later a single operator serves copy and move assignment -- the by-value parameter is copy-constructed from lvalues and move-constructed from rvalues -- so the class needs fewer special members.",
+    "The same shape covers in-place updates in garbage-collected languages: publish a freshly built immutable value through one reference store, with the collector replacing the destructor half of the idiom."
+  ],
+  "tradeoffs": [
+    "Every assignment pays a full copy: the idiom cannot reuse the target's existing buffer or capacity, so it always reallocates (cppreference notes this explicitly for the copy-and-swap form) and is measurably slower than a bespoke assignment that copies into storage it already owns.",
+    "The guarantee is only as strong as the swap: a member swap that can throw or allocate downgrades the strong guarantee to the basic one, and a throw escaping a noexcept swap terminates the process -- a worse failure mode than the one the idiom removed; members that cannot be swapped at all (std::mutex, std::atomic) force pointer indirection or exclusion.",
+    "Old and new state coexist until the commit, so peak memory (and any per-state resource, lock or descriptor) roughly doubles for the duration, and releasing the old state can be expensive (recursive frees, closing handles) on the assignment operator's exit path rather than at an explicit release point.",
+    "The fallible copy moves to the call site, which changes overload control and diagnostics: a by-value operator= cannot be paired with a separate noexcept move-assign, a type with an expensive destructor pays for the temporary's destruction, and is_nothrow_copy_assignable correctly stays false while operator= itself is noexcept.",
+    "The object keeps its address but receives another object's contents, so types whose identity is registered elsewhere (mutexes, atomics, self-referential nodes, callback registries) get an assignment that compiles and silently breaks invariants.",
+    "It can hide a design question: for many types the right answer is not a safer assignment but no mutation at all (an immutable value replaced by reference, or a non-copyable owner), and adding copy-and-swap keeps a design that should have been removed.",
+    "Every extension of the type must be mirrored in swap: a forgotten member is not a compile error, it is stale state in every assigned object -- a silent correctness bug no warning catches."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 5,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 4,
+    "reliability": 9,
+    "security": 4,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Assignment entry point (operator= / update method)",
+      "responsibility": "Accepts the new state -- in C++ by value, so the copy or move happens at the call site before the body runs -- performs only the non-failing commit (swap or publish) and returns the target so chained assignment keeps working."
+    },
+    {
+      "role": "Copy constructor (the copy step)",
+      "responsibility": "Builds a complete, independent copy of the source off to the side; it is the only participant allowed to fail, and it must itself clean up already-constructed members before propagating an error so the caller is left with nothing partial."
+    },
+    {
+      "role": "swap / commit primitive",
+      "responsibility": "Exchanges the target's internals with the temporary's, or publishes the freshly built value in one store; it must not allocate and must not fail (noexcept member swap, single reference store, atomic exchange), because a half-finished commit cannot be rolled back."
+    },
+    {
+      "role": "Temporary (new-state holder)",
+      "responsibility": "Owns the new state before the commit and the previous state after it; its destructor (RAII) or the garbage collector releases the old state, which is why no explicit cleanup appears in the assignment."
+    },
+    {
+      "role": "Resource-owning members",
+      "responsibility": "The fields the swap exchanges; the guarantee is exactly as strong as the weakest member swap, and members that must not be swapped (locks, atomics, back-references to the owner) have to be indirected behind a swappable handle or left out."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Container and buffer classes that own heap memory (dynamic array, string, matrix, tree) and must be assignable without leaking or leaving the target inconsistent when an allocation fails.",
+    "Handle/pimpl classes that keep their state behind a single pointer: the swap is a pointer exchange, so the commit is unconditionally non-throwing while the deep copy still happens in the copy constructor (Sutter's canonical Pimpl exception-safety transformation).",
+    "Pre-C++11 codebases where the same operator= must serve lvalues and rvalues and no move constructor exists, using the const-reference plus explicit-local-temporary form.",
+    "Value types stored inside standard containers: std::vector and friends need element assignment to be safe before they can offer their own strong guarantee on reallocation, and a noexcept swap participates in their internal move/swap dispatch.",
+    "Garbage-collected languages where shared state must be replaced rather than mutated: build a complete replacement value and publish it with one store (AtomicReference.updateAndGet, atomic.Pointer[T].Store, a record with-expression) so readers never observe a partially updated object.",
+    "In-place state replacement where identity must be preserved (a registry entry, a cached object with live references): copy into a scratch value, then commit with a member-wise exchange or a replace-style API instead of repointing the reference.",
+    "Concurrent programming with thread-safe local-then-publish: build the replacement in a local object (thread-private by definition), then publish atomically -- readers never see a partially updated state, and the previous value is released by the collector after the atomic write is visible.",
+    "Version-control-style update: check out a local copy, mutate freely, then commit or discard; copy-and-swap maps directly to this workflow and provides the same transactional semantics (Howard Hinnant's analogy from his C++ Con 2018 talk).",
+    "Compiler tooling treats the idiom as the canonical self-assignment-safe assignment: LLVM's clang-tidy bugprone-unhandled-self-assignment checker explicitly recognizes 'build a temporary in operator=, then swap it' as correct handling and matches extended (allocator-aware) constructors plus ADL swap forms so real copy-and-swap code is not flagged (llvm/llvm-project PR #147066).",
+    "Boost's move/assignment guidance converged on the single by-value form T operator=(T b) { swap(*this, b); return *this; } as the common way to get copy-, move-, and convertible-assignment from one operator, with dedicated macros (BOOST_COPYABLE_AND_MOVABLE_ALT) for classes that adopt it instead of separate overloads.",
+    "When a strong guarantee is needed on the standard containers, libc++ maintainers advise exactly this idiom at the call site -- 'construct a new vector and swap it with the one you want to assign to' (libc++ PR #117516 discussion) -- because the library's own copy assignment deliberately offers only the basic guarantee."
+  ],
+  "avoid_when": [
+    "The assignment can reuse the target's existing resources safely (same-size copy into an owned buffer, a container that keeps its capacity): a bespoke in-place assignment with the basic guarantee is faster, and the extra copy is pure overhead.",
+    "The class cannot provide a non-failing swap -- it owns a std::mutex or std::atomic, holds references bound to *this, or has a member whose swap can throw: use pointer indirection, or commit member by member with a documented basic guarantee.",
+    "The type has identity or address-bound invariants (observers registered on the object, self-referential nodes, intrusive links): exchanging the guts breaks invariants the compiler cannot see, so prefer an immutable value plus reference replacement.",
+    "Assignment is on a hot path with large objects: doubling the peak footprint and deep-copying everything per assignment can dominate the profile; move, swap ownership, or update in place with a cheap rollback instead.",
+    "The type should not be assignable at all: make it non-copyable (delete the copy operations, move-only, or a handle to a shared immutable value) rather than writing a safe assignment for a design that wanted none."
+  ],
+  "language_files": {
+    "generic": "copy-and-swap.generic.json",
+    "c": "copy-and-swap.c.json",
+    "cplusplus": "copy-and-swap.cplusplus.json",
+    "csharp": "copy-and-swap.csharp.json",
+    "go": "copy-and-swap.go.json",
+    "java": "copy-and-swap.java.json",
+    "javascript": "copy-and-swap.javascript.json",
+    "kotlin": "copy-and-swap.kotlin.json",
+    "python": "copy-and-swap.python.json",
+    "ruby": "copy-and-swap.ruby.json",
+    "rust": "copy-and-swap.rust.json",
+    "scala": "copy-and-swap.scala.json",
+    "swift": "copy-and-swap.swift.json",
+    "typescript": "copy-and-swap.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "non-throwing-swap",
+    "raii",
+    "pimpl",
+    "smart-pointer",
+    "copy-on-write",
+    "immutable-object",
+    "value-object"
+  ],
+  "anti_patterns": [
+    "Applying copy-and-swap to every class as a reflex, including types that can reuse their existing storage: a full deep copy per assignment for a guarantee the operation never needed.",
+    "A swap marked noexcept whose body copies or allocates (std::swap on a type whose move can throw, or an allocation inside swap): a throw escaping it calls std::terminate, replacing silent corruption with a crash.",
+    "Forgetting a data member when extending swap: the operator still compiles and every assigned object keeps stale state for that member -- a silent bug that no compiler warning catches.",
+    "Using the idiom on a type whose identity matters (mutexes, atomics, self-referential containers, registered callbacks): the swap exchanges state the type promised to keep at a fixed address.",
+    "Half-measures -- an explicit temporary plus a self-assignment check kept 'for speed', or a swap that exchanges only the easy fields -- leave exactly the partial-state bugs the idiom exists to remove.",
+    "Mutating state that readers already hold instead of replacing it: in a garbage-collected language this makes the copy step pointless and reintroduces torn reads.",
+    "Relying on copy-and-swap as the only form of assignment in high-throughput code: the mandatory reallocation and extra copy are pure overhead when basic exception safety would suffice, and Howard Hinnant's critique (C++ Con 2018) shows that the standard library itself (e.g. std::vector) opts for basic guarantee in copy assignment specifically to avoid this overhead."
+  ],
+  "design_principles": [
+    "Commit or rollback (strong exception guarantee): an operation either completes fully or has no observable effect; fallible-work-first, non-failing-commit-second is the mechanism that delivers it.",
+    "Single responsibility: copying is the copy constructor's job, release is the destructor's job, and assignment only sequences the two.",
+    "RAII / resource ownership: the temporary owns the old state after the commit, so release cannot be forgotten on any error path.",
+    "DRY: assignment reuses the copy constructor instead of duplicating member-wise copy logic that would drift apart from it.",
+    "Fail fast before observable change: everything that can fail runs while the target is still untouched, which preserves invariants and not merely the no-leak guarantee.",
+    "Separated mechanism: the class exposes one swap primitive, and assignment, move construction, sorting and container algorithms all build on it."
+  ],
+  "best_practices": [
+    "Take the parameter by value (T& operator=(T other)) so the compiler performs the copy from an lvalue and the move from an rvalue at the call site, and keep the body to swap plus return *this.",
+    "Provide a member swap and an ADL friend swap defined in terms of it, mark it noexcept, and call swap as 'using std::swap; swap(a, b);' so member types get their own overload.",
+    "Verify the noexcept chain (static_assert(noexcept(swap(declval<T&>(), declval<T&>()))) and audit every data member's swap; anything that can throw belongs in the copy step, not in the commit. C++ Core Guidelines C.85: Make swap noexcept is not optional -- a throw from a noexcept function calls std::terminate.",
+    "Make the copy constructor give at least the basic guarantee -- clean up already-constructed members before propagating -- and keep the destructor non-throwing; the idiom assumes both.",
+    "Prefer the rule of zero: use value-type members that already copy and swap correctly (std::vector, std::string, smart pointers) and let the compiler generate the special members; write copy-and-swap only for the class that really manages a resource by hand.",
+    "When state is shared or read concurrently, hold it behind one pointer or reference and commit with a single store (atomic or under a lock); never mix in-place mutation of published state with the copy-and-swap discipline.",
+    "Unit-test the guarantee with a copy constructor that throws on demand and assert the target is unchanged (and add a self-assignment test); a happy-path test does not exercise it.",
+    "Consider separating the strong-guarantee assignment from the default operator=: implement a cheap in-place copy assignment for the basic guarantee, and provide a distinct strong_assign(target, source) function (or a dedicated transaction API) only when callers genuinely need the strong guarantee -- this avoids forcing all assignees to pay the copy-and-swap overhead (Hinnant's advice from C++ Con 2018).",
+    "Audit all data members for noexcept swap: if any member's swap can throw, the overall swap is not noexcept and the strong guarantee does not hold; std::unique_ptr's swap is noexcept, but containers and user-defined types need explicit verification.",
+    "Remember C++ Core Guidelines C.21: if you define copy= and swap, also define the move operations; copy-and-swap handles copy assignment but does not automatically give a correct move assignment -- define it explicitly or = default it when the members support it."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Tyagi & Volchko, More C++ Idioms, 'Copy-and-swap' (Wikibooks) -- intent: 'To create an exception-safe implementation of overloaded assignment operator'; also known as Create-Temporary-and-Swap.",
+    "https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Copy-and-swap",
+    "https://en.cppreference.com/w/cpp/language/copy_assignment",
+    "http://www.gotw.ca/gotw/059.htm",
+    "Sutter, More Exceptional C++ (Addison-Wesley, 2002) -- 'Exception-Safe Class Design, Part 1: Copy Assignment': create a temporary and swap, committing with non-throwing operations only.",
+    "https://www.stroustrup.com/except.pdf",
+    "https://cpppatterns.com/patterns/copy-and-swap.html",
+    "https://www.modernescpp.com/index.php/the-copy-and-swap-idiom/",
+    "Ropert, 'Copy and Swap, 20 years later' (2019) -- examines the performance tradeoff (always allocates, 3x peak memory) and the C++ standard library's choice of basic guarantee for container copy assignment: https://mropert.github.io/2019/01/07/copy_swap_20_years/",
+    "Hinnant, 'Zero-Budget Exception Safety' (C++ Con 2018) -- argues copy-and-swap is necessary for strong guarantee but is overkill when basic guarantee suffices; proposes separating strong_assign from the default operator= to avoid mandatory overhead: https://www.youtube.com/watch?v=vLinb2fgkHk",
+    "ISO C++ Core Guidelines C.83 (value-like swap should be noexcept), C.84 (swap may not fail), C.85 (make swap noexcept): https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#Rc-swap",
+    "ISO C++ Core Guidelines C.21 (if you define copy= and swap, define move operations too): https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#C21",
+    "Abrahams, 'Exception-Safety in Generic Components' (Boost) -- formalized the four exception-safety levels (no-throw, strong, basic, no guarantee) that the copy-and-swap idiom guarantees: https://www.boost.org/community/exception_safety.html",
+    "Hinnant, 'Should I define one special member in terms of another? Case study: the copy/swap idiom' (ACCU 2014) -- measurements: copy/swap is same-speed only when the target's capacity always suffices, ~70% slower on average, almost 8x slower worst case: https://howardhinnant.github.io/accu_2014_48.pdf",
+    "Meyers, 'The Drawbacks of Implementing Move Assignment in Terms of Swap' (2014) -- swap-based move assignment delays release of the target's resources and raises peak memory; swap is not the right default for move assignment: http://scottmeyers.blogspot.com/2014/06/the-drawbacks-of-implementing-move.html",
+    "LLVM clang-tidy PR #147066 (2025) -- bugprone-unhandled-self-assignment matches copy-and-swap (including extended constructors, std::swap and ADL swap) as the accepted self-assignment-safe form: https://github.com/llvm/llvm-project/pull/147066",
+    "Boost mailing list, '[move] Implementing operator= in terms of pass-by-value and swap' -- one by-value operator= serves copy/move/convertible assignment; Boost.Move documents the separate-overload alternative: https://lists.boost.org/archives/list/boost@lists.boost.org/thread/2WCGCXQJHLHZZSJ2WKRFH3D3GTJP4ZML/",
+    "libc++ PR #117516 discussion (2024) -- maintainers confirm vector copy assignment keeps the basic guarantee and that callers wanting strong safety should construct-and-swap: https://lists.llvm.org/pipermail/libcxx-commits/2024-November/095816.html",
+    "https://docs.oracle.com/en/java/javase/22/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+  ],
+  "related_patterns_notes": {
+    "commit-rollback-semantics": "commit-rollback-semantics",
+    "transactional-memory": "transactional-memory"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "pattern": "optimistic-offline-lock",
+  "language": "rust",
+  "variants": [
+    {
+      "variant_id": "rusqlite-rowcount-guard",
+      "name": "Hand-written guard over rusqlite",
+      "paradigm": "procedural",
+      "idiom_name": "Connection::execute -> rows changed",
+      "implementation_notes": "Rust's database crates deliberately stop short of an ORM concurrency token: with rusqlite the guarded statement itself reports the outcome - Connection::execute returns the number of rows changed (and Connection::changes() reads the count of the most recent statement) - while sqlx exposes the same figure as rows_affected on its query result. The pattern is therefore the hand-written version column plus a dedicated conflict error variant, so a stale write cannot be ignored at the call site.",
+      "code_sketch": "let changed = conn.execute(\n    \"UPDATE account SET balance = ?1, version = version + 1 \\\n     WHERE id = ?2 AND version = ?3\",\n    params![new_balance, id, expected_version],\n)?;\nif changed == 0 {\n    return Err(StaleRow(id));   // someone else committed first\n}",
+      "pitfalls": [
+        "Connection::changes() is connection-scoped state: any other statement executed before it is read (logging, a dropped transaction guard) overwrites the count.",
+        "rusqlite connections are not Sync - sharing one across threads needs a pool or mutex, and a per-statement pooled connection breaks the one-system-transaction rule.",
+        "Discarding the returned row count (let _ = ...) makes the conflict invisible; model it as a #[must_use] result or an error variant."
+      ],
+      "sources": [
+        "https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-compare-exchange",
+      "name": "In-process CAS retry loop",
+      "paradigm": "concurrent",
+      "idiom_name": "AtomicU64::compare_exchange",
+      "implementation_notes": "In-process the same mechanics are std atomics: load the current version, compute the new value, and publish it with compare_exchange (or compare_exchange_weak inside a loop); a failure yields the current value, which the caller re-reads and recomputes. This is the hardware form of validate-then-act and the basis of Rust's lock-free data structures; it does not persist anything, so an edit session that outlives the process still needs a stored token.",
+      "code_sketch": "let mut current = version.load(Ordering::Acquire);\nloop {\n    let next = compute(current);\n    match version.compare_exchange_weak(\n        current, next, Ordering::AcqRel, Ordering::Acquire) {\n        Ok(_) => break,\n        Err(actual) => current = actual,   // conflict: re-read, recompute\n    }\n}",
+      "pitfalls": [
+        "Relaxed ordering gives the exchange but not the happens-before edge needed to publish the data the version guards; Acquire/Release is the minimum.",
+        "compare_exchange compares bit patterns, so packing payload and version into one atomic only works if the type is Copy with no padding-induced duplicate representations.",
+        "Spinning on compare_exchange_weak under real contention burns a core - add backoff or fall back to a lock."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/nomicon/atomics.html"
+      ]
+    }
+  ],
+  "default_variant": "rusqlite-rowcount-guard",
+  "idiom_name": "Connection::execute -> rows changed",
+  "implementation_notes": "Rust's database crates deliberately stop short of an ORM concurrency token: with rusqlite the guarded statement itself reports the outcome - Connection::execute returns the number of rows changed (and Connection::changes() reads the count of the most recent statement) - while sqlx exposes the same figure as rows_affected on its query result. The pattern is therefore the hand-written version column plus a dedicated conflict error variant, so a stale write cannot be ignored at the call site.",
+  "code_sketch": "let changed = conn.execute(\n    \"UPDATE account SET balance = ?1, version = version + 1 \\\n     WHERE id = ?2 AND version = ?3\",\n    params![new_balance, id, expected_version],\n)?;\nif changed == 0 {\n    return Err(StaleRow(id));   // someone else committed first\n}",
+  "pitfalls": [
+    "Connection::changes() is connection-scoped state: any other statement executed before it is read (logging, a dropped transaction guard) overwrites the count.",
+    "rusqlite connections are not Sync - sharing one across threads needs a pool or mutex, and a per-statement pooled connection breaks the one-system-transaction rule.",
+    "Discarding the returned row count (let _ = ...) makes the conflict invisible; model it as a #[must_use] result or an error variant."
+  ],
+  "sources": [
+    "https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html"
+  ],
+  "support": "manual",
+  "version": "1.0"
+}

@@ -1,0 +1,65 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "AtLeastOnceDelivery with deliver/confirmDelivery over a PersistentActor journal",
+  "implementation_notes": "Scala's actor stack absorbs the pattern: mixing AtLeastOnceDelivery into a PersistentActor (or extending AbstractPersistentActorWithAtLeastOnceDelivery) makes the journal the durable store, deliver(destination)(id => message) the store-and-forward step, and confirmDelivery(deliveryId) - sent by the destination as a reply - the acknowledgement that stops re-sending. Unconfirmed deliveries are retried after a configurable interval and warnAfterNumberOfUnconfirmedAttempts flags the ones that never confirm, so the replay logic is the framework's rather than yours. The destination must be idempotent (at-least-once is explicit in the name); choose the Kafka variant instead when the store should be a shared broker log rather than the actor's journal.",
+  "code_sketch": "class OrderSender extends AbstractPersistentActorWithAtLeastOnceDelivery {\n  override def receiveCommand: Receive = {\n    case PlaceOrder(o) =>\n      persist(OrderPlaced(o.id)) { _ =>\n        deliver(o.destination)(deliveryId => SendOrder(deliveryId, o))  // journaled\n      }\n    case Ack(orderId, deliveryId) =>\n      persist(OrderAcked(orderId)) { _ => confirmDelivery(deliveryId) }\n  }\n  override def receiveRecover: Receive = { case _: OrderEvent => }\n}",
+  "pitfalls": [
+    "The destination must reply with the deliveryId and the sender must translate that reply into confirmDelivery; otherwise every message is re-sent forever.",
+    "Delivery tracking is actor state: unconfirmed messages accumulate (bounded only by max-unconfirmed-messages), so a dead destination must be alerted on, not just retried.",
+    "At-least-once means the receiver sees duplicates after every crash-restart window; idempotence in the destination is mandatory.",
+    "The typed EventSourcedBehavior API has no equivalent of AtLeastOnceDelivery - a typed service needs the retry/outbox or the classic actor API, and mixing them is a design decision, not a drop-in."
+  ],
+  "sources": [
+    "https://pekko.apache.org/docs/pekko/current/persistence.html",
+    "https://doc.akka.io/api/akka/current/akka/persistence/AtLeastOnceDelivery.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pekko-at-least-once-delivery",
+      "name": "Pekko/Akka Persistence AtLeastOnceDelivery (journal-backed)",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "pekko-persistence"
+      ],
+      "idiom_name": "AtLeastOnceDelivery with deliver/confirmDelivery over a PersistentActor journal",
+      "implementation_notes": "Scala's actor stack absorbs the pattern: mixing AtLeastOnceDelivery into a PersistentActor (or extending AbstractPersistentActorWithAtLeastOnceDelivery) makes the journal the durable store, deliver(destination)(id => message) the store-and-forward step, and confirmDelivery(deliveryId) - sent by the destination as a reply - the acknowledgement that stops re-sending. Unconfirmed deliveries are retried after a configurable interval and warnAfterNumberOfUnconfirmedAttempts flags the ones that never confirm, so the replay logic is the framework's rather than yours. The destination must be idempotent (at-least-once is explicit in the name); choose the Kafka variant instead when the store should be a shared broker log rather than the actor's journal.",
+      "code_sketch": "class OrderSender extends AbstractPersistentActorWithAtLeastOnceDelivery {\n  override def receiveCommand: Receive = {\n    case PlaceOrder(o) =>\n      persist(OrderPlaced(o.id)) { _ =>\n        deliver(o.destination)(deliveryId => SendOrder(deliveryId, o))  // journaled\n      }\n    case Ack(orderId, deliveryId) =>\n      persist(OrderAcked(orderId)) { _ => confirmDelivery(deliveryId) }\n  }\n  override def receiveRecover: Receive = { case _: OrderEvent => }\n}",
+      "pitfalls": [
+        "The destination must reply with the deliveryId and the sender must translate that reply into confirmDelivery; otherwise every message is re-sent forever.",
+        "Delivery tracking is actor state: unconfirmed messages accumulate (bounded only by max-unconfirmed-messages), so a dead destination must be alerted on, not just retried.",
+        "At-least-once means the receiver sees duplicates after every crash-restart window; idempotence in the destination is mandatory.",
+        "The typed EventSourcedBehavior API has no equivalent of AtLeastOnceDelivery - a typed service needs the retry/outbox or the classic actor API, and mixing them is a design decision, not a drop-in."
+      ],
+      "sources": [
+        "https://pekko.apache.org/docs/pekko/current/persistence.html",
+        "https://doc.akka.io/api/akka/current/akka/persistence/AtLeastOnceDelivery.html"
+      ]
+    },
+    {
+      "variant_id": "kafka-transactions-scala",
+      "name": "Kafka transactional producer from Scala",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "kafka-transactions"
+      ],
+      "idiom_name": "KafkaProducer initTransactions/commitTransaction + sendOffsetsToTransaction",
+      "implementation_notes": "Scala backends use the JVM Kafka client directly: enable.idempotence=true for retry-safe writes plus a transaction so the produced records and the consumed offsets commit together (sendOffsetsToTransaction), which is the acknowledgement protocol for consume-transform-produce. The broker log is the store and the transaction is what the Pekko variant achieves with a journal plus explicit confirmations; choose Kafka when the data must be visible to other services on a shared topic. The blocking KafkaProducer belongs behind a dedicated dispatcher or an Akka Streams/Pekko Streams producer stage.",
+      "code_sketch": "val producer = new KafkaProducer[String, String](props)   // transactional.id + idempotence\nproducer.initTransactions()\nproducer.beginTransaction()\ntry {\n  producer.send(new ProducerRecord(\"orders.out\", key, value))\n  producer.sendOffsetsToTransaction(offsets, groupMetadata)  // ack = offset\n  producer.commitTransaction()                               // then visible\n} catch { case _: KafkaException => producer.abortTransaction() }",
+      "pitfalls": [
+        "KafkaProducer blocks and is not stream-aware: calling it on the actor/stream dispatcher stalls the whole system - isolate it.",
+        "A transaction left open (no commit or abort on an exception path) blocks the transactional id until transaction.timeout.ms.",
+        "Consumers must use isolation.level=read_committed, otherwise records from aborted transactions are delivered - Scala clients default to read_uncommitted.",
+        "One transactional id must map to exactly one live producer instance; a rolling restart without fencing can let two instances write."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html"
+      ]
+    }
+  ],
+  "default_variant": "pekko-at-least-once-delivery",
+  "version": "1.0"
+}

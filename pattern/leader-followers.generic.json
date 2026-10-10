@@ -1,0 +1,26 @@
+{
+  "pattern": "leader-followers",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "fixed thread pool with a leader slot over a shared handle set (join / promote_new_leader protocol)",
+  "implementation_notes": "Language-neutral core: pre-spawn N threads; each runs join(), which under the pool synchronizer waits while a leader exists, claims the leader slot, releases the synchronizer and blocks in the demultiplexer on the shared handle set. When the wait returns an event, the leader re-acquires the synchronizer, clears the leader slot, signals one follower (promotion), releases it, deactivates the ready handle from the set, runs the handler itself as a processing thread, then reactivates the handle and loops back to join(). Keep the handle -> handler mapping in a demultiplexing table or registry, share one synchronizer among all followers, and make the promotion order an explicit decision (LIFO for cache affinity, priority order for real-time pools, FIFO or per-thread contexts for bound associations, and the native synchronizer's order only when simplicity outweighs cache behaviour). Pool sizing: N = C × U × (1 + W/S) where C=cores, U=target CPU utilisation, W=wait time, S=service time; for CPU-bound work use N = C + 1; for I/O-bound work a typical range is N × 5 to N × 50 depending on wait/compute ratio.",
+  "code_sketch": "join():                        # runs on every pool thread\n  lock(pool)\n  while leader != NONE: wait(followers_cv)   # follower\n  leader = self(); unlock(pool)              # become leader\n  events = demultiplex(handle_set)           # the leader's wait\n  lock(pool)\n  leader = NONE; signal(followers_cv)        # promote a follower\n  unlock(pool)\n  for e in events:\n      deactivate(e.handle)                   # no double dispatch\n      dispatch(handle_table[e.handle], e)    # process as ex-leader\n      reactivate(e.handle)",
+  "pitfalls": [
+    "Promotion and rejoin race with each other: every pool-state transition must happen under the pool synchronizer, and the synchronizer must never be held while waiting for events or running a handler.",
+    "Without the deactivate/reactivate step the newly promoted leader demultiplexes the same event a second time.",
+    "A processing thread cannot detect new events; nested waits must be designed as bound thread/handle associations with explicit hand-offs.",
+    "Skipping the deactivate step causes duplicate dispatch; skipping the reactivate step causes the event to never be noticed again.",
+    "Holding the pool lock across the demultiplexer wait serialises all followers and creates a thundering-herd on wakeup.",
+    "On NUMA systems, all threads accessing the same epoll fd rb-tree causes cache-line invalidation storms on the memory bus; consider sharding by handle-set.",
+    "Burst traffic can drain the pool entirely: if all N threads become processing threads simultaneously, no leader exists and incoming events sit in the kernel buffer until one handler returns - instrument this window.",
+    "Wrong move: hold the pool synchronizer while calling select()/poll() -> followers cannot wait or be promoted and wakeup contention serializes the pool -> instead release the synchronizer before demultiplexing and reacquire it only for role transitions.",
+    "Wrong move: run blocking database, file, or downstream-RPC work inside an unbound processing handler -> enough handlers can occupy every thread, leaving no leader and pushing latency into kernel buffers -> instead keep handlers non-blocking or hand blocking work to a separate executor or deliberately bound variant.",
+    "Wrong move: treat level-triggered readiness as one-shot without deactivation and rearm -> a promoted leader can dispatch the same readiness repeatedly, or a forgotten rearm can lose future events -> instead deactivate before dispatch and explicitly rearm after handling, or use an appropriate edge/one-shot mode."
+  ],
+  "sources": [
+    "Schmidt, O'Ryan, Pyarali, Kircher & Buschmann, 'Leader/Followers: A Design Pattern for Efficient Multi-threaded Event Demultiplexing and Dispatching', PLoP 2000 / POSA2.",
+    "ACE TP_Reactor: ACE_wrappers/ace/TP_Reactor.h — production C++ implementation of thread-pool reactor over ACE_Reactor.",
+    "TAO_Leader_Follower: docgroup.org/TAO — CORBA ORB client-side leader/followers for multiplexed connection demultiplexing."
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,194 @@
+{
+  "category": "specialized-components",
+  "name": "data-locality",
+  "aliases": [
+    "data-oriented design",
+    "cache-friendly layout",
+    "structure of arrays",
+    "SoA",
+    "AoS to SoA transformation"
+  ],
+  "intent": "Arrange data so the values a loop will process next are already in the cache lines it has fetched - contiguous arrays of values in processing order instead of pointer-linked objects, handles instead of references, hot fields separated from cold - so a hot loop streams through CPU cache instead of stalling on a fresh main-memory access per element.",
+  "problem": "A performance-critical loop is bound by memory latency rather than its own instructions: the data it touches is scattered across the heap - the container holds pointers, each object points at its own separately allocated fields or components, and every dereference lands on a cache line that must first be fetched from RAM, so the CPU idles while the prefetcher chases an unpredictable path. The recurring decision is whether the physical layout follows the class hierarchy (objects owning references) or the order and frequency in which the code processes the data (packed arrays addressed by index).",
+  "context": "Applies when a hot loop processes many similar items and profiling shows that cache misses, not the algorithm, dominate its time - entity/component updates in games and simulations, particle and physics systems, bulk numeric processing, and data pipelines in C, C++, Rust, Go, and managed runtimes where the object model (headers, boxing, GC movement) has to be bypassed deliberately. It is a measured trade of abstraction for throughput, not a default style.",
+  "benefits": [
+    "The same computation runs with far fewer memory stalls: contiguous traversal lets the prefetcher and the cache turn repeated accesses into hits (the originating chapter measured an ~50x speed-up for one update loop from layout alone).",
+    "Homogeneous storage removes indirection from the hot path: no vtable lookup and no per-item pointer chase, so the loop becomes a straight crawl that compilers can unroll and vectorize.",
+    "One allocation replaces many: a packed array (or a single arena) holds all records, which cuts allocator and garbage-collector pressure along with the layout.",
+    "Splitting records by access frequency (hot/cold split) and keeping active elements packed shrinks the working set, so every cache line carries data the loop actually uses and branch mispredictions disappear.",
+    "Handles (indices or ids) stay valid across growth, reordering and compaction, where raw pointers and references would silently dangle - and they are cheap to copy, store and serialize.",
+    "The layout becomes explicit and reviewable: field order, padding and the active prefix are visible in the code, which also makes FFI, persistence and GPU uploads straightforward.",
+    "Structure-of-Arrays (SoA) layouts unlock SIMD vectorization: when a hot loop operates on one or a few fields across thousands of records, storing each field in its own contiguous array lets vector units (AVX, SSE) load wide registers in a single instruction, yielding 4-8x throughput gains over equivalent Array-of-Structs (AoS) loops that require gather/scatter operations.",
+    "AoS-to-SoA transformation reduces memory bandwidth waste: if a loop touches only 2 of 8 fields, SoA loads exactly those two arrays (2 cache lines of useful data) whereas AoS loads all 8 fields per record, throwing away 6 fields per cache line.",
+    "False sharing becomes visible and preventable: when per-thread working sets are packed into separate cache lines (via alignas or padding), the coherence traffic that plagues shared objects vanishes."
+  ],
+  "tradeoffs": [
+    "Abstractions are sacrificed: interfaces, virtual dispatch and per-object encapsulation give way to data-shaped code whose invariants are upheld by accessor discipline rather than by the type system.",
+    "Element addresses are unstable: growing, inserting, sorting or packing the array invalidates every pointer and reference into it, so all references must become handles and every access must re-resolve through the storage.",
+    "The hot/cold and packing decisions are workload- and hardware-specific and age badly: access patterns change, yesterday's cold field becomes hot, and the layout has to be revised with fresh profiles.",
+    "Several threads writing fields that share a cache line suffer false sharing, so shared records need padding or alignment (alignas, @Contended, per-thread buffers) - extra structure that the object model did not need.",
+    "It only pays where misses dominate: applied to cold code or to code that is compute- or IO-bound it adds complexity and rigidity with no measurable gain, and it can pessimize branchy or sparse workloads.",
+    "Bookkeeping has to be upheld forever: handle tables, free lists, active counts, parallel arrays and swap-based removal are code that every later change must respect.",
+    "SoA can increase TLB pressure: splitting a record into N arrays means N separate pages of TLB entries for the same logical dataset; for very large collections this can offset the cache win.",
+    "Mixed-field access in SoA (when a loop needs several fields of the same record) now requires N parallel array lookups at the same index - acceptable in the hot path if each array fits in cache, but a regression if random per-object access is common."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 4,
+    "maintainability": 4,
+    "simplicity": 3,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Homogeneous storage (packed array / column)",
+      "responsibility": "Holds every record of one type as values in one contiguous allocation (or one column per field); owns capacity, the active count and the packed prefix."
+    },
+    {
+      "role": "Handle (index / id)",
+      "responsibility": "Cheap, stable reference to a record; replaces pointers and references so reordering, growth and compaction cannot dangle, and resolves through the storage."
+    },
+    {
+      "role": "Hot data / cold data",
+      "responsibility": "Splits a record into the fields the hot loop touches every iteration and the rare fields (reachable by one pointer or a parallel array at the same index) so cache lines carry only useful bytes."
+    },
+    {
+      "role": "Traversal loop (system)",
+      "responsibility": "Iterates the packed storage directly in processing order, over a count of active elements, without touching the class hierarchy or per-item flags."
+    },
+    {
+      "role": "Allocator / arena (optional)",
+      "responsibility": "Supplies and frees the storage (malloc, arena, pmr resource, pool, typed buffer) so records keep their addresses, packing stays cheap and allocation is not per item."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Entity/component systems (ECS): one packed array per component type with entity ids as handles, so each update system sweeps one contiguous array per domain. Archetype-based ECS (Unity DOTS, Flecs, Bevy) further groups entities sharing the same component set into columnar tables, enabling O(1) component lookup and streaming traversal — empirically measured to yield higher frame rates and better frame stability than object-oriented layouts for large entity counts.",
+    "Particle systems and physics: a fixed pool of particle records with active elements kept in the front of the array, so the integration loop has no branch and no gaps. GPU physics kernels follow the same principle: threads in a warp access adjacent particle data, maximizing memory coalescing on the device.",
+    "Frame-critical rendering and UI lists: transform, visibility and bounding-volume data in parallel arrays so culling walks contiguous spans instead of a tree of objects. This is the layout underlying tiled rendering, frustum culling, and LOD selection in modern game engines.",
+    "Numeric kernels and analytics: columnar/struct-of-arrays layouts that scan a field at a time and vectorize (SIMD) without padding waste. Database column stores (Apache Arrow, Parquet) are the canonical production instance: analytical queries that aggregate one column across millions of rows get maximum cache reuse and SIMD throughput.",
+    "Interop and I/O paths: packed record arrays or typed-array views over one buffer shared with native code, a file mapping, or the GPU, avoiding per-object marshalling. Memory-mapped files, GPU upload buffers, and zero-copy network rings (DPDK, io_uring) all require flat, cache-aligned record layouts.",
+    "Real-time audio DSP: sample buffers processed in fixed-size blocks with hot sample values in contiguous arrays; vectorizable EQ, compression and reverb kernels that process thousands of samples per loop iteration without pointer chasing.",
+    "Network packet processing: flow tables and ring buffers in network stacks (Linux kernel AF_XDP, DPDK) store per-flow state in contiguous arrays indexed by packet header fields, turning flow classification into an array lookup rather than a hash-map traversal.",
+    "Sparse-set ECS in C++ (EnTT): each component pool keeps its entities and components in paged packed arrays, so a view iterates a compact contiguous span, groups can additionally own their columns for raw-pointer iteration, and page size is a tuning knob that trades pointer stability against strict contiguity.",
+    "Columnar analytics formats (Apache Arrow): the Arrow columnar specification prescribes 8- or 64-byte aligned buffers - 64-byte padding preferred to match wide SIMD registers - and a pointer/offset layout that is relocatable without pointer swizzling, so record batches can be scanned zero-copy in shared memory.",
+    "Unity Entities (DOTS): entities sharing the same component set are stored together in 16KB archetype chunks with one dense column per component type, and Burst-compiled systems iterate those columns - a commercial production form of the packed-array-per-component design."
+  ],
+  "avoid_when": [
+    "No measured cache problem: profile first (e.g. Cachegrind, VTune, perf stat -e cache-misses); if the time is spent elsewhere, keep ordinary objects and their clarity.",
+    "The collection is small or touched rarely: plain objects, lists and maps are simpler and just as fast at that size. Rule of thumb: <1,000 objects — choose clarity; 1,000–10,000 — consider the pattern for hot subsets only; >10,000 — evaluate SoA vs AoS with profiling.",
+    "The items are genuinely heterogeneous or constantly changing type: a polymorphic collection (array of pointers/interfaces) is the simpler structure, and the pattern's uniformity is exactly what is missing.",
+    "The loop is compute-bound, branch-bound or IO-bound: layout will not move the needle; optimize the algorithm, the branch or the IO instead.",
+    "The data crosses a remote or persistence boundary: the schema and the store decide the on-disk layout; convert to packed form at the edge rather than reshaping the whole model.",
+    "Frequent random per-record access dominates: if the hot path repeatedly jumps to arbitrary records (not sequential scan), SoA's N-array index chase at each jump can exceed AoS's single-pointer dereference — profile both layouts."
+  ],
+  "language_files": {
+    "generic": "data-locality.generic.json",
+    "c": "data-locality.c.json",
+    "cplusplus": "data-locality.cplusplus.json",
+    "csharp": "data-locality.csharp.json",
+    "go": "data-locality.go.json",
+    "java": "data-locality.java.json",
+    "javascript": "data-locality.javascript.json",
+    "kotlin": "data-locality.kotlin.json",
+    "python": "data-locality.python.json",
+    "ruby": "data-locality.ruby.json",
+    "rust": "data-locality.rust.json",
+    "scala": "data-locality.scala.json",
+    "swift": "data-locality.swift.json",
+    "typescript": "data-locality.typescript.json"
+  },
+  "paradigm": [
+    "data-oriented",
+    "procedural"
+  ],
+  "scope": "module",
+  "provenance": [
+    "game-programming"
+  ],
+  "related_patterns": [
+    "component",
+    "object-pool",
+    "spatial-partition",
+    "update-method",
+    "game-loop",
+    "flyweight",
+    "memoization",
+    "pipeline",
+    "producer-consumer"
+  ],
+  "anti_patterns": [
+    "Premature packing: rewriting a data model for the cache with no profile showing misses, paying lost abstractions for no measured gain.",
+    "Half-migrated layout: arrays of records whose fields are still pointers or objects, so every element chases into the heap - pointer chasing in a bigger container.",
+    "Sort-the-whole-array-every-frame packing: the reordering cost dwarfs the cache win; the active prefix must be maintained incrementally.",
+    "Handles without a resolver: indices or ids passed around after records move, so a stale handle silently addresses a different element.",
+    "False sharing by design: hot per-thread counters, cursors or fields of different threads packed into one cache line, so cores keep invalidating each other.",
+    "Hot/cold split by intuition: moving genuinely hot fields out of the packed record and adding a pointer chase to every iteration.",
+    "SoA/AoS flip without profiling: applying the opposite layout of what the access pattern demands — e.g., SoA when the loop accesses all fields of each record, or AoS when only one field is touched across all records — wastes cache lines or forces gather/scatter operations.",
+    "Stale cold data pointer: after a hot/cold split, the cold pointer embedded in the hot struct is not updated when the cold record migrates (e.g., during a defragmenting compaction), silently dangling the chase."
+  ],
+  "design_principles": [
+    "Measure before optimizing: a data-layout change is justified by profiler evidence (cache misses, stalls), never by principle alone.",
+    "Form follows frequency of access: the physical layout mirrors the order and frequency in which the loop uses the data, not the class hierarchy.",
+    "Separation of concerns: storage (arrays, arenas, handle tables) is separate from the operations that sweep it, so the layout can change without rewriting behavior.",
+    "Encapsulation at the storage boundary: invariants (capacity, active count, handle generation) live in one owner instead of being spread over call sites.",
+    "Don't pay for indirection you do not use: homogeneous collections trade polymorphism for direct addressing in the hot path, and pay for the polymorphism only at the cold edge.",
+    "Layout is a first-degree optimization: unlike algorithmic changes which are portable, data layout is hardware-dependent (cache line size, associativity, TLB depth) and must be re-evaluated when the target architecture changes.",
+    "The hot path is the only path worth optimizing: cold edges (initialization, cleanup, error paths) can keep ordinary abstractions; reshaping them for the cache is nearly always wasted effort."
+  ],
+  "best_practices": [
+    "Profile first - a cache-miss profiler (Cachegrind, VTune, perf stat -e cache-misses, platform sampling) - and restructure only the loops it implicates. Confirm that cache misses dominate time before touching layout.",
+    "Store values, not pointers: arrays of records (or of ids into other arrays); every dereference removed from the hot loop is a win.",
+    "Reference records by handle and resolve through the storage; never keep raw pointers or references across growth, insertion or reordering.",
+    "Keep the hot loop branch-free: keep active records contiguous (swap-with-last on deactivate) and iterate a count rather than testing a per-record flag.",
+    "Split records by hotness only once access patterns are known, keep the cold side reachable through one pointer or a parallel array at the same index, and re-check the split when profiles change.",
+    "Give the storage a single owner and a stable lifetime (pool, arena, reserved capacity) so packing and reuse stay cheap and records do not move unexpectedly.",
+    "Prefer per-thread or per-shard storage over sharing one packed array between writers, and pad records that several threads write to at least one cache line (64 bytes on x86) to eliminate false sharing.",
+    "Keep a thin object-shaped facade (handles/views over the packed storage) at the module edge so call sites stay readable while the kernel stays data-shaped.",
+    "Choose AoS vs SoA based on access pattern: if a hot loop accesses all (or most) fields of each record, AoS is simpler and avoids TLB pressure; if it accesses one or a few fields across all records, SoA eliminates bandwidth waste and enables SIMD. For mixed access, consider AoSoA (hybrids of 8-16 element blocks).",
+    "Align hot data structures to cache lines (typically 64 bytes) using alignas, __attribute__((aligned)), or explicit padding — especially in multi-threaded contexts — to prevent adjacent data from sharing a line.",
+    "Verify layout with platform tools: use perf stat -e cache-misses,cache-references or VTune to confirm that layout changes actually reduce misses; measure both throughput and tail latency.",
+    "When using SoA, wrap all parallel arrays in a single typed container that atomically performs insert/delete/swap so that index corruption across columns is impossible at compile time.",
+    "Re-profile after hardware changes: cache geometry, cache-line size, and vector width differ between architectures (e.g., Arm Neoverse vs x86 Sapphire Rapids), so a layout optimal on one may be suboptimal on another."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Nystrom (2014), Game Programming Patterns, 'Optimization Patterns: Data Locality' - the originating catalogue entry: intent ('Accelerate memory access by arranging data to take advantage of CPU caching'), the pattern statement ('keeping data in contiguous memory in the order that you process it'), packed data, hot/cold splitting, the polymorphism and entity-representation design decisions, and the pointer-chasing motivation. https://gameprogrammingpatterns.com/data-locality.html",
+    "Albrecht (2009), 'Pitfalls of Object Oriented Programming' (GCAP Australia) - the widely-read introduction to designing game data structures for cache-friendliness; cited by the originating chapter for the CPU-vs-RAM speed data. http://research.scee.net/files/presentations/gcapaustralia09/Pitfalls_of_Object_Oriented_Programming_GCAP_09.pdf",
+    "Llopis, 'Data-Oriented Design' (Games from Within) - the article that popularised the data-oriented framing of the same technique. http://gamesfromwithin.com/data-oriented-design",
+    "Fabian, Data-Oriented Design - the book-length treatment of layout-driven design (structs of arrays, cache-friendly access patterns). http://www.dataorienteddesign.com/dodmain/",
+    "Valgrind, Cachegrind: a cache and branch-prediction profiler - the free tool the originating chapter recommends for confirming that misses, not the algorithm, are the cost. https://valgrind.org/docs/manual/cg-manual.html",
+    "Hennessy & Patterson, Computer Architecture: A Quantitative Approach - the source of the processor/RAM speed divergence that motivates the pattern (memory-wall data cited by the originating chapter).",
+    "Intel, 'Memory Layout Transformations' - official guidance on AoS-to-SoA transformation to eliminate gather/scatter operations and enable vectorization on Intel architectures. https://www.intel.com/content/www/us/en/developer/articles/technical/memory-layout-transformations.html",
+    "Müller, 'Cache-Friendly C++' (CppCon 2025) - Jonathan Müller explains CPU cache fundamentals, AoS vs SoA trade-offs, false sharing, and practical C++ layout guidance with std::vector and aligned allocations. https://www.youtube.com/watch?v=g_X5g3xw43Q",
+    "Boyang et al., 'The Essence of Entity Component System' (ACM SAC 2026) - formal model of archetype-based ECS with empirical evaluation of cache efficiency and frame stability in a Tower Defense simulation; contrasts Unity DOTS, Bevy and Flecs. https://boyang.cs.uwm.edu/publication/sac2026_ECS.pdf",
+    "Linux Kernel Documentation, 'False Sharing' - authoritative treatment of false sharing causes, detection, and mitigations (per-CPU copies, cache-line padding, alignas) in the kernel context. https://docs.kernel.org/kernel-hacking/false-sharing.html",
+    "J. M. Devkar et al., 'False sharing and spatial locality in multiprocessor caches', IEEE Transactions on Computers - quantitative analysis showing spatial locality often has larger impact on cache misses than false sharing; data layout optimizations reduce shared-data misses ~10% on average. https://iacoma.cs.uiuc.edu/iacoma-papers/false_sharing.pdf",
+    "Wikipedia, 'Data-oriented design' - peer-reviewed article covering the programming approach, its relationship to OOD, cache fundamentals, and common techniques (SoA, hot/cold splitting, contiguous storage). https://en.wikipedia.org/wiki/Data-oriented_design",
+    "Fabian, Data-Oriented Design (online book, updated) - the definitive online reference for data-oriented design; covers data formation, transforms, existence-based processing, concurrency and the distinction from OOD. https://dataorienteddesign.com/dodbook.pdf",
+    "CedarDB, 'Why You Shouldn't Forget to Optimize the Data Layout' - practical comparison of AoS vs SoA performance on real workloads, with guidance on when each layout wins and how TLB pressure factors in. https://cedardb.com/blog/optimizing_data_layouts/",
+    "Micrologics, 'Cache-Friendly Architecture: A Practical Guide to Data-Oriented Design in High-Performance Systems' - contemporary treatment covering the memory wall, cache-line utilization, prefetching, and practical ECS-style patterns for cloud-native services. https://micrologics.org/blog/cache-friendly-architecture-a-practical-guide-to-data-oriented-design-in-high-performance-systems",
+    "KruN, 'Data Oriented Design Performance and CPU Cache Optimization' - practitioner-focused walkthrough of CPU cache geometry, data-oriented transformation of a particle system, and perf-based validation of cache improvements. https://krun.pro/data-oriented-design-performance/",
+    "KinaTechnical, 'Data-Oriented Design: Structuring Code for Cache-Friendly Access Patterns' - structured tutorial covering cache hierarchy, cache-aware data placement, struct-of-arrays, and the memory gap between CPU speed and DRAM latency. https://kindatechnical.com/low-level-computing/lesson-100-data-oriented-design-structuring-code-for-cache-friendly-access-patterns.html",
+    "Unity Technologies, 'Component concepts' (Entities package manual) - official DOTS documentation: archetypes group entities by component set into 16KB chunks with dense per-component columns; the commercial production instance of archetype-based data locality. https://docs.unity3d.com/Packages/com.unity.entities@6.4/manual/concepts-components.html",
+    "Apache Arrow Project, 'Arrow Columnar Format' - official specification of the in-memory columnar layout: data adjacency for efficient scans, SIMD-friendly 8-/64-byte alignment and padding, and relocatable buffers enabling zero-copy shared-memory access. https://arrow.apache.org/docs/format/Columnar.html",
+    "Scandurati, 'EnTT: Crash Course - Entity-Component System' - official EnTT documentation: paged sparse-set pools holding components in packed contiguous arrays, the pagination/pointer-stability trade-off, and group-owned columns for cache-friendly iteration. https://skypjack.github.io/entt/md_docs_2md_2entity.html",
+    "Mertens, 'Flecs FAQ' - official Flecs documentation: archetype-based storage keeps entities with the same component set contiguously, improving CPU cache locality, vectorization and query speed. https://github.com/SanderMertens/flecs/blob/master/docs/FAQ.md",
+    "Dixon, 'Data oriented design is not about SoA and ECS' - practitioner critique warning against treating SoA and ECS as universal recipes: real data-oriented design starts from architecture, profiling and measurement, not cache tricks. https://polymonster.co.uk/blog/dod-ecs"
+  ],
+  "related_patterns_notes": {
+    "archetype-evolution": "archetype-evolution",
+    "double-buffering": "double-buffering"
+  }
+}

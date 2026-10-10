@@ -1,0 +1,55 @@
+{
+  "pattern": "cache-aside",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "Cache::builder().time_to_live(...).max_capacity(...).build() + get_with + invalidate",
+  "implementation_notes": "moka is the ecosystem cache for this: get_with(key, |k| load(k)) initializes and inserts atomically on a miss (try_get_with for fallible loaders), time_to_live/time_to_idle and max_capacity carry the expiry and eviction policy, and invalidate(&key) is the write-path step. The cache is thread-safe without an outer lock and cheap to clone across threads, but get returns a clone of the value, so expensive payloads belong behind an Arc; moka::future::Cache is the async form that awaits the loader without blocking a runtime thread.",
+  "code_sketch": "let cache: Cache<String, Arc<Entity>> = Cache::builder()\n    .time_to_live(Duration::from_secs(300))\n    .max_capacity(100_000)\n    .build();\n\nfn read(&self, id: &str) -> Arc<Entity> {\n    self.cache.get_with(id.to_string(), |k| Arc::new(self.store.find(k).unwrap()))\n}\nfn update(&self, e: &Entity) { self.store.save(e); self.cache.invalidate(&e.id); }",
+  "pitfalls": [
+    "get() clones the value on every hit (documented behaviour), so store Arc<T> rather than large structures or each read pays a deep copy.",
+    "Never wrap the cache in a Mutex or RwLock: it is already thread-safe and the surrounding lock destroys the concurrency it provides.",
+    "Eviction and expiry are best-effort: an entry can disappear at any time, so the read path must always be able to reload from the source of truth."
+  ],
+  "sources": [
+    "https://docs.rs/moka/latest/moka/sync/struct.Cache.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "moka",
+      "name": "moka::sync::Cache with get_with (TTL + capacity)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "Cache::builder().time_to_live(...).max_capacity(...).build() + get_with + invalidate",
+      "implementation_notes": "moka is the ecosystem cache for this: get_with(key, |k| load(k)) initializes and inserts atomically on a miss (try_get_with for fallible loaders), time_to_live/time_to_idle and max_capacity carry the expiry and eviction policy, and invalidate(&key) is the write-path step. The cache is thread-safe without an outer lock and cheap to clone across threads, but get returns a clone of the value, so expensive payloads belong behind an Arc; moka::future::Cache is the async form that awaits the loader without blocking a runtime thread.",
+      "code_sketch": "let cache: Cache<String, Arc<Entity>> = Cache::builder()\n    .time_to_live(Duration::from_secs(300))\n    .max_capacity(100_000)\n    .build();\n\nfn read(&self, id: &str) -> Arc<Entity> {\n    self.cache.get_with(id.to_string(), |k| Arc::new(self.store.find(k).unwrap()))\n}\nfn update(&self, e: &Entity) { self.store.save(e); self.cache.invalidate(&e.id); }",
+      "pitfalls": [
+        "get() clones the value on every hit (documented behaviour), so store Arc<T> rather than large structures or each read pays a deep copy.",
+        "Never wrap the cache in a Mutex or RwLock: it is already thread-safe and the surrounding lock destroys the concurrency it provides.",
+        "Eviction and expiry are best-effort: an entry can disappear at any time, so the read path must always be able to reload from the source of truth."
+      ],
+      "sources": [
+        "https://docs.rs/moka/latest/moka/sync/struct.Cache.html"
+      ]
+    },
+    {
+      "variant_id": "std-mutex-map",
+      "name": "Mutex<HashMap> with the entry API (std only)",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "std::sync::Mutex<HashMap<K, Entry>> with a deadline per entry",
+      "implementation_notes": "With no dependencies the store is a std::sync::Mutex<HashMap<K, Entry>> (or RwLock for read-heavy maps) and the populate step checks the deadline and inserts under one guard; the guard must be released before the source-of-truth call, because holding a std lock across I/O serializes every reader. In async code a std::sync::Mutex guard cannot be held across an .await, so either the critical section is purely synchronous or the map uses tokio::sync::Mutex. TTL, eviction and invalidation are all application code in this form.",
+      "code_sketch": "fn read(&self, key: &str) -> Arc<Value> {\n    if let Some(e) = self.map.lock().unwrap().get(key) {          // cache hit\n        if e.deadline > Instant::now() { return Arc::clone(&e.value); }\n    }\n    let value = Arc::new(self.source.read(key));                  // lock released: safe across I/O\n    let mut map = self.map.lock().unwrap();\n    map.insert(key.to_string(),\n               Entry { value: Arc::clone(&value), deadline: Instant::now() + self.ttl });\n    value\n}\n// write: self.source.write(key, v); self.map.lock().unwrap().remove(key);",
+      "pitfalls": [
+        "A std::sync::Mutex guard held across an .await does not compile (or deadlocks when two tasks share the lock): scope the guard or use an async mutex.",
+        "Mutex poisoning: if a loader panics while holding the lock, later .lock() calls return Err - decide whether to recover the guard or propagate the panic.",
+        "A HashMap cache has no capacity bound and leaks until the process runs out of memory unless a sweep task and an eviction rule are added."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+        "https://docs.rs/moka/latest/moka/sync/struct.Cache.html"
+      ]
+    }
+  ],
+  "default_variant": "moka",
+  "version": "1.0"
+}

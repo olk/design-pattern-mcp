@@ -1,0 +1,209 @@
+{
+  "category": "concurrency-resilience",
+  "name": "fail-fast",
+  "aliases": [
+    "fail fast",
+    "crash early"
+  ],
+  "intent": "Make an operation that cannot be served end immediately, visibly and at the earliest point of detection - releasing whatever it already holds - instead of continuing in a degraded or corrupted state.",
+  "problem": "A component accepts work it cannot serve: a precondition is violated, input is invalid or unauthorised, a dependency is known to be down, or a pool, quota or queue is already exhausted. The dangerous default is to keep going - queue the request behind a timeout, repair the invalid state silently, or log the error and continue - so callers hold threads, connections and permits until they expire, and the defect surfaces far from its cause as a slow, corrupt or non-deterministic state. The recurring decision is whether to say no at the moment the evidence appears, what the refusal must carry, and what it must release.",
+  "context": "Applies wherever work is admitted or an operation begins: request handlers and admission control, constructors and public method entries, message consumers, configuration and startup validation, and calls into dependencies that may be unavailable or saturated. It matters most on paths that acquire resources, mutate state, or would otherwise wait for a timeout, and where a defect is cheap to detect early but expensive to locate later. It is a policy about the failure path, not a recovery mechanism: retry, fallback and restart stay with the caller or the supervisor.",
+  "benefits": [
+    "Faults become visible at their origin, with the offending value in the failure report, instead of corrupting state and surfacing much later in a place whose stack trace leads nowhere.",
+    "Resources are released immediately: a refused request does not hold a thread, connection, permit or queue slot until a timeout expires - which is what stops one unhealthy dependency from draining the pools of everything else.",
+    "Under overload the system gets a bounded, predictable failure mode - refusal instead of unbounded queueing and latency growth - which gives callers a chance to shed, retry or fall back.",
+    "Contracts become executable: guard clauses document and enforce an interface's preconditions at the point of entry, so misuse fails on the first call rather than after partial mutation.",
+    "The mechanism is local and cheap - one check at the boundary, using primitives the language already provides - with no infrastructure to operate, unlike circuit breakers or bulkheads."
+  ],
+  "tradeoffs": [
+    "Availability is traded for integrity: immediate refusal turns a degraded-but-slow dependency into a hard, user-visible error, and without caller-side retry, fallback or a circuit policy the visible failure rate rises.",
+    "The failure classes must be designed: programmer error, invalid input, capacity refusal and transient dependency fault need different responses, and misclassifying one as another (aborting on a blip, or repairing a bug) makes an incident worse than the delay would have been.",
+    "Partial work is a residual risk: nothing rolls back side effects that already happened, so the pattern only frees what a structured cleanup path (scope guard, finally/defer, RAII, try-with-resources) covers.",
+    "Process-wide aborts conflict with multi-tenant processes: terminating on a violated invariant is correct only when state beyond the current request is unusable, and needs supervisor/restart semantics to remain an availability gain.",
+    "It can be neutralised silently: a catch-all handler, an empty catch or a default-substituting fallback preserves the shape of the check while restoring fail-slow behaviour, so the discipline erodes unless it is reviewed.",
+    "Checks cost something on hot paths and behave differently when assertions are compiled out, so which conditions are enforced in production must be a deliberate choice."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 5,
+    "maintainability": 8,
+    "simplicity": 7,
+    "performance": 7,
+    "reliability": 8,
+    "security": 7,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Guarded Operation",
+      "responsibility": "The entry point - method, constructor, handler, task - that must not proceed unless its preconditions hold; it owns the decision to stop."
+    },
+    {
+      "role": "Precondition Check",
+      "responsibility": "The cheap, local predicate that decides serviceability: argument and state validity, admission capacity, quota or dependency health evaluated before any expensive work."
+    },
+    {
+      "role": "Failure Signal",
+      "responsibility": "The immediate abort primitive (exception, error value returned at once, panic/fatal error, non-success status) that ends the operation without processing further, carrying contextual information."
+    },
+    {
+      "role": "Cleanup Path",
+      "responsibility": "Releases everything the attempt already acquired - descriptors, permits, locks, partial transactions - on the failure path as well as the success path."
+    },
+    {
+      "role": "Caller / Supervisor",
+      "responsibility": "Receives the visible failure and owns the recovery decision (retry with backoff, fallback, shed, restart); fail-fast deliberately does not recover by itself."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Request ingress: reject malformed, unauthenticated, or over-quota requests before a downstream connection, lock, or queue slot is taken.",
+    "Dependency guards: when a circuit breaker is open or a bulkhead is full, return an error immediately instead of issuing a call that would wait for its timeout.",
+    "Constructors and public entries: parameter and state validation (requireNonNull/require/guard clauses) so no object or half-initialised operation exists with invalid state.",
+    "Configuration and startup: validate configuration, credentials, and schema versions before serving traffic, so a bad deployment fails at deploy time instead of hours later on a request path.",
+    "Assertions at subsystem seams: assert the contracts that cross module boundaries, where a violated assumption is an integration bug and the report must identify the producer.",
+    "gRPC and HTTP/2 ingress validation: reject requests with invalid protobuf schema or malformed headers before message parsing begins.",
+    "GraphQL query complexity and depth limits: abort resolution when a query exceeds pre-computed cost bounds, preventing resource exhaustion through malicious queries.",
+    "Database connection pool exhaustion at the ORM or connection-pool layer: fail immediately rather than queuing behind a stalled connection acquisition, freeing the caller to shed, retry, or fall back.",
+    "Kafka and streaming consumer lag thresholds: when consumer lag exceeds a configured horizon, the consumer fails fast rather than continuing to fall further behind, triggering alerting and operator intervention.",
+    "Kubernetes readiness and liveness probes: a failing liveness probe triggers container restart — the fail-fast enforcement mechanism at the infrastructure layer; readiness probes remove pods from the load balancer without restarting them.",
+    "Erlang/OTP supervisor trees: worker processes follow \"let it crash\" semantics — when a worker reaches an undefined state, the supervisor terminates and restarts it with clean state rather than attempting in-process recovery.",
+    "CDN and edge computing rejection: validate cache keys, header size, and payload bounds at the CDN edge before proxying to origin, so malformed or oversized requests are terminated at the closest PoP instead of consuming origin threads.",
+    "API rate-limiting boundary: enforce rate limits and quota at the API gateway with an immediate 429 (or 503) response — a form of fail-fast that protects backends from being queued behind their own timeouts.",
+    "Event sourcing and CQRS command validation: validate command preconditions (business invariants, aggregate state) before the event is written to the stream; the stream append failure is the fail-fast signal, not a silent rejection.",
+    "Serverless function cold-start validation: validate environment variables, credentials, and initialization dependencies before the handler is invoked — fail fast during cold start rather than timing out on the first request.",
+    "Async task-parallel cancellation: in parallel task runners (Task.WhenAll, asyncio.gather), fail-fast semantics mean one task's exception cancels sibling tasks immediately — correct cancellation requires structured cleanup on all paths.",
+    "Canary deployment absolute-fail thresholds: when canary verification metrics (error rate, latency p99) breach an absolute fail threshold, the progressive delivery pipeline aborts immediately rather than continuing to route traffic.",
+    "Load shedding at the admission edge: when a service is overloaded beyond its stable-concurrency threshold, shed excess requests with an immediate error rather than enqueuing — the fail-fast complement to backpressure (which signals slowdown rather than stop).",
+    "Envoy per-cluster circuit breaking: when a cluster's limits on connections, pending requests, active requests, retries or connection pools are exceeded, Envoy fails new work immediately and applies backpressure downstream instead of letting one saturated upstream drag the whole mesh behind its timeouts.",
+    "Google SRE overload protection: the overloaded service sheds load with immediate errors and clients throttle their own request rate in response — the fail-fast signal at the admission edge is what keeps a cascading failure from forming."
+  ],
+  "avoid_when": [
+    "The condition is a transient dependency fault that will clear in milliseconds: a bounded, jittered retry-with-backoff serves the request instead of refusing it.",
+    "A useful answer is still possible with less: prefer graceful-degradation (or a null-object default) over aborting the whole operation.",
+    "The condition is expected and part of normal flow - missing optional configuration, cache miss, absent record: return an Option/default instead of treating it as an operational failure.",
+    "The work must be absorbed rather than refused (bursty batch intake): a load-leveller/queue is the intended answer, with the fail-fast decision pushed to the admission edge that bounds the queue.",
+    "One long-lived process serves several tenants: fail the request, not the process (bulkhead + timeout); reserve process-level aborts for state that is compromised beyond the current request."
+  ],
+  "language_files": {
+    "generic": "fail-fast.generic.json",
+    "c": "fail-fast.c.json",
+    "cplusplus": "fail-fast.cplusplus.json",
+    "csharp": "fail-fast.csharp.json",
+    "go": "fail-fast.go.json",
+    "java": "fail-fast.java.json",
+    "javascript": "fail-fast.javascript.json",
+    "kotlin": "fail-fast.kotlin.json",
+    "python": "fail-fast.python.json",
+    "ruby": "fail-fast.ruby.json",
+    "rust": "fail-fast.rust.json",
+    "scala": "fail-fast.scala.json",
+    "swift": "fail-fast.swift.json",
+    "typescript": "fail-fast.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "procedural"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "circuit-breaker",
+    "bulkhead",
+    "timeout",
+    "retry-with-backoff",
+    "graceful-degradation",
+    "rate-limiting",
+    "load-leveller",
+    "guard-clause",
+    "backpressure"
+  ],
+  "anti_patterns": [
+    "Fail-slow masquerade: catch-all handlers that log and continue, empty catches, or fallbacks that substitute defaults - the check stays in the code but the system proceeds in the state it was meant to reject.",
+    "Assertions as input validation: guarding untrusted input or production capacity with assert-style checks that are compiled out or elided, so tests and production enforce different contracts.",
+    "Failing fast on the wrong class: turning a transient dependency blip into an immediate hard error at the user boundary, with no retry, fallback or circuit decision at the caller.",
+    "Abort without cleanup: throwing, panicking or exiting after resources were acquired, leaving descriptors, permits or locks behind - the 'free the resource' half of the decision is missing.",
+    "Blanket abort in batch and pipeline work: one bad item terminates a whole run, or a stream processor exits, where the recoverable unit was the item and not the job."
+  ],
+  "design_principles": [
+    "Fail at the earliest point of detection, close to the cause: error localization is the primary benefit, because the hardest part of debugging is reproducing and pinpointing the error.",
+    "Design by contract: preconditions are part of the interface and a violated precondition is the caller's bug - enforced at the entry, not repaired deep inside.",
+    "Separation of detection from recovery: the component that detects the failure refuses it; retry, fallback and restart policy belong to the caller or supervisor.",
+    "Resource safety under failure: an aborting operation must release what it owns through a structured cleanup path, not by chance.",
+    "Prefer a loud, deterministic failure over silent repair: an immediate visible error beats a system that continues in an undefined state."
+  ],
+  "best_practices": [
+    "Put the check at the earliest point where the needed information exists — the operation's entry or the admission edge — and keep it cheap enough to run always.",
+    "Make the failure informative: include what was expected, what was found, and the identity of the resource, so the abort removes debugging rather than adding a traceback.",
+    "Classify the condition before choosing the signal: invariant violation (assert/panic), caller misuse (typed error), capacity refusal (retryable status), transient fault (retry/circuit decision at the caller).",
+    "Keep one global or supervisory error handler and avoid catch-all blocks in the middle of the code; never swallow an exception to keep a workflow alive.",
+    "Guarantee cleanup on every abort path with the language's structured mechanism (RAII, try-with-resources/using/finally, defer, scope guards).",
+    "For capacity, decide before admitting: check quota, pool, and dependency health at the edge so refusal is cheap and the queue cannot grow without bound.",
+    "Distinguish infrastructure-level transient failures (leader election, network jitter) from business-level failures (validation error, permission denial): use bounded retry for the former, fail fast for the latter — mixing them up turns a 12-second failover into a cascading outage.",
+    "Test fail-fast behavior explicitly: write unit tests that verify invalid inputs raise the correct error type with the right context, not just that the happy path succeeds.",
+    "Integrate fail-fast signals into observability: emit a metric (e.g., request_rejected_total) and a structured log entry on every rejection so capacity pressure is visible in dashboards before it becomes an incident.",
+    "When upgrading from typed error to process abort (panic/exit), document the boundary clearly and keep it narrow: process-level abort is reserved for state that is compromised beyond the current request.",
+    "Distinguish fail-fast from fail-loud: fail-fast decides when to stop; fail-loud decides how to signal. A silent abort (no metric, no log, no alert) is fail-fast without fail-loud — the error is detected but never reaches the right actor.",
+    "Use structured error chaining when propagating: wrap the original error context (what was checked, what was found) rather than substituting a generic message, so caller-side retry logic and alerting can classify the failure correctly.",
+    "In streaming and data pipelines, validate schema and cardinality at ingestion before the record enters the processing graph — a malformed record in the pipeline triggers cascading deserialisation failures that are harder to isolate.",
+    "For async and parallel task runners, prefer fail-fast cancellation (one task's exception cancels the group) over best-effort continuation (collect all errors and return) when the operation is logically atomic; document which policy applies.",
+    "In memory-unsafe languages (C, C++), treat any undefined-behavior trigger as a fail-fast event: detecting it and aborting is the only portable option, because the compiler is free to optimise away subsequent code.",
+    "Implement backpressure as a complement to fail-fast, not a replacement: backpressure signals producers to slow down; fail-fast rejects work that cannot be admitted at all. Use both — backpressure for load tolerance, fail-fast for integrity.",
+    "Validate early in serverless cold starts: check credentials, configuration, and connection availability before the handler is entered so cold-start failures are reported immediately rather than timing out on the first business request."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Shore, J. - \"Fail Fast\", IEEE Software 21(5), September/October 2004: fail immediately and visibly at the first evidence of a problem; assertions placed at system seams plus a global error handler, instead of silent repair that makes defects surface far from their cause.",
+    "Nygard, M. - Release It! Design and Deploy Production-Ready Software, 2nd ed. (Pragmatic Bookshelf, 2018), Stability Patterns: Fail Fast — refuse a request the system cannot serve immediately instead of admitting work that will wait and time out.",
+    "Hunt, A. and Thomas, D. - The Pragmatic Programmer, 20th Anniversary Edition (Addison-Wesley, 2019): \"Crash Early\" principle — stop running as soon as the first thing goes wrong, so the error is as close as possible to its cause.",
+    "Armstrong, J. - Programming Erlang: Software for a Concurrent World, 2nd ed. (Pragmatic Bookshelf, 2013): Erlang's \"let it crash\" philosophy — supervisors restart failed processes with clean state, so a failure becomes a reset rather than a slow corruption.",
+    "Meyer, B. - Object-Oriented Software Construction, 2nd ed. (Prentice Hall, 1997): Design by Contract — preconditions, postconditions and invariants enforced at entry points; a violated precondition is the caller's bug.",
+    "Shore, J. - \"Fail Fast\", IEEE Software, September/October 2004: https://martinfowler.com/ieeeSoftware/failFast.pdf",
+    "Nygard, M. - Release It! 2nd ed.: https://pragprog.com/titles/mnee2/release-it-second-edition/",
+    "Martin Fowler - Fail-Fast article: https://martinfowler.com/ieeeSoftware/failFast.pdf",
+    "Netflix Hystrix Wiki — How it Works: https://github.com/Netflix/Hystrix/wiki/How-it-Works",
+    "Microsoft Azure Well-Architected Framework — Circuit Breaker pattern: https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker",
+    "AWS Well-Architected Framework — Reliability Pillar: Fail Fast: https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_mitigate_interaction_failure_fail_fast.html",
+    "HLD Handbook — Resilience Patterns (Timeouts, Retries, Circuit Breakers, Bulkheads): https://hld.handbook.academy/curriculum/reliability-and-operations/resilience-patterns/",
+    "HarrisonSec — \"Why Your Fail-Fast Strategy is Killing Your Distributed System\": https://harrisonsec.com/blog/fail-fast-bounded-resilience-distributed-systems/",
+    "ACM Queue — \"Fail-fast Is Failing... Fast!\" (gray failures in cloud environments): https://queue.acm.org/detail.cfm?id=3458812",
+    "Principles Wiki — Fail Fast principle: https://www.principles-wiki.net/principles:fail_fast",
+    "Software Patterns Lexicon — Fail-Fast Strategy: https://softwarepatternslexicon.com/stream-processing/error-handling-and-recovery-patterns/fail-fast-strategy/",
+    "Adaptive Enforcement Lab — Fail Fast pattern: https://adaptive-enforcement-lab.com/patterns/error-handling/fail-fast/",
+    "Encyclopedia of Agentic Coding Patterns — Fail Fast and Loud: https://aipatternbook.com/fail-fast-and-loud",
+    "Wikipedia — Fail-fast system: https://en.wikipedia.org/wiki/Fail-fast_system",
+    "Oracle Java SE — ConcurrentModificationException (fail-fast iterators): https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/ConcurrentModificationException.html",
+    "Rust Programming Language Book — \"To panic! or Not to panic!\": https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html",
+    "Microsoft Rust Training — Error Handling Patterns: https://microsoft.github.io/RustTraining/rust-patterns-book/ch10-error-handling-patterns.html",
+    "System Design Space — Fault Tolerance Patterns (Circuit Breaker, Bulkhead, Retry): https://system-design.space/en/chapter/resilience-patterns/",
+    "Candea, G. and Fox, A. — \"Crash-Only Software\", EPFL Technical Report / Usenix FAST '03 (2003): crash-only design means the only way to stop a service is to crash it, and the only way to start it is to recover — formalises fail-fast as a recovery discipline, not just an error-reporting policy.",
+    "Fowler, J. — \"Fail Fast\", IEEE Software (2004): https://martinfowler.com/ieeeSoftware/failFast.pdf — the original IEEE Software column distinguishing fail-fast from silent repair.",
+    "AWS — \"AWS Well-Architected Framework — Reliability Pillar: Mitigate interaction failure with fail-fast\" (2024): https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_mitigate_interaction_failure_fail_fast.html — official AWS guidance: validate requests before work is admitted, fail fast on constraint violations, use circuit breakers to bound retry storms.",
+    "Huang, P. et al. — \"Gray Failure: The Achilles' Heel of Cloud-Scale Systems\", Microsoft Research (2017): https://www.microsoft.com/en-us/research/publication/gray-failure-achilles-heel-cloud-scale-systems/ — gray failures (partial performance degradation) are harder to detect than crash failures; running slow is worse than failing fast.",
+    "Helland, P. — \"Life Beyond Distributed Transactions\", ACM Queue (2021): https://spawn-queue.acm.org — fail-fast in multi-AZ resilience: refusing work that cannot be safely processed prevents gray failures from propagating across availability boundaries.",
+    "Khellbnikov, R. — \"Contracts, Undefined Behavior, and Defensive Programming\", Bloomberg Engineering Blog (2023): https://bloomberg.github.io — in C++, detecting a primary contract violation and aborting is the only sane response to undefined behavior, because the compiler may optimise away subsequent code.",
+    "Brooker, M. — \"The properties of crash-only software\" (2012): https://brooker.co.za/blog/2012/01/22/crash-only.html — crash-only design eliminates the distinction between expected and unexpected termination, producing more reliable, testable, and predictable services.",
+    "LWN.net — \"Crash-only software: More than meets the eye\" (2006): https://lwn.net/Articles/191059 — practical guide to crash-only design: the only way to stop is to crash, the only way to start is to recover.",
+    "Envoy documentation — Circuit breaking: https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking.html — official docs: per-cluster limits on connections, pending requests, active requests, retries and pools; overflowed work fails immediately and applies downstream backpressure to prevent cascading failures.",
+    "Kubernetes documentation — Liveness, Readiness, and Startup Probes: https://kubernetes.io/docs/concepts/workloads/pods/probes/ — kubelet restarts a container after failureThreshold liveness failures and pulls a pod from service endpoints on readiness failure: infrastructure-level fail-fast enforcement paired with restart semantics.",
+    "Beyer, B. et al. — Google SRE Book, \"Addressing Cascading Failures\": https://sre.google/sre-book/addressing-cascading-failures/ — load shedding, client latency/load-based throttling and bounded retries as the fail-fast defences that stop overload propagating across service boundaries.",
+    "SaaS Systems Canon — \"Failing Fast Can Be Worse Than Failing Slowly\": https://saassystemscanon.com/layer-0/failing-fast-can-be-worse-than-failing-slowly/ — critique: failure speed is not a virtue; without bounded blast radius, observability and reversibility, fast failure amplifies damage instead of containing it."
+  ],
+  "related_patterns_notes": {
+    "health-check": "health-check",
+    "let-it-crash": "let-it-crash",
+    "load-shedding": "load-shedding",
+    "canary-deployment": "canary-deployment",
+    "crash-only-software": "crash-only-software"
+  }
+}

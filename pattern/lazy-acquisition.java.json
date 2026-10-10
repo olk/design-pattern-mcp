@@ -1,0 +1,73 @@
+{
+  "pattern": "lazy-acquisition",
+  "language": "java",
+  "support": "idiomatic",
+  "idiom_name": "initialization-on-demand holder class",
+  "implementation_notes": "The JDK has no Lazy<T>, so the canonical Java realization is the initialization-on-demand holder: a private static nested class whose static final field is initialized by the JVM when the holder is first referenced. JLS chapter 12 makes class initialization lazy (it happens on first active use) and guarantees it runs at most once, so the guard, the publication and the memory barriers come for free - no volatile and no synchronized. Use it for process-wide lazily acquired singletons; the field is final and never resettable, so anything releasable or reconfigurable belongs in an owner object (or in a Supplier/FutureTask holder, see the sibling variants) instead.",
+  "code_sketch": "final class ConfigHolder {\n    static final Config INSTANCE = Config.load(\"app.toml\");   // JVM-initialized once, on first use\n    private ConfigHolder() {}\n}\n\nConfig config() { return ConfigHolder.INSTANCE; }",
+  "pitfalls": [
+    "A failing initializer makes the class permanently unusable in that classloader: the first failure surfaces as ExceptionInInitializerError and later accesses throw NoClassDefFoundError, so do not put a network acquisition behind a holder if retry is required.",
+    "The holder class must not be touched from other static initializers that run earlier, or the acquisition becomes eager again; and a static holder in a web application pins the resource per classloader, so a redeploy without closing it leaks connections.",
+    "Double-checked locking with a non-volatile field is still broken under the Java memory model (before Java 5 the idiom was broken outright); any hand-written lazily published field must be volatile, an AtomicReference or a memoized Supplier."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "holder-class",
+      "name": "Initialization-on-demand holder class",
+      "paradigm": "oo",
+      "idiom_name": "initialization-on-demand holder class",
+      "implementation_notes": "The JDK has no Lazy<T>, so the canonical Java realization is the initialization-on-demand holder: a private static nested class whose static final field is initialized by the JVM when the holder is first referenced. JLS chapter 12 makes class initialization lazy (it happens on first active use) and guarantees it runs at most once, so the guard, the publication and the memory barriers come for free - no volatile and no synchronized. Use it for process-wide lazily acquired singletons; the field is final and never resettable, so anything releasable or reconfigurable belongs in an owner object (or in a Supplier/FutureTask holder, see the sibling variants) instead.",
+      "code_sketch": "final class ConfigHolder {\n    static final Config INSTANCE = Config.load(\"app.toml\");   // JVM-initialized once, on first use\n    private ConfigHolder() {}\n}\n\nConfig config() { return ConfigHolder.INSTANCE; }",
+      "pitfalls": [
+        "A failing initializer makes the class permanently unusable in that classloader: the first failure surfaces as ExceptionInInitializerError and later accesses throw NoClassDefFoundError, so do not put a network acquisition behind a holder if retry is required.",
+        "The holder class must not be touched from other static initializers that run earlier, or the acquisition becomes eager again; and a static holder in a web application pins the resource per classloader, so a redeploy without closing it leaks connections.",
+        "Double-checked locking with a non-volatile field is still broken under the Java memory model (before Java 5 the idiom was broken outright); any hand-written lazily published field must be volatile, an AtomicReference or a memoized Supplier."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html"
+      ]
+    },
+    {
+      "variant_id": "memoized-supplier",
+      "name": "Memoized Supplier<T>",
+      "paradigm": "functional",
+      "min_standard": "Java8",
+      "requires_features": [
+        "lambdas"
+      ],
+      "idiom_name": "Supplier<T> + volatile double-checked memoization",
+      "implementation_notes": "java.util.function.Supplier<T> separates acquisition from use: the holder takes a Supplier and calls get() at most once, which is the form to prefer when acquisition must be injected (a test passes a counting supplier) or when several resources share one policy. Memoize with a volatile field and a synchronized block, or with ConcurrentHashMap.computeIfAbsent for keyed resources; unlike the holder class, the field can be cleared to allow re-acquisition.",
+      "code_sketch": "final class Lazy<T> implements Supplier<T> {\n    private final Supplier<T> factory;\n    private volatile T value;\n    Lazy(Supplier<T> f) { factory = f; }\n    public T get() {\n        T v = value;                        // volatile read (fast path)\n        if (v == null) synchronized (this) { if (value == null) value = factory.get(); v = value; }\n        return v;\n    }\n}",
+      "pitfalls": [
+        "The double-checked block is only correct with a volatile field and a non-null sentinel: if the acquired value may legitimately be null the check re-acquires forever - use Optional or a separate initialised flag.",
+        "Reentrancy deadlocks or publishes partially built state: calling get() from inside the factory, directly or through a shared resource, must be impossible by design.",
+        "Exceptions are not remembered - a throwing factory leaves the field unset and the next caller retries, the opposite of C# and Go semantics, so error handling must be deliberate."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/function/Supplier.html"
+      ]
+    },
+    {
+      "variant_id": "lazy-future",
+      "name": "FutureTask (compute once, cache result or failure)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "FutureTask + Callable",
+      "implementation_notes": "FutureTask is a lazy holder that also gives cancellation and exception caching: constructed with a Callable it does nothing until run() or an executor runs it, and afterwards get() returns the cached result or rethrows the cached failure for every caller. Call run() from the first accessor for a synchronous acquire-once, or submit it to an Executor for an asynchronous one; CompletableFuture.supplyAsync is the Java 8+ equivalent when composition matters more than a single-shot result.",
+      "code_sketch": "private final FutureTask<Connection> conn =\n    new FutureTask<>(() -> Dialer.dial(endpoint));\n\nConnection connection() throws Exception {\n    conn.run();            // no-op once completed\n    return conn.get();     // blocks until acquired; rethrows the cached failure\n}",
+      "pitfalls": [
+        "FutureTask caches the exception: every later get() rethrows the same ExecutionException, so a transient failure is permanent for that task - construct a new task to retry.",
+        "run() executes on the calling thread; submitting to an executor makes acquisition concurrent but the first get() then blocks on another thread, so pass a timeout when callers cannot wait indefinitely.",
+        "Cancellation is terminal: run() cannot revive a cancelled task, so retry semantics need explicit replacement of the task."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/FutureTask.html"
+      ]
+    }
+  ],
+  "default_variant": "holder-class",
+  "version": "1.0"
+}

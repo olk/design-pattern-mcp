@@ -1,0 +1,63 @@
+{
+  "pattern": "command-processor",
+  "language": "csharp",
+  "idiom_name": "Channel<Command> + IHostedService/BackgroundService loop",
+  "implementation_notes": "The .NET-idiomatic realization: `Channel.CreateBounded<Command>(...)` is the repository (bounded, with FullMode to choose between Wait/DropWrite), a `BackgroundService` is the concrete processor whose ExecuteAsync loop awaits `ReadAllAsync()` and dispatches each command to its `ICommandHandler<TCommand>` from a DI-resolved registry; `Task`/`CancellationToken` carry the per-command result and shutdown. MediatR layers the same shape at the request level (ISender.Send + IPipelineBehavior for logging/validation), so it is worth reusing instead of re-writing the dispatcher. Hand-written `Command` class hierarchies are redundant; a `record` implementing ICommand is enough - keep a class only when a command is serialised across processes.",
+  "code_sketch": "var queue = Channel.CreateBounded<ICommand>(new BoundedChannelOptions(256)\n    { FullMode = BoundedChannelFullMode.Wait });          // backpressure\npublic sealed class Processor(ChannelReader<ICommand> reader, IServiceProvider sp)\n    : BackgroundService {\n    protected override async Task ExecuteAsync(CancellationToken ct) {\n        await foreach (var cmd in reader.ReadAllAsync(ct)) {\n            await HandlerFor(cmd, sp).HandleAsync(cmd, ct);   // dispatch + log\n        }\n    }\n}",
+  "pitfalls": [
+    "An unhandled exception in ExecuteAsync stops the whole host (BackgroundServiceExceptionBehavior defaults to StopHost); catch per command and record the failure instead.",
+    "CreateUnbounded queues away the backpressure the Channel was chosen for - the producer's awaits never slow down and memory grows.",
+    "Scoped services (DbContext, unit of work) cannot be injected into a singleton BackgroundService; create a scope per command with IServiceScopeFactory.",
+    "Commands captured in a log must be serialisable value records; leaking live service references makes replay impossible."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel",
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.backgroundservice",
+    "https://github.com/jbogard/MediatR/wiki"
+  ],
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "channels-backgroundservice",
+      "name": "System.Threading.Channels queue drained by a BackgroundService",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "idiom_name": "Channel<Command> + IHostedService/BackgroundService loop",
+      "implementation_notes": "The .NET-idiomatic realization: `Channel.CreateBounded<Command>(...)` is the repository (bounded, with FullMode to choose between Wait/DropWrite), a `BackgroundService` is the concrete processor whose ExecuteAsync loop awaits `ReadAllAsync()` and dispatches each command to its `ICommandHandler<TCommand>` from a DI-resolved registry; `Task`/`CancellationToken` carry the per-command result and shutdown. MediatR layers the same shape at the request level (ISender.Send + IPipelineBehavior for logging/validation), so it is worth reusing instead of re-writing the dispatcher. Hand-written `Command` class hierarchies are redundant; a `record` implementing ICommand is enough - keep a class only when a command is serialised across processes.",
+      "code_sketch": "var queue = Channel.CreateBounded<ICommand>(new BoundedChannelOptions(256)\n    { FullMode = BoundedChannelFullMode.Wait });          // backpressure\npublic sealed class Processor(ChannelReader<ICommand> reader, IServiceProvider sp)\n    : BackgroundService {\n    protected override async Task ExecuteAsync(CancellationToken ct) {\n        await foreach (var cmd in reader.ReadAllAsync(ct)) {\n            await HandlerFor(cmd, sp).HandleAsync(cmd, ct);   // dispatch + log\n        }\n    }\n}",
+      "pitfalls": [
+        "An unhandled exception in ExecuteAsync stops the whole host (BackgroundServiceExceptionBehavior defaults to StopHost); catch per command and record the failure instead.",
+        "CreateUnbounded queues away the backpressure the Channel was chosen for - the producer's awaits never slow down and memory grows.",
+        "Scoped services (DbContext, unit of work) cannot be injected into a singleton BackgroundService; create a scope per command with IServiceScopeFactory.",
+        "Commands captured in a log must be serialisable value records; leaking live service references makes replay impossible."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel",
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.backgroundservice",
+        "https://github.com/jbogard/MediatR/wiki"
+      ]
+    },
+    {
+      "variant_id": "dataflow-actionblock",
+      "name": "TPL Dataflow ActionBlock as queue+executor",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "system-threading-tasks-dataflow"
+      ],
+      "idiom_name": "ActionBlock<ICommand> with BoundedCapacity + MaxDegreeOfParallelism",
+      "implementation_notes": "`ActionBlock<T>` is literally a queue with an executor attached: it buffers posted commands, runs them with a configurable `MaxDegreeOfParallelism`, applies `BoundedCapacity` for backpressure and returns a `Task` that completes when the pipeline drains - sizing, backpressure and shutdown policy are configuration rather than hand-written code. Prefer it when commands fan into multi-stage pipelines (BufferBlock/TransformBlock chains, completion propagation); prefer the Channel + BackgroundService variant for a single ordered queue or when no TPL Dataflow dependency is wanted.",
+      "code_sketch": "var processor = new ActionBlock<ICommand>(async cmd =>\n    await dispatch(cmd), new ExecutionDataflowBlockOptions {\n        MaxDegreeOfParallelism = 4,\n        BoundedCapacity = 256            // blocks Post when full == backpressure\n    });\nawait processor.SendAsync(new PlaceOrder(orderId, qty));\nprocessor.Complete();\nawait processor.Completion;           // drain before shutdown",
+      "pitfalls": [
+        "`Post` returns false when a bounded block is full - ignoring the result silently drops commands; use SendAsync to wait instead.",
+        "Forgetting Complete()/await Completion leaves queued commands unexecuted when the host shuts down.",
+        "A faulted action faults the block, after which it accepts no more commands; decide per-command error handling rather than letting one bad command kill the processor."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library"
+      ]
+    }
+  ],
+  "default_variant": "channels-backgroundservice",
+  "version": "1.0"
+}

@@ -1,0 +1,161 @@
+{
+  "category": "persistence-state",
+  "name": "table-data-gateway",
+  "aliases": [
+    "table gateway"
+  ],
+  "intent": "Confine every SQL statement that touches one table or view inside a single gateway object whose methods take and return plain record structures, so that no other code contains SQL for that table and rows cross the boundary as data rather than as domain objects.",
+  "problem": "Access to one table is spread across the codebase: SELECT/INSERT/UPDATE/DELETE fragments are copied into every caller, nobody can say which queries a schema change will break, DBAs cannot find the SQL that needs tuning, and each caller has to know the dialect, the placeholders and the column order. The desired boundary is a single object that mediates all access to the whole table while the individual rows remain records (tuples, structs, hashes, DataRows) instead of becoming mapped objects.",
+  "context": "Relational persistence where the database is a stable, schema-first integration point and SQL-level control matters (indexes, hints, bulk loads, vendor features), where the team deliberately does not want O/R mapping machinery in the domain layer, and where the domain logic is simple enough that rows may travel as records - CRUD and query services, reporting/read models, ETL writers, local SQLite stores, or a legacy database mediated for several applications. It is also the packaging decision for 'the SQL has to live somewhere well known' before a DAO, repository or query object is justified.",
+  "benefits": [
+    "All SQL for a table lives in one place: it can be reviewed, tuned and re-used instead of being re-invented in every caller, and DBAs have a single file to inspect.",
+    "Callers are freed from dialect, placeholder and column-order knowledge; they speak in method calls and record fields.",
+    "Rows stay records, so no mapping layer, no lazy-loading proxies and no domain-object machinery are needed to move data in and out.",
+    "Schema changes localise: altering a column breaks the gateway first, not every call site.",
+    "Parameter binding is applied uniformly, which removes the most common source of SQL injection (string-built statements scattered through the code).",
+    "The gateway is a natural seam for instrumentation (query logging, timing, retry policies) and for testing against a real instance of the same database engine.",
+    "It composes with transaction and identity patterns instead of competing with them: the client owns the connection and the unit of work, the gateway owns the SQL."
+  ],
+  "tradeoffs": [
+    "One gateway per table multiplies classes and files: a schema with hundreds of tables becomes hundreds of access objects to keep in step with migrations.",
+    "The gateway is the natural attractor for business logic; once validation, pricing or workflow lands in it, the domain is anemic and the object has become a Transaction Script with a database accent.",
+    "A record-oriented API pushes callers to think in rows, so cross-table reporting and join-shaped reads leak into the write path unless a query object or finder takes them over.",
+    "No identity map and no change tracking: two reads of the same row produce two independent records, and concurrent updates silently overwrite unless Version Number, Identity Map or Unit of Work are added.",
+    "Transactions and connection lifetime stay outside the gateway by design, so a gateway that opens or pools its own connection cannot participate in a caller-managed unit of work - a constraint that is easy to violate accidentally.",
+    "The set of methods becomes an implicit API for every consumer; when several applications share the gateway, adding or changing a method is a cross-team negotiation.",
+    "Per-method SQL duplicates joins and column lists between the read and the write side, and nothing in the pattern keeps the record shape aligned with the table when a migration runs."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 8,
+    "performance": 8,
+    "reliability": 6,
+    "security": 7,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Table Gateway",
+      "responsibility": "Holds every SQL statement for exactly one table (or updatable view) - select, find, insert, update, delete - and publishes them as intention-revealing methods; owns no transaction and no connection state."
+    },
+    {
+      "role": "Record",
+      "responsibility": "The plain data structure of one row (tuple, struct, hash, DataRow, POCO); carries values only, no behaviour, no identity and no persistence knowledge."
+    },
+    {
+      "role": "Record Set / Result",
+      "responsibility": "The collection, cursor or rowset returned by finder methods; iterable records plus whatever count or metadata the caller needs."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Application, service-layer or domain code that calls gateway methods and assembles records into whatever it needs; it knows the record shape but never the SQL."
+    },
+    {
+      "role": "Data Source",
+      "responsibility": "The connection, pool, session or driver handle the gateway executes against; supplied by the client (or injected) so that transaction boundaries and units of work remain outside the gateway."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "A service or CRUD application over a handful of tables where every screen maps to a few statements per table and an ORM would add more machinery than it removes.",
+    "Reporting and read models: read-only gateways over views or wide tables that return records directly to a formatter, export or BI job.",
+    "Legacy databases mediated for several applications: one gateway library per database becomes the documented API and the place where vendor quirks are hidden.",
+    "Embedded/local storage (SQLite, SQLCipher) in a desktop or mobile app, where one gateway per table keeps SQL out of the UI and can be tested with an in-memory database.",
+    "Batch and ETL writers that need explicit control over statement batching, cursors and transaction size - control that generated mappers hide.",
+    "Gradual refactoring of SQL scattered through transaction scripts: the first step is to move each table's statements into a gateway, after which a Data Mapper or repository can be introduced deliberately.",
+    "Test fixtures and seeders that must write through the same statements as production code rather than through a second, divergent SQL path.",
+    "Generated gateways in Go: sqlc compiles a schema plus a file of named queries into one struct per table and one type-safe method per SQL statement, with the caller holding the database handle and opening transactions - the gateway's invariants are then enforced by the generator and compiler rather than by convention.",
+    "Local SQLite storage on Android: each Room @Dao is a gateway over one table - the SQL lives in @Query-annotated methods validated at compile time, rows travel as plain entity data classes, and @Transaction or database-level transactions keep atomic multi-DAO boundaries in the caller.",
+    "Java teams that want the gateway structure without hand-writing it: jOOQ's code generator emits one DAO class per table or view (findAll, findById, generated fetchByColumn methods) that reads and writes Record/POJO rows and borrows the caller's Configuration, so the per-table SQL surface is regenerated when the schema changes."
+  ],
+  "avoid_when": [
+    "A one-off script or migration: inline SQL or a single database/sql call is simpler than a gateway per table.",
+    "The domain is rich enough that objects with behaviour matter: use Data Mapper with a domain model, and let a repository speak in domain terms rather than records.",
+    "The store choice varies behind the same application code: the seam you want is a Data Access Object (or repository) interface, not one object per physical table.",
+    "The schema has hundreds of tables and access is uniform - generated metadata mapping or a query object over a shared mapper carries less maintenance than a class per table.",
+    "Reporting joins several tables into one row shape: a query object models the query, whereas a per-table gateway would have to grow cross-table methods.",
+    "The data is not relational (document, key-value, graph): a table gateway has no table to hold the SQL for.",
+    "The framework already provides the gateway and the team would only wrap it - for example an ORM's table-level API or a store-specific client that already centralises SQL."
+  ],
+  "language_files": {
+    "generic": "table-data-gateway.generic.json",
+    "c": "table-data-gateway.c.json",
+    "cplusplus": "table-data-gateway.cplusplus.json",
+    "csharp": "table-data-gateway.csharp.json",
+    "go": "table-data-gateway.go.json",
+    "java": "table-data-gateway.java.json",
+    "javascript": "table-data-gateway.javascript.json",
+    "kotlin": "table-data-gateway.kotlin.json",
+    "python": "table-data-gateway.python.json",
+    "ruby": "table-data-gateway.ruby.json",
+    "rust": "table-data-gateway.rust.json",
+    "scala": "table-data-gateway.scala.json",
+    "swift": "table-data-gateway.swift.json",
+    "typescript": "table-data-gateway.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "procedural"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "row-data-gateway",
+    "data-access-object",
+    "dao-factory",
+    "active-record",
+    "data-mapper",
+    "repository",
+    "query-object",
+    "unit-of-work"
+  ],
+  "anti_patterns": [
+    "God gateway: one class holding the SQL of the whole schema, so every table's change touches the same file and callers couple to each other's queries.",
+    "Gateway with business rules: validation, pricing or workflow creeps in until the object is a service layer that happens to write SQL and the domain is anemic.",
+    "String-built SQL inside the gateway (concatenation or interpolation), which turns the central point of database access into the central point of injection.",
+    "A gateway that owns its own connection or pool and commits internally, silently splitting the application's transactions and defeating Unit of Work.",
+    "Using the gateway as a cache or holding records in a shared mutable collection, so stale rows survive writes issued through other paths.",
+    "Leaking positional tuples to callers as the public record type, so adding a column to the SELECT reshuffles the meaning of every call site."
+  ],
+  "design_principles": [
+    "Single responsibility: one gateway per table (or view), one statement per method.",
+    "Separation of concerns: SQL is isolated from application and domain logic; persistence stays a boundary concern.",
+    "Information hiding: dialect, placeholders, column order and vendor quirks stay behind the gateway's method signatures.",
+    "DRY for statements: each query exists once, so tuning and migration edits happen in exactly one place.",
+    "Dependency inversion (where it pays): clients depend on the gateway's interface, and the gateway depends on a connection abstraction, so the store can be replaced or faked.",
+    "KISS: records instead of mapping machinery - no object-identity, lazy-load or session semantics are implied by reading a row."
+  ],
+  "best_practices": [
+    "Keep the gateway stateless with respect to transactions and connections: accept the connection/pool/session per call or at construction, and never commit inside the gateway.",
+    "One gateway per table or updatable view, with one parameterized statement per method; bind every value and never build SQL from caller input.",
+    "Return records, not domain objects or framework entities, and keep the record type free of behaviour so it can be serialized, logged and diffed.",
+    "Keep cross-table reporting and join-heavy reads in a separate query object or finder instead of widening the write-path gateway into a schema-wide query surface.",
+    "Pair the gateway with the change-tracking patterns it does not provide: Unit of Work for atomic flushes, Identity Map when one row must be one object, Version Number for optimistic concurrency.",
+    "Test the gateway against a real instance of the same database engine (in-memory or containerised), because a fake that speaks a different dialect hides exactly the bugs the gateway exists to contain.",
+    "Handle NULLs and column types explicitly in the mapping to records, and keep the record shape in step with migrations as part of the migration checklist.",
+    "Instrument the gateway once (timing, logging, retries) rather than duplicating those concerns at every call site."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Martin Fowler, Patterns of Enterprise Application Architecture (2002), Chapter 10 'Data Source Architectural Patterns' - Table Data Gateway (intent, how it works, when to use it, record/DataSet variants).",
+    "https://martinfowler.com/eaaCatalog/tableDataGateway.html",
+    "https://learning.oreilly.com/library/view/patterns-of-enterprise/0321127420/ch10.html#ch10lev1sec1",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.data.common.dbdataadapter",
+    "https://docs.sqlc.dev/en/latest/index.html",
+    "https://developer.android.com/training/data-storage/room/accessing-data",
+    "https://www.jooq.org/doc/latest/manual/sql-execution/daos/",
+    "https://technology.lmax.com/posts/don-t-use-dao-use-repository/"
+  ]
+}

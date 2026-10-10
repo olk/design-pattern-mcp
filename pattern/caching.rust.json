@@ -1,0 +1,61 @@
+{
+  "pattern": "caching",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "Mutex<HashMap<K, V>> or OnceLock for a single computed value",
+  "implementation_notes": "std has no cache: the pattern starts as HashMap<K, V> behind a Mutex/RwLock, or OnceLock for one value computed at most once, with eviction and TTL written by hand because nothing in std tracks recency or expiry. The borrow checker shapes the design - values in a shared cache must be owned or Arc-shared and effectively immutable, so handing out references across a possible eviction does not compile; return clones or Arc handles instead. Weak<T> plus upgrade() is how Rust expresses GC-owned cache keys. Reach for the lru or moka crate once a real bound, TTL or lock-free read path is needed.",
+  "code_sketch": "struct Memo<K, V> { map: std::sync::Mutex<std::collections::HashMap<K, V>> }\n\nimpl<K: Eq + std::hash::Hash + Clone, V: Clone> Memo<K, V> {\n    fn get_or_insert_with(&self, key: K, load: impl FnOnce() -> V) -> V {\n        if let Some(v) = self.map.lock().unwrap().get(&key).cloned() {\n            return v;                                  // guard drops before loader\n        }\n        let v = load();                                // no lock held; duplicate loads need single-flight\n        let mut m = self.map.lock().unwrap();\n        if let Some(existing) = m.get(&key).cloned() {\n            return existing;\n        }\n        m.insert(key, v.clone());                       // capacity/eviction policy is still yours\n        v\n    }\n}\n// single computed value: std::sync::OnceLock<T> (no eviction, no TTL)",
+  "pitfalls": [
+    "Holding the MutexGuard while calling the loader serializes every lookup and deadlocks if the loader re-enters the cache - std's Mutex is not reentrant.",
+    "Returning references into the map is impossible; cloning every hit is the naive workaround (wrap large values in Arc<str>/Arc<Vec<_>> to make it cheap).",
+    "Weak<T> keys need upgrade() and a separate strong owner, or entries are dropped as soon as the last strong reference goes away.",
+    "std's HashMap has no TTL: expired entries must be swept by the caller, and the sweep needs the same lock."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+    "https://doc.rust-lang.org/std/collections/index.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-hashmap-memo",
+      "name": "Mutex-guarded HashMap memo (std only)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "Mutex<HashMap<K, V>> or OnceLock for a single computed value",
+      "implementation_notes": "std has no cache: the pattern starts as HashMap<K, V> behind a Mutex/RwLock, or OnceLock for one value computed at most once, with eviction and TTL written by hand because nothing in std tracks recency or expiry. The borrow checker shapes the design - values in a shared cache must be owned or Arc-shared and effectively immutable, so handing out references across a possible eviction does not compile; return clones or Arc handles instead. Weak<T> plus upgrade() is how Rust expresses GC-owned cache keys. Reach for the lru or moka crate once a real bound, TTL or lock-free read path is needed.",
+      "code_sketch": "struct Memo<K, V> { map: std::sync::Mutex<std::collections::HashMap<K, V>> }\n\nimpl<K: Eq + std::hash::Hash + Clone, V: Clone> Memo<K, V> {\n    fn get_or_insert_with(&self, key: K, load: impl FnOnce() -> V) -> V {\n        if let Some(v) = self.map.lock().unwrap().get(&key).cloned() {\n            return v;                                  // guard drops before loader\n        }\n        let v = load();                                // no lock held; duplicate loads need single-flight\n        let mut m = self.map.lock().unwrap();\n        if let Some(existing) = m.get(&key).cloned() {\n            return existing;\n        }\n        m.insert(key, v.clone());                       // capacity/eviction policy is still yours\n        v\n    }\n}\n// single computed value: std::sync::OnceLock<T> (no eviction, no TTL)",
+      "pitfalls": [
+        "Holding the MutexGuard while calling the loader serializes every lookup and deadlocks if the loader re-enters the cache - std's Mutex is not reentrant.",
+        "Returning references into the map is impossible; cloning every hit is the naive workaround (wrap large values in Arc<str>/Arc<Vec<_>> to make it cheap).",
+        "Weak<T> keys need upgrade() and a separate strong owner, or entries are dropped as soon as the last strong reference goes away.",
+        "std's HashMap has no TTL: expired entries must be swept by the caller, and the sweep needs the same lock."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+        "https://doc.rust-lang.org/std/collections/index.html"
+      ]
+    },
+    {
+      "variant_id": "moka-concurrent",
+      "name": "moka concurrent cache with TTL and weigher (crate)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "moka::sync::Cache / moka::future::Cache builder",
+      "implementation_notes": "moka is the concurrent-cache crate: Cache::builder().max_capacity(n).time_to_live(...).time_to_idle(...).weigher(...).build() gives a lock-free read path with TinyLFU admission and TTL/TTI expiry, and moka::future::Cache offers the same API under async/await. Because the cache is internally synchronized and get returns a clone, it sidesteps the Mutex-per-lookup cost of the hand-rolled variant; the price is an extra dependency and value cloning. Choose it for shared caches with real eviction pressure or expiry requirements; the lru crate remains the minimal alternative for a plain bounded LRU.",
+      "code_sketch": "use moka::sync::Cache;\nuse std::time::Duration;\nuse std::sync::Arc;\n\nlet cache: Cache<u64, Arc<Product>> = Cache::builder()\n    .max_capacity(10_000)\n    .time_to_live(Duration::from_secs(600))\n    .build();\n\nlet p = cache.get(&id).unwrap_or_else(|| {\n    let v = Arc::new(load(id));\n    cache.insert(id, v.clone());\n    v\n});",
+      "pitfalls": [
+        "get returns a clone, so every hit clones the value - store Arc<T> or small Copy types, or the cache becomes the bottleneck.",
+        "Maintenance (capacity enforcement, expiry) is amortised in background tasks: the cache can briefly exceed max_capacity unless run_pending_tasks() is forced.",
+        "Async cache calls must not be made while holding another lock, and blocking loaders inside future::Cache::get_with starve the executor."
+      ],
+      "sources": [
+        "https://docs.rs/moka/latest/moka/",
+        "https://docs.rs/moka/latest/moka/sync/struct.Cache.html"
+      ]
+    }
+  ],
+  "default_variant": "std-hashmap-memo",
+  "version": "1.1"
+}

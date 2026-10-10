@@ -1,0 +1,78 @@
+{
+  "pattern": "bulkhead",
+  "language": "java",
+  "support": "library",
+  "implementation_notes": "The dominant Java realization is Resilience4j's Bulkhead backed by java.util.concurrent.Semaphore: maxConcurrentCalls sets the permits, maxWaitDuration the bounded wait (zero means immediate BulkheadFullException), and decorateSupplier or executeSupplier wraps the dependency call so saturation surfaces as a typed exception that maps to a fast failure; metrics and an event stream come with it, and the call stays on the caller thread, which preserves context and thread-locals. The framework-free j.u.c. variant remains justified when the dependency cannot be added or admission must be keyed dynamically.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "resilience4j-semaphore",
+      "name": "Resilience4j Bulkhead (semaphore)",
+      "paradigm": "concurrent",
+      "implementation_notes": "The dominant Java realization is Resilience4j's Bulkhead backed by java.util.concurrent.Semaphore: maxConcurrentCalls sets the permits, maxWaitDuration the bounded wait (zero means immediate BulkheadFullException), and decorateSupplier or executeSupplier wraps the dependency call so saturation surfaces as a typed exception that maps to a fast failure; metrics and an event stream come with it, and the call stays on the caller thread, which preserves context and thread-locals. The framework-free j.u.c. variant remains justified when the dependency cannot be added or admission must be keyed dynamically.",
+      "min_standard": "Java8",
+      "idiom_name": "Resilience4j Bulkhead with BulkheadConfig (semaphore)",
+      "code_sketch": "Bulkhead dbBulkhead = Bulkhead.of(\"db\", BulkheadConfig.custom()\n    .maxConcurrentCalls(8)\n    .maxWaitDuration(Duration.ZERO)          // saturated -> BulkheadFullException\n    .build());\n\nString rows = dbBulkhead.executeSupplier(() -> db.query(sql));\n// BulkheadFullException: map to a fast 503, never to a retry",
+      "pitfalls": [
+        "The semaphore bulkhead runs the call on the caller thread, so a blocking dependency still ties up the caller's own pool; pair it with a timeout.",
+        "maxWaitDuration set too high makes waiting callers occupy their threads, so the bound protects less than expected.",
+        "Registries need per-dependency configuration; the default 25 permits silently shares one capacity for everything unless each instance is named and configured.",
+        "BulkheadFullException must be handled explicitly: generic retry code can retry the rejection and amplify load."
+      ],
+      "sources": [
+        "https://resilience4j.readme.io/docs/bulkhead",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Semaphore.html"
+      ]
+    },
+    {
+      "variant_id": "resilience4j-thread-pool",
+      "name": "Resilience4j ThreadPoolBulkhead (worker isolation)",
+      "paradigm": "concurrent",
+      "implementation_notes": "ThreadPoolBulkhead is the thread-isolation realization: a fixed thread pool (maxThreadPoolSize, coreThreadPoolSize) plus a bounded queue (queueCapacity); executeSupplier returns a CompletionStage, so the caller thread is never blocked by the dependency and saturation raises BulkheadFullException once pool and queue are full. Choose it over the semaphore form when the call blocks a thread and callers must stay responsive; prefer the semaphore when calls are already asynchronous or the caller thread's context must be preserved.",
+      "min_standard": "Java8",
+      "idiom_name": "ThreadPoolBulkhead with bounded queue",
+      "code_sketch": "ThreadPoolBulkhead dbBulkhead = ThreadPoolBulkhead.of(\"db\",\n    ThreadPoolBulkheadConfig.custom()\n        .maxThreadPoolSize(8)\n        .coreThreadPoolSize(8)\n        .queueCapacity(16)                   // bounded waiting\n        .build());\n\nCompletionStage<String> rows = dbBulkhead.executeSupplier(() -> db.query(sql));",
+      "pitfalls": [
+        "Threads come from a dedicated pool, so thread-local context (security, MDC, transactions) is not propagated automatically and must be captured and restored.",
+        "queueCapacity is the only waiting bound: a large value converts rejection into latency.",
+        "Fixed pools reserve threads and stacks even when idle; many per-dependency pools dominate memory unless they are small.",
+        "A CompletionStage that never completes (hanging dependency) holds both a thread and a queue slot; wrap it with a timeout."
+      ],
+      "sources": [
+        "https://resilience4j.readme.io/docs/bulkhead",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html"
+      ]
+    },
+    {
+      "variant_id": "juc-semaphore",
+      "name": "java.util.concurrent.Semaphore (framework-free)",
+      "paradigm": "concurrent",
+      "implementation_notes": "Framework-free realization: a java.util.concurrent.Semaphore per dependency, tryAcquire(wait, unit) for bounded admission (or plain tryAcquire for immediate rejection) and release() in a finally block; on Java 21+ the same semaphore can guard virtual-thread-per-task execution, where cheap threads make a dedicated platform-thread pool unnecessary. This is the form to use inside infrastructure code, when no framework is wanted, or when admission must be keyed dynamically per tenant.",
+      "min_standard": "Java8",
+      "idiom_name": "Semaphore.tryAcquire(timeout) + finally release",
+      "code_sketch": "private final Semaphore dbSlots = new Semaphore(8);\n\nif (!dbSlots.tryAcquire(50, TimeUnit.MILLISECONDS))\n    return Response.status(503).build();      // saturated\n\ntry {\n    return db.query(sql);\n} finally {\n    dbSlots.release();                        // every exit path\n}",
+      "pitfalls": [
+        "tryAcquire returns false on timeout or saturation, while interruption throws - distinguish the two for metrics and retry policy.",
+        "Releasing in a catch instead of a finally leaks permits on rethrown or wrapped exceptions.",
+        "The default Semaphore is unfair and can starve waiters under contention; pass fair=true when latency fairness matters, at some throughput cost.",
+        "On Loom, permits bound tasks rather than threads; hold them for the shortest possible region and always bound with a timeout."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Semaphore.html"
+      ]
+    }
+  ],
+  "default_variant": "resilience4j-semaphore",
+  "idiom_name": "Resilience4j Bulkhead with BulkheadConfig (semaphore)",
+  "code_sketch": "Bulkhead dbBulkhead = Bulkhead.of(\"db\", BulkheadConfig.custom()\n    .maxConcurrentCalls(8)\n    .maxWaitDuration(Duration.ZERO)          // saturated -> BulkheadFullException\n    .build());\n\nString rows = dbBulkhead.executeSupplier(() -> db.query(sql));\n// BulkheadFullException: map to a fast 503, never to a retry",
+  "pitfalls": [
+    "The semaphore bulkhead runs the call on the caller thread, so a blocking dependency still ties up the caller's own pool; pair it with a timeout.",
+    "maxWaitDuration set too high makes waiting callers occupy their threads, so the bound protects less than expected.",
+    "Registries need per-dependency configuration; the default 25 permits silently shares one capacity for everything unless each instance is named and configured.",
+    "BulkheadFullException must be handled explicitly: generic retry code can retry the rejection and amplify load."
+  ],
+  "sources": [
+    "https://resilience4j.readme.io/docs/bulkhead",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Semaphore.html"
+  ]
+}

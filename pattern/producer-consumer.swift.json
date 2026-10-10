@@ -1,0 +1,63 @@
+{
+  "pattern": "producer-consumer",
+  "language": "swift",
+  "support": "idiomatic",
+  "idiom_name": "AsyncStream(bufferingPolicy:) with continuation.yield and `for await`",
+  "implementation_notes": "Swift deliberately has no blocking queue - the concurrency model is async/await plus structured concurrency - so the hand-off is an AsyncStream: the producer pushes with continuation.yield(_:) from any concurrent context, the consumer drains with for await ... in, and the bufferingPolicy (bufferingNewest(n)/bufferingOldest(n)) is the buffer bound, because the default policy buffers without limit (Int.max). Production ends with continuation.finish(), which terminates the for-await loop after the remaining buffer is consumed, and cancellation propagates through onTermination; use a TaskGroup when several consumers should share the work. Keep blocking primitives (DispatchSemaphore.wait) off the cooperative pool, and use actors to serialize any shared state around the stream.",
+  "code_sketch": "let jobs = AsyncStream<Job>(bufferingPolicy: .bufferingNewest(256)) { cont in\n    producer.onJob = { cont.yield($0) }          // producer side\n    cont.onTermination = { _ in producer.stop() }\n}\nfor await job in jobs {                          // consumer side\n    await handle(job)\n}",
+  "pitfalls": [
+    "The default buffering policy is unbounded: without bufferingNewest/bufferingOldest the producer never backpressures and memory grows; the dropping policies instead discard elements, which must be acceptable.",
+    "Forgetting cont.finish() leaves for await waiting forever; finish also flushes the remaining buffer to the consumer.",
+    "yield is non-blocking and callable from any context, so producers must not assume the consumer has caught up - and isolation must be respected (hop to an actor or MainActor as needed).",
+    "Calling DispatchSemaphore.wait() on a cooperative-pool thread starves the pool; bridge legacy callbacks with continuations instead."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/swift/asyncstream"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "async-stream",
+      "name": "AsyncStream with buffering policy (structured concurrency)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "async-await",
+        "structured-concurrency"
+      ],
+      "idiom_name": "AsyncStream(bufferingPolicy:) with continuation.yield and `for await`",
+      "implementation_notes": "Swift deliberately has no blocking queue - the concurrency model is async/await plus structured concurrency - so the hand-off is an AsyncStream: the producer pushes with continuation.yield(_:) from any concurrent context, the consumer drains with for await ... in, and the bufferingPolicy (bufferingNewest(n)/bufferingOldest(n)) is the buffer bound, because the default policy buffers without limit (Int.max). Production ends with continuation.finish(), which terminates the for-await loop after the remaining buffer is consumed, and cancellation propagates through onTermination; use a TaskGroup when several consumers should share the work. Keep blocking primitives (DispatchSemaphore.wait) off the cooperative pool, and use actors to serialize any shared state around the stream.",
+      "code_sketch": "let jobs = AsyncStream<Job>(bufferingPolicy: .bufferingNewest(256)) { cont in\n    producer.onJob = { cont.yield($0) }          // producer side\n    cont.onTermination = { _ in producer.stop() }\n}\nfor await job in jobs {                          // consumer side\n    await handle(job)\n}",
+      "pitfalls": [
+        "The default buffering policy is unbounded: without bufferingNewest/bufferingOldest the producer never backpressures and memory grows; the dropping policies instead discard elements, which must be acceptable.",
+        "Forgetting cont.finish() leaves for await waiting forever; finish also flushes the remaining buffer to the consumer.",
+        "yield is non-blocking and callable from any context, so producers must not assume the consumer has caught up - and isolation must be respected (hop to an actor or MainActor as needed).",
+        "Calling DispatchSemaphore.wait() on a cooperative-pool thread starves the pool; bridge legacy callbacks with continuations instead."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/swift/asyncstream"
+      ]
+    },
+    {
+      "variant_id": "dispatch-semaphore-queue",
+      "name": "Legacy libdispatch bounded queue (two semaphores + buffer)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift3.0",
+      "requires_features": [
+        "libdispatch"
+      ],
+      "idiom_name": "DispatchSemaphore slots/items + DispatchQueue-guarded buffer",
+      "implementation_notes": "Before Swift concurrency, the hand-rolled realization paired a lock (or serial DispatchQueue) guarding an array with two DispatchSemaphore values - one counting free slots and one counting items - so a producer waits on slots and signals items, and the consumer does the inverse: Dijkstra's two-semaphore buffer expressed with libdispatch. It still exists in legacy code and in code that must support pre-5.5 runtimes, but it blocks a thread on every wait and has no cancellation integration, so new code should use AsyncStream or actors instead.",
+      "code_sketch": "let slots = DispatchSemaphore(value: 256)\nlet items = DispatchSemaphore(value: 0)\nvar buffer = [Job]()                 // guarded by a lock or serial queue\n\nfunc produce(_ job: Job) {           // producer thread\n    slots.wait()\n    buffer.append(job)\n    items.signal()\n}\n// consumer: items.wait(); let job = buffer.removeFirst(); slots.signal()",
+      "pitfalls": [
+        "Semaphore waits block a DispatchQueue thread, so more consumers than queue threads makes libdispatch spawn threads and hide oversubscription.",
+        "The buffer still needs its own lock (or serial queue): the semaphores count capacity but do not make array access atomic.",
+        "There is no cancellation: a thread parked in semaphore.wait() cannot observe Task cancellation - use wait(timeout:) when shutdown must interrupt it."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/dispatch/dispatchsemaphore"
+      ]
+    }
+  ],
+  "default_variant": "async-stream"
+}

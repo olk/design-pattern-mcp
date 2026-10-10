@@ -1,0 +1,63 @@
+{
+  "pattern": "load-leveller",
+  "language": "javascript",
+  "support": "library",
+  "idiom_name": "p-queue PQueue({concurrency}) with .add()",
+  "implementation_notes": "Node has no standard queue class, so the idiomatic in-process load leveller is a promise queue with a concurrency limit: p-queue's add() buffers a task and runs at most {concurrency} of them at once, queue.size and queue.pending expose the backlog, and await queue.add() settles only when the task itself completes, which is why awaiting it in the request path defeats the decoupling. This replaces the classic worker-thread pool with the event loop's own scheduling; CPU-bound work still belongs in worker_threads. The queue lives in the process, so accepted work is lost on restart - the project's own README points servers at a Redis-backed job queue instead.",
+  "code_sketch": "import PQueue from 'p-queue';\n\nconst queue = new PQueue({concurrency: 8});   // workers: 8 tasks in flight\n\nexport function submit(job) {\n  queue.add(() => process(job));              // buffered; no await (settles on completion)\n}\n\nsetInterval(() => metrics.gauge('queue_backlog', queue.size + queue.pending), 5000);",
+  "pitfalls": [
+    "Awaiting queue.add() waits for the task to finish, which serializes the caller and throws away the decoupling the queue provides.",
+    "The returned promise must be handled: an unhandled rejection can terminate the Node process.",
+    "The backlog lives in memory - a producer faster than the consumers grows the heap without bound, since nothing blocks the event loop.",
+    "CPU-bound tasks starve the loop and the queue never drains; move them to worker_threads or a separate worker process."
+  ],
+  "sources": [
+    "https://github.com/sindresorhus/p-queue"
+  ],
+  "variants": [
+    {
+      "variant_id": "promise-queue",
+      "name": "In-process concurrency-limited promise queue (p-queue)",
+      "paradigm": "concurrent",
+      "implementation_notes": "Node has no standard queue class, so the idiomatic in-process load leveller is a promise queue with a concurrency limit: p-queue's add() buffers a task and runs at most {concurrency} of them at once, queue.size and queue.pending expose the backlog, and await queue.add() settles only when the task itself completes, which is why awaiting it in the request path defeats the decoupling. This replaces the classic worker-thread pool with the event loop's own scheduling; CPU-bound work still belongs in worker_threads. The queue lives in the process, so accepted work is lost on restart - the project's own README points servers at a Redis-backed job queue instead.",
+      "min_standard": "ES2017",
+      "requires_features": [
+        "promises"
+      ],
+      "idiom_name": "p-queue PQueue({concurrency}) with .add()",
+      "code_sketch": "import PQueue from 'p-queue';\n\nconst queue = new PQueue({concurrency: 8});   // workers: 8 tasks in flight\n\nexport function submit(job) {\n  queue.add(() => process(job));              // buffered; no await (settles on completion)\n}\n\nsetInterval(() => metrics.gauge('queue_backlog', queue.size + queue.pending), 5000);",
+      "pitfalls": [
+        "Awaiting queue.add() waits for the task to finish, which serializes the caller and throws away the decoupling the queue provides.",
+        "The returned promise must be handled: an unhandled rejection can terminate the Node process.",
+        "The backlog lives in memory - a producer faster than the consumers grows the heap without bound, since nothing blocks the event loop.",
+        "CPU-bound tasks starve the loop and the queue never drains; move them to worker_threads or a separate worker process."
+      ],
+      "sources": [
+        "https://github.com/sindresorhus/p-queue"
+      ]
+    },
+    {
+      "variant_id": "redis-bullmq",
+      "name": "Durable queue with Redis-backed workers (BullMQ)",
+      "paradigm": "concurrent",
+      "implementation_notes": "For work that must survive a restart or be shared between hosts, the queue is moved out of process: BullMQ keeps jobs in Redis, workers pull with their own concurrency setting, and the framework supplies retries, backoff, delayed jobs, priorities and the failed set that otherwise has to be hand-rolled. Producer and consumer scale independently - add workers with the same queue name - and at-least-once delivery (BullMQ aims at exactly-once but delivers at least once in the worst case) makes idempotent job handlers the contract. The traffic smoothing is now the broker's backlog rather than an in-process array.",
+      "min_standard": "ES2020",
+      "requires_features": [
+        "redis"
+      ],
+      "idiom_name": "BullMQ Queue.add + Worker(queue, processor, {concurrency})",
+      "code_sketch": "import { Queue, Worker } from 'bullmq';\n\nconst jobs = new Queue('jobs', { connection });        // durable buffer in Redis\nawait jobs.add('process', payload, { attempts: 5, backoff: { type: 'exponential', delay: 500 } });\n\nnew Worker('jobs', async job => process(job.data),   // consumers pace themselves\n           { connection, concurrency: 8 });",
+      "pitfalls": [
+        "At-least-once delivery means a job can run twice after a worker crash; handlers must be idempotent (idempotency keys, upserts) or duplicates corrupt data.",
+        "Redis is a hard dependency: eviction policies, persistence settings and quotas decide whether accepted work survives - configure maxmemory-policy and Redis persistence deliberately.",
+        "A growing 'waiting' backlog is invisible unless queue metrics are exported and alerted on.",
+        "Job data must be serializable and versioned; deploying a producer with a new payload shape before consumers understand it breaks in-flight jobs."
+      ],
+      "sources": [
+        "https://docs.bullmq.io/"
+      ]
+    }
+  ],
+  "default_variant": "promise-queue",
+  "version": "1.0"
+}

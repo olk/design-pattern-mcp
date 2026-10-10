@@ -1,0 +1,60 @@
+{
+  "pattern": "channel-adapter",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "lapin Channel::basic_publish + Channel::basic_consume (Consumer stream)",
+  "implementation_notes": "lapin exposes an async AMQP 0-9-1 channel: the outbound half is channel.basic_publish(exchange, routing_key, options, payload, properties).await returning a publisher confirm, and the inbound half is the Consumer stream from basic_consume, iterated with StreamExt::next() and acknowledged via basic_ack. Ownership is static, so the adapter is a struct that owns a Channel (Clone + Send + Sync, internally synchronized) and is generic over the application handler trait - trait bounds replace the classic handler interface. Choose this variant for RabbitMQ/AMQP with tokio or async-std; keep the stream alive and re-subscribe after connection errors (wait_for_recovery).",
+  "code_sketch": "struct OrderAdapter { ch: lapin::Channel }\n\nimpl OrderAdapter {\n    async fn publish(&self, o: &Order) -> lapin::Result<()> {\n        let body = serde_json::to_vec(o).unwrap();\n        self.ch.basic_publish(\"orders\", \"order.placed\", BasicPublishOptions::default(),\n                              &body, BasicProperties::default().with_delivery_mode(2)).await?;\n        Ok(())\n    }\n}\n// inbound: let mut c = ch.basic_consume(\"orders\", \"adapter\", ..).await?;\n// while let Some(Ok(d)) = c.next().await { handle(&d.data).await?; d.ack(..).await?; }",
+  "pitfalls": [
+    "Dropping the Consumer cancels consumption silently: the adapter must keep the stream alive and wait_for_recovery (or resubscribe) after a connection error.",
+    "Awaiting the publisher confirm on every message serialises throughput; ignoring it loses the delivery guarantee the caller assumes - choose deliberately.",
+    "Handlers that hold references across await points must be Send; blocking work inside the async adapter belongs in spawn_blocking."
+  ],
+  "sources": [
+    "https://docs.rs/lapin/latest/lapin/struct.Channel.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "lapin-consumer-stream",
+      "name": "lapin AMQP channel with a Consumer stream",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async-await"
+      ],
+      "idiom_name": "lapin Channel::basic_publish + Channel::basic_consume (Consumer stream)",
+      "implementation_notes": "lapin exposes an async AMQP 0-9-1 channel: the outbound half is channel.basic_publish(exchange, routing_key, options, payload, properties).await returning a publisher confirm, and the inbound half is the Consumer stream from basic_consume, iterated with StreamExt::next() and acknowledged via basic_ack. Ownership is static, so the adapter is a struct that owns a Channel (Clone + Send + Sync, internally synchronized) and is generic over the application handler trait - trait bounds replace the classic handler interface. Choose this variant for RabbitMQ/AMQP with tokio or async-std; keep the stream alive and re-subscribe after connection errors (wait_for_recovery).",
+      "code_sketch": "struct OrderAdapter { ch: lapin::Channel }\n\nimpl OrderAdapter {\n    async fn publish(&self, o: &Order) -> lapin::Result<()> {\n        let body = serde_json::to_vec(o).unwrap();\n        self.ch.basic_publish(\"orders\", \"order.placed\", BasicPublishOptions::default(),\n                              &body, BasicProperties::default().with_delivery_mode(2)).await?;\n        Ok(())\n    }\n}\n// inbound: let mut c = ch.basic_consume(\"orders\", \"adapter\", ..).await?;\n// while let Some(Ok(d)) = c.next().await { handle(&d.data).await?; d.ack(..).await?; }",
+      "pitfalls": [
+        "Dropping the Consumer cancels consumption silently: the adapter must keep the stream alive and wait_for_recovery (or resubscribe) after a connection error.",
+        "Awaiting the publisher confirm on every message serialises throughput; ignoring it loses the delivery guarantee the caller assumes - choose deliberately.",
+        "Handlers that hold references across await points must be Send; blocking work inside the async adapter belongs in spawn_blocking."
+      ],
+      "sources": [
+        "https://docs.rs/lapin/latest/lapin/struct.Channel.html"
+      ]
+    },
+    {
+      "variant_id": "rdkafka-stream-consumer",
+      "name": "rdkafka FutureProducer + StreamConsumer",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "tokio"
+      ],
+      "idiom_name": "rdkafka FutureProducer::send + StreamConsumer::stream (MessageStream)",
+      "implementation_notes": "Kafka's Rust client models both directions as futures and streams: FutureProducer::send returns a future resolving to the partition/offset, and StreamConsumer::stream() yields BorrowedMessages without explicit polling, so the adapter becomes a thin async pipeline (`while let Some(m) = stream.next().await`) that maps payloads to application calls. Choose this variant when the transport is Kafka and the application is futures-based; unlike the AMQP variant the consumer needs a topic subscription and an explicit commit strategy rather than per-message acknowledgement.",
+      "code_sketch": "let producer: FutureProducer = client_config.create()?;\nproducer.send(FutureRecord::to(\"orders\").payload(&serde_json::to_vec(&order)?), Timeout::Never).await?;\n\n// inbound:\nlet stream = consumer.stream();\nwhile let Some(msg) = stream.next().await {\n    let msg = msg?;\n    let order: Order = serde_json::from_slice(msg.payload().unwrap())?;\n    handler.handle(order).await?;     // commit offsets according to CommitMode\n}",
+      "pitfalls": [
+        "The stream must be polled at least every max.poll.interval.ms or the group treats the process as dead (KIP-62 liveness) and rebalances.",
+        "The default auto-commit timer can advance past unprocessed messages; a slow handler needs explicit CommitMode::Async/manual commits.",
+        "BorrowedMessage borrows from the consumer: buffering messages beyond the loop body requires converting/owning the payload first."
+      ],
+      "sources": [
+        "https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html"
+      ]
+    }
+  ],
+  "default_variant": "lapin-consumer-stream"
+}

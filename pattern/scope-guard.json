@@ -1,0 +1,154 @@
+{
+  "category": "persistence-state",
+  "name": "scope-guard",
+  "aliases": [
+    "scope guard idiom",
+    "deferred cleanup"
+  ],
+  "intent": "Run a cleanup (or any deferred) action automatically when the enclosing scope exits, on every exit path, without inventing an owner object for the resource it protects.",
+  "problem": "A function acquires several resources or opens several pieces of state and must release or restore them on every way out - normal return, early return, thrown exception or panic, break/continue, cancellation. Spelling the cleanup out at each exit path duplicates code, breaks as soon as a new exit path is added, and mistimes releases (a leaked handle, an un-rolled-back transaction); wrapping each resource in a dedicated owner object (RAII / Execute-Around Object) solves the timing but forces a class per resource, including for actions that are not resources at all (rollback, span, restore state).",
+  "context": "Applies in any language that offers a lexical scope with a guaranteed exit hook (destructor, defer, ensure, finally, with, using, cleanup attribute) and where the code must express 'when this scope ends, do X' for resources or actions that have no natural owner: locks, file descriptors, transactions, timers/spans, temporary files, temporarily swapped global or thread-local state. It is most valuable when a scope has several such actions, when the number of exit paths grows during maintenance, when the action is conditional (only on failure, only on success) or cancellable (commit/dismiss), and when a GC finalizer would run too late to be correct.",
+  "benefits": [
+    "Cleanup is attached at the point of acquisition, so it travels with the scope instead of being re-stated at every exit path; adding a new early return cannot forget it.",
+    "No owner class per resource: a closure plus the language's scope-exit hook replaces the classic guard object, so actions that are not resources (rollback, restore invariant, end span) get the same guarantees as real resources.",
+    "Guaranteed execution on abnormal exits - exception, panic, cancellation, break/continue out of a loop - which is exactly where hand-written cleanup is forgotten.",
+    "Reverse (LIFO) execution order matches acquisition order, so a guard whose action depends on an earlier resource still sees that resource alive.",
+    "Commit semantics become an explicit dismiss/release operation ('run unless committed') instead of nested conditionals or a duplicated success path.",
+    "Composable: several guards in one scope, or a stack of registered callbacks (ExitStack, DisposableStack, Using.Manager), cover a dynamic number of resources without nesting."
+  ],
+  "tradeoffs": [
+    "The exit action is invisible at the point where control leaves the scope: control flow is no longer read top-to-bottom, reviewers and tests must exercise the exit path to observe the effect, and a missing guard fails silently (a leak, not an error).",
+    "Guards run while state is already invalid - captured references may point at locals that were returned, moved, or destroyed (cppreference documents a scope_exit whose exit function refers to a local used as a return operand; JS closures can capture an already-disposed `using` binding), so capture discipline is on the programmer.",
+    "A failing exit action on an already-failing path is fatal or second-class everywhere: Rust's double panic aborts, plain finally/ensure semantics let the cleanup error replace the original one, and Java/Kotlin/Python/JS hide it behind the primary exception (suppressed or SuppressedError). Cleanup must therefore be non-throwing by discipline, which no compiler enforces.",
+    "Lifetime and binding rules are easy to get wrong: a guard declared before the resource it protects destroys things in the wrong order, `let _ = Guard::new(..)` drops immediately, `defer` captures variables rather than values, and a moved-from guard silently disarms.",
+    "Mixing two teardown systems in one scope (guards plus framework callbacks, finalizers or an owner object) invites double release and ordering surprises, because the guard's position relative to the other mechanism is not obvious.",
+    "Overused, it turns straight-line code into a stack of invisible deferred actions whose combined effect only exists at scope exit - debuggable only by breakpoints in destructors."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 7,
+    "performance": 9,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Scope",
+      "responsibility": "Lexical region (block, function body, module init) whose exit triggers the guard; the pattern's whole guarantee rests on the language running an exit hook for this region on every path out of it."
+    },
+    {
+      "role": "Guard",
+      "responsibility": "The construct that holds the action and is bound to the scope - a local object with a destructor, a defer/ensure/finally block, a with/using declaration or a registered stack entry - and that decides whether the action still runs."
+    },
+    {
+      "role": "Exit Action",
+      "responsibility": "The callable executed at scope exit: release, rollback, restore, end span, delete partial artifact. Must be short, idempotent and non-throwing, because it runs on paths where errors cannot be handled normally."
+    },
+    {
+      "role": "Dismiss Operation",
+      "responsibility": "The commit/release/disarm operation (release(), set_active(false), committed flag, pop_all(), into_inner()) that deactivates the guard on the success path, making 'run unless committed' explicit."
+    },
+    {
+      "role": "Exit Classifier",
+      "responsibility": "Optional selector that picks which exit path runs the action - unconditional (scope_exit), failure-only (scope_fail, defer_on_unwind!) or success-only (scope_success, defer_on_success!) - so conditional actions need no hand-written flag."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Releasing a resource acquired mid-procedure: close a descriptor or socket, unlock a mutex, cancel a timer after a multi-step handshake that can fail halfway.",
+    "Transaction control: arm a rollback (or mark a unit of work dirty) and dismiss it on commit, so failure or an exception rolls back exactly once.",
+    "Instrumentation spans: start a span/timing/log scope on entry and finish it on exit, including error and cancellation paths.",
+    "Restoring temporary state: swap a locale, environment variable, signal handler, thread-local or feature flag and restore the previous value on exit.",
+    "Removing partial artifacts: delete a temporary file or an incomplete record unless the operation completes (failure-only variant).",
+    "Returning borrowed resources to their pool, releasing a lease or quota slot at the end of the scope that used it.",
+    "Go's built-in `defer` statement keeps file closes, mutex unlocks and tracing finalizers adjacent to acquisition while guaranteeing LIFO execution on every return or panic path.",
+    "Python's `contextlib.ExitStack` models a data-driven scope guard: optional context managers and callbacks are registered as resources appear, then unwound in reverse order or transferred with `pop_all()` on success.",
+    "Boost.Scope's `scope_exit`, `scope_fail` and `scope_success` provide named C++ scope guards for unconditional cleanup, rollback on exception and commit-only actions without a bespoke owner type."
+  ],
+  "avoid_when": [
+    "A dedicated owner object is the better answer: if the resource's whole lifetime is 'as long as this object exists', use RAII/Execute-Around Object or the stdlib owner type (smart pointer, stream, session) instead of a one-off guard.",
+    "The release must happen at a point other than scope exit - after commit, per loop iteration boundary, on another thread, or when a client says so: make it an explicit call (Dispose, close, release) with a deterministic error path.",
+    "The language has no scope-exit hook and the toolchain is fixed (ISO C without the cleanup attribute, some managed runtimes): use a single-exit goto/label chain or an explicit cleanup call, and do not simulate destructors with finalizers.",
+    "The action is core behaviour rather than cleanup (charging a customer, publishing a message): hiding business logic in a destructor/defer body makes it invisible to readers, tests and reviewers.",
+    "The scope is long-lived (application, static, session lifetime): guards are for lexical scopes, not for managing singletons, pools or caches whose lifetime exceeds one function body."
+  ],
+  "language_files": {
+    "generic": "scope-guard.generic.json",
+    "c": "scope-guard.c.json",
+    "cplusplus": "scope-guard.cplusplus.json",
+    "csharp": "scope-guard.csharp.json",
+    "go": "scope-guard.go.json",
+    "java": "scope-guard.java.json",
+    "javascript": "scope-guard.javascript.json",
+    "kotlin": "scope-guard.kotlin.json",
+    "python": "scope-guard.python.json",
+    "ruby": "scope-guard.ruby.json",
+    "rust": "scope-guard.rust.json",
+    "scala": "scope-guard.scala.json",
+    "swift": "scope-guard.swift.json",
+    "typescript": "scope-guard.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "procedural"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "raii",
+    "execute-around",
+    "dispose",
+    "resource-return",
+    "smart-pointer",
+    "object-pool"
+  ],
+  "anti_patterns": [
+    "Hiding business behaviour (not cleanup) in a destructor or defer body, so the exit path performs actions nobody can see at the call site.",
+    "Cleanup that can fail or throw on the unwinding path - the classic double-panic/abort or 'close error replaced the real error' bug.",
+    "Guards capturing references to state that no longer exists at exit (return-operand locals, moved-from objects, already-disposed `using` bindings), which turns release into use-after-free or a no-op.",
+    "Relying on finalizers/garbage collection instead of a lexical hook for deterministic release, so the resource survives exactly as long as memory pressure allows.",
+    "Re-stating the cleanup at every exit path and adding a guard on top: two teardown mechanisms in one scope, double release and unclear ordering."
+  ],
+  "design_principles": [
+    "Single point of acquisition, single point of release: the cleanup is attached where the resource is acquired, not where the scope ends.",
+    "Separation of concerns: the happy path carries no cleanup logic; abnormal exits are handled uniformly by the hook instead of by duplicated handlers.",
+    "Fail-safe default: the action runs unless it is explicitly dismissed, so the unsafe state (lock held, transaction open, artifact present) is the one that requires a deliberate decision to keep.",
+    "Determinism over convenience: release is bound to lexical scope, never to garbage collection or timing luck.",
+    "Information hiding of the release mechanics: callers see 'a scope that cleans up after itself', not the release order and conditions."
+  ],
+  "best_practices": [
+    "Declare the guard immediately after acquiring the resource, in the same scope, and before any operation that can leave the scope.",
+    "Keep exit actions short, self-contained, idempotent and non-throwing; log-and-continue is acceptable here, a throw or an abort is not.",
+    "Model commit with the dismiss/release operation (or an explicit commit flag read inside the action) rather than with two different guard bodies.",
+    "Prefer the language's built-in hook and its standard guard type (defer, using, with, try-with-resources, Drop, scope_exit, scopeguard, Using.resource) over a hand-rolled guard class, and never simulate scope-bound cleanup with finalizers.",
+    "Order guards so dependencies unwind last-in-first-out, and do not rely on a guard's position relative to other teardown mechanisms (framework callbacks, owner objects) that you do not control.",
+    "Make the exit action observable: log the release, expose a counter or at least name the guard after the action, because a guard that silently stops running is indistinguishable from correct code."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Andrei Alexandrescu & Petru Marginean, 'Generic: Change the Way You Write Exception-Safe Code - Forever', C/C++ Users Journal, December 2000 - the ScopeGuard formulation of on-exit actions with an explicit release/dismiss step.",
+    "https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Scope_Guard",
+    "https://cplusplus.github.io/fundamentals-ts/v3.html",
+    "https://www.boost.org/doc/libs/latest/libs/scope/doc/html/index.html",
+    "https://erdani.org/publications/cuj-12-2000.php.html",
+    "https://go.dev/ref/spec",
+    "https://docs.python.org/3/library/contextlib.html",
+    "https://www.boost.org/doc/libs/latest/libs/scope/doc/html/scope/scope_guards.html",
+    "https://docs.kernel.org/next/core-api/cleanup.html",
+    "https://bigcpp.com/reference/idioms/scope-guard"
+  ]
+}

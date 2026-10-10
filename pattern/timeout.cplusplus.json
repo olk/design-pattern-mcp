@@ -1,0 +1,78 @@
+{
+  "pattern": "timeout",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::future::wait_for + std::condition_variable::wait_for",
+  "implementation_notes": "C++11 gives the pattern two standard-library shapes: std::future<T>::wait_for(duration) returns future_status::timeout when the result is not ready (it may block longer than requested under scheduling pressure, and returns immediately for a deferred task), while std::condition_variable::wait_for(lock, duration, pred) reports cv_status::timeout or false for waits on shared state. Neither cancels the producer: the task behind the future keeps running in its thread, and the condition wait only stops the waiter, so the timeout has to be paired with a stop flag (or C++20 stop_token) when the work itself should stop.",
+  "code_sketch": "std::future<Receipt> f = std::async(std::launch::async, [&]{ return api.authorize(order); });\nif (f.wait_for(300ms) != std::future_status::ready)\n    throw TimeoutError{\"payment dependency did not answer in 300 ms\"};\nReceipt r = f.get();   /* wait_for does not cancel the async task */",
+  "pitfalls": [
+    "wait_for may block longer than the requested duration (scheduling, resource contention) and returns immediately for a task launched with std::launch::deferred, so the elapsed time is never exactly the budget.",
+    "wait_for does not cancel the task: the std::async thread keeps running, so the work needs its own budget or a cooperative stop.",
+    "A std::future returned by std::async blocks in its destructor until the task completes, so abandoning it 'after the timeout' can still hang the caller at scope exit."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/future/wait_for",
+    "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-timed-wait",
+      "name": "Standard timed waits (std::future / std::condition_variable)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::future::wait_for + std::condition_variable::wait_for",
+      "implementation_notes": "C++11 gives the pattern two standard-library shapes: std::future<T>::wait_for(duration) returns future_status::timeout when the result is not ready (it may block longer than requested under scheduling pressure, and returns immediately for a deferred task), while std::condition_variable::wait_for(lock, duration, pred) reports cv_status::timeout or false for waits on shared state. Neither cancels the producer: the task behind the future keeps running in its thread, and the condition wait only stops the waiter, so the timeout has to be paired with a stop flag (or C++20 stop_token) when the work itself should stop.",
+      "code_sketch": "std::future<Receipt> f = std::async(std::launch::async, [&]{ return api.authorize(order); });\nif (f.wait_for(300ms) != std::future_status::ready)\n    throw TimeoutError{\"payment dependency did not answer in 300 ms\"};\nReceipt r = f.get();   /* wait_for does not cancel the async task */",
+      "pitfalls": [
+        "wait_for may block longer than the requested duration (scheduling, resource contention) and returns immediately for a task launched with std::launch::deferred, so the elapsed time is never exactly the budget.",
+        "wait_for does not cancel the task: the std::async thread keeps running, so the work needs its own budget or a cooperative stop.",
+        "A std::future returned by std::async blocks in its destructor until the task completes, so abandoning it 'after the timeout' can still hang the caller at scope exit."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/future/wait_for",
+        "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for"
+      ]
+    },
+    {
+      "variant_id": "stop-token",
+      "name": "C++20 jthread + stop_token cooperative cancellation",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "stop_token",
+        "jthread"
+      ],
+      "idiom_name": "std::jthread + std::stop_token (interruptible condition_variable_any::wait_for)",
+      "implementation_notes": "C++20 supplies the half the pattern was missing: a std::jthread owns a std::stop_source and hands its std::stop_token to the worker, and the condition_variable_any wait_for/wait_until overloads take that token so a stop request interrupts the timed wait instead of hiding inside it. std::stop_callback registers the action to run on the stop request (closing a socket, setting a flag), and the jthread destructor requests stop and joins, so a timeout path cannot leave a detached worker behind.",
+      "code_sketch": "std::jthread worker([&](std::stop_token st) {\n    std::unique_lock lk(m);\n    if (!cv.wait_for(lk, st, 300ms, [&]{ return ready; }))\n        return;                       /* timed out: the wait was interrupted */\n    process(data);\n});\nif (!done_in_time) worker.request_stop();   /* cooperative: the worker checks the token */",
+      "pitfalls": [
+        "The stop_token must reach the blocking primitive: a wait on a plain std::condition_variable ignores request_stop and keeps blocking for the full duration.",
+        "request_stop does not interrupt a blocking syscall (read, recv); a stop_callback must close the descriptor, or the worker must tear the socket down itself.",
+        "request_stop only sets the flag - code that never checks stop_requested()/the token keeps running, so the timeout still is not a guarantee."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/stop_token",
+        "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for"
+      ]
+    },
+    {
+      "variant_id": "asio-steady-timer",
+      "name": "Boost.Asio steady_timer deadline around an async operation",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "boost::asio::steady_timer expires_after + async_wait / cancel",
+      "implementation_notes": "In asynchronous C++ the deadline is a second outstanding operation: a boost::asio::steady_timer with expires_after(duration) runs an async_wait whose handler cancels the real operation (socket.cancel()/close()) when it fires, while the operation's own handler calls timer.cancel() when it finishes first. Timer expiry and cancellation stay distinguishable because a cancelled wait handler is invoked with error_code == boost::asio::error::operation_aborted, and re-arming expires_after on an active timer cancels the pending wait, so the race is decided by the return value of expires_after.",
+      "code_sketch": "boost::asio::steady_timer timer(io);\ntimer.expires_after(std::chrono::milliseconds(300));\ntimer.async_wait([&](boost::system::error_code ec) {\n    if (!ec) sock.cancel();          /* deadline hit: abort the in-flight I/O */\n});\nsock.async_read_some(buf, [&](boost::system::error_code ec, size_t n) {\n    if (ec == boost::asio::error::operation_aborted) return on_timeout();\n    timer.cancel();                  /* the operation won the race */\n    on_data(n);\n});",
+      "pitfalls": [
+        "Cancelling an Asio operation completes its handler with operation_aborted on the same thread: the timeout path and the normal path must agree who owns the buffer and the socket, or a cancelled handler frees state the other one still uses.",
+        "One timer per operation - sharing a steady_timer between concurrent operations makes the second expires_after cancel the first wait.",
+        "steady_timer is the right typedef because it uses the steady clock; system_timer follows the wall clock, so an adjustment can move the deadline."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    }
+  ],
+  "default_variant": "std-timed-wait"
+}

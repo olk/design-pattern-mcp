@@ -1,0 +1,58 @@
+{
+  "pattern": "least-privilege",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "setresuid / setgroups credential drop before untrusted work, with file modes and O_CLOEXEC",
+  "implementation_notes": "C has no authority model, so least privilege is realized with process credentials plus code discipline: a program that needs a privileged resource (a low port, a device, a privileged file) acquires it first and then drops irreversibly with setresuid(-1, uid, uid) and setresgid, plus setgroups(0, NULL) so the supplementary groups go too - before it parses or acts on untrusted input. What replaces the classic structure: there is no policy object to instantiate, the kernel's credential check is the enforcement point, and the grant set is whatever the process's uid, gid, supplementary groups and open descriptors allow. The classic rights-table form is justified only when authority must be assigned to many subjects inside one process, which in C means you are writing the mechanism the operating system would otherwise provide and should treat that code as security critical.",
+  "code_sketch": "/* take the privileged resource first, then drop everything else */\nint fd = open(\"/dev/port0\", O_RDWR | O_CLOEXEC);    /* needs root briefly */\nif (fd < 0) die(\"open\");\nif (setgroups(0, NULL) != 0) die(\"setgroups\");       /* no stray group rights */\nif (setresgid(-1, gid, gid) != 0) die(\"setresgid\");  /* not re-acquirable */\nif (setresuid(-1, uid, uid) != 0) die(\"setresuid\");  /* saved-set is gone */\n/* from here the process can only do what uid/gid permit */\nserve(fd);",
+  "pitfalls": [
+    "The classic C failure is a skippable drop: an early return, a longjmp or an exception between the privileged step and the setresuid call leaves the process running with its original authority (CWE-250's example is exactly an error path that skips the lowering call).",
+    "setuid and seteuid are not equivalent: unless the real and saved IDs are dropped too, the process can setuid back to its previous identity; setresuid(-1, uid, uid) (or setuid as root, which sets all three) is the irreversible form.",
+    "Descriptors are not close-on-exec by default, so a handle opened for the privileged step survives into a child unless O_CLOEXEC was passed; note also that signal handlers and spawned processes run with the privileges of the owning process.",
+    "Supplementary groups survive a naive uid drop, so a process can keep rights it meant to shed; call setgroups(0, NULL) (after initgroups while still privileged, if group membership is needed during startup)."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man7/capabilities.7.html",
+    "https://cwe.mitre.org/data/definitions/250.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "posix-drop-privileges",
+      "name": "Portable POSIX credential drop",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "setresuid / setgroups credential drop before untrusted work, with file modes and O_CLOEXEC",
+      "implementation_notes": "C has no authority model, so least privilege is realized with process credentials plus code discipline: a program that needs a privileged resource (a low port, a device, a privileged file) acquires it first and then drops irreversibly with setresuid(-1, uid, uid) and setresgid, plus setgroups(0, NULL) so the supplementary groups go too - before it parses or acts on untrusted input. What replaces the classic structure: there is no policy object to instantiate, the kernel's credential check is the enforcement point, and the grant set is whatever the process's uid, gid, supplementary groups and open descriptors allow. The classic rights-table form is justified only when authority must be assigned to many subjects inside one process, which in C means you are writing the mechanism the operating system would otherwise provide and should treat that code as security critical.",
+      "code_sketch": "/* take the privileged resource first, then drop everything else */\nint fd = open(\"/dev/port0\", O_RDWR | O_CLOEXEC);    /* needs root briefly */\nif (fd < 0) die(\"open\");\nif (setgroups(0, NULL) != 0) die(\"setgroups\");       /* no stray group rights */\nif (setresgid(-1, gid, gid) != 0) die(\"setresgid\");  /* not re-acquirable */\nif (setresuid(-1, uid, uid) != 0) die(\"setresuid\");  /* saved-set is gone */\n/* from here the process can only do what uid/gid permit */\nserve(fd);",
+      "pitfalls": [
+        "The classic C failure is a skippable drop: an early return, a longjmp or an exception between the privileged step and the setresuid call leaves the process running with its original authority (CWE-250's example is exactly an error path that skips the lowering call).",
+        "setuid and seteuid are not equivalent: unless the real and saved IDs are dropped too, the process can setuid back to its previous identity; setresuid(-1, uid, uid) (or setuid as root, which sets all three) is the irreversible form.",
+        "Descriptors are not close-on-exec by default, so a handle opened for the privileged step survives into a child unless O_CLOEXEC was passed; note also that signal handlers and spawned processes run with the privileges of the owning process.",
+        "Supplementary groups survive a naive uid drop, so a process can keep rights it meant to shed; call setgroups(0, NULL) (after initgroups while still privileged, if group membership is needed during startup)."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/capabilities.7.html",
+        "https://cwe.mitre.org/data/definitions/250.html"
+      ]
+    },
+    {
+      "variant_id": "linux-capabilities",
+      "name": "Linux capabilities over a reduced bounding set, plus seccomp",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "capset/cap_set_proc with PR_CAPBSET_DROP (libcap) and a seccomp filter",
+      "implementation_notes": "Instead of giving up the whole root identity, hold only the kernel privileges the job names: keep CAP_NET_BIND_SERVICE for a low port, CAP_CHOWN for one operation, and remove the rest from the effective and permitted sets through libcap or capset. Removing entries from the capability bounding set (prctl PR_CAPBSET_DROP) is what makes the reduction stick across execve - the manual is explicit that the bounding set limits the capabilities a file may grant and that a dropped entry can never be restored - and a seccomp filter then narrows the syscall surface. Choose this when the job needs one kernel privilege rather than root and the target is Linux; on other UNIX systems the portable credential drop is the only option.",
+      "code_sketch": "cap_t caps = cap_get_proc();\ncap_value_t keep[] = { CAP_NET_BIND_SERVICE };\ncap_set_flag(caps, CAP_EFFECTIVE, 1, keep, CAP_SET);\ncap_set_flag(caps, CAP_PERMITTED, 1, keep, CAP_SET);\nif (cap_set_proc(caps) != 0) die(\"cap_set_proc\");\n/* the bounding set is what execve can never grant back: drop it too */\nif (prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN, 0, 0, 0) != 0) die(\"prctl\");\ncap_free(caps);",
+      "pitfalls": [
+        "A capability left in the permitted or inheritable set is still authority: reduce the bounding set as well, because that - not the code - is what stops a later execve from handing the privilege back.",
+        "Dropping from the bounding set is irreversible and needs CAP_SETPCAP while you do it, so order the reductions so the capability required for the next one is still held.",
+        "A seccomp filter is not a substitute for dropping the credentials startup used: the mechanisms cover different surfaces (syscalls versus identity), and a filter installed after the privileged phase protects only what comes later."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/capabilities.7.html"
+      ]
+    }
+  ],
+  "default_variant": "posix-drop-privileges",
+  "version": "1.0"
+}

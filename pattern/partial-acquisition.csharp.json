@@ -1,0 +1,58 @@
+{
+  "pattern": "partial-acquisition",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "HttpClient with HttpCompletionOption.ResponseHeadersRead, then streamed content (IAsyncEnumerable)",
+  "implementation_notes": "The BCL carries both stages of a remote acquisition: HttpClient.GetAsync with HttpCompletionOption.ResponseHeadersRead completes as soon as the status line and headers are read and leaves the content unread, so status validation, routing and cache decisions happen on the cheap stage while ReadAsStreamAsync or await foreach over IAsyncEnumerable pulls the expensive part in bounded pieces. For local resources the same shape appears as deferred LINQ execution: a query builds an IEnumerable that is not executed until it is enumerated, and yield return in an iterator block produces one element per MoveNext instead of materialising the set. The hand-written stage plan is still worth it when the shared expensive part must be fetched once for many consumers (an enumerable re-executes on every enumeration) or when stages must be persisted and resumed.",
+  "code_sketch": "using var res = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);\nres.EnsureSuccessStatusCode();                       // stage 1: status + headers only\nvar length = res.Content.Headers.ContentLength;      // cheap metadata decides next\nawait using var body = await res.Content.ReadAsStreamAsync();   // stage 2\nvar buf = new byte[64 * 1024];\nint n; while ((n = await body.ReadAsync(buf)) > 0)\n    await sink.WriteAsync(buf.AsMemory(0, n));       // bounded, on-demand transfer",
+  "pitfalls": [
+    "With ResponseHeadersRead the HttpClient timeout applies only up to the point where headers were received; the content read needs its own cancellation or timeout, and MaxResponseContentBufferSize is ignored in this mode (the documentation calls out both).",
+    "A LINQ query is a plan, not a result: every enumeration re-executes it, so enumerating a deferred query twice acquires the expensive stage twice and the second pass may see different data.",
+    "An HttpResponseMessage or content stream that is not disposed keeps the connection occupied, so the expensive stage stays held by a holder that believes it has finished.",
+    "Deferred execution moves failures to the enumeration point, far from the call that built the query; an exception during a partially consumed enumeration leaves earlier stages un-released unless enumeration is wrapped in using/try."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcompletionoption",
+    "https://learn.microsoft.com/en-us/dotnet/standard/linq/deferred-execution-lazy-evaluation"
+  ],
+  "variants": [
+    {
+      "variant_id": "headers-then-content",
+      "name": "ResponseHeadersRead plus streamed content",
+      "paradigm": "concurrent",
+      "min_standard": "NET4.5",
+      "idiom_name": "HttpClient with HttpCompletionOption.ResponseHeadersRead, then streamed content (IAsyncEnumerable)",
+      "implementation_notes": "The BCL carries both stages of a remote acquisition: HttpClient.GetAsync with HttpCompletionOption.ResponseHeadersRead completes as soon as the status line and headers are read and leaves the content unread, so status validation, routing and cache decisions happen on the cheap stage while ReadAsStreamAsync or await foreach over IAsyncEnumerable pulls the expensive part in bounded pieces. For local resources the same shape appears as deferred LINQ execution: a query builds an IEnumerable that is not executed until it is enumerated, and yield return in an iterator block produces one element per MoveNext instead of materialising the set. The hand-written stage plan is still worth it when the shared expensive part must be fetched once for many consumers (an enumerable re-executes on every enumeration) or when stages must be persisted and resumed.",
+      "code_sketch": "using var res = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);\nres.EnsureSuccessStatusCode();                       // stage 1: status + headers only\nvar length = res.Content.Headers.ContentLength;      // cheap metadata decides next\nawait using var body = await res.Content.ReadAsStreamAsync();   // stage 2\nvar buf = new byte[64 * 1024];\nint n; while ((n = await body.ReadAsync(buf)) > 0)\n    await sink.WriteAsync(buf.AsMemory(0, n));       // bounded, on-demand transfer",
+      "pitfalls": [
+        "With ResponseHeadersRead the HttpClient timeout applies only up to the point where headers were received; the content read needs its own cancellation or timeout, and MaxResponseContentBufferSize is ignored in this mode (the documentation calls out both).",
+        "A LINQ query is a plan, not a result: every enumeration re-executes it, so enumerating a deferred query twice acquires the expensive stage twice and the second pass may see different data.",
+        "An HttpResponseMessage or content stream that is not disposed keeps the connection occupied, so the expensive stage stays held by a holder that believes it has finished.",
+        "Deferred execution moves failures to the enumeration point, far from the call that built the query; an exception during a partially consumed enumeration leaves earlier stages un-released unless enumeration is wrapped in using/try."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcompletionoption",
+        "https://learn.microsoft.com/en-us/dotnet/standard/linq/deferred-execution-lazy-evaluation"
+      ]
+    },
+    {
+      "variant_id": "deferred-linq-query",
+      "name": "Deferred LINQ query (yield return iterators)",
+      "paradigm": "declarative",
+      "min_standard": "C#3",
+      "idiom_name": "IEnumerable<T> iterator block executed on enumeration",
+      "implementation_notes": "A query expression or iterator block is the cheap first stage: it captures the source and the plan and acquires nothing, and each MoveNext performs one step of the expensive stage. The documentation distinguishes the two evaluation policies inside that stage - lazy evaluation processes one element per call, eager evaluation (OrderBy) has to consume the whole source before returning the first element - so parts that must be sorted, grouped or validated as a whole will materialise the resource anyway and should be identified as full-acquisition stages. Use it for collections, files and in-memory sources where the consumer decides how much it needs; use the async variant when the deferred part is I/O-bound.",
+      "code_sketch": "IEnumerable<Row> Rows(string path) {            // stage 1: a plan, nothing read\n    using var reader = new StreamReader(path);\n    while (reader.ReadLine() is { } line)       // stage 2: one record per MoveNext\n        yield return Row.Parse(line);\n}\nforeach (var row in Rows(path).Take(100))       // only these were acquired\n    Handle(row);",
+      "pitfalls": [
+        "Eager operators hide a full acquisition: OrderBy, Reverse, Count and ToList materialise the entire source, so a pipeline that looks staged can still pull everything on the first call.",
+        "The iterator owns the underlying resource: if the consumer abandons the enumeration without disposing it (or without foreach completing), the using inside the iterator only runs on Dispose, so partial consumption needs an explicit using around the enumerator.",
+        "Exceptions are raised at enumeration time, after the caller has moved on, which makes error handling and logging considerably harder than in a blocking call."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/standard/linq/deferred-execution-lazy-evaluation"
+      ]
+    }
+  ],
+  "default_variant": "headers-then-content",
+  "version": "1.0"
+}

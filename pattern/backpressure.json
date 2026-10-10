@@ -1,0 +1,208 @@
+{
+  "category": "concurrency-resilience",
+  "name": "backpressure",
+  "aliases": [
+    "back-pressure",
+    "flow control",
+    "backpressure signal",
+    "demand-driven flow control"
+  ],
+  "intent": "Keep an asynchronous producer-consumer pipeline stable when production can outrun consumption by carrying an explicit demand/readiness signal upstream: bound each hand-off and make saturation stall, reject, shed or conflate according to a visible policy rather than allowing an unbounded backlog.",
+  "problem": "A push-based source emits faster than a downstream stage can complete work, but the hand-off exposes no usable demand signal. The queue then becomes an accidental load leveller: backlog, memory and queueing latency grow until timeouts, retries and OOM, while a local bound that the source ignores only moves the failure. The design must choose how capacity is advertised and what happens at saturation.",
+  "context": "Use at asynchronous hand-offs where a cooperative source can be paused or paced—reactive streams, bounded worker channels, socket writes, and streaming RPCs. Pull iteration already supplies demand; a non-cooperative broker, callback, hardware source or external service needs a boundary policy such as admission control, load levelling/durable buffering or explicit shedding because local backpressure cannot reach it.",
+  "benefits": [
+    "Bounded memory: a fixed buffer plus a stall or shed policy keeps the working set predictable, independent of how far the rates diverge.",
+    "Bounded latency: the queue depth caps the queueing delay, so p99 stays a function of the bound instead of the backlog.",
+    "Overload becomes a first-class, observable outcome (block, drop, reject) instead of a crash or a silent degradation at the end of the pipeline.",
+    "The producer can react: it can retry, degrade, batch, shed or slow down, because it is told that the consumer is behind.",
+    "Whole-graph coherence in reactive/stream systems: one slow stage paces its upstream instead of detaching from it and unboundedly buffering the difference.",
+    "Fair sharing: bounded queues stop one hot producer from monopolising a downstream stage at the expense of the others.",
+    "Natural autoscaling and load-shedding signal: queue depth and water-mark crossings are measurable inputs to scaling, admission control and alerting."
+  ],
+  "tradeoffs": [
+    "Throughput is capped by the slowest stage: a burst that an unbounded buffer would have absorbed now stalls the producer, so throughput can drop where the buffer would have hidden the mismatch.",
+    "It is a protocol and needs a cooperative producer: a source that ignores the signal (broker push, external service, callback API) is not slowed at all, and an unbounded queue pretending to be backpressure recreates the original failure.",
+    "The full policy becomes an explicit design decision with data consequences - block stalls the producer, drop-oldest/newest/head/tail silently loses work, conflate redefines the semantics as latest-wins.",
+    "Blocking couples liveness: a stalled or dead consumer stalls upstream stages, and self-send or reentrant pipelines deadlock, so timeouts, cancellation and admission control must accompany the bound.",
+    "Observability gap: a blocked stage is indistinguishable from a hung system until queue depth, water marks, blocking time and drop counters are instrumented.",
+    "Latency amplification before shedding: buffers add delay before they protect, so sizing trades worker utilisation against p99 latency (Little's law) and a too-small bound merely converts overload into rejection.",
+    "It creates no capacity: a genuinely under-provisioned consumer gets a controlled failure mode, not more throughput, so capacity planning and load shedding remain necessary."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 5,
+    "reliability": 7,
+    "security": 4,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Producer (upstream stage)",
+      "responsibility": "Produces items faster than the downstream can process them; must respect the capacity signal (block, retry later, batch or shed) instead of pushing regardless."
+    },
+    {
+      "role": "Consumer (downstream stage)",
+      "responsibility": "The slowest stage of the pipeline; declares or implies how much it can accept and when it is ready for more, and is the source of the pressure signal."
+    },
+    {
+      "role": "Bounded buffer",
+      "responsibility": "The hand-off between the two stages: a fixed capacity plus the full policy (block, drop oldest/newest, conflate, reject); its size is the latency budget."
+    },
+    {
+      "role": "Capacity signal",
+      "responsibility": "The mechanism that carries the consumer's capacity to the producer - send returning false/Full/EAGAIN/Pending, an explicit request(n) or readiness poll, or the consumer's next pull."
+    },
+    {
+      "role": "Flow-control policy",
+      "responsibility": "Decides what happens under saturation (wait, shed, conflate, fail) and whether the decision is observable; it is configuration, not an accident of the implementation."
+    },
+    {
+      "role": "Shedding or durable buffer (non-cooperative sources)",
+      "responsibility": "For producers that cannot be slowed, the substitute for the signal: rate limiting, admission control, dead-lettering or a durable store-and-forward buffer."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Streaming large payloads between two stages of different speed (disk or socket to a slower sink) without materialising the whole payload in memory.",
+    "Message ingestion where the consumer writes to a database, index or third-party API slower than the broker delivers: poll or fetch only as fast as processing completes, and bound the in-process hand-off.",
+    "A service request pipeline with a bounded worker queue, so a traffic spike is queued to a limit and then rejected instead of exhausting memory.",
+    "Protocol-level flow control - TCP receive windows, HTTP/2 stream windows - and application-level equivalents for response streaming to a slow client.",
+    "Log, metrics and telemetry shipping from an application that can produce faster than the collector accepts, with an explicit drop policy rather than an unbounded buffer.",
+    "Model or media inference serving that streams tokens/frames to a slow consumer and must bound the batching queue and the in-flight work.",
+    "Reactive/stream graphs (Reactor, Akka/Pekko Streams, Kotlin Flow, ZIO) where one asynchronous stage must pace the whole pipeline.",
+    "Apache Kafka to consumer-proxy pipelines at scale (Uber): producer rate decoupled from consumer rate via consumer lag as the implicit backpressure signal; consumer proxy throttles fetch requests when downstream processing cannot keep pace.",
+    "Apache Flink streaming jobs: credit-based flow control at the buffer level signals upstream operators when downstream buffers are full, propagating backpressure across the entire job graph and preventing OOM during transient downstream slowdowns (e.g., database lookup spikes).",
+    "Netflix Adaptive Concurrency Limits: dynamic per-server concurrency limits (inspired by TCP congestion control) that reject excess requests with Status.UNAVAILABLE when latency-based congestion detection fires, protecting services from cascading failures during traffic spikes.",
+    "Uber Cinnamon PID controller: cross-service load management via PID feedback loop that applies backpressure across many microservices without per-service manual configuration, automatically adjusting target function as load varies.",
+    "Streaming databases (RisingWave, Flink, Kafka): barrier-based or credit-based flow control tied to checkpointing and fault tolerance, ensuring backpressure propagates and aligns with exactly-once semantics rather than at-best delivery.",
+    "Project Reactor Flux pipelines: use finite demand for cooperative sources and choose a bounded onBackpressureBuffer overflow policy or onBackpressureDrop/onBackpressureLatest explicitly; these operators buffer or shed rather than magically adding downstream capacity.",
+    "Akka Streams/Akka HTTP: Source/Flow.buffer(size, OverflowStrategy.backpressure) applies demand upstream, while withRequestTimeout bounds how long a request may wait for a stalled stage; the timeout is a safety boundary, not a substitute for stream demand.",
+    "gRPC streaming over HTTP/2 and TCP: receiver flow-control windows/HTTP/2 WINDOW_UPDATE pace DATA writes, so the transport demonstrates end-to-end credit; application queues still need a finite policy around the RPC."
+  ],
+  "avoid_when": [
+    "The producer cannot be slowed and no message may be lost: a bound alone only converts overload into drops; pair it with a durable buffer (store-and-forward, load leveling) or admission control first.",
+    "A single synchronous call chain with no queue: calling the slow operation is already backpressure, and adding a queue only adds latency.",
+    "A batch/offline job that fits in memory and runs once: the bound costs complexity and yields nothing.",
+    "A simple protective bound suffices - a timeout plus a concurrency limit or rate limiter may protect a consumer without introducing a demand-propagation protocol; do not call that backpressure.",
+    "The platform already implements it (TCP window, HTTP/2 flow control, Kafka consumer pause/poll, Node pipeline) and the application has no reason to intervene.",
+    "The real problem is insufficient capacity, not mismatched rates: backpressure controls the failure mode, it does not make a saturated consumer faster.",
+    "Use a load-leveller/store-and-forward boundary when the producer cannot pause and every item must survive: backpressure alone cannot make an external source wait, so durable capacity and replay are required.",
+    "Use a bulkhead when the requirement is isolation between tenants or dependencies: a bulkhead limits independent concurrency pools, whereas backpressure couples one pipeline's demand to its upstream.",
+    "Use rate-limiting when the requirement is an externally imposed arrival-rate budget: a limiter shapes admission over time, while backpressure reacts to instantaneous downstream capacity and may stall rather than reject."
+  ],
+  "language_files": {
+    "generic": "backpressure.generic.json",
+    "c": "backpressure.c.json",
+    "cplusplus": "backpressure.cplusplus.json",
+    "csharp": "backpressure.csharp.json",
+    "go": "backpressure.go.json",
+    "java": "backpressure.java.json",
+    "javascript": "backpressure.javascript.json",
+    "kotlin": "backpressure.kotlin.json",
+    "python": "backpressure.python.json",
+    "ruby": "backpressure.ruby.json",
+    "rust": "backpressure.rust.json",
+    "scala": "backpressure.scala.json",
+    "swift": "backpressure.swift.json",
+    "typescript": "backpressure.typescript.json"
+  },
+  "paradigm": [
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "async-method-invocation",
+    "circuit-breaker"
+  ],
+  "anti_patterns": [
+    "Unbounded queue presented as backpressure: it never signals capacity, so memory and latency grow until OOM; use a finite buffer with an explicit full policy instead.",
+    "Ignoring a false/Full/EAGAIN/pending signal: the producer keeps writing after capacity is exhausted, so the bound is fictional; stop, await readiness or apply the documented shed/fail policy instead.",
+    "Confusing rate limiting with backpressure: a rate limiter caps throughput from the outside and creates no demand signal, while backpressure follows the consumer's changing capacity; use each where that distinction is intentional.",
+    "Silent shedding presented as flow control: reporting success after a drop makes data loss invisible; emit metrics and route important work to a dead-letter/persistent log or fail instead.",
+    "Sizing only for throughput: a huge queue absorbs bursts by spending latency and memory, then fails later; size from the latency budget and choose what happens after the bound.",
+    "Assuming pressure crosses an external boundary: a broker, HTTP service or hardware source keeps producing because it cannot observe your local queue; add admission control, durable load levelling or shedding at that boundary.",
+    "Removing the bound to 'fix' a blocked stage: the symptom becomes an unbounded backlog and a latency death spiral; investigate the downstream bottleneck and retain a finite policy.",
+    "Treating one finite buffer as capacity planning: it can absorb variance but cannot raise μ for a permanently slower consumer; scale or shed sustained overload instead."
+  ],
+  "design_principles": [
+    "Flow control is a protocol, not a buffer: capacity must be communicated to the producer, never inferred from a queue that silently grows.",
+    "Bounded everything: every hand-off between stages has a capacity and a defined full policy; with Little's law, a bounded queue is what makes latency bounded.",
+    "Separation of concerns: the transport (queue), the policy (block/drop/conflate/fail) and the signal (return value, request(n), pull) are separate decisions.",
+    "Prefer pull to push: demand-driven iteration needs no explicit signal because nothing is produced until it is asked for.",
+    "Fail explicitly under overload: shed, reject or stall with observable signals instead of buffering without limit.",
+    "End-to-end reasoning: backpressure only helps where it can propagate, so identify the non-cooperative boundary and handle it with load shedding or durable buffering.",
+    "Backpressure and capacity planning are complements: the pattern bounds the damage of a mismatch, it does not remove the need for enough capacity.",
+    "Little's law as sizing tool: buffer depth = steady-state throughput × acceptable latency budget. A 1000 msg/s pipeline with a 50 ms latency budget needs ~50-message buffers; larger buffers only amplify latency without increasing throughput."
+  ],
+  "best_practices": [
+    "Choose and document the full policy per hand-off (wait, drop oldest/newest, conflate, reject) - the default of the library is rarely the right product decision.",
+    "Size bounds from a latency budget (bounded queue depth x drain rate) and from measured throughput, not from copied defaults; review when traffic or capacity changes.",
+    "Instrument queue depth, high-water-mark crossings, time spent blocking and drop/rejection counters, and alert on sustained saturation rather than on any single full queue.",
+    "Attach a timeout and a cancellation path to every blocking wait (send with timeout, trySend/offer, context/deadline) so a stalled consumer cannot hang the producer forever.",
+    "Keep per-stage buffers small where possible - large internal buffers (including the default 16-element buffers of asynchronous stream stages) prefetch and hide the signal.",
+    "Prefer demand-driven APIs (bounded channel send/await, request(n), for-await, pipeline) over hand-rolled polling, but always check the return value of push-style APIs.",
+    "Where the producer cannot be slowed, combine the bound with rate limiting/admission control and decide explicitly whether losing data is acceptable (and where dropped data goes).",
+    "Make the bounds configurable and observable so operations can retune them without a redeploy, and test the shedding/stall paths deliberately, not only the happy path.",
+    "Prefer bounded, disk-backed buffering (e.g., Kafka commit log, file spill) over pure in-memory bounds when sustained overload is possible and data must not be lost - disk-backed buffers make total capacity bounded by disk, not memory.",
+    "In reactive stream frameworks (Reactor, Akka Streams, Flink), use the built-in backpressure operators and wiring rather than adding manual queues; the framework enforces the signal propagation contract.",
+    "When combining backpressure with circuit breakers, place the circuit breaker downstream of the bounded queue so the circuit breaker's open state propagates backpressure to the producer, rather than letting the queue absorb and hide the failure signal.",
+    "Distinguish transient slowdowns (buffer and wait) from permanent capacity shortfall (shed or scale); sizing the buffer for transient spikes only - a permanently slow consumer requires capacity changes, not bigger buffers.",
+    "Never silently drop - every shed policy must emit a metric and, where data matters, route dropped messages to a dead-letter queue or persistent log for later inspection."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Reactive Streams specification v1.0.4 (reactive-streams.org) - the canonical definition of asynchronous stream processing with non-blocking back pressure: the Subscriber signals demand via Subscription.request(n) and every Publisher must not exceed it, so the queues between threads stay bounded. https://www.reactive-streams.org/",
+    "Reactive Streams JVM GitHub repository (v1.0.4) - TCK, Java API, textual specification, and reference implementations. https://github.com/reactive-streams/reactive-streams-jvm/",
+    "Akka Streams backpressure documentation - credit-based flow control in Akka/Pekko Streams and the role of async boundaries in pacing pipelines. https://doc.akka.io/libraries/akka-core/current/stream/stream-rate.html",
+    "Node.js backpressure in streams - the readable.write() returning false and the need to wait for drain before resuming. https://nodejs.org/learn/modules/backpressuring-in-streams",
+    "java-design-patterns.com backpressure pattern - illustrative Java implementation of bounded queue hand-off. https://java-design-patterns.com/patterns/backpressure/",
+    "Netflix Performance Under Load: Adaptive Concurrency Limits - dynamic concurrency limits inspired by TCP congestion control for server-side load shedding, with latency-based detection of queueing. https://netflixtechblog.medium.com/performance-under-load-3e6fa9a60581",
+    "Netflix/concurrency-limits open-source library - Java library implementing Vegas, AIMD, and other congestion-control algorithms for adaptive per-server concurrency limits. https://github.com/netflix/concurrency-limits",
+    "Uber Engineering: PID Controller for Cinnamon - PID feedback loop for cross-service backpressure management without per-service manual tuning. https://www.uber.com/us/en/blog/pid-controller-for-cinnamon/",
+    "Uber Engineering: Kafka Async Queuing with Consumer Proxy - consumer lag as implicit backpressure signal in Kafka-based pipelines at Uber scale (trillions of messages/day). https://www.uber.com/us/en/blog/kafka-async-queuing-with-consumer-proxy/",
+    "RisingWave: How Streaming Databases Handle Backpressure - comparison of Kafka (consumer-lag backpressure), Flink (credit-based), and RisingWave (barrier-based) flow control models. https://risingwave.com/blog/streaming-database-backpressure-handling/",
+    "Apache Flink: Monitoring Back Pressure - per-subtask backpressure metrics (backPressuredTimeMsPerSecond, idleTimeMsPerSecond, busyTimeMsPerSecond) and OK/LOW/HIGH classification in Flink WebUI. https://nightlies.apache.org/flink/flink-docs-master/docs/ops/monitoring/back_pressure/",
+    "ADHDecode: Backpressure in Streaming Systems Deep Dive - backpressure propagation in Kafka Streams and Flink pipelines; OOM prevention via cascading throttling. https://adhdecode.com/system-design/message-queues-and-event-streaming/backpressure-streaming-systems/",
+    "IETF draft-ietf-ccwg-bbr v3 - BBR (Bottleneck Bandwidth and Round-trip propagation time) congestion control: model-based approach regulating pacing rate and in-flight data using delivery rate and RTT measurements, applicable to TCP and QUIC. https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr",
+    "Google BBR open-source repository - TCP BBR and QUIC BBR implementations; pacing gain and cwnd as two control levers for backpressure in transport protocols. https://github.com/google/bbr",
+    "Unseel: Backpressure - Flow Control & Bounded Queues - OOM/GC death spiral from unbounded buffers; Little's law sizing; disk-backed buffering; silent drop anti-pattern. https://unseel.com/cs/backpressure",
+    "iam.slys.dev: Backpressure - when saying 'slow down' saves the system - latency death spiral from unbounded queues; observable overload signals vs. silent degradation. https://iam.slys.dev/p/backpressure-when-saying-slow-down",
+    "pmbanugo.me: Why Queues Don't Fix Overload - bounded mailboxes as explicit overload handling; constant-time rejection vs. unbounded queuing; Tina framework bounded-mailbox pattern. https://pmbanugo.me/blog/why-queues-dont-fix-overload-and-what-to-do-instead",
+    "RealProblem.me: The Queue That Ate Your Latency - bigger buffers cannot fix sustained overload; backpressure as upstream slow-down signal vs. downstream buffering. https://realproblem.me/blog/backpressure-flow-control",
+    "Chyshkala: Unbounded Queues Are Memory Leaks in Disguise - latency amplification and bufferbloat from oversized queues; buffer sizing as latency budget allocation. https://chyshkala.com/blog/unbounded-queues-are-memory-leaks-in-disguise",
+    "System-Design.space: Backpressure and Flow Control - four-reaction taxonomy (block, drop, conflate, reject) and end-to-end backpressure propagation in distributed systems. https://system-design.space/en/chapter/backpressure-flow-control/",
+    "Project Reactor Flux Javadoc - documents onBackpressureBuffer capacity and overflow behavior, including bounded buffering and overflow strategies. https://projectreactor.io/docs/core/release/api/reactor/core/publisher/Flux.html#onBackpressureBuffer-int-",
+    "Reactive Streams Subscription 1.0.4 API - request(n) carries demand, and cumulative demand at Long.MAX_VALUE may be treated as effectively unbounded; request only what can be safely handled. https://www.reactive-streams.org/reactive-streams-1.0.4-javadoc/org/reactivestreams/Subscription.html",
+    "Akka Streams buffer operator - documents backpressure, dropHead/dropTail/dropNew/dropBuffer, and fail overflow strategies. https://doc.akka.io/libraries/akka-core/current/stream/operators/Source-or-Flow/buffer.html",
+    "Akka HTTP withRequestTimeout - documents request timeout as a safety net, including stalled/pipelined request behavior; it complements but does not replace stream backpressure. https://doc.akka.io/libraries/akka-http/current/routing-dsl/directives/timeout-directives/withRequestTimeout.html",
+    "gRPC flow control guide - receiver reads acknowledge capacity and streaming writes may wait when transport flow-control windows are exhausted. https://grpc.io/docs/guides/flow-control/",
+    "IETF RFC 9113 HTTP/2 §5.2 - receiver flow-control windows restrict transmitted DATA to what the receiver can handle, with WINDOW_UPDATE credits. https://www.rfc-editor.org/rfc/rfc9113.html#name-flow-control",
+    "IETF RFC 9293 TCP - specifies TCP receive-window flow control as the transport baseline for pacing senders to receiver capacity. https://www.rfc-editor.org/rfc/rfc9293.html"
+  ],
+  "related_patterns_notes": {
+    "producer-consumer": "names the worker hand-off; backpressure adds a capacity signal and saturation policy that paces the producer.",
+    "load-leveller": "absorbs bursts by delaying work, often durably; backpressure instead propagates current consumer demand and cannot help a source that will not pause.",
+    "guarded-suspension": "blocks a caller until a guard is true; backpressure applies the guard to downstream capacity across an asynchronous flow.",
+    "rate-limiting": "caps admission by time or quota; backpressure follows actual downstream readiness and may stall, shed or conflate per hand-off.",
+    "bulkhead": "isolates resource pools or tenants; backpressure coordinates one pipeline's producer and consumer rather than isolating failures.",
+    "async-method-invocation": "queues a request behind a future-returning method; backpressure bounds that queue and exposes saturation instead of accepting indefinitely.",
+    "careful-buffering": "deliberately stores a bounded batch to absorb variance; backpressure is the signal/policy that prevents the batch from growing without limit.",
+    "circuit-breaker": "stops calls after failure thresholds; backpressure slows or refuses work when capacity is exhausted, including before errors occur.",
+    "retry-with-backoff": "spaces retries after failures; backpressure reduces new work while a downstream is slow and should not be used to hide repeated rejection.",
+    "dead-letter-queue": "preserves rejected or undeliverable messages for later handling; backpressure decides when to reject and can route those messages there."
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "pattern": "revocable-forwarder",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "opaque handle table: integer handle + operations table + generation counter, revoked slot",
+  "implementation_notes": "C has no proxy objects, so the forwarder is an entry in a handle table: the grantor keeps a struct with the target pointer and an operations table (function pointers), and the collaborator receives only an integer handle. Every call resolves the handle, checks the enable flag and dispatches through the table; revocation clears the flag and bumps the generation, so outstanding handles fail instead of resolving to a live target. The operating system analogue is attenuation rather than revocation - Capsicum's cap_rights_limit() reduces the rights carried by a file descriptor and never expands them again - while closing a descriptor is not a safe revocation primitive on its own, because the descriptor number is released early and may be reused. Hand-written is the only option; no C library provides a revocable wrapper.",
+  "code_sketch": "/* handle table: the collaborator holds an int, never the target pointer */\nstruct fwd { void *target; const struct file_ops *ops; bool enabled; uint32_t gen; };\n\nint h = fwd_grant(&slot, fd, &file_ops);      /* the forwarder the caller receives */\nstruct fwd *e = fwd_of(&slot, h);             /* NULL if revoked or stale */\nif (!e || !e->enabled)\n        return -EACCES;                        /* fail closed after revocation */\nreturn e->ops->read(e->target, buf, n);\n/* revoke: e->enabled = false; ++slot.gen;   -> every outstanding handle dies */",
+  "pitfalls": [
+    "Revoking by close() is not enough: the descriptor number is released early and may be reused, so a blocked call or a retried close can hit a different object (the man page warns about exactly this race); revoke through your own table and a generation counter instead.",
+    "The operations table must cover the whole interface: a method that forgets the enable check is an unmediated path to the target, and a revocation that only clears some entries leaves the rest live.",
+    "The flag check and the dispatch are two steps unless they are ordered by a lock or an atomic; under threads a call can pass the check and still dispatch after revocation, which is the same check-then-forward race the Murphi analysis found.",
+    "A handle whose generation is not checked aliases the next grant that reuses the slot, so revocation can silently revoke, or fail to revoke, the wrong object."
+  ],
+  "sources": [
+    "https://man.freebsd.org/cgi/man.cgi?query=cap_rights_limit&sektion=2",
+    "https://man7.org/linux/man-pages/man2/close.2.html"
+  ],
+  "version": "1.0"
+}

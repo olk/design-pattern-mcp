@@ -1,0 +1,18 @@
+{
+  "pattern": "write-behind",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "dirty map + flush goroutine (channel/ticker) over database/sql transactions",
+  "implementation_notes": "database/sql gives you transactions (DB.BeginTx and sql.Tx) but no persistence context, so the accumulator is yours: a map keyed by row id guarded by sync.Mutex (or owned outright by the flusher goroutine), fed by a wake-up channel and drained by a flusher that selects on the channel plus a time.Ticker and executes the batch through one transaction. What replaces the classic structure: nothing at the ORM level - the goroutine/channel pair is the idiomatic substitute for a flush thread, and Tx.StmtContext/prepared statements remove per-write parse cost. Justified when write throughput matters; for low-volume CRUD, write straight through.",
+  "code_sketch": "func (q *queue) stage(k Key, r Row) {\n    q.mu.Lock(); q.dirty[k] = r; q.mu.Unlock()   // one entry per key\n    select { case q.wake <- struct{}{}: default: } // never block the caller\n}\nfunc (q *queue) flush(ctx context.Context) error {\n    q.mu.Lock(); batch := q.dirty; q.dirty = map[Key]Row{}; q.mu.Unlock()\n    tx, err := db.BeginTx(ctx, nil)\n    if err != nil { return err }\n    defer tx.Rollback()\n    for k, r := range batch {\n        if _, err := tx.ExecContext(ctx, upsertSQL, r.V, k); err != nil { return err }\n    }\n    return tx.Commit()\n}",
+  "pitfalls": [
+    "Go maps are not safe for concurrent writes: guard the dirty map with a mutex or give it to a single goroutine, otherwise staging races with the flusher.",
+    "A deferred Tx.Rollback after a failed Commit hides the real error unless the commit error is checked and returned first.",
+    "An unbuffered wake-up channel blocks producers while the flusher works - use the non-blocking send shown above so staging never stalls."
+  ],
+  "sources": [
+    "https://go.dev/doc/database/execute-transactions",
+    "https://go.dev/doc/database/cancel-operations"
+  ],
+  "version": "1.0"
+}

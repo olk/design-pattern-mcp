@@ -1,0 +1,56 @@
+{
+  "pattern": "version-number",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "version column with a conditional UPDATE through the database client",
+  "implementation_notes": "The classic structure is hand-written over whichever database client the project uses: read the version with the row, bind it into WHERE id = ? AND version = ? on the write, and test the affected-row count (PQcmdTuples or sqlite3_changes) to decide whether the copy was stale - no standard-library facility supplies persistence, so there is nothing to replace it with. For a shared in-process record the token becomes std::atomic<uint64_t> and the check is compare_exchange_strong against the value the caller read (C++11), which is the same contract with the CPU as arbiter. Keep the SQL form when the store must be the arbiter and the atomic form for lock-free shared state; the classic hand-written structure stays justified because neither the language nor its standard library ships a mapper.",
+  "code_sketch": "// C++17, libpq\nauto res = conn.execParams(\n    \"UPDATE docs SET body = $1, version = version + 1 \"\n    \"WHERE id = $2 AND version = $3\", {body, id, seen_version});\nif (res.affectedRows() == 0) throw StaleCopy{};   // re-read, merge or fail\n// in-process token:\n// std::atomic<uint64_t> v{0};  uint64_t expected = seen;\n// v.compare_exchange_strong(expected, expected + 1);",
+  "pitfalls": [
+    "compare_exchange_strong overwrites the expected operand on failure - that variable no longer holds 'the version I read', so a retry loop must reset it from the freshly observed value.",
+    "A default-constructed std::atomic is not initialised before C++20; a token read from uninitialised storage compares against garbage.",
+    "Copying a versioned struct by value splits the token from the store that arbitrates it; only the authoritative copy may be compared."
+  ],
+  "sources": [
+    "https://sqlite.org/c3ref/changes.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "db-version-column",
+      "name": "Database version column over a C client (libpq / sqlite3)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "idiom_name": "version column with a conditional UPDATE through the database client",
+      "implementation_notes": "The classic structure is hand-written over whichever database client the project uses: read the version with the row, bind it into WHERE id = ? AND version = ? on the write, and test the affected-row count (PQcmdTuples or sqlite3_changes) to decide whether the copy was stale - no standard-library facility supplies persistence, so there is nothing to replace it with. For a shared in-process record the token becomes std::atomic<uint64_t> and the check is compare_exchange_strong against the value the caller read (C++11), which is the same contract with the CPU as arbiter. Keep the SQL form when the store must be the arbiter and the atomic form for lock-free shared state; the classic hand-written structure stays justified because neither the language nor its standard library ships a mapper.",
+      "code_sketch": "// C++17, libpq\nauto res = conn.execParams(\n    \"UPDATE docs SET body = $1, version = version + 1 \"\n    \"WHERE id = $2 AND version = $3\", {body, id, seen_version});\nif (res.affectedRows() == 0) throw StaleCopy{};   // re-read, merge or fail\n// in-process token:\n// std::atomic<uint64_t> v{0};  uint64_t expected = seen;\n// v.compare_exchange_strong(expected, expected + 1);",
+      "pitfalls": [
+        "compare_exchange_strong overwrites the expected operand on failure - that variable no longer holds 'the version I read', so a retry loop must reset it from the freshly observed value.",
+        "A default-constructed std::atomic is not initialised before C++20; a token read from uninitialised storage compares against garbage.",
+        "Copying a versioned struct by value splits the token from the store that arbitrates it; only the authoritative copy may be compared."
+      ],
+      "sources": [
+        "https://sqlite.org/c3ref/changes.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-cas",
+      "name": "In-process atomic version token (compare-exchange loop)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "atomics"
+      ],
+      "idiom_name": "std::atomic<uint64_t>::compare_exchange_strong token",
+      "implementation_notes": "When the shared resource is memory rather than a database, the per-record token is a std::atomic holding the version the writer last saw: compare_exchange_strong(expected, expected + 1) succeeds only if nothing changed in between, and on failure rewrites expected with the observed token so the caller can re-read and retry. It is the same detect-then-retry contract with the CPU as arbiter, and it replaces the SQL predicate for lock-free shared state - not for durable data, where the store must remain the arbiter. Use it where contention is bounded and the retry loop can be, because a CAS loop has no queueing fairness.",
+      "code_sketch": "std::atomic<uint64_t> version{0};\nbool publish(uint64_t seen, const Payload& next) {\n  uint64_t expected = seen;\n  return version.compare_exchange_strong(expected, seen + 1)\n      && commit(next);   // only the successful CAS publishes\n}",
+      "pitfalls": [
+        "A CAS only guards the token; the payload must be published through a pointer with matching release/acquire ordering or readers can still observe torn data.",
+        "Lock-free retry loops can livelock under contention - bound the attempts and fall back to a mutex."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic/compare_exchange"
+      ]
+    }
+  ],
+  "default_variant": "db-version-column",
+  "version": "1.0"
+}

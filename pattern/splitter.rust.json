@@ -1,0 +1,59 @@
+{
+  "pattern": "splitter",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "Iterator::flat_map / slice::chunks + send loop",
+  "implementation_notes": "The splitter is an adapter chain: flat_map maps one composite into its parts and flattens them into the iterator, slice::chunks(n) yields fixed-size parts, and the send loop is a plain for over the result, so nothing beyond the current part is materialised. Ownership is the design pressure: parts borrow from the composite, so anything that outlives the loop (an async publish, a spawned task) must own its bytes. The classic role structure only reappears with an async runtime, where the framed variant takes over.",
+  "code_sketch": "let parts = order.items.iter().enumerate().map(|(seq, item)| Part {\n    corr: order.id.clone(),\n    seq: seq as u32,\n    size: order.items.len() as u32,\n    body: item.clone(),\n});\nfor part in parts {\n    broker.publish(part).await?;\n}\n// fixed-size parts: for chunk in order.items.chunks(100) { publish(chunk).await?; }",
+  "pitfalls": [
+    "flat_map yields items borrowed from the composite: a part that must outlive the loop needs owned bytes (Bytes/String), otherwise the borrow checker forces 'static bounds through the whole signature.",
+    "Iterator adapters are lazy, so a chain that is never driven by a for/collect publishes nothing at all.",
+    "Iterators are single-use: a stored iterator cannot be restarted after it is exhausted, and collecting it to reuse it recreates the memory problem the split was meant to avoid."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "iterator-flat-map",
+      "name": "Iterator adapters over the decoded parts",
+      "paradigm": "functional",
+      "min_standard": "Rust2015",
+      "requires_features": [],
+      "idiom_name": "Iterator::flat_map / slice::chunks + send loop",
+      "implementation_notes": "The splitter is an adapter chain: flat_map maps one composite into its parts and flattens them into the iterator, slice::chunks(n) yields fixed-size parts, and the send loop is a plain for over the result, so nothing beyond the current part is materialised. Ownership is the design pressure: parts borrow from the composite, so anything that outlives the loop (an async publish, a spawned task) must own its bytes. The classic role structure only reappears with an async runtime, where the framed variant takes over.",
+      "code_sketch": "let parts = order.items.iter().enumerate().map(|(seq, item)| Part {\n    corr: order.id.clone(),\n    seq: seq as u32,\n    size: order.items.len() as u32,\n    body: item.clone(),\n});\nfor part in parts {\n    broker.publish(part).await?;\n}\n// fixed-size parts: for chunk in order.items.chunks(100) { publish(chunk).await?; }",
+      "pitfalls": [
+        "flat_map yields items borrowed from the composite: a part that must outlive the loop needs owned bytes (Bytes/String), otherwise the borrow checker forces 'static bounds through the whole signature.",
+        "Iterator adapters are lazy, so a chain that is never driven by a for/collect publishes nothing at all.",
+        "Iterators are single-use: a stored iterator cannot be restarted after it is exhausted, and collecting it to reuse it recreates the memory problem the split was meant to avoid."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/iter/trait.Iterator.html"
+      ]
+    },
+    {
+      "variant_id": "tokio-codec-framing",
+      "name": "Stream framing with tokio_util codecs (FramedRead + Decoder)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "async",
+        "tokio"
+      ],
+      "idiom_name": "tokio_util::codec::Decoder / FramedRead",
+      "implementation_notes": "When the composite is a byte stream rather than a decoded document, the splitter is the runtime's framing layer: implement Decoder - decode(&mut BytesMut) returns Option<Self::Item> - and FramedRead turns the socket or file into a stream of frames, each frame becoming one message, while state kept on the decoder carries the partial frame across reads. That is precisely the boundary-detection responsibility the classic Splitter owns, and decode_eof exists because files and FIFOs can read zero bytes at EOF (the decoder decides whether a frame may cross that boundary). Use it for length-prefixed or delimiter-framed protocols; use the iterator form when the payload is already parsed.",
+      "code_sketch": "struct Lines;\nimpl Decoder for Lines {\n    type Item = String;\n    type Error = io::Error;\n    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<String>, io::Error> {\n        match memchr::memchr(b'\\n', src) {\n            Some(i) => { let line = src.split_to(i + 1);\n                         Ok(Some(String::from_utf8_lossy(&line[..i]).into_owned())) }\n            None => Ok(None),   // need more bytes\n        }\n    }\n}\n// let mut frames = FramedRead::new(sock, Lines);\n// while let Some(part) = frames.next().await { publish(part?).await?; }",
+      "pitfalls": [
+        "Returning Ok(Some(..)) without consuming the bytes from src makes Framed spin forever on the same buffer; split_to/advance is mandatory.",
+        "The default decode_eof returns Ok(None), so a stream can end with a partial frame still in src - handle trailing data explicitly when the protocol allows it.",
+        "A decoder that allocates a fresh buffer per frame without a maximum frame length lets a peer exhaust memory (cap the frame size)."
+      ],
+      "sources": [
+        "https://docs.rs/tokio-util/latest/tokio_util/codec/trait.Decoder.html"
+      ]
+    }
+  ],
+  "default_variant": "iterator-flat-map"
+}

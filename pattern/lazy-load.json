@@ -1,0 +1,210 @@
+{
+  "category": "persistence-state",
+  "name": "lazy-load",
+  "aliases": [
+    "lazy loading"
+  ],
+  "intent": "Defer reading a persisted value or association until a caller actually touches it, so an object graph can be traversed without fetching rows, columns and joins the use case never reads.",
+  "problem": "An object that references persisted state is loaded from the database as a graph, and the mapper must either fetch the whole graph up front - paying for related rows, large columns and joins the current use case never touches - or leave the reference empty and make every caller re-implement the load decision as a null check plus a query. The value is often expensive to fetch (a related row, a collection, a large or remote column) and often never touched at all.",
+  "context": "Applies inside a data-access layer - object-relational mappers, hand-written mappers, gateways - when a domain object references persisted state that is expensive to read and only sometimes used: related entities, collections, large columns and BLOBs, rows behind a join table. The deferral is only well-defined while the session, connection or mapper that knows how to execute the read is still available, and the marker must be distinguishable from a legitimately absent value.",
+  "benefits": [
+    "Use cases pay only for the data they consume: an object graph can be handed around while the expensive parts stay unread, so a request that needs three columns does not pay for five tables.",
+    "Callers navigate ordinary object references - book.author is the same code whether the author came with the row or is fetched on demand - so traversal logic carries no load conditions.",
+    "Cheap handles for expensive data: markers (null sentinel, virtual proxy, value holder, ghost) are small, so lists, trees and wide graphs can be assembled without materialising every node.",
+    "Latency and memory move off the critical path: pages that never touch a large association never allocate or transfer it, and the wins are largest exactly where eager loading hurts most (wide collections, BLOBs, deep graphs).",
+    "One place owns the fetch policy: parameters, caching, identity-map routing and error handling live in the mapper/loader instead of being repeated as ad-hoc queries at each use site.",
+    "Composes with the surrounding persistence machinery: a deferred load can go through the identity map and unit of work, so it returns the session's existing instance and participates in the same transaction."
+  ],
+  "tradeoffs": [
+    "N+1 query storms: iterating n parents and touching a deferred association on each issues n additional queries; the pattern makes that easy to write by accident, and only a prefetch or a query counter makes it visible.",
+    "Loads fire after the context that could serve them is gone: closing the session/transaction before the first touch throws (Hibernate LazyInitializationException, SQLAlchemy DetachedInstanceError), which pushes the decision of what to prefetch back onto the use case.",
+    "Failures surface far from their cause: a derived read triggered by a getter, toString, equals or a serializer can throw or block long after the code that decided to keep the object, and open-session-in-view hides the failure by stretching the session over the whole request.",
+    "The marker is not the entity: provider proxies break getClass()/instanceof checks, equality contracts and serialization, and detached or merged graphs need explicit reattachment logic.",
+    "Failure caching is mechanism-dependent: Lazy<T> and sync.OnceValues cache a failed load permanently, std::call_once and Kotlin's lazy retry after a throwing initializer, and cached_property caches nothing - so error behaviour is a design choice that must be documented.",
+    "Hidden cost defeats capacity planning: whether a page runs 3 queries or 300 becomes a property of the access pattern rather than of the code, so quadratic behaviour can hide until production load.",
+    "Staleness: once loaded, the value is cached for the lifetime of the object or session, so writes made elsewhere stay invisible until the unit of work refreshes, evicts, or the marker is reset."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 5,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Domain Object (holder)",
+      "responsibility": "Owns the reference whose value is deferred and exposes it through ordinary access; it must not know how the fetch is executed."
+    },
+    {
+      "role": "Lazy Loader (marker)",
+      "responsibility": "The deferral mechanism in one of Fowler's four forms - lazy initialization (sentinel plus check), virtual proxy (same interface, load then delegate), value holder (getValue() triggers the load) or ghost (identity-only object filled on first method call)."
+    },
+    {
+      "role": "Mapper / Gateway",
+      "responsibility": "Executes the deferred read (SQL, document fetch, remote call) and returns the loaded value; it owns the store knowledge the domain object deliberately lacks."
+    },
+    {
+      "role": "Session / Persistence Context",
+      "responsibility": "Supplies the connection, transaction and identity map the load must use, and defines until when a deferred read is still possible."
+    },
+    {
+      "role": "Identity Map",
+      "responsibility": "Ensures the loaded row becomes the same in-memory instance the session already holds, so lazy loading does not create duplicate objects."
+    },
+    {
+      "role": "Client (navigator)",
+      "responsibility": "Touches the deferred value through normal navigation and benefits from the deferral without orchestrating it."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "ORM associations: @ManyToOne(fetch = LAZY), relationship(..., lazy='select') or belongs_to — related rows load when read, not when the parent is fetched.",
+    "Large or rare columns: a BLOB, long text, JSON document or expensive computed field kept out of the row fetch until the screen that shows it is opened.",
+    "UI and API responses over wide graphs: a list view renders identifiers and names while expensive detail stays unread behind markers.",
+    "Report and wizard flows: a multi-step process loads only the sections the user actually visits, and abandoned steps cost nothing.",
+    "Batch jobs over big tables: process each aggregate's own data lazily instead of joining half the schema for every row.",
+    "Legacy schemas with slow joins or few indexes: deferral keeps the common path fast while the rare paths still work.",
+    "Microservices and remote calls: an RPC stub or HTTP client loads the remote resource (document, image, configuration) on first access rather than at bootstrap, keeping startup fast and handling network failures at the call site.",
+    "Image, media and document thumbnails: a preview URL or thumbnail proxy loads the binary only when the browser requests it, reducing memory and bandwidth on list pages.",
+    "Plugin, extension and driver loading: a plugin registry defers instantiation of heavy extensions until the extension point is first accessed, keeping the core minimal.",
+    "Configuration and feature-flag trees: a hierarchical config object loads sub-trees lazily so an unused feature branch never hits disk or network.",
+    "Test fixtures and expensive test data: a test helper creates lazy data builders that materialise test data only when a specific assertion needs it, keeping suite run time proportional to assertions run.",
+    "JPA/Hibernate entities: FetchType.LAZY associations and Hibernate bytecode-enhanced lazy attributes keep related rows or large fields out of the initial fetch; use an entity graph or fetch join when a use case needs them.",
+    "SQLAlchemy ORM: relationship(..., lazy='select') defers the related SELECT until attribute access, while selectinload() or joinedload() supplies an explicit fetch plan for traversals that need the association.",
+    "EF Core: lazy-loading proxies or ILazyLoader defer navigation properties; choose Include, projection or explicit loading when a request needs a bounded graph rather than hidden per-entity queries."
+  ],
+  "avoid_when": [
+    "The data is always needed: load it eagerly (join fetch, projection) - a marker only adds round trips and indirection.",
+    "The access happens after the session/transaction closes: serialize the needed shape inside the boundary (DTO/projection) instead of reopening sessions to satisfy a proxy.",
+    "The workload is a tight loop over many parents needing the same association: one eager join beats n deferred queries every time.",
+    "The value is cheap (an in-memory map, a config value, a computed field): a plain accessor is simpler than a marker.",
+    "Correctness depends on the complete graph: if invariants, validation or serialization must see every field, a marker silently changes semantics - load explicitly or use a purpose-built projection."
+  ],
+  "language_files": {
+    "generic": "lazy-load.generic.json",
+    "c": "lazy-load.c.json",
+    "cplusplus": "lazy-load.cplusplus.json",
+    "csharp": "lazy-load.csharp.json",
+    "go": "lazy-load.go.json",
+    "java": "lazy-load.java.json",
+    "javascript": "lazy-load.javascript.json",
+    "kotlin": "lazy-load.kotlin.json",
+    "python": "lazy-load.python.json",
+    "ruby": "lazy-load.ruby.json",
+    "rust": "lazy-load.rust.json",
+    "scala": "lazy-load.scala.json",
+    "swift": "lazy-load.swift.json",
+    "typescript": "lazy-load.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "identity-map"
+  ],
+  "anti_patterns": [
+    "Serializer-driven loading: rendering or JSON-encoding entities without a projection walks every association and turns one page into hundreds of queries.",
+    "Lazy everything: marking every association deferred and prefetching nowhere makes performance unpredictable and leaves the cost without an owner.",
+    "Open-session-in-view as a cure for detached lazy state: it stretches the session (and its connection) over rendering instead of loading inside the transaction boundary.",
+    "Treating a marker as data: validation, business rules or equality checks that read unloaded fields silently compare sentinels and pass.",
+    "Rebuilding deferred loading on top of an ORM that already implements it (hand-rolled proxies or caches in front of JPA, EF Core, SQLAlchemy or ActiveRecord).",
+    "Double-checked locking without volatile/happens-before: a thread may observe a non-null reference to a partially-constructed object and crash or corrupt state — use sync.Once, Lazy<T>, OnceCell or the holder idiom instead.",
+    "Conflating absent with uninitialised: a null sentinel that is also a legitimate domain value forces the mapper to re-query to distinguish the two cases, turning one deferred load into two round-trips.",
+    "Silent failure caching: some Lazy<T> implementations cache a throwing initializer permanently, poisoning the marker for the object's entire lifetime — prefer retry-on-next-access or a circuit-breaker over permanent failure caching.",
+    "Accessing lazy fields inside equals/hashCode: triggering a deferred load inside object identity methods can throw if the session is closed, and makes identity dependent on which associations have been touched.",
+    "Circular lazy loads: A references B and B references A; touching one before the session loads the other can cause a loop or deadlock if both associations are deferred — prefetch at least one direction or break the cycle with a lazy-acquisition boundary."
+  ],
+  "design_principles": [
+    "Defer work until it is needed: pay the read cost only when a use actually demands the value.",
+    "Separation of concerns: the domain object states what it refers to, the mapper knows how to fetch it.",
+    "Information hiding: the marker hides store details and load timing from callers, who navigate as if the value were present.",
+    "Explicit lifecycle: a deferred read is valid only inside the session/transaction that can execute it - the boundary is part of the design.",
+    "Make costs and failures explicit: an accessor that can hit the database is a design decision, not an implementation detail."
+  ],
+  "best_practices": [
+    "Decide per association (lazy vs eager vs projection) from how the use case reads it, and record that decision where the mapping is declared.",
+    "Prefetch what a traversal will need (join fetch, EntityGraph, relations, includes/select_related) and keep an automated query count in tests to catch N+1 regressions.",
+    "Keep the deferred load inside the session/transaction that owns it; convert to the shape the caller needs (DTO/projection) before the boundary closes.",
+    "Route loads through the identity map/session so one row stays one instance, and define equals/hashCode/serialization that survive the proxy.",
+    "Choose the failure policy deliberately — retry or cache the error — and say what resets a failed or stale marker.",
+    "Make first access observable (log, meter, trace) so hidden loads are visible in production.",
+    "Prefer the platform's own lazy mechanism (lazy val, by lazy, Lazy<T>, OnceCell, JPA proxies) over a hand-built proxy layer.",
+    "Python: use the descriptor protocol (__get__) or functools.cached_property for attribute-level lazy loading; __getattr__ as a class-wide fallback; avoid __getattribute__ override for simple cases as it bypasses all descriptor logic.",
+    "Java: virtual proxy (interface same as real object) or JPA/Hibernate proxy (generated subclass) are the standard forms; use FetchType.LAZY explicitly and do not rely on the ORM default alone.",
+    "C#/.NET: Lazy<T> for thread-safe deferred init; EF Core proxies or explicit loading (Entry().Reference().Load()) for ORM associations; prefer explicit loading over silent proxy-triggered queries.",
+    "Go: sync.Once for one-shot deferred init (function call, not value — wrap in a struct); sync.RWMutex + pointer for read-mostly lazy fields; prefer init inside a sync.Once even for simple values.",
+    "C++: std::call_once + std::once_flag for thread-safe one-shot init; std::lazy (C++23) for automatic lazy<T>; prefer static-local init (guaranteed thread-safe in C++11+) over manual double-checked locking.",
+    "JavaScript/TypeScript: Object.defineProperty or ES6 Proxy for property-level interception; cached getter pattern (let cached; Object.defineProperty(obj,'prop',{get(){return cached||=compute()}}) ) as a simple form; avoid triggering lazy loads inside serializers (JSON.stringify) or micro-task loops.",
+    "Ruby: define_method with a closure captures the loader; memoize pattern (@ivar ||= load) is idiomatic but not thread-safe by default; ActiveRecord lazily-loads associations by default — override with eager_include.",
+    "Rust: OnceCell<T> / LazyLock<T> (std::sync, Rust 1.80+) for thread-safe deferred init; Cell/RefCell for single-threaded lazy fields; prefer &'static T where the value is a constant.",
+    "Kotlin: by lazy { } delegate (thread-safe by default, configurable); Kotlin 1.9+ supports suspend lambdas inside by lazy in coroutine context; avoid lateinit var for lazy-loaded mutable state.",
+    "Scala: lazy val (thread-safe, evaluated once, right-biased or-error result); cats-effect Resource for lazy-acquisition-with-release use cases; avoid var for lazy fields.",
+    "Swift: lazy var (stored property, non-thread-safe by default, order-dependent); @Lazy from the concurrency library for thread-safe forms; lazy with a closure that captures dependencies.",
+    "PHP: __get magic method for property proxying; Doctrine ORM lazy associations via proxy classes; prefer explicit getter methods over magic __get for debuggability."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (2002) - Lazy Load, chapter 11 (Object-Relational Structural Patterns); the catalog page lists the four varieties: lazy initialization, virtual proxy, value holder and ghost.",
+    "https://martinfowler.com/eaaCatalog/lazyLoad.html",
+    "https://learning.oreilly.com/library/view/patterns-of-enterprise/0321127420/ch11.html#ch11lev1sec3",
+    "Gamma, Helm, Johnson & Vlissides, Design Patterns: Elements of Reusable Object-Oriented Software (1994) - Proxy pattern, specifically Virtual Proxy as the lazy-loading specialisation.",
+    "https://refactoring.guru/design-patterns/proxy",
+    "https://en.wikipedia.org/wiki/Proxy_design_pattern",
+    "https://flylib.com/books/en/2.505.1.20/1/",
+    "Python Software Foundation, Descriptor HowTo Guide — Python 3 documentation: __get__, __set__, __delete__, property(), functools.cached_property as the language-native lazy-loading mechanisms.",
+    "https://docs.python.org/3/howto/descriptor.html",
+    "Mozilla, Proxy - JavaScript | MDN: ES6 Proxy API traps (__get, __set) for intercepting property access to implement lazy loading of object properties.",
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Proxy",
+    "CERT Secure Coding Standards, LCK10-J: Use a correct form of the double-checked locking idiom — documents that naive DCL publishes partially-initialised objects and recommends safe idioms.",
+    "https://cmu-sei.github.io/secure-coding-standards/sei-cert-oracle-coding-standard-for-java/rules/locking-lck/lck10-j/",
+    "Pugh et al., The 'Double-Checked Locking is Broken' Declaration: the canonical demonstration that DCL is unsafe without volatile or happens-before guarantees on all JVMs prior to Java 5.",
+    "https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html",
+    "Aslim, SQLAlchemy Relationship Lazy Loading Strategies in Multi-Tenant FastAPI: N+1 Queries and the Cost of Joinedload — practical guidance on selectinload vs joinedload trade-offs in async SQLAlchemy.",
+    "https://uguraslim.com/blog/sqlalchemy-relationship-lazy-loading-strategies-in-multi-ten/",
+    "Futurion, N+1, Lazy Load, and Preload: ORM Bugs Every Backend Should Know — four-faced N+1 taxonomy and explicit fetch-plan discipline as the fix.",
+    "https://futurion.blog/n1-lazy-load-and-preload-the-orm-performance-bugs-every-backend-should-know-by-name/",
+    "Woodruff, The N+1 Query Problem in EF Core: Detection, Diagnosis, and Permanent Fixes — four shapes of N+1 in EF Core with throw-on-lazy-load development mode.",
+    "https://www.woodruff.dev/the-n1-query-problem-in-ef-core/",
+    "Woodruff, Enterprise Patterns for ASP.NET Core Minimal API: Identity Map Pattern — clarifies the distinction between Lazy Load, Identity Map, Unit of Work and Memoization in an ORM context.",
+    "https://www.woodruff.dev/enterprise-patterns-for-asp-net-core-minimal-api-identity-map-pattern/",
+    "Fowler, Unit of Work, Patterns of Enterprise Application Architecture — the pattern that Lazy Load is most often combined with, providing the transaction boundary for deferred reads.",
+    "https://martinfowler.com/eaaCatalog/unitOfWork.html",
+    "StackOverflow, Using ES6 Proxy to lazily load resources — practical JS Proxy pattern for intercepting property access on database documents.",
+    "https://stackoverflow.com/questions/67002783/using-es6-proxy-to-lazily-load-resources",
+    "Wikipedia, Double-checked locking — overview of the anti-pattern with language-level safe alternatives.",
+    "https://en.wikipedia.org/wiki/Double-checked_locking",
+    "Stratadox/Proxy on GitHub — open-source PHP implementation of Virtual Proxy optimised for lazy loading database and remote resources.",
+    "https://github.com/Stratadox/Proxy",
+    "StackOverflow, Lazy loading of class attributes — Python descriptor-based lazy property implementations and __getattr__ patterns.",
+    "https://docs.jboss.org/hibernate/stable/orm/userguide/html_single/Hibernate_User_Guide.html",
+    "https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html",
+    "https://learn.microsoft.com/en-us/ef/core/querying/related-data/lazy",
+    "https://learn.microsoft.com/en-us/ef/core/performance/efficient-querying",
+    "https://stackoverflow.com/questions/17486104/lazy-loading-of-class-attributes"
+  ],
+  "related_patterns_notes": {
+    "virtual-proxy": "virtual-proxy: the Gang of Four name for the same mechanism — a placeholder that creates or fetches the real object on first request; Lazy Load is the Fowler/EAA framing of this same idea in a persistence context.",
+    "identity-map": "a session-scoped registry that ensures one in-memory instance per database key; lazy loading must route through the identity map so that a deferred read returns the already-tracked instance instead of a second copy.",
+    "unit-of-work": "unit-of-work: the transaction boundary that also acts as the lifecycle scope for lazy loading — a deferred read is only valid inside the unit that holds the connection and identity map; closing the unit before touching a marker causes DetachedInstanceError or LazyInitializationException.",
+    "data-mapper": "data-mapper: the layer that implements the deferred read — the mapper/gateway knows the store and executes the SQL/document fetch on behalf of the lazy loader; the mapper is the participant that the domain object deliberately does not import.",
+    "lazy-initialization": "lazy-initialization: the simplest of Fowler's four Lazy Load variants — a nullable field checked on every access; a language-level primitive in Java (Lazy<T>), Kotlin (by lazy), Swift (lazy var), and Rust (OnceCell); sometimes called 'deferred initialization' outside the EAA catalog.",
+    "lazy-acquisition": "lazy-acquisition: Lazy Load applied to resources that must be released (connections, file handles, locks); distinct from Lazy Load because the acquisition must be paired with a release policy — use try-with-resources, context managers or RAII to pair the deferred get with explicit close.",
+    "foreign-key-mapping": "foreign-key-mapping: the pattern that declares the lazy association in the object model — the foreign key column is the handle the lazy loader uses to issue the SELECT when the association is first navigated.",
+    "memoization": "memoization: caches the result of an expensive pure function for repeated calls on the same inputs; unlike Lazy Load it is not persistence-aware (no identity map, no transaction boundary) and is usually in-process — use memoization for computed fields, Lazy Load for persisted associations.",
+    "ghost": "a lazy-load variant where the marker is a real domain object with no data (a 'ghost') that fills itself on first method call; used by ORM proxies (Hibernate, EF Core) to preserve getClass() and instanceof behaviour that virtual proxies lose."
+  }
+}

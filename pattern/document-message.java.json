@@ -1,0 +1,74 @@
+{
+  "pattern": "document-message",
+  "language": "java",
+  "support": "library",
+  "version": "1.0",
+  "idiom_name": "POJO + ObjectMapper.writeValueAsString/readValue",
+  "implementation_notes": "The classic Java realization: the document is a POJO with properties and Jackson's ObjectMapper binds JSON to it - writeValueAsString for the producer side, readValue for the receiver side, @JsonProperty to pin wire names - while per-document settings live in immutable ObjectReader/ObjectWriter instances instead of being changed on the fly. Jackson, not the language, is the codec, so mapper configuration is part of the contract: unknown-property handling decides whether documents can evolve, and polymorphic coercion must stay restricted (BLOCK_UNSAFE_POLYMORPHIC_BASE_TYPES) because default-typed deserialization of untrusted documents is the classic Java deserialization hole.",
+  "code_sketch": "public class OrderShipped {\n    @JsonProperty(\"version\") private int version;\n    @JsonProperty(\"order_id\") private String orderId;\n    @JsonProperty(\"lines\") private List<Line> lines;\n    // getters and setters\n}\n\nString wire = MAPPER.writeValueAsString(doc);                   // producer\nOrderShipped got = MAPPER.readValue(body, OrderShipped.class);  // receiver\nhandle(got);                                                    // receiver decides",
+  "pitfalls": [
+    "FAIL_ON_UNKNOWN_PROPERTIES is enabled by default in Jackson, so a producer that adds a field breaks every consumer that never disabled it - the opposite of tolerant evolution.",
+    "Enabling default typing or an open polymorphic base type lets a crafted document instantiate arbitrary classes; keep polymorphic base types blocked and validate before binding.",
+    "Mapper features are per-mapper and must be configured before first use, so mutating a shared ObjectMapper at runtime is a race.",
+    "Field-based binding needs a usable constructor (or an annotated creator); immutable documents silently fail to deserialize until creator binding is configured."
+  ],
+  "sources": [
+    "https://github.com/FasterXML/jackson-databind/wiki"
+  ],
+  "variants": [
+    {
+      "variant_id": "jackson-pojo",
+      "name": "POJO document + Jackson ObjectMapper",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "POJO + ObjectMapper.writeValueAsString/readValue",
+      "implementation_notes": "The classic Java realization: the document is a POJO with properties and Jackson's ObjectMapper binds JSON to it - writeValueAsString for the producer side, readValue for the receiver side, @JsonProperty to pin wire names - while per-document settings live in immutable ObjectReader/ObjectWriter instances instead of being changed on the fly. Jackson, not the language, is the codec, so mapper configuration is part of the contract: unknown-property handling decides whether documents can evolve, and polymorphic coercion must stay restricted (BLOCK_UNSAFE_POLYMORPHIC_BASE_TYPES) because default-typed deserialization of untrusted documents is the classic Java deserialization hole.",
+      "code_sketch": "public class OrderShipped {\n    @JsonProperty(\"version\") private int version;\n    @JsonProperty(\"order_id\") private String orderId;\n    @JsonProperty(\"lines\") private List<Line> lines;\n    // getters and setters\n}\n\nString wire = MAPPER.writeValueAsString(doc);                   // producer\nOrderShipped got = MAPPER.readValue(body, OrderShipped.class);  // receiver\nhandle(got);                                                    // receiver decides",
+      "pitfalls": [
+        "FAIL_ON_UNKNOWN_PROPERTIES is enabled by default in Jackson, so a producer that adds a field breaks every consumer that never disabled it - the opposite of tolerant evolution.",
+        "Enabling default typing or an open polymorphic base type lets a crafted document instantiate arbitrary classes; keep polymorphic base types blocked and validate before binding.",
+        "Mapper features are per-mapper and must be configured before first use, so mutating a shared ObjectMapper at runtime is a race.",
+        "Field-based binding needs a usable constructor (or an annotated creator); immutable documents silently fail to deserialize until creator binding is configured."
+      ],
+      "sources": [
+        "https://github.com/FasterXML/jackson-databind/wiki"
+      ]
+    },
+    {
+      "variant_id": "jackson-record",
+      "name": "Java record documents (Java 16+)",
+      "paradigm": "oo",
+      "min_standard": "Java17",
+      "idiom_name": "record + ObjectMapper constructor binding",
+      "implementation_notes": "Records make the document immutable and self-describing: the component list is the contract, the canonical constructor is the binding point and Jackson (2.12+) maps JSON properties onto components without setters. Version 17 is the floor used here because records are a standard language feature and LTS toolchains are the practical minimum for new integration code. Compared with the POJO variant the codebase loses mutable state and boilerplate and gains validation inside the compact constructor; the trade is that any wire field the record does not declare still needs a mapper annotation.",
+      "code_sketch": "public record OrderShipped(int version, String orderId, List<Line> lines) {\n    public OrderShipped {\n        if (version < 1) throw new IllegalArgumentException(\"bad version\");\n        lines = List.copyOf(lines);\n    }\n}\n\nString wire = MAPPER.writeValueAsString(doc);                  // producer\nOrderShipped got = MAPPER.readValue(body, OrderShipped.class); // receiver\nhandle(got);",
+      "pitfalls": [
+        "Jackson must be new enough (2.12+) to bind records; older versions fail with a no-creator error rather than a clear message.",
+        "Component names are the wire names unless annotated, so renaming a component is a breaking change for every consumer.",
+        "Compact-constructor validation turns a bad document into an exception in the middle of deserialization, so the endpoint still needs its error path."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/17/language/records.html",
+        "https://github.com/FasterXML/jackson-databind/wiki"
+      ]
+    },
+    {
+      "variant_id": "jakarta-messaging-body",
+      "name": "Jakarta Messaging body types (provider-owned documents)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "MapMessage/TextMessage/BytesMessage + Message.getBody(Class)",
+      "implementation_notes": "The EIP-native Java realization: the messaging provider owns the document representation, and the document is one of the JMS/Jakarta Messaging body types - MapMessage for name-value documents, TextMessage for an embedded JSON/XML document, BytesMessage for binary wire formats, ObjectMessage for Java serialization - produced with the session factories (createMapMessage, createTextMessage) and read back through Message.getBody(Class) or the type-specific accessors (getText, getObject/getString). Choose it when the broker's own message model is the contract and no explicit mapper should exist; the trade is that document structure is expressed in broker API calls and ObjectMessage couples both classpaths.",
+      "code_sketch": "MapMessage msg = session.createMapMessage();\nmsg.setInt(\"version\", 3);\nmsg.setString(\"order_id\", order.id());\nproducer.send(msg);                       // producer\n\n// receiver: the provider hands the document back\nMap<String, Object> doc = msg.getBody(Map.class);\nhandle(doc);                              // receiver decides",
+      "pitfalls": [
+        "MapMessage values are untyped objects, so types must be read back explicitly (getString/getInt) and validated rather than assumed.",
+        "ObjectMessage uses Java serialization, coupling producer and consumer classpaths and exposing the deserialization attack surface - avoid it for untrusted documents.",
+        "Provider-specific limits (message size, allowed body types) become hard constraints on the document, so a large document needs a claim check rather than a bigger BytesMessage."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/api/javax/jms/Message.html"
+      ]
+    }
+  ],
+  "default_variant": "jackson-pojo"
+}

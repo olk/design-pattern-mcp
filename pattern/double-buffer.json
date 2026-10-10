@@ -1,0 +1,206 @@
+{
+  "category": "specialized-components",
+  "name": "double-buffer",
+  "aliases": [
+    "double buffering",
+    "page flipping"
+  ],
+  "intent": "Make incrementally modified state appear to change atomically by keeping two buffer instances, writing only the next buffer and swapping it with the current buffer when the update is complete, so no reader ever observes a half-written state.",
+  "problem": "The catalog trigger: two buffers must be swapped atomically, so no reader sees a half-written state. Concretely, state is updated piecemeal but observed as a whole - a display driver, DMA engine, interrupt handler or another subsystem reads the same state while the writer is midway through a frame - so the reader sees torn (half-updated) data and the display flickers or tears. The mirror-image case has the same fix: when the code doing the modification also reads the state it is modifying, results depend on the order in which entities happen to be visited.",
+  "context": "Applies wherever state or a buffer is modified in many steps but must become visible in one: real-time rendering and simulation loops (render into the back buffer, flip at the end of the frame), fixed-step updates over interacting entities, interrupt- or DMA-driven I/O where a producer fills the next block while the consumer drains the current one, audio streaming, and publication of device or telemetry state. It is a local technique at object or module level; Game Loop and Update Method usually supply the cadence at which the swap happens, and the swap is the only synchronization point in the design.",
+  "benefits": [
+    "Readers always observe a complete state: the half-written frame, table or block is never exposed, so tearing, flicker and order-dependent simulation results disappear.",
+    "Reader and writer proceed at independent rates in the re-point/index realization: the reader is not blocked by in-progress writing and the write is not blocked by readers - only the swap itself needs exclusivity.",
+    "The swap is O(1) for pointer, reference or index realizations - cost independent of buffer size - which is what makes per-frame use affordable.",
+    "Updates become order-independent and reproducible: because modifications land in the next buffer, an entity cannot observe another entity's update made earlier in the same pass (the simultaneous-update requirement).",
+    "Stale-but-complete reads are a usable guarantee: a reader running slower than the writer sees the previous consistent version instead of a corrupt one, so slow consumers degrade gracefully.",
+    "The same contract spans levels of a system - framebuffer flipping, swap chains and DMA double buffering are the hardware's version of it - so one mental model transfers from application code to the platform."
+  ],
+  "tradeoffs": [
+    "Two copies of the state must exist at all times - double the memory for the buffered structure; on memory-constrained devices this cost alone can disqualify the pattern (Nystrom's own caveat: 'we have to have two buffers').",
+    "The swap is a critical section: it must be atomic for every reader, and if it costs more than the incremental modification (copying a whole framebuffer, say), the pattern saves nothing and adds latency plus a coarse lock.",
+    "Readers must not hold pointers or references into a buffer across a swap: after a re-point the old pointer designates the recycled buffer, so long-lived pointers into buffered state are a use-after-swap bug by construction.",
+    "With pointer swapping, outside code cannot persist pointers into the buffer at all, and consumers that need a fixed address (a DMA engine, a GPU front buffer) force the copy variant instead.",
+    "Alternating buffers means the back buffer still holds data from two frames ago, not the last frame; reusing old content (motion-blur-style blending, incremental painting) needs an explicit copy or it reads the wrong generation.",
+    "Per-object granularity degrades the swap to O(n): if the buffered state is spread across a collection, the swap must visit every object, or every object must index a shared pair by an atomic current offset.",
+    "Staleness is by design: a reader may see the previous version, so anything that must react to the newest value (control decisions, acknowledgements) needs a separate handshake - and a slow reader forces triple buffering rather than double.",
+    "Memory-ordering mistakes are silent and platform-dependent: publishing the pointer without release/acquire (or an equivalent mutex/volatile discipline) behaves correctly on x86 and produces torn snapshots on weakly ordered CPUs."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 4,
+    "maintainability": 5,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 3,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Buffered Class",
+      "responsibility": "Owns the two buffer instances and the swap operation; exposes the current buffer for reading and keeps the next buffer behind a writing surface that only the update code may touch."
+    },
+    {
+      "role": "Buffer",
+      "responsibility": "The piece of state that is modified incrementally and read as a whole - a framebuffer, an entity/state table, an audio or I/O block."
+    },
+    {
+      "role": "Current Buffer",
+      "responsibility": "The version readers see; nothing may modify it while it is current, because it is the last completed state."
+    },
+    {
+      "role": "Next Buffer",
+      "responsibility": "The scratch copy the writer fills during the update; it replaces the current buffer at swap time and then becomes the new scratch."
+    },
+    {
+      "role": "Reader",
+      "responsibility": "Outside code (video driver, consumer thread, next simulation step, dashboard) that always reads the current buffer, is never exposed to work in progress, and must re-read the reference after every swap."
+    },
+    {
+      "role": "Swap Operation",
+      "responsibility": "The single point where next becomes current - a pointer, reference or index exchange, or a copy when consumers cannot be re-pointed - and the only moment that must be atomic with respect to readers."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Frame rendering: compose the scene into a back framebuffer and present it in one step (software framebuffers, page flipping, GPU swap chains, canvas/offscreen composition).",
+    "Fixed-step simulation with interacting entities: run every entity's update against the current state and write results into the next state, then swap, so update order cannot influence the outcome.",
+    "Interrupt- or DMA-driven I/O: the ISR (or DMA engine) fills the back block while the main loop consumes the front block, with a swap-request flag and an atomic index or pointer publication.",
+    "Audio streaming: the application fills the next sample block while the hardware plays the current block, swapping at the block-completion interrupt; lock-free SPSC ring buffers (crossbeam, spsc-ring, yring) implement this contract in Rust.",
+    "Telemetry and device state publication: a sampling thread publishes an immutable snapshot that readers (dashboards, control loops, loggers) load without locking; a reader that misses an update simply sees the older complete version.",
+    "Screenful composition in text UIs or batch rendering: build the complete next screen in memory and flush it in one write or flip, so consumers never see a partially drawn state.",
+    "Network packet buffering in high-throughput servers: the NIC DMA fills the front buffer while the application drains the back buffer; a swap at the completion interrupt hands the filled buffer to the OS stack without memcpy.",
+    "Log aggregation pipelines: a foreground thread writes log entries into the next buffer while a background flusher reads the current buffer and writes to persistent storage; the flusher never blocks the hot path.",
+    "Database MVCC snapshots: copy-on-write B-tree implementations (LMDB, Btrfs, ZFS) keep the old root pointer live as a consistent read snapshot while a new root is being written; the swap is a single atomic pointer update.",
+    "OffscreenCanvas worker rendering: the main thread holds the display canvas (front buffer) while the worker renders into an OffscreenCanvas (back buffer); transferToImageBitmap() hands the finished frame to the compositor without a pixel copy.",
+    "STM32 DMA double buffer mode (DBM): the controller owns two memory pointers (M0AR/M1AR) and swaps the active target when the transfer counter reaches zero, so software processes the just-filled buffer while the peripheral (ADC, audio, UART) streams into the other - the Linux stm32-dma driver runs this mode cyclically against a shared SRAM buffer.",
+    "Linux ALSA PCM drivers: the DMA buffer is divided into periods; the hardware plays one period while the application writes the next, and the period-complete interrupt is the swap point at which the two halves exchange producer/consumer roles.",
+    "Java 2D full-screen mode: java.awt.image.BufferStrategy (Oracle Full-Screen Exclusive Mode API) manages the swap chain - render into the back buffer returned by getDrawGraphics(), then show() flips it to the screen, with BufferCapabilities reporting whether the flip is copy- or page-flip-based."
+  ],
+  "avoid_when": [
+    "There is no interleaved reader: if nobody can observe the state during modification, a single buffer (optionally with a local copy inside the compute step) is simpler.",
+    "The reader can tolerate partial or stale data - publish immutable snapshots (immutability, copy-on-write) or a versioned store instead of maintaining a symmetric pair.",
+    "Consumers cannot be re-pointed and the buffer is large: the copy-on-swap variant then costs a full copy per swap, so prefer chunked updates, read-copy-update, or fixing the consumer to accept a movable buffer.",
+    "The platform already presents atomically (compositing window manager, browser canvas, GPU swap chain with vsync): consume the platform's present/flip API rather than building a second pair underneath it.",
+    "Writers and readers already hand off in lockstep - a producer-consumer queue or ring buffer expresses 'a sequence of blocks' better than 'latest consistent version', which is all double buffering offers.",
+    "Several readers need different versions or offsets at the same time: reference-counted immutable snapshots (or a versioned MVCC-style store) generalize better than two slots."
+  ],
+  "language_files": {
+    "generic": "double-buffer.generic.json",
+    "c": "double-buffer.c.json",
+    "cplusplus": "double-buffer.cplusplus.json",
+    "csharp": "double-buffer.csharp.json",
+    "go": "double-buffer.go.json",
+    "java": "double-buffer.java.json",
+    "javascript": "double-buffer.javascript.json",
+    "kotlin": "double-buffer.kotlin.json",
+    "python": "double-buffer.python.json",
+    "ruby": "double-buffer.ruby.json",
+    "rust": "double-buffer.rust.json",
+    "scala": "double-buffer.scala.json",
+    "swift": "double-buffer.swift.json",
+    "typescript": "double-buffer.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "object",
+  "provenance": [
+    "game-programming"
+  ],
+  "related_patterns": [
+    "game-loop",
+    "update-method",
+    "data-locality",
+    "event-queue",
+    "copy-on-write",
+    "immutability",
+    "thread-confinement",
+    "producer-consumer",
+    "active-object",
+    "half-sync-half-async"
+  ],
+  "anti_patterns": [
+    "Swapping without an atomic publication step: toggling an index or pointer with a plain store while readers are active reintroduces the torn state the pattern exists to prevent (especially on weakly ordered CPUs).",
+    "Copy-on-swap applied to large buffers: a double buffer that copies a whole framebuffer every frame pays the pattern's memory cost and the copy cost while claiming its performance benefits.",
+    "Readers caching a pointer or reference into the current buffer and using it after a swap - they now read or write the recycled generation ('two generations' bug).",
+    "Using double buffering to fix flicker or glitches that actually come from redundant repaints, missing invalidation or wrong draw order - the real bug is elsewhere and the extra buffer hides it.",
+    "Reusing the back buffer's previous content without accounting for alternation (data two frames old), producing ghosting or motion trails that look like rendering bugs.",
+    "Treating the pattern as a general replacement for synchronization: two buffers remove torn reads of a whole snapshot but not races on the snapshot's mutable contents or on multi-field updates.",
+    "Using a double buffer for a continuous stream rather than a discrete snapshot: when data flows continuously (audio, network packets), a ring buffer or bounded channel is the correct abstraction — double buffering's 'latest complete version' contract creates staleness at the tail of the stream.",
+    "False sharing in the swap index: placing the current/next index in the same cache line as frequently modified state causes the swap to cascade cache invalidations across cores, destroying the O(1) claim; pad the index to its own cache line.",
+    "Swap aliasing across thread boundaries: a pointer swap published to another thread without a memory barrier (or stored in a non-atomic field) may be reordered with the preceding writes, exposing the reader to a torn or null buffer on weakly ordered architectures (ARM, RISC-V).",
+    "Silent ImageBitmap leaks in Web/JS: transferToImageBitmap() transfers GPU ownership but if the returned ImageBitmap is not close()d, GPU memory grows unboundedly at 60 fps until the tab is discarded; instrument this in production dashboards.",
+    "Assuming the swap is free on all hardware: pointer-swap double buffering is O(1) but on NUMA systems or when the two buffers land on different memory controllers, the swap can incur a TLB shootdown or a cross-socket memory access that adds measurable latency.",
+    "Ignoring power management interactions: on laptops, the GPU may enter a lower power state between frames; a double buffer that depends on continuous GPU access for the swap may stall the CPU when the GPU is in an S0ix state, causing input lag spikes.",
+    "Using double buffering as a substitute for proper synchronization: the pattern prevents torn reads of a whole snapshot but does not protect the internal state of the buffer itself if multiple threads modify it — use a mutex, hazard pointer, or lock-free CAS for intra-buffer mutual exclusion."
+  ],
+  "design_principles": [
+    "Separation of modification from visibility: the update phase and the publication phase are distinct, and only publication is synchronized.",
+    "Single-writer/many-reader publication instead of mutual exclusion: readers never lock in the re-point realization and never wait for an in-progress write.",
+    "Encapsulation: the writable buffer is private; outside code only ever sees the current, complete version.",
+    "Temporal decoupling: producer and consumer rates are independent, with 'latest consistent version' semantics and no queue growth.",
+    "One explicit consistency point (the swap) instead of a lock or barrier on every access, keeping the invariant cheap and reviewable."
+  ],
+  "best_practices": [
+    "Make the swap a single atomic operation (pointer, reference or index exchange) and pair it with release/acquire ordering (or volatile/mutex semantics) so readers see the buffer contents, not just the new address.",
+    "Treat published buffers as immutable: never write into the current buffer after the swap, and clear or fully rebuild the back buffer instead of assuming what it contains.",
+    "Document the reader contract: take a snapshot reference per use, never cache addresses into a buffer across a swap, and re-read the current reference on every pass.",
+    "Choose granularity deliberately: one monolithic buffer keeps the swap O(1); distributed state needs a shared pair with an object-relative index or offset so a single publication swaps everything.",
+    "Size for two buffers up front (and consider triple buffering when the writer must run ahead of a slow reader), and measure the swap cost against the modification cost.",
+    "On platforms with a swap chain or flip API (GPU swap chains, compositors, SDL/pygame, AWT BufferStrategy, Android SurfaceHolder), use it and present in sync with the display rather than hand-rolling a pair underneath.",
+    "Add observability for staleness: frame or version counters and timestamps on published buffers make 'old but complete' reads diagnosable instead of mysterious.",
+    "Keep the swap window minimal under synchronization: no allocation, I/O or callbacks inside the critical section.",
+    "In Rust, prefer lock-free SPSC ring buffers (spsc-ring, yring, crossbeam-channel) over hand-rolled double buffers for streaming workloads; they eliminate the two-generation aliasing bug by construction and batch atomic operations per chunk.",
+    "In Go, model pipeline stages as channels with bounded buffers between them; double buffering is implicit in the buffered channel — the sender proceeds until the buffer is full, the receiver drains independently, and the swap is the channel receive operation.",
+    "In JavaScript/TypeScript, use OffscreenCanvas with transferToImageBitmap() for worker-based rendering; the ImageBitmap transfer is the swap and avoids a full pixel copy every frame — close() every ImageBitmap to prevent GPU memory leaks.",
+    "Prefer power-of-two buffer capacities in lock-free ring-buffer implementations so wrap detection becomes a bitmask operation, reducing the swap/index computation to a single AND instruction.",
+    "Pad producer and consumer cursors to separate cache lines (64 bytes on x86) to eliminate false sharing, which can degrade a lock-free buffer from ~2.5 ns to ~35 ns per operation.",
+    "For multi-producer multi-consumer scenarios, prefer a validated MPMC queue (crossbeam-channel) over a hand-rolled double buffer, because the latter is single-consumer by design and cannot safely be read by multiple consumers without additional synchronization."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Nystrom, Game Programming Patterns (2014), Sequencing Patterns — Double Buffer: the Buffered Class, next/current buffers, the atomic swap, pointer re-point vs. data copy, monolithic vs. per-object granularity.",
+    "https://gameprogrammingpatterns.com/double-buffer.html",
+    "Schmidt, Stal, Rohnert, Buschmann, Pattern-Oriented Software Architecture Volume 2: Patterns for Concurrent and Networked Objects (POSA2, Wiley 2000), Chapter 4 — Double-Checked Locking Optimization and related concurrency patterns; the double-buffering principle is applied throughout the Active Object and Monitor Object patterns.",
+    "https://www.cs.wm.edu/~dcschmidt/POSA/POSA2/",
+    "Wikipedia contributors, 'Multiple buffering,' Wikipedia, The Free Encyclopedia: double buffering, triple buffering, page flipping, vsync, and swap chain terminology.",
+    "https://en.wikipedia.org/wiki/Multiple_buffering",
+    "Khronos Group, Vulkan Documentation — Swapchain Images: double buffering vs. triple buffering tradeoffs, VK_PRESENT_MODE_FIFO_KHR vs. VK_PRESENT_MODE_MAILBOX_KHR, minImageCount implications.",
+    "https://docs.vulkan.org/samples/latest/samples/performance/swapchain_images/README.html",
+    "Microsoft DirectX Graphics Infrastructure (DXGI) documentation — flip model presentation, DXGISwapChain, present latency, and tear-free rendering.",
+    "https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_effect",
+    "Crossbeam-rs contributors, crossbeam-channel: bounded MPMC channel based on Dmitry Vyukov's bounded MPMC queue, cache-line padded atomics, acquire/release memory ordering used in lock-free ring buffers.",
+    "https://docs.rs/crossbeam/latest/crossbeam/channel/",
+    "geronimo-iia, spsc-ring: lock-free SPSC ring buffer with sequence-number protocol, cache-line padded producer/consumer cursors, zero dependencies.",
+    "https://github.com/geronimo-iia/spsc-ring",
+    "yring contributors, yring: bounded SPSC ring with ypipe-style batched flush/prefetch for high-throughput audio/network pipelines.",
+    "https://docs.rs/yring/latest",
+    "MDN Web Docs, OffscreenCanvas API: worker-driven canvas rendering, ImageBitmap transfer, double buffering across thread boundary via transferToImageBitmap/transferFromImageBitmap.",
+    "https://developer.mozilla.org/en-US/docs/Web/API/OffscreenCanvas",
+    "Microsoft Learn, Direct3D 9 — Page Flipping and Back Buffering: swap chain with front/back buffers, the flip that exchanges them without a pixel copy, and double buffering as one back buffer plus the front buffer.",
+    "https://learn.microsoft.com/en-us/windows/win32/direct3d9/page-flipping-and-back-buffering",
+    "The Linux Kernel documentation, Writing an ALSA Driver: PCM DMA buffer split into periods, period-complete interrupts as the hand-off between the playing half and the half being written.",
+    "https://docs.kernel.org/sound/kernel-api/writing-an-alsa-driver.html",
+    "The Linux Kernel documentation, STM32 DMA-MDMA chaining: STM32 DMA cyclic Double Buffer Mode (DBM) swapping memory pointers at each end of transaction to feed a shared SRAM buffer.",
+    "https://docs.kernel.org/arch/arm/stm32/stm32-dma-mdma-chaining.html",
+    "Oracle Java Tutorials, Full-Screen Exclusive Mode API — Double Buffering and Page Flipping: drawing the whole scene offscreen and flipping/copying it to the screen in one step via BufferStrategy.",
+    "https://docs.oracle.com/javase/tutorial/extra/fullscreen/doublebuf.html",
+    "Erik McClure, The Problem of Vsync: why double buffering synchronized to vsync stalls the CPU and adds perceptible input latency, motivating triple buffering and async present modes.",
+    "https://erikmcclure.com/blog/problem-of-vsync/"
+  ],
+  "related_patterns_notes": {
+    "triple-buffer": "triple-buffer",
+    "ring-buffer": "ring-buffer",
+    "mvcc": "mvcc"
+  }
+}

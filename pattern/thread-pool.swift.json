@@ -1,0 +1,72 @@
+{
+  "pattern": "thread-pool",
+  "language": "swift",
+  "support": "library",
+  "idiom_name": "DispatchQueue.global() + concurrentPerform / DispatchGroup",
+  "implementation_notes": "Grand Central Dispatch is the platform's pool: DispatchQueue.global() hands out work that 'executes on a pool of threads managed by the system' (the documented model), async { } enqueues without blocking, and DispatchQueue.concurrentPerform(iterations:execute:) fans a fixed number of iterations across the pool, returning only when all of them finish - the closest thing to a bounded parallel-for. You never create threads or size a pool: the system owns it, QoS classes prioritise work, DispatchGroup coordinates completion, and the docs explicitly warn that blocking inside concurrent blocks makes the system create more threads to compensate.",
+  "code_sketch": "DispatchQueue.concurrentPerform(iterations: jobs.count) { i in\n    process(jobs[i])                    // runs on the system pool, caller blocks\n}\nlet group = DispatchGroup()\nfor job in jobs {\n    group.enter()\n    DispatchQueue.global(qos: .utility).async { handle(job); group.leave() }\n}\ngroup.wait()                            // completion of the batch",
+  "pitfalls": [
+    "Blocking calls inside a concurrent dispatch block make the system spawn compensating threads; the docs' 'avoiding excessive thread creation' warning is about exactly this.",
+    "Global queues are shared with the rest of the app: heavy default-QoS work delays unrelated tasks, so choose the QoS deliberately.",
+    "There is no exact thread count to tune - the system decides the pool size, and concurrentPerform exists to bound the fan-out instead."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/dispatch/dispatchqueue"
+  ],
+  "variants": [
+    {
+      "variant_id": "gcd-global-queue",
+      "name": "GCD global concurrent queue / concurrentPerform",
+      "paradigm": "concurrent",
+      "idiom_name": "DispatchQueue.global() + concurrentPerform / DispatchGroup",
+      "implementation_notes": "Grand Central Dispatch is the platform's pool: DispatchQueue.global() hands out work that 'executes on a pool of threads managed by the system' (the documented model), async { } enqueues without blocking, and DispatchQueue.concurrentPerform(iterations:execute:) fans a fixed number of iterations across the pool, returning only when all of them finish - the closest thing to a bounded parallel-for. You never create threads or size a pool: the system owns it, QoS classes prioritise work, DispatchGroup coordinates completion, and the docs explicitly warn that blocking inside concurrent blocks makes the system create more threads to compensate.",
+      "code_sketch": "DispatchQueue.concurrentPerform(iterations: jobs.count) { i in\n    process(jobs[i])                    // runs on the system pool, caller blocks\n}\nlet group = DispatchGroup()\nfor job in jobs {\n    group.enter()\n    DispatchQueue.global(qos: .utility).async { handle(job); group.leave() }\n}\ngroup.wait()                            // completion of the batch",
+      "pitfalls": [
+        "Blocking calls inside a concurrent dispatch block make the system spawn compensating threads; the docs' 'avoiding excessive thread creation' warning is about exactly this.",
+        "Global queues are shared with the rest of the app: heavy default-QoS work delays unrelated tasks, so choose the QoS deliberately.",
+        "There is no exact thread count to tune - the system decides the pool size, and concurrentPerform exists to bound the fan-out instead."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/dispatch/dispatchqueue"
+      ]
+    },
+    {
+      "variant_id": "operation-queue",
+      "name": "OperationQueue with maxConcurrentOperationCount",
+      "paradigm": "oo",
+      "idiom_name": "OperationQueue with maxConcurrentOperationCount",
+      "implementation_notes": "OperationQueue is an explicit pool with a scheduling policy: maxConcurrentOperationCount caps how many operations run concurrently, dependencies order them, isSuspended pauses dispatch, and waitUntilAllOperationsAreFinished()/Progress expose completion while the queue runs operations on the system's dispatch pools underneath. Use it when tasks need dependencies, priorities, observability or cancellation semantics rather than raw parallelism - it is a policy layer over GCD, not a private thread pool, so it is the direct analogue of the classic pool manager.",
+      "code_sketch": "let queue = OperationQueue()\nqueue.maxConcurrentOperationCount = 4          // the pool bound\nqueue.addOperation { handle(job) }\nqueue.isSuspended = true                       // pause dispatch, keep queued work\nqueue.waitUntilAllOperationsAreFinished()",
+      "pitfalls": [
+        "The queue retains operations until they finish and a suspended queue retains them too, so a suspended queue with pending work looks like a leak.",
+        "cancel() only sets a flag: the operation body must check isCancelled and stop, and cancelling makes an operation ignore its dependencies and start as soon as possible (documented).",
+        "Operations that block occupy one of the concurrent slots for their whole duration, exactly like pool workers."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/foundation/operationqueue"
+      ]
+    },
+    {
+      "variant_id": "swift-taskgroup",
+      "name": "Structured concurrency (TaskGroup)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "structured concurrency"
+      ],
+      "idiom_name": "withTaskGroup + child tasks on the cooperative pool",
+      "implementation_notes": "Swift's concurrency model replaces the explicit pool in async code: child tasks added to a TaskGroup run on the runtime's cooperative pool, the group always awaits all of them before returning, and cancellation propagates from the parent (cancelAll() plus cooperative isCancelled checks) instead of through a thread API. Bounded fan-out is expressed as a window of awaited tasks rather than a pool size, and because the executor is cooperative, blocking a task blocks a thread for every task multiplexed on it - so this form suits async workloads, while CPU-bound synchronous fan-out still fits GCD/concurrentPerform.",
+      "code_sketch": "await withTaskGroup(of: Result.self) { group in\n    for job in jobs { group.addTask { await handle(job) } }   // cooperative pool\n    for await result in group { collect(result) }             // always awaits all\n}",
+      "pitfalls": [
+        "Never block (sleep, synchronous I/O, locks) inside a task: the cooperative pool has roughly as many threads as cores.",
+        "A task group always waits for all child tasks even after an early return (documented) - use cancelAll() plus cooperative checks to stop early.",
+        "Cancellation is cooperative: ignore isCancelled and the work keeps running to completion."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/swift/taskgroup"
+      ]
+    }
+  ],
+  "default_variant": "gcd-global-queue",
+  "version": "1.0"
+}

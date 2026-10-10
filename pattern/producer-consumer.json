@@ -1,0 +1,230 @@
+{
+  "category": "concurrency-resilience",
+  "name": "producer-consumer",
+  "aliases": [
+    "bounded buffer",
+    "consumer-producer"
+  ],
+  "intent": "Insert a bounded buffer between producers and consumers of work items so the two sides run concurrently at their own rates, the buffer absorbs bursts and slack, and its bound turns overload into backpressure, queueing or an explicit drop policy instead of unbounded growth.",
+  "problem": "Production and consumption proceed at different rates: a fast producer outruns its consumer and either drops items or grows a backlog until memory runs out, a slow producer leaves consumers idle, and bursts arrive faster than they can be processed. Wiring the two sides together directly also couples their lifetimes and schedules - a synchronous hand-off makes the faster side wait for the slower - so neither side can be scaled, restarted or tested on its own.",
+  "context": "Concurrent in-process software (threads, tasks, coroutines, event-loop callbacks) with one or more producers and one or more consumers that can run at the same time but not at the same average rate. The buffer is a component-level data structure owned by the application - a work queue for a thread pool, a pipeline hand-off, a logging or telemetry sink - not a durable broker, so the decisions are how to hand items over, how to bound the queue and how to end the arrangement cleanly.",
+  "benefits": [
+    "Rate decoupling: the buffer absorbs bursts and idle periods, so each side averages its own pace instead of running in lockstep, and throughput approaches the slower side's rate without idle gaps on the faster one.",
+    "Overlap and parallel throughput: production and consumption run concurrently, potentially on different cores, so the pipeline overlaps work rather than executing it alternately.",
+    "One explicit bound: the queue's capacity is a single number that caps work in flight and memory, which makes backpressure a designed property of the system instead of an accident of scheduling.",
+    "Loose coupling and testability: each side knows only the queue and the item type, so either side can be replaced, scaled out to multiple producers/consumers or unit-tested against a queue alone.",
+    "Uniform shutdown and error paths: one close/disconnect/sentinel protocol tells every consumer that production has ended, and per-item retry or dead-letter handling stays local to the consumer loop.",
+    "Reuse: the same queue-plus-workers shape serves request handlers, log writers, media stages and batch pipelines regardless of what an item means."
+  ],
+  "tradeoffs": [
+    "The bound is the pattern: an unbounded queue (or a forgotten capacity) converts decoupling into unbounded memory growth - the most common production incident caused by this pattern.",
+    "A full bounded queue turns overload into blocked producers or an explicit drop policy, and head-of-line blocking means one slow item stalls every producer behind it.",
+    "Shutdown is a protocol, not a flag: consumers blocked on an empty queue and producers blocked on a full one cannot be released by a flag alone, so close/disconnect/sentinels and timeouts must be designed or threads, goroutines and tasks leak.",
+    "Ownership moves into the queue: items are copied or moved in and out, so large payloads cost real time, and recycled/pooled buffers must not be referenced after enqueue (a whole class of use-after-free and data-race bugs the pattern makes easy).",
+    "Ordering changes: with several producers or consumers the item order follows scheduling rather than arrival, and per-key order needs partitioning or a serializing stage.",
+    "The queue is a single synchronization point: at high rates its atomics/locks and wakeups dominate, and chaining bounded queues (a consumer feeding another queue) reintroduces deadlock risk if the stage graph is cyclic or stages block on each other.",
+    "Latency per item grows by the queueing delay, and the buffer hides it: a saturated queue increases the time a request spends waiting without any error surfacing until the backlog is beyond recovery.",
+    "Operational blindness: without depth and wait-time instrumentation a growing queue looks like normal operation until memory or latency is already exhausted.",
+    "The convoy problem: slow consumers holding the lock while processing cause fast producers to queue up behind them, collapsing effective throughput even when the queue is not full; this is distinct from head-of-line blocking but equally damaging."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 4,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Producer",
+      "responsibility": "Creates items and enqueues them; when the buffer is full its rate is coupled to the consumer's through the bound - it blocks, waits with a timeout or drops according to the chosen policy."
+    },
+    {
+      "role": "Consumer",
+      "responsibility": "Dequeues items and processes them; when the buffer is empty it waits (blocks, suspends or polls) until an item arrives or the producer signals completion."
+    },
+    {
+      "role": "Buffer (queue or channel)",
+      "responsibility": "Holds items in flight and owns the capacity bound and the empty/full waiting internally, so it is the only object both sides touch."
+    },
+    {
+      "role": "Synchronization mechanism",
+      "responsibility": "The mutex plus not-empty/not-full condition variables, the semaphore pair or the runtime's channel machinery that makes insert and remove atomic and wakes exactly the waiters that can proceed."
+    },
+    {
+      "role": "Termination protocol",
+      "responsibility": "The convention that ends the arrangement - poison item, close/disconnect, cancellation token or queue shutdown - including how remaining items are drained and how blocked waiters are released."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Work queues behind thread or worker pools: request handlers enqueue tasks and a fixed set of workers consumes them, so pool size is independent of the arrival rate. Industry examples: Celery (Python), Sidekiq (Ruby), BullMQ (Node.js) all use this shape with Redis or a broker as the durable backing store.",
+    "Asynchronous logging and telemetry: hot paths enqueue records cheaply while a background writer drains, formats and writes them, keeping I/O latency off the request path. Structured log collectors (Fluent Bit, Vector) ingest from many sources into one consumer.",
+    "Multi-stage data pipelines (decode - transform - encode, extract - transform - load): bounded queues between stages give each stage its own workers and let a slow stage backpressure a fast one. Used in media transcoding, ETL workflows, and stream processors.",
+    "Ingestion buffers: a socket, file or broker reader produces records faster than the processing or indexing stage can absorb them, and the buffer smooths the mismatch without dropping data. Common in IoT telemetry ingestion, click-stream collection, and log aggregation.",
+    "UI/host integration: a background thread posts work or results to the main/event-loop thread's queue and vice versa, keeping the UI responsive without locks around application state. All major GUI frameworks (Qt, Swing, Flutter) use this internally.",
+    "Batch job scheduling: producers enqueue compute jobs (image resize, PDF generation, report creation) and a pool of consumers processes them. Systems like Celery, Hangfire, and AWS SQS follow this pattern, often with priority queues, delayed execution, and dead-letter routing.",
+    "Event streaming pre-processing: a Kafka, Pulsar, or NATS consumer-producer chain filters, transforms, and routes events through a series of bounded queues before landing in a data warehouse or search index.",
+    "Simulation and testing: a producer generates a deterministic stream of items while a consumer asserts on what it receives, with a sentinel marking the end of the stream. Property-based testing frameworks use this to drive scenario generation.",
+    "Print spooling and document processing: print jobs or document conversion tasks are queued and processed by a pool of workers, with bounded queues preventing runaway memory use even under burst load.",
+    "ML inference pipelines: a model-serving host receives requests via an API, enqueues them into a bounded queue, and a pool of worker coroutines or threads dequeues and runs inference. The queue decouples HTTP latency from inference latency and provides backpressure when the model GPU is saturated. Tools like Ray Serve, Triton Inference Server, and TorchServe use this shape.",
+    "Streaming audio/video processing: a media pipeline (capture - encode - mux - stream) uses bounded queues between stages; frames that arrive during a temporary encoding stall are buffered rather than dropped, and a full encoder output queue backpressures the camera capture stage to prevent unbounded memory growth from frame accumulation.",
+    "WebSocket connection management: a server's accept loop enqueues new connections into a bounded connection queue; a pool of handler coroutines or threads dequeues and upgrades them, preventing connection exhaustion under burst load while the handler pool limits concurrency independently of the arrival rate.",
+    "Financial order processing: high-frequency trading systems receive market data feeds (producer) and route orders through risk checks and execution engines (consumers), with bounded queues between stages preventing downstream latency from backpressuring the market data ingestion and applying backpressure to upstream feed handlers.",
+    "Go channel pipelines: a source goroutine produces values into a channel, transformation stages consume and emit through downstream channels, and a sink drains the final stage. Go's documented pipeline pattern makes channel closure and cancellation part of the producer-consumer lifecycle.",
+    "Python asyncio worker queues: an asyncio.Queue(maxsize=N) accepts work from coroutine producers while worker coroutines await get(), process items and call task_done(); finite maxsize suspends producers when consumers fall behind.",
+    "Java executor work queues: java.util.concurrent.BlockingQueue coordinates multiple producer threads and consumer workers, with put()/take() waiting on full and empty capacity so an Executor-style worker pool can be bounded independently of arrival rate."
+  ],
+  "avoid_when": [
+    "The work is a single synchronous call chain: a direct call (or a future/promise when only the result is needed later) is simpler and has no queue, bound or shutdown protocol to get wrong.",
+    "The two sides must run in lockstep for correctness (request/response with exactly one consumer), where a zero-capacity hand-off or a plain call states the intent better.",
+    "Rates are already matched and smooth: the queue adds per-item latency and a synchronization point with no decoupling benefit.",
+    "Durability, redelivery or cross-process transport is required: that is a message broker or a durable log; an in-process queue dies with the process.",
+    "The runtime or framework already owns the queue (a thread pool's work queue, an event loop's task queue, a server's request queue): use it instead of building a second hand-off.",
+    "Unbounded growth and blocked producers are both unacceptable and work cannot be shed: a rate limiter, load shedding or a load leveller with a drop policy addresses overload better than a plain queue."
+  ],
+  "language_files": {
+    "generic": "producer-consumer.generic.json",
+    "c": "producer-consumer.c.json",
+    "cplusplus": "producer-consumer.cplusplus.json",
+    "csharp": "producer-consumer.csharp.json",
+    "go": "producer-consumer.go.json",
+    "java": "producer-consumer.java.json",
+    "javascript": "producer-consumer.javascript.json",
+    "kotlin": "producer-consumer.kotlin.json",
+    "python": "producer-consumer.python.json",
+    "ruby": "producer-consumer.ruby.json",
+    "rust": "producer-consumer.rust.json",
+    "scala": "producer-consumer.scala.json",
+    "swift": "producer-consumer.swift.json",
+    "typescript": "producer-consumer.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "module",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "thread-pool",
+    "half-sync-half-async",
+    "monitor-object",
+    "counting-semaphore",
+    "backpressure",
+    "load-leveller",
+    "future-promise",
+    "poison-pill",
+    "event-queue",
+    "publisher-subscriber",
+    "leader-followers",
+    "active-object",
+    "reactor",
+    "proactor",
+    "pipeline",
+    "composed-message-processor"
+  ],
+  "anti_patterns": [
+    "The unbounded queue as a decoupling fix: memory grows until the process dies, and the incident is blamed on the consumer's speed rather than the missing bound.",
+    "Blocking a producer inside a latency-critical context (event loop, reactor callback, UI thread, async executor thread) on a full queue, converting a local overload into a global stall.",
+    "Busy-wait polling the buffer for empty/full instead of using the blocking/wakeup mechanism, burning a core and adding latency.",
+    "One global queue for unrelated work so a single stuck item blocks everyone (head-of-line blocking) and unrelated rates become coupled - partition by class or key instead.",
+    "Termination by flag only: consumers blocked on an empty queue never observe it and producers blocked on a full queue never return, leaking threads, goroutines or tasks.",
+    "Sharing mutable per-item state between the two sides (or reusing a buffer after enqueue) - the queue is correct and the payload still races.",
+    "Treating buffering as if it were load shedding: a queue without a rate or drop policy just delays the overload and loses the chance to reject early.",
+    "Wrong semaphore wait order: acquiring the mutex before the counting semaphore causes circular wait - always wait on the resource semaphore first, then acquire the mutex.",
+    "Using if instead of while to guard wait conditions: spurious wakeups cause the consumer to proceed on an empty buffer; always re-check the predicate in a loop.",
+    "Signaling the wrong condition variable: waking producers with not_empty or consumers with not_full wakes the wrong waiters and can cause deadlock or lost wakeups.",
+    "The convoy problem: slow consumers serializing behind a shared lock cause throughput collapse even when the queue is shallow; mitigate by partitioning work by consumer affinity or limiting work-in-flight per consumer.",
+    "Priority inversion: a low-priority consumer holds the queue lock while a high-priority producer waits; use priority inheritance or avoid holding locks during slow processing.",
+    "The lock convoy: under high contention, a strict FIFO lock policy causes threads to context-switch on every lock acquisition, wasting CPU cycles in syscall overhead and scheduler thrashing even when the critical section is brief. Mitigate by keeping critical sections O(1), reducing thread count to match CPU cores, or switching to a lock-free queue.",
+    "Blocking on put() inside an asyncio event loop with put_nowait() fallback that accumulates into an unbounded secondary list - re-creating the unbounded growth one layer upstream."
+  ],
+  "design_principles": [
+    "Decouple in time: producers and consumers need not be available simultaneously; the buffer is the seam that absorbs the difference.",
+    "Bounded resources: every buffer has an explicit capacity, and the full-queue policy (block, reject, drop) is a decision rather than a default.",
+    "Single shared object: the queue is the only object both sides touch, so all synchronization lives in one place - do not communicate by sharing memory, share memory by communicating.",
+    "Ownership transfer: an item belongs to exactly one side at a time - moved or copied into the queue, owned by the queue, taken by the consumer.",
+    "Termination as part of the protocol: closing or disconnecting the queue and draining the tail is designed up front, together with releasing every blocked waiter.",
+    "Keep the critical section minimal: hold the lock only while mutating the queue data structure, never while doing slow external work (I/O, network calls, heavy computation); doing so converts a lock-based queue into a convoy factory.",
+    "Backpressure is the point: a bounded queue whose put() blocks is the cheapest backpressure mechanism; the bound must be set deliberately and the producer must use the blocking put (not a try- variant) for backpressure to propagate to the source."
+  ],
+  "best_practices": [
+    "Always set a capacity, derived from a memory budget and an acceptable queueing delay, and document the number instead of copying one from an example. A queue depth of 100 is not a default - it is a decision. Size it with Little's Law: capacity ≈ consumer_rate × tolerable_queueing_delay, plus burst headroom.",
+    "Pick the full-queue policy per use case (block, block with timeout, reject, drop oldest/newest) and implement it in one place. Document the policy so operators know what happens under load.",
+    "Make items immutable or move-only across the hand-off; never let a producer keep a reference to an enqueued or recycled buffer. Ownership transfer is the contract between producer and consumer.",
+    "Use the runtime's primitive (BlockingQueue, channel, async queue, Channel<T>, AsyncStream) rather than hand-writing mutex plus condition variables unless a custom policy requires it.",
+    "Design the shutdown protocol first: sentinel/close/disconnect, how blocked producers and consumers are released, and how the remaining items are drained. Test the shutdown path under load.",
+    "Handle consumer errors per item (retry, dead-letter, log) so one bad item cannot terminate the consumer loop or silently drop work. A poison pill per consumer is the canonical shutdown signal.",
+    "Instrument queue depth, wait time and drop count; depth is the earliest saturation signal. Alert on depth exceeding a configured threshold before memory is threatened.",
+    "Size the consumer count independently of the queue capacity: the bound limits work in flight, the worker count sets parallelism. A queue of 1000 with one worker still serializes all work.",
+    "Partition by work class or partition key when rates differ: a single queue for fast and slow work couples their backpressure; separate queues let the fast path stay fast.",
+    "For multiple producers or consumers, prefer a lock-free or multi-consumer-safe queue implementation; a two-lock queue (one for enqueue, one for dequeue) allows concurrent access.",
+    "Prefer channel closure or a poison pill over a flag for termination: blocked consumers automatically unblock when the queue is closed, and a closed queue is an unambiguous signal.",
+    "Test edge cases: buffer size of 1, burst arrivals, slow consumer, uneven producer/consumer counts, and interruptible waits. These expose ordering, fairness, and shutdown assumptions.",
+    "For high-throughput workloads consider a ring buffer (circular buffer) implementation: fixed-size O(1) inserts and removes with no dynamic allocation after initialization, cache-friendly sequential access, and no GC pressure. Suitable when the maximum queue depth is known ahead of time.",
+    "Be aware of the convoy effect: slow consumers holding queue locks while processing cause cascading latency for other consumers and producers. Mitigate by limiting the time a consumer can hold the lock per item, partitioning work by consumer affinity, or using a lock-free queue design.",
+    "In async runtimes (asyncio, Tokio, Kotlin coroutines), prefer bounded channel capacity and explicit backpressure over implicit unbounded buffering; Tokio's mpsc channel with a set capacity is the canonical model - producers suspend when the channel is full and consumers suspend when empty.",
+    "Choose fairness vs. throughput trade-off explicitly: a fair wakeup policy (round-robin across waiters) prevents starvation but adds scheduling overhead; a LIFO wakeup policy (last-waiting producer served first) improves cache locality but can starve older producers. Many production queues default to FIFO which is a reasonable general-purpose choice.",
+    "For priority-based work, use a priority queue variant (heap-backed) where consumers always retrieve the highest-priority item; note that priority-inversion can still occur when high-priority items wait behind large batches of low-priority ones.",
+    "When building multi-stage pipelines (producer → queue₁ → consumer₁ → queue₂ → consumer₂), ensure the stage graph is acyclic and each stage has its own shutdown protocol; cyclic dependencies between stages with mutual bounded queues are a direct path to deadlock.",
+    "Monitor queue depth and put-wait time as primary health signals: depth pinned at maxsize means consumers are the bottleneck; depth pinned at zero means the producer is; put-wait time above zero confirms backpressure is engaging and is the earliest warning before memory exhaustion.",
+    "In asyncio, always pair get() with task_done() in a finally block - an exception escaping before task_done() causes join() to hang forever. The join()/task_done() barrier is only as correct as the task_done() discipline.",
+    "Prefer notifyAll() over notify() with condition variables unless you can rigorously prove exactly one waiting thread can benefit from the state change; notify() to the wrong waiters combined with a now-invalid predicate causes the consumer to proceed on an empty buffer. The LTSA-bounded-buffer deadlock (multiple consumers, one slot) is the canonical example of why notify() is dangerous.",
+    "For SPSC (single-producer single-consumer) workloads, use a lock-free SPSC queue implementation: eliminates all contention and provides O(1) wait-free enqueue and dequeue with no atomic operations under contention. Available in most languages' concurrency libraries."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Dijkstra, E. W. - Cooperating Sequential Processes (EWD123, Technological University Eindhoven, 1965), section 4.3 'The Bounded Buffer' - the producer/consumer problem solved with two counting semaphores and a binary semaphore guarding the buffer.",
+    "https://www.cs.utexas.edu/~EWD/transcriptions/EWD01xx/EWD123.html",
+    "Schmidt, D. C., Stal, M., Rohnert, H. & Buschmann, F. - Pattern-Oriented Software Architecture, Volume 2: Patterns for Concurrent and Networked Objects (POSA 2). Wiley, 2000. Chapter on the Producer-Consumer pattern and its relationship to Event Channel, Half-Sync/Half-Async, and Monitor Object.",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/",
+    "Goetz, B., Peierls, T., Bloch, J., Bowbeer, J., Holmes, D. & Lea, D. - Java Concurrency in Practice. Addison-Wesley, 2006. Chapter 5 covers bounding and partitioning, Chapter 8 discusses thread pools and work queues. The canonical modern treatment of BlockingQueue, the executor framework, and safe publication of mutable state.",
+    "https://www.cs.rochester.edu/u/scott/papers/2009_Scherer_CACM_SSQ.pdf - Scherer, C. A., Scott, M. L. - 'Synchronous Queues: In Defense of Drop Policy' (Communications of the ACM, 2009) - synchronous vs buffered queues, fair/unfair variants, and the Java SE SynchronousQueue implementation.",
+    "https://www.cs.rochester.edu/u/scott/papers/2006_PPoPP_synch_queues.pdf - Scherer, C. A., Dougaldy, S. & Scott, M. L. - 'Scalable Synchronous Queues' (PPoPP 2006) - nonblocking contention-free synchronous queue algorithms for producer-consumer handoff.",
+    "https://arxiv.org/pdf/1012.1824 - Afek, Y., Koren, G. & Rottenstreich, O. - 'Exploiting Dynamic Memory Access in Multi-Core Architectures for an Efficient wait-free SPSC Queue' (2010) - efficient wait-free single-producer/single-consumer queue designs on modern cache-coherent architectures.",
+    "https://go.dev/blog/pipelines - Go Blog - 'Go Concurrency Patterns: Pipelines' - canonical treatment of channels, cancellation, and fan-in/fan-out for the producer-consumer pattern in Go.",
+    "https://en.wikipedia.org/wiki/Producer%E2%80%93consumer_problem",
+    "https://java-design-patterns.com/patterns/producer-consumer/",
+    "Fowler, M. - 'Enterprise Integration Patterns' (2003) - Message Queue, Channel Adapter, and Dead Letter Queue patterns frame the producer-consumer shape in distributed systems.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling - Microsoft Azure Architecture Patterns: Queue-Based Load Leveling - cloud-scale producer-consumer with Azure Queue Storage.",
+    "https://tokio.rs/tokio/tutorial/channels - Tokio Tutorial: Channels - async mpsc and broadcast channels, backpressure via bounded capacity, oneshot for request-response, and channel closure semantics in Tokio's async runtime.",
+    "https://doc.rust-lang.org/std/sync/mpsc/index.html - Rust std::sync::mpsc - multi-producer single-consumer channels with synchronous (bounded, rendezvous) and asynchronous (unbounded) variants; documents channel closing and sender drop semantics.",
+    "https://kotlinlang.org/docs/channels.html - Kotlin Coroutines Channels - BufferedChannel, Channel capacities, fair vs. conflated channels, ticker channels for time-based pipelines, and the relationship between coroutine dispatch and channel backpressure.",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/PLoP-95.pdf - Schmidt, D. C. - 'Half-Sync/Half-Async' (PLoP 1995) - architectural pattern where asynchronous I/O layers communicate with synchronous processing layers via a queueing layer; explicitly models producer-consumer as the inter-layer communication mechanism.",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/PLoP-94.pdf - Schmidt, D. C. - 'Reactor' (PLoP 1994) - event demultiplexing pattern that uses a synchronous event demultiplexer and single-threaded event loop; the logging server example uses a producer-queue shape between async network receivers and synchronous request handlers.",
+    "Lea, D. - Concurrent Programming in Java: Design Principles and Patterns (2nd ed.). Addison-Wesley, 1999. The definitive pre-Java-5 treatment of monitor-based bounded buffers, the guarded suspension pattern, and the util.concurrent library that preceded java.util.concurrent. Known uses section documents real-world applications in telecommunications and trading systems.",
+    "https://gee.cs.oswego.edu/dl/cpj/ - Doug Lea's Concurrent Programming in Java online supplement - further readings, errata, and full code for all patterns from the book, including semaphore-based and monitor-based bounded buffers.",
+    "https://flylib.com/books/en/2.752.1.34/1/ - Jeff Magee & Jeff Kramer - Concurrency: State Models and Java Programs (Wiley 2006) - formal LTS modeling of the bounded buffer demonstrating that notify() alone (without notifyAll()) causes deadlock when producer/consumer counts exceed buffer slots, and the corrected monitor implementation with notifyAll().",
+    "https://web.mit.edu/6.031/www/sp21/classes/23-queues/ - MIT 6.031 Software Construction - 'Queues and Message-Passing' - teaches producer-consumer with blocking queues in Java, covers deadlock from bidirectional full queues in client/server request/reply protocols, and the discipline of immutable messages for lock-free communication.",
+    "Klein, M., Bayer, R., Holt, R. C., G. K. M. Lehr, G., Szajda, D., Tuffs, J. & Worthington, M. - 'Concurrency: State Models and Java Programs' - A rigorous formal treatment using labeled transition systems (LTS) to model bounded buffer correctness and deadlock conditions, demonstrating how notify() alone causes deadlock with N producers, N consumers, and a single-slot buffer.",
+    "https://unseel.com/cs/producer-consumer - Unseel - 'The Producer-Consumer Problem' (2026) - comprehensive modern treatment covering Dijkstra's original semaphore solution, the empty/full semaphore invariant (empty + full = N), correct semaphore ordering to avoid deadlock, and the distinction between spinlocks and blocking queues.",
+    "https://davekilian.com/lock-convoys.html - Dave Kilian - 'A Complete Guide to Lock Convoys' - detailed technical explanation of how strict FIFO lock policy under thread-preemption causes context-switch thrashing, collapses throughput below pre-contention levels, and why matching thread count to CPU core count is the primary mitigation.",
+    "https://async-concurrency.com/concurrent-execution-worker-patterns/async-queue-management/ - Async Concurrency - 'Async Queue Management in Python' - comprehensive asyncio.Queue guide covering maxsize as backpressure, join()/task_done() deadlock pitfalls, consumer starvation from blocking work, and queue depth/put-wait as diagnostic signals.",
+    "https://async-concurrency.com/concurrent-execution-worker-patterns/async-queue-management/bounded-asyncio-queue-with-backpressure-under-load/ - Async Concurrency - 'Bounded asyncio.Queue with Backpressure Under Load' - reproduces unbounded growth failure mode, measures backpressure propagation to TCP layer, and documents that put_nowait() on a full queue provides no throttling and no memory protection.",
+    "https://palakorn.com/blog/backpressure-async-systems/ - Palakorn Voramongkol - 'Backpressure and Flow Control in Async Systems' (2026) - systematic taxonomy of four backpressure responses (slow producer, buffer bounded, drop, spill-to-disk), Reactive Streams request(n) pull model, and Kafka consumer lag as the canonical demand signal.",
+    "https://stackpractices.com/patterns/back-pressure-pattern/ - StackPractices - 'Back-Pressure Pattern' - practical implementation of BackPressuredQueue in Python, Java, and TypeScript with drop/block/shed policies, plus the Sizing Rule based on Little's Law: buffer ≈ consumer_rate × tolerable_latency.",
+    "https://medium.com/@Realblank/backpressure-patterns-in-go-from-channels-to-queues-to-load-shedding-0841c9fe5607 - Medium - 'Backpressure Patterns in Go' (2026) - Go-channel backpressure, explicit BoundedQueue with sync.Cond, timeout-based TryPut, load shedding with prioritized queues, and monitoring goroutine count and queue sizes.",
+    "https://adhdecode.com/performance-engineering/concurrency-and-parallelism-performance/producer-consumer-pattern-performance/ - ADHDecode - 'Producer-Consumer Pattern Performance' (2026) - production case study showing queue size as a dynamic property, blocking vs. drop policies, SynchronousQueue trade-offs, and database write latency as the real consumer bottleneck beneath queueing delay.",
+    "https://yejunpark3.hashnode.dev/when-threads-collide-a-deep-dive-into-classical-synchronization-problems-and-concurrency-bugs - 'When Threads Collide' (2026) - comprehensive concurrency bug taxonomy including the four deadlock conditions, priority inversion with the Mars Pathfinder fix, atomicity vs. order violations from ASPLOS'08, and the Readers-Writers starvation problem.",
+    "https://docs.python.org/3/library/asyncio-queue.html - Python asyncio Queue documentation - maxsize, blocking put/get, join/task_done, and bounded producer-consumer semantics.",
+    "https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/concurrent/BlockingQueue.html - Java SE BlockingQueue documentation - blocking insertion/retrieval, multi-producer/multi-consumer use, and no intrinsic shutdown signal.",
+    "https://pmbanugo.me/blog/why-queues-dont-fix-overload-and-what-to-do-instead - Why Queues Don't Fix Overload - critique of unbounded queues and recommendation for explicit backpressure and load shedding."
+  ],
+  "related_patterns_notes": {
+    "channel": "channel",
+    "ring-buffer": "ring-buffer",
+    "work-queue": "work-queue"
+  }
+}

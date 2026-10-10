@@ -1,0 +1,82 @@
+{
+  "pattern": "wire-tap",
+  "language": "java",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "camel-wiretap",
+      "name": "Apache Camel wireTap EIP (Camel 4.x)",
+      "paradigm": "declarative",
+      "min_standard": "Java17",
+      "idiom_name": "Apache Camel route step .wireTap(uri)",
+      "implementation_notes": "Camel implements the pattern as a route step: .wireTap(uri) copies the original Exchange, sets its Exchange Pattern to InOnly (fire and forget) and sends the copy on a separate thread, so the tapped message is routed independently of the original route while the original continues unchanged. The copy is shallow - the docs state only the Exchange is copied, Wire Tap won't do a deep clone, so all copies can share body and header objects - use onPrepare with a Processor that deep-clones or serializes the body when the analyzer must not alias primary state. Thread model: a pool from Camel's default thread pool profile (poolSize 10, maxPoolSize 20, maxQueueSize 1000, rejectedPolicy CallerRuns); when pool and queue are exhausted further wiretaps run synchronously on the calling route thread, which is backpressure into the primary path - the documented remedy is an explicit executorService (a ThreadPoolProfile or a registered ExecutorService) with a larger queue or an Abort/Block rejection policy. Tapped exchanges are fire-and-forget, so failures surface only as route-level logs: export the tap endpoint's route metrics as the visible delivery counter. Choose this when Camel is already the integration runtime; Camel 4 requires Java 17 (4.22.x LTS supports Java 17/21/25), Camel 3.x (Java 11) is end of life.",
+      "code_sketch": "from(\"jms:queue:orders\")\n    .wireTap(\"jms:queue:orders-tap\")   // copy, InOnly, separate thread\n        .onPrepare(ex -> ex.getMessage().setBody(deepClone(ex.getMessage().getBody())))\n        .end()                                       // back to the main route\n    .to(\"bean:orderService\");                        // original exchange, unchanged",
+      "pitfalls": [
+        "The tapped Exchange is a shallow copy: 'Wire Tap won't do a deep clone ... all copies could share objects from the original Exchange', so an analyzer that mutates the body or headers corrupts what the primary route is still processing - deep-clone via onPrepare.",
+        "When the wire-tap thread pool is exhausted (default 10/20 threads with a 1000-entry queue, CallerRuns policy), 'further wiretaps will be executed synchronously by the calling thread', so a slow analyzer turns into latency injected straight into the primary route - size or replace the executor explicitly.",
+        "If you Wire Tap a stream message body, the docs say you should enable Stream Caching, otherwise the body may already be consumed when the tap endpoint reads it.",
+        "The copy is sent InOnly fire-and-forget: a failed tap send does not fail or retry from the wire tap itself, so without metrics on the tap route the analyzer silently loses messages."
+      ],
+      "sources": [
+        "https://camel.apache.org/components/4.22.x/eips/wireTap-eip.html",
+        "https://camel.apache.org/manual/threading-model.html",
+        "https://camel.apache.org/download/"
+      ]
+    },
+    {
+      "variant_id": "spring-integration-wiretap",
+      "name": "Spring Integration WireTap interceptor",
+      "paradigm": "oo",
+      "min_standard": "Java17",
+      "idiom_name": "WireTap ChannelInterceptor via .wireTap(...) DSL",
+      "implementation_notes": "Spring Integration ships the pattern as org.springframework.integration.channel.interceptor.WireTap, a ChannelInterceptor that 'publishes a copy of the intercepted message to a secondary target while still sending the original message to the main channel'. The tap is installed on the channel, not the endpoints - the Java DSL exposes it as BaseIntegrationFlowDefinition.wireTap(String channelName | MessageChannel | IntegrationFlow | WireTapSpec, optionally with a Consumer<WireTapSpec> for selector/timeout) and as MessageChannelSpec.wireTap(...); if the current channel is not an InterceptableChannel, the DSL injects an implicit DirectChannel and attaches the interceptor there. Threading: preSend runs inline on the sending thread, so the tap is only as asynchronous as its target channel - a DirectChannel runs the analyzer in the primary sender's thread, while a QueueChannel or ExecutorChannel hands off and keeps latency out of the primary path. Loss policy: WireTap.send uses the configured timeout (WireTapSpec.timeout / setTimeout) against a bounded tap channel, and if send() returns false it only logs a WARN and drops the copy. The forwarded object is the same immutable-by-convention Message (payload and header references are shared; only MessageHistory is cloned when present), so analyzer code must treat the payload as read-only. The interceptor is a ManageableLifecycle exposed over JMX (stop()/start()), which gives the removable-tap property at runtime. Floor: Spring Integration 6 and 7 both keep the Java 17 baseline of Spring Framework.",
+      "code_sketch": "@Bean\nMessageChannel ordersTap() { return MessageChannels.queue(1000).get(); }  // bounded tap buffer\n\n@Bean\nIntegrationFlow orders(OrderService orderService) {\n    return IntegrationFlow.from(\"orders\")\n        .wireTap(\"ordersTap\", wt -> wt.timeout(200))    // copy to secondary channel, capped wait\n        .handle(orderService, \"process\")                // primary flow unchanged\n        .get();\n}",
+      "pitfalls": [
+        "preSend dispatches synchronously in the sending thread, so a DirectChannel (the default channel type) as the tap target runs the whole analyzer inline and its latency and exceptions join the primary send - point the tap at a QueueChannel or ExecutorChannel for fire-and-forget semantics.",
+        "A failed handoff is silent by design: when wireTapChannel.send() returns false (full bounded queue past the timeout) WireTap only logs 'failed to send message to WireTap channel' at WARN - the drops are neither counted nor retried, so alert on that log or wrap the tap consumer with metrics.",
+        "The copy shares the payload and header object references with the primary message (SI immutability is by convention, and only MessageHistory is cloned) - a tap handler that mutates a mutable payload corrupts the primary flow's view.",
+        "Global channel interceptors apply to dynamically registered channels (IntegrationFlowContext, initializeBean) only from version 5.1 onward, and the WireTap vetoes intercepting its own target channel - register the tap where the channel is created to avoid it silently not being applied."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-integration/reference/channel/interceptors.html",
+        "https://docs.spring.io/spring-integration/reference/dsl/java-wiretap.html",
+        "https://docs.spring.io/spring-integration/api/org/springframework/integration/channel/interceptor/WireTap.html",
+        "https://docs.spring.io/spring-integration/docs/7.1.x/api/org/springframework/integration/dsl/BaseIntegrationFlowDefinition.html"
+      ]
+    },
+    {
+      "variant_id": "jakarta-jms-copy",
+      "name": "Hand-built copy with two Jakarta Messaging producers",
+      "paradigm": "oo",
+      "min_standard": "Java11",
+      "idiom_name": "MessageListener forwarding a copy on a separate JMSContext",
+      "implementation_notes": "Without an EIP framework the tap is ordinary messaging code: a MessageListener consumes from the primary destination, builds a fresh Message (new message of the right type, copying body and only the properties the analyzer needs), sends it to the tap queue through a separate JMSContext, then lets the original continue to the primary destination. The spec drives the design: a Session/JMSContext is a single-threaded context, and once a session has a registered listener it is dedicated to the delivery thread, so the tap send MUST NOT reuse the consuming context - create a new one with ConnectionFactory.createContext(), which the spec explicitly exempts from that threading restriction. Keep the tap best-effort: catch JMSException around the tap send, count the failure, and never rethrow, because an exception out of onMessage triggers redelivery of the business message. For real out-of-band latency, JMS 2.0+ async send (JMSProducer.completionListener) hands part of the send to a provider thread, with the CompletionListener invoked off the caller's thread - but after the send returns the spec forbids touching that Message, which is another reason the tap needs its own copy. Overflow/loss policy is the broker's (flow control, time-to-live) plus your counted catch block. Java 11 is the current floor: Jakarta Messaging 3.1 (Jakarta EE 10) requires Java SE 11+. Choose this when the stack has only the messaging API and no Camel/Spring runtime.",
+      "code_sketch": "public void onMessage(Message m) {\n    try (JMSContext tapCtx = cf.createContext()) {          // separate context; never the consume session\n        JMSProducer tap = tapCtx.createProducer()\n            .completionListener(new CountingListener(delivered, dropped)); // async, callback off-thread\n        tap.send(tapQueue, copyOf(tapCtx, m));              // independent copy: body + needed properties\n    } catch (JMSException e) {\n        dropped.increment();                                // explicit, visible loss policy\n    }\n    primaryProducer.send(m);                                // original, unchanged\n}",
+      "pitfalls": [
+        "Sessions and JMSContexts are single-threaded contexts and a session with a registered listener is dedicated to the delivery thread - 'it is erroneous for client code to use such a session from another thread of control'; reusing the consume session/context for the tap send also couples the tap to its transaction, so a tap failure rolls back or redelivers the business message (JMSRedelivered set, JMSXDeliveryCount incremented).",
+        "A session runs all its message listeners on a single thread, so a slow tap send inside onMessage head-of-line-blocks every other consumer on that session - use async send or a separate session so the tap stays off the delivery path.",
+        "A Message object is designed for one logical thread of control and after an asynchronous send 'the application must not attempt to read the headers, properties or body ... until the send has completed' (the provider may throw JMSException if you do) - hand the analyzer a fresh copy, never the live or async-sent message.",
+        "Swallowing tap exceptions is the right posture for the primary flow but means the tap can rot unnoticed; the spec routes async-send failures to the CompletionListener's onException on a provider thread, so wire that callback to a drop counter instead of an empty catch."
+      ],
+      "sources": [
+        "https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1.html"
+      ]
+    }
+  ],
+  "default_variant": "camel-wiretap",
+  "idiom_name": "Apache Camel route step .wireTap(uri)",
+  "implementation_notes": "Camel implements the pattern as a route step: .wireTap(uri) copies the original Exchange, sets its Exchange Pattern to InOnly (fire and forget) and sends the copy on a separate thread, so the tapped message is routed independently of the original route while the original continues unchanged. The copy is shallow - the docs state only the Exchange is copied, Wire Tap won't do a deep clone, so all copies can share body and header objects - use onPrepare with a Processor that deep-clones or serializes the body when the analyzer must not alias primary state. Thread model: a pool from Camel's default thread pool profile (poolSize 10, maxPoolSize 20, maxQueueSize 1000, rejectedPolicy CallerRuns); when pool and queue are exhausted further wiretaps run synchronously on the calling route thread, which is backpressure into the primary path - the documented remedy is an explicit executorService (a ThreadPoolProfile or a registered ExecutorService) with a larger queue or an Abort/Block rejection policy. Tapped exchanges are fire-and-forget, so failures surface only as route-level logs: export the tap endpoint's route metrics as the visible delivery counter. Choose this when Camel is already the integration runtime; Camel 4 requires Java 17 (4.22.x LTS supports Java 17/21/25), Camel 3.x (Java 11) is end of life.",
+  "code_sketch": "from(\"jms:queue:orders\")\n    .wireTap(\"jms:queue:orders-tap\")   // copy, InOnly, separate thread\n        .onPrepare(ex -> ex.getMessage().setBody(deepClone(ex.getMessage().getBody())))\n        .end()                                       // back to the main route\n    .to(\"bean:orderService\");                        // original exchange, unchanged",
+  "pitfalls": [
+    "The tapped Exchange is a shallow copy: 'Wire Tap won't do a deep clone ... all copies could share objects from the original Exchange', so an analyzer that mutates the body or headers corrupts what the primary route is still processing - deep-clone via onPrepare.",
+    "When the wire-tap thread pool is exhausted (default 10/20 threads with a 1000-entry queue, CallerRuns policy), 'further wiretaps will be executed synchronously by the calling thread', so a slow analyzer turns into latency injected straight into the primary route - size or replace the executor explicitly.",
+    "If you Wire Tap a stream message body, the docs say you should enable Stream Caching, otherwise the body may already be consumed when the tap endpoint reads it.",
+    "The copy is sent InOnly fire-and-forget: a failed tap send does not fail or retry from the wire tap itself, so without metrics on the tap route the analyzer silently loses messages."
+  ],
+  "sources": [
+    "https://camel.apache.org/components/4.22.x/eips/wireTap-eip.html",
+    "https://camel.apache.org/manual/threading-model.html",
+    "https://camel.apache.org/download/"
+  ],
+  "version": "1.1"
+}

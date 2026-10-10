@@ -1,0 +1,55 @@
+{
+  "pattern": "transactional-message-queue",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "transaction.atomic() + transaction.on_commit() / SQLAlchemy after_commit + outbox",
+  "implementation_notes": "The idiomatic Python realization ties publication to the commit boundary instead of to a transactional queue: inside transaction.atomic() a call to transaction.on_commit(callback) runs the callback only after the outermost transaction commits and never on rollback; SQLAlchemy offers the equivalent through session events (after_commit) or a two-phase session, and other frameworks expose similar hooks. When a crash between COMMIT and the in-memory callback would lose the message, the callback is replaced by an outbox row written in the same transaction and published by a separate worker.",
+  "code_sketch": "with transaction.atomic():\n    order = Order.objects.create(**payload)\n    transaction.on_commit(lambda: producer.send(\"orders\", order.event()))\n# or, when the crash window between commit and callback must be closed:\nwith transaction.atomic():\n    Order.objects.create(**payload)\n    Outbox.objects.create(topic=\"orders\", payload=json.dumps(payload))",
+  "pitfalls": [
+    "on_commit callbacks live in memory: a process crash after COMMIT but before the callback runs loses the publication, so guarantees beyond best-effort need the outbox row plus a relay.",
+    "Callbacks registered inside a nested atomic() block run only at the outermost commit, and discarding them silently is a common way to lose events.",
+    "A publish call placed in the transaction body (rather than the hook) still races the commit: the broker can see the message while the transaction is still open."
+  ],
+  "sources": [
+    "https://docs.djangoproject.com/en/stable/topics/db/transactions/"
+  ],
+  "variants": [
+    {
+      "variant_id": "commit-hook-outbox",
+      "name": "Commit-time publication hook (Django on_commit / SQLAlchemy after_commit) or outbox row",
+      "paradigm": "declarative",
+      "min_standard": "Python3.6",
+      "idiom_name": "transaction.atomic() + transaction.on_commit() / SQLAlchemy after_commit + outbox",
+      "implementation_notes": "The idiomatic Python realization ties publication to the commit boundary instead of to a transactional queue: inside transaction.atomic() a call to transaction.on_commit(callback) runs the callback only after the outermost transaction commits and never on rollback; SQLAlchemy offers the equivalent through session events (after_commit) or a two-phase session, and other frameworks expose similar hooks. When a crash between COMMIT and the in-memory callback would lose the message, the callback is replaced by an outbox row written in the same transaction and published by a separate worker.",
+      "code_sketch": "with transaction.atomic():\n    order = Order.objects.create(**payload)\n    transaction.on_commit(lambda: producer.send(\"orders\", order.event()))\n# or, when the crash window between commit and callback must be closed:\nwith transaction.atomic():\n    Order.objects.create(**payload)\n    Outbox.objects.create(topic=\"orders\", payload=json.dumps(payload))",
+      "pitfalls": [
+        "on_commit callbacks live in memory: a process crash after COMMIT but before the callback runs loses the publication, so guarantees beyond best-effort need the outbox row plus a relay.",
+        "Callbacks registered inside a nested atomic() block run only at the outermost commit, and discarding them silently is a common way to lose events.",
+        "A publish call placed in the transaction body (rather than the hook) still races the commit: the broker can see the message while the transaction is still open."
+      ],
+      "sources": [
+        "https://docs.djangoproject.com/en/stable/topics/db/transactions/"
+      ]
+    },
+    {
+      "variant_id": "confluent-kafka-transaction",
+      "name": "confluent-kafka transactional producer",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "Producer init_transactions / begin_transaction / send_offsets_to_transaction / commit_transaction",
+      "implementation_notes": "The broker-side realization: a Producer configured with a stable transactional.id calls init_transactions() once, then begin_transaction(), produce(), optionally send_offsets_to_transaction() to commit consumed offsets, and commit_transaction() or abort_transaction(). It makes the broker operations atomic among themselves and gives exactly-once effects for consume-transform-produce, but it cannot include a database write, so database-coupled services combine it with an outbox row or with the commit-hook variant.",
+      "code_sketch": "p = Producer({\"bootstrap.servers\": brokers, \"transactional.id\": \"orders-0\"})\np.init_transactions()\np.begin_transaction()\np.produce(\"orders\", key=str(order_id), value=event)\np.send_offsets_to_transaction(consumer.position(consumer.assignment()),\n                              consumer.consumer_group_metadata())\np.commit_transaction()          # or p.abort_transaction()",
+      "pitfalls": [
+        "init_transactions() must be called exactly once per producer and the transactional.id must be stable, otherwise zombie fencing is lost.",
+        "A transactional producer cannot run two transactions concurrently and is not thread-safe; sharing it across threads or asyncio tasks breaks the transaction state.",
+        "A failed commit_transaction() aborts the transaction, so the retry path must re-initialise before reusing the producer."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html",
+        "https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ],
+  "default_variant": "commit-hook-outbox",
+  "version": "1.0"
+}

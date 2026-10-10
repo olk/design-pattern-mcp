@@ -1,0 +1,59 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "queue_declare(arguments={x-dead-letter-*}) + basic_nack(requeue=False)",
+  "implementation_notes": "On AMQP the dead-letter channel is declared rather than coded: create the dead-letter exchange and its queue once, declare the source queue with arguments={'x-dead-letter-exchange': ..., 'x-dead-letter-routing-key': ...}, and have the consumer call basic_nack(delivery_tag, requeue=False) or basic_reject when the handler classifies the failure as terminal. pika keeps that decision in a single callback, and the broker takes over from there - including on TTL expiry and queue-length overflow. The DLQ side is an ordinary consumer that reads the x-death header for the original queue and reason. Celery has no dead-letter mechanism of its own: tasks that exhaust retries are dropped unless a parking mechanism like this one (or a result-backend table) is added.",
+  "code_sketch": "args = {'x-dead-letter-exchange': 'dlx', 'x-dead-letter-routing-key': 'failed'}\nchannel.exchange_declare('dlx', exchange_type='direct', durable=True)\nchannel.queue_declare('orders.dlq', durable=True)\nchannel.queue_bind('orders.dlq', 'dlx', routing_key='failed')\nchannel.queue_declare('orders', durable=True, arguments=args)\n\ndef on_message(ch, method, props, body):\n    try:\n        handle(body)\n        ch.basic_ack(method.delivery_tag)\n    except PermanentError:\n        ch.basic_nack(method.delivery_tag, requeue=False)   # -> dead-letter exchange",
+  "pitfalls": [
+    "basic_nack(requeue=True) is the default trap: the poison message returns to the head of the queue and the consumer spins; requeue=False is what engages dead-lettering.",
+    "pika's BlockingConnection and its channels are not thread-safe: nacking from a worker thread through the consumer's channel corrupts the frame stream.",
+    "If the dead-letter exchange does not exist at dead-letter time the message is dropped silently, so DLX and DLQ must be declared before the source queue and kept in every deployment.",
+    "An exception raised outside the try (or a dropped connection) leaves the message unacked; the broker redelivers it, and the dead-letter decision then happens by delivery count rather than by the handler."
+  ],
+  "sources": [
+    "https://pika.readthedocs.io/en/stable/modules/channel.html",
+    "https://www.rabbitmq.com/docs/dlx"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "pika-rabbitmq-dlx",
+      "name": "RabbitMQ dead-letter exchange declared from pika",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "queue_declare(arguments={x-dead-letter-*}) + basic_nack(requeue=False)",
+      "implementation_notes": "On AMQP the dead-letter channel is declared rather than coded: create the dead-letter exchange and its queue once, declare the source queue with arguments={'x-dead-letter-exchange': ..., 'x-dead-letter-routing-key': ...}, and have the consumer call basic_nack(delivery_tag, requeue=False) or basic_reject when the handler classifies the failure as terminal. pika keeps that decision in a single callback, and the broker takes over from there - including on TTL expiry and queue-length overflow. The DLQ side is an ordinary consumer that reads the x-death header for the original queue and reason. Celery has no dead-letter mechanism of its own: tasks that exhaust retries are dropped unless a parking mechanism like this one (or a result-backend table) is added.",
+      "code_sketch": "args = {'x-dead-letter-exchange': 'dlx', 'x-dead-letter-routing-key': 'failed'}\nchannel.exchange_declare('dlx', exchange_type='direct', durable=True)\nchannel.queue_declare('orders.dlq', durable=True)\nchannel.queue_bind('orders.dlq', 'dlx', routing_key='failed')\nchannel.queue_declare('orders', durable=True, arguments=args)\n\ndef on_message(ch, method, props, body):\n    try:\n        handle(body)\n        ch.basic_ack(method.delivery_tag)\n    except PermanentError:\n        ch.basic_nack(method.delivery_tag, requeue=False)   # -> dead-letter exchange",
+      "pitfalls": [
+        "basic_nack(requeue=True) is the default trap: the poison message returns to the head of the queue and the consumer spins; requeue=False is what engages dead-lettering.",
+        "pika's BlockingConnection and its channels are not thread-safe: nacking from a worker thread through the consumer's channel corrupts the frame stream.",
+        "If the dead-letter exchange does not exist at dead-letter time the message is dropped silently, so DLX and DLQ must be declared before the source queue and kept in every deployment.",
+        "An exception raised outside the try (or a dropped connection) leaves the message unacked; the broker redelivers it, and the dead-letter decision then happens by delivery count rather than by the handler."
+      ],
+      "sources": [
+        "https://pika.readthedocs.io/en/stable/modules/channel.html",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    },
+    {
+      "variant_id": "sqs-redrive-policy",
+      "name": "Amazon SQS RedrivePolicy with maxReceiveCount and DLQ redrive",
+      "paradigm": "declarative",
+      "min_standard": "Python3.8",
+      "idiom_name": "boto3 set_queue_attributes(RedrivePolicy) + StartMessageMoveTask redrive",
+      "implementation_notes": "On SQS dead-lettering is a queue attribute rather than consumer logic: the source queue carries a RedrivePolicy naming the dead-letter queue and a maxReceiveCount, every receive that ends without a delete (because the visibility timeout expired) increments the receive count, and at the limit SQS moves the message to the DLQ. The consumer therefore only has to be correct about acknowledgement - delete on success, let the visibility timeout expire on failure - and the operator drains the DLQ with receive_message or moves the backlog back with the queue-level redrive task once the fix is deployed. The trade-off against AMQP is coarser control: there is no per-message nack, the dead-letter target is selected per source queue, and ordering is best-effort.",
+      "code_sketch": "sqs = boto3.client('sqs')\ndlq = sqs.create_queue(QueueName='orders-dlq')['QueueUrl']\nsqs.set_queue_attributes(QueueUrl=src, Attributes={'RedrivePolicy': json.dumps({\n    'deadLetterTargetArn': dlq_arn, 'maxReceiveCount': '5'})})\n\nfor m in sqs.receive_message(QueueUrl=src, MaxNumberOfMessages=10).get('Messages', []):\n    try:\n        handle(m)\n        sqs.delete_message(QueueUrl=src, ReceiptHandle=m['ReceiptHandle'])\n    except PermanentError:\n        pass                    # do not delete: the receive count grows until the DLQ",
+      "pitfalls": [
+        "Deleting the message in a finally block (or on any exception) resets the path to the DLQ: the receive count never grows and failed messages vanish.",
+        "Standard queues are at-least-once with best-effort ordering, so a message can be processed several times before it is dead-lettered; handlers must already be idempotent.",
+        "The DLQ must be the same queue type (standard/FIFO) in the same account and region, and its retention must cover the redrive window or messages expire while parked.",
+        "A bulk redrive re-injects the entire backlog at once: without filtering or rate limiting, the poison messages that caused the incident return together."
+      ],
+      "sources": [
+        "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"
+      ]
+    }
+  ],
+  "default_variant": "pika-rabbitmq-dlx"
+}

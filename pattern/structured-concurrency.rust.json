@@ -1,0 +1,73 @@
+{
+  "pattern": "structured-concurrency",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "tokio::task::JoinSet + join_next/shutdown",
+  "implementation_notes": "In async Rust the scope is a JoinSet: spawned tasks are owned by the set, join_next() awaits them one by one and surfaces panics as JoinError, and dropping the set aborts the tasks still tracked (the docs state tasks are aborted when the JoinSet is dropped). abort_all()/shutdown() implement failure-driven cancellation, but aborting only takes effect at the next await point. Use std::thread::scope for OS threads and futures::try_join for fixed subtrees.",
+  "code_sketch": "let mut set = tokio::task::JoinSet::new();\nfor url in urls { set.spawn(fetch(url)); }\nlet mut results = Vec::new();\nwhile let Some(res) = set.join_next().await {   // join every child\n    results.push(res?);                          // JoinError = panic or abort\n}\n// dropping `set` aborts any task that was not joined",
+  "pitfalls": [
+    "Drop-abort means an early return silently cancels children and discards their partial work - finish the join loop or make the cancellation explicit.",
+    "Task panics are caught by the runtime and arrive as JoinError, not as a scope failure; unwrap and translate them so the caller sees the real cause.",
+    "A blocking call (std::fs, a sync mutex, a CPU loop) inside a task starves the runtime worker; use spawn_blocking for blocking children."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "tokio-joinset",
+      "name": "tokio JoinSet (async tasks)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "tokio runtime"
+      ],
+      "idiom_name": "tokio::task::JoinSet + join_next/shutdown",
+      "implementation_notes": "In async Rust the scope is a JoinSet: spawned tasks are owned by the set, join_next() awaits them one by one and surfaces panics as JoinError, and dropping the set aborts the tasks still tracked (the docs state tasks are aborted when the JoinSet is dropped). abort_all()/shutdown() implement failure-driven cancellation, but aborting only takes effect at the next await point. Use std::thread::scope for OS threads and futures::try_join for fixed subtrees.",
+      "code_sketch": "let mut set = tokio::task::JoinSet::new();\nfor url in urls { set.spawn(fetch(url)); }\nlet mut results = Vec::new();\nwhile let Some(res) = set.join_next().await {   // join every child\n    results.push(res?);                          // JoinError = panic or abort\n}\n// dropping `set` aborts any task that was not joined",
+      "pitfalls": [
+        "Drop-abort means an early return silently cancels children and discards their partial work - finish the join loop or make the cancellation explicit.",
+        "Task panics are caught by the runtime and arrive as JoinError, not as a scope failure; unwrap and translate them so the caller sees the real cause.",
+        "A blocking call (std::fs, a sync mutex, a CPU loop) inside a task starves the runtime worker; use spawn_blocking for blocking children."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html"
+      ]
+    },
+    {
+      "variant_id": "std-scoped-threads",
+      "name": "std::thread::scope (Rust 1.63+)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.63",
+      "idiom_name": "std::thread::scope + scoped spawn",
+      "implementation_notes": "std::thread::scope gives OS threads the same containment: threads spawned inside the scope closure are automatically joined before scope() returns (per the documentation, all threads spawned within the scope that have not been manually joined are joined) and may borrow non-'static locals. There is no cancellation primitive - a running thread cannot be dropped - so cooperative stop flags/atomics or channels provide early exit, and explicit ScopedJoinHandle::join() is needed to handle a child's panic instead of letting it panic the whole scope.",
+      "code_sketch": "let stop = std::sync::atomic::AtomicBool::new(false);\nstd::thread::scope(|s| {\n    for url in &urls {\n        s.spawn(|| fetch(url, &stop));\n    }\n});   // all threads joined here; a panicking child panics the scope",
+      "pitfalls": [
+        "If any automatically joined child panicked, scope() panics - join the handles explicitly when partial failure must be recoverable.",
+        "There is no forced termination for threads; a child that ignores the stop flag delays scope exit forever.",
+        "Scoped threads must not outlive the borrows they were given; the borrow checker enforces this, but work moved into channels can still be lost."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/thread/fn.scope.html"
+      ]
+    },
+    {
+      "variant_id": "futures-try-join",
+      "name": "futures::try_join for fixed subtrees (no spawn)",
+      "paradigm": "concurrent",
+      "idiom_name": "futures::try_join / join on fixed-size subtrees",
+      "implementation_notes": "For a fixed, known set of subtasks the futures crate composes them on one task: try_join awaits both children and completes with the first error, dropping the sibling future, which cancels it at its next await point; join waits for all regardless of failure. There is no scope object and no spawn, so keep the futures alive in the combinator expression, and switch to JoinSet when children appear dynamically.",
+      "code_sketch": "use futures::future::try_join;\nlet (user, order) = try_join(find_user(id), fetch_order(id)).await?;  // first error wins;\n// the sibling future is dropped, i.e. cancelled at its next await point",
+      "pitfalls": [
+        "Dropping a future is safe only if it is cancellation-safe; a combinator must not be abandoned mid-state-transition without cleanup.",
+        "Both children run on the caller's task, so one busy child delays the other - spawn for CPU-bound or blocking work.",
+        "With more than a couple of heterogeneous futures, error types must agree for try_join_all/try_join_* to compose."
+      ],
+      "sources": [
+        "https://docs.rs/futures/latest/futures/future/fn.try_join.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-joinset",
+  "version": "1.0"
+}

@@ -1,0 +1,176 @@
+{
+  "category": "persistence-state",
+  "name": "lazy-initialization",
+  "aliases": [
+    "lazy instantiation",
+    "on-demand initialization"
+  ],
+  "intent": "Defer building an expensive or frequently unused value until the moment it is first needed, so an object, module or process pays for a resource only if some code path actually uses it.",
+  "problem": "A field is expensive to build - a query result, a decoded blob, a connection, an index - and most instances never read it: building it eagerly makes every construction slow, allocates memory nobody uses and can fail for objects that would have worked without it, while rebuilding it on each access repeats the cost.",
+  "context": "Applies inside an object, a module or a process-global facility whose members have uneven and hard-to-predict access patterns, where construction cost dominates and where the resource may legitimately never be needed. In single-threaded code the decision is only about cost and error locality; once several threads can arrive at the value at the same time the decision also covers publication (a marker check, a once-primitive or a language-level lazy binding), and that is where the pattern's real risks live.",
+  "benefits": [
+    "Construction becomes cheap: creating an object, loading a module or starting a process no longer pays for members that are never touched.",
+    "The cost is paid at most once per instance - or once per process for shared/static values - so every later access is a plain read plus a marker test.",
+    "Resource-hungry dependencies (connections, file handles, decoders, caches) are acquired only on the code paths that need them, which shortens startup and lowers peak memory.",
+    "Failures stay local: an instance whose lazy part is never used keeps working even when that optional dependency is unavailable or misconfigured.",
+    "It is a reversible decision: the accessor is a seam, so the value can later be made eager (or backed by a cache) without changing a single client."
+  ],
+  "tradeoffs": [
+    "Every access still pays a branch - and in the lock-based forms an atomic read or a lock acquire - so the field is never truly constant/final and the check sits on the hot path it was meant to shorten.",
+    "Failure policy is implicit in most once-primitives: the attempt (Go's sync.Once), the exception (C# Lazy<T> built from a factory) or nothing at all (std::call_once leaves the flag unflipped and retries) may be cached, so a transient error can become permanent - or silently recur - depending on the mechanism chosen.",
+    "Initialisation errors surface at first use instead of at startup: the stack trace points into an unrelated accessor, boot-time validation no longer proves the dependency works, and the failure can land inside a request instead of during deployment.",
+    "Latency becomes non-deterministic: the first access after a cold start (or after a reload) pays the whole cost, which shows up as unexplained p99 spikes and makes startup-time budgets unverifiable - the opposite bargain from eager acquisition.",
+    "Concurrency correctness is easy to lose: double-checked locking without volatile/atomic publication is broken (Java before 5, C++ before 11, hand-rolled C), and non-atomic idioms (Ruby ||=, Python's cached_property, Swift's lazy var, a plain C guard) may compute twice or publish a partially built object; recursive initialisation (an initialiser that re-enters the same cell) deadlocks, recurses or throws a mechanism-specific error.",
+    "The built value is retained for as long as its owner lives - lazily populated caches, listener lists and mappings keep growing and are never released until the instance dies - and a field that looks free in a constructor can hold a connection or a memory-hungry structure for an unbounded time."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Lazy Cell",
+      "responsibility": "Holds the marker meaning 'not built yet' together with the built value; usually a private field, a static slot, or the delegate/once-type that owns them."
+    },
+    {
+      "role": "Initializer",
+      "responsibility": "Builds the value exactly once (or safely loses a race); it should touch nothing that re-enters the same cell and should be safe to run at most once."
+    },
+    {
+      "role": "Guarded Accessor",
+      "responsibility": "The only route to the value: it consults the guard, runs the initializer when needed, publishes the result and returns it; clients never see the marker."
+    },
+    {
+      "role": "Guard (once-primitive or marker)",
+      "responsibility": "Makes 'not built yet' observable and the transition to 'built' atomic for concurrent callers: a null sentinel, once_flag/once.Func, Lazy<T>, OnceLock, or a lazy binding guaranteed by the language."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Reads the member through the accessor and stays unaware of when or how it was built - though it does observe the first-access latency and any initialisation failure."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow"
+  ],
+  "use_cases": [
+    "ORM entities whose large column or related collection is materialised only when business logic touches it (the classic Lazy Load field).",
+    "Configuration/application objects holding optional expensive subsystems - database pool, TLS context, model, decoder - that most code paths never reach.",
+    "Caches and indexes built on first query, such as an in-process lookup table, a compiled regular expression or a parsed schema.",
+    "Module or package initialisation: a heavyweight submodule imported on first attribute access (Python module __getattr__, JavaScript dynamic import, Java holder class).",
+    "Process-wide infrastructure (loggers, clients, thread pools) that must not be constructed during static initialisation, including construct-on-first-use accessors for shared objects.",
+    "View models and UI objects that materialise expensive child graphics or detail data only when first displayed.",
+    "Python module-level lazy imports (PEP 0793, Python 3.15+): heavy submodules such as parsers, regex engines, or ML libraries imported only when first referenced, reducing startup time and baseline memory for code paths that never touch them.",
+    "Rust process-global OnceLock singletons: database clients, HTTP connectors, or telemetry exporters initialised at first use but shared across the entire program, avoiding static init order bugs and the static-lifetime constraint that plague raw statics.",
+    "Python's importlib.util.LazyLoader wraps an import loader so module code executes only when an attribute is first accessed, a concrete module-level implementation for optional imports.",
+    ".NET's System.Lazy<T> wraps an initializer and creates the value only when Value is first accessed; LazyThreadSafetyMode makes publication and exception-caching policy explicit.",
+    "Entity Framework Core's UseLazyLoadingProxies and ILazyLoader materialise navigation properties on access, a framework-owned object-level implementation whose query cost must be measured."
+  ],
+  "avoid_when": [
+    "Construction is cheap (a few field assignments or a small allocation): the marker test and its state cost as much as the work and add a failure mode.",
+    "The value is read on every code path, or instances that do not use it are not a real case: eager construction in the constructor is simpler and fails fast.",
+    "Deterministic startup, memory and latency budgets matter more than average cost - embedded and real-time paths, or services that must refuse traffic when a dependency is broken (compare Eager Acquisition).",
+    "The value must be validated or authorised before any use: validate eagerly or make the failure explicit at the boundary instead of discovering it inside an accessor.",
+    "The host type has value semantics with no mutable cell to carry the marker: use a computed property, a lazily constructed wrapper or an explicit once-type field instead.",
+    "A framework already owns the decision (DI container lazy resolution, ORM lazy loading, Spring @Lazy/bean scopes, framework caches): configure that mechanism rather than hand-rolling a second one."
+  ],
+  "language_files": {
+    "generic": "lazy-initialization.generic.json",
+    "c": "lazy-initialization.c.json",
+    "cplusplus": "lazy-initialization.cplusplus.json",
+    "csharp": "lazy-initialization.csharp.json",
+    "go": "lazy-initialization.go.json",
+    "java": "lazy-initialization.java.json",
+    "javascript": "lazy-initialization.javascript.json",
+    "kotlin": "lazy-initialization.kotlin.json",
+    "python": "lazy-initialization.python.json",
+    "ruby": "lazy-initialization.ruby.json",
+    "rust": "lazy-initialization.rust.json",
+    "scala": "lazy-initialization.scala.json",
+    "swift": "lazy-initialization.swift.json",
+    "typescript": "lazy-initialization.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "smalltalk",
+    "eaa"
+  ],
+  "related_patterns": [
+    "lazy-load",
+    "lazy-acquisition",
+    "virtual-proxy",
+    "memoization",
+    "double-checked-locking",
+    "cache-aside",
+    "singleton",
+    "eager-acquisition"
+  ],
+  "anti_patterns": [
+    "Double-checked locking without volatile/atomic publication - unsynchronised DCL (pre-Java-5, pre-C++11, hand-rolled C) is the classic broken idiom that publishes a partially constructed object.",
+    "Lazy getters that do work beyond construction - I/O, remote calls, cache warming, logging - turning an ordinary property read into an unpredictable, hard-to-test operation.",
+    "Marking everything lazy 'just in case': fields read on every path then pay a guard test for nothing, and the object's cost profile becomes impossible to reason about.",
+    "Caching an initialisation failure (or a panic) forever and presenting it as exactly-once semantics.",
+    "Using lazy initialization to paper over missing resource ownership: the real fix is deterministic release (RAII/Dispose) or a pool, not a deferred constructor.",
+    "Global mutable lazy singletons used as an architecture device: hidden global state with non-deterministic construction order and surprising first-call cost."
+  ],
+  "migration_from": [
+    "eager-acquisition"
+  ],
+  "migration_to": [
+    "memoization"
+  ],
+  "design_principles": [
+    "Lazy evaluation: pay only for what is used, and postpone work until its result is actually required.",
+    "Separation of concerns: 'what the value is' (the initializer) is separated from 'when it becomes available' (the access policy).",
+    "Encapsulation: the marker state and the initialisation policy stay inside the accessor, so clients see a plain read and no client can build the value twice.",
+    "Idempotence: the initializer must be safe to attempt at most once, and its result is the single authoritative value for the cell's lifetime.",
+    "Ownership discipline: the cell owns the built value, so its lifetime, invalidation and release are decided with the cell, not left to callers."
+  ],
+  "best_practices": [
+    "Prefer the language's own mechanism - function-local static, std::call_once, Lazy<T>/LazyInitializer, sync.Once, by lazy, lazy val, OnceLock/LazyLock, cached_property - over a hand-rolled guard, and hand-roll only where the runtime gives nothing, documenting the memory model you rely on.",
+    "Keep the initializer small, free of callbacks into the same object or cell, and free of side effects other than the construction; anything else must be an explicit method call, not hidden in an accessor.",
+    "State the failure policy in the code or its name: failure cached (C# factory-based Lazy<T>, Go once values), failure retried (std::call_once, function-local statics), or failure surfaced once (a Result/Monad cell).",
+    "Publish shared lazy values through the runtime's once/atomic primitive; never through a plain non-volatile field, and prefer first-access-wins semantics over last-write-wins.",
+    "Measure before applying: compare construction cost times the share of instances that need the value against the guard's cost, and keep mandatory values eager.",
+    "Provide an explicit reset/invalidate seam when the value depends on external state (configuration reload, connection loss, tenant switch), or the cell will be stale for the process lifetime.",
+    "Make laziness visible where clients can observe it (Lazy<T>, lazy var, OnceLock, a documented first-access cost) instead of hiding a slow build behind getFoo().",
+    "Pair every lazily built resource with a release rule (dispose, close, invalidate, reset) so the cell can be emptied when its owner is disposed.",
+    "Prefer language-provided intrinsics over hand-rolled guards: Python's functools.cached_property (3.8+), Rust's OnceLock/LazyLock (1.70+/1.80+), Go's sync.Once, Swift's lazy var, Kotlin's by lazy, Java's Lazy<T> — these are battle-tested against the language's memory model and handle the hard cases (poison, retry, deadlock) correctly.",
+    "Document the failure policy in code or naming: some mechanisms cache a failed attempt permanently (C# Lazy<T> with LazyThreadSafetyMode.ExecutionAndPublication), while others retry on every access (std::call_once, Go sync.Once) — a caller who assumes the wrong policy will mishandle a transient failure.",
+    "Never build a lazy cell that re-enters itself: an initializer that accesses the same cell causes a deadlock (Rust OnceLock), an infinite recursion, or a mechanism-specific error. Keep initializers narrow and free of callbacks into the owner.",
+    "Provide an explicit reset or invalidate seam when the built value depends on mutable external state (configuration reload, database connection switch, tenant context change) — otherwise the cell holds stale data for the owner's entire lifetime with no recovery path."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Kent Beck, Smalltalk Best Practice Patterns (1997) - 'Lazy Initialization', p. 85: the pattern's origin as a named idiom for deferring a value's construction until first use.",
+    "Martin Fowler, Patterns of Enterprise Application Architecture (2002), Lazy Load chapter: lazy initialization is the first of the four Lazy Load implementations (with virtual proxy, value holder and ghost) - 'Lazy Initialization uses a special marker value (usually null) to indicate a field isn't loaded yet'.",
+    "https://martinfowler.com/eaaCatalog/lazyLoad.html",
+    "https://learn.microsoft.com/en-us/dotnet/framework/performance/lazy-initialization",
+    "https://en.wikipedia.org/wiki/Lazy_initialization",
+    "Python Software Foundation, \"functools.cached_property — Python 3.13 Documentation\" (2024): https://docs.python.org/3/library/functools.html#functools.cached_property — \"Transforms a method of a class into a property whose value is computed once and then cached as a normal attribute for the life of the instance.\"",
+    "Python Software Foundation, \"PEP 0793 – Lazy Imports (Python 3.15)\" (2024): https://peps.python.org/pep-0793/ — \"Defers module loading until the imported name is first accessed using the lazy soft keyword.\"",
+    "The Rust Team, \"std::sync::OnceLock — The Rust Standard Library\" (2024): https://doc.rust-lang.org/std/sync/struct.OnceLock.html — \"Many threads may call get_or_init concurrently with different initializing functions, but it is guaranteed that only one function will be executed. If the initialization closure panics, the cell remains uninitialized.\"",
+    "The Rust Team, \"std::sync::LazyLock — The Rust Standard Library\" (2024): https://doc.rust-lang.org/std/sync/struct.LazyLock.html — \"LazyLock blocks the calling thread if another initialization routine is currently running. If the initialization closure panics, the panic is propagated and the lock becomes poisoned.\"",
+    "James Gosling et al., \"Java Language Specification – Section 12.4.2 Initialization Procedures\" (Java 21, 2023): https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html#jls-12.4.2 — specifies the precise mechanics of when class initialization is triggered.",
+    "Java Community Process, JSR-133 (Java Memory Model) — Double-Checked Locking (2004): https://www.cs.umd.edu/~pugh/java/memoryModel/jsr133.html — warns that pre-Java-5 double-checked locking can publish a partially constructed object.",
+    "https://www.martinfowler.com/bliki/LazyInitialization.html",
+    "https://docs.python.org/3/library/importlib.html",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1?view=net-10.0",
+    "https://learn.microsoft.com/en-us/ef/core/querying/related-data/lazy"
+  ]
+}

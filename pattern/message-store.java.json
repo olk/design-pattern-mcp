@@ -1,0 +1,65 @@
+{
+  "pattern": "message-store",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "MessageStore (JdbcMessageStore) + IntegrationFlow Wire Tap",
+  "implementation_notes": "Spring Integration ships the pattern as an interface: MessageStore.addMessage/getMessage/removeMessage (plus getMessageMetadata for querying without deserialising) with JdbcMessageStore backed by the packaged int_message/int_group schema, MongoDbMessageStore, RedisMessageStore and a SimpleMessageStore for tests; regions separate independent audit streams. Wire the copy off the main path with a Wire Tap or an outbound channel interceptor whose handler calls store.addMessage, and route the tap's failures to a counted error channel, because a tap that throws would push store availability into the delivery path. Reporting reads the store directly (or the owning database), and retention is a scheduled job calling removeMessage / expiring groups, or plain SQL when the application owns the schema. Choose this variant when the application already runs Spring Integration; the classic hand-written structure remains the better choice when one audit table is the only reason to add the dependency.",
+  "code_sketch": "@Bean\nMessageStore store(DataSource ds) {\n    JdbcMessageStore s = new JdbcMessageStore(ds);   // packaged schema: int_message, int_group\n    s.setRegion(\"orders.audit\");                     // one region per audit stream\n    return s;\n}\n@Bean\nIntegrationFlow flow(MessageStore store) {\n    return IntegrationFlow.from(\"orders\")\n        .wireTap(t -> t.handle(m -> store.addMessage(m)))   // copy, off the main path\n        .handle(orderService())                             // business handling unchanged\n        .get();\n}",
+  "pitfalls": [
+    "A Wire Tap handler that throws (or an unconfigured error channel) can propagate into the main flow; route tap failures to a counted error channel so the copy stays best-effort.",
+    "JdbcMessageStore tables grow without bound: retention or group expiry must be scheduled, or the audit store quietly becomes the largest table in the database.",
+    "getMessage deserialises stored payloads with the application's converters; a later payload-class change makes old rows unreadable unless serialisation is versioned or stored as explicit JSON.",
+    "Sharing one region between unrelated flows mixes records and their retention rules; separate regions (or stores) keep each stream's policy and access separable."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-integration/reference/message-store.html",
+    "https://docs.spring.io/spring-integration/api/org/springframework/integration/store/MessageStore.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "spring-integration-jdbc-store",
+      "name": "Spring Integration MessageStore behind a Wire Tap",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "spring-integration"
+      ],
+      "idiom_name": "MessageStore (JdbcMessageStore) + IntegrationFlow Wire Tap",
+      "implementation_notes": "Spring Integration ships the pattern as an interface: MessageStore.addMessage/getMessage/removeMessage (plus getMessageMetadata for querying without deserialising) with JdbcMessageStore backed by the packaged int_message/int_group schema, MongoDbMessageStore, RedisMessageStore and a SimpleMessageStore for tests; regions separate independent audit streams. Wire the copy off the main path with a Wire Tap or an outbound channel interceptor whose handler calls store.addMessage, and route the tap's failures to a counted error channel, because a tap that throws would push store availability into the delivery path. Reporting reads the store directly (or the owning database), and retention is a scheduled job calling removeMessage / expiring groups, or plain SQL when the application owns the schema. Choose this variant when the application already runs Spring Integration; the classic hand-written structure remains the better choice when one audit table is the only reason to add the dependency.",
+      "code_sketch": "@Bean\nMessageStore store(DataSource ds) {\n    JdbcMessageStore s = new JdbcMessageStore(ds);   // packaged schema: int_message, int_group\n    s.setRegion(\"orders.audit\");                     // one region per audit stream\n    return s;\n}\n@Bean\nIntegrationFlow flow(MessageStore store) {\n    return IntegrationFlow.from(\"orders\")\n        .wireTap(t -> t.handle(m -> store.addMessage(m)))   // copy, off the main path\n        .handle(orderService())                             // business handling unchanged\n        .get();\n}",
+      "pitfalls": [
+        "A Wire Tap handler that throws (or an unconfigured error channel) can propagate into the main flow; route tap failures to a counted error channel so the copy stays best-effort.",
+        "JdbcMessageStore tables grow without bound: retention or group expiry must be scheduled, or the audit store quietly becomes the largest table in the database.",
+        "getMessage deserialises stored payloads with the application's converters; a later payload-class change makes old rows unreadable unless serialisation is versioned or stored as explicit JSON.",
+        "Sharing one region between unrelated flows mixes records and their retention rules; separate regions (or stores) keep each stream's policy and access separable."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-integration/reference/message-store.html",
+        "https://docs.spring.io/spring-integration/api/org/springframework/integration/store/MessageStore.html"
+      ]
+    },
+    {
+      "variant_id": "plain-jdbc-store",
+      "name": "Hand-written JDBC store with batched inserts",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "jdbc"
+      ],
+      "idiom_name": "PreparedStatement addBatch/executeBatch + explicit commit",
+      "implementation_notes": "Without a framework the store is a small repository: a DataSource, one prepared INSERT executed in batches inside a single transaction (setAutoCommit(false), addBatch, executeBatch, commit), so durability costs one fsync per batch instead of one per message, plus an index on the report columns (correlation id, channel, recorded_at). The tap is a bounded BlockingQueue drained by one writer thread, which is what keeps the delivery path from touching the connection. Retention is a scheduled DELETE by timestamp, or a partitioned table where the database offers partitioning. Choose this variant when the application already owns its schema and the only reason to add a framework would be this one table; choose the Spring Integration variant when the flow is already built from channels and endpoints.",
+      "code_sketch": "try (Connection c = ds.getConnection()) {\n    c.setAutoCommit(false);                        // one transaction per batch\n    try (PreparedStatement ps = c.prepareStatement(\n            \"INSERT INTO msg_store(id, chan, ts, body) VALUES (?,?,?,?)\")) {\n        for (StoredMessage m : batch) {\n            ps.setString(1, m.id()); ps.setString(2, m.channel());\n            ps.setLong(3, m.recordedAt()); ps.setString(4, m.body());\n            ps.addBatch();\n        }\n        ps.executeBatch();                         // one fsync per batch, not per message\n        c.commit();\n    }\n}",
+      "pitfalls": [
+        "With auto-commit left on, every message costs its own transaction and fsync; batching plus an explicit commit is what makes the store affordable at message rates.",
+        "JDBC objects are not thread-safe: sharing a Connection or PreparedStatement between the delivery thread and the writer corrupts batches - hand records to a single writer, not the connection to everyone.",
+        "Without an index on the reporting columns the audit queries scan a growing table; the index is part of the pattern, not an optimisation to add later.",
+        "Unbounded retention turns the table into the database's largest object; a scheduled DELETE by timestamp (or partitioning) belongs in the same repository as the insert."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/jdbc/basics/transactions.html"
+      ]
+    }
+  ],
+  "default_variant": "spring-integration-jdbc-store"
+}

@@ -1,0 +1,56 @@
+{
+  "pattern": "backpressure",
+  "language": "go",
+  "support": "native",
+  "variants": [
+    {
+      "variant_id": "buffered-channel",
+      "name": "Buffered channel: send blocks when full",
+      "paradigm": "concurrent",
+      "idiom_name": "make(chan T, n) + blocking send / select",
+      "implementation_notes": "Go makes backpressure the default semantics of the language: a send on a buffered channel blocks once the buffer is full, so `make(chan T, n)` IS the bounded queue and the pipeline stage automatically runs no faster than its slowest consumer; an unbuffered channel makes every hand-off a rendezvous. The classic queue-plus-lock structure is never written, and select with a default branch or a ctx.Done() case converts blocking into the explicit policies (shed or cancel). The same primitive paces a fan-in: if the consumer loop is the only goroutine sending downstream, its whole pipeline follows the slowest link.",
+      "code_sketch": "out := make(chan Frame, 64)              // the bound\ngo func() {\n    defer close(out)                      // consumers know when work ends\n    for f := range src {\n        select {\n        case out <- f:                    // blocks while the buffer is full\n        case <-ctx.Done():\n            return                        // deadline/cancel beats a stuck consumer\n        }\n    }\n}()",
+      "pitfalls": [
+        "Polling len(ch) to decide whether a send would block is a race; the bound must come from the channel's capacity and the blocking send itself.",
+        "A goroutine per message with an unbounded slice or channel behind it discards the pattern entirely and buffers until OOM.",
+        "Forgetting close(out) makes consumers block forever, while closing from the consumer side panics; the producer owns close.",
+        "Sending on a channel inside a select with default drops messages silently - that is load shedding, and it must be a documented decision."
+      ],
+      "sources": [
+        "https://go.dev/blog/pipelines"
+      ]
+    },
+    {
+      "variant_id": "weighted-semaphore",
+      "name": "Weighted semaphore for a bound on in-flight work",
+      "paradigm": "concurrent",
+      "idiom_name": "golang.org/x/sync/semaphore Weighted.Acquire/Release",
+      "implementation_notes": "When the limit is in-flight concurrent work rather than queued messages, the bound is a semaphore: golang.org/x/sync/semaphore's Weighted.Acquire blocks (or TryAcquire fails) and Release returns capacity, so a goroutine that cannot get a permit waits instead of spawning unbounded work. Channels express the same thing idiomatically when the unit is a message, and a buffered channel used as a token bucket is often sufficient; the semaphore wins when permits are weighted (cost per request) or the bound must be shared across pipelines. Either way the bound is explicit, and context cancellation stays attached to the wait.",
+      "code_sketch": "slots := semaphore.NewWeighted(8)        // at most 8 in flight\n\nfunc handle(ctx context.Context, req Request) error {\n    if err := slots.Acquire(ctx, 1); err != nil {\n        return err                        // cancelled while waiting\n    }\n    defer slots.Release(1)                // every exit path frees capacity\n    return process(ctx, req)              // else: tryAcquire + shed, if preferred\n}",
+      "pitfalls": [
+        "semaphore.Weighted without a ctx timeout blocks forever when every permit is held by a stalled handler.",
+        "Release on the success path only leaks permits until the limiter is permanently saturated.",
+        "A semaphore bounds concurrency, not queue length: waiting goroutines and their memory still accumulate unless Acquire has a deadline.",
+        "Using a shared semaphore for unrelated stages couples their throughput; budget capacity per dependency instead."
+      ],
+      "sources": [
+        "https://pkg.go.dev/golang.org/x/sync/semaphore",
+        "https://go.dev/blog/pipelines"
+      ]
+    }
+  ],
+  "default_variant": "buffered-channel",
+  "idiom_name": "make(chan T, n) + blocking send / select",
+  "implementation_notes": "Go makes backpressure the default semantics of the language: a send on a buffered channel blocks once the buffer is full, so `make(chan T, n)` IS the bounded queue and the pipeline stage automatically runs no faster than its slowest consumer; an unbuffered channel makes every hand-off a rendezvous. The classic queue-plus-lock structure is never written, and select with a default branch or a ctx.Done() case converts blocking into the explicit policies (shed or cancel). The same primitive paces a fan-in: if the consumer loop is the only goroutine sending downstream, its whole pipeline follows the slowest link.",
+  "code_sketch": "out := make(chan Frame, 64)              // the bound\ngo func() {\n    defer close(out)                      // consumers know when work ends\n    for f := range src {\n        select {\n        case out <- f:                    // blocks while the buffer is full\n        case <-ctx.Done():\n            return                        // deadline/cancel beats a stuck consumer\n        }\n    }\n}()",
+  "pitfalls": [
+    "Polling len(ch) to decide whether a send would block is a race; the bound must come from the channel's capacity and the blocking send itself.",
+    "A goroutine per message with an unbounded slice or channel behind it discards the pattern entirely and buffers until OOM.",
+    "Forgetting close(out) makes consumers block forever, while closing from the consumer side panics; the producer owns close.",
+    "Sending on a channel inside a select with default drops messages silently - that is load shedding, and it must be a documented decision."
+  ],
+  "sources": [
+    "https://go.dev/blog/pipelines"
+  ],
+  "version": "1.0"
+}

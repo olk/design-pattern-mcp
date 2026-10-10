@@ -1,0 +1,183 @@
+{
+  "category": "behavior-selection",
+  "name": "crtp",
+  "aliases": [
+    "curiously recurring template pattern",
+    "static polymorphism"
+  ],
+  "intent": "Give a base class template access to the concrete type that derives from it - passed as the base's own template argument - so that shared behaviour and interface methods are generated and resolved at compile time, with no virtual dispatch, no vtable and no runtime indirection.",
+  "problem": "A family of related types must share behaviour or an interface, but the shared code has to call members of the concrete type, and that type is already known at compile time. Virtual functions would answer the call, yet they add a per-object pointer, an indirect call that defeats inlining, and they force the participating types to become runtime-polymorphic - which costs size and speed for value types and is impossible where the operation itself is static (per-class counters, nested types) or must run in constexpr contexts.",
+  "context": "Statically typed compiled languages with templates or compile-time generics, above all C++ (and, in weaker forms, languages with recursive generic bounds). It applies to header and library code and to value types where the set of participating types is closed at compile time, where the abstraction must stay inlinable and free of per-object state, and where the base must hand back the concrete type (fluent builders, clone, comparison suites, iterator facades). It does not apply where the concrete type is first known at runtime or where values of different participating types must be stored together behind one type.",
+  "benefits": [
+    "Polymorphism without runtime cost: no vtable pointer per object, no indirect call and no lost inlining - the call to the derived hook is an ordinary static call.",
+    "The base can name the derived type in its signatures, so fluent interfaces return the concrete type and operations such as clone or compare keep their exact argument types.",
+    "Shared behaviour is written once and instantiated per derived type (mixin definitions, operator suites, facade skeletons) instead of being repeated in every class.",
+    "The participating types stay non-polymorphic values: they can be constexpr, benefit from the empty base optimization, and remain cheap to copy because nothing about them is virtual.",
+    "Contract violations are compile-time errors: a missing hook or a wrong type argument fails while building, and no runtime type test is needed at the call site.",
+    "It reaches where virtual functions cannot go: static members, nested types, and code that a policy or target forbids from being virtual (embedded, freestanding, constexpr-heavy).",
+    "Each derived type's CRTP instantiation is a distinct type, enabling per-derived-type static state (counters, caches, registries) without any runtime type information."
+  ],
+  "tradeoffs": [
+    "Each specialization is a distinct type: CRTP siblings cannot be stored homogeneously without adding a separate common (usually virtual) base, so the flexibility dynamic polymorphism offers up front is gone.",
+    "Compile-time and binary-size cost grow with the number of participating types: every instantiation is a separate function set, and template-heavy interfaces lengthen builds and produce large, deeply nested error messages.",
+    "Misuse is undefined behaviour rather than a compile error: deriving two classes from the same specialization makes the base's downcast silently wrong, and the standard remedies (private base constructor, static_assert) are extra code the compiler does not supply.",
+    "Name hiding is unchecked: a derived member with the same name as a base member hides it with no override diagnostic, so refactoring the base can change meaning silently.",
+    "No runtime extensibility: the participating types must be known when the program is compiled, so the pattern is unusable for plugins, dynamically loaded modules or configuration-driven type selection.",
+    "The base is not a usable type on its own (constructing it is meaningless or undefined); its constructors must be restricted, and it cannot be passed around as 'the base'.",
+    "Debugging and documentation are harder: the interesting code lives in a template instantiated far from where it is read, and failures point into base internals rather than at the mistake.",
+    "Calling a derived virtual function from the CRTP base constructor is UB: the derived part of the object is not yet constructed. Unlike virtual dispatch which is simply pure-call-UB at worst, CRTP's static_cast in a constructor goes to an incompletely-built object."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 5,
+    "simplicity": 3,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "performance_notes": "CRTP-based static dispatch is consistently faster than virtual dispatch in microbenchmarks. Eli Bendersky's benchmarks show ~6x improvement at -O3, primarily because CRTP calls are fully inlinable while virtual calls cannot be inlined across translation units without LTO. At -O0 the gap narrows; with LTO and -flto virtual calls can approach CRTP for simple cases but CRTP still wins for hot inner loops. Binary size is larger: each CRTP instantiation generates a separate function set. A dispatch benchmark (Xeon Gold, GCC 11, -O2) found CRTP ~2.4ns vs virtual ~2.9ns per call (+1.42ns overhead for virtual vs ~+0.9ns for CRTP over a direct-call baseline of 1.48ns). Branch misprediction and ICache pressure are measurably higher for virtual dispatch in polymorphic workloads.",
+  "participants": [
+    {
+      "role": "Derived type",
+      "responsibility": "Names itself as the base's template argument and supplies the hook operations the base's interface calls; it stays a complete, ordinary type with no virtual functions."
+    },
+    {
+      "role": "CRTP base template",
+      "responsibility": "Provides the shared behaviour and/or the static interface; reaches the derived type through the template parameter (static_cast<Derived*>(this), or a deduced self parameter since C++23) and is instantiated once per derived type."
+    },
+    {
+      "role": "Generic client (algorithm)",
+      "responsibility": "Is written against the base template or a constrained type parameter and obtains the derived type's implementation by monomorphization / static dispatch instead of a virtual call."
+    },
+    {
+      "role": "Injected mixin functions",
+      "responsibility": "Optional friends or free functions defined inside the base (Barton-Nackman style) that extend the derived type's interface and are found by argument-dependent lookup."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Mixin operator suites for value types: define equality, ordering and arithmetic once in terms of a single primitive (the Barton-Nackman trick) so every participating type inherits the full operator set.",
+    "Fluent builders and self-typed APIs where each chained method must return the concrete builder type rather than a base type (the same need is served by recursive generic bounds in Java, C#, Kotlin and Scala).",
+    "Polymorphic cloning and copying: the base provides clone() returning a pointer to the derived type so each class only supplies its copy constructor.",
+    "Per-class static state such as instance counters, ID allocators and registries, where each derived type must own its own counter - impossible with a single non-templated base.",
+    "Facade and skeleton libraries that implement a large interface in terms of a few operations the derived type supplies (iterator facades, ranges::view_interface, visitor skeletons such as Clang's RecursiveASTVisitor).",
+    "Giving a type polymorphic-looking operations that need the exact derived type, e.g. enable_shared_from_this returning shared_ptr<Derived> / weak_from_this without a virtual function.",
+    "Chained CRTP inheritance: a CRTP base can itself derive from another CRTP base, enabling multi-axis mixin composition (e.g. Printable<Comparable<MyType>>) - each layer adds one behavioural dimension.",
+    "Compile-time interface contracts: use C++20 concepts to constrain what a CRTP-derived type must supply, turning the implicit CRTP hook contract into an explicit, checked, named concept.",
+    "Type-safe non-virtual visitors: a visitor base template receives the derived visitor type as its template argument, enabling static double dispatch without virtual inheritance.",
+    "Boost.Iterator's iterator_facade: a custom iterator passes itself as iterator_facade<Derived, Value, Category, Reference, Difference>'s first argument and supplies only dereference, increment, distance and equal; the facade synthesizes the whole standard iterator interface (operator->, [], arithmetic) and its associated types - chosen over policy objects precisely to allow custom constructors and descriptive types like indirect_iterator<T*>.",
+    "Clang's RecursiveASTVisitor as used in practice: class MyVisitor : public clang::RecursiveASTVisitor<MyVisitor> - the base's traversal code calls the user's Visit*/WalkUpFrom*/Traverse* hooks through the template parameter, so a full AST walker runs with no virtual call per node (and pays for it with a large instantiation per visitor).",
+    "Standard-library CRTP bases as precedent: std::enable_shared_from_this<T> (the shared_ptr constructor detects the base via a nested detector type and wires weak_this, so shared_from_this() returns shared_ptr<T> on the existing control block) and std::ranges::view_interface<D>."
+  ],
+  "avoid_when": [
+    "The concrete type is only known at runtime (plugins, dynamically loaded services, configuration-driven selection) - use virtual functions, an interpreter or type erasure.",
+    "Values of the family must be stored together behind one type - use a common abstract base with a virtual destructor, or type erasure (std::function, std::any, a virtual-concept handle).",
+    "There is exactly one concrete type and no family: a plain class or a free function is simpler and more readable than a parameterized base.",
+    "The shared interface is one or two trivial operations and no type identity is needed at the call site: a function template or a lambda says the same thing without the recurrence and the cast.",
+    "The toolchain is C++23 and the only goal is to deduce the cvref-qualified self or to deduplicate const/non-const overloads - an explicit object parameter (deducing this) does that with a plain, non-template base.",
+    "The derived type must be used through a pointer to base where multiple concrete types are involved - CRTP cannot model heterogeneous collections; a virtual base is required."
+  ],
+  "language_files": {
+    "generic": "crtp.generic.json",
+    "c": "crtp.c.json",
+    "cplusplus": "crtp.cplusplus.json",
+    "csharp": "crtp.csharp.json",
+    "go": "crtp.go.json",
+    "java": "crtp.java.json",
+    "javascript": "crtp.javascript.json",
+    "kotlin": "crtp.kotlin.json",
+    "python": "crtp.python.json",
+    "ruby": "crtp.ruby.json",
+    "rust": "crtp.rust.json",
+    "scala": "crtp.scala.json",
+    "swift": "crtp.swift.json",
+    "typescript": "crtp.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "barton-nackman",
+    "policy-based-design",
+    "tag-dispatching",
+    "traits",
+    "non-copyable-mixin",
+    "empty-base-optimization",
+    "type-erasure",
+    "template-method"
+  ],
+  "anti_patterns": [
+    "Two classes deriving from the same CRTP specialization (struct A : Base<A>, struct B : Base<A>): it compiles and the base's downcast then reads the wrong type - undefined behaviour, not a compile error.",
+    "Reaching for CRTP where the type set is open at runtime and then bolting on virtual functions and heap allocation to store the results, paying the costs of both mechanisms.",
+    "A CRTP base that does nothing but downcast for calls the caller could make directly: the recurrence and the cast add indirection in the code without adding capability.",
+    "Using CRTP to satisfy an interface that is never used generically (no template client ever calls through the base), leaving a parameterized base as pure ceremony.",
+    "Choosing CRTP purely for performance without measuring, when the virtual call was inlined or devirtualized anyway, or when concepts / deducing this would remove the cast entirely.",
+    "Calling a derived hook from the CRTP base constructor or destructor: the derived subobject does not exist yet / is already destroyed, making the static_cast produce undefined behaviour."
+  ],
+  "design_principles": [
+    "Choose the cheapest mechanism that satisfies the requirement: static polymorphism when the type set is closed, dynamic polymorphism when it is open.",
+    "Single point of definition: shared behaviour belongs in the base and is instantiated per type, not copied into every type.",
+    "Open/closed within a closed world: add behaviour by deriving a new type, without editing the base's clients.",
+    "Value semantics: keep participating types non-polymorphic so they stay cheap, copyable and constexpr-friendly; do not mix static and dynamic polymorphism by accident.",
+    "Explicit compile-time contracts: state what the base requires of the derived type and let violations fail the build (concepts, static_assert, restricted constructors).",
+    "Fail fast at compile time: make it impossible to construct a naked CRTP base or to derive two classes from the same instantiation; the worst CRTP failure is silent undefined behaviour, so deliberate guards are warranted."
+  ],
+  "best_practices": [
+    "Prevent misuse at compile time: a private or protected base constructor with the derived class as friend, or a static_assert / C++20 constraint on std::derived_from<Derived, Base<Derived>>, turns the worst failure mode (silent undefined behaviour) into a build error.",
+    "Give the derived hook a name that cannot collide with base members, or qualify base helpers explicitly; because nothing is virtual there is no override checking to catch shadowing.",
+    "Keep the base stateless where possible (it then costs no object size thanks to the empty base optimization) and never give it a virtual destructor or virtual functions - that would defeat the point.",
+    "Prefer non-member friend operators defined inside the base (Barton-Nackman) when the mixin must participate in implicit conversions, and remember they are found by ADL only.",
+    "Restrict the base's constructors so it cannot be instantiated on its own, and document that each derived type must pass itself exactly once as the template argument.",
+    "On new toolchains prefer the modern spellings that keep the same semantics with better diagnostics: concepts-constrained CRTP (C++20) for the contract, explicit object parameters (C++23) where only self-deduction is needed; keep classic CRTP for static-member and nested-type hooks and for pre-C++20 code.",
+    "Never call a derived hook from a CRTP base constructor or destructor; if two-phase construction is needed, use a separate init() method called after full construction.",
+    "When using chained CRTP (CRTP-of-CRTP), ensure each layer adds exactly one behavioural concern and name the intermediate types explicitly so that error messages remain readable.",
+    "Prefer C++20 concepts to name and constrain the CRTP hook contract: a requires clause on the base catches missing members at the call site rather than deep inside template instantiation traces.",
+    "For compile-time performance budgets: be aware that deeply nested CRTP layers increase template instantiation depth and may exhaust compiler limits in complex class hierarchies; profile build times in addition to runtime."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Coplien, J. O., 'Curiously Recurring Template Patterns', C++ Report 7(2), February 1995, pp. 24-27 - the article that named the idiom.",
+    "https://cppreference.dev/w/cpp/language/crtp",
+    "https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern",
+    "https://eli.thegreenplace.net/2011/05/17/the-curiously-recurring-template-pattern-in-c",
+    "https://eli.thegreenplace.net/2013/12/05/the-cost-of-dynamic-virtual-calls-vs-static-crtp-dispatch-in-c",
+    "https://www.fluentcpp.com/2017/05/12/curiously-recurring-template-pattern/",
+    "https://isocpp.org/blog/2017/05/what-the-curiously-recurring-template-pattern-can-bring-to-your-code-jonathan-boccara",
+    "https://isocpp.org/blog/2018/05/how-to-turn-a-hierarchy-of-virtual-methods-into-a-crtp-jonathan-boccara",
+    "https://isocpp.org/blog/2022/09/static-dynamic-polymorphism-crtp-and-cpp20s-concepts-thomas-sedlmair",
+    "https://isocpp.org/blog/2025/01/replace-crtp-with-concepts-sandor-dargo",
+    "https://isocpp.org/blog/2024/05/cppcon-2023-a-journey-into-non-virtual-polymorphism-in-cpp-rudyard-merriam",
+    "https://accu.org/journals/overload/13/70/nasonov_296/",
+    "https://www.modernescpp.com/index.php/c23-deducing-this/",
+    "https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2021/p0847r7.html",
+    "https://stackoverflow.com/questions/66126893/crtp-and-downcasting",
+    "https://stackoverflow.com/questions/11224838/prevent-user-from-deriving-from-incorrect-crtp-base",
+    "https://lucisqr.substack.com/p/virtual-is-still-the-right-default",
+    "https://www.boost.org/doc/libs/latest/libs/iterator/doc/iterator_facade.html",
+    "https://clang.llvm.org/doxygen/classclang_1_1RecursiveASTVisitor.html",
+    "https://en.cppreference.com/w/cpp/language/crtp",
+    "https://devblogs.microsoft.com/oldnewthing/20230816-00/?p=108608",
+    "https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines",
+    "https://github.com/llvm/llvm-project/issues/93462"
+  ],
+  "related_patterns_notes": {
+    "explicit-object-parameter": "explicit-object-parameter",
+    "static-polymorphism": "static-polymorphism",
+    "mixin": "mixin"
+  }
+}

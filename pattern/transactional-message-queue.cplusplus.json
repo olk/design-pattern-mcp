@@ -1,0 +1,57 @@
+{
+  "pattern": "transactional-message-queue",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "pqxx::work scoped transaction + outbox row + relay",
+  "implementation_notes": "C++ has no transaction manager, so the atomic unit of work is a database transaction plus the message as an outbox row: with libpqxx a pqxx::work commits on tx.commit() and aborts in its destructor otherwise, and with sqlite3 an explicit BEGIN/COMMIT pair does the same; a relay then turns committed rows into real sends. RAII makes this safer than the C equivalent, but the relay, its acknowledgement handling and the retry policy are still hand-written. The classic broker-transaction structure is still justified when the business state and the message live in the same broker rather than in a database.",
+  "code_sketch": "pqxx::work tx{conn};\ntx.exec_params(\"INSERT INTO orders(id,total) VALUES ($1,$2)\", id, total);\ntx.exec_params(\"INSERT INTO outbox(topic,payload) VALUES ($1,$2)\", \"orders\", ev);\ntx.commit();   // the announcement becomes visible exactly when the state change does\n// relay: SELECT ... FOR UPDATE SKIP LOCKED -> publish -> DELETE after ack",
+  "pitfalls": [
+    "Forgetting tx.commit() aborts the whole unit of work silently at scope exit (the pqxx::work destructor rolls back), which hides the bug until a message goes missing.",
+    "libpqxx and sqlite3 connections and transactions are not thread-safe: keep one transaction on one thread and never let a relay share the connection inside the transaction.",
+    "Publishing from inside the transaction body can reach the broker before COMMIT, so a rollback still emits a message; publish only after the commit point."
+  ],
+  "sources": [
+    "https://pqxx.org/",
+    "https://www.sqlite.org/lang_transaction.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "db-outbox",
+      "name": "Database transaction + outbox row (libpqxx / sqlite3)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "pqxx::work scoped transaction + outbox row + relay",
+      "implementation_notes": "C++ has no transaction manager, so the atomic unit of work is a database transaction plus the message as an outbox row: with libpqxx a pqxx::work commits on tx.commit() and aborts in its destructor otherwise, and with sqlite3 an explicit BEGIN/COMMIT pair does the same; a relay then turns committed rows into real sends. RAII makes this safer than the C equivalent, but the relay, its acknowledgement handling and the retry policy are still hand-written. The classic broker-transaction structure is still justified when the business state and the message live in the same broker rather than in a database.",
+      "code_sketch": "pqxx::work tx{conn};\ntx.exec_params(\"INSERT INTO orders(id,total) VALUES ($1,$2)\", id, total);\ntx.exec_params(\"INSERT INTO outbox(topic,payload) VALUES ($1,$2)\", \"orders\", ev);\ntx.commit();   // the announcement becomes visible exactly when the state change does\n// relay: SELECT ... FOR UPDATE SKIP LOCKED -> publish -> DELETE after ack",
+      "pitfalls": [
+        "Forgetting tx.commit() aborts the whole unit of work silently at scope exit (the pqxx::work destructor rolls back), which hides the bug until a message goes missing.",
+        "libpqxx and sqlite3 connections and transactions are not thread-safe: keep one transaction on one thread and never let a relay share the connection inside the transaction.",
+        "Publishing from inside the transaction body can reach the broker before COMMIT, so a rollback still emits a message; publish only after the commit point."
+      ],
+      "sources": [
+        "https://pqxx.org/",
+        "https://www.sqlite.org/lang_transaction.html"
+      ]
+    },
+    {
+      "variant_id": "librdkafka-transactional",
+      "name": "librdkafka transactional producer through its C++ API",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "RdKafka::Producer::init_transactions / begin_transaction / commit_transaction",
+      "implementation_notes": "The C++ wrapper exposes the same transaction state machine as the C library: RdKafka::Producer::init_transactions(), begin_transaction(), produce(), send_offsets_to_transaction() and commit_transaction()/abort_transaction(), with the completion events delivered through the polled queue. Use it for consume-transform-produce loops where offsets and records must commit together, or when the business state lives inside the cluster; the producer holds at most one transaction at a time and none of it spans a database.",
+      "code_sketch": "producer->init_transactions(10000);\nproducer->begin_transaction();\nproducer->produce(topic, RdKafka::Topic::PARTITION_UA,\n                 RdKafka::Producer::RK_MSG_COPY, buf, len, nullptr, 0, 0, nullptr);\nproducer->commit_transaction(10000);   // or abort_transaction() on failure",
+      "pitfalls": [
+        "A single producer instance can hold only one transaction at a time and the transactional producer is not thread-safe.",
+        "Transactions need Kafka 0.11+ brokers and a stable transactional.id, otherwise zombie fencing does not apply and a restarted producer can duplicate or be fenced by itself.",
+        "The polled event queue must be served or the transaction callbacks never fire and the commit appears to hang."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/clients/librdkafka/html/classRdKafka_1_1Producer.html",
+        "https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ],
+  "default_variant": "db-outbox",
+  "version": "1.0"
+}

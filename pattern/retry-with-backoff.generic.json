@@ -1,0 +1,19 @@
+{
+  "pattern": "retry-with-backoff",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "capped exponential delay with jitter, plus an attempt and elapsed-time budget",
+  "implementation_notes": "Language-neutral form: wrap the operation in a loop that (1) invokes it, (2) asks a predicate whether the failure is transient, (3) if the attempt and time budget are not exhausted computes the next delay as min(cap, base * multiplier^(attempt-1)), draws the jitter, waits, and re-invokes, and (4) otherwise surfaces the last failure. Keep the delay function pure and separate from the executor so the schedule can be tested without waiting. Bound it twice - a maximum interval so one delay cannot exceed the caller's patience, and a maximum elapsed time or attempt count so the total wait is bounded - and measure the budget on a monotonic clock. Jitter must be drawn inside the delay calculation on every attempt, because a deterministic schedule makes every client retry in phase; where the dependency supplies its own timing (Retry-After), take the maximum of the server value and the computed delay. Make the wait cancellable so shutdown and caller deadlines are respected, log each attempt more quietly than the exhausted failure, and export attempts as a metric.",
+  "code_sketch": "attempt = 1\nwhile True:\n    result = operation()\n    if not transient(result) or attempt >= max_attempts or elapsed() > budget:\n        return result                                  # non-retryable, exhausted, or out of budget\n    delay = min(cap, base * multiplier ** (attempt - 1))  # capped exponential growth\n    delay = random.uniform(0, delay)                   # full jitter: never retry in lockstep\n    if server_said_wait():                             # Retry-After / x-amz-retry-after\n        delay = max(delay, server_said_wait())\n    sleep_cancellably(delay)                           # monotonic clock, honours cancellation\n    attempt += 1",
+  "pitfalls": [
+    "No interval cap: the delay doubles until it exceeds any sane budget, so one failure can hold a worker for hours.",
+    "No jitter, or jitter so small that it does not decorrelate clients: the retries that failed together keep arriving together.",
+    "Retrying failures that were never classified as transient (validation errors, 404s), which multiplies work for a guaranteed failure.",
+    "Blocking the caller's thread - or holding a lock, transaction or connection - for the whole delay instead of waiting on a cancellable timer.",
+    "Wrong move: retry every transport-looking failure -> a non-idempotent operation can duplicate side effects -> instead gate retries by idempotency and an idempotency key.",
+    "Wrong move: sleep for the next backoff after the caller deadline is exhausted -> tail latency is spent on work that cannot return in time -> instead cap each wait by the remaining monotonic deadline and cancel it.",
+    "Wrong move: enable SDK, service and application retries independently -> one logical failure multiplies into an uncontrolled call storm -> instead assign one retry owner and share a retry budget."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

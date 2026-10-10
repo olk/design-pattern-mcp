@@ -1,0 +1,157 @@
+{
+  "category": "construction-composition",
+  "name": "non-throwing-swap",
+  "aliases": [
+    "exception safe swap",
+    "noexcept swap"
+  ],
+  "intent": "Give a value-like type an exchange operation that moves only its ownership handles - no copies, no allocation, no fallible user code - and make the no-failure guarantee explicit, so commit and rollback paths such as copy-and-swap assignment can rely on it.",
+  "problem": "The catalog trigger is \"swap must never throw, so rollback paths stay safe\": the generic exchange (copy into a temporary, assign both ways) runs the copy constructor, so it can throw precisely where an infallible commit is needed. Whenever an update must be all-or-nothing, the fallible work has to happen before the commit, and the commit itself must be an exchange that cannot fail; a copy-based swap cannot be that step.",
+  "context": "Types whose representation is (or can be made) a handle to a body - pimpl/handle-body classes, copy-on-write and reference-counted containers, smart pointers, and immutable state objects published behind one reference - plus the generic code that consumes them: standard containers and algorithms (sort, rotate, permutations), copy-and-swap assignment, transactional updates and reloads. The decision is sharp where user-defined copy/move code may throw (C++); elsewhere it collapses into ordinary reference assignment, leaving the discipline \"build the new state first, exchange last\".",
+  "benefits": [
+    "A commit or rollback step that cannot fail: the fallible part (building the new state) happens before the exchange, so a failed attempt leaves the old state untouched - the strong exception-safety guarantee.",
+    "O(1) exchange independent of the size of the represented state: only the handle (pointer, reference, index or body pointer) moves, with no deep copy, no allocation and no resource acquisition.",
+    "Uniformity for generic code: one swap that is found both unqualified (ADL) and qualified (std::swap or the language's generic swap) means algorithms, containers and copy-and-swap assignments all get the efficient version instead of the generic copy-based fallback.",
+    "Resource ownership changes hands in one step: the old representation is released by the destructor of the temporary that received it, so cleanup stays on one path.",
+    "Cheaper derived operations: move assignment, shrink-to-fit, clear-by-swap, double-buffering and hot-reload of state all reduce to the same non-throwing exchange."
+  ],
+  "tradeoffs": [
+    "The guarantee is a promise the callers cannot see: if the swap actually performs fallible work (allocation, logging, callbacks, taking a lock, copying another object) then a noexcept/declared-infallible swap turns a recoverable error into std::terminate or into a corrupted rollback path.",
+    "It only pays off when the representation is a handle: for types whose state lives inline, the exchange still copies every field, and the non-throwing property is inherited from the members rather than created here.",
+    "The whole representation must move together: fields added later (caches, observer lists, back-pointers, indices, mutexes) that are not exchanged leave an object half old and half new - a silent invariant break.",
+    "External aliases survive the exchange: references, iterators, pointers and observers into the old body keep pointing there, which is the intended sharing behaviour for a copy-on-write handle and a bug for a value that callers assume is updated in place.",
+    "The home language's protocol is easy to get subtly wrong - member swap vs free swap vs std::swap specialization, ADL vs qualified calls, the class-template specialization ban, self-swap - and easy to \"simplify\" back into the copy-based version.",
+    "Where the exchange is already primitive, wrapping it in a helper or abstraction (a Swap class, a closure, a tuple) adds indirection and allocation without adding any guarantee."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 5,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 9,
+    "reliability": 8,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Value type",
+      "responsibility": "Owns the representation and defines what exchanging it means; keeps every piece of state that must travel together inside the handle so an exchange can never leave a partially updated object."
+    },
+    {
+      "role": "Representation handle",
+      "responsibility": "The pointer, reference, index or state object that is actually exchanged; it must be cheap to move and free of fallible work, which is what makes the swap non-throwing."
+    },
+    {
+      "role": "Swap operation",
+      "responsibility": "The member swap and the matching non-member (ADL) swap: the customization point that exchanges handles only, is declared or known not to fail, and is the only thing clients are allowed to rely on."
+    },
+    {
+      "role": "Generic swap protocol",
+      "responsibility": "The uniform lookup and dispatch path - std::swap and the Swappable requirement in C++, multiple assignment, destructuring or a standard-library swap elsewhere - so callers never need to know which type has a custom swap."
+    },
+    {
+      "role": "Commit / rollback path",
+      "responsibility": "Copy-and-swap assignment, transactional update, container algorithm or hot reload: performs all fallible work first and uses the swap as the infallible commit, so a failure leaves the previous state in place."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Copy assignment implemented as copy-and-swap: build a temporary copy (the only fallible step), then exchange it with *this so the old state is released by the temporary's destructor.",
+    "Handle-body / pimpl classes whose swap exchanges one implementation pointer - the classic realization and the reason the idiom exists.",
+    "Copy-on-write and reference-counted containers: the commit step replaces the shared body with a freshly built one while readers of the old body stay valid.",
+    "Shrink-to-fit and clear-by-swap: Container(container).swap(container) releases capacity without disturbing the elements' storage semantics.",
+    "Rollback of an in-progress update: stage a modified copy (or a new state object) and exchange it into place only after every step succeeded; the previous state is still intact if anything failed.",
+    "Concurrent publication of an immutable snapshot: readers take the current state and the writer exchanges one reference (atomic exchange / AtomicReference / Interlocked.Exchange / atomic.Pointer) so no reader sees a half-installed state.",
+    "Standard algorithms and containers that require swappable elements: sort, rotate, permute and unique rely on the exchange being cheap and, in their strong-guarantee overloads, non-throwing.",
+    "Qt's QSharedDataPointer provides an explicit swap() documented as a fast, noexcept exchange for implicitly shared value classes, making the shared-data handle the commit unit.",
+    "C++ std::vector::swap exchanges contents and capacity in constant time without moving or copying elements; allocator propagation and equality conditions still govern its no-throw contract.",
+    "C++ std::shared_ptr::swap exchanges stored pointers and ownership in constant time without changing reference counts during the swap, providing a concrete smart-pointer handle exchange."
+  ],
+  "avoid_when": [
+    "The type is trivially copyable or cheap to move (an int, a small struct, an array of them): the ordinary exchange already cannot fail, so a hand-written swap is noise.",
+    "The representation cannot be exchanged cheaply - the state lives inline and would have to be copied, or the object owns things whose ownership cannot be transferred (references to itself, registered observers, OS handles with callbacks) - fix the representation (introduce a handle) before claiming a non-throwing swap.",
+    "The exchange genuinely needs to do fallible work (take a lock, allocate, register a callback, write a log): do not declare it non-throwing; keep the commit as a single reference assignment instead, or accept an explicit failure path.",
+    "The language has no user-defined value semantics and no throwing assignment (Java, Python, Ruby, Go, JS/TS, C#): wrapping the exchange in a helper adds nothing; rely on the primitive and keep the state behind one reference.",
+    "Swapping is being used to dodge a design problem - to copy an object that should have been replaced, or to paper over aliasing between two objects - rather than to commit a new state."
+  ],
+  "language_files": {
+    "generic": "non-throwing-swap.generic.json",
+    "c": "non-throwing-swap.c.json",
+    "cplusplus": "non-throwing-swap.cplusplus.json",
+    "csharp": "non-throwing-swap.csharp.json",
+    "go": "non-throwing-swap.go.json",
+    "java": "non-throwing-swap.java.json",
+    "javascript": "non-throwing-swap.javascript.json",
+    "kotlin": "non-throwing-swap.kotlin.json",
+    "python": "non-throwing-swap.python.json",
+    "ruby": "non-throwing-swap.ruby.json",
+    "rust": "non-throwing-swap.rust.json",
+    "scala": "non-throwing-swap.scala.json",
+    "swift": "non-throwing-swap.swift.json",
+    "typescript": "non-throwing-swap.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "procedural"
+  ],
+  "scope": "value",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "copy-and-swap",
+    "pimpl",
+    "shrink-to-fit",
+    "smart-pointer",
+    "raii",
+    "copy-on-write",
+    "value-object"
+  ],
+  "anti_patterns": [
+    "A \"non-throwing\" swap built on the copy-based exchange (temporary copy, two assignments): it allocates through the copy constructor and can throw - the exact implementation the pattern replaces, and the reason a copy assignment implemented with it gives no strong guarantee.",
+    "Declaring swap noexcept while its body calls something that can throw (member assignment, container growth, logging, a user callback, mutex acquisition): any escape terminates the program, so the \"safety\" becomes a crash.",
+    "Exchanging only part of the representation - swapping the pimpl pointer but not the cached size, the body's back-pointer or a mutex - leaving the object half old and half new.",
+    "A swap that deep-copies owned resources instead of exchanging handles: it can throw and it defeats the O(1) point of the pattern.",
+    "The XOR/arithmetic swap trick (a ^= b; b ^= a; a ^= b) presented as the no-temporary alternative: it only exists for integers and pointers, reads worse, and creates no guarantee whatsoever - it is a puzzle, not the pattern.",
+    "A generic \"swap anything\" helper that silently falls back to copying when no custom swap exists: it restores the throwing copy-based path invisibly and discourages types from declaring their own non-throwing swap."
+  ],
+  "design_principles": [
+    "Fail fast, then commit infallibly: do all fallible work first and make the final step an operation that cannot fail.",
+    "Single responsibility: the swap moves ownership handles; construction, validation and resource acquisition stay in their own steps.",
+    "Invariant preservation: exchange the whole representation at once so no observer can see a partially updated object.",
+    "Honesty in interfaces: the no-failure guarantee is part of the type's contract (noexcept or documented) and must not be claimed when the implementation can fail.",
+    "Zero-overhead abstraction: exchanging handles should compile to a few register moves, not to a copy of the represented state.",
+    "Uniformity for genericity: one protocol (ADL plus the generic swap, or the language's own primitive) so generic algorithms never fall back to a degrading implementation."
+  ],
+  "best_practices": [
+    "Give the type a member swap (or a friend/ADL non-member swap) that exchanges handles only and mark it noexcept; provide the non-member in the class's namespace as well, and for non-template classes a std::swap specialization, so both qualified and unqualified calls find the efficient version (Effective C++ Item 25).",
+    "In generic code always write `using std::swap; swap(a, b);` so argument-dependent lookup can pick a user-defined swap while the standard one stays the fallback.",
+    "Keep fallible work (building the copy or the new state) outside the commit step; implement copy assignment as copy-and-swap and move assignment as a swap with the donor.",
+    "Pin the guarantee with a compile-time check (static_assert(std::is_nothrow_swappable_v<T>), or the equivalent trait) so a later refactor cannot silently re-enable a throwing path.",
+    "Keep everything that belongs to the value inside the exchanged handle - caches, back-pointers, size, ownership - and handle self-swap and aliased handles explicitly.",
+    "Where instances are shared between threads, exchange one immutable state reference atomically (atomic exchange, AtomicReference, Interlocked.Exchange, atomic.Pointer) rather than swapping two independent fields.",
+    "Prefer the language's own exchange primitive when one exists (mem::swap and mem::replace in Rust, swap/swapAt in Swift, multiple assignment or destructuring in Python, Ruby, Go, JavaScript and C#) instead of re-implementing the C++ protocol."
+  ],
+  "version": "1.1",
+  "sources": [
+    "More C++ Idioms (Wikibooks), \"Non-throwing swap\" (also known as \"exception safe swap\") - https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Non-throwing_swap",
+    "Scott Meyers, Effective C++ Third Edition (2005), Item 25 \"Consider support for a non-throwing swap\" - https://flylib.com/books/en/2.887.1.39/1/",
+    "C++ Core Guidelines, C.83 \"For value-like types, consider providing a noexcept swap function\" (with C.84 \"A swap must not fail\" and C.85 \"Make swap noexcept\") - https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines.html#c83-for-value-like-types-consider-providing-a-noexcept-swap-function",
+    "cppreference, \"std::swap\" (conditionally noexcept since C++11; equivalent to std::is_nothrow_swappable_v since C++17) - https://en.cppreference.com/w/cpp/algorithm/swap",
+    "LWG issue 1349, \"swap should not throw\" (GB-65; non-throwing swap is key to the copy/swap idiom) - https://cplusplus.github.io/LWG/issue1349",
+    "Rainer Grimm, \"The Copy-and-Swap Idiom\", Modernes C++ (2022) - https://www.modernescpp.com/index.php/the-copy-and-swap-idiom/",
+    "Qt Documentation, \"QSharedDataPointer Class\" (fast, noexcept swap for implicitly shared classes) - https://doc.qt.io/qt-6/qshareddatapointer.html",
+    "cppreference, \"std::vector<T,Allocator>::swap\" (constant-time exchange without element moves/copies; allocator conditions) - https://en.cppreference.com/cpp/container/vector/swap",
+    "cppreference, \"std::shared_ptr<T>::swap\" (noexcept constant-time ownership exchange) - https://en.cppreference.com/cpp/memory/shared_ptr/swap",
+    "Stack Overflow, \"What are the consequences of a throwing swap() for a type?\" (criticism of throwing swap contracts) - https://stackoverflow.com/questions/69212460/what-are-the-consequences-of-a-throwing-swap-for-a-type"
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "pattern": "functional-core-imperative-shell",
+  "language": "swift",
+  "support": "idiomatic",
+  "idiom_name": "struct/enum core + pure methods; a small class holds state and does the IO",
+  "implementation_notes": "Put the decisions in `struct`/`enum` value types with pure methods or free functions (`let` bindings, `Result`, enums with associated values for outcomes) and keep the effects in a small `final class` that holds the value and implements networking, persistence and IO - the Swift shape of the pattern: encapsulate the logic in value types with pure functions, and use objects only to store those values and provide side effects. Because structs are copied on assignment and `mutating` methods produce new values, the core cannot share state with the shell; reference-type members and captured closures are the leak. A protocol-injected Core class is only needed where the core must call out, which is what the pattern removes.",
+  "code_sketch": "struct Fasting { var start: Date?; var end: Date?; let goal: TimeInterval\n    func finish(at now: Date) -> Fasting { var c = self; c.end = now; return c } }\nenum Action { case start(Date), finish(Date) }\nfunc reduce(_ s: Fasting, _ a: Action) -> Fasting {          // pure core\n    switch a {\n    case .start(let now):  return Fasting(start: now, end: s.end, goal: s.goal)\n    case .finish(let now): return s.finish(at: now) }\n}\n@MainActor final class Store: ObservableObject {             // shell\n    @Published private(set) var state: Fasting\n    func send(_ a: Action) { state = reduce(state, a) } }",
+  "pitfalls": [
+    "A `struct` holding a `class` (or a closure that captures one) is not isolated: copies share the reference, so mutation through it is an invisible effect - keep reference types out of the core's stored properties.",
+    "`Date()`, `UUID()` and `Task { }` inside the core make it impure and non-deterministic; pass the date/time in (as `finish(at:)` does) and let the shell start the tasks.",
+    "`@MainActor`, `ObservableObject` and dispatch queues belong to the shell: core code that touches them cannot be tested synchronously and drags UI concerns into the rules."
+  ],
+  "sources": [
+    "https://swiftwithmajid.com/2022/03/01/functional-core-imperative-shell-in-swift/",
+    "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/classesandstructures/"
+  ],
+  "variants": [
+    {
+      "variant_id": "value-type-core",
+      "name": "Value-type core with an object shell",
+      "paradigm": "functional",
+      "min_standard": "Swift5.0",
+      "idiom_name": "struct/enum core + pure methods; a small class holds state and does the IO",
+      "implementation_notes": "Put the decisions in `struct`/`enum` value types with pure methods or free functions (`let` bindings, `Result`, enums with associated values for outcomes) and keep the effects in a small `final class` that holds the value and implements networking, persistence and IO - the Swift shape of the pattern: encapsulate the logic in value types with pure functions, and use objects only to store those values and provide side effects. Because structs are copied on assignment and `mutating` methods produce new values, the core cannot share state with the shell; reference-type members and captured closures are the leak. A protocol-injected Core class is only needed where the core must call out, which is what the pattern removes.",
+      "code_sketch": "struct Fasting { var start: Date?; var end: Date?; let goal: TimeInterval\n    func finish(at now: Date) -> Fasting { var c = self; c.end = now; return c } }\nenum Action { case start(Date), finish(Date) }\nfunc reduce(_ s: Fasting, _ a: Action) -> Fasting {          // pure core\n    switch a {\n    case .start(let now):  return Fasting(start: now, end: s.end, goal: s.goal)\n    case .finish(let now): return s.finish(at: now) }\n}\n@MainActor final class Store: ObservableObject {             // shell\n    @Published private(set) var state: Fasting\n    func send(_ a: Action) { state = reduce(state, a) } }",
+      "pitfalls": [
+        "A `struct` holding a `class` (or a closure that captures one) is not isolated: copies share the reference, so mutation through it is an invisible effect - keep reference types out of the core's stored properties.",
+        "`Date()`, `UUID()` and `Task { }` inside the core make it impure and non-deterministic; pass the date/time in (as `finish(at:)` does) and let the shell start the tasks.",
+        "`@MainActor`, `ObservableObject` and dispatch queues belong to the shell: core code that touches them cannot be tested synchronously and drags UI concerns into the rules."
+      ],
+      "sources": [
+        "https://swiftwithmajid.com/2022/03/01/functional-core-imperative-shell-in-swift/",
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/classesandstructures/"
+      ]
+    },
+    {
+      "variant_id": "reducer-middleware-shell",
+      "name": "Reducer + middleware (unidirectional flow)",
+      "paradigm": "functional",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "structured-concurrency",
+        "MainActor"
+      ],
+      "idiom_name": "Reducer<State, Action> core; @MainActor Store + Middleware effects",
+      "implementation_notes": "The opinionated form: the core is a `Reducer` (`(State, Action) -> State`) and the shell is a `@MainActor` store that publishes the state, applies the reducer, and runs `Middleware` closures that perform the IO and feed back a new action; effects run in a `TaskGroup`, so they are parallel and cooperatively cancellable, and the store holds the dependencies. The reducer stays synchronous and testable by calling it with a state and an action, which is why reducers work so well as the functional core in UI applications. Choose it when the application state is shared and long-lived; for a single entry point the small store of the other variant is enough.",
+      "code_sketch": "typealias Reducer<S, A> = (S, A) -> S\ntypealias Middleware<S, A, D> = (S, A, D) async -> A?\n@MainActor final class Store<S, A, D>: ObservableObject {     // shell\n    @Published private(set) var state: S\n    let reduce: Reducer<S, A>, deps: D, middlewares: [Middleware<S, A, D>]\n    func send(_ a: A) async {\n        state = reduce(state, a)                               // pure\n        await withTaskGroup(of: A?.self) { group in             // effects\n            for m in middlewares { group.addTask { await m(state, a, deps) } }\n            for await next in group { if let next { await send(next) } } } }\n}",
+      "pitfalls": [
+        "Middleware runs after the reducer, so an action produced by a middleware that is itself intercepted can loop forever - keep 'internal' actions (status updates) out of the middleware's switch.",
+        "Effects started with a detached `Task` escape the store's lifetime (and the view's); use the structured `TaskGroup` so cancellation propagates when the store goes away.",
+        "`@Published` state mutation off the main actor is a data race: the store must stay `@MainActor` and the reducer must never touch it, which means middleware may only return actions."
+      ],
+      "sources": [
+        "https://swiftwithmajid.com/2022/03/16/functional-core-imperative-shell-in-swift-unidirectional-flow/",
+        "https://swiftwithmajid.com/2022/03/01/functional-core-imperative-shell-in-swift/"
+      ]
+    }
+  ],
+  "default_variant": "value-type-core",
+  "version": "1.0"
+}

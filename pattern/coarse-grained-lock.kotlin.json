@@ -1,0 +1,54 @@
+{
+  "pattern": "coarse-grained-lock",
+  "language": "kotlin",
+  "support": "library",
+  "implementation_notes": "Default realization for Kotlin back ends: the same JPA surface as Java - one @Version attribute on the root entity, checked when the root row is updated, surfaced as OptimisticLockException (or an optimistic-lock failure at commit). Kotlin adds nothing special here: entity classes are ordinary classes, and Spring Boot's @Transactional plus a retry wrapper is how conflicts are handled. As in Java, a write path that touches only members does not trigger the check, so member writes must be funnelled through the root.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "jpa-shared-version",
+      "name": "JPA/Hibernate @Version on the aggregate root",
+      "paradigm": "oo",
+      "implementation_notes": "Default realization for Kotlin back ends: the same JPA surface as Java - one @Version attribute on the root entity, checked when the root row is updated, surfaced as OptimisticLockException (or an optimistic-lock failure at commit). Kotlin adds nothing special here: entity classes are ordinary classes, and Spring Boot's @Transactional plus a retry wrapper is how conflicts are handled. As in Java, a write path that touches only members does not trigger the check, so member writes must be funnelled through the root.",
+      "min_standard": "Kotlin1.8",
+      "idiom_name": "JPA @Version on the root entity (Hibernate provider)",
+      "code_sketch": "@Entity\nclass Order(                       // aggregate root\n    @Id val id: Long,\n    @Version var version: Int = 0,\n    @OneToMany(mappedBy = \"order\", cascade = [CascadeType.ALL])\n    var lines: MutableList<OrderLine> = mutableListOf()\n)\n\n@Transactional\nfun apply(id: Long, delta: Int) {\n    val root = em.find(Order::class.java, id)\n    root.lines.first().qty += delta   // one token for the cluster\n}",
+      "pitfalls": [
+        "Kotlin's val/var choice does not affect Hibernate's tracking: both property and field access strategies still rely on the provider detecting a dirty root for the version bump.",
+        "@Transactional proxies only intercept external calls; an internal method call inside the same class runs without the transaction that is supposed to scope the version check."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/tutorial/persistence-locking002.htm"
+      ]
+    },
+    {
+      "variant_id": "coroutine-cluster-mutex",
+      "name": "one kotlinx.coroutines Mutex per aggregate root",
+      "paradigm": "concurrent",
+      "implementation_notes": "The in-process realization for coroutine services that own the cluster in memory: keep a ConcurrentHashMap<Long, Mutex> keyed by the cluster id and wrap every edit in mutex.withLock so exactly one coroutine at a time touches root and members. The Mutex replaces the classic lock manager and is non-reentrant by design - a nested lock of the same root suspends forever - and it coordinates only within one process, so the durable side still needs a row lock or version token.",
+      "min_standard": "Kotlin1.6",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "ConcurrentHashMap<ClusterId, Mutex>.withLock",
+      "code_sketch": "private val locks = ConcurrentHashMap<Long, Mutex>()\n\nsuspend fun <T> withCluster(id: Long, block: suspend () -> T): T =\n    locks.computeIfAbsent(id) { Mutex() }.withLock { block() }\n\nsuspend fun apply(id: Long, delta: Int) = withCluster(id) {\n    val root = clusters.getValue(id)   // root + members, one lock\n    root.lines.first().qty += delta\n}",
+      "pitfalls": [
+        "The Mutex suspends rather than blocks, but a withLock around a blocking JDBC call still parks a thread - keep the critical section free of blocking I/O or use a dispatcher that can afford it.",
+        "computeIfAbsent plus withLock must not be nested for the same id (Mutex is non-reentrant), and the map's entries need eviction once a cluster is idle."
+      ],
+      "sources": [
+        "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/"
+      ]
+    }
+  ],
+  "default_variant": "jpa-shared-version",
+  "idiom_name": "JPA @Version on the root entity (Hibernate provider)",
+  "code_sketch": "@Entity\nclass Order(                       // aggregate root\n    @Id val id: Long,\n    @Version var version: Int = 0,\n    @OneToMany(mappedBy = \"order\", cascade = [CascadeType.ALL])\n    var lines: MutableList<OrderLine> = mutableListOf()\n)\n\n@Transactional\nfun apply(id: Long, delta: Int) {\n    val root = em.find(Order::class.java, id)\n    root.lines.first().qty += delta   // one token for the cluster\n}",
+  "pitfalls": [
+    "Kotlin's val/var choice does not affect Hibernate's tracking: both property and field access strategies still rely on the provider detecting a dirty root for the version bump.",
+    "@Transactional proxies only intercept external calls; an internal method call inside the same class runs without the transaction that is supposed to scope the version check."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javaee/7/tutorial/persistence-locking002.htm"
+  ]
+}

@@ -1,0 +1,264 @@
+# Thin override of ghcr.io/huggingface/text-embeddings-inference, build-arg driven.
+#
+# Why we use the community ONNX artifact
+# (`onnx-community/Qwen3-Embedding-0.6B-ONNX`) instead of the upstream
+# `Qwen/Qwen3-Embedding-0.6B`:
+#
+#   TEI tries the ORT (OnnxRuntime) backend first, then falls back to
+#   candle. The upstream Qwen3-Embedding-0.6B repo ships PyTorch /
+#   Safetensors weights only — no `onnx/model.onnx` — so ORT fails to
+#   start, the server logs an `ERROR Could not start ORT backend`, and
+#   candle is loaded as a fallback. Two consequences:
+#
+#     1. The ORT error adds ~2 min to warmup (the probe + load attempt
+#        is non-trivial).
+#     2. The candle backend on the cpu-1.9 image hard-caps
+#        `max_batch_requests` at 4, so the llama-index client's
+#        `embed_batch_size=8` is split into 2 sequential batches of 4.
+#
+#   The community ONNX artifact ships float32 ONNX weights (plus int8
+#   and fp16 variants) and is verified working with TEI's ORT backend
+#   (see TEI issue #714). Switching to it makes ORT the actual backend
+#   — no more ORT probe, no more candle batch-size cap.
+#
+# We default to the float32 ONNX variant (highest accuracy). Set
+# `EMBED_ONNX_VARIANT=int8` for ~2-4× faster CPU inference at a small
+# accuracy drop (~1.2 GB download instead of ~4.7 GB). The build arg
+# selects the artifact and renames it to `model.onnx` so ORT can find it
+# (ORT hard-codes the filename lookup; no `--onnx-filename` flag in
+# TEI 1.9). Use `EMBED_ONNX_VARIANT=fp16` after extending the variant
+# switch with a `fp16` case arm — the download glob already covers it.
+#
+# Build args (defaults below; the Makefile forwards them):
+#
+#   EMBED_MODEL_REPO    HuggingFace repo id (default
+#                       `onnx-community/Qwen3-Embedding-0.6B-ONNX`).
+#                       Public — `HF_TOKEN` is optional. Switching it
+#                       here changes the model identity surfaced in the
+#                       dense-cache manifest fingerprint (`embedder.
+#                       config.model_repo`); set the same value in the
+#                       compose env so the metadata check accepts the
+#                       new cache.
+#   EMBED_ONNX_VARIANT  ONNX artifact to keep: `fp32` (default), `int8`.
+#                       The runtime image sees `model.onnx` either way.
+#   EMBED_POOLING       Token-pooling mode; `last-token` matches
+#                       Qwen3's training (TEI default `cls` would be
+#                       silently wrong).
+#   EMBED_DTYPE         ORT dtype; `float32` is the only precision the
+#                       community ONNX export ships in.
+#   TEI_BASE_IMAGE      TEI base image tag, e.g.
+#                       `ghcr.io/huggingface/text-embeddings-inference:cpu-1.9`
+#                       for CPU or `:cuda-1.9` for GPU (needs an NVIDIA
+#                       runtime + the toolkit on the host).
+#
+# Runtime tunables (clap env fallbacks — see TEI --help):
+#
+#   MAX_CONCURRENT_REQUESTS  (default 512 in TEI; we set 32 as a safe CPU cap)
+#   MAX_BATCH_TOKENS       (default 16384 in TEI; we set 8192 to avoid the
+#                          documented CPU warmup OOM at PR #634/#725 — raising
+#                          to 32768 with 8 × 32768 fp32 allocation crashes the
+#                          process.  The Qwen team's own usage example also uses
+#                          max_length=8192.)
+#   MAX_CLIENT_BATCH_SIZE  (default 32 in TEI; must be ≥ the client's
+#                          EMBEDDER_BATCH_SIZE.  With fewer permits TEI returns HTTP 429
+#                          `try_acquire_permit: no permits available` because it
+#                          acquires one semaphore permit per input, not per request
+#                          (router/src/http/server.rs batch branch).  Client-side
+#                          embed_batch_size is controlled by EMBEDDER_BATCH_SIZE
+#                          (compose) / embed_batch_size (config.json), default 16.
+#   AUTO_TRUNCATE           (default true; silently truncates inputs longer than
+#                          max_input_length.  Keep enabled: client requirements
+#                          strings can be up to 100 000 chars.)
+#   PROMETHEUS_PORT        (default 9000; we set 0 to bind an OS-assigned
+#                          ephemeral port so /metrics is never exposed outside
+#                          the container.)
+#   HOSTNAME               (default 0.0.0.0; bind to all interfaces so the
+#                          container is reachable from other containers.)
+#                          NOTE: Docker auto-injects HOSTNAME=<container-hostname>
+#                          into every container's process env at runtime.  TEI's
+#                          hostname parser rejects non-IP strings (logs "Invalid
+#                          hostname, defaulting to 0.0.0.0") so the effective
+#                          bind address is always 0.0.0.0 regardless of this
+#                          env var.  To actually bind to a specific IP, use
+#                          `docker run --hostname <ip>` (which sets the injected
+#                          env var to a valid IP that TEI accepts).  This env
+#                          var is included for API consistency; it cannot be
+#                          set to a useful value through compose -e or Dockerfile
+#                          ENV alone because Docker overrides it at runtime.
+#   PORT                   (default 8080; TEI's port.  NOTE: if you change this,
+#                          update the healthcheck curl URL in docker-compose.yml
+#                          and any EMBEDDER_BASE_URL that hard-codes :8080.)
+#   WARMUP_TOKENS          (default in upstream TEI: unset = warm
+#                          min(max_input_length, max_batch_tokens) on CPU;
+#                          we set 0 to skip the synthetic warmup pass —
+#                          the 131s measured startup cost — via PR #884.
+#                          Positive N warms with N tokens instead; values
+#                          > MAX_BATCH_TOKENS are rejected at startup.)
+#   POOLING, DTYPE         Pinned via EMBED_POOLING / EMBED_DTYPE; surfaced as
+#                          env vars instead of CLI flags so the CMD can stay
+#                          exec-form and short.  TEI reads `[env: POOLING=]`
+#                          and `[env: DTYPE=]` from the environment at start.
+#
+# NOTE: the runtime binary is a self-built v1.9.4+PR#884 router (Stage 0),
+# not the stock TEI base-image binary. See the Stage 0 comment for rebase rules.
+#
+# Clap precedence: CLI flag > env var > built-in default.
+# All eight tunables above are configurable via environment variables.
+#
+# Persistent warnings (genuinely unfixable from the command line):
+#   - "Could not find a Sentence Transformers config" (lib.rs:203) —
+#     the model artifact lacks the ST config file; TEI falls back to
+#     config.json's max_position_embeddings (which we patch above).
+#   - "Backend does not support a batch size > 8" + "forcing
+#     max_batch_requests=8" (lib.rs:303-304) — the ORT backend's
+#     intrinsic batch cap for this model on the cpu-1.9 image. Set by
+#     the backend in `backend.max_batch_size.inspect(...)` and exposed
+#     via `/info`. The check fires against the backend's capability,
+#     not against `--max-batch-requests`; setting the flag does not
+#     silence the warning.  8 happens to match the llama-index client's
+#     `embed_batch_size=8` exactly, so no client-side splitting is
+#     needed.  The earlier private base image (candle backend) also
+#     reported 8; cpu-1.9 + candle reported 4 — switching to ORT
+#     doubled the cap back to 8.  Raising it further requires a GPU
+#     image (cuda-1.9 et al.) or a different ONNX export.
+#
+# No model weights are re-downloaded at runtime — they are baked into
+# the image at build time and served with `HF_HUB_OFFLINE=1` in
+# docker-compose.yaml.
+#
+# Invariant: the in-image model path is `/data/embedding-model` and the
+# server's `config/config.json` declares `openai//data/embedding-model`
+# (the litellm `openai/` prefix routes to TEI's OpenAI-compatible HTTP
+# surface). Swapping `EMBED_MODEL_REPO` does NOT touch the server's
+# model string — the path is the contract; the model contents are
+# whatever the snapshot_download fetched.
+#
+# NOTE: CMD must be in JSON exec form (not shell form) so that the args
+# are appended to the entrypoint instead of being wrapped in `/bin/sh -c`.
+
+ARG TEI_BASE_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+
+# Stage 0: Build the TEI router from source (v1.9.4 + unmerged PR #884).
+#
+# PR #884 (huggingface/text-embeddings-inference#884, head 5806bdc) adds
+# --warmup-tokens / WARMUP_TOKENS so the synthetic startup warmup pass can
+# be skipped (0) or shrunk (N) without lowering MAX_BATCH_TOKENS. The PR is
+# OPEN/UNMERGED as of 2026-10-09; both ARGs must be bumped together when
+# rebasing onto a newer tag or when the PR merges (then drop the patch).
+# Feature set matches the PR author's validated x86 ONNX build:
+#   cargo build -p text-embeddings-router --no-default-features --features ort,http
+# (TEI README's recommended x86 ONNX path is `cargo install --path router -F ort`.)
+FROM rust:1.92-bookworm AS router-builder
+# rust:1.92 matches upstream rust-toolchain.toml channel 1.92.0; bookworm
+# matches the TEI runtime base (Debian 12) so glibc ABI lines up.
+ARG TEI_SOURCE_VERSION=v1.9.4
+ARG TEI_PR884_SHA=5806bdc99f11ad490cd7e38c1f4dd757034c0adb
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${TEI_SOURCE_VERSION} \
+        https://github.com/huggingface/text-embeddings-inference.git /usr/src/tei \
+    && cd /usr/src/tei \
+    && git fetch --depth 2 origin ${TEI_PR884_SHA} \
+    && git diff FETCH_HEAD^ FETCH_HEAD -- backends/src/lib.rs router/src/lib.rs router/src/main.rs \
+        | git apply --3way
+# NOTE: not `git cherry-pick` — the shallow tag clone shares no history with
+# the PR commit, so cherry-pick degrades to add/add conflicts on every file.
+# Diffing the PR commit against its own parent (^) applies exactly the PR's
+# changes to the three code files; docs/README drift on main is skipped.
+# FETCH_HEAD^ is present because the fetch uses depth 2; the fetch targets
+# the pinned SHA (not pull/884/head) so a PR update cannot move the build.
+RUN cd /usr/src/tei \
+    && cargo build --release -p text-embeddings-router \
+        --no-default-features --features ort,http
+# Binary lands at /usr/src/tei/target/release/text-embeddings-router
+
+# Stage 1: Download the ONNX weights.
+# The TEI runtime image is a pure Rust binary with no Python, so we use
+# a slim Python image purely for the download step and copy the result
+# into the runtime stage.
+FROM python:3.10-slim AS model-downloader
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG EMBED_MODEL_REPO=onnx-community/Qwen3-Embedding-0.6B-ONNX
+ARG EMBED_ONNX_VARIANT=fp32
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+
+# The model repo is public on the Hub, so HF_TOKEN is optional.
+# `allow_patterns` picks the fp32 + int8 + fp16 ONNX artifacts plus tokenizer
+# files; missing files are simply not fetched.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "import os; \
+from huggingface_hub import snapshot_download; \
+snapshot_download( \
+    os.environ['EMBED_MODEL_REPO'], \
+    token=os.environ.get('HF_TOKEN') or None, \
+    local_dir='/data/embedding-model', \
+    allow_patterns=[ \
+        '*.json', '*.txt', 'tokenizer*', 'special_tokens*', \
+        'added_tokens*', 'chat_template*', \
+        'onnx/model*.onnx', 'onnx/model*.onnx_data', \
+    ], \
+)"
+
+# Variant selection: stage the chosen artifacts, delete EVERY other variant, then
+# rename to model.onnx (ORT's hard-coded lookup — there is no --onnx-filename flag).
+# The delete-all step matters: the download glob is deliberately broad
+# (`onnx/model*.onnx*`), and the repo also ships bnb4/q4/q4f16 exports, so a
+# per-variant `rm` list would silently leave gigabytes of unused weights in the
+# image (measured: 7.9 GB image vs 2.4 GB of actually-served fp32 weights).
+RUN set -e; \
+    cd /data/embedding-model/onnx; \
+    mkdir -p /tmp/keep; \
+    case "${EMBED_ONNX_VARIANT}" in \
+        fp32) mv model.onnx model.onnx_data /tmp/keep/ ;; \
+        int8) mv model_int8.onnx /tmp/keep/model.onnx ;; \
+        *) echo "invalid EMBED_ONNX_VARIANT '${EMBED_ONNX_VARIANT}' (expected fp32|int8)" >&2; exit 1 ;; \
+    esac; \
+    rm -f model*.onnx model*.onnx_data; \
+    mv /tmp/keep/* .; \
+    rmdir /tmp/keep; \
+    ls -la
+
+# Stage 2: Runtime image with the model baked in and config patched.
+FROM ${TEI_BASE_IMAGE}
+
+ARG EMBED_POOLING=last-token
+ARG EMBED_DTYPE=float32
+
+COPY --from=model-downloader /data /data
+
+# Overwrite the stock router with the v1.9.4+PR#884 build (same feature
+# family: ORT backend, HTTP router). The TEI base image provides the shared
+# libs (glibc, onnxruntime dylib) the binary was linked against.
+COPY --from=router-builder /usr/src/tei/target/release/text-embeddings-router \
+     /usr/local/bin/text-embeddings-router
+
+ENV HF_HUB_OFFLINE=1 \
+    POOLING=${EMBED_POOLING} \
+    DTYPE=${EMBED_DTYPE}
+
+# Safe CPU tunables as image-level defaults.  These are overridable at
+# runtime via docker-compose environment block or bare `docker run -e VAR=VALUE`.
+ENV MAX_CONCURRENT_REQUESTS=32 \
+    MAX_BATCH_TOKENS=8192 \
+    MAX_CLIENT_BATCH_SIZE=32 \
+    AUTO_TRUNCATE=true \
+    PROMETHEUS_PORT=0 \
+    HOSTNAME=0.0.0.0 \
+    PORT=8080 \
+    WARMUP_TOKENS=0
+
+RUN sed -i -E 's/("max_position_embeddings"[[:space:]]*:[[:space:]]*)32768/\18192/' \
+        /data/embedding-model/config.json
+
+CMD ["--model-id", "/data/embedding-model"]

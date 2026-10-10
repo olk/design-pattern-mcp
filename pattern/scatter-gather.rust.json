@@ -1,0 +1,84 @@
+{
+  "pattern": "scatter-gather",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "tokio::task::JoinSet + join_next in a select! against tokio::time::sleep",
+  "implementation_notes": "std has no runtime and no futures, so the pattern is realized through tokio: a JoinSet holds the fan-out (spawn one task per recipient), join_next() yields replies in completion order - the streaming gather - and a select! branch on a sleep applies the budget. Dropping the JoinSet aborts every task still in it, which is the cheapest reaping policy available in any language on this list; JoinSet::shutdown/abort_all make it explicit. JoinSet::join_all is the wait-for-all form, and tokio::time::timeout wraps a single future (for example a whole FuturesUnordered) when the deadline belongs around the aggregate rather than around each join.",
+  "code_sketch": "let mut set = JoinSet::new();\nfor r in recipients { set.spawn(async move { ask(r).await }); }\nlet deadline = tokio::time::sleep(budget);\ntokio::pin!(deadline);\nlet mut offers = Vec::new();\nwhile let Some(res) = tokio::select! {\n    _ = &mut deadline => None,             // budget exhausted: drop the set, stragglers aborted\n    joined = set.join_next() => joined,\n} {\n    if let Ok(o) = res { offers.push(o); }\n}",
+  "pitfalls": [
+    "Dropping a JoinSet aborts all of its tasks: a set that goes out of scope mid-gather silently kills replies that were about to arrive.",
+    "tokio::time::timeout polls the future before it checks the deadline, so a future that never yields can overshoot the budget without reporting Elapsed; CPU-bound work belongs in spawn_blocking.",
+    "Spawned tasks must be 'static: the client and the recipient data have to be owned (or Arc-shared/Clone) inside the async block."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html",
+    "https://docs.rs/tokio/latest/tokio/time/fn.timeout.html",
+    "https://docs.rs/tokio/latest/tokio/macro.select.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "tokio-joinset-select",
+      "name": "tokio JoinSet with select! deadline",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "tokio"
+      ],
+      "idiom_name": "tokio::task::JoinSet + join_next in a select! against tokio::time::sleep",
+      "implementation_notes": "std has no runtime and no futures, so the pattern is realized through tokio: a JoinSet holds the fan-out (spawn one task per recipient), join_next() yields replies in completion order - the streaming gather - and a select! branch on a sleep applies the budget. Dropping the JoinSet aborts every task still in it, which is the cheapest reaping policy available in any language on this list; JoinSet::shutdown/abort_all make it explicit. JoinSet::join_all is the wait-for-all form, and tokio::time::timeout wraps a single future (for example a whole FuturesUnordered) when the deadline belongs around the aggregate rather than around each join.",
+      "code_sketch": "let mut set = JoinSet::new();\nfor r in recipients { set.spawn(async move { ask(r).await }); }\nlet deadline = tokio::time::sleep(budget);\ntokio::pin!(deadline);\nlet mut offers = Vec::new();\nwhile let Some(res) = tokio::select! {\n    _ = &mut deadline => None,             // budget exhausted: drop the set, stragglers aborted\n    joined = set.join_next() => joined,\n} {\n    if let Ok(o) = res { offers.push(o); }\n}",
+      "pitfalls": [
+        "Dropping a JoinSet aborts all of its tasks: a set that goes out of scope mid-gather silently kills replies that were about to arrive.",
+        "tokio::time::timeout polls the future before it checks the deadline, so a future that never yields can overshoot the budget without reporting Elapsed; CPU-bound work belongs in spawn_blocking.",
+        "Spawned tasks must be 'static: the client and the recipient data have to be owned (or Arc-shared/Clone) inside the async block."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html",
+        "https://docs.rs/tokio/latest/tokio/time/fn.timeout.html",
+        "https://docs.rs/tokio/latest/tokio/macro.select.html"
+      ]
+    },
+    {
+      "variant_id": "futures-join-all",
+      "name": "futures::join_all / FuturesUnordered (runtime-agnostic)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "futures"
+      ],
+      "idiom_name": "futures::future::join_all for wait-for-all; FuturesUnordered for completion order",
+      "implementation_notes": "The futures crate provides the combinators without depending on tokio: join_all drives every future to completion and returns all results in input order (the wait-for-all gather; it switches internally to the more powerful FuturesOrdered for large inputs to avoid quadratic polling), while FuturesUnordered yields results as they finish for a first-answer policy. The deadline then comes from whatever timer the chosen runtime offers (tokio::time, async-io, futures-timer) wrapped around the aggregate. Choose this variant for library crates that must not force a runtime on their users; note that join_all itself imposes no budget, so a straggler blocks the gather.",
+      "code_sketch": "use futures::future::join_all;\nlet all: Vec<Result<Offer, Error>> = join_all(recipients.iter().map(|r| ask(r))).await;\nlet offers: Vec<Offer> = all.into_iter().flatten().collect();   // partial gather, input order\npick_best(offers)",
+      "pitfalls": [
+        "join_all waits for every future and has no deadline of its own: the budget has to wrap the whole aggregate (or each call), otherwise one straggler defines the latency.",
+        "FuturesUnordered only makes progress while it is being polled; forgetting the driving loop (or a StreamExt combinator) makes the gather appear to finish early.",
+        "Results of join_all keep input order, not completion order, so 'how late did each reply arrive' must be measured separately if the merge needs it."
+      ],
+      "sources": [
+        "https://docs.rs/futures/latest/futures/future/fn.join_all.html"
+      ]
+    },
+    {
+      "variant_id": "rayon-par-map",
+      "name": "rayon parallel iterator (CPU-bound scatter)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "rayon"
+      ],
+      "idiom_name": "par_iter().map(...).collect() + an associative reduce for the aggregate",
+      "implementation_notes": "When 'ask many' means shards of local computation rather than remote calls, rayon's parallel iterators are the scatter-gather: par_iter().map(...).collect() fans the work across the work-stealing pool and gathers results in the original order, while reduce/fold expresses the aggregation as an associative operation. There is no per-item deadline - a computation cannot be abandoned - so this variant fits CPU-bound work over a partition of data (shards, chunks, rows), not request/response fan-out. Mixing it with async recipients is a smell: I/O belongs to the runtime variants, and blocking I/O inside par_iter starves the pool.",
+      "code_sketch": "use rayon::prelude::*;\nlet per_shard: Vec<Counts> = shards.par_iter().map(|s| count(s)).collect();   // scatter + gather\nlet total: u64 = per_shard.par_iter().map(|c| c.total()).sum();              // associative aggregate\n(total, per_shard)",
+      "pitfalls": [
+        "rayon tasks are neither cancellable nor time-bounded: a hung shard hangs the gather, so local work with deadlines needs an async runtime or a supervisor thread.",
+        "Blocking I/O inside par_iter occupies pool workers and starves every other rayon user in the process.",
+        "The gather is ordered per the iterator contract, so costs are charged to the whole fan-out even when only the first result is needed (find_any/any is the early-exit primitive)."
+      ],
+      "sources": [
+        "https://docs.rs/rayon/latest/rayon/iter/trait.ParallelIterator.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-joinset-select",
+  "version": "1.0"
+}

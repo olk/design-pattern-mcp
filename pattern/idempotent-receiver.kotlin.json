@@ -1,0 +1,56 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "kotlin",
+  "support": "idiomatic",
+  "idiom_name": "kotlinx.coroutines Mutex.withLock + mutableSetOf",
+  "implementation_notes": "In coroutine-based receivers the guard is a Mutex around the seen-set: `mutex.withLock { if (key in seen) false else { seen += key; true } }` makes check-and-claim a single suspending critical section, and no lock discipline is written by hand. It is in-process, so it protects one instance only; the durable route is the same as on the JVM generally - a unique index on the idempotency key claimed inside the consumer's transaction with Exposed or JDBC. Hold the mutex only for the claim, never across the effects, or the guard serializes all processing.",
+  "code_sketch": "class IdempotencyGuard {\n    private val mutex = Mutex()\n    private val seen = mutableSetOf<String>()\n    suspend fun claim(key: String): Boolean = mutex.withLock {\n        if (key in seen) false else { seen += key; true }   // false => duplicate\n    }\n}\n\nsuspend fun onMessage(msg: Message) {\n    if (!guard.claim(msg.idempotencyKey)) return ack(msg)    // duplicate: absorb\n    applyEffects(msg); ack(msg)\n}",
+  "pitfalls": [
+    "The guard is per-process: with several pods or after a restart the seen-set is gone, so duplicates reappear unless the claim is durable.",
+    "Suspending inside withLock across the effects serializes the receiver; claim, release, then process.",
+    "The set never expires on its own; retention must be swept by timestamp or delegated to the store."
+  ],
+  "sources": [
+    "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/",
+    "https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "coroutine-mutex-guard",
+      "name": "Coroutine Mutex-guarded seen-set",
+      "paradigm": "concurrent",
+      "implementation_notes": "In coroutine-based receivers the guard is a Mutex around the seen-set: `mutex.withLock { if (key in seen) false else { seen += key; true } }` makes check-and-claim a single suspending critical section, and no lock discipline is written by hand. It is in-process, so it protects one instance only; the durable route is the same as on the JVM generally - a unique index on the idempotency key claimed inside the consumer's transaction with Exposed or JDBC. Hold the mutex only for the claim, never across the effects, or the guard serializes all processing.",
+      "code_sketch": "class IdempotencyGuard {\n    private val mutex = Mutex()\n    private val seen = mutableSetOf<String>()\n    suspend fun claim(key: String): Boolean = mutex.withLock {\n        if (key in seen) false else { seen += key; true }   // false => duplicate\n    }\n}\n\nsuspend fun onMessage(msg: Message) {\n    if (!guard.claim(msg.idempotencyKey)) return ack(msg)    // duplicate: absorb\n    applyEffects(msg); ack(msg)\n}",
+      "pitfalls": [
+        "The guard is per-process: with several pods or after a restart the seen-set is gone, so duplicates reappear unless the claim is durable.",
+        "Suspending inside withLock across the effects serializes the receiver; claim, release, then process.",
+        "The set never expires on its own; retention must be swept by timestamp or delegated to the store."
+      ],
+      "sources": [
+        "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/",
+        "https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html"
+      ],
+      "min_standard": "Kotlin1.9",
+      "idiom_name": "kotlinx.coroutines Mutex.withLock + mutableSetOf"
+    },
+    {
+      "variant_id": "jvm-concurrent-map-claim",
+      "name": "JVM atomic claim with ConcurrentHashMap.putIfAbsent",
+      "paradigm": "concurrent",
+      "implementation_notes": "For thread-based (non-coroutine) Kotlin on the JVM, ConcurrentHashMap.putIfAbsent is the atomic claim: a null return means this thread won. It is the same primitive Java uses, minus the coroutine plumbing, and equally process-local. The durable variant on the JVM is the shared claim: Exposed/JDBC insert against a UNIQUE key inside the business transaction, or a database upsert whose zero-row result is the duplicate signal.",
+      "code_sketch": "private val seen = ConcurrentHashMap<String, Long>()   // key -> expiry\n\nfun claim(key: String, ttlMs: Long): Boolean =\n    seen.putIfAbsent(key, System.currentTimeMillis() + ttlMs) == null\n\nfun onMessage(msg: Message) {\n    if (!claim(msg.idempotencyKey, REDELIVERY_WINDOW_MS)) return ack(msg)\n    applyEffects(msg)\n    ack(msg)\n}",
+      "pitfalls": [
+        "putIfAbsent on a process-local map gives no protection once the service scales out or restarts.",
+        "Entries need an explicit expiry sweep; ConcurrentHashMap has no TTL."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html",
+        "https://www.postgresql.org/docs/current/sql-insert.html"
+      ],
+      "min_standard": "Kotlin1.9",
+      "idiom_name": "ConcurrentHashMap.putIfAbsent (JVM)"
+    }
+  ],
+  "default_variant": "coroutine-mutex-guard"
+}

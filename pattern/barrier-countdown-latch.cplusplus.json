@@ -1,0 +1,57 @@
+{
+  "pattern": "barrier-countdown-latch",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::barrier<CompletionFunction> (reusable) and std::latch (one-shot)",
+  "implementation_notes": "The standard library now ships both halves: std::barrier is reusable and calls its completion function once per phase - in exactly one thread, before any party is released - which is the leader/aggregation slot of the pattern; std::latch is the single-use downward counter whose count_down() plus wait() pair is the fan-in gate, with arrive_and_wait() as the combined worker-side call. Reach for the hand-rolled form only below C++20, and note that std::latch has no reset at all, so a loop must use std::barrier or construct a new latch per round.",
+  "code_sketch": "std::barrier phase(n_workers, [] noexcept { merge_partials(); });  // once per generation\n\nauto worker = [&](int id) {\n    for (int step = 0; step < steps; ++step) {\n        compute(id, step);\n        phase.arrive_and_wait();          // reusable rendezvous\n    }\n};\n\nstd::latch done(n_workers);               // one-shot fan-in, no reset\n/* ... done.count_down(); in each producer ... */\ndone.wait();",
+  "pitfalls": [
+    "std::latch is single-use: reusing it in a loop is impossible (no reset exists), and std::barrier::arrive_and_drop() changes the party count for every later generation - document which one the loop uses.",
+    "The completion function runs inside the barrier, before other parties are released: blocking there stalls the phase, while throwing violates the nothrow completion requirement and can terminate the program; keep the callback small and report failures through shared state.",
+    "A participating thread that exits or is cancelled leaves the barrier permanently short of its party count; C++20 barriers have no timeout or broken state, so exception safety must rethrow after arrive_and_drop() or propagate through a side channel."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/barrier",
+    "https://en.cppreference.com/w/cpp/thread/latch"
+  ],
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "std-latch-barrier",
+      "name": "C++20 std::latch and std::barrier",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "idiom_name": "std::barrier<CompletionFunction> (reusable) and std::latch (one-shot)",
+      "implementation_notes": "The standard library now ships both halves: std::barrier is reusable and calls its completion function once per phase - in exactly one thread, before any party is released - which is the leader/aggregation slot of the pattern; std::latch is the single-use downward counter whose count_down() plus wait() pair is the fan-in gate, with arrive_and_wait() as the combined worker-side call. Reach for the hand-rolled form only below C++20, and note that std::latch has no reset at all, so a loop must use std::barrier or construct a new latch per round.",
+      "code_sketch": "std::barrier phase(n_workers, [] noexcept { merge_partials(); });  // once per generation\n\nauto worker = [&](int id) {\n    for (int step = 0; step < steps; ++step) {\n        compute(id, step);\n        phase.arrive_and_wait();          // reusable rendezvous\n    }\n};\n\nstd::latch done(n_workers);               // one-shot fan-in, no reset\n/* ... done.count_down(); in each producer ... */\ndone.wait();",
+      "pitfalls": [
+        "std::latch is single-use: reusing it in a loop is impossible (no reset exists), and std::barrier::arrive_and_drop() changes the party count for every later generation - document which one the loop uses.",
+        "The completion function runs inside the barrier, before other parties are released: blocking there stalls the phase, while throwing violates the nothrow completion requirement and can terminate the program; keep the callback small and report failures through shared state.",
+        "A participating thread that exits or is cancelled leaves the barrier permanently short of its party count; C++20 barriers have no timeout or broken state, so exception safety must rethrow after arrive_and_drop() or propagate through a side channel."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/barrier",
+        "https://en.cppreference.com/w/cpp/thread/latch"
+      ]
+    },
+    {
+      "variant_id": "condvar-manual",
+      "name": "Pre-C++20 hand-rolled barrier and latch (mutex + condition variable)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::mutex + std::condition_variable with a generation counter",
+      "implementation_notes": "Below C++20 the structure is written by hand: a mutex, a condition variable, a remaining-parties counter and a generation number. Each arrival locks, decrements the counter, and either releases everyone of the current generation (bump the generation, notify all) or waits until the generation changes behind a predicate. The same class covers both usages - reusable while the counter is reset each generation, one-shot when it is not - and the classic form remains justified only where the toolchain cannot use C++20 or where a non-standard notification policy is required.",
+      "code_sketch": "class barrier {                                  // pre-C++20 fallback\n    std::mutex m;\n    std::condition_variable cv;\n    unsigned left, gen = 0;\n    const unsigned parties;\npublic:\n    explicit barrier(unsigned n) : left(n), parties(n) {}\n    void wait() {\n        std::unique_lock lk(m);\n        auto g = gen;\n        if (--left == 0) { gen++; left = parties; cv.notify_all(); }\n        else cv.wait(lk, [&] { return gen != g; });   // predicate loop\n    }\n};",
+      "pitfalls": [
+        "A bare cv.wait() without the generation predicate wakes on spurious wakeups or on the next generation's release and lets a straggler run ahead of its phase.",
+        "The release must happen after the state change; notifying while still holding the mutex is legal but hands the awakened thread a lock collision, and forgetting the notify converts the barrier into a permanent hang.",
+        "An exception in one participant breaks the generation: without an explicit abort flag plus broadcast the remaining parties wait forever, so the failure policy is part of the hand-rolled class, not of its callers."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable",
+        "https://en.cppreference.com/w/cpp/thread/barrier"
+      ]
+    }
+  ],
+  "default_variant": "std-latch-barrier"
+}

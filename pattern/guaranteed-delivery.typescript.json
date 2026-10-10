@@ -1,0 +1,67 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "typescript",
+  "support": "library",
+  "idiom_name": "boss.send(..., { db }) inside the business transaction + typed boss.work handler",
+  "implementation_notes": "pg-boss keeps jobs in Postgres and lets a send participate in a caller-supplied transaction: passing the same db handle used for the business write means the job row commits with the state change, and workers claim rows with SKIP LOCKED and only delete them when the handler resolves - so the acknowledgement is the handler's successful completion. Retry limits and delays make redelivery explicit, and the TypeScript generics (typed queue payloads and handlers) put the message contract in the build. The durable store is the database, so no broker transaction or XA is needed; use the Kafka variant when the sink must be a shared topic.",
+  "code_sketch": "const boss = new PgBoss(connectionString);\nawait boss.start();\nawait db.query(\"BEGIN\");\nawait db.query(\"INSERT INTO orders(id, status) VALUES ($1, 'new')\", [order.id]);\nawait boss.send(\"orders\", order, { db });     // commits with the business write\nawait db.query(\"COMMIT\");\nawait boss.work<Order>(\"orders\", async ([job]) => {\n  await gateway.deliver(job.data);            // ack happens when this resolves\n});",
+  "pitfalls": [
+    "Calling boss.send without the transaction's db handle uses the pool and reintroduces the dual write the variant exists to remove.",
+    "A throwing handler triggers a retry, so the receiver must be idempotent on job.data (or on job.id) - the same duplicate contract as any at-least-once channel.",
+    "Handlers that outlive their job's lock/expiry window are re-delivered while still running; keep handler duration bounded or extend the job's lifetime explicitly.",
+    "The archive/completion tables grow without a retention policy, turning a queue into the largest table in the database."
+  ],
+  "sources": [
+    "https://github.com/timgit/pg-boss",
+    "https://www.postgresql.org/docs/current/sql-select.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pg-boss-transactional",
+      "name": "pg-boss transactional enqueue in Postgres",
+      "paradigm": "oo",
+      "min_standard": "TypeScript4.7",
+      "requires_features": [
+        "pg-boss",
+        "postgres"
+      ],
+      "idiom_name": "boss.send(..., { db }) inside the business transaction + typed boss.work handler",
+      "implementation_notes": "pg-boss keeps jobs in Postgres and lets a send participate in a caller-supplied transaction: passing the same db handle used for the business write means the job row commits with the state change, and workers claim rows with SKIP LOCKED and only delete them when the handler resolves - so the acknowledgement is the handler's successful completion. Retry limits and delays make redelivery explicit, and the TypeScript generics (typed queue payloads and handlers) put the message contract in the build. The durable store is the database, so no broker transaction or XA is needed; use the Kafka variant when the sink must be a shared topic.",
+      "code_sketch": "const boss = new PgBoss(connectionString);\nawait boss.start();\nawait db.query(\"BEGIN\");\nawait db.query(\"INSERT INTO orders(id, status) VALUES ($1, 'new')\", [order.id]);\nawait boss.send(\"orders\", order, { db });     // commits with the business write\nawait db.query(\"COMMIT\");\nawait boss.work<Order>(\"orders\", async ([job]) => {\n  await gateway.deliver(job.data);            // ack happens when this resolves\n});",
+      "pitfalls": [
+        "Calling boss.send without the transaction's db handle uses the pool and reintroduces the dual write the variant exists to remove.",
+        "A throwing handler triggers a retry, so the receiver must be idempotent on job.data (or on job.id) - the same duplicate contract as any at-least-once channel.",
+        "Handlers that outlive their job's lock/expiry window are re-delivered while still running; keep handler duration bounded or extend the job's lifetime explicitly.",
+        "The archive/completion tables grow without a retention policy, turning a queue into the largest table in the database."
+      ],
+      "sources": [
+        "https://github.com/timgit/pg-boss",
+        "https://www.postgresql.org/docs/current/sql-select.html"
+      ]
+    },
+    {
+      "variant_id": "kafkajs-transaction-typed",
+      "name": "KafkaJS transactional producer with typed records",
+      "paradigm": "concurrent",
+      "min_standard": "TypeScript4.7",
+      "requires_features": [
+        "kafkajs"
+      ],
+      "idiom_name": "producer.transaction() with sendBatch and transaction.sendOffsets()",
+      "implementation_notes": "The Kafka realization in TypeScript: a producer configured with a stable transactionalId, idempotent: true and maxInFlightRequests: 1, then a transaction whose sendBatch publishes the typed records and whose sendOffsets commits the consumer offsets in the same atomic unit - the broker log is the store and the ack is the commit. TypeScript adds the record contract: the generic producer and the explicit codec keep key/value types visible at the boundary instead of relying on JSON.stringify. Choose it over the pg-boss variant when the channel must be a shared Kafka topic rather than a private job table.",
+      "code_sketch": "const producer = kafka.producer({\n  transactionalId: \"orders-tx-1\", idempotent: true, maxInFlightRequests: 1,\n});\nawait producer.connect();\nconst tx = await producer.transaction();\ntry {\n  await tx.sendBatch({ topicMessages: [{ topic: \"orders.out\", messages: [rec] }] });\n  await tx.sendOffsets({ consumerGroupId: group, topics: [{ topic: \"orders.in\", partitions: parts }] });\n  await tx.commit();\n} catch (e) {\n  await tx.abort();\n}",
+      "pitfalls": [
+        "Serializing with JSON.stringify silently truncates bigint and converts Date/undefined - use a typed codec, otherwise the payload that was acknowledged is not the payload that was written.",
+        "Every party in the transaction must read with read_committed, otherwise aborted records surface in TypeScript consumers as if committed.",
+        "The transactional id must be stable per instance and owned by exactly one running producer, or the broker's fencing cannot protect against duplicate writers.",
+        "`tx.commit()`/`tx.abort()` must be reachable on every path (including cancellation and shutdown) or the id stays blocked for a full transaction timeout."
+      ],
+      "sources": [
+        "https://kafka.js.org/docs/transactions",
+        "https://kafka.js.org/docs/producing"
+      ]
+    }
+  ],
+  "default_variant": "pg-boss-transactional",
+  "version": "1.0"
+}

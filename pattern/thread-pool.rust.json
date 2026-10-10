@@ -1,0 +1,68 @@
+{
+  "pattern": "thread-pool",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "rayon par_iter/join over a global or ThreadPoolBuilder pool",
+  "implementation_notes": "Rayon is the idiomatic Rust pool: a global work-stealing pool sized to the available parallelism backs par_iter, par_sort and join, and ThreadPoolBuilder::new().num_threads(n).build() creates a private pool when the global one must not be shared. Closures are the tasks, so threads, queues and joins disappear from the code; work stealing requires the work to be splittable, which is why rayon fits data-parallel batches best. Run synchronous third-party code inside pool.install() to keep it on pool threads, and keep per-task state in the closure because reused workers carry nothing between tasks except their stack.",
+  "code_sketch": "use rayon::prelude::*;\nlet pool = rayon::ThreadPoolBuilder::new().num_threads(8).build()?;\nlet digests: Vec<_> = pool.install(|| files.par_iter().map(|f| digest(f)).collect());",
+  "pitfalls": [
+    "A task that blocks (mutex, I/O, sleep) occupies a stealing worker and stalls unrelated work: rayon is for CPU-bound work.",
+    "Panics propagate to the join/collect caller and can poison shared state - treat a panic as a task failure and isolate it.",
+    "Nested pools re-enter scheduling and can deadlock when bounded; prefer rayon::join or install on the existing pool."
+  ],
+  "sources": [
+    "https://docs.rs/rayon/latest/rayon/"
+  ],
+  "variants": [
+    {
+      "variant_id": "rayon",
+      "name": "Rayon thread pool (work stealing)",
+      "paradigm": "data-oriented",
+      "idiom_name": "rayon par_iter/join over a global or ThreadPoolBuilder pool",
+      "implementation_notes": "Rayon is the idiomatic Rust pool: a global work-stealing pool sized to the available parallelism backs par_iter, par_sort and join, and ThreadPoolBuilder::new().num_threads(n).build() creates a private pool when the global one must not be shared. Closures are the tasks, so threads, queues and joins disappear from the code; work stealing requires the work to be splittable, which is why rayon fits data-parallel batches best. Run synchronous third-party code inside pool.install() to keep it on pool threads, and keep per-task state in the closure because reused workers carry nothing between tasks except their stack.",
+      "code_sketch": "use rayon::prelude::*;\nlet pool = rayon::ThreadPoolBuilder::new().num_threads(8).build()?;\nlet digests: Vec<_> = pool.install(|| files.par_iter().map(|f| digest(f)).collect());",
+      "pitfalls": [
+        "A task that blocks (mutex, I/O, sleep) occupies a stealing worker and stalls unrelated work: rayon is for CPU-bound work.",
+        "Panics propagate to the join/collect caller and can poison shared state - treat a panic as a task failure and isolate it.",
+        "Nested pools re-enter scheduling and can deadlock when bounded; prefer rayon::join or install on the existing pool."
+      ],
+      "sources": [
+        "https://docs.rs/rayon/latest/rayon/"
+      ]
+    },
+    {
+      "variant_id": "tokio-blocking-pool",
+      "name": "Tokio blocking pool (spawn_blocking)",
+      "paradigm": "concurrent",
+      "idiom_name": "tokio::task::spawn_blocking on the runtime's blocking pool",
+      "implementation_notes": "In an async service the pool you actually want is the runtime's: Tokio's multi-threaded scheduler multiplexes async tasks cooperatively and keeps a separate pool for spawn_blocking (and block_in_place on the multi-thread flavour), so synchronous libraries and CPU-heavy work do not stall the reactor. It replaces a hand-written pool entirely for that use case - size the runtime with worker_threads, bound concurrency with semaphores or a dedicated runtime, and rely on JoinHandle for completion.",
+      "code_sketch": "let handle = tokio::task::spawn_blocking(move || compress(payload));\nlet out = handle.await?;          // JoinError if it panicked or was aborted\n// runtime: #[tokio::main(flavor = \"multi_thread\", worker_threads = 4)]",
+      "pitfalls": [
+        "spawn_blocking tasks cannot be aborted once running (documented): a runaway blocking task holds its thread.",
+        "The blocking pool is bounded and shared; long tasks delay every other spawn_blocking in the process.",
+        "Blocking directly inside an async task stalls a worker for every task multiplexed on it."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/task/index.html"
+      ]
+    },
+    {
+      "variant_id": "std-thread-mpsc",
+      "name": "std::thread + channel (no dependencies)",
+      "paradigm": "oo",
+      "idiom_name": "std::thread workers over std::sync::mpsc with join-based shutdown",
+      "implementation_notes": "Without crates the pool is std::thread::spawn workers each owning a Receiver (or sharing one behind Arc<Mutex<Receiver>>/crossbeam-channel) and looping over messages, with channel disconnect or an Arc<AtomicBool> as the stop signal and JoinHandle::join at shutdown; std::thread::scope bounds thread lifetimes so borrowed data needs no Arc. This is the dependency-free fallback and the place to build an exact queue policy; tasks must be Send + 'static unless the pool is scoped.",
+      "code_sketch": "let (tx, rx) = std::sync::mpsc::channel::<Job>();\nlet rx = std::sync::Arc::new(std::sync::Mutex::new(rx));\nlet workers: Vec<_> = (0..4).map(|_| {\n    let rx = rx.clone();\n    std::thread::spawn(move || loop {\n        let Ok(job) = rx.lock().unwrap().recv() else { break };  // Err = shutdown\n        job.run();\n    })\n}).collect();",
+      "pitfalls": [
+        "An mpsc Receiver cannot be shared without a Mutex (only one receiver exists): use crossbeam-channel or Arc<Mutex<Receiver>>.",
+        "Dropping a JoinHandle detaches the thread silently: exit paths must join, and a panic poisons the queue Mutex so the worker loop turns into a panic storm.",
+        "A worker panic only surfaces at join - track task failures instead of assuming the pool survived."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/thread/index.html"
+      ]
+    }
+  ],
+  "default_variant": "rayon",
+  "version": "1.0"
+}

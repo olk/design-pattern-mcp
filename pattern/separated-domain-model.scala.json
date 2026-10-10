@@ -1,0 +1,56 @@
+{
+  "pattern": "separated-domain-model",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "implicit Read[Order]/Write[Order] + Transactor + sql interpolation",
+  "implementation_notes": "Doobie is not an ORM, so the mapping is a typeclass: Read[Order]/Write[Order] instances are defined in the persistence layer (imap over the primitive tuple, or Get/Put composition), which lets the domain case classes stay annotation-free while doobie still checks the row shape at the call site (sql\"select ...\".query[Order]). The instances replace the classic Mapper, the repository is a domain-owned trait implemented with a Transactor, and the mutable object graph, identity map and lazy loading of ORMs never appear - reads return immutable values. Slick, by contrast, makes the data model explicit as Table objects with a <> projection to the case class and returns tuples or association case classes for joins instead of persisting object graphs.",
+  "code_sketch": "// domain (no doobie import)\nfinal case class Order private (id: OrderId, total: Money)\nobject Order {\n  def create(id: OrderId, total: Money): Either[String, Order] = /* validate */\n}\n\n// infrastructure/persistence/OrderQueries.scala\nimplicit val orderRead: Read[Order] =\n  Read[(String, Long)].imap { case (id, cents) =>\n    Order.create(OrderId(id), Money.cents(cents)).fold(sys.error, identity)\n  }(o => (o.id.value, o.total.cents))\nsql\"select id, total_cents from orders\".query[Order].transact(xa)",
+  "pitfalls": [
+    "Implicit Read/Write instances are invisible wiring: a hand-written instance with the wrong column order or types compiles and fails at runtime, so keep them beside the queries and covered by tests.",
+    "Case-class copy/apply can bypass smart constructors unless the primary constructor is private and validation lives in the companion factory - the mapping instance must go through that factory, not apply.",
+    "Nothing stops a domain case class from acquiring a doobie or json dependency; the crates/modules are convention, so the build should keep the domain module free of the persistence and HTTP libraries."
+  ],
+  "sources": [
+    "https://typelevel.org/doobie/",
+    "https://docs.scala-lang.org/tour/case-classes.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "doobie-typeclasses",
+      "name": "doobie Read/Write instances defined in the persistence layer",
+      "paradigm": "functional",
+      "min_standard": "Scala2.12",
+      "idiom_name": "implicit Read[Order]/Write[Order] + Transactor + sql interpolation",
+      "implementation_notes": "Doobie is not an ORM, so the mapping is a typeclass: Read[Order]/Write[Order] instances are defined in the persistence layer (imap over the primitive tuple, or Get/Put composition), which lets the domain case classes stay annotation-free while doobie still checks the row shape at the call site (sql\"select ...\".query[Order]). The instances replace the classic Mapper, the repository is a domain-owned trait implemented with a Transactor, and the mutable object graph, identity map and lazy loading of ORMs never appear - reads return immutable values. Slick, by contrast, makes the data model explicit as Table objects with a <> projection to the case class and returns tuples or association case classes for joins instead of persisting object graphs.",
+      "code_sketch": "// domain (no doobie import)\nfinal case class Order private (id: OrderId, total: Money)\nobject Order {\n  def create(id: OrderId, total: Money): Either[String, Order] = /* validate */\n}\n\n// infrastructure/persistence/OrderQueries.scala\nimplicit val orderRead: Read[Order] =\n  Read[(String, Long)].imap { case (id, cents) =>\n    Order.create(OrderId(id), Money.cents(cents)).fold(sys.error, identity)\n  }(o => (o.id.value, o.total.cents))\nsql\"select id, total_cents from orders\".query[Order].transact(xa)",
+      "pitfalls": [
+        "Implicit Read/Write instances are invisible wiring: a hand-written instance with the wrong column order or types compiles and fails at runtime, so keep them beside the queries and covered by tests.",
+        "Case-class copy/apply can bypass smart constructors unless the primary constructor is private and validation lives in the companion factory - the mapping instance must go through that factory, not apply.",
+        "Nothing stops a domain case class from acquiring a doobie or json dependency; the crates/modules are convention, so the build should keep the domain module free of the persistence and HTTP libraries."
+      ],
+      "sources": [
+        "https://typelevel.org/doobie/",
+        "https://docs.scala-lang.org/tour/case-classes.html"
+      ]
+    },
+    {
+      "variant_id": "slick-lifted-embedding",
+      "name": "Slick table objects as the explicit data model",
+      "paradigm": "functional",
+      "min_standard": "Scala2.12",
+      "idiom_name": "Table[T] + <> projection to case classes, joins returning tuples",
+      "implementation_notes": "Slick is a functional-relational mapper, not an ORM: you declare the database as Table objects (one per table, with columns and a <> projection to a case class), and that table definition is the data model, kept in the repository layer while the case classes stay the domain model. Joins return tuples or association case classes rather than navigating an object graph, so nothing is half-loaded and there is no identity map, cache or lazy loading to leak into the domain; the price is that queries are composed explicitly and inheritance/relationship magic simply does not exist.",
+      "code_sketch": "// infrastructure/persistence/Orders.scala\nfinal class Orders(tag: Tag) extends Table[OrderRow](tag, \"orders\") {\n  def id = column[String](\"id\", O.PrimaryKey)\n  def totalCents = column[Long](\"total_cents\")\n  def * = (id, totalCents).mapTo[OrderRow]\n}\n\n// domain: case class Order(id: OrderId, total: Money) mapped in the repository\n// query: orders.join(lines).on(_.id === _.orderId).result  // tuples, not graphs",
+      "pitfalls": [
+        "Projections and case classes drift: a column added to the schema must be reflected in both the Table definition and the <> projection, and nothing checks that the domain mapping still matches.",
+        "There is no lazy loading and no object graph: code written against ORM habits ends up issuing a query per element instead of joining, which shows up as an N+1 pattern under load.",
+        "Slick is synchronous at its core - blocking JDBC calls must be dispatched to the right execution context rather than run on the compute pool."
+      ],
+      "sources": [
+        "https://scala-slick.org/doc/prerelease/orm-to-slick.html"
+      ]
+    }
+  ],
+  "default_variant": "doobie-typeclasses",
+  "version": "1.0"
+}

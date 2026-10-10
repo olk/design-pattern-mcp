@@ -1,0 +1,194 @@
+{
+  "category": "concurrency-resilience",
+  "name": "fork-join",
+  "aliases": [
+    "fork/join parallelism",
+    "work-stealing parallelism"
+  ],
+  "intent": "Exploit divide-and-conquer parallelism by splitting a problem recursively into lightweight subtasks that run concurrently, joining their partial results at a single point, while idle workers steal the remaining subtasks so cores do not sit idle on an uneven split.",
+  "problem": "A recursive divide-and-conquer computation has independent subproblems that could keep several cores busy, but a fixed partition leaves cores idle when the halves are uneven and spawning an OS thread per subtask costs more than the work itself. The recurring decision: how do I express recursive parallelism so that the runtime - not the algorithm - balances the remaining subtasks across the available cores?",
+  "context": "Recursive, CPU-bound, side-effect-free computation over an in-memory structure (array, tree, index range, search space) that can be split until a granularity threshold and whose subtasks never block on I/O, locks or each other. The pattern needs a task scheduler with per-worker queues and idle-worker stealing - a JVM ForkJoinPool, the .NET TPL, rayon, TBB, the Go runtime, OpenMP tasks - or the budget to build that scheduler by hand.",
+  "benefits": [
+    "Near-linear speedup on regular recursive workloads: splitting stops when the leaf work is small enough, and stealing keeps late-finishing workers busy instead of letting a static partition idle cores.",
+    "Granularity becomes a runtime knob rather than a design constraint: the same decomposition scales from one core to many, and on a uniprocessor the identical code still runs correctly.",
+    "The skeleton documents the algorithm: split, solve leaf, combine is explicit, so the parallel form stays recognizably close to the sequential divide-and-conquer and can be reviewed as such.",
+    "No thread per task: lightweight tasks over a bounded worker pool amortize task creation, keep the thread count proportional to cores, and avoid the context-switch cost of thread-per-subtask designs.",
+    "Locality by construction: workers pop their own newest tasks (LIFO, depth-first execution) while thieves take the oldest task (FIFO), which is usually the largest remaining unit of work - the scheme that made Cilk and Lea's framework fast.",
+    "Structured join points: results, failures and completion are aggregated where the caller expects them (invokeAll, Task.WhenAll, awaitAll, task groups, taskgroup), so composition and error handling stay explicit."
+  ],
+  "tradeoffs": [
+    "Granularity tuning is unavoidable: split too far and the fork/join bookkeeping costs more than the leaf work returns, split too coarsely and the last split still leaves cores idle - the right threshold is workload- and machine-dependent.",
+    "The pattern assumes CPU-bound, non-blocking leaf tasks: blocking I/O, taking locks or waiting on another task's result inside a task holds a worker (or deadlocks); JVM and .NET only compensate through managed blockers and thread injection, and rayon explicitly warns against blocking inside join.",
+    "Stealing is best-effort balancing, not a scheduler: it adds deque contention, Amdahl's law still caps the speedup at the sequential fraction, and nested or multiple pools oversubscribe the machine.",
+    "Observability degrades: one logical computation spans many workers, a stack trace shows a stolen task instead of the call chain, and exceptions surface only where the join aggregates them.",
+    "Cancellation, timeouts and backpressure are outside the pattern: only runtimes with cooperative cancellation (task groups, structured concurrency, cancellation tokens) compose cleanly with the join; a hand-built fork/join needs its own stop protocol.",
+    "Recursive decomposition allocates heavily - Lea measured programs generating millions of short-lived task objects per second - and unbounded recursion depth can still exhaust worker stacks when the threshold is missing.",
+    "The join is a hard rendezvous: a task that forks both halves and then immediately joins has nothing left to compute and simply blocks, which is why the classic advice is to fork one side and compute the other."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 8,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Recursive Task",
+      "responsibility": "Represents one problem instance: decides whether the range is small enough to solve sequentially, otherwise splits it, forks the subtasks and joins their partial results into its own result."
+    },
+    {
+      "role": "Worker (worker thread)",
+      "responsibility": "Executes tasks popped from its own deque; when that deque is empty it tries to steal a task from another worker instead of blocking on a central queue."
+    },
+    {
+      "role": "Work Deque (per-worker task queue)",
+      "responsibility": "Holds a worker's private tasks: the owner pushes and pops at one end (LIFO), thieves take from the opposite end (FIFO) so that stealing yields the oldest and usually largest subtask."
+    },
+    {
+      "role": "Stealing Scheduler",
+      "responsibility": "Maps tasks to workers, arbitrates steals, decides what an idle worker does (spin, yield, sleep or block) and compensates for workers blocked at a join."
+    },
+    {
+      "role": "Join Point (result combiner)",
+      "responsibility": "The synchronization point where a task waits for its forked subtasks and combines their results - in structured runtimes the scope exit, in framework versions ForkJoinTask.join, Task.WhenAll, awaitAll, taskgroup or sgroup."
+    },
+    {
+      "role": "Granularity Threshold",
+      "responsibility": "The policy that decides when splitting stops; the only decomposition parameter the algorithm itself names, and the main performance knob of the pattern."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Sorting and selection over large arrays: merge sort, quicksort, parallel selection and index construction where ranges are split recursively and merged at the joins.",
+    "Recursive data structures: tree and graph traversals, XML/JSON/compiler-AST transformations, expression evaluation and filesystem walks where each node is a natural split point.",
+    "Numerical and imaging kernels: FFT, matrix multiplication, quadrature, ray tracing and image filters/tiles where the frame or matrix is recursively subdivided.",
+    "Search and optimisation: game-tree search with pruning (alpha-beta), branch-and-bound, SAT solving and recursive dynamic programming over a state space.",
+    "Bulk reductions and aggregations over in-memory collections where a runtime's parallel reduce (parallel streams, par_iter/par_reduce, ForkJoinTask.invokeAll, OpenMP taskloop) is the entry point.",
+    "Recursive document processing: shard merges for search indexes, histogram construction, recursive parsing and validation of large nested payloads.",
+    "GPU kernel orchestration: the CPU fork/join schedules CPU-side preprocessing and GPU command submission while GPU SIMT kernels implement the per-chunk compute - the CPU pattern and GPU kernel are separate fork/join layers with different task granularities.",
+    "Database query parallelisation: index range scans, sort-merge joins and hash joins recursively partition data shards and combine partial results at each join; common in column-store and OLAP engines.",
+    "ML inference with model parallelism: large model tensors are recursively partitioned across devices or threads (e.g., parallel matrix-vector products, attention head parallelism) and combined at batch or layer boundaries.",
+    "Scientific simulation: finite element analysis, lattice Boltzmann methods and Monte Carlo integration recursively subdivide the physical domain; each subdomain is a leaf task and boundary exchanges happen at the join.",
+    "Large-scale graph processing: parallel breadth-first search, PageRank, connected components and single-source shortest paths recursively split vertex frontiers and synchronise at barrier joins.",
+    "Java parallel streams and Arrays.parallelSort: every parallel stream pipeline is a fork/join computation - the source's Spliterator is split recursively into tasks submitted to the shared ForkJoinPool.commonPool - so any parallelStream() call is this pattern whether or not the author wrote a RecursiveTask.",
+    "Kotlin coroutine fan-out: async children started inside a coroutineScope and awaited with awaitAll form a fork/join whose scope exit is the join - a failing child cancels its siblings and the exception is rethrown at the scope, giving the combine point cancellation as well as results.",
+    "Rust data-parallel libraries built on rayon::join: quicksort, parallel iterators and recursive filters express the split as two closures handed to join, which runs one on the current thread and lets another worker steal the other instead of spawning a thread."
+  ],
+  "avoid_when": [
+    "The work is I/O-bound or waits on external events: use asynchronous invocation (futures, async/await, callbacks) instead; blocking inside a fork/join task starves the pool.",
+    "The problem is flat and evenly divisible: a fixed thread pool or a plain parallel for is simpler than recursive splitting, and needs no threshold tuning.",
+    "The runtime already exposes the operation as a parallel primitive (par_iter, parallelStream, Parallel.For, OpenMP parallel for): reimplementing the recursion beneath it duplicates scheduling and nests pools.",
+    "Subtasks need heavy shared mutable state or locking: partition ownership or message passing first; fork/join assumes independent subtasks that combine only at the join.",
+    "The total work is tiny (leaf work below tens of microseconds) or latency-critical: task creation, queue traffic and pool warm-up dominate and sequential code wins.",
+    "Work must be cancelled or timed out quickly: only runtimes with cooperative cancellation compose with the join; otherwise add a cancellation token/deadline first - the pattern alone provides neither.",
+    "The computation is deeply irregular with poor spatial locality: stealing across NUMA nodes or socket boundaries can destroy performance; partition statically when topology is known."
+  ],
+  "language_files": {
+    "generic": "fork-join.generic.json",
+    "c": "fork-join.c.json",
+    "cplusplus": "fork-join.cplusplus.json",
+    "csharp": "fork-join.csharp.json",
+    "go": "fork-join.go.json",
+    "java": "fork-join.java.json",
+    "javascript": "fork-join.javascript.json",
+    "kotlin": "fork-join.kotlin.json",
+    "python": "fork-join.python.json",
+    "ruby": "fork-join.ruby.json",
+    "rust": "fork-join.rust.json",
+    "scala": "fork-join.scala.json",
+    "swift": "fork-join.swift.json",
+    "typescript": "fork-join.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "master-worker",
+    "divide-and-conquer",
+    "structured-concurrency",
+    "thread-pool",
+    "future-promise",
+    "barrier-countdown-latch",
+    "pipeline",
+    "producer-consumer"
+  ],
+  "anti_patterns": [
+    "Forking both halves and immediately joining both in the same task: the parent has nothing left to compute and merely blocks, wasting one worker (fork one side and compute the other instead).",
+    "Recursive splitting without a granularity threshold: millions of tiny tasks, deque contention and GC pressure swamp whatever parallel speedup the decomposition could win.",
+    "Using a fork/join pool as a general thread pool for blocking work (I/O, locks, sleeps): workers stall inside tasks, stealing cannot help, and effective parallelism collapses - the JVM's common pool is a shared resource for exactly this reason.",
+    "Sharing mutable state between sibling tasks (accumulating into one collection or field) and calling it parallel: racing writes and order-dependent results turn a decomposition bug into a heisenbug.",
+    "Creating a private pool per recursive call, request or library: pools multiply, the machine oversubscribes, and the stealing locality that makes the pattern pay off disappears.",
+    "Bolting fork/join onto a runtime that already provides it (a recursive task whose leaf calls parallelStream, par_iter or Parallel.For): duplicated scheduling and nested parallelism with no benefit.",
+    "Fork/join inside async/await without structured concurrency scopes: the join blocks the async context and prevents cancellation from propagating to subtasks, creating orphaned tasks that hold resources past the scope exit.",
+    "Accumulating results into a shared buffer in the combine step without padding to avoid false sharing: adjacent cache lines modified by different workers cause repeated cache-line invalidations and kill throughput."
+  ],
+  "design_principles": [
+    "Divide and conquer: solve a problem by splitting it into independent subproblems and combining their results at a join.",
+    "Separate the decomposition policy (when to stop splitting) from the scheduling policy (which worker runs a task) - the algorithm names only the former.",
+    "Dynamic load balancing over static assignment: let idle workers steal work instead of partitioning it up front.",
+    "Single writer per unit of work: sibling tasks must not share mutable state; ownership changes only at the join.",
+    "Bounded resources: workers map to cores while tasks stay lightweight and unbounded.",
+    "Structured joins: every fork is matched by a join in the same logical scope, giving completion, failure and cancellation one well-defined point.",
+    "Topology awareness: on NUMA or multi-socket systems, prefer partition-local accumulation over cross-node stealing to preserve memory locality."
+  ],
+  "best_practices": [
+    "Tune the threshold empirically: split until leaf tasks take roughly 10-100 microseconds of real work, not until they are atomic.",
+    "Fork one side and compute the other before joining (fork/compute/join), or use the runtime's bulk form (invokeAll, join with helping) so the parent never idles.",
+    "Keep tasks pure and independent: combine results only at the join, and pass them back through return values, futures or channels rather than shared buffers.",
+    "Never block inside a task: no locks, no I/O, no waiting on other tasks; if blocking is unavoidable, use the runtime's compensation mechanism (managed blockers, thread injection).",
+    "Reuse one pool per application or module, sized to the CPU count (common pool, default TPL scheduler, global rayon pool, Go runtime); avoid nesting independent pools.",
+    "Prefer the framework's primitives - rayon::join/par_iter, Parallel.For/Task.WhenAll, RecursiveTask, OpenMP tasks - over hand-rolled deques unless no runtime exists.",
+    "Aggregate failures at the join and decide the policy explicitly (fail fast, all-settled, first error), because parallel exceptions arrive aggregated or as the first failure.",
+    "Measure with the real workload: speedup is bounded by the sequential fraction and memory bandwidth, not by the number of forks or the number of cores.",
+    "Pad accumulators to cache-line size (64 bytes on most architectures) in the combine step to prevent false sharing between worker-local results.",
+    "Use structured concurrency scopes (TaskGroup, StructuredTaskScope, scope, coroutineScope) instead of bare fork/join when the runtime supports them - cancellation and failure propagate correctly and joins are guaranteed.",
+    "On NUMA systems, prefer locality-first partitioning: assign partitions to NUMA nodes and accumulate locally before copying at the join, rather than accumulating into a shared remote variable.",
+    "For async/await runtimes, prefer fork/join expressed through structured concurrency primitives (async let, TaskGroup) rather than raw Task.Run + WaitAll to ensure cancellation propagates to child tasks.",
+    "In languages with task priorities (OpenMP priority clause, TBB task priority), assign higher priority to tasks on the critical path to reduce inter-job latency.",
+    "Validate fork/join behaviour under cancellation: confirm that cancelling a parent task aborts all in-flight subtasks and that no orphaned work continues after the scope exits."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Doug Lea, \"A Java Fork/Join Framework\" (ACM Java Grande 2000) - the canonical description of the pattern's mechanics: recursive split/fork/join, the granularity threshold, per-worker deques with LIFO owner / FIFO thief work stealing, derived from the Cilk scheduler. https://gee.cs.oswego.edu/dl/papers/fj.pdf",
+    "R. D. Blumofe & C. E. Leiserson, \"Scheduling Multithreaded Computations by Work Stealing\", Journal of the ACM 46(5), 1999 - the foundational theory behind work-stealing: the deque protocol, T₁/P + O(T∞) execution bound, and proof that stealing yields near-optimal schedules for fully-strict computations. https://dl.acm.org/doi/10.1145/324133.324234",
+    "M. Frigo, C. E. Leiserson & K. H. Randall, \"The Implementation of the Cilk-5 Multithreaded Language\" (PLDI 1998) - the work-first scheduling principle, the two-clone compilation strategy, the THE (Dijkstra-like) deque protocol, and the cilk2c compiler that made Cilk-5 spawn overhead only 2-6x a C function call. https://dl.acm.org/doi/10.1145/277652.277725",
+    "T. Mattson, B. Sanders & B. Massingill, Patterns for Parallel Programming (Addison-Wesley, 2004) - the \"Divide and Conquer\" and \"Task Parallelism\" algorithm structures and the work-stealing implementation support for them.",
+    "Intel oneAPI Threading Building Blocks, \"How Task Scheduler Works\" - depth-first (LIFO, cache-local) for owner tasks and breadth-first (FIFO, largest remaining work) for stolen tasks, with task bypass extensions for reduced scheduling overhead. https://www.intel.com/content/www/us/en/docs/onetbb/developer-guide-api-reference/2021-6/how-task-scheduler-works.html",
+    "Intel oneAPI Threading Building Blocks, \"Divide and Conquer\" - parallel_invoke for uniform subproblems and parallel_for with recursive subdivision for non-uniform subproblems; explains how task_group coordinates fork/join with dynamic dependencies. https://www.intel.com/content/www/us/en/docs/onetbb/developer-guide-api-reference/2021-9/divide-and-conquer.html",
+    "Rayon Rust, \"FAQ\" and \"join/mod.rs\" - join() places one closure on the local deque and executes the other; if the second is stolen the thread continues finding other work until the stolen closure completes; panic safety ensures both sides complete even if one panics. https://github.com/rayon-rs/rayon/blob/main/rayon-core/src/join/mod.rs",
+    "Rayon Rust, \"par_iter internal.rs\" (Splitter/Cost vs Thief policy) - adaptive cost-based splitting vs thief-based stealing; bridge_producer_consumer halves ranges recursively using join and falls back to serial consumption when splitting is not worthwhile. https://github.com/rayon-rs/rayon/blob/main/src/par_iter/internal.rs",
+    "Go Under the Hood, \"Work-Stealing Scheduling\" - Go's GMP model uses a per-P 256-entry ring buffer as a local queue (FIFO + LIFO runnext slot), random pseudo-random steal targets, and spinning vs non-spinning M handling; not a strict fork/join DAG but a heuristic work-stealing balancer for goroutines. https://golang.design/under-the-hood/en/part3concurrency/ch09sched/steal/",
+    "Microsoft Learn, \"System.Threading.Tasks.TaskScheduler Class\" - .NET ThreadPool uses a global queue for top-level tasks and per-thread local queues (LIFO) for nested/child tasks; threads prefer local then global then stealing from other locals. https://learn.microsoft.com/en-us/dotnet/fundamentals/runtime-libraries/system-threading-tasks-taskscheduler",
+    "Microsoft Learn, \"Task.WhenAll Method\" - aggregates results and exceptions; if any input task faults or is cancelled the resulting task transitions to the corresponding state and holds an AggregateException with all failures; overloads accept ReadOnlySpan for low-allocation fan-out. https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall",
+    "OpenMP 5.2, \"Task Scheduling\" - task scheduling points include task creation, taskwait, taskgroup, barrier, and taskyield; tasks by default are tied (same thread throughout) and scheduling constraints prevent ties from migrating mid-execution unless untied is specified. https://www.openmp.org/spec-html/5.2/openmpse77.html",
+    "OpenMP 5.2, \"task Construct\" and \"taskgroup Construct\" - #pragma omp task defines an explicit fork/join task; taskgroup performs deep synchronization waiting for all descendant tasks; priority clause provides scheduling hints; detach enables non-blocking continuation. https://www.openmp.org/spec-html/5.1/openmpsu54.html",
+    "Apple Swift Evolution, SE-0304 \"Structured Concurrency\" - Swift TaskGroup implements fork/join where adding a child task is a fork and awaiting the group is the join; async let creates implicit child tasks; cancellation is cooperative and propagates to all children on scope exit. https://github.com/swiftlang/swift-evolution/blob/main/proposals/0304-structured-concurrency.md",
+    "Donny Wals, \"Structured Concurrency in Swift Explained\" - TaskGroup fork-join within structured concurrency enforces parent-child task lifecycle guarantees: a parent task cannot complete until all child tasks finish or are cancelled. https://www.donnywals.com/the-basics-of-structured-concurrency-in-swift-explained/",
+    "Tian Pan, \"Structured Concurrency for Parallel Tool Fanout\" (2026) - naive fan-out (asyncio.gather, Promise.all) without structured scopes leaks orphaned tasks on partial failure; proper fork/join requires deterministic cleanup: cancel all children when any fails and aggregate all exceptions before propagating. https://tianpan.co/blog/2026-04-27-structured-concurrency-parallel-tool-fanout",
+    "Wikipedia, \"Fork-join model\" - the pattern's characterisation as a parallel design pattern (formulated as early as 1963), the recursive divide-and-conquer pseudocode, lightweight tasks over a work-stealing pool, and adoption in OpenMP, Java, .NET TPL and Intel TBB. https://en.wikipedia.org/wiki/Fork%E2%80%93join_model",
+    "NVIDIA GPU Gems 3, \"Chapter 39: Parallel Prefix Sum (Scan) with CUDA\" - the canonical fork/join decomposition of a scan into a reduce phase and a propagate phase; demonstrates how divide-and-conquer scan achieves O(n) total work with O(log n) synchronisation levels. https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda",
+    "GTaP: GPU-Resident Fork-Join Runtime (arXiv 2024) - a fully GPU-resident fork/join runtime using persistent kernels, EPAQ work-stealing at the thread-block and thread granularity, and a Clang pragma front-end for irregular workloads entirely on-GPU without CPU back-and-forth. https://www.emergentmind.com/papers/2604.05982",
+    "Bhautik Kapadiya, \"When Parallel Became a Problem: A Backend Engineering Postmortem on Fan-Out Concurrency\" (Medium 2026) - practical failure modes of fork/join fan-out at scale: AggregateException hiding per-task failure context, lack of bulkhead/circuit-breaker, and missing cancellation propagation leading to resource exhaustion. https://bhautikk.medium.com/when-parallel-became-a-problem-a-backend-engineering-postmortem-on-fan-out-concurrency-729deb5a19d9",
+    "Oracle, \"ForkJoinPool (Java SE API)\" - the official reference for the pattern's flagship implementation: an ExecutorService using work-stealing for tasks that create subtasks, the shared commonPool sized to available processors, asyncMode for non-joined event-style tasks, ManagedBlocker/thread-injection compensation for blocking, and getStealCount()/getQueuedTaskCount() monitoring that only approximates state while the pool is quiescent. https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ForkJoinPool.html",
+    "Rayon (Rust), \"rayon::join\" official docs - executes two closures potentially in parallel on a fixed work-stealing pool: called from inside the pool the current thread runs one closure and looks for other work while waiting for the stolen one; called from outside it blocks; explicitly intended for CPU-bound work, warns that blocking I/O inside closures hurts performance and closures waiting on each other can deadlock. https://docs.rs/rayon/latest/rayon/fn.join.html",
+    "kotlinx.coroutines, \"coroutineScope\" - the structured fork/join point for Kotlin: the scope returns only when all child coroutines complete, a failing child cancels the scope's other children and the exception is rethrown to the caller, and cancellation of the surrounding coroutine is guaranteed to surface as CancellationException. https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/coroutine-scope.html",
+    "OpenJDK bug JDK-8315740, \"ForkJoinPool starvation in commonPool\" - a real-world regression (Java 17-21) in which a work-stealing pool variant starved tasks in the common pool, showing that common-pool scheduling is neither fair nor guaranteed and that shared-pool workloads need isolation or a private pool. https://bugs.openjdk.org/browse/JDK-8315740",
+    "Devops Monk, \"Parallel Streams: ForkJoinPool, Spliterators, and When NOT to Parallelize\" - a misuse survey of fork/join via parallelStream(): blocking I/O inside the pipeline starves the shared common pool, stateful operations and poorly-spliterable sources (LinkedList) collapse the speedup, and the fixes are CPU-bound stateless work, custom pools via submit(), or plain executors for blocking calls. https://blog.devops-monk.com/tutorials/java8/parallel-streams/"
+  ]
+}

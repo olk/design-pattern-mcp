@@ -1,0 +1,58 @@
+{
+  "pattern": "double-buffer",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "two static buffers + _Atomic(frame *) published with atomic_exchange/store",
+  "implementation_notes": "The full structure is hand-written: two buffers of the same type, an owner that fills the back one, and exactly one publication step. On C11 and later declare the published pointer `_Atomic(frame *)` and publish with `atomic_store_explicit(&cur, back, memory_order_release)`, reading it with `memory_order_acquire`; a `size_t` index published the same way works when both buffers should live in one array. If a consumer needs a fixed address (a DMA engine writing to a fixed front buffer), copy the finished back buffer over the front under the same synchronization - the pattern survives at O(size) swap cost.",
+  "code_sketch": "static frame_t bufs[2];\nstatic _Atomic(frame_t *) cur = &bufs[0];\n\nframe_t *back = (atomic_load_explicit(&cur, memory_order_relaxed) == &bufs[0])\n                    ? &bufs[1] : &bufs[0];\nrender_into(back);                               /* incremental writes        */\natomic_store_explicit(&cur, back, memory_order_release);\n\n/* reader */ frame_t *front = atomic_load_explicit(&cur, memory_order_acquire);",
+  "pitfalls": [
+    "Publishing the pointer before the buffer contents are ordered: without release/acquire (or a critical section) a reader can observe a re-pointed buffer whose writes have not landed yet.",
+    "`volatile` is not `<stdatomic.h>`: it does not make an operation atomic and provides no inter-thread ordering - a common embedded misconception.",
+    "Readers that keep a `frame_t *` across a swap use the recycled generation; take a fresh load for every pass.",
+    "C has no GC: the writer must not reuse a buffer while any reader can still reach it, which requires an explicit handshake when the reader is asynchronous."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/c/atomic"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "atomic-pointer-pair",
+      "name": "C11 atomic pointer pair (lock-free publication)",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "requires_features": [
+        "stdatomic"
+      ],
+      "idiom_name": "two static buffers + _Atomic(frame *) published with atomic_exchange/store",
+      "implementation_notes": "The full structure is hand-written: two buffers of the same type, an owner that fills the back one, and exactly one publication step. On C11 and later declare the published pointer `_Atomic(frame *)` and publish with `atomic_store_explicit(&cur, back, memory_order_release)`, reading it with `memory_order_acquire`; a `size_t` index published the same way works when both buffers should live in one array. If a consumer needs a fixed address (a DMA engine writing to a fixed front buffer), copy the finished back buffer over the front under the same synchronization - the pattern survives at O(size) swap cost.",
+      "code_sketch": "static frame_t bufs[2];\nstatic _Atomic(frame_t *) cur = &bufs[0];\n\nframe_t *back = (atomic_load_explicit(&cur, memory_order_relaxed) == &bufs[0])\n                    ? &bufs[1] : &bufs[0];\nrender_into(back);                               /* incremental writes        */\natomic_store_explicit(&cur, back, memory_order_release);\n\n/* reader */ frame_t *front = atomic_load_explicit(&cur, memory_order_acquire);",
+      "pitfalls": [
+        "Publishing the pointer before the buffer contents are ordered: without release/acquire (or a critical section) a reader can observe a re-pointed buffer whose writes have not landed yet.",
+        "`volatile` is not `<stdatomic.h>`: it does not make an operation atomic and provides no inter-thread ordering - a common embedded misconception.",
+        "Readers that keep a `frame_t *` across a swap use the recycled generation; take a fresh load for every pass.",
+        "C has no GC: the writer must not reuse a buffer while any reader can still reach it, which requires an explicit handshake when the reader is asynchronous."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/c/atomic"
+      ]
+    },
+    {
+      "variant_id": "interrupt-masked-index",
+      "name": "Interrupt-masked index toggle (no atomics)",
+      "paradigm": "procedural",
+      "idiom_name": "volatile index + swap-request flag toggled with interrupts disabled (or a pthread mutex)",
+      "implementation_notes": "Where atomics are unavailable, or the swap must be atomic against an ISR, keep a `volatile unsigned idx` plus a swap-request flag: the ISR fills the back block and sets the flag, the main loop polls the flag and toggles the index inside a critical section (interrupts masked, or a `pthread_mutex_t` when readers may sleep). This is the classical embedded double buffer; it trades the lock-free property for portability, and the critical section must stay short because masking interrupts adds latency to every interrupt source.",
+      "code_sketch": "static volatile unsigned cur = 0, swap_request = 0;\n\n/* ISR: fill the back block, then ask for the swap */\nfill(&blocks[1 - cur]);\nswap_request = 1;\n\n/* main loop */\nif (swap_request) {\n    disable_irqs();  cur = 1 - cur;  swap_request = 0;  enable_irqs();\n}\nconsume(&blocks[cur]);",
+      "pitfalls": [
+        "Interrupt masking on the wrong side (or not covering the flag read) still lets the ISR and the loop disagree about which block is current.",
+        "A `volatile` index is not atomic on all architectures for wider types; use `sig_atomic_t` or a critical section.",
+        "The ISR must never block on a mutex a thread holds; mutex-based swaps need masking or lock-free variants in hard real-time paths."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3.html"
+      ]
+    }
+  ],
+  "default_variant": "atomic-pointer-pair"
+}

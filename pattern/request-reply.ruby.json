@@ -1,0 +1,58 @@
+{
+  "pattern": "request-reply",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "Bunny reply queue + correlation_id match in the subscription",
+  "implementation_notes": "Bunny exposes the AMQP primitives directly, which is exactly the classic structure: create an exclusive auto-delete reply queue per client (or use RabbitMQ's amq.rabbitmq.reply-to pseudo-queue), publish with reply_to and a fresh correlation_id, and match the reply in the subscription before handing it to the waiting caller. In-process, Thread::Queue#pop(timeout:) is the same exchange without a broker: the queue is the reply channel and the timeout is the deadline. The thread-per-call model means a synchronous server keeps a thread per in-flight request unless the application is built around threads or processes.",
+  "code_sketch": "reply = Queue.new\ncorr  = SecureRandom.uuid\ncallback = channel.queue('', exclusive: true)\ncallback.subscribe do |_info, props, body|\n  reply << body if props.correlation_id == corr     # dispatch by correlation id\nend\nchannel.default_exchange.publish(payload,\n  routing_key: 'rpc_queue', reply_to: callback.name, correlation_id: corr)\nbody = reply.pop(timeout: 5)                        # nil on deadline\nraise 'reply timeout' if body.nil?",
+  "pitfalls": [
+    "Subscribe blocks run on Bunny's reader thread: pushing to the Thread::Queue is safe, but slow work there delays every other delivery on the connection.",
+    "An exclusive/auto-delete reply queue is only cleaned up with the connection, so a crashed client leaves it on the broker until the connection times out.",
+    "Timeout.timeout, the pre-3.2 idiom, raises asynchronously inside the blocked thread and can leave an unacked message; prefer Queue#pop(timeout:)."
+  ],
+  "sources": [
+    "http://rubybunny.info/articles/queues.html",
+    "http://rubybunny.info/articles/exchanges.html",
+    "https://www.rabbitmq.com/tutorials/tutorial-six-ruby"
+  ],
+  "variants": [
+    {
+      "variant_id": "bunny-rpc",
+      "name": "Bunny publish with reply_to/correlation_id",
+      "paradigm": "concurrent",
+      "min_standard": "Ruby3.0",
+      "idiom_name": "Bunny reply queue + correlation_id match in the subscription",
+      "implementation_notes": "Bunny exposes the AMQP primitives directly, which is exactly the classic structure: create an exclusive auto-delete reply queue per client (or use RabbitMQ's amq.rabbitmq.reply-to pseudo-queue), publish with reply_to and a fresh correlation_id, and match the reply in the subscription before handing it to the waiting caller. In-process, Thread::Queue#pop(timeout:) is the same exchange without a broker: the queue is the reply channel and the timeout is the deadline. The thread-per-call model means a synchronous server keeps a thread per in-flight request unless the application is built around threads or processes.",
+      "code_sketch": "reply = Queue.new\ncorr  = SecureRandom.uuid\ncallback = channel.queue('', exclusive: true)\ncallback.subscribe do |_info, props, body|\n  reply << body if props.correlation_id == corr     # dispatch by correlation id\nend\nchannel.default_exchange.publish(payload,\n  routing_key: 'rpc_queue', reply_to: callback.name, correlation_id: corr)\nbody = reply.pop(timeout: 5)                        # nil on deadline\nraise 'reply timeout' if body.nil?",
+      "pitfalls": [
+        "Subscribe blocks run on Bunny's reader thread: pushing to the Thread::Queue is safe, but slow work there delays every other delivery on the connection.",
+        "An exclusive/auto-delete reply queue is only cleaned up with the connection, so a crashed client leaves it on the broker until the connection times out.",
+        "Timeout.timeout, the pre-3.2 idiom, raises asynchronously inside the blocked thread and can leave an unacked message; prefer Queue#pop(timeout:)."
+      ],
+      "sources": [
+        "http://rubybunny.info/articles/queues.html",
+        "http://rubybunny.info/articles/exchanges.html",
+        "https://www.rabbitmq.com/tutorials/tutorial-six-ruby"
+      ]
+    },
+    {
+      "variant_id": "thread-queue-correlation",
+      "name": "In-process Thread::Queue with a timeout",
+      "paradigm": "concurrent",
+      "min_standard": "Ruby3.2",
+      "idiom_name": "Thread::Queue#pop(timeout:) as the reply channel",
+      "implementation_notes": "Without a broker, one queue per request plus Queue#pop(timeout:) gives the whole pattern inside a process: the requester hands the queue to the worker, the worker pushes the result, and the caller's pop returns nil at the deadline (Ruby 3.2 added the keyword, nondestructively). Because each request owns its queue, no correlation identifier is needed; a shared queue with a correlation hash is the fallback for pooled workers. Use it for thread pools and background workers, where a broker would add an operational dependency.",
+      "code_sketch": "queue = Queue.new\nworkers << { payload: req, reply: queue }   # hand over the reply channel\nbody = queue.pop(timeout: 5)                # Ruby 3.2+: nil on deadline\nraise 'no reply' if body.nil?\n# worker: reply.push(handle(payload))",
+      "pitfalls": [
+        "A queue that is only referenced by the request can be garbage collected while a worker still holds it if the caller stops waiting; keep the queue referenced for the worker's lifetime.",
+        "Queue#pop(timeout:) returns nil rather than raising, so a nil result must be turned into an explicit timeout error at the call site."
+      ],
+      "sources": [
+        "https://docs.ruby-lang.org/en/3.2/Thread/Queue.html",
+        "https://rubyreferences.github.io/rubychanges/3.2.html"
+      ]
+    }
+  ],
+  "default_variant": "bunny-rpc",
+  "version": "1.0"
+}

@@ -1,0 +1,63 @@
+{
+  "pattern": "functional-core-imperative-shell",
+  "language": "typescript",
+  "support": "idiomatic",
+  "idiom_name": "readonly data + `{ _tag }` union results in src/core, shell in src/shell",
+  "implementation_notes": "Keep the core in `src/core/*.ts` as exported functions over `readonly` data with a discriminated union for the outcome (`{ _tag: 'Success', ... } | { _tag: 'Failure', ... }`), with no `await`, no `fetch`, no `Date.now()` and no `console.log`; the shell (`src/shell/*.ts`: CLI, HTTP handler, file store) reads inputs and interprets the result. This replaces the classic service class with an injected repository interface: facts the decision needs (a lookup's result, `now`, ids) are parameters or already-resolved booleans. Types make the decision space explicit but are erased at runtime, so the boundary is enforced by conventions/lint (no import of `node:fs` in `core`, no `Date`/`Math.random` calls) and by passing closures that only compute, never query.",
+  "code_sketch": "// src/core/user.ts — pure: no await, no fetch, no Date.now()\nexport type CreateUserResult =\n  | { _tag: 'Success'; user: User }\n  | { _tag: 'Failure'; error: 'InvalidEmail' | 'WeakPassword' | 'EmailTaken' }\n\nexport const createUserLogic = (\n  input: CreateUserInput,\n  emailTaken: (email: string) => boolean,     // fact passed by the shell\n): CreateUserResult =>\n  !isValidEmail(input.email) ? { _tag: 'Failure', error: 'InvalidEmail' }\n  : emailTaken(input.email)  ? { _tag: 'Failure', error: 'EmailTaken' }\n  : { _tag: 'Success', user: { id: input.id, email: input.email.trim().toLowerCase() } }",
+  "pitfalls": [
+    "`readonly` is compile-time only and shallow: nested objects/arrays stay mutable at runtime, so a leaked reference can be changed by the shell (freeze or clone at the boundary).",
+    "An `async` core function returns a `Promise`, which is not a value the shell can branch on synchronously - keep the core synchronous and let the shell await.",
+    "Passing an IO-performing closure (`() => repo.exists(...)`) into the core looks pure in the source but makes every call impure and non-deterministic; pass the resolved fact instead."
+  ],
+  "sources": [
+    "https://gist.github.com/redbar0n/af5e339ea8b2563738455dcdf6042ed5",
+    "https://www.typescriptlang.org/docs/handbook/2/narrowing.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pure-modules-union-core",
+      "name": "Pure modules + discriminated unions",
+      "paradigm": "functional",
+      "min_standard": "TypeScript4.7",
+      "requires_features": [
+        "discriminated-unions"
+      ],
+      "idiom_name": "readonly data + `{ _tag }` union results in src/core, shell in src/shell",
+      "implementation_notes": "Keep the core in `src/core/*.ts` as exported functions over `readonly` data with a discriminated union for the outcome (`{ _tag: 'Success', ... } | { _tag: 'Failure', ... }`), with no `await`, no `fetch`, no `Date.now()` and no `console.log`; the shell (`src/shell/*.ts`: CLI, HTTP handler, file store) reads inputs and interprets the result. This replaces the classic service class with an injected repository interface: facts the decision needs (a lookup's result, `now`, ids) are parameters or already-resolved booleans. Types make the decision space explicit but are erased at runtime, so the boundary is enforced by conventions/lint (no import of `node:fs` in `core`, no `Date`/`Math.random` calls) and by passing closures that only compute, never query.",
+      "code_sketch": "// src/core/user.ts — pure: no await, no fetch, no Date.now()\nexport type CreateUserResult =\n  | { _tag: 'Success'; user: User }\n  | { _tag: 'Failure'; error: 'InvalidEmail' | 'WeakPassword' | 'EmailTaken' }\n\nexport const createUserLogic = (\n  input: CreateUserInput,\n  emailTaken: (email: string) => boolean,     // fact passed by the shell\n): CreateUserResult =>\n  !isValidEmail(input.email) ? { _tag: 'Failure', error: 'InvalidEmail' }\n  : emailTaken(input.email)  ? { _tag: 'Failure', error: 'EmailTaken' }\n  : { _tag: 'Success', user: { id: input.id, email: input.email.trim().toLowerCase() } }",
+      "pitfalls": [
+        "`readonly` is compile-time only and shallow: nested objects/arrays stay mutable at runtime, so a leaked reference can be changed by the shell (freeze or clone at the boundary).",
+        "An `async` core function returns a `Promise`, which is not a value the shell can branch on synchronously - keep the core synchronous and let the shell await.",
+        "Passing an IO-performing closure (`() => repo.exists(...)`) into the core looks pure in the source but makes every call impure and non-deterministic; pass the resolved fact instead."
+      ],
+      "sources": [
+        "https://gist.github.com/redbar0n/af5e339ea8b2563738455dcdf6042ed5",
+        "https://www.typescriptlang.org/docs/handbook/2/narrowing.html"
+      ]
+    },
+    {
+      "variant_id": "effect-library-shell",
+      "name": "Typed effect system in the shell (Effect / fp-ts)",
+      "paradigm": "functional",
+      "min_standard": "TypeScript5.0",
+      "requires_features": [
+        "effect-library"
+      ],
+      "idiom_name": "Effect<A, E, R> services and layers around a plain pure core",
+      "implementation_notes": "When the workflow has many effectful steps, compose the shell with a typed effect system: `Effect<A, E, R>` (Effect) or `TaskEither` (fp-ts) makes the required services part of the type, `Effect.Tag`/`Context` plus `Layer` replace injected repositories, and the pure core stays a plain synchronous function the pipeline maps over. Semantically this is 'describe the effects, execute them at the edge' with the runtime as the outermost shell, and it keeps error handling and dependency wiring out of the decision code. Choose it when the alternative is heavy `try`/`catch` plus manual DI; a handful of handler steps do not need the runtime.",
+      "code_sketch": "// core: plain and pure (no Effect in here)\nexport const createUserPure = (input: CreateUserInput, emailTaken: boolean): CreateUserResult => ...\n\n// shell: effects described and composed\nexport const registerUser = (input: CreateUserInput) =>\n  Effect.gen(function* () {\n    const repo   = yield* UserRepository\n    const taken  = yield* repo.emailExists(input.email)\n    const result = createUserPure(input, taken)          // pure decision\n    if (result._tag === 'Success') yield* repo.save(result.user)\n    return result\n  })",
+      "pitfalls": [
+        "`.runPromise`/unsafe runners called outside the composition root drag the runtime into places the core's tests then depend on; keep exactly one boundary that executes effects.",
+        "Layers and services make it tempting to hide decisions behind effects (a `Rule` service that is pure), which re-introduces indirection and loses the plain-function testability; keep decisions as functions.",
+        "A generator-based pipeline is lazy: without a runner nothing happens, so a forgotten `yield*` silently produces an unused effect value instead of performing the IO."
+      ],
+      "sources": [
+        "https://gist.github.com/redbar0n/af5e339ea8b2563738455dcdf6042ed5",
+        "https://effect.website/docs/getting-started/introduction/"
+      ]
+    }
+  ],
+  "default_variant": "pure-modules-union-core",
+  "version": "1.0"
+}

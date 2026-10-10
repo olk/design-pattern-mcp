@@ -1,0 +1,85 @@
+{
+  "pattern": "scatter-gather",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "supplyAsync per recipient + allOf(...).orTimeout(budget) / anyOf(...) gather",
+  "implementation_notes": "CompletableFuture is the standard fan-out: one supplyAsync per recipient on a bounded Executor, then allOf(...).join() to wait for every reply or anyOf(...) for the first completion, with orTimeout/completeOnTimeout supplying the deadline. The gap that matters is that timing out or cancelling the combination does not cancel the individual futures - orTimeout completes the combined future exceptionally while every recipient call keeps running - so partial results are read from the individual futures (isDone/getNow) and the stragglers must be cancelled by hand. Java 25's preview StructuredTaskScope is the structured alternative (third variant).",
+  "code_sketch": "var pool = Executors.newFixedThreadPool(8);            // bound the fan-out width\nvar futures = recipients.stream()\n        .map(r -> CompletableFuture.supplyAsync(() -> ask(r), pool)).toList();\nvar all = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));\nall.orTimeout(budget, TimeUnit.MILLISECONDS);           // dead-line on the COMBINATION only\ntry { all.join(); } catch (CompletionException e) { /* timeout or a failed recipient */ }\nvar offers = futures.stream()\n        .filter(f -> f.isDone() && !f.isCompletedExceptionally())\n        .map(CompletableFuture::join).toList();         // explicit partial gather",
+  "pitfalls": [
+    "orTimeout/completeOnTimeout complete the combined future, not the per-recipient ones: without inspecting and cancelling the individual futures, the fan-out keeps consuming threads and connections after the caller gave up.",
+    "allOf carries no values and join() throws a CompletionException on the first failed recipient, hiding the successes; results must be read from the individual futures.",
+    "Using the common ForkJoinPool (no explicit executor) couples the fan-out to unrelated parallel-stream work and gives no bound on outbound calls."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "completable-future-allof",
+      "name": "CompletableFuture fan-out with allOf/anyOf and orTimeout",
+      "paradigm": "concurrent",
+      "min_standard": "Java9",
+      "requires_features": [
+        "java.util.concurrent.CompletableFuture",
+        "Executor"
+      ],
+      "idiom_name": "supplyAsync per recipient + allOf(...).orTimeout(budget) / anyOf(...) gather",
+      "implementation_notes": "CompletableFuture is the standard fan-out: one supplyAsync per recipient on a bounded Executor, then allOf(...).join() to wait for every reply or anyOf(...) for the first completion, with orTimeout/completeOnTimeout supplying the deadline. The gap that matters is that timing out or cancelling the combination does not cancel the individual futures - orTimeout completes the combined future exceptionally while every recipient call keeps running - so partial results are read from the individual futures (isDone/getNow) and the stragglers must be cancelled by hand. Java 25's preview StructuredTaskScope is the structured alternative (third variant).",
+      "code_sketch": "var pool = Executors.newFixedThreadPool(8);            // bound the fan-out width\nvar futures = recipients.stream()\n        .map(r -> CompletableFuture.supplyAsync(() -> ask(r), pool)).toList();\nvar all = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));\nall.orTimeout(budget, TimeUnit.MILLISECONDS);           // dead-line on the COMBINATION only\ntry { all.join(); } catch (CompletionException e) { /* timeout or a failed recipient */ }\nvar offers = futures.stream()\n        .filter(f -> f.isDone() && !f.isCompletedExceptionally())\n        .map(CompletableFuture::join).toList();         // explicit partial gather",
+      "pitfalls": [
+        "orTimeout/completeOnTimeout complete the combined future, not the per-recipient ones: without inspecting and cancelling the individual futures, the fan-out keeps consuming threads and connections after the caller gave up.",
+        "allOf carries no values and join() throws a CompletionException on the first failed recipient, hiding the successes; results must be read from the individual futures.",
+        "Using the common ForkJoinPool (no explicit executor) couples the fan-out to unrelated parallel-stream work and gives no bound on outbound calls."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+      ]
+    },
+    {
+      "variant_id": "executor-invokeall-timeout",
+      "name": "ExecutorService.invokeAll with a timeout (classic bulk gather)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "requires_features": [
+        "ExecutorService",
+        "Callable"
+      ],
+      "idiom_name": "ExecutorService.invokeAll(tasks, timeout, unit) with cancellation of unfinished tasks",
+      "implementation_notes": "invokeAll(tasks, timeout, unit) is the pre-CompletableFuture scatter-gather in a single call: it executes the callables concurrently and, upon return, cancels the tasks that have not completed (JDK javadoc: 'Upon return, tasks that have not completed are cancelled'), handing back a list of futures that are either done or cancelled - a deadline-bounded gather including the reaping. invokeAny is the first-success policy (one result, the rest cancelled). It is coarse - one global timeout, no per-recipient timing metadata, input order rather than completion order - but it is the smallest correct realization when the caller is already synchronous and runs on its own pool.",
+      "code_sketch": "ExecutorService pool = Executors.newFixedThreadPool(8);\nList<Callable<Offer>> tasks = recipients.stream().map(r -> (Callable<Offer>) () -> ask(r)).toList();\nList<Future<Offer>> done = pool.invokeAll(tasks, budget, TimeUnit.MILLISECONDS);\nList<Offer> offers = new ArrayList<>();\nfor (Future<Offer> f : done) {\n    if (f.isCancelled()) continue;            // deadline reaped this recipient\n    try { offers.add(f.get()); } catch (ExecutionException e) { /* per-recipient failure */ }\n}",
+      "pitfalls": [
+        "A timed-out task and a task that failed both come back as futures; only isCancelled() distinguishes 'too slow' from 'threw'.",
+        "invokeAll blocks the calling thread until the timeout or until all tasks finished, so it must not run on a request-handling thread pool that the tasks themselves need.",
+        "The timeout is the only budget control: a per-recipient timeout has to be implemented inside the Callable, and the returned list is in input order, so reply latencies are not observable."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ExecutorService.html"
+      ]
+    },
+    {
+      "variant_id": "structured-scope-joiner",
+      "name": "StructuredTaskScope with a Joiner policy (Java 25 preview)",
+      "paradigm": "concurrent",
+      "min_standard": "Java25",
+      "requires_features": [
+        "preview-apis",
+        "virtual-threads"
+      ],
+      "idiom_name": "StructuredTaskScope.open(Joiner.anySuccessfulResultOrThrow()) + fork/join",
+      "implementation_notes": "Java 25's preview StructuredTaskScope is the structured-concurrency form: scope.fork(...) per recipient and join() applying the Joiner policy - anySuccessfulResultOrThrow() returns the result of the first subtask to succeed and cancels the rest, allSuccessfulOrThrow() waits for all subtasks and yields them, awaitAll()/allUntil(predicate) cover the wait-for-N cases. The scope owns the subtasks' lifetime, so closing it cancels whatever is still running, and a timeout configured via Configuration.withTimeout makes join() throw StructuredTaskScope.TimeoutException. It requires --enable-preview, and the JDK 21-24 previews exposed ShutdownOnSuccess/ShutdownOnFailure policies instead of Joiners.",
+      "code_sketch": "try (var scope = StructuredTaskScope.open(\n        StructuredTaskScope.Joiner.anySuccessfulResultOrThrow(),\n        cfg -> cfg.withTimeout(budget))) {\n    for (Recipient r : recipients) scope.fork(() -> ask(r));\n    Offer best = scope.join();     // first success wins; the losers are cancelled by the scope\n    return best;\n}",
+      "pitfalls": [
+        "Preview API: --enable-preview is required and the policy surface changed between JDK 21 and 25 (ShutdownOnSuccess versus Joiner), so the JDK version must be pinned.",
+        "Subtasks run on virtual threads by default and only the owning thread may fork/join/close the scope: sharing a scope across threads is an error, not a pattern.",
+        "A timeout produces TimeoutException from join(); subtasks already completed are still retrievable from their Subtask handles, so a partial merge needs those handles kept."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html",
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/StructuredTaskScope.Joiner.html",
+        "https://openjdk.org/jeps/505"
+      ]
+    }
+  ],
+  "default_variant": "completable-future-allof",
+  "version": "1.0"
+}

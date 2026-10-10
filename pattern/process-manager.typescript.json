@@ -1,0 +1,59 @@
+{
+  "pattern": "process-manager",
+  "language": "typescript",
+  "support": "library",
+  "idiom_name": "setup({ types }).createMachine + persisted snapshots",
+  "implementation_notes": "XState v5 with setup({ types }) types context and events, so the decider is a fully typed state chart (guarded transitions, after delays, invoked actors) and one actor per process instance holds the state; snapshots are plain JSON, which lets them be stored in a row and rehydrated. Delivery guarantees stay with you: persist the snapshot atomically with the outgoing command and make the invoked actors idempotent, because replies can be redelivered. Choose it when the flow is in-process and the team wants one typed, testable definition; a durable-execution SDK is the alternative when the flow must survive the process itself.",
+  "code_sketch": "const orderMachine = setup({\n  types: {\n    context: {} as { cid: string; payment: 'pending' | 'ok' },\n    events: {} as { type: 'PAYMENT_OK' } | { type: 'TIMEOUT' },\n  },\n  guards: { paid: ({ context }) => context.payment === 'ok' },\n  actors: { reserveStock: fromPromise(({ input }) => api.reserve(input)) },\n}).createMachine({\n  initial: 'awaitingPayment',\n  states: {\n    awaitingPayment: {\n      after: { 3600000: { target: 'compensating' } },\n      on: { PAYMENT_OK: { guard: 'paid', target: 'awaitingStock' } },\n    },\n    awaitingStock: { invoke: { src: 'reserveStock', onDone: 'done', onError: 'compensating' } },\n    done: { type: 'final' },\n    compensating: { entry: ({ context }) => api.release(context.cid) },\n  },\n});\n\nconst actor = createActor(orderMachine, { snapshot: await store.load(cid) }).start();",
+  "pitfalls": [
+    "Snapshots are coupled to the machine definition; rehydrating under an edited definition silently misreads state, so store and check a version or machine id in the row.",
+    "after delays do not survive a restart: the deadline must also be persisted as data and the timer rebuilt on rehydrate.",
+    "Typing context loosely (any, or optional fields that mean different things per state) throws away the compiler's ability to catch a missed transition branch.",
+    "Spawning child actors for steps without stopping them on compensation leaks subscriptions and can deliver a reply to a finished instance."
+  ],
+  "sources": [
+    "https://stately.ai/docs/typescript",
+    "https://stately.ai/docs/machines"
+  ],
+  "variants": [
+    {
+      "variant_id": "xstate-typed",
+      "name": "XState v5 typed state machine",
+      "paradigm": "oo",
+      "min_standard": "TypeScript4.7",
+      "idiom_name": "setup({ types }).createMachine + persisted snapshots",
+      "implementation_notes": "XState v5 with setup({ types }) types context and events, so the decider is a fully typed state chart (guarded transitions, after delays, invoked actors) and one actor per process instance holds the state; snapshots are plain JSON, which lets them be stored in a row and rehydrated. Delivery guarantees stay with you: persist the snapshot atomically with the outgoing command and make the invoked actors idempotent, because replies can be redelivered. Choose it when the flow is in-process and the team wants one typed, testable definition; a durable-execution SDK is the alternative when the flow must survive the process itself.",
+      "code_sketch": "const orderMachine = setup({\n  types: {\n    context: {} as { cid: string; payment: 'pending' | 'ok' },\n    events: {} as { type: 'PAYMENT_OK' } | { type: 'TIMEOUT' },\n  },\n  guards: { paid: ({ context }) => context.payment === 'ok' },\n  actors: { reserveStock: fromPromise(({ input }) => api.reserve(input)) },\n}).createMachine({\n  initial: 'awaitingPayment',\n  states: {\n    awaitingPayment: {\n      after: { 3600000: { target: 'compensating' } },\n      on: { PAYMENT_OK: { guard: 'paid', target: 'awaitingStock' } },\n    },\n    awaitingStock: { invoke: { src: 'reserveStock', onDone: 'done', onError: 'compensating' } },\n    done: { type: 'final' },\n    compensating: { entry: ({ context }) => api.release(context.cid) },\n  },\n});\n\nconst actor = createActor(orderMachine, { snapshot: await store.load(cid) }).start();",
+      "pitfalls": [
+        "Snapshots are coupled to the machine definition; rehydrating under an edited definition silently misreads state, so store and check a version or machine id in the row.",
+        "after delays do not survive a restart: the deadline must also be persisted as data and the timer rebuilt on rehydrate.",
+        "Typing context loosely (any, or optional fields that mean different things per state) throws away the compiler's ability to catch a missed transition branch.",
+        "Spawning child actors for steps without stopping them on compensation leaks subscriptions and can deliver a reply to a finished instance."
+      ],
+      "sources": [
+        "https://stately.ai/docs/typescript",
+        "https://stately.ai/docs/machines"
+      ]
+    },
+    {
+      "variant_id": "temporal-sdk",
+      "name": "Temporal TypeScript SDK workflow",
+      "paradigm": "concurrent",
+      "min_standard": "TypeScript4.7",
+      "idiom_name": "proxyActivities + workflow condition()/sleep() with durable history",
+      "implementation_notes": "A Temporal workflow is the process manager: the SDK replays the workflow function from history, activities hold the side effects under explicit retry policies, and sleeps or condition() waits survive worker restarts and can last days. Deadlines are condition('payment', '1 hour', predicate) or sleep plus a check, and compensations are plain code on the failure path. Determinism rules apply - no direct Date, no I/O, no randomness inside the workflow - which pushes side effects into activities and keeps the flow readable; choose it when steps span services or the flow must outlive deployments.",
+      "code_sketch": "export async function orderWorkflow(order: Order): Promise<void> {\n  const { reserveCredit, takePayment, releaseCredit, ship } = proxyActivities<Activities>({\n    startToCloseTimeout: '30 seconds',\n    retry: { maximumAttempts: 5 },\n  });\n  await reserveCredit(order);\n  const paid = await condition('payment', '1 hour', () => state.payment === 'ok');\n  if (!paid) {\n    await releaseCredit(order);                     // compensate\n    throw ApplicationFailure.nonRetryable('payment timeout');\n  }\n  await ship(order);\n}",
+      "pitfalls": [
+        "Non-deterministic workflow code (Date.now, Math.random, direct fetch) breaks replay; use the SDK's condition/sleep and activities for anything time- or I/O-dependent.",
+        "Activities retry by default, so a non-idempotent payment call can charge twice without a business key or an explicit retry policy.",
+        "Workflow code runs again on every replay: heavy computation or unbounded loops in the workflow slow the worker and inflate history.",
+        "Long condition() waits without a timeout leave instances pending forever; every outstanding wait needs a deadline and a decided outcome."
+      ],
+      "sources": [
+        "https://docs.temporal.io/develop/typescript"
+      ]
+    }
+  ],
+  "default_variant": "xstate-typed",
+  "version": "1.0"
+}

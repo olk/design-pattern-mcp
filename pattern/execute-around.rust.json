@@ -1,0 +1,77 @@
+{
+  "pattern": "execute-around",
+  "language": "rust",
+  "support": "native",
+  "idiom_name": "RAII guard with Drop, e.g. Mutex::lock returning MutexGuard",
+  "implementation_notes": "Ownership plus Drop is the language's version of the pattern: the guard's construction is the setup, its destructor is the teardown, and the body is the scope in between, so no wrapper method is needed and the compiler removes the early-exit and panic defects statically. Mutex::lock returning a MutexGuard that unlocks on drop is the canonical shape, and a custom type with Drop wraps arbitrary protocols; where the guard borrows the protected value, the borrow checker also prevents the resource from being used after release. Keep the body-as-closure form for bounded regions and policies, and use guards whenever the resource has a clear owner.",
+  "code_sketch": "struct TempDir(std::path::PathBuf);\n\nimpl Drop for TempDir {\n    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }\n}\n\nlet dir = TempDir(make_dir()?);   // setup\nwrite_report(&dir.0)?;            // body\n// teardown: Drop runs on every exit path, including a panic unwind",
+  "pitfalls": [
+    "A guard must be bound to a name: let _ = guard(...) binds and drops at the end of the statement, and guard(...); drops immediately - the lock_guard footgun in Rust clothes.",
+    "Drop runs during panic unwinding but not on process::abort or a double panic, and a panic inside Drop while unwinding aborts the process: cleanup must be infallible.",
+    "A guard that borrows its resource keeps the borrow alive for its lifetime, so storing MutexGuard in a struct creates a self-referential type the borrow checker rejects; hold the guard in a scope instead."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.MutexGuard.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "drop-guard",
+      "name": "Drop guard owning the resource (MutexGuard, custom Drop type)",
+      "paradigm": "oo",
+      "min_standard": "Rust2015",
+      "idiom_name": "RAII guard with Drop, e.g. Mutex::lock returning MutexGuard",
+      "implementation_notes": "Ownership plus Drop is the language's version of the pattern: the guard's construction is the setup, its destructor is the teardown, and the body is the scope in between, so no wrapper method is needed and the compiler removes the early-exit and panic defects statically. Mutex::lock returning a MutexGuard that unlocks on drop is the canonical shape, and a custom type with Drop wraps arbitrary protocols; where the guard borrows the protected value, the borrow checker also prevents the resource from being used after release. Keep the body-as-closure form for bounded regions and policies, and use guards whenever the resource has a clear owner.",
+      "code_sketch": "struct TempDir(std::path::PathBuf);\n\nimpl Drop for TempDir {\n    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }\n}\n\nlet dir = TempDir(make_dir()?);   // setup\nwrite_report(&dir.0)?;            // body\n// teardown: Drop runs on every exit path, including a panic unwind",
+      "pitfalls": [
+        "A guard must be bound to a name: let _ = guard(...) binds and drops at the end of the statement, and guard(...); drops immediately - the lock_guard footgun in Rust clothes.",
+        "Drop runs during panic unwinding but not on process::abort or a double panic, and a panic inside Drop while unwinding aborts the process: cleanup must be infallible.",
+        "A guard that borrows its resource keeps the borrow alive for its lifetime, so storing MutexGuard in a struct creates a self-referential type the borrow checker rejects; hold the guard in a scope instead."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.MutexGuard.html"
+      ]
+    },
+    {
+      "variant_id": "closure-scope",
+      "name": "body-as-closure scope function (std::thread::scope, with_* helpers)",
+      "paradigm": "functional",
+      "requires_features": [
+        "scoped threads"
+      ],
+      "idiom_name": "std::thread::scope(|s| { ... }) / pub fn with_pool<R>(f: impl FnOnce(&Pool) -> R) -> R",
+      "implementation_notes": "When the pattern is about a bounded region rather than one owned object, Rust writes it as a function taking a closure: std::thread::scope hands the body a Scope, guarantees every spawned thread is joined before it returns, and can therefore lend the body non-'static data - the execute-around contract expressed with lifetimes instead of a discipline. Library-free helpers follow the same shape (with_pool, with_connection) and are preferred when the resource must not escape the call. Choose this over a guard when teardown has to await work the body started, or when the API must not hand the resource out at all.",
+      "code_sketch": "thread::scope(|scope| {              // setup: the borrowed scope\n    scope.spawn(|| process(&shared_a));   // body: may borrow locals\n    scope.spawn(|| process(&shared_b));\n});                                       // teardown: all threads joined\n\nwith_pool(|pool| pool.query(sql))     // with_* helper: resource never escapes",
+      "pitfalls": [
+        "thread::scope panics if an automatically joined thread panicked; if the wrapper must not propagate that, join the handles explicitly inside the body.",
+        "The closure's return value is the wrapper's return value, so a body that only mutates captured state has to return () explicitly or the signature becomes misleading.",
+        "A body that moves the resource out with mem::take, mem::replace or mem::forget defeats teardown - the wrapper cannot prevent it once the body owns the guard."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/thread/fn.scope.html"
+      ]
+    },
+    {
+      "variant_id": "scopeguard-crate",
+      "name": "one-off cleanup with the scopeguard crate (guard! / defer!)",
+      "paradigm": "declarative",
+      "min_standard": "Rust1.20",
+      "requires_features": [
+        "scopeguard crate"
+      ],
+      "idiom_name": "scopeguard::guard(value, |v| cleanup(v)) and the defer! macro",
+      "implementation_notes": "For one-off cleanup where writing a Drop type is not worth it, the scopeguard crate provides guard(value, closure) and the defer! macro: the closure runs when the guard leaves the scope, on a normal return and during a panic unwind, and ScopeGuard::into_inner disarms it on the success path. It is the Rust analogue of the C++ scope-exit guard and the natural home for restoring an invariant around arbitrary code (undoing a provisional registration, removing a partial file). Use it for one-off actions; write a real Drop type when the cleanup is reusable or owns the resource.",
+      "code_sketch": "use scopeguard::{guard, ScopeGuard};\n\nlet cleanup = guard(path.clone(), |p| { let _ = fs::remove_file(p); });\nwrite_partial(&path)?;                                   // body\nlet _kept = ScopeGuard::into_inner(cleanup);             // disarm on the success path",
+      "pitfalls": [
+        "A guard that is not assigned to a variable is dropped at once and its cleanup runs immediately; the crate warns about this because the code still compiles.",
+        "The base guard is unconditional: cleanup runs on success as well as failure, so success paths must disarm it with into_inner or set_active(false).",
+        "Deferred closures that run during unwinding must not panic themselves; a second panic aborts the process."
+      ],
+      "sources": [
+        "https://docs.rs/scopeguard/latest/scopeguard/struct.ScopeGuard.html",
+        "https://crates.io/crates/scopeguard"
+      ]
+    }
+  ],
+  "default_variant": "drop-guard",
+  "version": "1.0"
+}

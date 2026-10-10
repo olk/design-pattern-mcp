@@ -1,0 +1,63 @@
+{
+  "pattern": "multiton",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "static OnceLock<Mutex<HashMap<K, Arc<V>>>> + entry().or_insert_with()",
+  "implementation_notes": "Rust has no static constructors, so the registry is a static OnceLock initialised on first use, wrapping a Mutex<HashMap<K, Arc<V>>>; the lookup locks the map and entry(key).or_insert_with(|| Arc::new(make(key))) creates the instance exactly once per key under that lock, returning a clone of the Arc. Callers share ownership through Arc, so the registry never hands out a reference that could outlive the map, and OnceLock (stable since 1.70; LazyLock or once_cell before that) keeps initialisation exactly-once - the std docs state only one initialising function will run.",
+  "code_sketch": "static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Conn>>>> = OnceLock::new();\n\nfn conn_for(tenant: &str) -> Arc<Conn> {\n    let map = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));\n    let mut guard = map.lock().expect(\"registry poisoned\");\n    guard\n        .entry(tenant.to_owned())\n        .or_insert_with(|| Arc::new(Conn::open(tenant)))\n        .clone()\n}",
+  "pitfalls": [
+    "Lock poisoning: a panic while holding the registry lock poisons the mutex and every later lookup fails with PoisonError until the process is restarted or the guard is recovered.",
+    "Holding the registry lock while Conn::open performs I/O serialises every other key; expensive or blocking initialisation belongs in a per-key OnceLock slot (the sibling variant).",
+    "Static registries are never dropped: no destructor closes the connections at exit, and 'one per key' is per process, so tests sharing a process share the registry."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+    "https://doc.rust-lang.org/stable/std/sync/struct.Mutex.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutex-registry",
+      "name": "Static OnceLock<Mutex<HashMap<K, Arc<V>>>> registry",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "requires_features": [
+        "OnceLock"
+      ],
+      "idiom_name": "static OnceLock<Mutex<HashMap<K, Arc<V>>>> + entry().or_insert_with()",
+      "implementation_notes": "Rust has no static constructors, so the registry is a static OnceLock initialised on first use, wrapping a Mutex<HashMap<K, Arc<V>>>; the lookup locks the map and entry(key).or_insert_with(|| Arc::new(make(key))) creates the instance exactly once per key under that lock, returning a clone of the Arc. Callers share ownership through Arc, so the registry never hands out a reference that could outlive the map, and OnceLock (stable since 1.70; LazyLock or once_cell before that) keeps initialisation exactly-once - the std docs state only one initialising function will run.",
+      "code_sketch": "static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Conn>>>> = OnceLock::new();\n\nfn conn_for(tenant: &str) -> Arc<Conn> {\n    let map = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));\n    let mut guard = map.lock().expect(\"registry poisoned\");\n    guard\n        .entry(tenant.to_owned())\n        .or_insert_with(|| Arc::new(Conn::open(tenant)))\n        .clone()\n}",
+      "pitfalls": [
+        "Lock poisoning: a panic while holding the registry lock poisons the mutex and every later lookup fails with PoisonError until the process is restarted or the guard is recovered.",
+        "Holding the registry lock while Conn::open performs I/O serialises every other key; expensive or blocking initialisation belongs in a per-key OnceLock slot (the sibling variant).",
+        "Static registries are never dropped: no destructor closes the connections at exit, and 'one per key' is per process, so tests sharing a process share the registry."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+        "https://doc.rust-lang.org/stable/std/sync/struct.Mutex.html"
+      ]
+    },
+    {
+      "variant_id": "per-key-oncelock",
+      "name": "Per-key OnceLock slots (registry lock released before initialisation)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "requires_features": [
+        "OnceLock"
+      ],
+      "idiom_name": "Mutex<HashMap<K, Arc<OnceLock<Arc<V>>>>> + get_or_init per key",
+      "implementation_notes": "For expensive or blocking construction, store a per-key OnceLock instead of the value: the map lock is held only long enough to find or insert the slot, then released, and slot.get_or_init(...) runs the construction exactly once for that key while unrelated keys proceed. Only callers asking for the same key wait for each other, which turns one global critical section into per-key critical sections - at the cost of an extra Arc<OnceLock<Arc<V>>> per entry and a two-phase lookup.",
+      "code_sketch": "fn slot(tenant: &str) -> Arc<OnceLock<Arc<Conn>>> {\n    let map = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));\n    Arc::clone(\n        map.lock().unwrap()\n            .entry(tenant.to_owned())\n            .or_insert_with(|| Arc::new(OnceLock::new())),\n    )\n}\n// outside the registry lock:\n// Arc::clone(slot(tenant).get_or_init(|| Arc::new(Conn::open(tenant))))",
+      "pitfalls": [
+        "A failed initialisation is not recorded: OnceLock has no fallible get_or_init on stable, so a transient failure needs once_cell's get_or_try_init or an explicit retry policy instead of leaving a poisoned slot.",
+        "Removing an entry is subtle: taking the OnceLock out while another thread holds its Arc needs a generation or remove-then-reinsert protocol rather than plain map.remove.",
+        "Two Arc layers per entry make identity easy to confuse - comparing outer Arcs of two lookups is not the same as comparing the instances they point at."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+        "https://softwarepatternslexicon.com/rust/structural-design-patterns-in-rust/the-multiton-pattern/"
+      ]
+    }
+  ],
+  "default_variant": "mutex-registry"
+}

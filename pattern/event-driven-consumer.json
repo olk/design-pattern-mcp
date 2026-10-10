@@ -1,0 +1,252 @@
+{
+  "category": "interaction-boundary",
+  "name": "event-driven-consumer",
+  "aliases": [
+    "asynchronous receiver",
+    "message listener"
+  ],
+  "intent": "Invert delivery control at a messaging endpoint: the application registers a callback - the asynchronous receiver - with the messaging system, which invokes it every time a message arrives; application code never calls receive(), so delivery latency no longer depends on a poll interval and an idle channel costs no thread.",
+  "problem": "An application must react to messages the moment they arrive, but a hand-written receive loop makes it own the wait: latency is tied to the poll interval, a thread or timer is burned while the channel is idle, and connection, acknowledgement and retry logic get duplicated in every consumer. Should the application keep pulling for messages (Polling Consumer), or hand the wait to the messaging system and let it call back only when there is work to do?",
+  "context": "Push-capable messaging endpoints - JMS/AMQP queues, Kafka client callbacks, MSMQ, cloud queues, MQTT/telemetry feeds, in-process event buses - where the broker or its client owns the receive loop and can call back into application code through a listener container, message-driven bean, processor, dispatcher thread, event loop, coroutine or actor mailbox. It is the right-hand side of the Polling Consumer decision whenever delivery latency and idle cost matter more than application-controlled receive pacing.",
+  "benefits": [
+    "Delivery latency is decoupled from any poll interval: a message is handed to the application as soon as the transport delivers it.",
+    "No thread (or timer) is held while the channel is idle - the classic asynchronous-receiver property - so thousands of idle subscriptions stay cheap.",
+    "Delivery policy is centralised in one place: the listener container or client owns acknowledgement, redelivery, reconnection and error handling instead of every receive loop re-implementing them.",
+    "Application code reduces to a plain callback or service method, with no connection management or wait loop mixed in.",
+    "It composes with runtimes whose execution model is already callbacks or suspension: Node's event loop, asyncio, kotlinx.coroutines, Swift concurrency and actor systems resume code on delivery for free."
+  ],
+  "tradeoffs": [
+    "Control over the receive rate moves to the messaging system: back-pressure must be expressed through prefetch/consumer-window settings, concurrency limits and pause/resume APIs, and a slow handler accumulates broker-side backlog instead of naturally slowing a pull loop.",
+    "The handler inherits the container's threading model: blocking, throwing, deadlocking or leaking state there degrades the whole consumer (JMS treats an exception escaping the listener as a client programming error).",
+    "Concurrency becomes implicit - container size, MaxConcurrentCalls, partitionsConsumedConcurrently, dispatcher threads - so per-key ordering and shared mutable state break unless concurrency is pinned to one.",
+    "Failure semantics are indirect: redelivery is automatic, duplicates are normal, and a poison message is redelivered forever unless a dead-letter/retry policy is configured.",
+    "Lifecycle is container-owned: reconnection re-registers and re-delivers, and shutdown has to drain in-flight work (stop processing, then close) rather than just exiting the loop.",
+    "Tests lose determinism because arrival timing is broker-driven and callbacks fire on framework threads; deterministic tests need a startable/stoppable container and a mockable client.",
+    "More settings to own than a while-loop needs: ack mode, prefetch, retry and dead-letter policy, connection lifecycle and draining must all be configured deliberately."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Event-Driven Consumer (asynchronous receiver)",
+      "responsibility": "The endpoint object the messaging system invokes when a message arrives; it passes the message to application code and returns acknowledgement, rejection or failure to the transport."
+    },
+    {
+      "role": "Messaging system / channel",
+      "responsibility": "Delivers messages to the consumer as they arrive; its own internals may be poll- or push-driven, but the consumer only observes that it is invoked."
+    },
+    {
+      "role": "Listener / handler",
+      "responsibility": "The application callback that performs the work for one message and signals success or failure back through the consumer's acknowledgement contract."
+    },
+    {
+      "role": "Listener container",
+      "responsibility": "Realisation-side role: owns the receive loop, threading, session/channel lifecycle, reconnection, transaction and acknowledgement policy, and calls the listener; the consumer's no-thread-while-idle property is materialised here."
+    },
+    {
+      "role": "Error handler / dead-letter path",
+      "responsibility": "Receives failures the listener reports and decides redelivery, back-off or dead-lettering so poison messages do not spin forever."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Order, payment or trade event processing, where each message must be handled within milliseconds of arrival and no worker may idle-spin on the queue.",
+    "JMS/AMQP queue workers built on listener containers — message-driven beans, @JmsListener, Spring AMQP listeners — where delivery policy is declarative configuration.",
+    "Kafka consumers where the client feeds each record to a callback (eachMessage) and owns fetching, offsets and heartbeats; each partition is processed by one thread at a time.",
+    "IoT and telemetry gateways where an MQTT/AMQP client calls back per message and the endpoint must stay cheap between deliveries to preserve device battery.",
+    "Cloud queue triggers — AWS Lambda with SQS/SNS, Azure Event Hub processors, Google Cloud Pub/Sub push subscriptions — where the cloud platform invokes the handler on your behalf.",
+    "In-process event consumers — Node EventEmitter listeners, actor mailboxes, Kotlin coroutine channels, Swift concurrency actors — the same inversion of control inside a single process.",
+    "Event-driven microservices reacting to domain events (e.g., customer-created, order-shipped) published on a Kafka topic or EventBridge event bus, enabling loose coupling between bounded contexts.",
+    "Real-time stream processing pipelines where a Kafka consumer transforms, aggregates or enriches records and publishes to a downstream topic, with exactly-once semantics using transactions.",
+    "Serverless workflow steps where an EventBridge rule routes events to Lambda targets; the Lambda is the event-driven consumer and must be idempotent since EventBridge retries on failure.",
+    "Financial reconciliation pipelines consuming idempotent banking events, where exactly-once semantics are required and duplicates would cause incorrect account balances.",
+    "CQRS read-model projection rebuilders: an event-driven consumer subscribes to domain events and reconstructs a read-optimised projection (materialised view) by replaying all historical events from an offset of zero.",
+    "Saga orchestration steps where each service's step is an event-driven consumer listening for the completion event of the previous step; a compensating transaction is triggered if the saga times out or receives a failure event.",
+    "Webhook fan-out systems where an event-driven consumer receives a business event and fans out HTTP callbacks to registered subscriber endpoints; each delivery is idempotent using a deterministic request signature.",
+    "CDC (Change Data Capture) pipelines where a Debezium or similar connector publishes row-level events to Kafka; downstream consumers apply the changes to search indices, caches, or derived data warehouses.",
+    "Multi-cloud event replication where an event-driven consumer in one cloud region processes an event and re-publishes a translated copy to a partner cloud's event bus, requiring idempotent re-publish logic.",
+    "Apache Camel routes: the Event Driven Consumer is Camel's default consumer model — from('jms:queue:foo').bean(MyBean.class) lets the Camel container manage pooling, threading and concurrency declaratively.",
+    "Eclipse Paho MQTT clients: loop_start() runs the network loop on a background thread and invokes on_message per delivery (with manual_ack available instead of the default acknowledge-on-return) on battery- and bandwidth-constrained IoT endpoints.",
+    "Spring AMQP @RabbitListener: the framework builds a RabbitListenerContainer (SimpleMessageListenerContainer or DirectMessageListenerContainer) per annotated method; the container owns consumer threads, ack mode, concurrency and recovery."
+  ],
+  "avoid_when": [
+    "The transport cannot push: flat files, legacy tables or request-only HTTP endpoints must be polled - choose Polling Consumer instead of simulating callbacks.",
+    "The application must control its own receive rate to protect itself or a downstream system; a bounded polling batch with explicit idle/back-off makes that pacing visible.",
+    "The consumer is a batch job that should run to completion and exit; an explicit loop with idle/termination conditions is simpler to reason about.",
+    "Deterministic receive ordering or timing is the requirement (test harnesses, replay tooling); a pull loop gives the application the clock.",
+    "The exchange is really a synchronous request-reply method call; use Request-Reply or Messaging Gateway rather than forcing an asynchronous callback API onto the caller."
+  ],
+  "language_files": {
+    "generic": "event-driven-consumer.generic.json",
+    "c": "event-driven-consumer.c.json",
+    "cplusplus": "event-driven-consumer.cplusplus.json",
+    "csharp": "event-driven-consumer.csharp.json",
+    "go": "event-driven-consumer.go.json",
+    "java": "event-driven-consumer.java.json",
+    "javascript": "event-driven-consumer.javascript.json",
+    "kotlin": "event-driven-consumer.kotlin.json",
+    "python": "event-driven-consumer.python.json",
+    "ruby": "event-driven-consumer.ruby.json",
+    "rust": "event-driven-consumer.rust.json",
+    "scala": "event-driven-consumer.scala.json",
+    "swift": "event-driven-consumer.swift.json",
+    "typescript": "event-driven-consumer.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "polling-consumer",
+    "service-activator",
+    "message-endpoint",
+    "competing-consumers",
+    "durable-subscriber",
+    "message-dispatcher",
+    "idempotent-receiver",
+    "channel-adapter",
+    "process-manager",
+    "dead-letter-channel",
+    "circuit-breaker",
+    "bulkhead"
+  ],
+  "anti_patterns": [
+    "A listener that blocks for minutes on the container's callback thread, starving every other consumer served by that container.",
+    "Throwing exceptions out of the callback and relying on automatic redelivery with no retry limit or dead-letter queue — poison messages spin forever.",
+    "Hiding a polling loop (sleep/retry/drain) inside the callback, reintroducing the polling consumer under an event-driven facade.",
+    "Assuming single-threaded delivery and mutating shared mutable state from a listener the container invokes concurrently.",
+    "Auto-acknowledging on receipt and processing after the acknowledgement, so a crash inside the handler silently drops messages.",
+    "Registering listeners without cancelling or draining them at shutdown, leaking subscriptions and producing duplicated deliveries on the next instance.",
+    "Processing messages in a handler without an idempotency key and writing to an external store — at-least-once delivery causes duplicate charges, duplicate records, or state inconsistency.",
+    "Redelivery loops without a retry budget: a poison message is rejected, requeued, redelivered, rejected again — indefinitely blocking the queue and starving other consumers.",
+    "Out-of-order delivery on keyed streams where a later event (e.g., OrderShipped) arrives before an earlier one (OrderCreated), leaving entities in invalid states.",
+    "Retries with no back-off that cascade into deadlocks: multiple consumers retry simultaneously, lock the same downstream resource, and timeout on each other's held locks.",
+    "Silent dead-letter queues with no monitoring or alerting — failed events accumulate unseen and business consequences (unrefunded payments, stranded shipments) compound without detection.",
+    "Unbounded in-flight work with auto-ack and no prefetch limit — a burst of messages exhausts memory or disk before back-pressure can act.",
+    "Schema evolution without coordination: publishing a breaking change to an event type while some consumers are still on the old schema causes deserialisation errors and data loss.",
+    "End-to-end exactly-once assumed from Kafka transactions alone — Kafka transactions cover only Kafka-to-Kafka flows; external sink writes need idempotent consumers or the Outbox Pattern.",
+    "Consumer lag growing unchecked because errors are swallowed in the handler rather than nack'd to the DLQ — lag becomes a leading indicator of downstream outage.",
+    "Missing delivery acknowledgement timeout configuration — if a handler hangs indefinitely, the broker never requeues and the message is effectively stuck until the connection drops.",
+    "Rebalance storm: adding or removing consumers too frequently (e.g., auto-scaling with short poll intervals) triggers repeated stop-the-world rebalances, causing sustained throughput collapse.",
+    "Committing offsets before processing is durable: a crash after commit but before persisting the result makes the event unrecoverable — use commit-after-write, not commit-before-write.",
+    "Forgetting to close the consumer or subscriber on shutdown: connections leak, phantom subscriptions persist on the broker, and the next startup may receive duplicate or delayed messages.",
+    "Serial processing as a default: many frameworks invoke handlers serially by default; assuming parallel execution and relying on mutable shared state causes hard-to-reproduce race conditions.",
+    "Pausing a consumer without persisting the pause state: if the process restarts during a pause, the consumer resumes delivery at full speed, losing the back-pressure benefit.",
+    "Ignoring consumer group coordinator failover: during Kafka coordinator re-election, the group pauses consumption; not handling this gracefully produces timeout exceptions and spurious DLQ entries.",
+    "Partition ownership confusion after rebalance: a handler that caches per-partition state without a teardown callback on revoke will serve records from the wrong partition using stale state.",
+    "Deserialisation errors from breaking schema changes: publishing a new Avro schema that removes a required field while old consumers are still subscribed silently drops or corrupts downstream state.",
+    "Processing records with an infinite while-loop inside the handler: calling receive() or blocking on a Future inside the callback defeats the event-driven threading model and serialises throughput.",
+    "Outbox relay publishing without deduplication: if the relay reads the outbox table multiple times before marking a row published, the same event can be delivered more than once, defeating the transactional guarantee.",
+    "Relying on consumer lag as the only health signal: a consumer can be processing messages very slowly without lag growing, simply because the producer is also slow — lag alone does not reveal handler performance degradation.",
+    "Over-pinning concurrency: setting MaxConcurrentCalls = 1 across all consumers on a machine wastes parallelism when the handler is I/O bound; tune concurrency to the number of downstream connections.",
+    "Missing Schema Registry compatibility checks in CI: a schema-breaking change merged to main and deployed before the consumer is upgraded causes deserialisation exceptions across the entire consumer fleet.",
+    "Lambda batch item failures without tracking: returning batchItemFailure from a Lambda+SQS handler discards individual failures from the batch but does not persist which items failed, so a retry replays the whole batch.",
+    "Excessive consumer group partitioning: creating more partitions than consumers wastes resources; creating too few limits parallelism and causes hot-spot partitions under high load."
+  ],
+  "design_principles": [
+    "Inversion of control (Hollywood principle): the messaging system calls the application, not the reverse.",
+    "Separation of concerns: delivery mechanics (container/client) versus message handling (callback) versus policy (configuration).",
+    "Single responsibility per role: consumer endpoint, container, listener and error handler each own one concern.",
+    "Dependency inversion: the endpoint binds to a stable listener interface instead of the application owning transport lifecycle.",
+    "Explicit concurrency and back-pressure policy: the container's threading, prefetch and acknowledgement settings are deliberate design decisions, not defaults."
+  ],
+  "best_practices": [
+    "Keep the callback short and non-blocking; hand long work to a worker pool or queue and acknowledge only when the work has been durably accepted.",
+    "Configure prefetch/consumer window and container concurrency together with the maximum in-flight work, and pin concurrency to one where per-key ordering matters.",
+    "Make handlers idempotent: at-least-once delivery plus automatic redelivery makes duplicates normal; embed a durable eventId in every message and check-before-write.",
+    "Define poison-message handling up front — dead-letter queue, retry limit with back-off, and error handler — instead of throwing and hoping the framework recovers.",
+    "Never let expected failures escape the listener; convert them to nack/reject/dead-letter through the framework's acknowledgement API.",
+    "Drain gracefully on shutdown: stop the container, wait for in-flight messages to complete, then close the connection; failing to drain loses in-flight acknowledgements.",
+    "Register the listener only after topology (queue/exchange/subscription) is ready, and re-register on container recovery to avoid ghost subscriptions.",
+    "Test the handler as a plain function and cover delivery wiring with an embedded broker or the client's test doubles.",
+    "Monitor consumer lag (the distance between latest produced offset and latest committed offset) and set progressive alerts at multiple thresholds — lag is the primary early-warning signal.",
+    "Use manual acknowledgement (auto-ack = false) in preference to automatic acknowledgement; auto-ack loses messages on consumer crash after receipt but before processing.",
+    "Bound prefetch (e.g., QoS prefetch = 100–300 for RabbitMQ) to prevent consumer overload while maintaining throughput; zero prefetch disables back-pressure.",
+    "Track redelivery count per message and dead-letter after a fixed retry budget to prevent poison messages spinning forever; redelivery loops block the queue.",
+    "Propagate trace context (correlation ID, CloudEvents distributed tracing extensions, W3C Trace Context) through event metadata to achieve end-to-end observability across asynchronous boundaries.",
+    "Configure a delivery acknowledgement timeout (e.g., RabbitMQ's 30-minute default) long enough for your longest handler; too short causes premature requeue.",
+    "Use Single Active Consumer (SAC) on quorum queues when strict per-queue ordering or single-threaded delivery is required.",
+    "Implement the Outbox Pattern for downstream Kafka publishes: write to a database outbox in the same transaction as domain state, then a relay publishes using the outbox record's ID as the idempotency key.",
+    "Implement the Inbox Pattern for consuming: treat incoming messages as inbox entries, process them idempotently, and advance a cursor; this achieves exactly-once processing semantics from an at-least-once transport.",
+    "Use cooperative sticky partition assignment (CooperativeStickyAssignor in Kafka) to avoid stop-the-world rebalances; eager rebalance pauses all consumption for the duration of the rebalance.",
+    "Register a ConsumerRebalanceListener in Kafka to synchronously revoke offsets before the group rebalances, preventing duplicate processing of the revoked partition's records.",
+    "Close consumers explicitly in a try-finally or shutdown hook; forgetting to close leaves sessions open, causes phantom subscriptions, and can trigger rebalance storms on the next startup.",
+    "Use Schema Registry with Avro or Protobuf to enforce backward compatibility; register schemas before deploying consumers that depend on them, and never publish a breaking change to a topic with active consumers.",
+    "Pin the consumer to a specific thread or use thread-local state when the underlying framework invokes handlers concurrently; shared mutable state across handler invocations is a race condition.",
+    "Implement bulkheads and circuit breakers around downstream calls inside the handler: a slow or failing database does not have to take down the entire consumer; use Polly or equivalent to isolate failures.",
+    "Prefer pause/resume APIs over large prefetch buffers for back-pressure: pausing a consumer stops delivery without discarding messages, giving downstream systems time to recover.",
+    "For saga orchestration steps, treat each step's completion event as both a consumer input and an idempotency token; embed the saga ID and step number in the event so retries cannot start a second parallel instance.",
+    "Monitor message age (time-in-queue) in addition to consumer lag: messages that sit for long periods before being processed indicate a backlog forming before the consumer layer."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Enterprise Integration Patterns — Event-Driven Consumer — Hohpe & Woolf, Enterprise Integration Patterns (2003) — Messaging Endpoints chapter; the pattern is also known as the asynchronous receiver. — https://www.enterpriseintegrationpatterns.com/patterns/messaging/EventDrivenConsumer.html",
+    "Introduction to Messaging Endpoints — Hohpe & Woolf — covers the choice between Event-Driven Consumer and Polling Consumer, JMS message-driven beans, and composite endpoint patterns. — https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessagingEndpointsIntro.html",
+    "Consumer Acknowledgements and Publisher Confirms — RabbitMQ official documentation — covers manual vs automatic acknowledgement modes, prefetch/backpressure, redelivery behaviour, and dead-letter configuration. — https://www.rabbitmq.com/docs/confirms",
+    "Consumers — RabbitMQ official documentation — covers prefetch, Single Active Consumer, delivery acknowledgement timeout, and long-lived consumer best practices. — https://www.rabbitmq.com/docs/consumers",
+    "Dead Letter Exchanges — RabbitMQ official documentation — DLX configuration for routing poison messages and implementing TTL-based retry queues. — https://www.rabbitmq.com/docs/dlx",
+    "RabbitMQ in Production: DLQ, Retry with TTL, and a Generic Consumer Framework — Production-focused walkthrough: manual acks, DLQ with TTL-based delays, idempotent consumers, and observability. — https://thyagodev.net/posts/rabbitmq-production/",
+    "Consumer Patterns — Idempotency and Exactly-Once Processing — Covers manual offset commits, event deduplication via processed-events table or Redis SET NX EX, idempotent side effects, and the Outbox Pattern for downstream exactly-once delivery. — https://www.trinitylogic.co.uk/blog/kafka-consumer-idempotency-exactly-once/",
+    "Exactly-Once in Kafka Is Three Mechanisms Wearing One Name — Explains the trio of idempotent producers, Kafka transactions, and read_committed isolation; clarifies that end-to-end exactly-once requires consumer-side idempotency for external sinks. — https://petascalelabs.com/blog/kafka-exactly-once-idempotence-transactions-read-committed",
+    "KafkaConsumer API — Apache Kafka 3.4 — Official Kafka client API documentation — manual offset control, commitSync/commitAsync, ConsumerRebalanceListener, and at-least-once delivery semantics. — https://kafka.apache.org/34/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html",
+    "Kafka Rebalancing Explained: How It Works & Why It Matters — Confluent — explains eager vs cooperative sticky partition assignment, stop-the-world effect, and the incremental CooperativeStickyAssignor. — https://www.confluent.io",
+    "Kafka Rebalancing: Triggers, Effects, and Mitigation — Redpanda — covers stop-the-world rebalance latency, consumer group coordination overhead, and incremental rebalance protocols. — https://www.redpanda.com",
+    "Schema Evolution & Compatibility Types — Confluent Documentation — Schema Registry enforces backward/forward/full compatibility; breaking changes cause deserialisation errors and data loss. — https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html",
+    "Schema Registry: Schema Evolution, Avro, and Protobuf — ActiveWizards — covers breaking vs compatible schema changes, schema IDs in message headers, and consumer migration strategies. — https://activewizards.com/blog/the-importance-of-schema-registry-in-kafka",
+    "Pattern: Transactional Outbox — Microservices.io — Use the Outbox Pattern when a database update initiates an event notification; write to an outbox table in the same transaction, then relay publishes. — https://microservices.io/patterns/data/transactional-outbox.html",
+    "Transactional Outbox Pattern — AWS Prescriptive Guidance — AWS guidance on implementing the transactional outbox pattern for reliable event publishing from relational databases to event buses. — https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/implement-transactional-outbox-patterns.html",
+    "The Inbox & Outbox Patterns for Reliable Event Processing — The Burning Monk — producers use the Outbox Pattern; consumers use the Inbox Pattern to achieve exactly-once processing by treating incoming messages as inbox entries. — https://newsletter.theburningmonk.com/p/the-inbox-and-outbox-patterns-for",
+    "Pattern: Saga — Microservices.io — choreography-based sagas use events for maintaining data consistency across distributed services; each step of a saga is an event-driven consumer reacting to the previous step's completion event. — https://microservices.io/patterns/data/saga.html",
+    "How to Implement Saga Pattern with Kafka — OneUptime — covers orchestration vs choreography variants, compensating transactions, and correlation IDs for saga step routing. — https://oneuptime.com/blog/how-to-implement-saga-pattern-with-kafka/",
+    "Saga Pattern for Microservices Explained — Conduktor — Kafka's distributed event log provides an ideal foundation for choreographed sagas where each participant listens only to relevant events. — https://www.conduktor.io/saga-pattern-microservices/",
+    "CQRS and Event Sourcing with Kafka — Conduktor — CQRS separates read and write models; event-driven consumers build read-model projections by consuming domain events from Kafka. — https://www.conduktor.io/cqrs-event-sourcing-kafka/",
+    "Event-Driven API Testing: Kafka, AsyncAPI & Testcontainers — Totalshiftleft — covers contract testing, testcontainers for integration testing, and async message verification patterns. — https://totalshiftleft.ai/blog/event-driven-api-testing-kafka-asyncapi-testcontainers",
+    "How to Test Event Driven Microservices — QA Job Fit — end-to-end, component, and contract testing strategies for asynchronous microservices with deterministic callbacks. — https://qajobfit.com/blog/how-to-test-event-driven-microservices/",
+    "How to Implement Distributed Tracing for Event-Driven — OneUptime — OpenTelemetry trace propagation through Kafka headers and RabbitMQ metadata; trace context carry-through across asynchronous boundaries. — https://oneuptime.com/blog/distributed-tracing-event-driven-architecture/",
+    "OpenTelemetry in Decoupled Event Driven Architectures — CNCF — With distributed tracing in the broker, you can trace an event and know what partition, order, consumer, and processing span it traversed. — https://www.cncf.io/blog/opentelemetry-in-decoupled-event-driven-architectures",
+    "Event-Driven Architecture Pitfalls: Lessons Learned the Hard Way — ND Teknik — Production lessons: out-of-order delivery, duplicate events, retry deadlocks, silent DLQ growth, cascading failures, and observability requirements. — https://ndteknik.com/posts/event-driven-architecture-pitfalls/",
+    "Event-Driven System Design: The Decisions That Bite You Later — The Augmented Dev — covers star-topology coupling, at-least-once vs exactly-once trade-offs, schema evolution, outbox pattern, and partitioning strategy for consumers. — https://theaugmenteddev.com/blog/event-driven-system-design-decisions-that-bite",
+    "Handling Eventual Consistency in Java Event-Driven Systems — Software Patterns Lexicon — Dual-write problems, outbox/inbox patterns, sagas, reconciliation, and staleness monitoring for eventually-consistent consumer pipelines. — https://softwarepatternslexicon.com/java/event-driven-architecture/handling-eventual-consistency/",
+    "Event-Driven Platform Engineering: Building Always-On Consumer Systems with Exactly-Once Guarantees — JISEM — Academic paper on observability-driven consumer platform engineering; covers consumer lag metrics, multi-threshold alerting, and log-based event stream patterns. — https://doi.org/10.52783/jisem.v11i2s.14374",
+    "Event-Driven Systems in AWS: Service Selection, Production Patterns, and Architecture Trade-offs — CloudWebSchool — AWS-focused EDA best practices: correlation IDs, X-Ray tracing, DLQ monitoring, Lambda idempotency, and Step Functions vs event choreography. — https://cloudwebschool.com/docs/aws/architecture-and-best-practices/event-driven-systems-in-aws/",
+    "Event-Driven Architecture: Advanced Patterns for Distributed Systems Resilience — CrashBytes — Advanced consumer patterns: event lag tracking, per-partition consumer lag, DLQ tooling with replay, and cross-team observability platform design. — https://crashbytes.com/articles/event-driven-architecture-advanced-patterns-distributed-systems-resilience-2025",
+    "Best practices for monitoring event-driven architectures — Datadog — Distributed tracing across Kafka and RabbitMQ, consumer lag alerting, dead-letter queue monitoring, and end-to-end flow dashboards. — https://www.datadoghq.com/blog/monitoring-event-driven-architectures/",
+    "Using dead-letter queues in Amazon SQS — AWS documentation — SQS DLQ configuration, redrive, and max receive count for poison message handling in serverless event-driven consumers. — https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html",
+    "SQS Dead Letter Queues: Failures Handling Best Practices — RanTheBuilder — SQS Lambda integration DLQ patterns, batch item failures, and retry budget configuration for Lambda-based event-driven consumers. — https://ranthebuilder.cloud/blog/sqs-dead-letter-queues/",
+    "Event-Driven Asynchronous Patterns for High-Throughput — ResearchGate — Academic examination of event-driven asynchronous integration patterns as a foundational architectural approach for high-throughput enterprise systems. — https://www.researchgate.net/publication/372222495_Event-Driven_Asynchronous_Patterns_for_High-Throughput_Enterprise_Systems",
+    "Event Driven Consumer EIP — Apache Camel — official component docs: EDC is Camel's default asynchronous consumer model; the Camel container manages pooling, threading and concurrency, with Polling Consumer as the alternative. — https://camel.apache.org/components/next/eips/eventDrivenConsumer-eip.html",
+    "Asynchronous Consumer — Spring AMQP reference — official documentation of container-driven message listeners via @RabbitListener and message listener containers. — https://docs.spring.io/spring-amqp/reference/amqp/receiving-messages/async-consumer.html",
+    "client module — Eclipse Paho MQTT Python documentation — loop_start()/loop_forever() background network loop, on_message callback delivery and manual_ack for acknowledge-after-processing. — https://eclipse.dev/paho/files/paho.mqtt.python/html/client.html",
+    "[CAMEL-24525] camel-google-firestore: the realtime change buffer is unbounded — Apache JIRA — real-world push-consumer misuse: an unbounded in-memory buffer fed by change callbacks could exhaust heap under write bursts; bounded buffering with back-pressure was the fix. — https://issues.apache.org/jira/browse/CAMEL-24525",
+    "Polling Consumer vs Event-Driven Consumer — AI Study Room — comparison noting push consumers need persistent connections and careful back-pressure and can accumulate in-memory buffers, while polling gives natural rate control at a latency cost. — https://aidev.fit/en/architecture/polling-consumer.html",
+    "Event-Driven vs. Polling Architectures for Agent Triggers — Agent Blueprint — critique of the pure-push/pure-pull dichotomy: webhook callbacks bring duplicates, out-of-order updates and silent gaps; recommends push plus reconciliation polling with idempotent handlers. — https://agentblueprint.substack.com/p/event-driven-vs-polling-architectures"
+  ],
+  "related_patterns_notes": {
+    "outbox-pattern": "outbox-pattern",
+    "inbox-pattern": "inbox-pattern",
+    "cqrs": "cqrs",
+    "event-sourcing": "event-sourcing",
+    "retry-pattern": "retry-pattern",
+    "transactional-outbox": "transactional-outbox"
+  }
+}

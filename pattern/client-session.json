@@ -1,0 +1,186 @@
+{
+  "category": "interaction-boundary",
+  "name": "client-session",
+  "aliases": [
+    "client session state",
+    "cookie session"
+  ],
+  "intent": "Keep the per-conversation state on the client - serialized and integrity-protected, optionally encrypted, into the cookie, header or token that accompanies every request - so that the server keeps no per-user state between requests and any instance can serve any request.",
+  "problem": "A conversation spans several requests and needs state - shopping cart, wizard progress, authentication context, pagination cursor, one-shot flash message - yet the deployment has nowhere trustworthy to keep it: nodes behind the load balancer are interchangeable, sticky routing is unwanted, an in-process map loses the session on restart or on the next node's turn, and a shared session store adds an operational dependency plus a lookup on every request. The recurring decision is therefore not 'which store?' but 'can the client carry this state, and what does that cost in size, integrity, confidentiality and revocation?'",
+  "context": "Request-response software whose clients can hold and return an opaque blob: browsers with a cookie jar, native apps with a keychain or local storage, API consumers holding a token, message clients returning a header or a hidden form field. It applies when the per-conversation payload is small (hundreds of bytes, bounded by the roughly 4 KB cookie limit when a cookie is the carrier), when its lifetime is bounded, and when statelessness, failure tolerance and simple scaling are worth more than immediate server-side revocation and server-side confidentiality. It requires stable, shared key material (or an equivalent trust anchor) and a carrier the client will faithfully return.",
+  "benefits": [
+    "No server-side session store: application instances stay interchangeable - no sticky routing, no shared session datastore, no per-node memory growth and no session table to back up, expire or migrate.",
+    "Failure tolerance: a crash, restart or rolling deploy cannot lose a session, because the conversation state travels with the client instead of living in whichever process served the previous request (PoEAA's original motivation for the pattern).",
+    "Scaling becomes a deployment property: a new instance can serve an in-flight conversation immediately, which makes autoscaling and blue/green cutovers uneventful.",
+    "No lookup on the hot path: the request arrives with its state, so there is no session round trip and no read-through that can fail; the remaining costs are local (bytes, MAC verification, serialization).",
+    "Reaches shapes that cannot keep memory between requests: serverless functions, edge workers and multi-tenant gateways can still implement sessions when the state is a signed token or a self-contained cursor.",
+    "Testable codec and an explicit contract: encode/decode is a pure pair, so a test can craft a blob and assert the response without stubbing infrastructure, and the wire format is written down instead of being hidden in a store's schema."
+  ],
+  "tradeoffs": [
+    "The state travels on every request: bytes and latency are paid on each round trip, and the carrier imposes a hard ceiling (about 4 KB per cookie - Rails raises CookieOverflow, Django documents that a client which cannot store the whole value invalidates the session, and Express's cookie-session recommends a server-side store instead).",
+    "Authenticity is not confidentiality: a signed blob is still readable by the client (Django: 'signed but not encrypted'; Play: cookie information is visible to the browser and can expose sensitive data), so anything private needs a second layer - encryption - and therefore key management and rotation.",
+    "No per-session revocation: there is no server-side record to delete, so logout cannot invalidate a stolen copy before it expires (Django documents exactly this), and the only global kill switch is rotating the signing key, which signs every user out (Rails: changing secret_key_base invalidates all existing sessions).",
+    "Weak freshness: a MAC proves who wrote the blob, not when, so an old but valid copy can be replayed unless the record carries issued-at/expiry/version fields that the server actually checks (Django: 'No freshness guarantee').",
+    "The state is a per-request snapshot: two concurrent requests each start from their own copy, so updates race and the last writer wins; framework session changes are also only visible to the next request (Play pairs session writes with a redirect for that reason).",
+    "Per-request CPU and allocation: verify, decrypt, deserialize and - on the way out - serialize, encrypt and sign on every request, plus a format-versioning burden whenever the session shape changes.",
+    "The client is untrusted input in a stronger sense than usual: a correctly signed field is still a client-held value, so trusting it blindly (a role, a price, a quota) converts integrity protection into an authorization hole."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Client",
+      "responsibility": "Stores the opaque blob the server handed out (cookie jar, keychain, local storage, token) and returns it with every subsequent request of the conversation; it can read the blob only if the server chose signing without encryption."
+    },
+    {
+      "role": "Session State",
+      "responsibility": "The conversation snapshot itself - cart, wizard step, authentication claims, cursor position, flash message - carried as a value that is serialized on the way out and reconstituted on the way in."
+    },
+    {
+      "role": "Session Codec",
+      "responsibility": "Serializes and compresses the session object into the wire record on the way out and parses it on the way in, owning the versioned format so blobs still in flight keep working."
+    },
+    {
+      "role": "Integrity and Confidentiality Wrapper",
+      "responsibility": "Authenticates the record with a MAC, optionally encrypts it, and owns the key material: stable across instances and restarts, rotatable with a read-compatible transition, never derived per process."
+    },
+    {
+      "role": "Session Manager",
+      "responsibility": "Boundary code that reads the carrier before the application runs, rejects tampered, stale or wrong-version blobs, exposes the session through the framework's session abstraction, and writes the updated blob back with the right carrier attributes (HttpOnly, Secure, SameSite, Path, Max-Age/exp)."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "task-lifetime",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Stateless web applications and API gateways: the session lives in a cookie or a bearer token, so any instance can serve any request and rolling deploys do not log users out.",
+    "Serverless and edge deployments: functions with no process memory between invocations carry authentication context, tenant and cart in a signed or encrypted token, or in a self-contained cursor.",
+    "Guest carts and long-running wizards: the in-progress basket or form is a client-held blob, so no store row exists for visitors who never convert and the flow survives a node loss.",
+    "Pagination and resumable processing: an opaque continuation token encodes the filter, sort order and position (AIP-158-style page tokens, change-feed continuation tokens) instead of being looked up server-side.",
+    "Single-use flash messages and post/redirect/get: a signed one-shot value rides in a cookie for exactly one request and is stored nowhere.",
+    "Client-side preferences and experimentation context (theme, locale, bucket assignment) as a signed cookie the server verifies rather than stores or re-derives.",
+    "Rich or offline-capable clients that keep their own state and send a signed summary with each call - PoEAA's original framing, where the session record lives with the client application.",
+    "SPA authentication with BFF (Backend-for-Frontend): the browser holds only an HttpOnly, Secure, SameSite session cookie; the BFF converts it to a short-lived bearer token server-side, so the browser never exposes a JWT to XSS theft (the browser holds no long-lived secret, only an opaque session cookie).",
+    "Mobile and native app sessions: tokens stored in the OS keychain (iOS Keychain, Android Keystore) are returned as Authorization headers, where the app OS enforces hardware-backed protection and biometric unlock requirements unavailable to a cookie jar.",
+    "Edge worker and CDN-authoritative sessions: an edge node that cannot share state with other PoPs encodes tenant context, geolocation hints and feature flags into a signed token so any edge node can serve the request without a centralized store lookup.",
+    "Rails: ActionDispatch::Session::CookieStore is the framework's default session store - the whole session rides in one encrypted cookie (via secret_key_base), and exceeding the 4096-byte limit raises CookieOverflow, which is Rails' built-in enforcement of this pattern's size contract.",
+    "Flask: SecureCookieSessionInterface is the default session backend - the session dict is JSON-serialized, signed with itsdangerous, and shipped as a cookie, with a bad signature degrading to an empty session instead of an error.",
+    "Play Framework: Session and Flash are client-side JWT-format cookies signed with the application secret but not encrypted, capped at roughly 4 KB, with play.http.session.maxAge adding the exp claim the format otherwise lacks."
+  ],
+  "avoid_when": [
+    "The payload is large or unbounded (media, documents, whole object graphs): use a server-side session or database store (the catalog's Server Session sibling) - the roughly 4 KB cookie ceiling is not negotiable.",
+    "Immediate revocation, an administrator kill switch or per-session audit is required: a server-side session with an opaque id gives you a record you can delete, while a client-held blob cannot be un-issued.",
+    "The data is sensitive and the deployment cannot run key management (KMS, secret rotation, a stable key ring): keep the state where the client cannot read it.",
+    "Only a couple of scalars are involved: put them in the query string or a form field - a signed token adds cryptography and format versioning for no benefit.",
+    "A single long-lived process has no sticky-routing problem and you accept losing sessions on restart: an in-memory session map with an id cookie (or the framework default) is simpler.",
+    "The conversation is shared by several parties, must be observable for audit, or must survive the client clearing its storage: use a server-side store (a Process Manager for long-running flows) rather than the client's cookie jar."
+  ],
+  "language_files": {
+    "generic": "client-session.generic.json",
+    "c": "client-session.c.json",
+    "cplusplus": "client-session.cplusplus.json",
+    "csharp": "client-session.csharp.json",
+    "go": "client-session.go.json",
+    "java": "client-session.java.json",
+    "javascript": "client-session.javascript.json",
+    "kotlin": "client-session.kotlin.json",
+    "python": "client-session.python.json",
+    "ruby": "client-session.ruby.json",
+    "rust": "client-session.rust.json",
+    "scala": "client-session.scala.json",
+    "swift": "client-session.swift.json",
+    "typescript": "client-session.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "server-session",
+    "session-facade",
+    "memento",
+    "data-transfer-object",
+    "correlation-identifier",
+    "message-expiration",
+    "tolerant-reader"
+  ],
+  "anti_patterns": [
+    "'Signed means trusted': using a correctly MACed client field for authorization, prices or quota - integrity proves the server wrote the blob, not that the client is allowed to choose its contents.",
+    "Turning the cookie into a database: serializing half the user model into the record until the browser truncates it (Rails raises CookieOverflow, Django invalidates the session when the client drops bytes), or silently chunking it into several cookies.",
+    "Shipping secrets in a signed-only cookie: PII, internal identifiers, roles or API keys readable by anyone with access to the device, in exactly the backends whose documentation says 'signed but not encrypted'.",
+    "Pretending there is a session store: keeping a server-side session id inside the blob for revocation while claiming statelessness - paying for both designs and getting neither's guarantees.",
+    "Ignoring freshness and logout: no issued-at/max-age/version check, so an old record is replayed, and a logout endpoint that only clears the cookie while the stolen copy stays valid until its age limit.",
+    "Per-process keys: generating signing keys at startup, per instance and per restart, so cookies minted by one node are rejected by the next - visible to users as random logouts behind a load balancer.",
+    "Storing bearer tokens in localStorage: localStorage is accessible to JavaScript, so any XSS payload can exfiltrate the token; HttpOnly cookies prevent JavaScript access entirely and are strongly preferred for browser-based clients.",
+    "Accepting alg:none or an algorithm not on an explicit allowlist: even if the library's default is safe, omitting an explicit algorithm constraint means a future library change or misconfiguration can open alg:none bypass; pin the algorithm and reject unexpected values."
+  ],
+  "design_principles": [
+    "Statelessness as an architectural constraint: push conversation state to the edge instead of holding it in shared infrastructure - share nothing, scale anywhere.",
+    "Information hiding and single responsibility: carrier, cryptography and wire format live in one codec, while application code sees a session object and never a cookie or token.",
+    "Never trust the client: authenticate before parsing, and treat successfully authenticated fields as client-supplied data rather than server-issued facts.",
+    "Explicit lifecycle in the contract: expiry, freshness and format version are fields of the record, not implicit behaviour of a store.",
+    "Plan for key continuity: key material is shared infrastructure with a rotation story that still accepts the previous key for reads, otherwise the pattern's failure mode is a mass logout.",
+    "Defense in depth for the carrier: combine HttpOnly + Secure + SameSite (and prefer __Host- or __Secure- prefixes) so that even a single attribute failure does not immediately expose the session; no single control is sufficient on its own."
+  ],
+  "best_practices": [
+    "Always authenticate the record with a MAC (or AEAD tag) computed over exactly the bytes you ship, and compare it in constant time before parsing anything.",
+    "Encrypt (AEAD such as AES-GCM) whenever the payload carries anything private, and treat signing alone as tamper protection only - the distinction Django and Play document explicitly.",
+    "Keep the payload small and stable: identifiers instead of copies of data, compact field names, a version field; know the carrier's ceiling (about 4 KB per cookie) and monitor the encoded size.",
+    "Version the format and keep accepting the previous version (and previous key) for reads during rollout; drop the old shape only after the longest possible session lifetime has passed.",
+    "Keep keys in configuration or a secret store, shared by all instances; never generate them per process, and rehearse rotation because it doubles as the logout-everywhere switch.",
+    "Set carrier attributes deliberately: HttpOnly, Secure, SameSite and Path for cookies, a short Max-Age or token exp, plus an explicit 'reject if older than' rule to blunt replay. Prefer __Host- prefixed cookie names to enforce Secure, no Domain and Path=/, or __Secure- to enforce Secure alone.",
+    "Expose the state through the framework's session abstraction (request.session, HttpContext.User, call.sessions, a typed cookie jar) so exactly one module owns verification, and document the revocation limitation for operators.",
+    "For JWT-based sessions: pin the algorithm explicitly (e.g., verify(token, key, { algorithms: ['RS256'] })) and reject any token whose declared alg is not in the allowlist; never accept alg:none in production. When using asymmetric keys, keep the symmetric and asymmetric verification paths strictly separate to prevent RS256-to-HS256 confusion attacks.",
+    "Implement key rotation with a read-compatibility window: sign with the current key, accept reads from the current and the previous key (Django's SECRET_KEY_FALLBACKS, Flask-itsdangerous's key_derivation), and only drop the old key after the longest session lifetime has elapsed.",
+    "Combine SameSite with CSRF defenses: SameSite=Lax or Strict mitigates most CSRF but does not protect against top-level navigations; add an explicit anti-CSRF token on state-changing operations when SameSite= Lax or None is required.",
+    "Use partition-aware cookies (SameSite=None; Secure; Path=/) alongside __Host- or __Secure- prefixes when the session must work inside cross-site embedded contexts (e.g., embedded checkout or payment frames) to prevent browser partition-based cookie blocking from breaking the session.",
+    "When using refresh token rotation (long-lived token refreshed on each use with old token invalidated), detect token reuse as a theft signal: if a refresh token is used twice, revoke the entire token family and force re-authentication, as this is the canonical signal that a prior token was stolen and leaked.",
+    "For browser SPAs preferring JWT statelessness: strongly consider the BFF (Backend-for-Frontend) pattern where the browser holds only an HttpOnly session cookie and the BFF converts it to a short-lived bearer token server-side, keeping tokens entirely out of browser-accessible storage and eliminating XSS token exfiltration risk."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Martin Fowler, Patterns of Enterprise Application Architecture (2003) - Client Session State (Chapter 17, Session State Patterns), with Server Session State and Database Session State as the sibling alternatives.",
+    "https://martinfowler.com/eaaCatalog/clientSessionState.html",
+    "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie",
+    "https://datatracker.ietf.org/doc/html/rfc2965.html#section-5.3",
+    "Session Management - OWASP Cheat Sheet Series. https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html",
+    "Cookies: HTTP State Management Mechanism (RFC 6265bis draft) - IETF httpwg. https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html",
+    "JSON Web Token Best Current Practices - IETF draft-sheffer-oauth-rfc8725bis. https://www.ietf.org/archive/id/draft-sheffer-oauth-rfc8725bis-00.html",
+    "Cryptographic signing | Django documentation. https://docs.djangoproject.com/en/5.1/topics/signing/",
+    "How to use sessions | Django documentation. https://docs.djangoproject.com/en/6.1/topics/http/sessions/",
+    "Algorithm confusion attacks | Web Security Academy (PortSwigger). https://portswigger.net/web-security/jwt/algorithm-confusion",
+    "JWT Best Practices: Security, Storage, and Rotation | Skycloak. https://skycloak.io/blog/jwt-best-practices-developers/",
+    "Architecture - Duende.BFF (Backend-for-Frontend documentation). https://docs.duendesoftware.com/bff/architecture/",
+    "Implementing the BFF Pattern for SPAs | session-management.com. https://www.session-management.com/oidc-oauth-20-implementation/implementing-the-bff-pattern-for-spas/",
+    "Cookie Chaos: How to bypass __Host and __Secure prefixes | PortSwigger Research. https://portswigger.net/research/cookie-chaos-how-to-bypass-host-and-secure-cookie-prefixes",
+    "Set-Cookie header - HTTP | MDN Web Docs. https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie",
+    "ActionDispatch::Session::CookieStore - Ruby on Rails API documentation (default encrypted cookie session store, 4096-byte CookieOverflow limit). https://edgeapi.rubyonrails.org/classes/ActionDispatch/Session/CookieStore.html",
+    "Session and Flash - Play Framework 3.0.x documentation (client-side signed JWT cookies, ~4 KB limit, maxAge/exp). https://www.playframework.com/documentation/3.0.x/ScalaSessionFlash",
+    "Sessions / SecureCookieSessionInterface - Flask 3.1.x documentation (signed-cookie default, itsdangerous, empty session on BadSignature). https://flask.palletsprojects.com/en/stable/api/",
+    "Stop using JWT for sessions - joepie91's Ramblings (critique of stateless client tokens as long-lived sessions: no early invalidation, oversized tokens, roll-your-own crypto risk). http://cryto.net/~joepie91/blog/2016-06-13/stop-using-jwt-for-sessions/"
+  ],
+  "related_patterns_notes": {
+    "jwt-bearer-token": "jwt-bearer-token",
+    "token-binding": "token-binding",
+    "backend-for-frontend": "backend-for-frontend"
+  }
+}

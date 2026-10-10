@@ -1,0 +1,51 @@
+{
+  "pattern": "coarse-grained-lock",
+  "language": "rust",
+  "support": "manual",
+  "implementation_notes": "Default realization: open one sqlx transaction (pool.begin()) and, inside it, lock the aggregate root row with SELECT ... FOR UPDATE, then read and write members through the same executor; the row lock lives until commit or rollback, so it spans processes and hosts. The type system enforces the mechanics you would otherwise document - the Transaction is not Send/'static, so it cannot accidentally outlive its scope or be shared across tasks, which replaces the classic lock manager and its release bookkeeping.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sqlx-row-lock",
+      "name": "sqlx transaction with SELECT ... FOR UPDATE on the root row",
+      "paradigm": "concurrent",
+      "implementation_notes": "Default realization: open one sqlx transaction (pool.begin()) and, inside it, lock the aggregate root row with SELECT ... FOR UPDATE, then read and write members through the same executor; the row lock lives until commit or rollback, so it spans processes and hosts. The type system enforces the mechanics you would otherwise document - the Transaction is not Send/'static, so it cannot accidentally outlive its scope or be shared across tasks, which replaces the classic lock manager and its release bookkeeping.",
+      "min_standard": "Rust2021",
+      "idiom_name": "sqlx::Transaction + SELECT ... FOR UPDATE on the root",
+      "code_sketch": "let mut tx = pool.begin().await?;\nlet root_id: i64 = tx\n    .fetch_one(sql(\"SELECT id FROM orders WHERE id = $1 FOR UPDATE\"))\n    .bind(id).await?;\napply_cluster(&mut tx, root_id).await?;   // members covered\nlet _ = tx.commit().await?;               // lock released here",
+      "pitfalls": [
+        "The borrow checker will not let the transaction be shared across tasks, and the sqlx pool does not pin a connection: never re-acquire from the pool inside the cluster edit, or the member writes run outside the lock.",
+        "A transaction held across user think time keeps a pooled connection and the row lock; use a version token (UPDATE ... WHERE version = ...) for long sessions."
+      ],
+      "sources": [
+        "https://docs.rs/sqlx/latest/sqlx/struct.Pool.html"
+      ]
+    },
+    {
+      "variant_id": "guard-owned-aggregate",
+      "name": "Mutex guard owns the whole aggregate",
+      "paradigm": "concurrent",
+      "implementation_notes": "In-process realization: put the cluster behind one Mutex<Aggregate> and let its guard be the lock - accessing root and members is only possible through the guard, so per-member locking and lock ordering disappear and the borrow checker proves exclusivity. std::sync::Mutex documents exactly this: the data can only be accessed through the RAII guards returned by lock/try_lock. It coordinates one process only, and poisoning means a panic inside the guard typically has to be surfaced rather than ignored.",
+      "min_standard": "Rust2015",
+      "idiom_name": "Mutex<Aggregate> / lock().unwrap() guard",
+      "code_sketch": "let cluster = Arc::new(Mutex::new(Aggregate::new(id)));\n{\n    let mut guard = cluster.lock().unwrap();  // guard IS the lock\n    guard.lines[0].qty += delta;              // root + members\n}\n// guard dropped -> cluster unlocked",
+      "pitfalls": [
+        "Poisoning: if a thread panics while holding the guard, later lock() calls return Err and unwrap panics in turn - decide explicitly whether to propagate or recover.",
+        "Guards are not Send across await points in async code (std Mutex is not async-aware); use a tokio::sync::Mutex or scope the guard so it never spans an await."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.Mutex.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlx-row-lock",
+  "idiom_name": "sqlx::Transaction + SELECT ... FOR UPDATE on the root",
+  "code_sketch": "let mut tx = pool.begin().await?;\nlet root_id: i64 = tx\n    .fetch_one(sql(\"SELECT id FROM orders WHERE id = $1 FOR UPDATE\"))\n    .bind(id).await?;\napply_cluster(&mut tx, root_id).await?;   // members covered\nlet _ = tx.commit().await?;               // lock released here",
+  "pitfalls": [
+    "The borrow checker will not let the transaction be shared across tasks, and the sqlx pool does not pin a connection: never re-acquire from the pool inside the cluster edit, or the member writes run outside the lock.",
+    "A transaction held across user think time keeps a pooled connection and the row lock; use a version token (UPDATE ... WHERE version = ...) for long sessions."
+  ],
+  "sources": [
+    "https://docs.rs/sqlx/latest/sqlx/struct.Pool.html"
+  ]
+}

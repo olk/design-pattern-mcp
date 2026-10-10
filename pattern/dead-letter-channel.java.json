@@ -1,0 +1,62 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "@RetryableTopic + @DltHandler publishing to <topic>-dlt",
+  "implementation_notes": "The mainstream Java realization is framework-level: @RetryableTopic on the listener creates the retry topics and the dead-letter topic (the default suffix is -dlt, giving <topic>-dlt, configurable via dltTopicSuffix), moves the record there through DeadLetterPublishingRecoverer once the attempts and backoff are exhausted, and hands the DLT to a @DltHandler method or to the default logging handler. DltStrategy decides what happens when DLT processing itself fails: ALWAYS_RETRY_ON_ERROR (the default) forwards the record back to the DLT, FAIL_ON_ERROR stops the container, NO_DLT disables the DLT entirely. Fatal exceptions (DeserializationException, MessageConversionException, ConversionException, ClassCastException and friends) are deliberately not bounced back to the DLT, so deserialization failures need their own error handler and custom DLT routing.",
+  "code_sketch": "@RetryableTopic(attempts = \"4\", backoff = @Backoff(delay = 1000, multiplier = 2.0))\n@KafkaListener(topics = \"orders\")\nvoid consume(OrderEvent event) { service.apply(event); }   // throws -> retry topics -> -dlt\n\n@DltHandler\nvoid deadLetter(OrderEvent event) {\n    audit.park(event);          // triage + alert; never a silent drop\n}",
+  "pitfalls": [
+    "A DLT handler that throws under the default ALWAYS_RETRY_ON_ERROR sends the record back to the DLT, which can loop it forever; FAIL_ON_ERROR or an idempotent handler breaks the cycle.",
+    "Fatal exceptions bypass the DLT by design, so a deserialization failure is only logged unless a DeserializationExceptionHandler and a custom DLT route are configured.",
+    "The -dlt topic must exist with the retention and replication the broker requires: relying on auto-creation in production is how DLTs end up with default retention.",
+    "Consuming the DLT from the same application needs the DLT container enabled (autoStartDltHandler and endpoint registry wiring), otherwise the DLT fills silently."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-kafka/reference/retrytopic/dlt-strategies.html",
+    "https://docs.spring.io/spring-kafka/reference/retrytopic/topic-naming.html",
+    "https://docs.spring.io/spring-kafka/reference/retrytopic/features.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "spring-kafka-dlt",
+      "name": "Spring Kafka retry topics with @DltHandler (DeadLetterPublishingRecoverer)",
+      "paradigm": "oo",
+      "min_standard": "Java17",
+      "idiom_name": "@RetryableTopic + @DltHandler publishing to <topic>-dlt",
+      "implementation_notes": "The mainstream Java realization is framework-level: @RetryableTopic on the listener creates the retry topics and the dead-letter topic (the default suffix is -dlt, giving <topic>-dlt, configurable via dltTopicSuffix), moves the record there through DeadLetterPublishingRecoverer once the attempts and backoff are exhausted, and hands the DLT to a @DltHandler method or to the default logging handler. DltStrategy decides what happens when DLT processing itself fails: ALWAYS_RETRY_ON_ERROR (the default) forwards the record back to the DLT, FAIL_ON_ERROR stops the container, NO_DLT disables the DLT entirely. Fatal exceptions (DeserializationException, MessageConversionException, ConversionException, ClassCastException and friends) are deliberately not bounced back to the DLT, so deserialization failures need their own error handler and custom DLT routing.",
+      "code_sketch": "@RetryableTopic(attempts = \"4\", backoff = @Backoff(delay = 1000, multiplier = 2.0))\n@KafkaListener(topics = \"orders\")\nvoid consume(OrderEvent event) { service.apply(event); }   // throws -> retry topics -> -dlt\n\n@DltHandler\nvoid deadLetter(OrderEvent event) {\n    audit.park(event);          // triage + alert; never a silent drop\n}",
+      "pitfalls": [
+        "A DLT handler that throws under the default ALWAYS_RETRY_ON_ERROR sends the record back to the DLT, which can loop it forever; FAIL_ON_ERROR or an idempotent handler breaks the cycle.",
+        "Fatal exceptions bypass the DLT by design, so a deserialization failure is only logged unless a DeserializationExceptionHandler and a custom DLT route are configured.",
+        "The -dlt topic must exist with the retention and replication the broker requires: relying on auto-creation in production is how DLTs end up with default retention.",
+        "Consuming the DLT from the same application needs the DLT container enabled (autoStartDltHandler and endpoint registry wiring), otherwise the DLT fills silently."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-kafka/reference/retrytopic/dlt-strategies.html",
+        "https://docs.spring.io/spring-kafka/reference/retrytopic/topic-naming.html",
+        "https://docs.spring.io/spring-kafka/reference/retrytopic/features.html"
+      ]
+    },
+    {
+      "variant_id": "jms-broker-dlq",
+      "name": "JMS / Jakarta Messaging broker dead-letter address",
+      "paradigm": "declarative",
+      "min_standard": "Java8",
+      "idiom_name": "address-setting dead-letter-address + max-delivery-attempts (ActiveMQ Artemis)",
+      "implementation_notes": "The classic EIP arrangement keeps the decision in the broker: configure the destination with a dead-letter address and a maximum delivery attempt count and let the broker move the message when the session rolls back or the consumer rejects too often. On Artemis that is <dead-letter-address> and <max-delivery-attempts> (default 10, -1 for infinite) in address-settings; setting auto-create-dead-letter-resources to true gives per-destination queues named with the DLQ. prefix and an _AMQ_ORIG_ADDRESS filter, which is what keeps triage and selective replay possible. Application code stays a plain MessageListener that rolls back or throws - it never names the dead-letter queue.",
+      "code_sketch": "// broker.xml\n// <address-setting match=\"orders\">\n//   <dead-letter-address>DLA</dead-letter-address>\n//   <max-delivery-attempts>5</max-delivery-attempts>\n//   <auto-create-dead-letter-resources>true</auto-create-dead-letter-resources>\n// </address-setting>\npublic void onMessage(Message m) {                 // listener stays dumb\n    try { handler.apply(m.getBody(String.class)); session.commit(); }\n    catch (Exception e) { session.rollback(); }    // broker counts attempts -> DLA\n}",
+      "pitfalls": [
+        "Delivery counts are not persisted before delivery by default (persist-delivery-count-before-delivery=false), so a broker crash can reset the count and delay dead-lettering by a full redelivery budget.",
+        "max-delivery-attempts set to -1 (or a very high value) with an unhandled poison message recreates the head-of-line block the pattern exists to remove.",
+        "A shared dead-letter address without the automatic per-destination queues mixes sources: without the _AMQ_ORIG_ADDRESS filter, replay cannot tell which queue a message came from.",
+        "Rolling back a transacted session is the trigger - catching the exception and committing (or swallowing it) means the broker never counts an attempt and the message never leaves the queue."
+      ],
+      "sources": [
+        "https://artemis.apache.org/components/artemis/documentation/latest/undelivered-messages.html",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    }
+  ],
+  "default_variant": "spring-kafka-dlt"
+}

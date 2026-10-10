@@ -1,0 +1,55 @@
+{
+  "pattern": "cache-aside",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "reader/writer-locked unordered_map keyed to absolute steady_clock deadlines",
+  "implementation_notes": "From C++17 the store is a std::unordered_map behind a std::shared_mutex: readers take a std::shared_lock and inspect an entry whose deadline is an absolute std::chrono::steady_clock time_point, and a miss is served by dropping the shared lock, loading from the source of truth and re-checking under a std::unique_lock before inserting, because a shared lock cannot be upgraded. std::optional distinguishes an absent entry from a cached empty value. Boost and oneTBB ship library caches when a hand-written table is unwanted; the std form is what the pattern looks like in modern C++.",
+  "code_sketch": "std::optional<Value> get(std::string_view key) {\n  { std::shared_lock lk(m_);\n    if (auto it = map_.find(key); it != map_.end() && it->second.deadline > Clock::now())\n      return it->second.value; }\n  auto v = source_.read(key);               // miss: load outside the lock\n  { std::unique_lock lk(m_);                // re-check: another thread may have filled it\n    if (auto it = map_.find(key); it != map_.end() && it->second.deadline > Clock::now())\n      return it->second.value;\n    map_[std::string(key)] = {v, Clock::now() + ttl_}; }\n  return v;\n}\n// write: source_.write(key, v); { std::unique_lock lk(m_); map_.erase(key); }",
+  "pitfalls": [
+    "std::shared_lock cannot be promoted to std::unique_lock: always re-check after taking the exclusive lock, or two threads populate the same key and the slower one wins.",
+    "Do not hold the mutex across the source-of-truth call unless serializing the miss path is intended - a blocking load inside the lock stalls every reader.",
+    "Use std::chrono::steady_clock for deadlines; system_clock jumps with NTP or manual time changes."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/shared_mutex",
+    "https://en.cppreference.com/w/cpp/container/unordered_map"
+  ],
+  "variants": [
+    {
+      "variant_id": "cpp17-shared-mutex-map",
+      "name": "std::shared_mutex + unordered_map with steady_clock TTL",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "reader/writer-locked unordered_map keyed to absolute steady_clock deadlines",
+      "implementation_notes": "From C++17 the store is a std::unordered_map behind a std::shared_mutex: readers take a std::shared_lock and inspect an entry whose deadline is an absolute std::chrono::steady_clock time_point, and a miss is served by dropping the shared lock, loading from the source of truth and re-checking under a std::unique_lock before inserting, because a shared lock cannot be upgraded. std::optional distinguishes an absent entry from a cached empty value. Boost and oneTBB ship library caches when a hand-written table is unwanted; the std form is what the pattern looks like in modern C++.",
+      "code_sketch": "std::optional<Value> get(std::string_view key) {\n  { std::shared_lock lk(m_);\n    if (auto it = map_.find(key); it != map_.end() && it->second.deadline > Clock::now())\n      return it->second.value; }\n  auto v = source_.read(key);               // miss: load outside the lock\n  { std::unique_lock lk(m_);                // re-check: another thread may have filled it\n    if (auto it = map_.find(key); it != map_.end() && it->second.deadline > Clock::now())\n      return it->second.value;\n    map_[std::string(key)] = {v, Clock::now() + ttl_}; }\n  return v;\n}\n// write: source_.write(key, v); { std::unique_lock lk(m_); map_.erase(key); }",
+      "pitfalls": [
+        "std::shared_lock cannot be promoted to std::unique_lock: always re-check after taking the exclusive lock, or two threads populate the same key and the slower one wins.",
+        "Do not hold the mutex across the source-of-truth call unless serializing the miss path is intended - a blocking load inside the lock stalls every reader.",
+        "Use std::chrono::steady_clock for deadlines; system_clock jumps with NTP or manual time changes."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/shared_mutex",
+        "https://en.cppreference.com/w/cpp/container/unordered_map"
+      ]
+    },
+    {
+      "variant_id": "cpp11-mutex-map",
+      "name": "std::mutex-guarded unordered_map (C++11 baseline)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "single-lock unordered_map with a monotonic deadline per entry",
+      "implementation_notes": "Before shared_mutex (C++17, with shared_timed_mutex available from C++14) the store is a std::unordered_map behind a plain std::mutex: every lookup takes the exclusive lock, so the critical section must stay tiny - find the entry, copy or move the value out, unlock, then do the source-of-truth read and the insert. Pick it for C++11 toolchains and small caches where a reader/writer lock would cost more than the contention it removes.",
+      "code_sketch": "std::optional<Value> get(std::string_view key) {\n  { std::lock_guard<std::mutex> lk(m_);\n    auto it = map_.find(key);\n    if (it != map_.end() && it->second.deadline > Clock::now()) return it->second.value; }\n  auto v = source_.read(key);\n  std::lock_guard<std::mutex> lk(m_);\n  map_.emplace(std::string(key), Entry{v, Clock::now() + ttl_});  // last writer wins\n  return v;\n}",
+      "pitfalls": [
+        "One mutex for the whole table serializes readers; keeping the source-of-truth I/O outside the lock is what stops the cache from being slower than the store under load.",
+        "emplace versus insert_or_assign decides whether a concurrently written entry survives - pick deliberately and re-check when it matters."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/unordered_map"
+      ]
+    }
+  ],
+  "default_variant": "cpp17-shared-mutex-map",
+  "version": "1.0"
+}

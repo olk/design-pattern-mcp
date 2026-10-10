@@ -1,0 +1,71 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "sqlite3 INSERT ... ON CONFLICT DO NOTHING + rowcount",
+  "implementation_notes": "The durable idiom needs no dependency: sqlite3 ships with CPython, so one deduplication table with a UNIQUE key plus `INSERT OR IGNORE` (or `ON CONFLICT(key) DO NOTHING`) and `cursor.rowcount == 1` is the atomic claim, with the business writes in the same transaction. Postgres/psycopg and Django's get_or_create follow the same shape on a unique index. Choose it whenever redelivery can outlive the process or several workers (gunicorn, Celery) consume the same queue.",
+  "code_sketch": "with conn:                                     # one transaction\n    cur = conn.execute(\n        \"INSERT INTO seen(key, at) VALUES(?, ?) ON CONFLICT(key) DO NOTHING\",\n        (msg.key, time.time()))\n    if cur.rowcount == 0:\n        return ack(msg)                        # duplicate: absorb, do not reprocess\n    apply_effects(conn, msg)\nack(msg)",
+  "pitfalls": [
+    "cursor.rowcount is only meaningful for the claim statement itself; check it before reusing the connection for business writes.",
+    "Only a zero-row claim insert is a duplicate - a transient database error must propagate so the broker redelivers.",
+    "The dedup table grows; delete rows older than the redelivery window on a schedule."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/sqlite3.html",
+    "https://sqlite.org/lang_UPSERT.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sqlite-upsert-claim",
+      "name": "Durable claim with sqlite3/PostgreSQL upsert",
+      "paradigm": "oo",
+      "implementation_notes": "The durable idiom needs no dependency: sqlite3 ships with CPython, so one deduplication table with a UNIQUE key plus `INSERT OR IGNORE` (or `ON CONFLICT(key) DO NOTHING`) and `cursor.rowcount == 1` is the atomic claim, with the business writes in the same transaction. Postgres/psycopg and Django's get_or_create follow the same shape on a unique index. Choose it whenever redelivery can outlive the process or several workers (gunicorn, Celery) consume the same queue.",
+      "code_sketch": "with conn:                                     # one transaction\n    cur = conn.execute(\n        \"INSERT INTO seen(key, at) VALUES(?, ?) ON CONFLICT(key) DO NOTHING\",\n        (msg.key, time.time()))\n    if cur.rowcount == 0:\n        return ack(msg)                        # duplicate: absorb, do not reprocess\n    apply_effects(conn, msg)\nack(msg)",
+      "pitfalls": [
+        "cursor.rowcount is only meaningful for the claim statement itself; check it before reusing the connection for business writes.",
+        "Only a zero-row claim insert is a duplicate - a transient database error must propagate so the broker redelivers.",
+        "The dedup table grows; delete rows older than the redelivery window on a schedule."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://sqlite.org/lang_UPSERT.html"
+      ],
+      "min_standard": "Python3.8",
+      "idiom_name": "sqlite3 INSERT ... ON CONFLICT DO NOTHING + rowcount"
+    },
+    {
+      "variant_id": "redis-set-nx",
+      "name": "Distributed claim with redis-py SET NX PX",
+      "paradigm": "concurrent",
+      "implementation_notes": "redis-py maps `set(name, value, nx=True, px=ttl)` onto the single `SET key value NX PX ttl` command: the first caller gets True, later callers get None, and the TTL arms expiry in the same round trip. That is the standard distributed claim for several Python processes; None means duplicate, while connection errors must be retried rather than absorbed.",
+      "code_sketch": "r = redis.Redis()\n\ndef claim(key: str, ttl_ms: int) -> bool:\n    return bool(r.set(f\"seen:{key}\", \"1\", nx=True, px=ttl_ms))\n\ndef handle(msg: Message) -> None:\n    if not claim(msg.key, REDELIVERY_WINDOW_MS):\n        return ack(msg)                        # duplicate: absorb\n    apply_effects(msg)\n    ack(msg)",
+      "pitfalls": [
+        "Only the NX result distinguishes duplicate from failure; a raised ConnectionError must not be swallowed as a duplicate.",
+        "TTL shorter than the broker's redelivery window reopens duplicates after expiry."
+      ],
+      "sources": [
+        "https://redis.io/docs/latest/commands/set/"
+      ],
+      "min_standard": "Python3.6",
+      "idiom_name": "redis-py set(..., nx=True, px=ttl)"
+    },
+    {
+      "variant_id": "in-process-set-guard",
+      "name": "In-process set guard (single process)",
+      "paradigm": "oo",
+      "implementation_notes": "`if key in seen: return False; seen.add(key)` is atomic only because CPython's GIL makes the two bytecodes effectively uninterruptible in one thread - it is still not safe with multiple worker processes, fork-based servers or restarts, and other threads can interleave unless a Lock wraps the pair. Appropriate only for a single-process receiver; use the durable claim otherwise. `dict.setdefault` is the one-call variant of the same shape.",
+      "code_sketch": "_seen: set[str] = set()\n\ndef claim(key: str) -> bool:\n    if key in _seen:\n        return False\n    _seen.add(key)          # GIL-atomic pair: no I/O between check and add\n    return True",
+      "pitfalls": [
+        "The guard evaporates on restart and is invisible to sibling worker processes.",
+        "A blocking or async yield between check and add reintroduces the race the pair was standing in for."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/stdtypes.html"
+      ],
+      "min_standard": "Python3.0",
+      "idiom_name": "set.add / dict.setdefault"
+    }
+  ],
+  "default_variant": "sqlite-upsert-claim"
+}

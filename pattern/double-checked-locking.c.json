@@ -1,0 +1,81 @@
+{
+  "pattern": "double-checked-locking",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "static cell + accessor; pthread_once(&once, init) supplies the once guarantee",
+  "implementation_notes": "The structure is hand-written in C - file-scope cell, one accessor, storage duration chosen by the programmer - and only the exactly-once guarantee is delegated: pthread_once runs the initialiser once, blocks concurrent callers until it has finished, and establishes the ordering every later caller needs, so the flag test disappears from user code entirely. The double check itself is therefore not what a C programmer writes; the accessor calls the primitive and returns the published cell. The hand-written transformed form (an atomic pointer with release/acquire) remains for runtimes without a once primitive, and the plain pointer plus plain flag version is a data race, not a memory-model subtlety.",
+  "code_sketch": "static pthread_once_t once = PTHREAD_ONCE_INIT;\nstatic config_t *cfg;                       /* published by pthread_once */\n\nstatic void build(void) { cfg = config_load(); }\n\nconst config_t *config(void) {\n    pthread_once(&once, build);              /* exactly once, ordered */\n    return cfg;                              /* lock-free fast path */\n}",
+  "pitfalls": [
+    "The initialiser must not call pthread_once on the same control recursively: POSIX specifies that the recursive call returns without running the initialiser, so the outer call never completes - a deadlock that looks like a hang in an unrelated caller.",
+    "pthread_once cannot report failure: a failed or partial build is still published to every caller, so the initialiser has to record the failure (status field, sentinel value) for the accessor to check.",
+    "A pthread_once_t must not be copied or reset, and jumping out of the initialiser with longjmp leaves the state undefined.",
+    "The hand-written variant over a plain pointer plus a plain flag is a data race in ISO C even though it usually passes on x86."
+  ],
+  "sources": [
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_once.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pthread-once",
+      "name": "file-scope cell and accessor guarded by pthread_once",
+      "paradigm": "concurrent",
+      "min_standard": "POSIX.1",
+      "idiom_name": "static cell + accessor; pthread_once(&once, init) supplies the once guarantee",
+      "implementation_notes": "The structure is hand-written in C - file-scope cell, one accessor, storage duration chosen by the programmer - and only the exactly-once guarantee is delegated: pthread_once runs the initialiser once, blocks concurrent callers until it has finished, and establishes the ordering every later caller needs, so the flag test disappears from user code entirely. The double check itself is therefore not what a C programmer writes; the accessor calls the primitive and returns the published cell. The hand-written transformed form (an atomic pointer with release/acquire) remains for runtimes without a once primitive, and the plain pointer plus plain flag version is a data race, not a memory-model subtlety.",
+      "code_sketch": "static pthread_once_t once = PTHREAD_ONCE_INIT;\nstatic config_t *cfg;                       /* published by pthread_once */\n\nstatic void build(void) { cfg = config_load(); }\n\nconst config_t *config(void) {\n    pthread_once(&once, build);              /* exactly once, ordered */\n    return cfg;                              /* lock-free fast path */\n}",
+      "pitfalls": [
+        "The initialiser must not call pthread_once on the same control recursively: POSIX specifies that the recursive call returns without running the initialiser, so the outer call never completes - a deadlock that looks like a hang in an unrelated caller.",
+        "pthread_once cannot report failure: a failed or partial build is still published to every caller, so the initialiser has to record the failure (status field, sentinel value) for the accessor to check.",
+        "A pthread_once_t must not be copied or reset, and jumping out of the initialiser with longjmp leaves the state undefined.",
+        "The hand-written variant over a plain pointer plus a plain flag is a data race in ISO C even though it usually passes on x86."
+      ],
+      "sources": [
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_once.html"
+      ]
+    },
+    {
+      "variant_id": "c11-call-once",
+      "name": "C11 call_once from <threads.h>",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "idiom_name": "call_once(&flag, fn) with once_flag and ONCE_FLAG_INIT",
+      "implementation_notes": "The standard-C equivalent of pthread_once for toolchains that implement <threads.h>: the once_flag object carries the state, call_once runs the function exactly once and returns after it completed (or after another thread's call completed it). It is optional in practice - glibc shipped threads.h only in 2.28 and MSVC provides it - so libraries that must run everywhere end up with a pthread_once path as well.",
+      "code_sketch": "static once_flag flag = ONCE_FLAG_INIT;\nstatic config_t *cfg;\n\nstatic void build(void) { cfg = config_load(); }\n\nconst config_t *config(void) {\n    call_once(&flag, build);                 /* C11 <threads.h> */\n    return cfg;\n}",
+      "pitfalls": [
+        "C11 <threads.h> is optional and was late on glibc (2.28), so a portable library still needs the pthread_once path or a build-time choice.",
+        "As with pthread_once the initialiser gets no error channel: failures must be stored by the initialiser and inspected by the accessor.",
+        "call_once cannot be reset, so a flag that must be rebuilt needs a different mechanism entirely (a mutex plus an atomic snapshot)."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/c/thread/call_once"
+      ],
+      "requires_features": [
+        "threads.h"
+      ]
+    },
+    {
+      "variant_id": "atomic-acquire-release",
+      "name": "hand-written double check over a C11 atomic pointer",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "idiom_name": "_Atomic(T*) with memory_order_release store and memory_order_acquire load",
+      "implementation_notes": "The transformed classic form, written by hand for runtimes without <threads.h> or when the cell must be rebuilt: one atomic pointer carries both the value and the ordering, so the fast path is a single acquire load and the slow path is a mutex plus a re-test. This is the only form in which a hand-written double check is defensible, because the release/acquire pairing is stated in the code instead of being assumed.",
+      "code_sketch": "static _Atomic(config_t *) cfg;\nstatic mtx_t init_lock;\n\nconst config_t *config(void) {\n    config_t *c = atomic_load_explicit(&cfg, memory_order_acquire);\n    if (!c) {\n        mtx_lock(&init_lock);\n        c = atomic_load_explicit(&cfg, memory_order_relaxed);\n        if (!c) {\n            c = config_load();\n            atomic_store_explicit(&cfg, c, memory_order_release);\n        }\n        mtx_unlock(&init_lock);\n    }\n    return c;\n}",
+      "pitfalls": [
+        "A relaxed load on the fast path (or a plain, non-atomic pointer) removes the acquire that publishes the object: readers then see the pointer without the initialised contents.",
+        "memory_order_release must be on the store and memory_order_acquire on the reader's load; a seq_cst default hides the argument but costs a fence on some architectures.",
+        "The second load inside the lock may use memory_order_relaxed only because the lock itself orders it; taking it outside the lock would be a bug.",
+        "Rebuilding the cell after publication is not safe while readers may hold the previous pointer: that is a lifetime problem (hazard pointers, epoch reclamation), not a locking one."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/c/atomic/memory_order"
+      ],
+      "requires_features": [
+        "atomics",
+        "stdatomic.h"
+      ]
+    }
+  ],
+  "default_variant": "pthread-once",
+  "version": "1.0"
+}

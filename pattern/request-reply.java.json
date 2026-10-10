@@ -1,0 +1,78 @@
+{
+  "pattern": "request-reply",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "jakarta.jms QueueRequestor / JMSContext.request with TemporaryQueue",
+  "implementation_notes": "Jakarta Messaging ships the pattern as a helper: QueueRequestor creates a TemporaryQueue, sets JMSReplyTo on the request and copies the request's JMSMessageID into the reply's JMSCorrelationID, so request(Message) is a blocking request/reply call with no application-level correlation. The companion form - send, then receive(timeout) on a per-request consumer or a selector on JMSCorrelationID - is the one to use when a missing reply must expire rather than block forever. Spring Integration's outbound gateway wraps the same exchange declaratively with requestChannel/replyChannel and replyTimeout.",
+  "code_sketch": "try (JMSContext ctx = cf.createContext()) {\n    Queue requestQueue = ctx.createQueue(\"orders.status\");\n    TemporaryQueue replies = ctx.createTemporaryQueue();\n    ctx.createProducer()\n       .setJMSReplyTo(replies)\n       .send(requestQueue, ctx.createTextMessage(orderId));\n    TextMessage reply = (TextMessage) ctx.createConsumer(replies).receive(5000);\n    if (reply == null) throw new TimeoutException(\"no reply from orders.status\");\n    return reply.getText();\n}",
+  "pitfalls": [
+    "Temporary queues and their consumers live on the session/connection: leaking sessions leaks broker queues, and a reconnecting client must rebuild the reply destination.",
+    "receive(timeout) returns null instead of throwing, so the missing-reply case has to be turned into a domain timeout explicitly.",
+    "When hand-rolling instead of using QueueRequestor, do not confuse the reply's JMSCorrelationID (which the replier must set from the request id) with the reply's own JMSMessageID."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javaee/7/api/javax/jms/QueueRequestor.html",
+    "https://jakarta.ee/specifications/messaging/3.0/jakarta-messaging-spec-3.0",
+    "https://docs.spring.io/spring-integration/reference/gateway.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "jms-queue-requestor",
+      "name": "Jakarta Messaging QueueRequestor over a temporary reply queue",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "jakarta.jms QueueRequestor / JMSContext.request with TemporaryQueue",
+      "implementation_notes": "Jakarta Messaging ships the pattern as a helper: QueueRequestor creates a TemporaryQueue, sets JMSReplyTo on the request and copies the request's JMSMessageID into the reply's JMSCorrelationID, so request(Message) is a blocking request/reply call with no application-level correlation. The companion form - send, then receive(timeout) on a per-request consumer or a selector on JMSCorrelationID - is the one to use when a missing reply must expire rather than block forever. Spring Integration's outbound gateway wraps the same exchange declaratively with requestChannel/replyChannel and replyTimeout.",
+      "code_sketch": "try (JMSContext ctx = cf.createContext()) {\n    Queue requestQueue = ctx.createQueue(\"orders.status\");\n    TemporaryQueue replies = ctx.createTemporaryQueue();\n    ctx.createProducer()\n       .setJMSReplyTo(replies)\n       .send(requestQueue, ctx.createTextMessage(orderId));\n    TextMessage reply = (TextMessage) ctx.createConsumer(replies).receive(5000);\n    if (reply == null) throw new TimeoutException(\"no reply from orders.status\");\n    return reply.getText();\n}",
+      "pitfalls": [
+        "Temporary queues and their consumers live on the session/connection: leaking sessions leaks broker queues, and a reconnecting client must rebuild the reply destination.",
+        "receive(timeout) returns null instead of throwing, so the missing-reply case has to be turned into a domain timeout explicitly.",
+        "When hand-rolling instead of using QueueRequestor, do not confuse the reply's JMSCorrelationID (which the replier must set from the request id) with the reply's own JMSMessageID."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/api/javax/jms/QueueRequestor.html",
+        "https://jakarta.ee/specifications/messaging/3.0/jakarta-messaging-spec-3.0",
+        "https://docs.spring.io/spring-integration/reference/gateway.html"
+      ]
+    },
+    {
+      "variant_id": "completable-future-timeout",
+      "name": "CompletableFuture correlation table with orTimeout",
+      "paradigm": "concurrent",
+      "min_standard": "Java9",
+      "idiom_name": "ConcurrentHashMap<String, CompletableFuture<Reply>> + orTimeout",
+      "implementation_notes": "Without a broker helper the requestor keeps a ConcurrentHashMap of correlation id -> CompletableFuture, completes each future from the reply listener, and uses orTimeout (Java 9) or completeOnTimeout for the deadline with whenComplete to remove the entry on every exit path. This is the standard shape inside async clients (Netty-based, reactive, Kafka) where the transport only delivers messages and no JMS-like helper exists.",
+      "code_sketch": "var pending = new ConcurrentHashMap<String, CompletableFuture<Reply>>();\nCompletableFuture<Reply> call(Request req) {\n    var id = UUID.randomUUID().toString();\n    var future = new CompletableFuture<Reply>();\n    pending.put(id, future);\n    future.orTimeout(5, TimeUnit.SECONDS)\n          .whenComplete((r, e) -> pending.remove(id));  // cleanup on any exit\n    transport.send(new Envelope(id, req));\n    return future;                     // completed by the reply listener\n}",
+      "pitfalls": [
+        "orTimeout completes the future exceptionally but does not cancel the request; pair it with a cancellation message where the replier supports one.",
+        "whenComplete runs on the completing thread, so heavy callbacks there delay the reply listener."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/9/docs/api/java/util/concurrent/CompletableFuture.html",
+        "https://docs.nats.io/concepts/request-reply"
+      ]
+    },
+    {
+      "variant_id": "virtual-thread-blocking",
+      "name": "Blocking receive per request on a virtual thread",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor + blocking receive(timeout)",
+      "implementation_notes": "Java 21's virtual threads change the economics of the synchronous Block variant: keep the simple blocking receive(timeout)-style consumer per request and run each call on a virtual thread, so tens of thousands of outstanding requests no longer need tens of thousands of platform threads. Choose it when the transport API is blocking and per-call thread cost was the only objection to request/reply.",
+      "code_sketch": "try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {\n    List<Future<Reply>> inFlight = requests.stream()\n        .map(r -> executor.submit(\n            () -> client.callBlocking(r, Duration.ofSeconds(5))))\n        .toList();\n    for (Future<Reply> f : inFlight) collect(f.get());\n}",
+      "pitfalls": [
+        "Blocking calls on virtual threads still pin their carrier when they enter synchronized blocks or JNI-heavy paths; prefer ReentrantLock and check pinning before relying on the scaling claim.",
+        "The API must still enforce the timeout: a virtual thread parked forever on a lost reply is cheap but still a leak."
+      ],
+      "sources": [
+        "https://jakarta.ee/specifications/messaging/3.0/jakarta-messaging-spec-3.0",
+        "https://docs.nats.io/concepts/request-reply"
+      ]
+    }
+  ],
+  "default_variant": "jms-queue-requestor",
+  "version": "1.0"
+}

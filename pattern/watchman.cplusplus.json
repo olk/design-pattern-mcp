@@ -1,0 +1,83 @@
+{
+  "pattern": "watchman",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::condition_variable predicate loop on a std::chrono::steady_clock deadline (or Boost.Asio steady_timer)",
+  "implementation_notes": "The standard library provides the timing substrate but no scheduling or health framework, so the watchman structure - per-subject expectation, last-seen stamp, evaluation, escalation - is written by hand: the arrival path stores a monotonic deadline (steady_clock::now() + period) under a mutex and notifies, and the monitor evaluates wait_for with a predicate rather than trusting the return value, because spurious wake-ups are allowed. C++20 adds std::jthread with a stop_token so the monitor loop can be cancelled and joined deterministically, and Boost.Asio's steady_timer is the library alternative when an io_context already drives the process. std::system_clock is never the right clock here.",
+  "code_sketch": "std::mutex m; std::condition_variable cv;\nstd::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();\nconstexpr auto period = std::chrono::seconds(60);\n/* arrival path: { std::lock_guard g(m); last = std::chrono::steady_clock::now(); } cv.notify_one(); */\nstd::unique_lock lk(m);\nwhile (!stop_requested() && cv.wait_for(lk, period, [&] {\n           return stop_requested() || std::chrono::steady_clock::now() - last >= period; }))\n    if (!stop_requested()) { alert(subject, period); last = std::chrono::steady_clock::now(); }",
+  "pitfalls": [
+    "std::system_clock steps with NTP and manual clock changes, producing phantom silences and alarms that never fire; every deadline and stamp must come from std::chrono::steady_clock.",
+    "wait_for may wake spuriously and its return value alone does not mean the timeout elapsed - always re-check the predicate (the predicate overload or an explicit loop).",
+    "std::atomic<std::chrono::steady_clock::time_point> is not a supported or lock-free specialization on common ABIs; if the stamp must be shared without a mutex, store steady_clock ticks in std::atomic<long long> and derive silence from that.",
+    "Alert dispatch inside the monitor (paging, DNS, SMTP, logging to a blocking sink) stalls the loop that is supposed to notice the next silence; hand the alarm to a worker or queue.",
+    "Shutdown must not race a producer that is still stamping: stop the arrival path (or drive the close with a stop_token) before joining the monitor, or the last wait_for can hold shutdown for a full silence budget."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for",
+    "https://en.cppreference.com/w/cpp/thread/jthread",
+    "https://en.cppreference.com/w/cpp/chrono/steady_clock",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "cpp11-condvar-deadline",
+      "name": "C++11 condition variable with a steady_clock deadline",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::condition_variable predicate loop on a std::chrono::steady_clock deadline (or Boost.Asio steady_timer)",
+      "implementation_notes": "The standard library provides the timing substrate but no scheduling or health framework, so the watchman structure - per-subject expectation, last-seen stamp, evaluation, escalation - is written by hand: the arrival path stores a monotonic deadline (steady_clock::now() + period) under a mutex and notifies, and the monitor evaluates wait_for with a predicate rather than trusting the return value, because spurious wake-ups are allowed. C++20 adds std::jthread with a stop_token so the monitor loop can be cancelled and joined deterministically, and Boost.Asio's steady_timer is the library alternative when an io_context already drives the process. std::system_clock is never the right clock here.",
+      "code_sketch": "std::mutex m; std::condition_variable cv;\nstd::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();\nconstexpr auto period = std::chrono::seconds(60);\n/* arrival path: { std::lock_guard g(m); last = std::chrono::steady_clock::now(); } cv.notify_one(); */\nstd::unique_lock lk(m);\nwhile (!stop_requested() && cv.wait_for(lk, period, [&] {\n           return stop_requested() || std::chrono::steady_clock::now() - last >= period; }))\n    if (!stop_requested()) { alert(subject, period); last = std::chrono::steady_clock::now(); }",
+      "pitfalls": [
+        "std::system_clock steps with NTP and manual clock changes, producing phantom silences and alarms that never fire; every deadline and stamp must come from std::chrono::steady_clock.",
+        "wait_for may wake spuriously and its return value alone does not mean the timeout elapsed - always re-check the predicate (the predicate overload or an explicit loop).",
+        "std::atomic<std::chrono::steady_clock::time_point> is not a supported or lock-free specialization on common ABIs; if the stamp must be shared without a mutex, store steady_clock ticks in std::atomic<long long> and derive silence from that.",
+        "Alert dispatch inside the monitor (paging, DNS, SMTP, logging to a blocking sink) stalls the loop that is supposed to notice the next silence; hand the alarm to a worker or queue.",
+        "Shutdown must not race a producer that is still stamping: stop the arrival path (or drive the close with a stop_token) before joining the monitor, or the last wait_for can hold shutdown for a full silence budget."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for",
+        "https://en.cppreference.com/w/cpp/thread/jthread",
+        "https://en.cppreference.com/w/cpp/chrono/steady_clock",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    },
+    {
+      "variant_id": "cpp20-jthread-stop-token",
+      "name": "C++20 jthread with stop_token cancellation",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "std::jthread",
+        "stop_token"
+      ],
+      "idiom_name": "std::jthread + std::stop_token + condition_variable_any deadline wait",
+      "implementation_notes": "The C++20 realization makes the monitor a self-joining component: std::jthread owns the loop and requests_stop() ends it without a bespoke shutdown flag, while condition_variable_any::wait_for(lock, stop_token, deadline) wakes on cancellation as well as on the deadline. The last-seen stamp is an atomic tick count so arrival paths never block behind the monitor.",
+      "code_sketch": "std::atomic<long long> last{ticks_now()};\nstd::condition_variable_any cv; std::mutex m;\nworker = std::jthread([&](std::stop_token st) {\n    std::unique_lock lk(m);\n    while (!st.stop_requested()) {\n        if (!cv.wait_for(lk, st, period, [&] { return ticks_now() - last.load() >= budget; })) continue;\n        alert(subject, period); last = ticks_now();\n    }\n});",
+      "pitfalls": [
+        "stop_token-aware waits must still re-check the predicate, and a stop request that arrives between predicate check and wait is only reliable through the token overload.",
+        "The atomic tick counter must be monotonic ticks, not seconds since epoch, or it silently reintroduces the wall-clock dependency."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    },
+    {
+      "variant_id": "boost-asio-steady-timer",
+      "name": "Boost.Asio steady_timer deadline in an io_context",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "boost::asio::steady_timer + expires_after, re-armed by the arrival handler",
+      "implementation_notes": "Where an Asio io_context already runs, the watchman is a timer instead of a thread: the arrival handler calls expires_after(period) (and async_wait again), and the wait handler is the absence alarm; the completion handler model matches the rest of the process and keeps the monitor single-threaded. Asio's steady_timer is monotonic, so the deadline survives clock changes.",
+      "code_sketch": "boost::asio::steady_timer silence{io, std::chrono::seconds(60)};\nsilence.async_wait([](boost::system::error_code ec) {\n    if (!ec) alert(subject, std::chrono::seconds(60));\n});\n/* arrival handler: */\nsilence.expires_after(std::chrono::seconds(60));\nsilence.async_wait(on_deadline);",
+      "pitfalls": [
+        "expires_after() on a timer with a pending async_wait cancels that wait with operation_aborted: the handler must distinguish genuine expiry from cancellation, or every arrival pages.",
+        "A single-threaded io_context must not run blocking alert I/O inside the wait handler - it stops all timers on that context while reporting."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    }
+  ],
+  "default_variant": "cpp11-condvar-deadline",
+  "version": "1.0"
+}

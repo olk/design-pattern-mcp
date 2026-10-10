@@ -1,0 +1,212 @@
+{
+  "category": "concurrency-resilience",
+  "name": "bulkhead",
+  "aliases": [
+    "bulkhead isolation",
+    "cell-based architecture"
+  ],
+  "intent": "Partition finite shared capacity at the failure domain (dependency, tenant, priority class, or cell) into independently bounded pools or permits, with an explicit queue and saturation policy, so one slow, saturated, or failing participant cannot consume capacity reserved for others.",
+  "problem": "Several dependencies or tenants share thread, connection, worker, or permit pools. When one becomes slow, leaky, or overloaded, its calls hold shared slots and fill shared queues, so unrelated work queues and fails behind it; the design needs a boundary that contains resource exhaustion without pretending to isolate CPU, network, or server-side limits that remain shared.",
+  "context": "Any component whose concurrency is a finite resource: a service calling multiple downstream APIs, a multi-tenant workload, a job runner mixing interactive and batch work, or an inference and gateway tier with per-deployment quotas. The failure mode to contain is degradation and overload (slow dependency, connection leak, traffic spike), not only hard failure, and the isolation boundary must be chosen at the failure domain - instance, dependency, tenant or priority class.",
+  "benefits": [
+    "Fault containment: a slow or saturated dependency consumes only its own partition, so the paths that use other dependencies keep serving at normal latency.",
+    "Cascading-failure prevention: shared pools (HTTP clients, database connections, executor threads, sockets) can no longer be exhausted by a single misbehaving dependency.",
+    "Explicit capacity budgeting: every dependency's concurrency budget is a visible, configurable number instead of an emergent property of shared defaults.",
+    "Observability per dependency: saturation, rejection and queue depth are measured per partition, which makes overload diagnosable and capacity planning testable.",
+    "Quality-of-service differentiation: priority classes, tenants or critical flows can receive dedicated pools with their own limits and timeouts.",
+    "Predictable behaviour under overload: a bounded admission decision (admit, queue within a bound, or reject fast) replaces unbounded waiting, keeping latency and memory under control.",
+    "Independent tuning and scaling: one dependency's limit can be raised, lowered or moved to its own instance without retuning the rest."
+  ],
+  "tradeoffs": [
+    "Capacity fragmentation: a partition that idles cannot lend capacity to one that saturates, so aggregate throughput drops unless the shared budget is at least the sum of the per-dependency limits.",
+    "More machinery: every dependency needs its own pool or limiter with its own configuration, monitoring and lifecycle; worker-pool forms also add a queue hop, latency and thread/stack memory even when idle.",
+    "Rejection becomes a first-class failure mode: requests now fail fast with bulkhead-full errors, so fallbacks, error mapping and client retry behaviour must be designed - naive retries on that error make overload worse.",
+    "Only partial isolation: partitions that share the same underlying resource (one database server, one NIC, one CPU, one event loop) still contend; true isolation requires processes, containers or hosts.",
+    "Queues can defeat the bound: most pools cap concurrency but not their waiting queue, so without an explicit queue bound rejection silently becomes unbounded latency and memory growth.",
+    "Tuning debt: limits must be derived from measured concurrency and reevaluated as traffic and capacity change; defaults and copied values are commonly wrong.",
+    "Fairness questions move into configuration: a fixed partition can starve a flow whose budget is too small even while other partitions idle."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 5,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Bulkhead",
+      "responsibility": "The bounded capacity assigned to exactly one dependency, tenant or priority class: permits, worker threads, sockets or connections, plus its waiting bound."
+    },
+    {
+      "role": "Work unit",
+      "responsibility": "The request, task or message that must obtain capacity from the bulkhead before it may touch the protected resource, and that must release that capacity on every exit path."
+    },
+    {
+      "role": "Admission gate",
+      "responsibility": "The acquire/release protocol that decides admit, queue or reject, with an optional bounded wait; it makes saturation explicit and measurable."
+    },
+    {
+      "role": "Protected resource",
+      "responsibility": "The dependency or shared resource whose consumption is bounded (remote API, database, message broker, accelerator) - the element whose slowdown must not spread."
+    },
+    {
+      "role": "Isolation mechanism",
+      "responsibility": "How capacity is physically separated: dedicated thread pool or executor, semaphore slots, connection pool, dedicated dispatcher/runtime, or process/container."
+    },
+    {
+      "role": "Saturation policy",
+      "responsibility": "What happens when the bulkhead is full: fail fast with a distinguishable error, wait with a bounded timeout, queue within a fixed bound, or degrade to a fallback - including rejection metrics."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "A service that calls several downstream APIs through one shared HTTP client: give each downstream its own connection and thread budget so one hanging endpoint cannot block the others.",
+    "Multi-tenant SaaS where one tenant's workload must not consume the concurrency available to other tenants (per-tenant pools).",
+    "Interactive request traffic sharing a database with batch or report jobs: separate pools per workload class keep the database from serialising everything behind the batch.",
+    "An API gateway or backend-for-frontend routing to many backends with per-route concurrency caps, so a slow backend does not consume the proxy's shared capacity.",
+    "Job workers that mix latency-critical and background queues: per-queue worker pools prevent a backlog of background jobs from starving urgent work.",
+    "Inference and AI serving where each model deployment has its own concurrency quota and a saturated model must not consume the shared request capacity.",
+    "Cell-based architectures: each cell (complete, independent service instance) is a bulkhead partition; load grows by adding cells, and a failure is contained to the single cell — used at AWS, Google, and Netflix scale.",
+    "Shuffle sharding: Amazon Route 53-style virtual shard assignment where each tenant is assigned to a random shard of two or more cells; with eight cells and two-per-shard there are 28 unique shards, so a problem affects only 1/28th of tenants — far better than regular per-cell partitioning.",
+    "AI and inference workloads: per-deployment or per-tenant Azure OpenAI or LLM deployment quotas prevent one saturated model from consuming the shared request capacity across the platform.",
+    "Database RU isolation: Azure Cosmos DB request-unit throughput assigned per container acts as a storage-layer bulkhead; one noisy container cannot exhaust the RU budget of others.",
+    "Resilience4j's SemaphoreBulkhead and FixedThreadPoolBulkhead give a JVM service per-dependency permits versus a bounded queue and worker pool; choose based on whether caller threads may be occupied.",
+    "Netflix Hystrix's per-command thread pools or semaphore isolation reject work and route it to fallback, containing a slow downstream to its command boundary (historical and deprecated).",
+    ".NET services use Polly's BulkheadPolicy/AsyncBulkheadPolicy (maxParallelization plus maxQueuingActions, rejecting with BulkheadRejectedException when both are full); Polly v8 replaced it with ConcurrencyLimiter over System.Threading.RateLimiting, whose partitioned per-key limiters give per-tenant bulkheads.",
+    "Service meshes enforce bulkheads at the platform layer: an Istio DestinationRule's trafficPolicy.connectionPool caps tcp.maxConnections, http.http1MaxPendingRequests and http.http2MaxRequests per upstream host, enforced by Envoy alongside its circuit-breaking limits.",
+    "Netflix's concurrency-limits library replaces hand-tuned static partitions with per-dependency adaptive limits (Vegas and Gradient algorithms modelled on TCP congestion control) that shrink the concurrency budget automatically as downstream latency rises, e.g. separating live from batch traffic on one gRPC server.",
+    "Envoy maintains per-upstream-cluster connection pools and circuit-breaking limits, while Kubernetes ResourceQuota caps aggregate namespace CPU, memory, or object use; both are platform-level capacity partitions rather than application call-site wrappers."
+  ],
+  "avoid_when": [
+    "A single dependency in a single-tenant component is the only meaningful boundary: use one global concurrency limit; per-dependency partitions add configuration and strand capacity.",
+    "The resource must be fully shareable for utilization, such as bursty work with no reserved headroom: fixed partitions fragment capacity; use a bounded shared limiter or queue with explicit fairness instead.",
+    "The platform already enforces the same failure-domain boundary with instances, containers, quotas, or mesh limits: duplicating it in application code can reject healthy work without adding isolation.",
+    "Only hard, fast failures dominate and calls have reliable timeouts: a circuit breaker plus timeout may suffice, while a bulkhead would add rejection and tuning cost.",
+    "The shared resource cannot be partitioned (one connection, lock, or server-side session): the bulkhead degenerates into a global limiter, so use that limiter and a timeout directly.",
+    "Traffic is small and latency budgets are loose: added rejection paths and configuration cost more than the availability they buy."
+  ],
+  "language_files": {
+    "generic": "bulkhead.generic.json",
+    "c": "bulkhead.c.json",
+    "cplusplus": "bulkhead.cplusplus.json",
+    "csharp": "bulkhead.csharp.json",
+    "go": "bulkhead.go.json",
+    "java": "bulkhead.java.json",
+    "javascript": "bulkhead.javascript.json",
+    "kotlin": "bulkhead.kotlin.json",
+    "python": "bulkhead.python.json",
+    "ruby": "bulkhead.ruby.json",
+    "rust": "bulkhead.rust.json",
+    "scala": "bulkhead.scala.json",
+    "swift": "bulkhead.swift.json",
+    "typescript": "bulkhead.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "circuit-breaker",
+    "timeout",
+    "rate-limiting",
+    "retry-with-backoff",
+    "graceful-degradation",
+    "load-leveller",
+    "thread-pool",
+    "counting-semaphore"
+  ],
+  "anti_patterns": [
+    "Applying thread-pool isolation blindly in an async runtime -> hand-offs add cost while the pool does not bound actual coroutine work -> use an async limiter for non-blocking calls and a dedicated executor only for blocking work.",
+    "Leaving the queue unbounded -> a saturated dependency still accumulates work and latency without limit -> cap pending work and reject or cancel excess items.",
+    "Retrying bulkhead-full rejections immediately -> each rejection is re-injected as more load and becomes a retry storm -> classify capacity rejection as load shedding and retry only eligible downstream failures.",
+    "Copying default or blog limits without measuring actual concurrency -> healthy traffic is rejected or the partition is too loose to contain overload -> derive limits from telemetry and load tests.",
+    "Partitioning per call site instead of per dependency -> the same dependency is reached through several pools and its total consumption becomes unbounded -> share one partition at the dependency boundary.",
+    "Using a bulkhead as a substitute for a timeout -> a call can still hang forever while holding its permit -> compose a deadline that releases capacity on timeout.",
+    "Oversizing a pool -> idle threads and queues consume memory and CPU while a slow dependency still drags on shared lower layers -> size from measured demand and the underlying resource budget.",
+    "Waiting indefinitely for a semaphore permit -> callers park until latency and memory grow without bound -> use try-acquire or a bounded wait with a typed rejection.",
+    "Omitting a fallback strategy -> capacity rejection propagates as an opaque user error -> return a cache, degraded response, or explicitly deferred work.",
+    "Adding a bulkhead without a circuit breaker -> a sick downstream keeps the partition saturated with futile calls -> stop new calls on observed failure and let the partition recover.",
+    "Ignoring rejection metrics -> a partition can silently shed a significant fraction of traffic and hide an availability regression -> expose active, rejected, queue, wait, timeout, and completion metrics per partition.",
+    "Skipping bulkheads in async pipelines or background handlers -> those paths still consume shared pools and can starve the user-facing path -> enforce the same partition at every entry point."
+  ],
+  "design_principles": [
+    "Fault isolation: apply single responsibility to capacity - each dependency gets its own budget so failures stay local.",
+    "Explicit resource budgeting: allocate concurrency deliberately instead of letting it emerge from shared defaults.",
+    "Fail fast under saturation: a bounded, observable rejection is better than unbounded queueing and creeping latency.",
+    "Separation of concerns: the isolation policy (limiter, pool, decorator) is independent of business logic and composes with timeout, retry and circuit breaking.",
+    "Backpressure: producers cannot exceed the consumer's declared capacity; the bound is communicated, not hidden.",
+    "Boundary choice follows the failure domain: partition at the granularity of what fails together, not at the granularity of call sites."
+  ],
+  "best_practices": [
+    "Partition per dependency (or per tenant/priority class), never per call site, so a dependency's total consumption is bounded.",
+    "Bound both the concurrency and the waiting queue, and define the saturation outcome (fast rejection with a distinct error, bounded wait, or fallback) up front.",
+    "Size limits from measured concurrency - peak concurrent calls plus headroom, verified by load test - and keep the sum of partitions inside the host budget. Use Little's Law: pool_size = (peak_RPS × P99_latency_seconds) × headroom_factor (1.5-2.0x).",
+    "Choose thread-pool bulkhead for synchronous blocking I/O (JDBC, blocking HTTP), and semaphore bulkhead for non-blocking async/reactive calls - they have different isolation semantics and overhead profiles.",
+    "Set a maxWaitDuration on semaphore bulkheads (50-200 ms for interactive paths) so callers fail fast instead of queuing indefinitely; set to 0 for strict fail-fast.",
+    "Keep queue depth small (5-20 entries) so backpressure is visible immediately rather than hidden as memory growth.",
+    "Compose the bulkhead with a timeout (innermost), circuit breaker (tracks failure rate, trips to stop futile calls), and jittered retry (outermost): bulkhead bounds impact, timeout bounds duration, breaker stops hammering a sick downstream.",
+    "Make rejection observable and typed - dedicated error and metrics per partition - and make sure clients and retry logic treat bulkhead rejections as load shedding, not transient failure (naive retry on bulkhead-full errors creates a retry storm).",
+    "Prefer the lightest isolation that fits: permits for suspending calls, dedicated workers for blocking calls, separate instances or containers only when the underlying resource is genuinely shared.",
+    "Alert on leading indicators before saturation: queue_depth > 75% of capacity is a warning; available_concurrent_calls hitting 0 is the exact moment live requests start being rejected.",
+    "Review limits whenever capacity or traffic shape changes; treat partition configuration as capacity planning, not as a one-off setting. Start with Hystrix-derived defaults (10 threads, queue of 5 per dependency) and tune from production telemetry.",
+    "For multi-tenant systems, namespace bulkheads by tenant ID to prevent noisy-neighbor contention, and assign priority tiers (CRITICAL, NORMAL, BEST_EFFORT) so critical flows can be reserved headroom even when the bulkhead is saturated.",
+    "In async runtimes (Project Reactor, RxJava, CompletableFuture), bulkheads are still necessary: every execution path including background jobs and event handlers must enforce the partition bound, or isolation is bypassed.",
+    "Use platform-builtin isolation before rebuilding in application code: Azure API Management rate limits, AKS resource limits, Azure Cosmos DB RU throughput, and Azure Functions concurrency controls are bulkheads at the infrastructure layer."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Nygard, M. - Release It! Design and Deploy Production-Ready Software, 2nd ed. (Pragmatic Bookshelf, 2018), Stability Patterns: Bulkheads — originating catalog for the pattern.",
+    "https://pragprog.com/titles/mnee2/release-it-second-edition/",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead",
+    "https://en.wikipedia.org/wiki/Bulkhead_pattern",
+    "https://docs.aws.amazon.com/wellarchitected/2022-03-31/framework/rel_fault_isolation_use_bulkhead.html — AWS Well-Architected REL10-BP04: bulkhead architectures, cell-based architecture, shuffle sharding",
+    "https://resilience4j.readme.io/docs/bulkhead — Resilience4j Bulkhead and ThreadPoolBulkhead implementation reference, configuration parameters, and decorator API",
+    "https://github.com/Netflix/Hystrix — Netflix Hystrix (deprecated 2018), the original popularizer of thread-pool bulkheads at scale in the JVM ecosystem",
+    "https://aws.amazon.com/blogs/architecture/shuffle-sharding-massive-and-magical-fault-isolation/ — Colm MacCarthaigh, Amazon Route 53 shuffle sharding for fault isolation",
+    "https://www.systemdesign.academy/glossary/bulkhead — System Design Academy: bulkhead pattern fundamentals with thread-pool vs semaphore comparison",
+    "https://martinfowler.com/bliki/CircuitBreaker.html — circuit-breaker interaction, timeouts, and queue saturation as complementary resilience controls",
+    "https://adhdecode.com/distributed-systems/design-patterns/bulkhead-isolation — ADHDecode: thread-pool partitioning and sizing with Little's Law formula",
+    "https://oneuptime.com/blog/post/2026-01-30-microservices-bulkhead-pattern/view — OneUptime: bulkhead implementation patterns with thread pool sizing calculations and Java ThreadPoolExecutor examples",
+    "https://statuscodefyi.com/guides/bulkhead-pattern-guide — StatusCodeFYI: bulkhead pattern guide with Resilience4j code examples and monitoring metrics table",
+    "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking — Envoy per-cluster connection, pending-request, retry, and pool limits",
+    "https://swpatterns.com/pattern/bulkhead/ — SWPatterns: bulkhead pattern overview with Hystrix, Polly, and Istio implementations",
+    "https://github.com/Netflix/Hystrix/wiki/How-it-Works#thread-and-hystrix — per-dependency thread pools, semaphore trade-offs, timeout behavior, and fallback",
+    "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/connection_pooling — per-cluster upstream connection pools and protocol-specific concurrency limits",
+    "https://kubernetes.io/docs/concepts/policy/resource-quotas/ — namespace-level CPU, memory, object, and extended-resource quotas",
+    "https://www.pollydocs.org/strategies/rate-limiter — Polly v8 ConcurrencyLimiter (PermitLimit/QueueLimit) and partitioned rate limiters, the successor to the Bulkhead policy",
+    "https://www.pollydocs.org/migration-v8.html — Polly v8 migration guide: the bulkhead policy is replaced by the rate-limiter-based ConcurrencyLimiter",
+    "https://github-wiki-see.page/m/App-vNext/Polly/wiki/Bulkhead — Polly Bulkhead policy: maxParallelization/maxQueuingActions semantics, BulkheadRejectedException, and sync-vs-async queue-sizing guidance",
+    "https://istio.io/latest/docs/reference/config/networking/destination-rule/ — Istio DestinationRule connectionPool: per-destination maxConnections, http1MaxPendingRequests, http2MaxRequests, and maxRetries",
+    "https://github.com/Netflix/concurrency-limits — Netflix adaptive per-dependency concurrency limiting (Vegas/Gradient algorithms) as dynamic bulkhead budgets",
+    "https://www.nilus.be/blog/bulkheads_in_resilient_microservices/ — critique of bulkheads: over-fragmentation, idle pools, and the operational cost of misconfigured partitions",
+    "https://javadoc.io/static/io.github.resilience4j/resilience4j-bulkhead/2.4.0/io/github/resilience4j/bulkhead/ThreadPoolBulkhead.html — Resilience4j ThreadPoolBulkhead execution, queue, and rejection API"
+  ],
+  "related_patterns_notes": {
+    "circuit-breaker": "stops calls after observed failures; bulkhead limits concurrent resource consumption even before failures accumulate.",
+    "timeout": "bounds how long one call may occupy resources; bulkhead bounds how many calls may occupy them.",
+    "rate-limiting": "controls arrivals over a time window; bulkhead controls concurrent occupancy and bounded waiting.",
+    "retry-with-backoff": "repeats selected failures after delay; bulkhead decides admission and should normally reject a full partition.",
+    "graceful-degradation": "defines the fallback result; bulkhead supplies the saturation signal that can trigger that fallback.",
+    "load-leveller": "smooths bursts through a queue; bulkhead keeps work and queue capacity bounded and may reject instead.",
+    "thread-pool": "is an execution mechanism; bulkhead is the failure-domain policy that may use a pool or a semaphore.",
+    "counting-semaphore": "is a permit primitive; bulkhead composes it with partition ownership, queue policy, timeout, and metrics.",
+    "shuffle-sharding": "maps tenants to overlapping cell sets to reduce blast radius; bulkhead is the broader partitioned-capacity pattern.",
+    "cell-based-architecture": "deploys complete service cells; bulkhead can be a local pool or permit boundary inside one cell.",
+    "load-shedding": "discards work under overload; bulkhead often triggers shedding but first defines the capacity reserved for each boundary."
+  }
+}

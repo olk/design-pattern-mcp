@@ -1,0 +1,59 @@
+{
+  "pattern": "game-loop",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "Instant::now() deltas with thread::sleep and an owned world state",
+  "implementation_notes": "Rust's stdlib gives measurement and a blocking sleep: Instant is 'a measurement of a monotonically nondecreasing clock', useful 'for tasks such as measuring benchmarks or timing how long an operation takes', and thread::sleep 'puts the current thread to sleep for at least the specified amount of time' - it 'will never sleep less' and 'is blocking, and should not be used in async functions'. What replaces the classic structure: nothing - the driver is a loop over Instant::now() deltas and sleep, with the world owned as a plain value that the loop mutates; the borrow checker keeps the update signature honest (exactly one mutable borrow of the world per step). Instant is monotonic but not guaranteed steady (ticks can be uneven, and whether suspends count is unspecified), so derive elapsed time by subtraction and clamp instead of summing expected durations.",
+  "code_sketch": "let dt = Duration::from_nanos(16_666_667);\nlet mut prev = Instant::now();\nlet mut lag = Duration::ZERO;\nwhile running(&world) {\n    let now = Instant::now();\n    lag += now - prev;                              // monotonic, non-decreasing\n    prev = now;\n    lag = lag.min(Duration::from_millis(250));      // clamp\n    drain_input();\n    while lag >= dt { world.step(dt); lag -= dt; }\n    render(&world, lag.as_secs_f64() / dt.as_secs_f64());\n    thread::sleep(Duration::from_millis(1));        // at-least; re-measured above\n}",
+  "pitfalls": [
+    "thread::sleep blocks the thread and must not be used inside async tasks (tokio has its own timer); an async game loop needs tokio::time or the platform event loop.",
+    "Instant is monotonic but not guaranteed steady and may or may not count system suspends; clamp large gaps (laptop sleep, debugger pause) instead of simulating hours of catch-up.",
+    "Keeping the world alive across iterations makes the loop its owner: sharing it with input or render threads requires Arc<Mutex<_>> or channels, and a lock held across a step serialises everything.",
+    "Debug builds are slow enough to miss dt; profile with --release before tuning the step or blaming the loop."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/time/struct.Instant.html",
+    "https://doc.rust-lang.org/std/thread/fn.sleep.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "instant-fixed-step",
+      "name": "std::time::Instant fixed-step accumulator with thread::sleep pacing",
+      "paradigm": "procedural",
+      "implementation_notes": "Rust's stdlib gives measurement and a blocking sleep: Instant is 'a measurement of a monotonically nondecreasing clock', useful 'for tasks such as measuring benchmarks or timing how long an operation takes', and thread::sleep 'puts the current thread to sleep for at least the specified amount of time' - it 'will never sleep less' and 'is blocking, and should not be used in async functions'. What replaces the classic structure: nothing - the driver is a loop over Instant::now() deltas and sleep, with the world owned as a plain value that the loop mutates; the borrow checker keeps the update signature honest (exactly one mutable borrow of the world per step). Instant is monotonic but not guaranteed steady (ticks can be uneven, and whether suspends count is unspecified), so derive elapsed time by subtraction and clamp instead of summing expected durations.",
+      "min_standard": "Rust2021",
+      "idiom_name": "Instant::now() deltas with thread::sleep and an owned world state",
+      "code_sketch": "let dt = Duration::from_nanos(16_666_667);\nlet mut prev = Instant::now();\nlet mut lag = Duration::ZERO;\nwhile running(&world) {\n    let now = Instant::now();\n    lag += now - prev;                              // monotonic, non-decreasing\n    prev = now;\n    lag = lag.min(Duration::from_millis(250));      // clamp\n    drain_input();\n    while lag >= dt { world.step(dt); lag -= dt; }\n    render(&world, lag.as_secs_f64() / dt.as_secs_f64());\n    thread::sleep(Duration::from_millis(1));        // at-least; re-measured above\n}",
+      "pitfalls": [
+        "thread::sleep blocks the thread and must not be used inside async tasks (tokio has its own timer); an async game loop needs tokio::time or the platform event loop.",
+        "Instant is monotonic but not guaranteed steady and may or may not count system suspends; clamp large gaps (laptop sleep, debugger pause) instead of simulating hours of catch-up.",
+        "Keeping the world alive across iterations makes the loop its owner: sharing it with input or render threads requires Arc<Mutex<_>> or channels, and a lock held across a step serialises everything.",
+        "Debug builds are slow enough to miss dt; profile with --release before tuning the step or blaming the loop."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/time/struct.Instant.html",
+        "https://doc.rust-lang.org/std/thread/fn.sleep.html"
+      ]
+    },
+    {
+      "variant_id": "winit-control-flow",
+      "name": "winit event loop with ControlFlow::WaitUntil (platform-owned loop)",
+      "paradigm": "concurrent",
+      "implementation_notes": "For windowed Rust applications the event loop owns the loop: winit's ControlFlow is 'set through ActiveEventLoop::set_control_flow()' and 'indicates the desired behavior of the event loop after Event::AboutToWait is emitted'; WaitUntil (from ControlFlow::wait_duration) 'suspends the thread until either another event arrives' or the timeout expires, Wait blocks until another event arrives, and Poll spins immediately. What replaces the classic structure: instead of a bespoke loop you implement the handler callbacks and ask the event loop to wake you at the next deadline - ControlFlow::WaitUntil(deadline) is the pacing sleep and events arrive as callbacks, so the app stays responsive without blocking. Use Poll only for benchmarks or demos; WaitUntil is the power-friendly fixed-cadence choice, and Wait is right for strictly event-driven presentations.",
+      "min_standard": "Rust2021",
+      "idiom_name": "winit ApplicationHandler with set_control_flow(ControlFlow::WaitUntil)",
+      "code_sketch": "impl ApplicationHandler for App {\n    fn about_to_wait(&mut self, el: &ActiveEventLoop) {\n        let now = Instant::now();\n        self.lag += now - self.prev;\n        self.prev = now;                                  // measured time\n        self.lag = self.lag.min(Duration::from_millis(250));\n        while self.lag >= DT { self.world.step(DT); self.lag -= DT; }\n        self.window.request_redraw();\n        el.set_control_flow(ControlFlow::WaitUntil(now + DT - self.lag));\n    }\n}",
+      "pitfalls": [
+        "ControlFlow::Poll runs iterations as fast as the CPU allows - never ship it for a paced game; choose WaitUntil(deadline) and let the OS sleep until the next step.",
+        "Event callbacks carry no dt: compute elapsed time from Instant inside about_to_wait/redraw rather than assuming one callback equals one step.",
+        "winit 0.30's ApplicationHandler replaces the old EventLoop::run closure style; lifecycle events (resumed/suspended) rebuild window state, and a stale control-flow target can starve redraws or spin.",
+        "Blocking I/O or holding a lock in a handler stalls the whole event loop; keep handlers short and hand work to a channel or thread."
+      ],
+      "sources": [
+        "https://docs.rs/winit/latest/winit/event_loop/enum.ControlFlow.html"
+      ]
+    }
+  ],
+  "default_variant": "instant-fixed-step"
+}

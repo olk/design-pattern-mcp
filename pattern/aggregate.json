@@ -1,0 +1,222 @@
+{
+  "category": "domain-modeling",
+  "name": "aggregate",
+  "aliases": [
+    "aggregate root",
+    "consistency boundary"
+  ],
+  "intent": "Define a transactional consistency boundary around domain objects: one root entity is the sole externally reachable entry point, owns internal entities and value objects, and is the only object application code modifies directly; each command loads and commits one root instance, while other roots are referenced by identity and coordinated separately.",
+  "problem": "Business rules relate several objects at once - an order total that must stay within a credit limit, allocations that must never exceed stock - but if every object is writable on its own, no single place can enforce the rule at commit time. Concurrent callers interleave, persistence updates parts separately, and the invariant survives only while every caller remembers to check it; the model needs one owner and one atomic persistence boundary.",
+  "context": "Tactical domain modelling inside a bounded context with genuine transaction-wide invariants: an object graph whose parts must agree at every commit, a store that can persist one root and its cluster as one unit (one transaction, a cascade or an explicit unit of work), and domain experts who can state which rules must hold immediately. It matters most where concurrency, distribution or graph size make 'everything is consistent with everything' unaffordable.",
+  "benefits": [
+    "Invariants get one owner: every rule spanning the cluster is checked in the root's methods, so it cannot be bypassed by mutation from outside the boundary.",
+    "The boundary is explicit: outside code may hold a reference to the root only, making 'who may change this' a design decision instead of an accident.",
+    "The transactional unit matches the model: repositories load and store the whole cluster and one aggregate per transaction gives a small, predictable locking footprint.",
+    "Consistency design becomes deliberate: rules that must hold immediately live inside the boundary, everything else is explicitly eventually consistent rather than silently coupled.",
+    "Testability: the aggregate can be unit-tested in memory (construct, call commands, assert invariants) where an open object graph forces integration tests.",
+    "Parts outside the boundary can change and scale independently: other aggregates are referenced by identity, so they can be loaded on demand, stored elsewhere or moved to another service."
+  ],
+  "tradeoffs": [
+    "Finding the boundary is the hard part, and its failure modes are asymmetric: too small and a true invariant leaks across aggregates; too large and loads, locks and conflicts grow with the cluster, which is why Vernon warns that large-cluster aggregates 'never perform or scale well'.",
+    "One aggregate per transaction forces eventual consistency between aggregates: domain events, asynchronous handlers, retries, idempotency and compensation become the coordination cost of every cross-aggregate rule.",
+    "Persistence coupling: mapping the boundary onto a store (cascades, orphan removal, lazy collections, identity maps) either pushes ORM concerns into the model or forces an explicit mapping layer.",
+    "The root tends to grow: if behaviour is pushed into services, the root degenerates into a bag of getters and setters - the anemic domain model - while the team still pays for the boundary.",
+    "Reference by identity costs extra loads and an application-service coordination step; a traversal that used to be one object graph becomes several queries plus a consistency window.",
+    "Optimistic concurrency conflicts must be handled: version checks on the root fail commits, so callers need retry or conflict-resolution logic that plain CRUD never had."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 4,
+    "performance": 6,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Aggregate Root",
+      "responsibility": "The single entry point: an entity with global identity that owns the boundary, exposes behaviour (commands) instead of setters, enforces every invariant of the cluster and records the domain events raised inside it."
+    },
+    {
+      "role": "Internal Entity",
+      "responsibility": "A part with local identity that exists only inside the boundary and is reached only through the root; it is loaded, changed and deleted together with the aggregate."
+    },
+    {
+      "role": "Value Object",
+      "responsibility": "An immutable part defined entirely by its attributes; preferred over internal entities because it can be replaced as a whole and needs no separate storage tracking."
+    },
+    {
+      "role": "Repository",
+      "responsibility": "Loads and saves the whole aggregate by the root's identity - one repository per aggregate root - and never exposes queries for internal parts."
+    },
+    {
+      "role": "Application Service",
+      "responsibility": "Owns the unit of work around one command: loads one aggregate, invokes its behaviour, commits one transaction and publishes the events the aggregate recorded."
+    },
+    {
+      "role": "Domain Event",
+      "responsibility": "What the aggregate records when a change must propagate to other aggregates; delivered after commit so each other boundary can react in its own transaction."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Order capture with line items where the order total must not exceed a credit limit - the purchase-order invariant Evans uses to motivate the pattern.",
+    "Inventory allocation where allocated quantity must never exceed on-hand stock for one stock item (Vernon's StockItem example).",
+    "Booking and reservation models where a seat, room or slot must not be double-booked inside one boundary.",
+    "Invoicing: an invoice with its lines and a tax total that must equal the sum of the lines, loaded and committed as one unit.",
+    "A shopping cart or basket with a maximum line count or quantity per item enforced per cart.",
+    "Write models under CQRS whose command handlers must modify exactly one consistency boundary and let the rest of the system catch up from events.",
+    "Banking account transfers: a debit and credit of the same amount must be atomic within one account aggregate.",
+    "Subscription lifecycle management: a plan change must atomically update status, record the new plan, and create a proration record.",
+    "Patient treatment records: a treatment episode where diagnosis, prescriptions, and progress notes must remain consistent.",
+    "Axon Framework's event-sourced GiftCard aggregate: an IssueCard command targets the root identifier, replays that aggregate's stream, and applies events to rebuild state.",
+    "EventStoreDB event-sourced orders: one order stream is replayed to rebuild the aggregate and appended with an expected stream version for optimistic concurrency.",
+    "SQLAlchemy's Order.items relationship with cascade='all, delete-orphan': a Session flushes owned line items with their root while the application transaction remains scoped to that aggregate.",
+    "EF Core owned entity types ([Owned] / OwnsOne / OwnsMany): owned parts cannot exist or be persisted independently, are loaded with their owner by default, and map the aggregate's ownership boundary onto the ORM's change tracker.",
+    "Protean's BaseAggregate: invariants are validated before and after every state change, the aggregate is the unit of persistence and optimistic concurrency, and a stale version raises ExpectedVersionError for retry.",
+    "Axon Framework 5 event-sourced entities: commands target the @EventSourcedEntity root's identifier and @EntityMember child entities receive only their routed events, so the consistency boundary survives under the entity-based model."
+  ],
+  "avoid_when": [
+    "The data is plain CRUD over independent rows with no rule spanning objects: Active Record or a Transaction Script is simpler and cheaper.",
+    "The 'invariant' is really reporting or UX convenience (a dashboard that should look current) - that is a consistency delay to design, not a boundary to draw.",
+    "Two facts must be atomic by law but live in different stores or services: prefer one boundary where feasible, or coordinate with a process manager and compensations instead of stretching an aggregate across systems.",
+    "Read-heavy reporting dominates: build a read model (query object, view) rather than loading the aggregate for display.",
+    "A single-user batch import rewrites everything: set-oriented/streamed processing beats per-aggregate load-modify-save.",
+    "You need only one identity-bearing object with a local lifecycle and no invariant spanning parts: model an entity, not an aggregate.",
+    "You need loading/saving mechanics or transaction orchestration rather than a consistency boundary: use a repository or unit of work around the aggregate, not instead of one.",
+    "A business process spans multiple roots and needs retries, compensation or human steps: use a saga/process manager rather than one unbounded aggregate.",
+    "Concurrency is low and the domain is simple: a large aggregate that simplifies the code may be a reasonable trade-off when contention is rare."
+  ],
+  "language_files": {
+    "generic": "aggregate.generic.json",
+    "c": "aggregate.c.json",
+    "cplusplus": "aggregate.cplusplus.json",
+    "csharp": "aggregate.csharp.json",
+    "go": "aggregate.go.json",
+    "java": "aggregate.java.json",
+    "javascript": "aggregate.javascript.json",
+    "kotlin": "aggregate.kotlin.json",
+    "python": "aggregate.python.json",
+    "ruby": "aggregate.ruby.json",
+    "rust": "aggregate.rust.json",
+    "scala": "aggregate.scala.json",
+    "swift": "aggregate.swift.json",
+    "typescript": "aggregate.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "ddd"
+  ],
+  "related_patterns": [
+    "entity",
+    "value-object",
+    "repository",
+    "unit-of-work",
+    "domain-event",
+    "application-service",
+    "domain-factory",
+    "specification",
+    "memento"
+  ],
+  "anti_patterns": [
+    "Cluster-by-containment: unlike an aggregate boundary drawn around a true invariant, making everything reachable from an entity part of the cluster loads the whole model for one change.",
+    "Anemic root: unlike a behavior-rich root, public setters and live child collections leave invariants in services where callers can bypass them.",
+    "Leaking internals: unlike a root-only API, returning an internal collection or child reference lets callers mutate parts behind the root's back.",
+    "Multi-aggregate transaction: unlike one root per consistency transaction, modifying two roots (or calling a repository per child) creates lock contention and failure coupling.",
+    "Relational normalisation driving the model: unlike an invariant-driven boundary, one aggregate per table produces repositories and queries for child entities.",
+    "God aggregate: unlike a small consistency boundary, embedding entire other aggregates as value objects turns one root into a monolith that loads the domain model.",
+    "Cross-aggregate object references: unlike an identity reference, holding another root as a direct object creates implicit loading chains and tight coupling.",
+    "Denormalised stored state: unlike a single authoritative value, storing fields such as 'total' that can be derived from children creates divergence risk.",
+    "Wrong move: merge related concepts (Customer, Order, Address, Payments, Loyalty) into one aggregate because they appear on one screen; failure: every update locks and rehydrates the whole graph, event streams grow long and slow to replay, and unrelated operations collide on the same root version; instead: keep only data that must change atomically for one invariant and reference the rest by identity.",
+    "Wrong move: modify several roots in one transaction to dodge optimistic-concurrency failures; failure: independent user activities keep bumping the same aggregate version, retries escalate and commit conflicts couple failures across features; instead: modify one aggregate per transaction and reconcile cross-boundary rules with after-commit domain events and idempotent handlers.",
+    "Wrong move: model the aggregate as a data container mirroring a table or a screen; failure: the boundary follows schema or UI layout instead of invariants, so the root decays into CRUD getters and setters while the real rules drift into services; instead: start from the smallest root plus value-typed parts that can check each true invariant in one transaction and re-verify that the invariant really demands same-transaction consistency."
+  ],
+  "design_principles": [
+    "Single responsibility: the root is the only place allowed to decide how the cluster changes.",
+    "Information hiding / encapsulation: internal parts are unreachable from outside the boundary.",
+    "Law of Demeter: clients talk to the root, never through it to its parts.",
+    "Consistency boundary as a design unit: draw the smallest boundary that keeps a true invariant atomic.",
+    "Separation of concerns: invariants stay in the model, transactions and delivery stay in the application layer.",
+    "Reference other aggregates by identity only: never hold a navigation property or object reference to another aggregate root.",
+    "Small aggregates by default: start from the premise that every entity is its own aggregate, and add only what is strictly necessary to protect a true invariant."
+  ],
+  "best_practices": [
+    "Model the true invariants first, then draw the boundary around the smallest cluster that makes each of them checkable in one transaction.",
+    "Give the root commands (verbs) and read-only views - never setters and never the live internal collection.",
+    "Reference other aggregates by identity only, so nothing outside the boundary can be modified by accident.",
+    "Keep aggregates small: prefer value-typed parts and add internal entities only where a part has its own lifecycle the invariant needs.",
+    "Persist the aggregate as one unit (one repository per root, cascade or explicit unit of work) and version the root for optimistic concurrency.",
+    "Coordinate across boundaries with domain events published after commit, and make the handlers idempotent and retryable.",
+    "Test invariants by attempting illegal command sequences in memory, not by inspecting state after a database round-trip.",
+    "Apply the 'Two Aggregate Rule': if a business operation seems to require modifying two aggregates, it probably needs a domain event and eventual consistency, not a shared transaction.",
+    "Use a customer snapshot (immutable value object with name/email at time of order) instead of embedding the full Customer aggregate when the order needs buyer details.",
+    "Design aggregates around consistency requirements, not data relationships - 'related' is not the same as 'transactionally coupled'.",
+    "When an aggregate accumulates hundreds of events, introduce snapshots to avoid slow reconstitution on every load.",
+    "In event-sourced systems, design events to be immutable and forward-compatible; use upcasters or version fields to handle schema evolution without rewriting stored events.",
+    "Prefer command methods returning Result types over methods that throw, to make aggregate failures first-class return values rather than exceptions.",
+    "Use a domain service only for operations that genuinely span multiple aggregates; resist the pull to put domain logic in services just because it touches several objects."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Evans, Domain-Driven Design: Tackling Complexity in the Heart of Software (2003) - Aggregate (Chapter 6, 'The Lifecycle of a Domain Object').",
+    "Vernon, Implementing Domain-Driven Design (2013) - Chapter 10, Aggregates.",
+    "Vernon, Effective Aggregate Design Parts I–III (2011), InfoQ / dddcommunity.org.",
+    "Fowler, Bliki: DDD Aggregate — martinfowler.com/bliki/DDD_Aggregate.html.",
+    "Microsoft, .NET Microservices Architecture Guide — Microservice Domain Model / CQRS patterns.",
+    "Microservices.io, Pattern: Event Sourcing — microservices.io/patterns/data/event-sourcing.html.",
+    "Youngju, Event Sourcing + CQRS Architecture Implementation Guide (2026) — youngju.dev.",
+    "StackPractices, CQRS + Event Sourcing Combined Guide (2026) — stackpractices.com.",
+    "Hossain, CQRS and Event Sourcing in Production: A Deep Dive (2026) — mdsanwarhossain.me.",
+    "AWS, Decompose Monoliths with CQRS and Event Sourcing — AWS Prescriptive Guidance.",
+    "Protean, Design Small Aggregates — docs.proteanhq.com/patterns/design-small-aggregates/.",
+    "Erard, Part IX: Build Aggregates (MUD to DDD series, 2026) — serard.dev.",
+    "Klinkert, Aggregates and their Boundaries (Go DDD tutorial) — sklinkert.github.io/go-ddd/.",
+    "Eventsourcing.dev, Designing Aggregates Best Practices — eventsourcing.dev.",
+    "pydomino — pypi.org/project/pydomino/ — Python DDD library with AggregateRoot base.",
+    "dddkit — github.com/mom1/dddkit — Python DDD library with dataclasses and pydantic support.",
+    "pydddantic — github.com/Daveography/pydddantic — Pydantic-based DDD with EventSourcedAggregate.",
+    "svngoku/coding-agents-skills: Python DDD patterns reference — github.com/svngoku/coding-agents-skills.",
+    "marvinrichter/clarc: ddd-python skill — github.com/marvinrichter/clarc.",
+    "Dan Does Code, DDD Modelling — Aggregates vs Entities (2025) — dandoescode.com/blog.",
+    "steffenskov/DDD-CQRS-EventSourcing-Template — github.com/steffenskov/DDD-CQRS-EventSourcing-Template — .NET 7 CQRS+ES template with MediatR and snapshots.",
+    "https://www.domainlanguage.com/ddd/",
+    "https://www.dddcommunity.org/library/vernon_2011/",
+    "https://www.dddcommunity.org/wp-content/uploads/files/pdf_articles/Vernon_2011_1.pdf",
+    "https://www.dddcommunity.org/wp-content/uploads/files/pdf_articles/Vernon_2011_2.pdf",
+    "https://docs.axoniq.io/axon-framework-reference/4.13/axon-framework-commands/modeling/aggregate/",
+    "https://github.com/kurrent-io/ESDB-Docs-v5/blob/main/docs/streams.md",
+    "https://github.com/kurrent-io/ESDB-Docs-v5/blob/main/docs/http-api/optional-http-headers.mdx",
+    "https://docs.sqlalchemy.org/en/20/orm/cascades.html",
+    "https://learn.microsoft.com/en-us/ef/core/modeling/owned-entities",
+    "https://docs.proteanhq.com/concepts/building-blocks/aggregates/",
+    "https://docs.axoniq.io/axon-framework-reference/5.3/migration/paths/aggregates/multi-entity-migration/",
+    "https://andriiboyko.com/articles/aggregate-design-getting-the-consistency-boundary-right",
+    "https://www.heise.de/en/blog/Lean-instead-of-bloated-What-Aggregates-and-Read-Models-really-are-11163363.html"
+  ],
+  "related_patterns_notes": {
+    "entity": "an identity-bearing domain object; an aggregate is a consistency boundary that may contain entities.",
+    "value-object": "an immutable descriptive value; an aggregate decides whether to own it inside its boundary.",
+    "repository": "loads and stores an aggregate by root identity; it is persistence access, not the domain boundary.",
+    "unit-of-work": "groups persistence operations into a transaction; an aggregate defines which changes must be atomic.",
+    "domain-event": "records a completed aggregate change for other boundaries; it does not widen the aggregate transaction.",
+    "application-service": "opens the use-case transaction and invokes the root; the aggregate owns invariant decisions.",
+    "domain-factory": "constructs a valid object or aggregate; it does not replace the root's ongoing behavior.",
+    "specification": "expresses a reusable business predicate; aggregate methods enforce invariants during state changes.",
+    "cqrs": "separates command and query models; an aggregate is typically the command-side consistency boundary.",
+    "event-sourcing": "stores state transitions as events; an event-sourced aggregate still has one root and one stream.",
+    "saga-process-manager": "coordinates long-running work across roots; it is the alternative to one cross-root transaction.",
+    "memento": "accelerates reconstitution of an event stream; it is a persistence optimization, not a smaller boundary."
+  }
+}

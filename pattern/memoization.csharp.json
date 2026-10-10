@@ -1,0 +1,81 @@
+{
+  "pattern": "memoization",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "ConcurrentDictionary<TKey,TValue>.GetOrAdd",
+  "implementation_notes": "ConcurrentDictionary.GetOrAdd is the direct memo primitive: it adds the pair produced by the value factory when the key is absent and returns the existing value otherwise, with reads taking no locks. The documented caveat shapes the design - the factory runs outside the dictionary's locks, so simultaneous calls on different threads may compute the same key more than once, and only one pair ends up stored; for a pure, moderately cheap computation that is exactly the right trade, and for an expensive one the Lazy<T> form below is the fix. The GetOrAdd<TArg>(key, factory, arg) overload avoids a capturing closure per call, and because the dictionary never allows null values a legitimate null result must be wrapped in an Option or a sentinel.",
+  "code_sketch": "private readonly ConcurrentDictionary<Key, Report> _cache = new();\n\npublic Report Get(Key key) =>\n    _cache.GetOrAdd(key, static k => Compose(k));   // factory may run more than once\n\npublic long CachedCount => _cache.Count;            // observe the cache before trusting it",
+  "pitfalls": [
+    "The value factory may run more than once under contention (documented on GetOrAdd); never put a side effect or an expensive computation in it without switching to the Lazy<T> form.",
+    "Recursively calling GetOrAdd for the same key from inside the factory is a re-entrancy trap: the outer entry does not exist yet, so the recursion recomputes and can run away.",
+    "A static cache keyed by user input retains everything it has ever seen; it needs a bound, an eviction policy or a per-scope dictionary.",
+    "Reference-typed keys compare by the type's Equals/GetHashCode, which default to reference identity for classes - two logically equal keys become two entries unless the type overrides them or a comparer is supplied."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2.getoradd",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1"
+  ],
+  "variants": [
+    {
+      "variant_id": "concurrentdictionary-getoradd",
+      "name": "ConcurrentDictionary.GetOrAdd memo",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "idiom_name": "ConcurrentDictionary<TKey,TValue>.GetOrAdd",
+      "implementation_notes": "ConcurrentDictionary.GetOrAdd is the direct memo primitive: it adds the pair produced by the value factory when the key is absent and returns the existing value otherwise, with reads taking no locks. The documented caveat shapes the design - the factory runs outside the dictionary's locks, so simultaneous calls on different threads may compute the same key more than once, and only one pair ends up stored; for a pure, moderately cheap computation that is exactly the right trade, and for an expensive one the Lazy<T> form below is the fix. The GetOrAdd<TArg>(key, factory, arg) overload avoids a capturing closure per call, and because the dictionary never allows null values a legitimate null result must be wrapped in an Option or a sentinel.",
+      "code_sketch": "private readonly ConcurrentDictionary<Key, Report> _cache = new();\n\npublic Report Get(Key key) =>\n    _cache.GetOrAdd(key, static k => Compose(k));   // factory may run more than once\n\npublic long CachedCount => _cache.Count;            // observe the cache before trusting it",
+      "pitfalls": [
+        "The value factory may run more than once under contention (documented on GetOrAdd); never put a side effect or an expensive computation in it without switching to the Lazy<T> form.",
+        "Recursively calling GetOrAdd for the same key from inside the factory is a re-entrancy trap: the outer entry does not exist yet, so the recursion recomputes and can run away.",
+        "A static cache keyed by user input retains everything it has ever seen; it needs a bound, an eviction policy or a per-scope dictionary.",
+        "Reference-typed keys compare by the type's Equals/GetHashCode, which default to reference identity for classes - two logically equal keys become two entries unless the type overrides them or a comparer is supplied."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2.getoradd",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1"
+      ]
+    },
+    {
+      "variant_id": "lazy-single-value",
+      "name": "Lazy<T> for a single memoized value",
+      "paradigm": "oo",
+      "min_standard": "C#4",
+      "idiom_name": "Lazy<T> with LazyThreadSafetyMode.ExecutionAndPublication",
+      "implementation_notes": "For a memo with no arguments - a built index, a parsed configuration, a compiled table - Lazy<T> is the standard cell: the factory runs at most once and all readers observe the same instance, and LazyThreadSafetyMode.ExecutionAndPublication is the documented default that guarantees one execution even when several threads touch Value at the same time. It cannot express argument-keyed memoization, so it is the nullary case of the pattern rather than a replacement for the dictionary; the docs also show that failures are remembered, so a Lazy that threw during initialization keeps rethrowing until it is replaced, which is often what you want and occasionally a trap.",
+      "code_sketch": "private static readonly Lazy<Index> SharedIndex =\n    new Lazy<Index>(BuildIndex, LazyThreadSafetyMode.ExecutionAndPublication);\n\npublic static Index Index => SharedIndex.Value;   // built exactly once, even under contention",
+      "pitfalls": [
+        "A failed initialization is cached (the documented exception-caching behaviour), so a transient failure keeps being rethrown for the lifetime of the Lazy instance.",
+        "Lazy<T> holds its value for the lifetime of the instance; a Lazy in a static field is a process-lifetime retention point.",
+        "It has no key, so it does not memoize a function of arguments - using it per argument creates one Lazy per call and no sharing at all.",
+        "The safety mode must be chosen deliberately: LazyThreadSafetyMode.None is a data race when several threads can call Value."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1"
+      ]
+    },
+    {
+      "variant_id": "lazy-dictionary-value",
+      "name": "ConcurrentDictionary of Lazy<T> (exactly-once computation)",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "Lazy<T>"
+      ],
+      "idiom_name": "ConcurrentDictionary<TKey, Lazy<TValue>> + GetOrAdd",
+      "implementation_notes": "The documented cure for GetOrAdd's duplicate-factory caveat is to make the cached value a Lazy<T>: each caller proposes a fresh Lazy, GetOrAdd keeps exactly one of them, and only the winning Lazy ever runs its factory, so the expensive computation happens exactly once per key even when many threads miss together. The discarded Lazy instances cost one allocation each and run nothing, which is cheap enough for expensive computations; the trade is an extra indirection on every hit and a value type that now has to be unwrapped at every call site.",
+      "code_sketch": "private readonly ConcurrentDictionary<Key, Lazy<Report>> _cache = new();\n\npublic Report Get(Key key) =>\n    _cache.GetOrAdd(key, static k => new Lazy<Report>(() => Compose(k))).Value;",
+      "pitfalls": [
+        "The Lazy must be created cheaply; if the factory expression itself does work (rather than returning a delegate), that work is paid on every call, including hits.",
+        "Only the winning Lazy is ever started, but a losing Lazy that captured an expensive closure still allocates; keep the factory expression minimal.",
+        "Errors are cached inside the Lazy, so a thrown exception sticks to that key until the entry is removed.",
+        "Nothing evicts: for unbounded key spaces this form must be combined with a size bound or replaced by a real cache with expiration."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2.getoradd",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1"
+      ]
+    }
+  ],
+  "default_variant": "concurrentdictionary-getoradd",
+  "version": "1.0"
+}

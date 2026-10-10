@@ -1,0 +1,194 @@
+{
+  "category": "concurrency-resilience",
+  "name": "two-phase-termination",
+  "aliases": [
+    "graceful shutdown",
+    "orderly shutdown",
+    "controlled termination",
+    "drain-and-exit"
+  ],
+  "intent": "Stop a running worker without leaving the system in a broken state: separate the request to stop from the completion of the stop, so the participant can finish or abort its current work, release the locks and resources it owns, flush its state and notify its collaborators before anyone treats it as gone.",
+  "problem": "A long-running participant - a worker thread, consumer loop, session, device handler or background service - owns work in flight and scarce resources (locks, buffers, connections, files, queues) and must eventually be stopped from outside: a deploy, a SIGTERM, an operator command, a parent shutting down, or a failure elsewhere. Both available extremes are wrong. Killing it immediately can leave locks held, transactions half-applied and buffers unflushed; merely abandoning the request leaves the owner unable to tell whether the worker is still running, still cleaning up, or already gone. The recurring decision is how a stop request is delivered and honoured, and - the part that is usually missing - how its completion is observed.",
+  "context": "Applies wherever a participant outlives a single call: worker threads and thread pools, consumer loops and message listeners, session objects, background services, device or connection owners. It is the right shape when the participant can be asked to stop (cooperative), when some resource or buffer must be released on the participant's own control flow, and when the surrounding lifecycle (process exit, orchestrator kill window, parent scope) can afford to wait a bounded time for that release. The classic forces apply: the shutdown must survive the worker being blocked in a wait, repeated stop requests must be harmless, and termination - not just the request - must be observable.",
+  "benefits": [
+    "State stays consistent across restarts and deployments: locks are released, buffers and offsets flushed, transactions finished and handles closed on the worker's own control flow before the process or scope disappears.",
+    "The two facts become distinguishable: 'stop requested' and 'stopped' are separate states, so a joiner can wait, an orchestrator can bound its kill window, and an operator can be told what actually happened.",
+    "No platform-specific thread killing is needed: a latch plus safe points plus a join works the same on POSIX, the JVM, the CLR, Go, Rust, JavaScript and the actor runtimes; the runtime's kill/abort stays a fallback rather than the mechanism.",
+    "Dependent work is released deliberately: participants whose completion others are waiting for (a queue drain, a session, a sub-worker) can be ordered - stop accepting, finish in flight, then close infrastructure - instead of racing the shutdown.",
+    "The shutdown path becomes ordinary, testable code: an idempotent stop request, a drain that is a normal loop exit, and a completion signal a test can await deterministically, with the forced fallback covered as its own case.",
+    "Failure handling can be layered honestly: cooperative stop with a deadline, then an explicit forced fallback (shutdownNow, abort, terminate, kill), each logged and reasoned about rather than left as an implicit race."
+  ],
+  "tradeoffs": [
+    "Two steps instead of one: the stop request returns before termination, so every caller must join/await; a caller that treats requested as finished releases the process while in-flight work is still running, silently truncating it.",
+    "Cooperative checks are only as good as the safe points: a worker blocked in a library call that never observes the flag needs an explicit wake-up (condition broadcast, interrupt, queue close, token cancel), or phase 2 never starts and shutdown hangs until something forces the process down.",
+    "Waiting is unbounded by default: without a deadline and a forced fallback graceful shutdown is a hang with good intentions, while with a deadline the work that misses it is abandoned - and that loss has to be designed for, not discovered.",
+    "Cleanup ordering across components is application logic, not pattern machinery: the reverse dependency order (stop accepting, finish in flight, close infrastructure) must be written down, or a late request writes into an already-closed pool or connection.",
+    "Cleanup must be executable while cancellation is already active and while the machinery it uses still exists; in cancellation-aware runtimes the cleanup block itself is skipped or throws at its first suspension unless it is shielded (NonCancellable, onCancel, a non-cancellable finally path).",
+    "Terminal-state publication is a synchronisation problem of its own: the latch must be atomic or safely published (a plain bool or C++ volatile is not enough), and joiners must never observe terminated before its effects are visible.",
+    "Shutdown code is cold, timing-dependent code: it is rarely exercised, awkward to test deterministically, and rots quietly until the first real deploy; repeated or concurrent stop requests must be idempotent or double cleanup corrupts state.",
+    "The pattern requires strategic safe-point insertion throughout the participant's run loop; retrofitting safe points into an existing codebase can be invasive and error-prone."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Participant (worker)",
+      "responsibility": "Runs the long-lived activity, checks the termination latch at strategic points, stops accepting new work, finishes or aborts the work in flight according to policy, releases the resources it owns, flushes state and reports termination."
+    },
+    {
+      "role": "Controller",
+      "responsibility": "Initiates termination: sets the latch idempotently (and may wake a blocked participant via interrupt, condition broadcast, queue close or token cancel), then waits for the completion signal, applying a deadline and a forced fallback when needed."
+    },
+    {
+      "role": "Termination latch",
+      "responsibility": "The shared, safely published stop indicator (atomic flag, Event, stop/cancellation token, closed channel or queue) that phase 1 sets and phase 2 reads; one-way - once requested it cannot be withdrawn."
+    },
+    {
+      "role": "Dependent participant / collaborator",
+      "responsibility": "Anything that must not proceed while the participant is only terminating: it observes the completion signal (join, latch, await, Future) or is explicitly notified by the participant as part of cleanup."
+    },
+    {
+      "role": "Owned resources",
+      "responsibility": "Locks, buffers, connections, files, registrations and sub-workers the participant acquired; releasing them is the substance of phase 2 and must happen on the participant's own exit paths."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Service shutdown on SIGTERM: stop accepting connections, drain in-flight requests, close pools and flush telemetry, then exit within the orchestrator's termination grace period.",
+    "Worker pools and consumer loops that must finish the current item and commit its offset or transaction before the process ends.",
+    "Device, session or connection owners that have to release locks/handles and flush buffers before the owner is torn down.",
+    "Background jobs and admin-triggered operations that need a shutdown button and must report, on request, whether they are still draining.",
+    "Rolling deploys and node replacements that must not drop requests or lose buffered state when the old instance is asked to go away.",
+    "Long-running simulation or control loops that have to bring their state (and attached hardware) to a safe point before the controller is powered down.",
+    "Kubernetes pod termination: SIGTERM to container main process, graceful drain within terminationGracePeriodSeconds, then SIGKILL if the window expires - the container orchestration two-phase pattern at infrastructure level.",
+    "Database connection pool drain: on application shutdown, stop returning connections to the pool, wait for in-flight queries to complete or hit their timeout, then close all connections and shut down the pool.",
+    "Message queue consumer graceful drain: stop consuming new messages, finish processing the current message with a bounded timeout, acknowledge or requeue based on policy, then close the consumer and commit offsets.",
+    "Go net/http server shutdown: http.Server.Shutdown(ctx) closes the listeners, closes idle connections and blocks until active handlers return or the context deadline expires - the standard library's built-in two-phase termination used by production Go HTTP services.",
+    "nginx graceful stop: sending QUIT to the master process (nginx -s quit) closes the listening sockets and lets the current workers finish their in-flight requests before exiting, with TERM/INT kept as the fast-shutdown fallback - the cooperative/forced layering expressed in OS signals.",
+    "Spring Boot graceful shutdown: on context close the embedded server (Tomcat, Jetty, Reactor Netty) stops accepting new requests and waits for in-flight requests to complete within spring.lifecycle.timeout-per-shutdown-phase; the phase times out into the forced path rather than hanging the context."
+  ],
+  "avoid_when": [
+    "The unit of work is a single short call with nothing to release: return, fail or use a plain Timeout - there is no second phase to honour.",
+    "The work is stateless, idempotent and safe to kill at any instant: immediate cancellation (abort, terminate, process kill) is simpler, faster and honest about what happens.",
+    "Scope exit already guarantees cleanup and there is no work in flight: RAII, defer, using or a with-block (Scope Guard, Resource Return) releases the resources without a protocol.",
+    "The task is inherently bounded and its completion is already awaited by its creator: structured concurrency plus awaiting the task is the simpler answer.",
+    "The target cannot be made cooperative at all (an opaque blocking call with no safe points): run it in a disposable thread or process you can abandon, rather than pretending to drain it."
+  ],
+  "language_files": {
+    "generic": "two-phase-termination.generic.json",
+    "c": "two-phase-termination.c.json",
+    "cplusplus": "two-phase-termination.cplusplus.json",
+    "csharp": "two-phase-termination.csharp.json",
+    "go": "two-phase-termination.go.json",
+    "java": "two-phase-termination.java.json",
+    "javascript": "two-phase-termination.javascript.json",
+    "kotlin": "two-phase-termination.kotlin.json",
+    "python": "two-phase-termination.python.json",
+    "ruby": "two-phase-termination.ruby.json",
+    "rust": "two-phase-termination.rust.json",
+    "scala": "two-phase-termination.scala.json",
+    "swift": "two-phase-termination.swift.json",
+    "typescript": "two-phase-termination.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "cancellation-token",
+    "structured-concurrency",
+    "poison-pill",
+    "guarded-suspension",
+    "monitor-object",
+    "thread-pool",
+    "active-object",
+    "leader-followers",
+    "half-sync-half-async",
+    "producer-consumer"
+  ],
+  "anti_patterns": [
+    "Treating the request as the termination: setting the flag and exiting the process (or freeing the worker's resources) without waiting for the second phase, silently truncating in-flight work.",
+    "Uncooperative blocking work: a loop body parked in a call that never observes the flag and is never woken, so the drain hangs until something kills the process.",
+    "Forced termination as the primary path: Thread.stop/Thread#kill/Thread.Abort/asynchronous pthread_cancel/kill -9 used as the normal shutdown, leaving locks held and state half-written.",
+    "Cleanup that needs the machinery being shut down, or that runs on the wrong thread: the joiner releasing the worker's resources, a signal handler joining threads, a flush after the executor/logger/pool was closed.",
+    "Non-idempotent or unordered stops: double flush, double close, an exception on the second request, or every component stopping at once so a late writer hits a closed database or queue.",
+    "Wait-forever shutdown with no deadline and no fallback, which turns the graceful path into an outage rather than a bounded drain.",
+    "Using deprecated primitives as the primary mechanism: Thread.stop() in Java, pthread_cancel in a synchronous POSIX thread context, or Thread.Abort() in .NET - all leave monitors in indeterminate states.",
+    "Deadlock during drain: the shutdown sequence waits for workers to finish but one worker holds a lock that the controller needs to close the resource the worker is waiting on.",
+    "Cancellation masking in finally: a suppressed or swallowed CancelledError/InterruptedException that prevents the true exit reason from being diagnosed or logged.",
+    "Forgetting the termination latch is one-way: designing a restart path that 'clears' the latch, turning it from a monotonic stop-signal into a race condition between stop and restart."
+  ],
+  "design_principles": [
+    "Separation of concerns: requesting a stop, completing a stop and releasing the participant's resources are three different responsibilities.",
+    "Single responsibility per role: only the participant knows how to release what it owns, so only the participant performs phase 2.",
+    "Cooperative cancellation over preemption: safety at known points beats asynchronous interruption that can land inside cleanup.",
+    "Idempotence and monotonicity: a stop request is repeatable and one-way; it can never be withdrawn or undone.",
+    "Explicit lifecycle: publish a terminal state and an observable completion, instead of letting 'the thread just stops' be the contract.",
+    "Bounded over unbounded: every wait must have a deadline and a documented forced fallback, or shutdown is a potential outage.",
+    "Reverse dependency order: stop acceptors before finishers, finishers before closers, closers before exit - no component closes what a surviving component still needs."
+  ],
+  "best_practices": [
+    "Make the latch idempotent and safely published (atomic, volatile, Event, token), never a plain unsynchronised boolean.",
+    "Name the safe points where the latch is checked, and wake blocked waits explicitly (condition broadcast, interrupt, queue close, cancellation token) instead of polling on a timer.",
+    "Distinguish the states - running, stopping (work withdrawn), terminating (cleanup), terminated (published and joinable) - and let callers observe only the last one as 'gone'.",
+    "Give shutdown a deadline and an explicit forced fallback (shutdownNow, abort/terminate, SIGKILL), and log which path was taken and what was abandoned.",
+    "Run cleanup on the participant's own exit paths (finally, defer, ensure, RAII, a cancellation handler, a shield) so it happens on exceptions and cancellation too, not only on the happy path.",
+    "Drain in reverse dependency order: stop accepting, finish in flight, notify dependants and readiness probes, then close infrastructure last.",
+    "Test the shutdown path deliberately - repeated stops, stop during work, deadline expiry, forced fallback - because it is cold code that nothing else exercises.",
+    "Place safe points at every unit-of-work boundary and every blocking wait; in async runtimes, use shielded or non-cancellable finally blocks for phase 2 cleanup so cancellation cannot abort the cleanup itself.",
+    "Set the orchestrator's kill window (SIGKILL deadline) longer than the sum of the per-request timeout, the longest in-flight job, and a safety buffer; document this relationship explicitly.",
+    "In languages with cancellation-aware runtimes (asyncio, Kotlin coroutines, goroutines via context), separate the cancellation signal from the cleanup: catch the cancellation, drain normally, then publish completion in a non-cancellable context.",
+    "Make the termination latch monotonic: once set it must never be cleared. Any restart requirement must create a fresh latch, not reuse a reset old one.",
+    "Coordinate the readiness/liveness probe with the termination latch: on receiving SIGTERM, flip readiness to false first (so the load balancer stops routing) before starting the drain phase."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Grand, M., Patterns in Java, Volume 1 (1998) - Two-Phase Termination: provide for the orderly shutdown of a thread or process through the setting of a latch checked at strategic points in its execution (cited as Grand98 by POSA2's concurrency-pattern overview).",
+    "Lea, D., Concurrent Programming in Java: Design Principles and Patterns, 2nd ed. (1999) - the catalog's attribution for the §7 concurrency patterns (Balking, Guarded Suspension, Read-Write Lock, Two-Phase Termination, Thread Confinement); termination is an explicit participant state, not a side effect of killing a thread.",
+    "Schmidt, D. C. et al., Pattern-Oriented Software Architecture, Volume 2: Patterns for Concurrent and Networked Objects (2000) - POSA2's concurrency-patterns overview presents Two-Phase Termination as a named participant state managed through a latch and explicit shutdown hook, distinct from asynchronous preemption.",
+    "Pattern-Oriented Software Architecture, Volume 2 - Design Pattern Synopses, M. Grand (1998) - One-paragraph synopsis of Two-Phase Termination confirming its purpose: provide a controlled, cooperative termination protocol using a latch at strategic points in a thread's execution.",
+    "Vanderbilt University DOC Group - POSA2 Concurrency Patterns overview: http://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html",
+    "PDX CS - Two-Phase Termination Course Slides (Antoy): https://web.cecs.pdx.edu/~antoy/Courses/Patterns/slides/TwoPhaseTermination.html",
+    "Oracle Java Tutorials - Interrupts: https://docs.oracle.com/javase/tutorial/essential/concurrency/interrupt.html - canonical Java two-phase termination using Thread.interrupt and the interrupt status flag as the termination latch.",
+    "Oracle Java SE - Thread Primitive Deprecation Guide: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/doc-files/threadPrimitiveDeprecation.html - documents why Thread.stop() is unsafe and recommends cooperative two-phase termination as the replacement.",
+    "Baeldung - How to Kill a Java Thread: https://www.baeldung.com/java-thread-stop - presents the two-phase pattern combining AtomicBoolean flag with Thread.interrupt() for responsive, safe thread termination.",
+    "Champlin Enterprises - Graceful Shutdown in Distributed Systems (2025): https://champlinenterprises.com/blog/graceful-shutdown-distributed-systems - production two-phase termination with Kubernetes TerminationGracePeriodSeconds alignment, multi-layer timeouts, and drain ordering.",
+    "Zylos Research - Graceful Shutdown Patterns for Long-Lived Services (2026): https://zylos.ai/research/2026-02-25-graceful-shutdown-long-lived-services - multi-phase (2-4) shutdown for WebSocket servers, AI agents, schedulers, with per-layer timeout budgets and coordinated orchestrator settings.",
+    "ADHDecode - Graceful Shutdown and Draining (2025): https://adhdecode.com/system-design/operational-excellence/graceful-shutdown-draining/ - five-gate shutdown model (SIGTERM, stop accepting, drain with timeout, abort remaining, exit) with context-based cancellation propagation.",
+    "ScaleMind - Poison Pill Shutdown Pattern in Java (2024): https://scalemind.dev/java/concurrency/poison-pill-shutdown-pattern-in-java/ - Poison Pill as a complementary phase-1 signal for shared BlockingQueue consumer loops; one sentinel per consumer to guarantee orderly exit.",
+    "Python Async Concurrency - Graceful Shutdown & Signal Handling (2025): https://async-concurrency.com/resilience-cancellation-error-handling/graceful-shutdown-and-signals/ - two-signal strategy (first SIGTERM for graceful, second for forced), readiness-first ordering, and bounded drain with asyncio.timeout.",
+    "Python Async Concurrency - Worker Pool Implementations (2025): https://async-concurrency.com/concurrent-execution-worker-patterns/worker-pool-implementations/ - sentinel-driven pool shutdown with asyncio.Queue.join() drain and asyncio.timeout deadline.",
+    "Voxire - Graceful Shutdown in Go Services on ECS (2025): https://voxire.com/blog/graceful-shutdown-go-ecs-production/ - context cancellation as phase-1 propagation, WaitGroup for drain tracking, and os/signal NotifyChannel as the SIGTERM controller.",
+    "TheLinuxCode - Graceful Shutdown in Distributed Systems: A Practical Field Guide (2025): https://thelinuxcode.com/graceful-shutdown-in-distributed-systems-and-microservices-a-practical-field-guide/ - phased shutdown with advertise-reduce-capacity, drain, and force-terminate gates for microservices.",
+    "Microsoft Debug Adapter Protocol - Issue #249: https://github.com/microsoft/debug-adapter-protocol/issues/249 - two-phase terminate/disconnect pattern for debug adapters: graceful terminate request followed by forced disconnect as the fallback.",
+    "alxkm/java-concurrency-patterns GitHub: https://github.com/alxkm/java-concurrency - Java implementations of TwoPhaseTermination and related patterns with thread pool ExecutorService shutdown sequencing.",
+    "Identification and annotation of concurrency design patterns in Java source code using static analysis (2021): http://hdl.handle.net/10155/214 - academic work statically detecting Two-Phase Termination and related concurrency patterns in Java source code.",
+    "Go Project - net/http package documentation (Server.Shutdown, ShutdownOptions): https://pkg.go.dev/net/http - standard-library two-phase termination: Shutdown closes listeners, refuses new connections, closes idle ones and waits for active handlers up to the context deadline, returning ErrServerClosed to the Serve loop.",
+    "nginx documentation - Controlling nginx: https://nginx.org/en/docs/control.html - master/worker two-phase stop: QUIT requests graceful shutdown so workers finish their current requests, HUP-reload gracefully retires old workers (WINCH), and TERM/INT is the documented fast-shutdown fallback.",
+    "Spring Boot reference - Graceful Shutdown: https://docs.spring.io/spring-boot/reference/web/graceful-shutdown.html - framework-managed two-phase web-server stop: stop accepting, bounded wait for in-flight requests via spring.lifecycle.timeout-per-shutdown-phase, server.shutdown=immediate as the forced alternative.",
+    "Matthew Palma - Graceful shutdown for HTTP services: signals, draining, and Kubernetes: https://matthewpalma.dev/blog/graceful-shutdown-http-services-kubernetes-nodejs - misuse survey of the pattern's failure modes: un-cancelled external calls hang the drain past the kill deadline, idle keep-alives keep the server open, and async side effects race the shutdown after 503s begin."
+  ],
+  "related_patterns_notes": {
+    "guardian-process": "guardian-process"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "pattern": "watchman",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "BackgroundService + PeriodicTimer + TimeProvider (health-check/observability stack for escalation)",
+  "implementation_notes": "The .NET hosting stack owns the machinery the classic watchman hand-writes: a BackgroundService supplies the monitor loop with a CancellationToken, PeriodicTimer.WaitForNextTickAsync gives non-overlapping periodic ticks (.NET 6+) and TimeProvider supplies the clock so the check is testable with a fake provider; the arrival path does an Interlocked exchange of clock.GetTimestamp(). What replaces the classic structure is not just the timer but the surrounding contract - the alert is normally published as a health check, counter or observable gauge and the escalation lives in the monitoring stack, so the watchman itself stays a small hosted service. On .NET Framework or pre-.NET 6 targets the same structure is rebuilt on System.Threading.Timer, whose callbacks can overlap and must be re-armed with Change(Timeout.Infinite, Timeout.Infinite) or guarded by a SemaphoreSlim.",
+  "code_sketch": "sealed class FlowWatchman(TimeProvider clock, TimeSpan grace) : BackgroundService {\n    long _last = clock.GetTimestamp();                 // arrival: Interlocked.Exchange(ref _last, clock.GetTimestamp());\n    protected override async Task ExecuteAsync(CancellationToken ct) {\n        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));   // ticks do not overlap\n        while (await timer.WaitForNextTickAsync(ct)) {\n            var silent = clock.GetElapsedTime(Interlocked.Read(ref _last));\n            if (silent > grace) Publish(subject, silent);   // health check / metric / alert sink\n        }\n    }\n}",
+  "pitfalls": [
+    "System.Threading.Timer callbacks run on thread-pool threads and can overlap (the timer re-fires regardless of the previous callback); guard the alert path with a SemaphoreSlim/Interlocked or move to PeriodicTimer, whose ticks are delivered one at a time.",
+    "DateTime.UtcNow and DateTimeOffset.Now are wall-clock and jump with NTP, DST and manual changes; measure silence with Stopwatch.GetTimestamp(), TimeProvider.GetTimestamp() or Environment.TickCount64, which are monotonic.",
+    "An undisposed PeriodicTimer or a BackgroundService whose loop ignores CancellationToken keeps running (and paging) across host shutdown and deployment; always dispose the timer and honour the token.",
+    "TimeProvider.System is assumed everywhere unless injected: hard-coding DateTimeOffset.UtcNow inside the watchman makes the grace-window logic untestable, which is precisely the part that needs the injected fake clock."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/timers",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.periodictimer",
+    "https://learn.microsoft.com/en-us/dotnet/standard/datetime/timeprovider-overview",
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.backgroundservice"
+  ],
+  "version": "1.0"
+}

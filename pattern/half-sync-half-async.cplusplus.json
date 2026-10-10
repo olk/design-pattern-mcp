@@ -1,0 +1,75 @@
+{
+  "pattern": "half-sync-half-async",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "Boost.Asio io_context reactor plus a bounded queue and a std::thread worker pool",
+  "implementation_notes": "Asio supplies the asynchronous layer as an io_context that demultiplexes readiness and completions; blocking service code must not run in it. The synchronous layer is a bounded pool of std::threads that pull move-only request objects from a thread-safe queue, which is the explicit hand-off; alternatively, several threads may call io_context::run() to form a pool from which completion handlers are invoked, with strands providing per-connection ordering. Take the explicit queue when the workers perform blocking work, and Asio's own pool when the completion handlers are non-blocking.",
+  "code_sketch": "asio::io_context io;                                      // asynchronous layer\nBlockingQueue<Request> q(1024);                           // queueing layer\nasio::ip::tcp::acceptor acc(io, {tcp::v4(), 8080});\nacc.async_accept([&](error_code ec, tcp::socket s) {\n    if (!ec) q.push(read_request(s));                     // never blocks\n});\nstd::vector<std::thread> pool;                            // synchronous layer\nfor (int i = 0; i < 4; ++i) pool.emplace_back([&]{ for (;;) handle(q.pop()); });\nio.run();                                                 // one reactor thread",
+  "pitfalls": [
+    "A handler that blocks inside a run() thread stalls all other completions on that thread; offload the work to the worker pool instead.",
+    "Queue items must own their payloads (move-only request objects); a pointer into a socket's read buffer that is recycled when the handler returns is a use-after-free.",
+    "A shared io_context used by several threads needs strands for per-connection ordering; otherwise handlers for one connection interleave."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/threads.html",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/strands.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "asio-callbacks-threadpool",
+      "name": "Boost.Asio reactor with a callback layer and a bounded worker pool",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Asio io_context reactor plus a bounded queue and a std::thread worker pool",
+      "implementation_notes": "Asio supplies the asynchronous layer as an io_context that demultiplexes readiness and completions; blocking service code must not run in it. The synchronous layer is a bounded pool of std::threads that pull move-only request objects from a thread-safe queue, which is the explicit hand-off; alternatively, several threads may call io_context::run() to form a pool from which completion handlers are invoked, with strands providing per-connection ordering. Take the explicit queue when the workers perform blocking work, and Asio's own pool when the completion handlers are non-blocking.",
+      "code_sketch": "asio::io_context io;                                      // asynchronous layer\nBlockingQueue<Request> q(1024);                           // queueing layer\nasio::ip::tcp::acceptor acc(io, {tcp::v4(), 8080});\nacc.async_accept([&](error_code ec, tcp::socket s) {\n    if (!ec) q.push(read_request(s));                     // never blocks\n});\nstd::vector<std::thread> pool;                            // synchronous layer\nfor (int i = 0; i < 4; ++i) pool.emplace_back([&]{ for (;;) handle(q.pop()); });\nio.run();                                                 // one reactor thread",
+      "pitfalls": [
+        "A handler that blocks inside a run() thread stalls all other completions on that thread; offload the work to the worker pool instead.",
+        "Queue items must own their payloads (move-only request objects); a pointer into a socket's read buffer that is recycled when the handler returns is a use-after-free.",
+        "A shared io_context used by several threads needs strands for per-connection ordering; otherwise handlers for one connection interleave."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/threads.html",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/strands.html"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutines",
+      "name": "Boost.Asio with C++20 stackless coroutines",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await async reads with co_spawn workers",
+      "implementation_notes": "C++20 stackless coroutines express the asynchronous layer as a linear co_await loop and the hand-off as an ordinary await on a channel, which removes the callback pyramid without moving the layer boundary. Use it where the toolchain is C++20 and the codebase already uses Asio's coroutine support; the runtime cost model and the blocking rules are unchanged, because a blocking call inside a coroutine still occupies the run() thread.",
+      "code_sketch": "awaitable<void> react(tcp::socket s) {\n  for (;;) {\n    auto req = co_await async_read_request(s);                    // async layer\n    co_await work_channel.async_send(error_code{}, req);          // hand-off\n    auto res = co_await result_channel.async_receive(use_awaitable);\n    co_await async_write(s, res);\n  }\n}",
+      "pitfalls": [
+        "co_spawn with the detached token erases ownership: the coroutine must own its socket and buffers, or the queued request outlives the connection.",
+        "A blocking call (file I/O, a mutex, a synchronous database client) inside a coroutine still blocks the run() thread; coroutines change the syntax, not the layering."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/threads.html"
+      ]
+    },
+    {
+      "variant_id": "ace-reactor-classic",
+      "name": "ACE_Reactor over ACE_Task worker threads (classic POSA2)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "ACE_Reactor with ACE_Task_Base and its built-in ACE_Message_Queue",
+      "implementation_notes": "The pattern's original C++ home: ACE_Reactor demultiplexes events in the asynchronous layer, while derivations of ACE_Task_Base carry the queueing layer as their built-in ACE_Message_Queue and the synchronous layer as the threads that activate() spawns and whose svc() blocks on getq(). Choose it for codebases that already depend on ACE or must stay at C++03; modern projects should prefer Asio.",
+      "code_sketch": "class Worker : public ACE_Task<ACE_MT_SYNCH> {          // queueing + synchronous layer\n public:\n  int svc() override {\n    ACE_Message_Block *mb;\n    while (getq(mb) != -1) { handle(mb); mb->release(); }\n    return 0;\n  }\n};\nWorker w; w.activate(THR_NEW_LWP | THR_JOINABLE, 4);     // four worker threads\nACE_Reactor::instance()->run_reactor_event_loop();       // asynchronous layer",
+      "pitfalls": [
+        "ACE_Message_Blocks are reference-counted: a missing release() leaks, and an early release gives a use-after-free that crosses the layer boundary.",
+        "ACE couples queue items to its own memory management and its Reactor/Service-Configurator machinery, so mixing it with modern std facilities needs care."
+      ],
+      "sources": [
+        "http://www.dre.vanderbilt.edu/~schmidt/ACE/book2/"
+      ]
+    }
+  ],
+  "default_variant": "asio-callbacks-threadpool",
+  "version": "1.0"
+}

@@ -1,0 +1,53 @@
+{
+  "pattern": "routing-slip",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "RoutingSlipBuilder + IActivity Execute/Compensate",
+  "implementation_notes": "The dominant .NET realization is Courier inside MassTransit: a RoutingSlipBuilder composes an itinerary of activities (IActivity/IExecuteActivity with Execute plus Compensate), and the resulting slip - tracking number, itinerary, activity log and compensation log - travels over a durable transport while the saga host executes each activity and, on failure, runs the recorded compensations in reverse order. Use it when the steps live in different services and the flow must survive restarts; for in-process step chains the delegate itinerary below is enough, and it is the only option when the itinerary must not depend on a broker.",
+  "code_sketch": "var builder = new RoutingSlipBuilder(NewId.NextGuid());\nbuilder.AddActivity(\"reserve\", new Uri(\"queue:reserve_execute\"), new { OrderId = order.Id });\nbuilder.AddActivity(\"charge\", new Uri(\"queue:charge_execute\"), new { OrderId = order.Id });\nawait bus.Publish(builder.Build());   // itinerary travels with the slip",
+  "pitfalls": [
+    "Activities are re-executed after transport redelivery, so Execute must be idempotent and Compensate must tolerate being called for work that partly happened.",
+    "Compensation is only possible for activities that ran and logged data, so a crash between side effect and log entry is the classic gap.",
+    "Itinerary arguments are part of the message contract: renaming an activity or its argument type breaks slips that are already in flight."
+  ],
+  "sources": [
+    "https://masstransit.io/documentation/patterns/routing-slip"
+  ],
+  "variants": [
+    {
+      "variant_id": "masstransit-courier",
+      "name": "MassTransit Courier routing slip",
+      "paradigm": "oo",
+      "idiom_name": "RoutingSlipBuilder + IActivity Execute/Compensate",
+      "implementation_notes": "The dominant .NET realization is Courier inside MassTransit: a RoutingSlipBuilder composes an itinerary of activities (IActivity/IExecuteActivity with Execute plus Compensate), and the resulting slip - tracking number, itinerary, activity log and compensation log - travels over a durable transport while the saga host executes each activity and, on failure, runs the recorded compensations in reverse order. Use it when the steps live in different services and the flow must survive restarts; for in-process step chains the delegate itinerary below is enough, and it is the only option when the itinerary must not depend on a broker.",
+      "code_sketch": "var builder = new RoutingSlipBuilder(NewId.NextGuid());\nbuilder.AddActivity(\"reserve\", new Uri(\"queue:reserve_execute\"), new { OrderId = order.Id });\nbuilder.AddActivity(\"charge\", new Uri(\"queue:charge_execute\"), new { OrderId = order.Id });\nawait bus.Publish(builder.Build());   // itinerary travels with the slip",
+      "pitfalls": [
+        "Activities are re-executed after transport redelivery, so Execute must be idempotent and Compensate must tolerate being called for work that partly happened.",
+        "Compensation is only possible for activities that ran and logged data, so a crash between side effect and log entry is the classic gap.",
+        "Itinerary arguments are part of the message contract: renaming an activity or its argument type breaks slips that are already in flight."
+      ],
+      "sources": [
+        "https://masstransit.io/documentation/patterns/routing-slip"
+      ]
+    },
+    {
+      "variant_id": "delegate-itinerary",
+      "name": "Immutable envelope with a Func<,> itinerary",
+      "paradigm": "functional",
+      "min_standard": "C#9",
+      "idiom_name": "record Envelope + IReadOnlyList<Func<Order, Task<Order>>>",
+      "implementation_notes": "In-process, a C# record with a read-only list of Func<Order, Task<Order>> steps and a cursor replaces the whole Router/Step class structure, and LINQ or a while loop applies the chain; records give copy-with semantics, so each step returns a new envelope and progress is a field of the value rather than a mutable object. This is the form to use inside one service or one process, and the only honest form when no broker is present. Cross-process slips must carry step ids instead, because delegates capture state and are not serializable; reach for the Courier variant when the flow has to survive restarts.",
+      "code_sketch": "public record Envelope(Order Body, IReadOnlyList<Func<Order, Task<Order>>> Slip, int Cursor = 0);\n\nvar envelope = new Envelope(order, new[] { Validate, Reserve, Charge });\nwhile (envelope.Cursor < envelope.Slip.Count)\n{\n    var step = envelope.Slip[envelope.Cursor];\n    envelope = envelope with\n    {\n        Body = await step(envelope.Body),\n        Cursor = envelope.Cursor + 1\n    };\n}",
+      "pitfalls": [
+        "A lambda-based slip cannot be serialized or queued, so it must never leave the process; sending delegates over a broker is a design error that only appears at runtime.",
+        "Captured services (IHttpClientFactory, DbContext, scoped services) go stale or leak when the slip is stored in a long-lived field - resolve dependencies per step instead.",
+        "Async steps that throw abort the loop with the cursor unmoved while earlier effects remain; decide explicitly between retry, compensation and dead-lettering."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.func-2"
+      ]
+    }
+  ],
+  "default_variant": "masstransit-courier",
+  "version": "1.0"
+}

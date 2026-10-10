@@ -1,0 +1,59 @@
+{
+  "pattern": "careful-buffering",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "sync_channel(bound) + SyncSender::send / try_send",
+  "implementation_notes": "The standard library's bounded channel is the pattern in its native vocabulary: sync_channel(bound) documents that when the internal buffer is full future sends block (bound 0 makes it a rendezvous), SyncSender::send is the block policy, and try_send is the reject policy - it returns immediately with a TrySendError that separates 'full' from 'receiver disconnected' and hands the unsent value back to the caller. Because ownership moves with the value, an item that is refused or dropped is still an owned object you can decide about, and no finaliser hook is needed. Reach for a hand-written ring only for drop-oldest/coalescing policies, watermarks, or when you need multiple consumers.",
+  "code_sketch": "let (tx, rx) = sync_channel::<Msg>(10_000);            // bound = capacity\nmatch tx.try_send(msg) {\n    Ok(()) => {}\n    Err(TrySendError::Full(msg)) => { dropped += 1; }          // full: value handed back\n    Err(TrySendError::Disconnected(msg)) => shut_down(msg),    // consumer is gone\n}\n// tx.send(msg) blocks instead; rx.recv() blocks while the buffer is empty",
+  "pitfalls": [
+    "Collapsing TrySendError::Full and TrySendError::Disconnected loses the difference between back-pressure and a dead consumer - the two need different responses.",
+    "std::sync::mpsc has exactly one consumer: the Receiver cannot be cloned, so a worker pool needs crossbeam-channel or an async runtime instead of a shared std Receiver.",
+    "Calling the blocking send() while holding a lock or from a single-threaded async runtime blocks the thread that would drain the channel; use try_send on latency-critical paths."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html",
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-sync-channel",
+      "name": "std::sync::mpsc::sync_channel with try_send",
+      "paradigm": "concurrent",
+      "implementation_notes": "The standard library's bounded channel is the pattern in its native vocabulary: sync_channel(bound) documents that when the internal buffer is full future sends block (bound 0 makes it a rendezvous), SyncSender::send is the block policy, and try_send is the reject policy - it returns immediately with a TrySendError that separates 'full' from 'receiver disconnected' and hands the unsent value back to the caller. Because ownership moves with the value, an item that is refused or dropped is still an owned object you can decide about, and no finaliser hook is needed. Reach for a hand-written ring only for drop-oldest/coalescing policies, watermarks, or when you need multiple consumers.",
+      "min_standard": "Rust1.0",
+      "idiom_name": "sync_channel(bound) + SyncSender::send / try_send",
+      "code_sketch": "let (tx, rx) = sync_channel::<Msg>(10_000);            // bound = capacity\nmatch tx.try_send(msg) {\n    Ok(()) => {}\n    Err(TrySendError::Full(msg)) => { dropped += 1; }          // full: value handed back\n    Err(TrySendError::Disconnected(msg)) => shut_down(msg),    // consumer is gone\n}\n// tx.send(msg) blocks instead; rx.recv() blocks while the buffer is empty",
+      "pitfalls": [
+        "Collapsing TrySendError::Full and TrySendError::Disconnected loses the difference between back-pressure and a dead consumer - the two need different responses.",
+        "std::sync::mpsc has exactly one consumer: the Receiver cannot be cloned, so a worker pool needs crossbeam-channel or an async runtime instead of a shared std Receiver.",
+        "Calling the blocking send() while holding a lock or from a single-threaded async runtime blocks the thread that would drain the channel; use try_send on latency-critical paths."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html",
+        "https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html"
+      ]
+    },
+    {
+      "variant_id": "tokio-bounded-mpsc",
+      "name": "tokio bounded mpsc channel",
+      "paradigm": "concurrent",
+      "implementation_notes": "In async Rust the same vocabulary reappears with suspending operations: mpsc::channel(capacity) creates a bounded channel explicitly documented as providing backpressure, send().await waits for room instead of blocking a thread, try_send returns TrySendError::Full immediately (the reject policy), and a capacity of 0 panics, so the bound can never be omitted by accident. Multi-producer is built in via cloned Senders, which makes it the default for task pools; watch and broadcast channels cover the coalescing ('latest value wins') and fan-out shapes, which are the same capacity decision with different semantics. Prefer it over std sync_channel whenever the producer is a task rather than a thread.",
+      "min_standard": "Rust1.39",
+      "requires_features": [
+        "async-await"
+      ],
+      "idiom_name": "tokio::sync::mpsc::channel(capacity) + send().await / try_send",
+      "code_sketch": "let (tx, mut rx) = mpsc::channel::<Msg>(10_000);   // capacity 0 panics: the bound is mandatory\ntokio::spawn(async move { while let Some(m) = rx.recv().await { process(m).await } });\nmatch tx.try_send(msg) {\n    Ok(()) => {}\n    Err(TrySendError::Full(_)) => dropped += 1,     // full: shed instead of awaiting room\n    Err(TrySendError::Closed(_)) => return,\n}",
+      "pitfalls": [
+        "Awaiting send() from a task that the consumer itself depends on self-deadlocks once the channel is full: back-pressure only works when the producer is not on the consumer's critical path.",
+        "The receiver dropping closes the channel, after which every send fails: handle Closed separately from Full or shutdown will be reported as overload.",
+        "Tasks spawned to fill the channel are not joined by default, so a shutdown can leave buffered work unprocessed; drain, close and await the join handles as part of the design."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/mpsc/fn.channel.html"
+      ]
+    }
+  ],
+  "default_variant": "std-sync-channel",
+  "version": "1.0"
+}

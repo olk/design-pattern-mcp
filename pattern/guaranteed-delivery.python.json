@@ -1,0 +1,67 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "BlockingChannel confirm_delivery + BasicProperties(delivery_mode=2) + basic_ack",
+  "implementation_notes": "pika turns the broker into the store with three calls: channel.confirm_delivery() enables publisher confirms, basic_publish(..., properties=pika.BasicProperties(delivery_mode=2, message_id=order_id)) marks the message persistent, and the call then blocks until the broker confirms (RabbitMQ confirms a persistent message to a durable - best quorum - queue only after it is persisted). On the consuming side, basic_consume plus basic_ack after the business commit is the receiver half, with prefetch_count bounding in-flight unacknowledged messages. The classic channel/consumer objects are still the right shape here; Python offers no simpler durable-messaging idiom beyond a database outbox (next variant).",
+  "code_sketch": "ch.confirm_delivery()                                   # publisher confirms on\nch.queue_declare(\"orders\", durable=True,\n                 arguments={\"x-queue-type\": \"quorum\"})  # replicated store\nch.basic_publish(exchange=\"\", routing_key=\"orders\", body=body,\n                 properties=pika.BasicProperties(delivery_mode=2, message_id=order_id),\n                 mandatory=True)                            # raises on nack/unroutable\n\ndef on_message(ch, method, props, body):\n    save_order(body)                              # business commit\n    ch.basic_ack(method.delivery_tag)              # then the delivery ack",
+  "pitfalls": [
+    "confirm_delivery() only affects publishes issued on that channel afterwards and raises UnroutableError/NackError instead of returning a flag - catching and continuing loses messages.",
+    "delivery_mode=2 does nothing useful on a transient queue or an auto-delete exchange; the queue's durability is the other half of the configuration.",
+    "pika channels are not thread-safe and the blocking adapter must not run long work inside a consumer callback (heartbeats and the ack window break) - hand work to a worker thread with add_callback_threadsafe.",
+    "basic_ack before the database commit converts a crash into silent loss, and acking twice closes the channel with a PRECONDITION_FAILED error."
+  ],
+  "sources": [
+    "https://pika.readthedocs.io/en/stable/modules/channel.html",
+    "https://www.rabbitmq.com/docs/quorum-queues"
+  ],
+  "variants": [
+    {
+      "variant_id": "rabbitmq-confirms",
+      "name": "RabbitMQ publisher confirms with durable quorum queue (pika)",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "pika",
+        "rabbitmq"
+      ],
+      "idiom_name": "BlockingChannel confirm_delivery + BasicProperties(delivery_mode=2) + basic_ack",
+      "implementation_notes": "pika turns the broker into the store with three calls: channel.confirm_delivery() enables publisher confirms, basic_publish(..., properties=pika.BasicProperties(delivery_mode=2, message_id=order_id)) marks the message persistent, and the call then blocks until the broker confirms (RabbitMQ confirms a persistent message to a durable - best quorum - queue only after it is persisted). On the consuming side, basic_consume plus basic_ack after the business commit is the receiver half, with prefetch_count bounding in-flight unacknowledged messages. The classic channel/consumer objects are still the right shape here; Python offers no simpler durable-messaging idiom beyond a database outbox (next variant).",
+      "code_sketch": "ch.confirm_delivery()                                   # publisher confirms on\nch.queue_declare(\"orders\", durable=True,\n                 arguments={\"x-queue-type\": \"quorum\"})  # replicated store\nch.basic_publish(exchange=\"\", routing_key=\"orders\", body=body,\n                 properties=pika.BasicProperties(delivery_mode=2, message_id=order_id),\n                 mandatory=True)                            # raises on nack/unroutable\n\ndef on_message(ch, method, props, body):\n    save_order(body)                              # business commit\n    ch.basic_ack(method.delivery_tag)              # then the delivery ack",
+      "pitfalls": [
+        "confirm_delivery() only affects publishes issued on that channel afterwards and raises UnroutableError/NackError instead of returning a flag - catching and continuing loses messages.",
+        "delivery_mode=2 does nothing useful on a transient queue or an auto-delete exchange; the queue's durability is the other half of the configuration.",
+        "pika channels are not thread-safe and the blocking adapter must not run long work inside a consumer callback (heartbeats and the ack window break) - hand work to a worker thread with add_callback_threadsafe.",
+        "basic_ack before the database commit converts a crash into silent loss, and acking twice closes the channel with a PRECONDITION_FAILED error."
+      ],
+      "sources": [
+        "https://pika.readthedocs.io/en/stable/modules/channel.html",
+        "https://www.rabbitmq.com/docs/quorum-queues"
+      ]
+    },
+    {
+      "variant_id": "sql-outbox",
+      "name": "Transactional outbox table with a polling dispatcher",
+      "paradigm": "procedural",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "sqlalchemy-or-sqlite3"
+      ],
+      "idiom_name": "outbox row in the business transaction + FOR UPDATE SKIP LOCKED poller",
+      "implementation_notes": "With the business state in the same database, the outbox replaces the messaging store: add the message row inside the business transaction (one session.commit() writes state and message), and let a dispatcher send and delete it - SELECT ... FOR UPDATE SKIP LOCKED on Postgres, or a single-writer BEGIN IMMEDIATE transaction on SQLite. The database's WAL is the durable copy and 'write plus send' becomes one atomic commit, so no XA and no dual-write window is needed. This is the idiomatic Python shape when Redis/RabbitMQ cannot join the transaction; use a broker client variant when the throughput per message matters more than atomicity.",
+      "code_sketch": "with Session(engine) as s, s.begin():            # one transaction\n    s.add(Order(id=oid, status=\"new\"))\n    s.add(Outbox(id=oid, topic=\"orders\", payload=body))   # durable with the state\n\nrow = s.execute(text(\"SELECT id, topic, payload FROM outbox \"\n                     \"ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1\")).one()\nbroker.send(row.topic, row.payload)              # at-least-once\ns.execute(text(\"DELETE FROM outbox WHERE id=:i\"), {\"i\": row.id})\ns.commit()                                        # forget only after the send",
+      "pitfalls": [
+        "Calling the broker outside the transaction that wrote the row reintroduces the dual write; the dispatcher must not start before the transaction commits (enqueue after commit hooks are safer than a nested session).",
+        "Sending and deleting in separate transactions duplicates on a crash - intended at-least-once, so the consumer needs dedup or idempotence on the outbox id.",
+        "SQLite needs WAL mode and BEGIN IMMEDIATE (or a single writer) because it has no SKIP LOCKED; concurrent pollers otherwise raise 'database is locked'.",
+        "An outbox without retention or archive cleans up turns into an ever-growing table, and a poller that stops logging is an invisible delivery outage."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://www.postgresql.org/docs/current/sql-select.html"
+      ]
+    }
+  ],
+  "default_variant": "rabbitmq-confirms",
+  "version": "1.0"
+}

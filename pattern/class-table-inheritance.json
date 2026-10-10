@@ -1,0 +1,211 @@
+{
+  "category": "persistence-state",
+  "name": "class-table-inheritance",
+  "aliases": [
+    "table-per-type",
+    "table-per-subclass",
+    "joined-table-inheritance",
+    "TPT",
+    "table-per-class"
+  ],
+  "intent": "Represent an inheritance hierarchy relationally with one table per class: each table stores only the attributes the class itself declares, and each subclass table's primary key doubles as a foreign key to its superclass table, so every attribute is stored exactly once and the schema itself enforces that every subtype row is also a base-class row.",
+  "problem": "An object hierarchy has to be persisted relationally and the schema keeps lying about it: shared and subclass-specific attributes either share one wide table full of nullable columns, or every concrete class duplicates the inherited columns. Neither layout can state a subclass attribute as NOT NULL, neither shows which class actually owns a column, and adding a subtype or changing one subtype's attributes forces a schema edit that touches unrelated types.",
+  "context": "Applies where a relational store holds a genuine IS-A hierarchy that is mapped to objects, the hierarchy has attributes declared at several levels (not just a status flag), and both polymorphic reads by base type and per-subclass integrity matter. It is the middle option between single table inheritance (one table plus a discriminator, cheap reads, nullable subtype columns) and concrete table inheritance (no joins, duplicated base columns), and it fits best where the schema is owned or reviewed — a DBA, a legacy layout, or a regulated data model. ORM-specific names: SQLAlchemy calls this joined table inheritance, JPA/Hibernate calls it JOINED, EF Core calls it TPT (table-per-type).",
+  "benefits": [
+    "Every attribute is stored exactly once, in the table of the class that declares it: no nullable padding for sibling types and no duplicated base columns.",
+    "Constraints stay honest: subclass-only columns can be NOT NULL, UNIQUE, CHECKed and indexed, precisely because no sibling type ever writes to them.",
+    "Referential integrity is structural: subclass keys are foreign keys to the superclass table, so an orphaned subtype row cannot exist, and base-table references stay valid for every subtype.",
+    "A new subclass adds one table plus its mapper and touches no sibling table or sibling mapper.",
+    "Polymorphic reads are natural: a base-class query joins only the paths it needs, while a query restricted to one subclass reads one join path and can use that subclass table's indexes.",
+    "The base table alone answers base-class questions, so the cheap common path stays cheap.",
+    "Normalized schema satisfies database purists and regulatory audits where nullable columns representing non-applicable attributes are unacceptable.",
+    "Each subtype's physical storage is independent: buffer pages, VACUUM schedules, and index maintenance are type-specific, eliminating the lock contention that co-located subtypes create in single-table layouts."
+  ],
+  "tradeoffs": [
+    "Every subclass read pays one join per class in its inheritance path; deep hierarchies (more than 3–4 levels) degrade predictably, and EF Core's own modelling guidance warns that table-per-type is slower than table-per-hierarchy.",
+    "Insert, update and delete touch every table in the path and must happen in one transaction, or the schema temporarily disagrees with the object.",
+    "Polymorphic loading needs a discriminator plus mapper machinery that resolves the concrete class per row; without it you get partially populated objects rather than an error.",
+    "The table layout encodes the class structure, so refactoring the hierarchy (pushing a field up or down) becomes a schema migration instead of a code move.",
+    "Object identity now spans rows in several tables, which complicates bulk operations, exports, reporting SQL and any code that reaches the database without the mapper.",
+    "There is more mapping machinery than the single-table alternative: one mapper per class, a registry of type codes and a join builder, and hand-written queries become harder to read.",
+    "The JOIN cost is paid even for leaf-class queries: a query for a leaf subclass that never accesses base-class columns still joins the entire ancestor chain."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 4,
+    "performance": 5,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Class hierarchy",
+      "responsibility": "The domain types whose attributes are partitioned across tables; each class's declared attributes determine which table owns which column."
+    },
+    {
+      "role": "Base table (root table)",
+      "responsibility": "Holds the attributes declared by the root class plus the shared primary key and, normally, the type code (discriminator) that says which concrete class a row is."
+    },
+    {
+      "role": "Subclass table",
+      "responsibility": "One per subclass; its primary key is also a foreign key to the table of its superclass, and it stores only the attributes that class declares."
+    },
+    {
+      "role": "Mapper per class",
+      "responsibility": "Reads and writes the join path for its class, converts rows to objects, and resolves the concrete class from the type code on polymorphic reads (Inheritance Mappers)."
+    },
+    {
+      "role": "Shared key (identity field)",
+      "responsibility": "The key value that ties the rows of one object across the tables together and gives the object its identity (Identity Field)."
+    },
+    {
+      "role": "Discriminator column",
+      "responsibility": "A column (usually on the base table) whose value identifies the concrete subclass for each row, enabling the mapper to resolve which class to instantiate on polymorphic reads."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "A billing hierarchy (payment base table plus credit-card and bank-transfer tables) where each method's columns are mandatory only for that method.",
+    "Party models: a shared party table carrying identity, with person and organisation tables holding the type-specific columns.",
+    "Product or asset catalogues with a common item table plus per-category attribute tables owned by different teams.",
+    "Regulated or DBA-owned schemas that require normalised tables, no nullable type columns and database-enforced foreign keys.",
+    "Legacy databases already laid out as one table per class, where new domain classes have to map onto the existing shape.",
+    "Deep type trees in which queries usually target one concrete subtype while the base table remains the cheap common lookup.",
+    "Multi-tenant SaaS event systems: a shared events table plus per-type extension tables (user_events, billing_events) where type-specific columns must be NOT NULL for their type and where tenant isolation requires per-type foreign keys.",
+    "Notification systems: a base notification table (user_id, created_at, read) with EmailNotification and SmsNotification extension tables where channel-specific columns (email_address, phone_number) must be NOT NULL enforced at the database level.",
+    "Organisational hierarchies where the base party table is referenced by many other tables, but subtype-specific columns differ significantly across Person, Organisation, and GovernmentAgency.",
+    "Django's built-in multi-table inheritance: every child model gets its own table linked to the parent by an implicit OneToOneField, used for hierarchies like Place/Restaurant where each model must stay independently queryable.",
+    "Doctrine ORM's JOINED strategy (the Person/Employee example): discriminator column on the root table plus per-class child tables joined by foreign key, chosen when changing one subtype's columns must not touch sibling tables.",
+    "Rails apps that outgrow single-table inheritance and move subclass columns into per-type tables via delegated types or the activerecord-cti / class-table-inheritance gems."
+  ],
+  "avoid_when": [
+    "The hierarchy is small and stable with few subclass-specific columns: single table inheritance (one table plus a type code) is far simpler and pays no joins.",
+    "Reads dominate and almost always load whole hierarchies polymorphically: joining every subclass table costs more than the nullable columns it avoids.",
+    "Subclasses add no attributes of their own — the difference is behaviour or a status flag: a type column, or Special Case objects, replaces the hierarchy.",
+    "The types only share a few fields but are not an IS-A family: composition (a shared component or Embedded Value) models that better than a mapped hierarchy.",
+    "The schema is not yours to shape (third-party or dataset-owned) or the store is not relational: this is a schema-shape decision, not only a mapping decision.",
+    "EF Core is the ORM and the hierarchy has more than 5–6 subclasses: EF Core's TPT query generation historically produces extremely complex SQL with many LEFT OUTER JOINs that degrades badly at scale.",
+    "Polymorphic queries returning large result sets are the primary access pattern: the per-row joins outweigh the storage savings for most workloads."
+  ],
+  "language_files": {
+    "generic": "class-table-inheritance.generic.json",
+    "c": "class-table-inheritance.c.json",
+    "cplusplus": "class-table-inheritance.cplusplus.json",
+    "csharp": "class-table-inheritance.csharp.json",
+    "go": "class-table-inheritance.go.json",
+    "java": "class-table-inheritance.java.json",
+    "javascript": "class-table-inheritance.javascript.json",
+    "kotlin": "class-table-inheritance.kotlin.json",
+    "python": "class-table-inheritance.python.json",
+    "ruby": "class-table-inheritance.ruby.json",
+    "rust": "class-table-inheritance.rust.json",
+    "scala": "class-table-inheritance.scala.json",
+    "swift": "class-table-inheritance.swift.json",
+    "typescript": "class-table-inheritance.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "declarative"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "single-table-inheritance",
+    "concrete-table-inheritance",
+    "inheritance-mappers",
+    "identity-field",
+    "foreign-key-mapping",
+    "data-mapper",
+    "metadata-mapping",
+    "lazy-load"
+  ],
+  "anti_patterns": [
+    "One table per class schemas in which every subclass table also repeats the inherited columns — concrete table inheritance wearing a joined schema's clothes, with the same update anomalies the pattern removes.",
+    "Subclass tables with their own separately generated surrogate keys instead of a key that is also a foreign key to the base table: nothing then enforces one-to-one, so duplicated identities and orphan rows appear.",
+    "Inventing a new subclass (and table) for every minor behavioural variation, so the schema grows a table per special case and every read joins half the hierarchy.",
+    "Loading a subclass through a query that joins only part of its inheritance path and handing out partially populated objects.",
+    "Hand-written SQL that reads the base table alone and then assumes subclass columns are present.",
+    "Mixing STI and CTI in the same hierarchy without clear boundaries: the polymorphic query planner receives a mix of nullable columns and joined tables that cannot be optimised effectively.",
+    "Using CTI for a hierarchy where subtypes are queried together (polymorphically) more than 80% of the time — the joins outweigh every other benefit."
+  ],
+  "design_principles": [
+    "Single source of truth: each attribute is stored once, where the class declares it.",
+    "Open/closed: a new subclass extends the schema and the mapper set without editing existing mappers.",
+    "Separation of concerns: keys, attribute storage and mapping knowledge are separate, and domain classes stay ignorant of the tables.",
+    "Integrity by construction: making the subclass key a foreign key states the one-to-one invariant the object model assumes.",
+    "Liskov substitution at the data level: a subtype row is a base-table row, so references to the base table remain valid for every subtype.",
+    "Query cost is proportional to data accessed: only the tables involved in a query contribute to its cost; base-table-only queries never pay subclass join penalties."
+  ],
+  "best_practices": [
+    "Let the base table own the primary key and the discriminator/type code; make every subclass table's primary key a foreign key to its superclass's table (PK = FK).",
+    "Index the discriminator column on the base table; index each subclass table's FK column (the shared key) since it is the join key on every polymorphic query.",
+    "Write all tables of a path in one transaction — base row first on insert, leaf row first on delete — or let ON DELETE CASCADE clean up the path.",
+    "Keep one mapper per class (Inheritance Mappers) and let it own the join path for that class so the join is written once.",
+    "Load subclass-only columns only when the query needs them; a base-class query should not pay for subclass joins it does not use.",
+    "Keep subclass column names disjoint from the names in their superclass tables, since name-resolved mappers and hand-written readers confuse them.",
+    "Record the mapping (class to table and to type code) as metadata or configuration instead of re-deriving it in each mapper.",
+    "Prefer shallow hierarchies (3 or fewer levels): each level adds one JOIN to every leaf-class query; beyond 3 levels the join cost becomes measurable.",
+    "For SQLAlchemy: configure polymorphic_load='selectin' on leaf subclasses to eliminate N+1 lazy-load queries; use selectin_polymorphic() for bulk base-class queries.",
+    "For Hibernate/JPA: add @BatchSize(size=25) on subclass entities to batch lazy-loads; consider a discriminator column even for JOINED to let Hibernate skip the CASE WHEN EXISTS subqueries.",
+    "For EF Core: only use TPT when NOT NULL constraints on subclass columns are a hard requirement; otherwise prefer TPH; always review generated SQL with EXPLAIN/ANALYZE.",
+    "Use bulk operations (COPY, batch insert) at the appropriate level: insert base rows in bulk, then subclass rows in bulk — never interleave them.",
+    "For polymorphic reporting queries across the full hierarchy, consider a denormalised read replica or a materialized view rather than repeated multi-join queries."
+  ],
+  "pitfalls": [
+    "N+1 lazy-load queries: the default behavior when loading a base class is to NOT join subclass tables, so accessing subclass attributes triggers one SELECT per row. Fix with eager loading (selectin_polymorphic in SQLAlchemy, @BatchSize in Hibernate).",
+    "Deep hierarchy join amplification: a 5-level hierarchy pays 4 joins per leaf query regardless of which leaf; plan the hierarchy depth deliberately.",
+    "Bulk delete without proper ordering: deleting from subclass tables before the base table violates FK constraints unless ON DELETE CASCADE is used — always delete from base or use CASCADE.",
+    "Discriminator drift: if the application code sets the discriminator column directly rather than through the ORM mapper, wrong type codes cause object instantiation failures at runtime.",
+    "Cross-ORM polymorphic associations: a relationship from a CTI-mapped entity to the base class that is then loaded through a different ORM session can return partially-loaded objects.",
+    "Schema drift during refactoring: moving a field up or down the class hierarchy is a multi-table migration, not a code move — plan migrations with backward compatibility windows.",
+    "Key generation strategy mismatch: using TABLE/GENERATED ALWAYS AS IDENTITY on the base table but sequences or UUIDs on subclasses breaks the PK=FK invariant unless the same generator is used.",
+    "Partial index on base table columns: a partial index on base columns filtered by discriminator can be bypassed by ORM polymorphic queries that rewrite the filter incorrectly.",
+    "EF Core TPT query plan bloat: EF Core's TPT query generation can produce query plans with hundreds of joins at scale, which is an EF Core limitation, not a fundamental CTI problem.",
+    "Wrong move: mapping 30+ sibling subclasses onto one JOINED base entity -> every polymorphic base query fans out into a join per subclass, hitting MySQL's 61-table join limit and collapsing the query plan -> instead collapse sibling leaf types (SINGLE_TABLE with secondary tables keeps the per-type columns) or split the hierarchy into separate roots.",
+    "Wrong move: defining a ForeignKey on a Django multi-table inheritance child model without an explicit related_name -> the implicit parent-link reverse accessor collides and system checks fail -> instead set related_name on every relation declared in a child model.",
+    "Wrong move: using Doctrine partial objects to dodge JOINED joins -> any later access to a field outside the partial selection returns an incomplete object or triggers hidden reloads -> instead keep hot polymorphic fields on the root table or explicitly join the subtype tables the query reads."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (2002) — Class Table Inheritance (Object-Relational Structural Patterns, Chapter 12).",
+    "https://martinfowler.com/eaaCatalog/classTableInheritance.html",
+    "https://learning.oreilly.com/library/view/patterns-of-enterprise/0321127420/ch12.html#ch12lev1sec8",
+    "SQLAlchemy 2.x Documentation: Mapping Class Inheritance Hierarchies — https://docs.sqlalchemy.org/en/21/orm/inheritance.html",
+    "SQLAlchemy 2.x Documentation: Writing SELECT statements for Inheritance Mappings — https://docs.sqlalchemy.org/en/21/orm/queryguide/inheritance.html",
+    "Vlad Mihalcea, High-Performance Java Persistence, Chapter 12 — Inheritance — https://vladmihalcea.com/high-performance-java-persistence-chapter-12-inheritance/",
+    "Vlad Mihalcea, 'The best way to use entity inheritance with JPA and Hibernate' (2017) — https://vladmihalcea.com/the-best-way-to-use-entity-inheritance-with-jpa-and-hibernate/",
+    "Thorben Janssen, 'Complete Guide to Inheritance Strategies with JPA and Hibernate' — https://thorben-janssen.com/complete-guide-inheritance-strategies-jpa-hibernate/",
+    "akquinet DE Blog: JPA Pitfalls (5) — Object-Relational Mapping and Inheritance (2020) — https://blog.akquinet.de/2020/03/29/jpa-pitfalls-5-object-relational-mapping-and-inheritance/",
+    "Microsoft EF Core Documentation: Inheritance — https://learn.microsoft.com/en-us/ef/core/modeling/inheritance",
+    "João Antunes, Coding Militia: 'Checking out EF Core inheritance options' (2023) — https://blog.codingmilitia.com/2023/05/08/checking-out-ef-core-inheritance-options/",
+    "Martin Lorenz, Jan-Peer Rudolph, Günter Hesse, Matthias Uflacker, Hasso Plattner, 'Object-Relational Mapping Revisited — A Quantitative Study on the Impact of Database Technology on O/R Mapping Strategies' (SCISpace, 2017) — https://scispace.com/pdf/object-relational-mapping-revisited-a-quantitative-study-on-yj2jmxph3o.pdf",
+    "Gold Lapel: 'Single Table Inheritance on PostgreSQL: The Performance Pitfalls at Scale, and the Escape Routes' (2026) — https://goldlapel.com/grounds/orm-performance/sti-postgres-performance-pitfalls",
+    "Baeldung: 'How to Represent Inheritance in a Database?' — https://www.baeldung.com/sql/database-inheritance",
+    "Java Design Patterns: Table Inheritance Pattern — https://java-design-patterns.com/patterns/table-inheritance/",
+    "Viprasol: 'PostgreSQL Table Inheritance and Polymorphism' (2026) — https://viprasol.com/blog/postgres-table-inheritance/",
+    "Hibernate ORM 5.0 Documentation: Inheritance mapping — https://docs.jboss.org/hibernate/orm/5.0/userguide/html_single/chapters/domain/inheritance.html",
+    "Hibernate ORM 8.0 Javadocs: JoinedSubclassEntityPersister — https://docs.hibernate.org/orm/8.0/javadocs/org/hibernate/persister/entity/JoinedSubclassEntityPersister.html",
+    "InfoWorld: 'Inheritance relationships in JPA and Hibernate' (Steven Haines, 2019) — https://www.infoworld.com/article/2260314/inheritance-relationships-in-jpa-and-hibernate.html",
+    "Django Documentation: Models — Multi-table inheritance — https://docs.djangoproject.com/en/6.1/topics/db/models/",
+    "Doctrine ORM Documentation: Inheritance Mapping (JOINED strategy) — https://www.doctrine-project.org/projects/doctrine-orm/en/latest/reference/inheritance-mapping.html",
+    "Rails API Documentation: ActiveRecord::DelegatedType — https://api.rubyonrails.org/classes/ActiveRecord/DelegatedType.html",
+    "khata-jp/activerecord-cti: Class Table Inheritance gem for Rails ActiveRecord — https://github.com/khata-jp/activerecord-cti",
+    "Andrei Kists, Life in IDE: 'How to avoid subclasses join in Hibernate model' (2015) — http://lifeinide.blogspot.com/2015/09/how-to-avoid-subclasses-join-in.html"
+  ],
+  "related_patterns_notes": {
+    "mapped-superclass": "mapped-superclass",
+    "table-per-hierarchy": "table-per-hierarchy",
+    "table-per-concrete-type": "table-per-concrete-type"
+  }
+}

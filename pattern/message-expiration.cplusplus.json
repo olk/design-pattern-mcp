@@ -1,0 +1,57 @@
+{
+  "pattern": "message-expiration",
+  "language": "cplusplus",
+  "support": "manual",
+  "variants": [
+    {
+      "variant_id": "steady-clock-expiry-index",
+      "name": "In-process expiry index over steady_clock deadlines",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::priority_queue over steady_clock::time_point deadlines",
+      "implementation_notes": "Standard C++ has no TTL facility, so the receiver keeps an expiry index: each message carries a steady_clock::time_point deadline and a min-heap ordered by deadline (std::priority_queue with std::greater) lets the worker drop everything whose deadline has passed before it dispatches. steady_clock is monotonic and unaffected by wall-clock jumps, which is why it is the right local clock, but its epoch is unspecified and process-local, so the wire value must be an absolute UTC timestamp that each hop converts once. The hand-built index is still justified inside a process - there is no stdlib equivalent of the JMS/AMQP expiry contract - while on an AMQP broker the per-message expiration property is the better enforcement point.",
+      "code_sketch": "using clock = std::chrono::steady_clock;\nstruct Item { clock::time_point deadline; Message msg; };\nstruct Later { bool operator()(const Item& a, const Item& b) const { return a.deadline > b.deadline; } };\nstd::priority_queue<Item, std::vector<Item>, Later> pending;\n\nvoid drop_expired() {\n    const auto now = clock::now();\n    while (!pending.empty() && pending.top().deadline <= now) {\n        dead_letter(pending.top().msg);   // expired: never dispatched\n        pending.pop();\n    }\n}",
+      "pitfalls": [
+        "steady_clock's epoch is unspecified (typically boot time) - never serialize it; convert to an absolute UTC deadline at the boundary and accept the bounded skew between hosts.",
+        "The heap only exposes expired items when they reach the top, so a long-deadline item at the top delays cleanup of everything behind it; sweep on a timer derived from the earliest deadline instead of only on dequeue.",
+        "Calling pop() or top() on an empty std::priority_queue is undefined behaviour, and payloads kept alive in the index must still be released deterministically (move them out or use smart pointers)."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/chrono/steady_clock",
+        "https://en.cppreference.com/w/cpp/container/priority_queue"
+      ]
+    },
+    {
+      "variant_id": "broker-expiration-property",
+      "name": "Broker-enforced per-message expiry property",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "AMQP 0-9-1 per-message expiration property (RabbitMQ)",
+      "implementation_notes": "When the transport is already AMQP, expiry becomes message metadata instead of application code: publish with the expiration property (a string of milliseconds) or declare x-message-ttl on the queue, and let the broker discard or dead-letter expired messages - route them through a dead-letter exchange so expiry stays observable. This needs no timers in the process, survives restarts and multiple consumers, and is the closest C++ comes to the JMS TTL contract; AMQP 1.0 clients use the ttl header (milliseconds as uint64) instead, and mixing the two dialects silently produces messages that never expire. Choose the in-process index only when there is no broker, or when the check must run on the consumer's own clock.",
+      "code_sketch": "AMQP::Message msg(payload.data(), payload.size(), \"orders\", \"\", false);\nmsg.setExpiration(\"60000\");            // ms as string (AMQP 0-9-1 property)\nchannel.publish(\"\", \"orders\", msg);\n// queue args: x-dead-letter-exchange -> expired messages arrive there with reason\n//              x-message-ttl         -> queue-level backstop",
+      "pitfalls": [
+        "RabbitMQ evaluates per-message TTL only when a message reaches the queue head, so a large backlog still holds expired payloads and their memory, and dead-lettering strips the original expiration so the message cannot expire again downstream.",
+        "The expiration value is a string in AMQP 0-9-1 and a ttl header in milliseconds for AMQP 1.0; passing a number where a string is expected (or the wrong header) silently yields a never-expiring message.",
+        "A TTL longer than the queue-level x-message-ttl is capped by the queue, so the effective policy has to be read from the broker configuration, not from the publish call."
+      ],
+      "sources": [
+        "https://www.rabbitmq.com/docs/ttl",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    }
+  ],
+  "default_variant": "steady-clock-expiry-index",
+  "idiom_name": "std::priority_queue over steady_clock::time_point deadlines",
+  "implementation_notes": "Standard C++ has no TTL facility, so the receiver keeps an expiry index: each message carries a steady_clock::time_point deadline and a min-heap ordered by deadline (std::priority_queue with std::greater) lets the worker drop everything whose deadline has passed before it dispatches. steady_clock is monotonic and unaffected by wall-clock jumps, which is why it is the right local clock, but its epoch is unspecified and process-local, so the wire value must be an absolute UTC timestamp that each hop converts once. The hand-built index is still justified inside a process - there is no stdlib equivalent of the JMS/AMQP expiry contract - while on an AMQP broker the per-message expiration property is the better enforcement point.",
+  "code_sketch": "using clock = std::chrono::steady_clock;\nstruct Item { clock::time_point deadline; Message msg; };\nstruct Later { bool operator()(const Item& a, const Item& b) const { return a.deadline > b.deadline; } };\nstd::priority_queue<Item, std::vector<Item>, Later> pending;\n\nvoid drop_expired() {\n    const auto now = clock::now();\n    while (!pending.empty() && pending.top().deadline <= now) {\n        dead_letter(pending.top().msg);   // expired: never dispatched\n        pending.pop();\n    }\n}",
+  "pitfalls": [
+    "steady_clock's epoch is unspecified (typically boot time) - never serialize it; convert to an absolute UTC deadline at the boundary and accept the bounded skew between hosts.",
+    "The heap only exposes expired items when they reach the top, so a long-deadline item at the top delays cleanup of everything behind it; sweep on a timer derived from the earliest deadline instead of only on dequeue.",
+    "Calling pop() or top() on an empty std::priority_queue is undefined behaviour, and payloads kept alive in the index must still be released deterministically (move them out or use smart pointers)."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/chrono/steady_clock",
+    "https://en.cppreference.com/w/cpp/container/priority_queue"
+  ],
+  "version": "1.0"
+}

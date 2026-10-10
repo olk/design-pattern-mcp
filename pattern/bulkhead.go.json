@@ -1,0 +1,57 @@
+{
+  "pattern": "bulkhead",
+  "language": "go",
+  "support": "idiomatic",
+  "implementation_notes": "Go has no pool type because the channel is the pool: one buffered channel plus N worker goroutines per dependency bounds in-flight work, and a non-blocking send (select with default) is the fail-fast rejection path; this is the idiomatic realization and needs no dependency. Keep it when a blocking dependency must be isolated onto dedicated workers; when tasks are spawned per request instead of queued, the sibling semaphore variant is usually smaller.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "channel-worker-pool",
+      "name": "buffered channel + worker goroutines per dependency",
+      "paradigm": "concurrent",
+      "implementation_notes": "Go has no pool type because the channel is the pool: one buffered channel plus N worker goroutines per dependency bounds in-flight work, and a non-blocking send (select with default) is the fail-fast rejection path; this is the idiomatic realization and needs no dependency. Keep it when a blocking dependency must be isolated onto dedicated workers; when tasks are spawned per request instead of queued, the sibling semaphore variant is usually smaller.",
+      "min_standard": "Go1.0",
+      "idiom_name": "buffered channel worker pool with select/default rejection",
+      "code_sketch": "jobs := make(chan Request, 16)          // bounded queue per dependency\nfor range 8 {                          // 8 workers = the bulkhead width\n    go func() { for r := range jobs { callDependency(r) } }()\n}\n\nselect {\ncase jobs <- req:                      // admitted\ncase <-ctx.Done():\n    return ctx.Err()\ndefault:                               // saturated: fail fast\n    return errBulkheadFull\n}",
+      "pitfalls": [
+        "Spawning a goroutine per request before admitting it defeats the bound: goroutines are cheap but not free, so enqueue first and let workers admit the work.",
+        "A blocking send without a ctx or default branch parks the producer, turning the bulkhead into an unbounded wait; always give the send a cancellation path.",
+        "Channel capacity counts pending jobs, not running workers; bound both and drain the channel on shutdown or workers leak.",
+        "One channel per call site rather than per dependency silently multiplies the dependency's total concurrency."
+      ],
+      "sources": [
+        "https://pkg.go.dev/golang.org/x/sync/semaphore"
+      ]
+    },
+    {
+      "variant_id": "weighted-semaphore",
+      "name": "x/sync weighted semaphore and errgroup.SetLimit",
+      "paradigm": "concurrent",
+      "implementation_notes": "Library form: semaphore.NewWeighted(n) implements weighted admission, Acquire(ctx, 1) gives the bounded wait driven by the context deadline and TryAcquire(1) the immediate rejection, with Release on every path; errgroup.SetLimit(n) bounds a fan-out of subtasks and blocks the launcher when full (backpressure), while TryGo offers the non-blocking variant. Prefer this over a channel worker pool when calls already suspend on I/O and no dedicated workers are needed.",
+      "min_standard": "Go1.20",
+      "idiom_name": "semaphore.NewWeighted + errgroup.SetLimit",
+      "code_sketch": "sem := semaphore.NewWeighted(8)                 // per-dependency permits\n\nif !sem.TryAcquire(1) {\n    return errBulkheadFull                      // fast reject on saturation\n}\ndefer sem.Release(1)\nreturn callDependency(ctx, req)\n\n// fan-out form:\ng, ctx := errgroup.WithContext(ctx)\ng.SetLimit(8)                                   // bounds active goroutines",
+      "pitfalls": [
+        "Acquire blocks until the context is done; with context.Background it waits forever, so always pass the request context to make saturation bounded.",
+        "Release must be deferred immediately after a successful acquire; any early return in between leaks weight capacity.",
+        "Weighted permits allow Acquire(ctx, n) for n > 1, so capacity is the sum of weights, not the number of callers.",
+        "x/sync versions independently of the toolchain; SetLimit and TryGo are newer additions, so pin a module version that provides them."
+      ],
+      "sources": [
+        "https://pkg.go.dev/golang.org/x/sync/errgroup"
+      ]
+    }
+  ],
+  "default_variant": "channel-worker-pool",
+  "idiom_name": "buffered channel worker pool with select/default rejection",
+  "code_sketch": "jobs := make(chan Request, 16)          // bounded queue per dependency\nfor range 8 {                          // 8 workers = the bulkhead width\n    go func() { for r := range jobs { callDependency(r) } }()\n}\n\nselect {\ncase jobs <- req:                      // admitted\ncase <-ctx.Done():\n    return ctx.Err()\ndefault:                               // saturated: fail fast\n    return errBulkheadFull\n}",
+  "pitfalls": [
+    "Spawning a goroutine per request before admitting it defeats the bound: goroutines are cheap but not free, so enqueue first and let workers admit the work.",
+    "A blocking send without a ctx or default branch parks the producer, turning the bulkhead into an unbounded wait; always give the send a cancellation path.",
+    "Channel capacity counts pending jobs, not running workers; bound both and drain the channel on shutdown or workers leak.",
+    "One channel per call site rather than per dependency silently multiplies the dependency's total concurrency."
+  ],
+  "sources": [
+    "https://pkg.go.dev/golang.org/x/sync/semaphore"
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "kotlin",
+  "support": "library",
+  "idiom_name": "CoroutineWorker + enqueueUniqueWork + Result.retry()",
+  "implementation_notes": "On Android the OS-managed store replaces the channel: WorkManager keeps scheduled work in its own SQLite database and reschedules it across process death and device reboots, so enqueueing a unique work request is 'accepted durably' and the worker returning Result.retry() is the redelivery loop with a configured backoff. The classic structure survives only as the worker's contract: a stable business id in inputData (not a fresh id per attempt) plus idempotent work, because the system may re-run a worker it is unsure about; payloads larger than the inputData limit must be persisted elsewhere and referenced. For JVM backends the equivalent store is a broker transaction (next variant).",
+  "code_sketch": "class SendOrderWorker(ctx: Context, p: WorkerParameters) : CoroutineWorker(ctx, p) {\n  override suspend fun doWork(): Result = try {\n    api.deliver(inputData.getString(\"orderId\")!!, payload())  // idempotent by design\n    Result.success()                       // ack -> work is discarded\n  } catch (e: IOException) {\n    Result.retry()                         // persisted, retried with backoff\n  }\n}\nWorkManager.getInstance(ctx).enqueueUniqueWork(\"order-$id\", ExistingWorkPolicy.KEEP,\n  OneTimeWorkRequestBuilder<SendOrderWorker>()\n    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).build())",
+  "pitfalls": [
+    "WorkManager may run a worker more than once (it cannot always tell whether a killed run completed), so the worker must be idempotent and use a stable business id rather than a fresh uuid.",
+    "ExistingWorkPolicy and the backoff criteria must be chosen deliberately: KEEP silently drops a re-scheduled delivery, REPLACE cancels one already in flight.",
+    "inputData is capped (about 10 KB): large payloads belong in the database or a file with a reference in the work request.",
+    "WorkManager's database is not the app's database: enqueueing inside an app transaction is still a dual write unless both live in one Room database."
+  ],
+  "sources": [
+    "https://developer.android.com/topic/libraries/architecture/workmanager",
+    "https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started"
+  ],
+  "variants": [
+    {
+      "variant_id": "workmanager-persistent-work",
+      "name": "Android WorkManager unique work with retry backoff",
+      "paradigm": "concurrent",
+      "min_standard": "Kotlin1.9",
+      "requires_features": [
+        "androidx-work"
+      ],
+      "idiom_name": "CoroutineWorker + enqueueUniqueWork + Result.retry()",
+      "implementation_notes": "On Android the OS-managed store replaces the channel: WorkManager keeps scheduled work in its own SQLite database and reschedules it across process death and device reboots, so enqueueing a unique work request is 'accepted durably' and the worker returning Result.retry() is the redelivery loop with a configured backoff. The classic structure survives only as the worker's contract: a stable business id in inputData (not a fresh id per attempt) plus idempotent work, because the system may re-run a worker it is unsure about; payloads larger than the inputData limit must be persisted elsewhere and referenced. For JVM backends the equivalent store is a broker transaction (next variant).",
+      "code_sketch": "class SendOrderWorker(ctx: Context, p: WorkerParameters) : CoroutineWorker(ctx, p) {\n  override suspend fun doWork(): Result = try {\n    api.deliver(inputData.getString(\"orderId\")!!, payload())  // idempotent by design\n    Result.success()                       // ack -> work is discarded\n  } catch (e: IOException) {\n    Result.retry()                         // persisted, retried with backoff\n  }\n}\nWorkManager.getInstance(ctx).enqueueUniqueWork(\"order-$id\", ExistingWorkPolicy.KEEP,\n  OneTimeWorkRequestBuilder<SendOrderWorker>()\n    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).build())",
+      "pitfalls": [
+        "WorkManager may run a worker more than once (it cannot always tell whether a killed run completed), so the worker must be idempotent and use a stable business id rather than a fresh uuid.",
+        "ExistingWorkPolicy and the backoff criteria must be chosen deliberately: KEEP silently drops a re-scheduled delivery, REPLACE cancels one already in flight.",
+        "inputData is capped (about 10 KB): large payloads belong in the database or a file with a reference in the work request.",
+        "WorkManager's database is not the app's database: enqueueing inside an app transaction is still a dual write unless both live in one Room database."
+      ],
+      "sources": [
+        "https://developer.android.com/topic/libraries/architecture/workmanager",
+        "https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started"
+      ]
+    },
+    {
+      "variant_id": "kafka-transaction-jvm",
+      "name": "JVM Kafka transactional producer wrapped in coroutines",
+      "paradigm": "concurrent",
+      "min_standard": "Kotlin1.9",
+      "requires_features": [
+        "kotlinx-coroutines",
+        "kafka-transactions"
+      ],
+      "idiom_name": "KafkaProducer transactions on Dispatchers.IO with use {}",
+      "implementation_notes": "Backend Kotlin uses the JVM Kafka client, so the guarantee is the broker's: idempotence for retry-safety and a transaction (initTransactions, beginTransaction, commitTransaction, sendOffsetsToTransaction) to commit output and consumer offset together. Kotlin adds only the wrapper: the blocking producer must run on Dispatchers.IO (or a dedicated dispatcher), the producer is closed with use {} so buffered records are flushed, and suspending call sites keep the ack path in one coroutine scope. The classic per-hop store remains the broker log; no Kotlin-specific durability primitive exists.",
+      "code_sketch": "val props = Properties().apply {\n  put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers)\n  put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, \"orders-tx-1\")\n  put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, \"true\")\n}\nKafkaProducer<String, String>(props).use { p ->\n  p.initTransactions()\n  withContext(Dispatchers.IO) {\n    p.beginTransaction(); p.send(ProducerRecord(\"orders.out\", key, value))\n    p.commitTransaction()              // ack for record and offset together\n  }\n}",
+      "pitfalls": [
+        "KafkaProducer is thread-safe but has no coroutine awareness: every blocking call must be on Dispatchers.IO, or the whole dispatcher stalls.",
+        "Skipping initTransactions() makes the first beginTransaction fail, and an abandoned transaction blocks the transactional id until its timeout.",
+        "Closing the producer without flushing (use {} does flush, a leaked instance does not) drops buffered records.",
+        "A transactional id that is regenerated per process start loses zombie fencing; it must be stable and owned by one instance."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html",
+        "https://kotlinlang.org/docs/coroutines-overview.html"
+      ]
+    }
+  ],
+  "default_variant": "workmanager-persistent-work",
+  "version": "1.0"
+}

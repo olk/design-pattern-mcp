@@ -1,0 +1,82 @@
+{
+  "pattern": "registry",
+  "language": "cplusplus",
+  "support": "idiomatic",
+  "idiom_name": "function-local static unordered_map",
+  "implementation_notes": "Default modern realization: an unordered_map held in a function-local static, reached through a free accessor function, with register/make free functions built on it. It replaces the hand-written Registry class (and avoids header-order coupling) with two functions and the STL container.",
+  "code_sketch": "using Factory = std::function<std::unique_ptr<Codec>()>;\nstd::unordered_map<std::string, Factory>& codec_registry() {\n    static std::unordered_map<std::string, Factory> r;   // construct on first use\n    return r;\n}\nbool register_codec(const std::string& name, Factory f) {\n    return codec_registry().emplace(name, std::move(f)).second;\n}\nstd::unique_ptr<Codec> make_codec(const std::string& name) {\n    auto it = codec_registry().find(name);\n    return it == codec_registry().end() ? nullptr : it->second();\n}",
+  "pitfalls": [
+    "Concurrent register and lookup are not safe: unordered_map has no internal locking, so either restrict registration to start-up or add std::shared_mutex with a unique_lock for writers.",
+    "Self-registering translation units can be discarded by the linker in static libraries (nothing references them), so the registry looks empty - the construct-on-first-use accessor fixes initialization order, not inclusion.",
+    "Entries live until exit (destruction order of function-local statics is reverse construction order), and every erased value must still be type-correct at the point of std::any_cast or it throws bad_any_cast."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/container/unordered_map",
+    "https://en.cppreference.com/w/cpp/language/siof"
+  ],
+  "variants": [
+    {
+      "variant_id": "function-local-static",
+      "name": "Function-local static map (construct on first use)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "function-local static unordered_map",
+      "implementation_notes": "Default modern realization: an unordered_map held in a function-local static, reached through a free accessor function, with register/make free functions built on it. It replaces the hand-written Registry class (and avoids header-order coupling) with two functions and the STL container.",
+      "code_sketch": "using Factory = std::function<std::unique_ptr<Codec>()>;\nstd::unordered_map<std::string, Factory>& codec_registry() {\n    static std::unordered_map<std::string, Factory> r;   // construct on first use\n    return r;\n}\nbool register_codec(const std::string& name, Factory f) {\n    return codec_registry().emplace(name, std::move(f)).second;\n}\nstd::unique_ptr<Codec> make_codec(const std::string& name) {\n    auto it = codec_registry().find(name);\n    return it == codec_registry().end() ? nullptr : it->second();\n}",
+      "pitfalls": [
+        "Concurrent register and lookup are not safe: unordered_map has no internal locking, so either restrict registration to start-up or add std::shared_mutex with a unique_lock for writers.",
+        "Self-registering translation units can be discarded by the linker in static libraries (nothing references them), so the registry looks empty - the construct-on-first-use accessor fixes initialization order, not inclusion.",
+        "Entries live until exit (destruction order of function-local statics is reverse construction order), and every erased value must still be type-correct at the point of std::any_cast or it throws bad_any_cast."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/unordered_map",
+        "https://en.cppreference.com/w/cpp/language/siof"
+      ]
+    },
+    {
+      "variant_id": "type-erased-any",
+      "name": "std::any type-erased registry",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::any"
+      ],
+      "idiom_name": "unordered_map<string, std::any>",
+      "implementation_notes": "When entries are heterogeneous (any registered object, not just one factory signature), store std::any in the map and downcast at lookup: the registry becomes a process-wide key/value store while registration and lookup stay type-checked only at the cast site. Prefer the homogeneous map whenever a single interface suffices.",
+      "code_sketch": "std::unordered_map<std::string, std::any>& services() {\n    static std::unordered_map<std::string, std::any> s;\n    return s;\n}\n\ntemplate <class T> void put(std::string_view key, T value) {\n    services().insert_or_assign(std::string(key), std::move(value));\n}\n\ntemplate <class T> T get(std::string_view key) {   // throws bad_any_cast\n    return std::any_cast<T>(services().at(std::string(key)));\n}",
+      "pitfalls": [
+        "std::any requires C++17 and stores a copy (or a pointer) of the value: registering a non-copyable type only works through a pointer/smart pointer.",
+        "Insertion overwrites silently with insert_or_assign; a duplicate-registration policy has to be built on top (emplace + .second, or a check).",
+        "Lookup type errors are runtime exceptions, so the registry cannot give the compile-time safety a checked factory map provides."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/any",
+        "https://en.cppreference.com/w/cpp/container/unordered_map"
+      ]
+    },
+    {
+      "variant_id": "constinit-self-registration",
+      "name": "constinit self-registering table",
+      "paradigm": "oo",
+      "min_standard": "C++20",
+      "requires_features": [
+        "constinit",
+        "constexpr containers"
+      ],
+      "idiom_name": "constinit std::array table + static registration",
+      "implementation_notes": "C++20 answer to the initialization-order problem: a static constexpr-capable container declared constinit is constant-initialized before any dynamic initializer runs, so classes can register themselves with a static bool member without depending on translation-unit order. Choose it when the registry must exist before main() (test discovery, plugin tables) and the table fits a fixed capacity.",
+      "code_sketch": "struct Entry { std::string_view name; Factory create; };\ntemplate <std::size_t N> struct Table {\n    std::array<Entry, N> slots{};\n    std::size_t size = 0;\n    constexpr bool add(std::string_view n, Factory f) {\n        if (size == N) return false;\n        slots[size++] = Entry{ n, f };\n        return true;\n    }\n};\nstruct CodecFactory {\n    static inline constinit Table<8> table{};    // constant-initialized\n    static constexpr bool reg(std::string_view n, Factory f) {\n        return table.add(n, f);\n    }\n};",
+      "pitfalls": [
+        "constinit only guarantees constant initialization of the container itself; the registering static bool in another translation unit is still dynamically initialized, so the table must tolerate any insertion order.",
+        "std::unordered_map/std::map are not usable in constant expressions - the table must be a fixed-capacity std::array or a custom constexpr map, which caps entry count and forbids duplicates only by explicit check.",
+        "Registrations still disappear when the linker drops the translation unit, and the constinit declaration is a compile-time error if anything in the initializer is not constexpr-constructible."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/constinit",
+        "https://en.cppreference.com/w/cpp/language/siof"
+      ]
+    }
+  ],
+  "default_variant": "function-local-static",
+  "version": "1.0"
+}

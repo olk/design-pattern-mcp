@@ -1,0 +1,212 @@
+{
+  "category": "specialized-components",
+  "name": "game-loop",
+  "aliases": [
+    "game loop",
+    "fixed timestep"
+  ],
+  "intent": "Drive a running simulation at a controlled, hardware-independent rate: one loop drains input without blocking, advances the world in fixed time steps and renders as often as the platform allows, so simulation time is decoupled from input and rendering speed.",
+  "problem": "A real-time simulation has no natural stopping point: it must keep advancing when no input arrives, and it must behave the same on hardware of every speed. A loop that runs as fast as it can ties game speed to frame cost and machine performance (turbo-era games sped up on faster CPUs, and a heavy frame slows the whole game down), while a loop that waits for input freezes the world whenever the user is idle. The recurring decision is how to pace simulation time and how to split the frame budget between input, simulation and rendering.",
+  "context": "Applies to real-time interactive software: games and simulations with a continuously changing world, fixed-step physics or AI that must stay stable and reproducible, headless tick-based servers, and any program where input, update and rendering must proceed as independent activities. It matters most when the platform already has an event loop (browser, mobile OS, desktop UI toolkit) or an engine that owns the frame cadence - there the pattern means borrowing that loop and stepping a simulation inside it rather than writing a second loop.",
+  "benefits": [
+    "Hardware independence: the simulation advances at the same rate whether the machine renders 30 or 300 frames per second, and gameplay speed no longer follows CPU or GPU speed.",
+    "Update and render are decoupled: rendering may drop frames, run at the display refresh rate or stop entirely (background tab, occluded window) while the simulation keeps catching up in whole steps.",
+    "Determinism: with the same inputs and a fixed dt, the simulation produces the same states on every machine, which is what replays, lockstep networking and automated simulation tests need.",
+    "Responsiveness: input is drained without blocking every iteration, so the loop keeps spinning while the user is idle and never freezes the world.",
+    "One place for time policy: pacing, frame-rate clamping, power management and the catch-up bound live in a single piece of code that the whole program can be reasoned about from.",
+    "Failure containment: the fixed step bounds how much world time one update may advance, so a slow frame degrades visibly (dropped render frames) instead of silently changing game behaviour."
+  ],
+  "tradeoffs": [
+    "The catch-up loop is machinery with a sharp edge: if updates cannot keep up with real time, each frame must simulate more steps, which makes the frame later still - the spiral of death - unless accumulated lag is clamped and steps per frame are capped.",
+    "Residual lag makes motion look stuttery unless rendering interpolates between the previous and current state, and interpolation is a guess: when the next step reveals a collision or a sudden stop, the interpolated frame was wrong (usually less noticeable than the stutter, but wrong).",
+    "Simulation code becomes step-coupled: damping, forces and AI look-ahead are tuned to one dt, and feeding raw frame deltas instead is non-deterministic and can go unstable, so every later gameplay constant inherits the chosen step.",
+    "Pacing has a cost either way: sleeping wastes timer granularity (sleeps overshoot and the loop must re-measure), while running free maximises responsiveness at the price of power, heat and a frame rate the content cannot control.",
+    "Owning the loop fights the platform: mobile OSes, browsers and UI toolkits want to drive frames themselves, and a self-owned loop must hand time back to the event loop or move to the platform's callback model.",
+    "Choosing dt is a permanent tuning problem: too large is choppy and unstable, too small burns CPU and makes the spiral more likely; the right value depends on content, hardware class and the slowest supported target."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 5,
+    "maintainability": 5,
+    "simplicity": 5,
+    "performance": 8,
+    "reliability": 6,
+    "security": 3,
+    "scalability": 4
+  },
+  "participants": [
+    {
+      "role": "Loop driver",
+      "responsibility": "Owns the top-level cycle: drains input without blocking, advances the simulation by whole steps, renders, and yields or sleeps to the frame budget. The single place where the program's cadence is decided."
+    },
+    {
+      "role": "Frame-time source (clock)",
+      "responsibility": "Monotonic time source (steady_clock, CLOCK_MONOTONIC, Instant, perf_counter, nanoTime, display-link timestamp) that measures real elapsed time between iterations; the loop's only window onto the outside clock."
+    },
+    {
+      "role": "Time-step policy (lag accumulator)",
+      "responsibility": "Converts measured real time into simulation time: a fixed dt per update, a lag/accumulator that carries the remainder into the next frame, and a clamp or step cap that bounds catch-up work."
+    },
+    {
+      "role": "Update (simulation step)",
+      "responsibility": "Advances the world by exactly one fixed dt per call - physics, AI and game rules. Never reads the clock itself; it receives dt as an argument."
+    },
+    {
+      "role": "Renderer (view)",
+      "responsibility": "Draws the current state whenever the loop decides to render; may interpolate between the previous and current state with the leftover lag so a fixed-step simulation still looks smooth at any refresh rate."
+    },
+    {
+      "role": "Input pump",
+      "responsibility": "Drains queued user and OS events without blocking (poll events, peek messages, frame callback, app-event callbacks) and forwards them to the simulation; it never waits for input inside the loop."
+    },
+    {
+      "role": "Platform/engine event loop (optional)",
+      "responsibility": "When the platform or engine owns the loop (browser, mobile OS, UI toolkit, SDL3 main callbacks, game engine), it replaces the driver and calls back per frame; the remaining roles stay the same."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit",
+    "boundary"
+  ],
+  "use_cases": [
+    "Real-time action games: physics and gameplay integrate at a fixed dt (commonly 1/60 s or smaller) while rendering follows the display refresh rate.",
+    "Deterministic simulations, replays and network lockstep: rollback and lockstep netcode require identical states from identical inputs, which only fixed steps provide.",
+    "Headless or dedicated servers: an authoritative tick loop advances the world at a fixed cadence independent of any client's frame rate.",
+    "Tools and visualisations that must keep animating while the user is idle: editors, dashboards and control loops step their model on a timer instead of on input.",
+    "Platform-owned loops: browser games (requestAnimationFrame), mobile and console engines, and SDL3 callback entry points, where the pattern is the discipline of stepping a simulation inside a loop someone else drives.",
+    "Multiplayer games with deterministic lockstep or rollback netcode (GGPO-style): the fixed timestep is what makes client-side prediction and server reconciliation identical across all peers.",
+    "Physics-based simulations requiring reproducible results for scientific visualisation, automated testing or deterministic replay: a fixed dt guarantees the same state from the same inputs.",
+    "Browser-based games and interactive visualisations: using requestAnimationFrame as the platform loop with a fixed-timestep accumulator inside it, and pausing when the tab is backgrounded to save battery.",
+    "Real-time data visualisations and control-room dashboards: the same cadence control ensures smooth animation regardless of hardware speed.",
+    "Rhythm games and audio-driven simulations: the game loop must advance in lock-step with the audio clock, and the fixed dt must divide evenly into the audio buffer size at the target sample rate to avoid audio-video desynchronisation.",
+    "Turn-based games with real-time animations: a lightweight fixed-timestep loop drives animations and particle effects during transitions between turns while gameplay logic advances only on explicit input, combining event-driven and time-driven pacing.",
+    "Physics-based puzzle games (Angry Birds-style): reproducible physics with fixed dt is essential for level design and community-built puzzles; every simulation tick must be deterministic so replays and ghost replays are bit-exact.",
+    "Unity's Player Loop: FixedUpdate and Time.fixedDeltaTime run physics on a fixed cadence separate from rendered frames; a frame may contain zero or multiple fixed updates, so simulation belongs in the fixed phase rather than a second self-owned loop.",
+    "Godot Engine: Node._physics_process runs on fixed physics ticks while _process follows rendered frames; physics interpolation keeps fixed-tick movement smooth when presentation runs faster.",
+    "Web browsers: MDN's requestAnimationFrame supplies a high-resolution callback timestamp and pauses hidden-page callbacks; use it as the platform-owned render cadence while a capped accumulator advances fixed simulation ticks."
+  ],
+  "avoid_when": [
+    "The application is purely event-driven or turn-based and nothing changes between inputs: the platform's event loop already is the loop, and adding a fixed-step driver burns power for no behavioural change.",
+    "The engine or framework you build on already owns the frame loop (Unity, Godot, SpriteKit, SDL3 callbacks, JavaFX): implement the update callback instead of writing a second loop.",
+    "A plain batch or one-shot computation suffices: a for loop over the input is clearer and there is no cadence to control.",
+    "The step cost cannot fit the frame budget on the slowest supported target and the work cannot be reduced: fix the workload first - a catch-up loop over unaffordable steps only spirals.",
+    "Simulation time is not real time (step-by-step solvers, spreadsheet-like recalculation, discrete event simulation): drive it from the data, not from a clock."
+  ],
+  "language_files": {
+    "generic": "game-loop.generic.json",
+    "c": "game-loop.c.json",
+    "cplusplus": "game-loop.cplusplus.json",
+    "csharp": "game-loop.csharp.json",
+    "go": "game-loop.go.json",
+    "java": "game-loop.java.json",
+    "javascript": "game-loop.javascript.json",
+    "kotlin": "game-loop.kotlin.json",
+    "python": "game-loop.python.json",
+    "ruby": "game-loop.ruby.json",
+    "rust": "game-loop.rust.json",
+    "scala": "game-loop.scala.json",
+    "swift": "game-loop.swift.json",
+    "typescript": "game-loop.typescript.json"
+  },
+  "paradigm": [
+    "procedural",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "game-programming"
+  ],
+  "related_patterns": [
+    "update-method",
+    "event-queue",
+    "double-buffer",
+    "data-locality",
+    "spatial-partition",
+    "command",
+    "object-pool"
+  ],
+  "anti_patterns": [
+    "Run-as-fast-as-you-can: the loop spins without pacing, so game speed follows hardware and frame content, and fans and batteries pay for it.",
+    "Variable dt physics: raw frame deltas fed into simulation and networking code, producing frame-rate-dependent, non-deterministic and potentially unstable behaviour.",
+    "Unclamped catch-up: an accumulator loop with no lag clamp and no step cap, so one hitch starts the spiral of death.",
+    "Wall-clock intervals: Date.now, currentTimeMillis or gettimeofday-style readings used for elapsed time, so an NTP correction or a user clock change teleports the simulation.",
+    "Blocking input or blocking I/O inside the loop: waits that stop the world whenever the player or the peer is idle.",
+    "Rendering inside the fixed step: drawing at simulation rate couples render cost into game speed and removes the loop's freedom to skip render frames.",
+    "Frame-counted steps: treating one platform callback or timer tick as one simulation step, although the platform may coalesce, stretch or drop callbacks.",
+    "Deterministic arithmetic failures: floating-point operations that differ across compilers, CPU architectures or browser versions silently break lockstep and replays; use fixed-point math or a deterministic floating-point library for cross-platform determinism.",
+    "Non-atomic input recording: capturing input state in multiple steps (e.g. reading a key, then reading a joystick axis) can produce inconsistent inputs on different frames; atomically snapshot all input state before processing.",
+    "Timer-trust fallacy: relying on setTimeout, setInterval or sleep duration as a timing source instead of re-reading a monotonic clock after the sleep; coarse timer granularity causes accumulator drift.",
+    "Frame-rate targeting instead of frame-rate independence: capping rendering to a target fps with a sleep without decoupling the simulation still ties game speed to frame cost.",
+    "Ignoring background-tab throttling: on mobile browsers and some desktop browsers, requestAnimationFrame callbacks are heavily throttled or suspended when the tab is not visible; the loop must detect this and pause simulation time rather than accumulate a huge lag spike on resume.",
+    "Time-unit mismatches: mixing seconds, milliseconds and nanoseconds between systems (e.g. SDL_GetTicks in ms vs steady_clock in ns) produces silent speed bugs; normalise to one unit at the loop boundary and convert only at the platform interface.",
+    "Floating-point determinism bugs across platforms: using sin, cos, pow or sqrt with platform-specific implementations produces different results on x86 vs ARM; use a cross-platform math library (PLMATH, Unity Mathematics, Godot Mathf) or fixed-point arithmetic for game-critical geometry.",
+    "Iteration-order-dependent state corruption: iterating over hash maps, unordered maps or parallel collections during the fixed update can produce different results across platforms or runs; always sort or use ordered containers for gameplay-critical iteration.",
+    "Audio-video desynchronisation: driving audio from a separate thread or the platform audio clock while the simulation runs on the fixed-timestep accumulator can cause audio to drift from visuals; use a single clock source and express all audio scheduling in simulation time.",
+    "Assuming a fixed update always completes within dt: heavy physics scenes, complex AI pathfinding, or garbage collection pauses can cause a single tick to exceed dt; always profile the update on the slowest supported device and budget at least 30% headroom.",
+    "Writing simulation code that reads system time mid-update: any call to Date.now, getTimeOfDay or equivalent inside the simulation step poisons determinism; normalise all time access at the loop boundary and pass only elapsed seconds as arguments."
+  ],
+  "design_principles": [
+    "Separation of concerns: input, simulation and presentation are three activities with different natural rates, and the loop is the seam that keeps them independent.",
+    "Determinism by construction: a fixed step makes the simulation reproducible from its inputs alone, a property a variable step silently gives up.",
+    "Time as an explicit dependency: the simulation receives dt and never reads the clock, so it stays testable, replayable and comparable across machines.",
+    "Bounded work per iteration: clamping lag and capping steps keeps the worst case bounded - a visibly degraded simulation beats an unresponsive program (fail-fast for real-time systems).",
+    "Measure, do not assume: budget dt from measured update cost, profile the loop, and re-tune when content or target hardware changes."
+  ],
+  "best_practices": [
+    "Measure elapsed time with a monotonic clock (steady_clock, CLOCK_MONOTONIC, Instant, perf_counter, nanoTime, display-link timestamp), never with wall-clock time.",
+    "Fix the simulation dt (commonly 1/60 s or smaller), render as often as the platform allows, and hand the leftover lag to the renderer as an interpolation factor.",
+    "Clamp the per-frame delta and cap catch-up steps (bail out after a maximum); log when the cap is hit so the miss is visible instead of silent.",
+    "Keep the cost of one update well below dt on the slowest supported target, and choose dt from that measurement rather than from habit.",
+    "Drain input once per iteration without blocking and hand it to the simulation as queued events; never wait for input inside the loop.",
+    "Sleep or yield after the frame's work when a target frame rate or a power budget matters, then re-read the clock - timer granularity is coarse and sleeps overshoot.",
+    "Keep world state owned by the simulation (the loop or one simulation thread); make concurrent access explicit and never mutate the world from rendering or input callbacks.",
+    "Test the simulation by stepping it directly with explicit dt values; keep the driver thin and the update pure with respect to time.",
+    "Use requestAnimationFrame on the web and let the browser pause the loop in background tabs; on native platforms prefer a monotonic-timer-driven loop with an explicit yield/sleep strategy tied to a power or frame-budget policy.",
+    "Implement dirty-flag rendering: skip draw calls when the world state has not changed since the last frame to save GPU power on laptops and mobile.",
+    "Track a rolling average of frame times rather than trusting any single frame delta; a single hitch should not corrupt the accumulator.",
+    "Design the simulation to be deterministic: centralise the RNG behind a single serialisable state, use the same iteration order on every tick, and avoid floating-point operations that behave differently across compilers or CPU architectures.",
+    "Store two world snapshots (previous and current) so the renderer can interpolate smoothly even when the simulation runs at a lower fixed rate than the display refresh.",
+    "For multiplayer lockstep or rollback netcode, keep a rolling input-history buffer (at least one second) to support re-simulation from a known-good checkpoint when a desync is detected.",
+    "When implementing time scaling (slow-motion or fast-forward), apply the same timescale to shader animations, particle timers and audio playback so visuals and audio stay synchronised with the simulation.",
+    "Profile the loop on the slowest supported target hardware and budget no more than 70% of dt for the update cost; the remaining headroom is for catch-up spikes and frame-rate variance.",
+    "Use a separate simulation thread for headless servers and tools: the loop advances world state without any rendering dependency and can be paused or throttled independently of the UI.",
+    "On platforms that support display-link or equivalent vertical-sync timestamps, prefer those over a naive sleep-then-remeasure pattern to avoid timer granularity artefacts.",
+    "Log or telemetry-tag every time the step-cap is hit and every large initial frame delta so systemic problems (content overload, background throttling, CPU contention) are visible in production.",
+    "On multi-threaded game loops (update/render on separate threads), synchronise the simulation thread's accumulator with the render thread's presentation timestamp using a lock-free queue or triple-buffer; never mutate world state from the render thread.",
+    "For ECS-based engines (Unity DOTS, Flecs, Bevy ECS), keep systems stateless between ticks and store all transient state (interpolation ratio, rolling average) outside the ECS world so serialising for rollback is a single mem-copy of the world snapshot.",
+    "Handle platform throttling gracefully: detect when the platform has heavily throttled or coalesced callbacks (mobile background tabs, Windows Game Mode, browser visibility API) and clamp or pause the accumulator rather than accumulating a huge lag spike.",
+    "When implementing frame-rate-independent damping (e.g. drag that decays per second, not per frame), express it as a rate constant k applied as state *= exp(-k * dt) rather than a fractional multiplier, which is frame-rate independent by construction.",
+    "For variable-hertz hardware (GSync, FreeSync, adaptive refresh), prefer display-linked timestamps (DXGI swap chain timestamps, Vulkan VK_GOOGLE_display_timing, SDL_GetWindowSurfaceDelta) over a naive sleep-then-remeasure loop, as the panel's refresh rate may differ from the OS timer granularity."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Nystrom (2014), Game Programming Patterns, 'Sequencing Patterns: Game Loop' - the originating catalogue entry: intent ('Decouple the progression of game time from user input and processor speed'), the pattern statement, the run-as-fast-as-you-can / sleep / variable / fixed-update-variable-render variations, interpolated rendering with the leftover lag, and the design decisions (who owns the loop, power consumption, controlling gameplay speed). https://gameprogrammingpatterns.com/game-loop.html",
+    "Fiedler (2004), 'Fix Your Timestep!' (Gaffer On Games) - the canonical treatment of fixed dt with an accumulator, the semi-fixed variant, interpolating between the previous and current physics state, and the spiral of death. https://gafferongames.com/post/fix_your_timestep/",
+    "SDL3 documentation, 'Where an SDL program starts running' - the platform-owned realization of the loop: SDL_AppIterate is 'called over and over, possibly at the refresh rate of the display or some other metric that the platform dictates', because iOS and Emscripten insist on driving the while loop themselves. https://wiki.libsdl.org/SDL3/README-main-functions",
+    "Sinisi (2025), 'Deterministic Lockstep Networking Demystified' - practical guide to lockstep networking: input buffering, rollback for desync recovery, ECS for fast forward simulation, and the Blizzard GDC Overwatch gameplay architecture as the canonical rollforward/rollback reference. https://zacksinisi.com/deterministic-lockstep-networking-demystified/",
+    "Simplified Media (2026), 'Deterministic Lockstep in Browser Games' - core requirements for true determinism across clients: identical initial state, identical input ordering, deterministic arithmetic, stable iteration order; covers checksum-based desync detection and rollback strategy for browser-based games. https://simplified.media/guides/deterministic-lockstep",
+    "Fiedler (2016), 'Deterministic Lockstep' (Gaffer On Games) - the definitive treatment of peer-to-peer lockstep: only inputs are exchanged (not world state), all clients run an identical simulation, an input delay D hides network latency, and inputs for each tick are waited on before that tick's simulation runs. https://gafferongames.com/post/deterministic_lockstep/",
+    "Socratopia (2024), 'Interpolation Between Ticks — Math for Game Developers, Chapter 28' - detailed treatment of rendering smoothly above the simulation rate: linear interpolation (lerp) for positions, spherical linear interpolation (slerp) for orientations, alpha = accumulator / dt formula, handling teleportation and new-spawn edge cases, and the risk/benefit of extrapolation (alpha > 1). https://www.socratopia.app/library/math-for-game-devs-en/chapter-28",
+    "Kirby Says Hi (2013), 'Interpolated Physics Rendering' - practical implementation of separating logic updates (fixed dt) from rendering (variable rate): the StepStateInterpolator pattern, storing previous/current state, computing an interpolation ratio, and rendering interpolated positions with a concrete JavaScript example. https://kirbysayshi.com/2013/09/24/interpolated-physics-rendering.html",
+    "Solana Garden (2026), 'Game Loop and Frame Timing Explained: Delta Time, FPS & Fixed Steps' - covers energy efficiency on laptops and mobile: requestAnimationFrame for browser background-tab pausing, rolling frame-time averages, adaptive quality when battery saver is active, dirty-flag rendering to skip frames when nothing changes, and devicePixelRatio management. https://solana.garden/guides/game-loop-frame-timing-explained/",
+    "The Coding Machine (2022), 'Energy Consumption of Web Game Engines' - empirical study showing GPU dominates energy usage (correlates with pixels drawn), dirty-flag rendering to skip unchanged frames, disabling the physics engine when characters are still, and using Chrome Task Manager / Linux powertop for measurement. https://thecodingmachine.io/energy-consumption-web-game-engine",
+    "Arcadeon Studios (2026), 'Turn Your Game Loop into a Testable System — Fixed-Step Determinism' - design for testability: explicit InputFrame per tick, SimState as a serialisable snapshot (positions, velocities, health, RNG state), ring-buffer input recorder for live play and replays, deterministic replay by re-feeding InputFrames through Step, and clamp/limit accumulated time with logging. https://arcadeonstudios.co.uk/blog/turn-your-game-loop-into-a-testable-system-fixed-step-determinism",
+    "Lotus Spring (2025), 'Upgrade Your Timestep' - practical extension of Fix Your Timestep with time scaling (slow-motion or fast-forward), tick-based timer system integrated into the loop for triggered events, semi-fixed timestep variant, and shader/animation coordination with the same timescale parameter. https://lotusspring.substack.com/p/upgrade-your-timestep",
+    "Bevy Authors (2024), 'Run physics in a fixed timestep' and Bevy App docs (FixedMain, RunFixedMainLoopSystems, FixedUpdate) - modern engine implementation: FixedUpdate schedule runs at a fixed cadence (default 64 Hz) for physics/AI/networking, RunFixedMainLoopSystems provides BeforeFixedMainLoop and AfterFixedMainLoop phases for per-frame variable-timestep work and transform interpolation between fixed steps. https://bevy.org/examples/movement/physics-in-fixed-timestep/",
+    "Socratopia (2024), 'Fixed Timestep vs Variable Timestep — Game Code Anatomy, Chapter 2' - explains why a paced loop alone does not fix physics: variable dt makes physics frame-rate-dependent and non-deterministic; the fix is fixed-step simulation plus render interpolation; covers SIM_DT constant, accumulator, alpha interpolation, and the full benefits chain from determinism to multiplayer and replays. https://www.socratopia.app/library/game-code-anatomy-en/chapter-2",
+    "Simplified Media (2026), 'Fixed Timestep Game Loops in the Browser' - browser-specific implementation: using performance.now(), accumulator pattern inside requestAnimationFrame, clamping initial frame time, step cap, and the particular hazards of background tab throttling. https://simplified.media/guides/fixed-timestep-loops",
+    "Gregory, Jason (2025), Game Engine Architecture, Fourth Edition, A K Peters/CRC Press — the definitive textbook on game engine design. Chapter 5 covers the game loop, timing and the frame-rate problem; Chapter 18 covers networking including lockstep and rollback architectures. Widely used as a university course text and industry reference. https://www.gameenginebook.com/",
+    "GGPO Project (2021), 'GGPO Rollback Netcode Developer Guide', GitHub — the canonical open-source rollback netcode library. Documents how the game loop must expose save/restore state and an advance-frame callback so GGPO can drive multiple rollbacks per frame. The reference implementation for fighting game netcode. https://github.com/GGPO/ggpo/blob/master/doc/DeveloperGuide.md",
+    "Dungeons, Ryan (2024), 'Deterministic Lockstep Networking Demystified' — practical guide covering input buffering, rollback for desync recovery, ECS for fast forward simulation, and the Blizzard GDC Overwatch architecture as the canonical rollforward/rollback reference. https://ryandungeon.com/posts/deterministic-lockstep-networking-demystified/",
+    "Ericson, Christer (2018), 'Real-Time Game Loop and Frame Pacing' (Real-Time Collision Detection blog) — blog post on frame pacing, vsync, and the interaction between fixed-timestep simulation and variable-rate rendering. Covers visual artifacts of misaligned simulation and render ticks and the importance of display-link timestamps. https://realtimecollisiondetection.net/",
+    "Unity Manual, 'Fixed updates' - documents FixedUpdate and Time.fixedDeltaTime as a physics cadence independent of rendering, including zero or multiple fixed updates per frame and a maximum timestep policy. https://docs.unity3d.com/6000.7/Documentation/Manual/fixed-updates.html",
+    "Godot Engine documentation, 'Idle and Physics Processing' - documents _physics_process at a fixed physics rate versus frame-driven _process, with the fixed callback intended for physics updates. https://docs.godotengine.org/en/latest/tutorials/scripting/idle_and_physics_processing.html",
+    "MDN Web Docs, 'Anatomy of a video game' - demonstrates a browser game loop driven by requestAnimationFrame timestamps while a separate tick schedule advances game state, and notes browser throttling behavior. https://developer.mozilla.org/en-US/docs/Games/Anatomy",
+    "Fabien Sanglard, 'Game timers: Issues and solutions of variable framerate' - a practical critique of driving simulation directly from variable frame intervals, covering nondeterminism, missed collisions and the fixed-timestep inner-loop remedy. https://fabiensanglard.net/timer_and_framerate/index.php"
+  ]
+}

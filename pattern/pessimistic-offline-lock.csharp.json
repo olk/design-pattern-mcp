@@ -1,0 +1,18 @@
+{
+  "pattern": "pessimistic-offline-lock",
+  "language": "csharp",
+  "support": "manual",
+  "idiom_name": "lock table claimed inside a serializable SqlTransaction; row locks expressed with UPDLOCK/ROWLOCK hints in raw SQL (EF Core has no pessimistic lock API)",
+  "implementation_notes": "EF Core exposes transactions and isolation levels (Database.BeginTransactionAsync, IsolationLevel, TransactionScope) but no API that locks selected rows, so the pessimistic primitive is vendor SQL: SELECT ... WITH (UPDLOCK, ROWLOCK) inside the transaction, or an INSERT into a lock table with a unique key on the lockable column. Because a row lock dies with its transaction, the offline lock is the lock record: claim it in one short serializable transaction, store owner plus acquisition time, and release it by deleting the row for the verified owner. The classic structure is still required - it is the only way to keep a claim visible across user think time, whereas the hints protect only the milliseconds of the transaction.",
+  "code_sketch": "await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);\nvar existing = await db.LockRecords.SingleOrDefaultAsync(l => l.Lockable == key);\nif (existing is { Owner: var owner } && owner != sessionId)\n    return Results.Conflict($\"locked by {existing.Owner}\");\ndb.LockRecords.Add(new LockRecord { Lockable = key, Owner = sessionId,\n                                    AcquiredAt = DateTime.UtcNow });\nawait db.SaveChangesAsync();\nawait tx.CommitAsync();   // the lock record now outlives this transaction",
+  "pitfalls": [
+    "UPDLOCK/HOLDLOCK hints bind to the enclosing transaction only; wrapping several SaveChanges calls in one long transaction to keep a lock occupies a connection and is lost when it drops.",
+    "EF Core creates a savepoint before every SaveChanges inside a transaction and disables savepoints when SQL Server MARS is enabled, so a failed save can leave the transaction in a state the caller did not expect.",
+    "Serializable isolation on SQL Server takes range locks that block unrelated readers; an explicit lock record with a unique constraint is usually cheaper than isolation-level-only locking."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/ef/core/saving/transactions",
+    "https://learn.microsoft.com/en-us/sql/t-sql/queries/hints-transact-sql-table"
+  ],
+  "version": "1.0"
+}

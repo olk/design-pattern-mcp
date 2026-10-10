@@ -1,0 +1,60 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "Sidekiq::Job with retry: N, dead: true and Sidekiq::DeadSet",
+  "implementation_notes": "In a Ruby web stack the dead-letter channel is Sidekiq's dead set: retry: N sets the attempt budget with exponential backoff built in, and once those attempts are exhausted the job moves into the dead set instead of vanishing - dead: false disables exactly that parking step and throws the job away, which is the silent loss this pattern prevents. The dead set is inspectable and replayable from the Web UI or with Sidekiq::DeadSet.new.each(&:retry), so size, error class and arguments are the operational surface. Where the transport is AMQP rather than Redis, the same role is played by a RabbitMQ dead-letter exchange configured on the queue, and the two are worth combining when a job must also be visible to non-Ruby consumers.",
+  "code_sketch": "class ChargeCard\n  include Sidekiq::Job\n  sidekiq_options retry: 5, dead: true, queue: 'payments'\n\n  def perform(order_id)\n    Payments.capture!(order_id)      # raises -> retries with backoff -> dead set\n  end\nend\n\n# replay (idempotent handler required):\nSidekiq::DeadSet.new.each { |job| job.retry }",
+  "pitfalls": [
+    "dead: false (or retry: 0) skips the dead set entirely: after the last failure the job is discarded and nothing retains the arguments.",
+    "The dead set lives in Redis with default caps (roughly the newest 10,000 entries and 6 months), so a failure storm evicts older dead jobs.",
+    "Retrying from the dead set re-runs perform with the same arguments, which duplicates charges or emails unless the handler is idempotent.",
+    "Bulk retry from the Web UI can requeue thousands of jobs against a dependency that is still broken, recreating the original outage."
+  ],
+  "sources": [
+    "https://github.com/sidekiq/sidekiq/wiki/Error-Handling",
+    "https://www.rabbitmq.com/docs/dlx"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sidekiq-dead-set",
+      "name": "Sidekiq dead set after the retry budget",
+      "paradigm": "oo",
+      "min_standard": "Ruby3.0",
+      "idiom_name": "Sidekiq::Job with retry: N, dead: true and Sidekiq::DeadSet",
+      "implementation_notes": "In a Ruby web stack the dead-letter channel is Sidekiq's dead set: retry: N sets the attempt budget with exponential backoff built in, and once those attempts are exhausted the job moves into the dead set instead of vanishing - dead: false disables exactly that parking step and throws the job away, which is the silent loss this pattern prevents. The dead set is inspectable and replayable from the Web UI or with Sidekiq::DeadSet.new.each(&:retry), so size, error class and arguments are the operational surface. Where the transport is AMQP rather than Redis, the same role is played by a RabbitMQ dead-letter exchange configured on the queue, and the two are worth combining when a job must also be visible to non-Ruby consumers.",
+      "code_sketch": "class ChargeCard\n  include Sidekiq::Job\n  sidekiq_options retry: 5, dead: true, queue: 'payments'\n\n  def perform(order_id)\n    Payments.capture!(order_id)      # raises -> retries with backoff -> dead set\n  end\nend\n\n# replay (idempotent handler required):\nSidekiq::DeadSet.new.each { |job| job.retry }",
+      "pitfalls": [
+        "dead: false (or retry: 0) skips the dead set entirely: after the last failure the job is discarded and nothing retains the arguments.",
+        "The dead set lives in Redis with default caps (roughly the newest 10,000 entries and 6 months), so a failure storm evicts older dead jobs.",
+        "Retrying from the dead set re-runs perform with the same arguments, which duplicates charges or emails unless the handler is idempotent.",
+        "Bulk retry from the Web UI can requeue thousands of jobs against a dependency that is still broken, recreating the original outage."
+      ],
+      "sources": [
+        "https://github.com/sidekiq/sidekiq/wiki/Error-Handling",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    },
+    {
+      "variant_id": "bunny-rabbitmq-dlx",
+      "name": "Bunny + RabbitMQ dead-letter exchange",
+      "paradigm": "declarative",
+      "min_standard": "Ruby3.0",
+      "idiom_name": "Bunny queue arguments with x-dead-letter-exchange, reject/nack(requeue=false)",
+      "implementation_notes": "On RabbitMQ the broker does the dead-lettering: declare the dead-letter exchange and queue, pass x-dead-letter-exchange and x-dead-letter-routing-key in the arguments hash when declaring the source queue with Bunny, and reject or nack with requeue=false from the consumer when the message cannot be processed; the broker also dead-letters on TTL expiry and queue-length overflow. Bunny exposes delivery info and headers, so the DLQ consumer can read x-death to recover the original queue and reason, and the dead-letter contract stays at the broker even when the queue is shared with services written in other languages - which is the reason to choose this variant over the Sidekiq dead set.",
+      "code_sketch": "ch  = conn.create_channel\nch.direct('dlx', durable: true)\nch.queue('orders.dlq', durable: true).bind('dlx', routing_key: 'failed')\nq = ch.queue('orders', durable: true, arguments: {\n  'x-dead-letter-exchange' => 'dlx', 'x-dead-letter-routing-key' => 'failed' })\n\nq.subscribe(manual_ack: true) do |info, _props, body|\n  begin\n    handle(body); ch.ack(info.delivery_tag)\n  rescue PermanentError\n    ch.nack(info.delivery_tag, false, false)   # requeue=false -> dead-letter exchange\n  end\nend",
+      "pitfalls": [
+        "Queue arguments are fixed at declaration: an existing queue declared with different arguments makes a redeploy fail with PRECONDITION_FAILED, so the DLX must be introduced with a queue migration.",
+        "An exception swallowed inside the subscribe block leaves the message unacked until the channel closes; the delivery is then counted as failed for reasons the handler never recorded.",
+        "Dead-lettering is best-effort on non-quorum queues (the republish is not internally publisher-confirmed); for at-least-once dead-lettering use quorum queues.",
+        "Auto-reconnect recreates channels but not consumer state: a nack against a stale delivery tag after a reconnect closes the channel instead of dead-lettering."
+      ],
+      "sources": [
+        "https://www.rabbitmq.com/docs/dlx",
+        "https://github.com/ruby-amqp/bunny"
+      ]
+    }
+  ],
+  "default_variant": "sidekiq-dead-set"
+}

@@ -1,0 +1,67 @@
+{
+  "pattern": "plugin",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "boost::dll::shared_library + import_alias",
+  "implementation_notes": "Modern default: build the plugin as a shared library that exports a C-ABI factory (or a symbol alias declared with BOOST_DLL_ALIAS), then let the host construct boost::dll::shared_library and import the factory with boost::dll::import_alias, which returns a callable or std::shared_ptr that holds a reference to the library so symbols stay valid. load_mode::append_decorations resolves libfoo.so / foo.dll / libfoo.dylib without hand-built names, and the imported callable is the plugin factory while the interface class in a shared header is the contract. Raw dlopen/LoadLibrary stays justified when Boost is not available or when the host must control the load flags itself.",
+  "code_sketch": "#include <boost/dll/import.hpp>\n// interface in a shared header\nstruct formatter { virtual ~formatter() = default; virtual std::string format(const doc&) = 0; };\n\nboost::dll::fs::path lib(argv[1]);\nauto create = boost::dll::import_alias<std::shared_ptr<formatter>()>(\n    lib / \"csv_plugin\", \"create_formatter\",\n    boost::dll::load_mode::append_decorations);\nstd::shared_ptr<formatter> f = create();   // keeps the library loaded",
+  "pitfalls": [
+    "Objects returned by import_alias do not themselves extend the library's lifetime; the shared_library or the imported callable must outlive the plugin object, otherwise destruction unloads the code under it (the documented nested-object caveat).",
+    "The plugin must export with BOOST_SYMBOL_EXPORT and be compiled with -fvisibility=hidden, otherwise the thin alias symbol is not found and mangled-name lookups differ between compilers."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_dll/tutorial.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "boost-dll-runtime-loading",
+      "name": "Boost.DLL shared_library + import_alias (runtime loading)",
+      "paradigm": "oo",
+      "implementation_notes": "Modern default: build the plugin as a shared library that exports a C-ABI factory (or a symbol alias declared with BOOST_DLL_ALIAS), then let the host construct boost::dll::shared_library and import the factory with boost::dll::import_alias, which returns a callable or std::shared_ptr that holds a reference to the library so symbols stay valid. load_mode::append_decorations resolves libfoo.so / foo.dll / libfoo.dylib without hand-built names, and the imported callable is the plugin factory while the interface class in a shared header is the contract. Raw dlopen/LoadLibrary stays justified when Boost is not available or when the host must control the load flags itself.",
+      "code_sketch": "#include <boost/dll/import.hpp>\n// interface in a shared header\nstruct formatter { virtual ~formatter() = default; virtual std::string format(const doc&) = 0; };\n\nboost::dll::fs::path lib(argv[1]);\nauto create = boost::dll::import_alias<std::shared_ptr<formatter>()>(\n    lib / \"csv_plugin\", \"create_formatter\",\n    boost::dll::load_mode::append_decorations);\nstd::shared_ptr<formatter> f = create();   // keeps the library loaded",
+      "pitfalls": [
+        "Objects returned by import_alias do not themselves extend the library's lifetime; the shared_library or the imported callable must outlive the plugin object, otherwise destruction unloads the code under it (the documented nested-object caveat).",
+        "The plugin must export with BOOST_SYMBOL_EXPORT and be compiled with -fvisibility=hidden, otherwise the thin alias symbol is not found and mangled-name lookups differ between compilers."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_dll/tutorial.html"
+      ],
+      "idiom_name": "boost::dll::shared_library + import_alias",
+      "min_standard": "C++11"
+    },
+    {
+      "variant_id": "qt-qpluginloader",
+      "name": "Qt QPluginLoader with JSON metadata and interface IIDs",
+      "paradigm": "oo",
+      "implementation_notes": "When the host is a Qt application, QPluginLoader is the loader and the meta-object system is the contract machinery: each plugin declares Q_PLUGIN_METADATA(IID \"...\" FILE \"plugin.json\") and Q_INTERFACES, the host states the interface with Q_DECLARE_INTERFACE, and instance() returns the root component which qobject_cast turns into the interface pointer. The metadata JSON can be read with QPluginLoader::metaData() before loading, which is exactly the discover-without-loading practice, and statically linked plugins are enumerated with QPluginLoader::staticInstances() instead of being loaded from disk.",
+      "code_sketch": "class CsvFormatter : public QObject, public ViewerInterface {\n    Q_OBJECT\n    Q_PLUGIN_METADATA(IID \"org.example.Formatter/1.0\" FILE \"csv.json\")\n    Q_INTERFACES(ViewerInterface)\n};\n// host\nQPluginLoader loader(dir.absoluteFilePath(name));\nconst QJsonObject md = loader.metaData();          // no code executed yet\nif (auto *p = qobject_cast<ViewerInterface *>(loader.instance())) use(p);",
+      "pitfalls": [
+        "A Qt plugin needs the meta-object system, so the class must be default-constructible, the project must be built with moc, and the plugin must target the same Qt major version and build configuration (debug/release, static Qt) as the host.",
+        "QPluginLoader cannot be used in a statically linked Qt application; static plugins must be imported with Q_IMPORT_PLUGIN and enumerated through staticInstances()."
+      ],
+      "sources": [
+        "https://doc.qt.io/qt-6.10/plugins-howto.html"
+      ],
+      "idiom_name": "QPluginLoader + Q_DECLARE_INTERFACE/Q_PLUGIN_METADATA",
+      "min_standard": "C++17"
+    },
+    {
+      "variant_id": "link-time-self-registration",
+      "name": "Link-time self-registration into a host registry (compile-time cousin)",
+      "paradigm": "oo",
+      "implementation_notes": "The shape most C++ codebases actually ship for built-in extensions: each implementation registers a factory in its translation unit's static initialization (a registrar object appending to a registry in a shared header), so the host only looks the id up at run time and no loader is involved. Boost.DLL can even import the factory out of the host's own image (dll::shared_library self(dll::program_location()) with get_alias), which shows how link-time registration differs from runtime loading. Choose it when the implementation set is closed - it gives full compile-time checking - and accept that adding a plugin means relinking the host, so it does not satisfy the add-without-recompiling requirement by itself.",
+      "code_sketch": "// registry.hpp: inline std::map<std::string, factory>& registry();\nstruct csv_plugin {\n    static std::unique_ptr<formatter> make();\n};\nnamespace {\nconst bool registered_csv = [] {\n    registry().emplace(\"csv\", &csv_plugin::make);\n    return true;\n}();\n}\n// host: auto f = registry().at(config.kind)();",
+      "pitfalls": [
+        "Static-initialization order is unspecified across translation units, so a registrar must not call into another registrar or into the host's own initialization; register into a function-local static registry instead.",
+        "The linker drops object files whose symbols are never referenced (static libraries, --gc-sections), so registration units need --whole-archive or an explicit reference anchor to survive the link."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_dll/tutorial.html"
+      ],
+      "idiom_name": "registrar object + function-local static registry",
+      "min_standard": "C++11"
+    }
+  ],
+  "default_variant": "boost-dll-runtime-loading"
+}

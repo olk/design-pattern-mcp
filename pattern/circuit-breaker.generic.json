@@ -1,0 +1,27 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "per-dependency state machine (closed/open/half-open) + classified failure window + monotonic cooldown",
+  "implementation_notes": "Language-neutral form: one breaker instance per dependency; every call asks the breaker for permission first, and while open the breaker refuses (short-circuits) so the protected call never runs. Count only classified outcomes in a rolling window (count- or time-based), require a minimum number of calls before computing a rate, and trip on failure rate - optionally also on slow-call rate or consecutive failures. Store the trip time from a monotonic clock, move to half-open after the cooldown, and admit only a limited number of trial calls: success closes and resets the window, failure reopens. Keep the protected call outside the critical section (only admission and result recording are synchronized), because the breaker must never become a throughput bottleneck. The half-open probe timeout must be shorter than the normal call timeout so a slow-but-recovering dependency does not count as a failure. Add jitter to the cooldown so that multiple replicas do not synchronize their half-open transitions.",
+  "code_sketch": "cb = breaker(name=\"payments\", window=count(100), min_calls=20,\n             failure_rate=0.50, slow_call=2s, cooldown=30s, half_open_trials=3)\n\ncb.call { payment_api.authorize(order) }     # closed: outcome is classified + counted\n# open:            raise ShortCircuit         # protected call is never executed\n# after cooldown:  limited trial calls; success -> closed, failure -> open again\ncb.trip()  # manual open       cb.reset()  # manual closed for operations",
+  "pitfalls": [
+    "One breaker shared by several dependencies: a failure in one opens the circuit for all of them and merges independent failure domains.",
+    "Counting every exception as a failure, so ordinary business errors trip the breaker and healthy traffic gets rejected.",
+    "No minimum-call guard: a cold window trips on its first few failures and rejects traffic while the dependency is fine.",
+    "Using wall-clock time for the cooldown, so a clock adjustment can open or close the circuit at the wrong moment.",
+    "Retrying the short-circuit error, which converts the breaker's protection back into load on a dependency that is still down.",
+    "Synchronized half-open spike: all N replicas transition to half-open at the same instant after the cooldown, sending N waves of probe calls simultaneously and re-tripping the dependency before it has recovered.",
+    "Percentage-only thresholds without a minimum-call floor: at low traffic a tiny absolute number of failures (e.g. 2 of 4) reaches the percentage threshold and trips the breaker on statistical noise.",
+    "Per-host breaker scope causing a cascade: when one host's breaker opens, the load balancer redistributes its traffic to surviving hosts, raising their error rates and triggering their breakers in a propagating wave.",
+    "Half-open trial timeout equal to the normal call timeout: a probe that is slow but would succeed gets counted as a failure, pushing the breaker back open before recovery completes.",
+    "Retrying inside the half-open trial: the probe call itself has retries attached, multiplying the number of requests hitting a dependency that is still recovering.",
+    "Treating half-open as recovery rather than probation: allowing too many probe calls (e.g., permittedNumberOfCallsInHalfOpenState=100) sends real load instead of a health probe, restarting the cascade.",
+    "Misaligning the slow-call threshold with HTTP/client timeouts: if the HTTP timeout exceeds the slow-call threshold, requests can exhaust thread pools before the breaker registers slowness as a failure.",
+    "In-memory breaker state in serverless environments: Lambda's stateless execution means each invocation starts with a closed breaker, so the open state learned by one cold-start instance is lost for subsequent invocations unless state is persisted externally (DynamoDB, Redis, durable entity).",
+    "Stuck-open circuit from client-side errors: 4xx responses, authentication failures and malformed requests are classified as failures but the dependency never recovers, leaving the circuit permanently open.",
+    "ABA race in distributed state: two independent half-open probes can interleave in a way that masks a re-failure, causing the circuit to remain half-open indefinitely when it should reopen."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

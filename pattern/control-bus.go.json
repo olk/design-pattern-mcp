@@ -1,0 +1,54 @@
+{
+  "pattern": "control-bus",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "net/http admin mux + net/http/pprof + expvar + chan command + signal.NotifyContext",
+  "implementation_notes": "Go's standard library already ships most of a control bus: importing net/http/pprof registers profiling handlers, expvar publishes application variables as JSON, and runtime.ReadMemStats/NumGoroutine expose the runtime's own statistics, so the monitoring half is an import rather than a subsystem. Control is an in-process channel (chan command) or a handler on a separate admin mux, with signal.NotifyContext turning SIGTERM/SIGINT into context cancellation for shutdown; goroutines derive from that context so cancellation actually stops the component. The classic EIP form - a dedicated control topic through a broker - is only worth it when the fleet already runs a broker and components cannot be addressed over HTTP.",
+  "code_sketch": "type command struct{ op, target string; reply chan string }\n\ncmds := make(chan command, 8)                     // the in-process control bus\nmux := http.NewServeMux()                         // admin surface on its own listener\nmux.HandleFunc(\"/admin/cmd\", func(w http.ResponseWriter, r *http.Request) {\n    c := command{op: r.URL.Query().Get(\"op\"), target: r.URL.Query().Get(\"target\"),\n        reply: make(chan string, 1)}\n    cmds <- c\n    fmt.Fprintln(w, <-c.reply)\n})\nmux.Handle(\"/debug/pprof/\", http.DefaultServeMux) // or blank-import net/http/pprof\ngo http.ListenAndServe(\"127.0.0.1:6060\", mux)     // loopback or a dedicated interface\nctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)\ndefer stop()",
+  "pitfalls": [
+    "Importing net/http/pprof or expvar registers handlers on http.DefaultServeMux: if the data-path server uses the default mux too, the control surface ends up on the public port - bind the admin mux to loopback or a separate listener.",
+    "An unbuffered command channel makes the HTTP handler block as long as the component is busy; use a buffered channel plus a timeout on the reply, and never hold the request goroutine hostage.",
+    "Context cancellation only stops goroutines that derive from that context: a worker created with context.Background survives the stop command and keeps consuming messages."
+  ],
+  "sources": [
+    "https://go.dev/doc/diagnostics"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "stdlib-admin-endpoints",
+      "name": "Standard-library admin surface plus an in-process command channel",
+      "paradigm": "procedural",
+      "min_standard": "Go1.16",
+      "idiom_name": "net/http admin mux + net/http/pprof + expvar + chan command + signal.NotifyContext",
+      "implementation_notes": "Go's standard library already ships most of a control bus: importing net/http/pprof registers profiling handlers, expvar publishes application variables as JSON, and runtime.ReadMemStats/NumGoroutine expose the runtime's own statistics, so the monitoring half is an import rather than a subsystem. Control is an in-process channel (chan command) or a handler on a separate admin mux, with signal.NotifyContext turning SIGTERM/SIGINT into context cancellation for shutdown; goroutines derive from that context so cancellation actually stops the component. The classic EIP form - a dedicated control topic through a broker - is only worth it when the fleet already runs a broker and components cannot be addressed over HTTP.",
+      "code_sketch": "type command struct{ op, target string; reply chan string }\n\ncmds := make(chan command, 8)                     // the in-process control bus\nmux := http.NewServeMux()                         // admin surface on its own listener\nmux.HandleFunc(\"/admin/cmd\", func(w http.ResponseWriter, r *http.Request) {\n    c := command{op: r.URL.Query().Get(\"op\"), target: r.URL.Query().Get(\"target\"),\n        reply: make(chan string, 1)}\n    cmds <- c\n    fmt.Fprintln(w, <-c.reply)\n})\nmux.Handle(\"/debug/pprof/\", http.DefaultServeMux) // or blank-import net/http/pprof\ngo http.ListenAndServe(\"127.0.0.1:6060\", mux)     // loopback or a dedicated interface\nctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)\ndefer stop()",
+      "pitfalls": [
+        "Importing net/http/pprof or expvar registers handlers on http.DefaultServeMux: if the data-path server uses the default mux too, the control surface ends up on the public port - bind the admin mux to loopback or a separate listener.",
+        "An unbuffered command channel makes the HTTP handler block as long as the component is busy; use a buffered channel plus a timeout on the reply, and never hold the request goroutine hostage.",
+        "Context cancellation only stops goroutines that derive from that context: a worker created with context.Background survives the stop command and keeps consuming messages."
+      ],
+      "sources": [
+        "https://go.dev/doc/diagnostics"
+      ]
+    },
+    {
+      "variant_id": "broker-control-subject",
+      "name": "Broker control subjects (NATS) with request/reply acknowledgement",
+      "paradigm": "oo",
+      "min_standard": "Go1.18",
+      "idiom_name": "NATS subject namespace control.<component>.cmd/.status with msg.Respond acks",
+      "implementation_notes": "When the deployment already runs NATS, the control bus is a subject namespace rather than an endpoint: the console publishes to control.<component>.cmd, each component subscribes to its own subject, replies through msg.Respond (the broker's inbox carries the correlated answer) and publishes status or heartbeats on control.<component>.status; wildcards let the console fan a command out to control.*.cmd. Subject naming is the addressing model, so scoping a command means choosing a subject, and authorisation is enforced by the broker's account and permission model instead of by the component. Choose this variant when components are ephemeral, behind NAT, or written in several languages - the classic control-bus form pays for itself only with a broker already in the stack.",
+      "code_sketch": "nc, _ := nats.Connect(nats.DefaultURL, nats.UserCredentials(\"control.creds\"))\nsub, _ := nc.Subscribe(\"control.orders-adapter.cmd\", func(m *nats.Msg) {\n    var c struct{ Op, ID string }\n    if err := json.Unmarshal(m.Data, &c); err != nil { return }\n    result := apply(c.Op)                                        // pause / resume / snapshot\n    _ = m.Respond(mustJSON(map[string]any{\"id\": c.ID, \"applied\": result}))\n})\ndefer sub.Unsubscribe()\n// console fan-out: nc.Publish(\"control.*.cmd\", mustJSON(map[string]string{\"op\": \"flush-stats\"}))",
+      "pitfalls": [
+        "Core NATS is at-most-once: a command published while a component is restarting is lost silently, so lifecycle commands need request/reply (or JetStream with durable consumers) and a timeout that the console actually reports.",
+        "A component subscribed to control.*.cmd executes commands meant for its neighbours; subject ownership must be enforced by broker permissions, not by convention.",
+        "Command payloads are untyped bytes: without a schema check in the handler a malformed or hostile message reaches apply() directly."
+      ],
+      "sources": [
+        "https://docs.nats.io/nats-concepts/subjects"
+      ]
+    }
+  ],
+  "default_variant": "stdlib-admin-endpoints"
+}

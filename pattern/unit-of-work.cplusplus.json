@@ -1,0 +1,76 @@
+{
+  "pattern": "unit-of-work",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "odb::session object cache + odb::transaction with explicit update/persist calls",
+  "implementation_notes": "ODB supplies the identity half of the pattern and the atomic boundary, but not the deferred flush: odb::session is an object cache that guarantees one instance per id for as long as the session is current, and odb::transaction (db.begin(), commit(), rollback()) is the boundary. The manual is explicit that in this version a session is just an object cache and that automatic object state change tracking and delayed database operations are future work, so a changed object is written with an explicit db.update() or db.persist() call inside the transaction - the flush step stays in application code. SOCI is the boundary-only alternative (soci::transaction is an RAII wrapper that rolls back in its destructor unless commit() was called); hand-roll the full register/flush structure only when several subsystems mutate the same graph and an explicit change list is worth the machinery.",
+  "code_sketch": "odb::session s;                    // object cache: one instance per id\nodb::transaction t(db.begin());    // one business transaction\nauto p = db.load<person>(id);       // cached by the session\np->email = \"new@example.com\";\ndb.update(*p);                     // explicit write - no automatic flush\nt.commit();                        // atomic commit; rollback if never reached\n// SOCI alternative:\n//   soci::transaction tr(sql);\n//   sql << \"update person set email = :e where id = :id\", use(e), use(id);\n//   tr.commit();",
+  "pitfalls": [
+    "A session is current per thread and throws already_in_session if a second one is made current - one unit of work per thread, not per application.",
+    "Mutating a loaded object and forgetting db.update() loses the change silently, because plain persistent objects are not dirty-tracked (only odb::vector-style containers track changes).",
+    "The session caches an object persisted through a const reference as non-const, so a genuinely const object can later be handed out as mutable - create persistent objects non-const.",
+    "A session outlives transactions by design, so it must be cleared deliberately when a transaction rolls back, or cached instances keep serving rolled-back state."
+  ],
+  "sources": [
+    "https://www.codesynthesis.com/products/odb/doc/manual.xhtml",
+    "https://soci.sourceforge.net/doc/master/transactions/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "odb-session",
+      "name": "ODB session (object cache) with explicit update calls",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "odb session support"
+      ],
+      "idiom_name": "odb::session object cache + odb::transaction with explicit update/persist calls",
+      "implementation_notes": "ODB supplies the identity half of the pattern and the atomic boundary, but not the deferred flush: odb::session is an object cache that guarantees one instance per id for as long as the session is current, and odb::transaction (db.begin(), commit(), rollback()) is the boundary. The manual is explicit that in this version a session is just an object cache and that automatic object state change tracking and delayed database operations are future work, so a changed object is written with an explicit db.update() or db.persist() call inside the transaction - the flush step stays in application code. SOCI is the boundary-only alternative (soci::transaction is an RAII wrapper that rolls back in its destructor unless commit() was called); hand-roll the full register/flush structure only when several subsystems mutate the same graph and an explicit change list is worth the machinery.",
+      "code_sketch": "odb::session s;                    // object cache: one instance per id\nodb::transaction t(db.begin());    // one business transaction\nauto p = db.load<person>(id);       // cached by the session\np->email = \"new@example.com\";\ndb.update(*p);                     // explicit write - no automatic flush\nt.commit();                        // atomic commit; rollback if never reached\n// SOCI alternative:\n//   soci::transaction tr(sql);\n//   sql << \"update person set email = :e where id = :id\", use(e), use(id);\n//   tr.commit();",
+      "pitfalls": [
+        "A session is current per thread and throws already_in_session if a second one is made current - one unit of work per thread, not per application.",
+        "Mutating a loaded object and forgetting db.update() loses the change silently, because plain persistent objects are not dirty-tracked (only odb::vector-style containers track changes).",
+        "The session caches an object persisted through a const reference as non-const, so a genuinely const object can later be handed out as mutable - create persistent objects non-const.",
+        "A session outlives transactions by design, so it must be cleared deliberately when a transaction rolls back, or cached instances keep serving rolled-back state."
+      ],
+      "sources": [
+        "https://www.codesynthesis.com/products/odb/doc/manual.xhtml",
+        "https://soci.sourceforge.net/doc/master/transactions/"
+      ]
+    },
+    {
+      "variant_id": "soci-raii-transaction",
+      "name": "SOCI RAII transaction (boundary only)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "soci::transaction RAII scope + hand-written change list",
+      "implementation_notes": "SOCI provides begin/commit/rollback and a scoped transaction object whose destructor rolls back unless commit() was called, which is exactly the base layer of the pattern without any tracking: you still keep the new/dirty/removed lists yourself and issue the statements in order. Choose this when the application writes mostly set-based SQL and only needs the atomic boundary; choose ODB when identity and object graph handling matter more than raw statement control.",
+      "code_sketch": "{\n    soci::transaction tr(sql);              // rollback in the destructor\n    for (const auto& r : uow.new_rows())    sql << insert_sql, use(r);\n    for (const auto& r : uow.dirty_rows())  sql << update_sql, use(r);\n    tr.commit();\n}",
+      "pitfalls": [
+        "The destructor rolls back silently, so a missing commit() looks like a successful write that never happened.",
+        "SOCI exceptions escaping the scope still roll back, but a caught exception plus commit() would commit a half-applied change set - order the statements so partial states cannot be committed."
+      ],
+      "sources": [
+        "https://soci.sourceforge.net/doc/master/transactions/"
+      ]
+    },
+    {
+      "variant_id": "hand-rolled-register-flush",
+      "name": "hand-written register/flush unit of work",
+      "paradigm": "procedural",
+      "min_standard": "C++17",
+      "idiom_name": "std::vector of tracked objects + ordered flush in one transaction",
+      "implementation_notes": "When no library ships the tracking half, the classic structure is small enough to write: three vectors (new, dirty, removed) of pointers or ids, a register API, and a flush that walks them in dependency order inside one transaction. This is the right choice for C++ code that owns its own data structures (game servers, embedded persistence, custom binary stores) and cannot adopt an ORM, and it is the variant that makes the ordering rules explicit in the codebase.",
+      "code_sketch": "struct unit_of_work {\n    std::vector<row*>  added, dirty, removed;\n    void flush(db& d) {\n        auto tx = d.begin();\n        for (auto* r : added)   d.insert(*r);\n        for (auto* r : dirty)   d.update(*r);\n        for (auto* r : removed) d.erase(*r);\n        tx.commit();\n        added.clear(); dirty.clear(); removed.clear();\n    }\n};",
+      "pitfalls": [
+        "Raw pointers in the change lists dangle if the owner deletes an object before the flush; hold ids or shared ownership, or flush before releasing anything.",
+        "Without an identity map the same row can be registered twice (once as new and once as dirty) and the flush emits conflicting statements."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/raii"
+      ]
+    }
+  ],
+  "default_variant": "odb-session"
+}

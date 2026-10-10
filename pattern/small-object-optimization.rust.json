@@ -1,0 +1,57 @@
+{
+  "pattern": "small-object-optimization",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "SmallVec<[T; N]>",
+  "implementation_notes": "Rust's standard library has no small-object container - Vec and String allocate as soon as they are non-empty - but the ecosystem settled the question: smallvec's SmallVec is 'a Vec-like container that can store a small number of elements inline, and fall back to the heap for larger allocations', which the crate frames as 'a useful optimization for improving cache locality and reducing allocator traffic for workloads that fit within the inline buffer'. That is the classic structure with the crate owning the details, so no hand-written union-plus-tag buffer is needed in application code: const generics give arbitrary inline sizes, an optional union feature removes the state tag word, and no_std is supported. For type-erased values (an Any/function-like wrapper), hand-rolling is possible with MaybeUninit plus a manual drop flag because Rust exposes unions and raw storage directly, but the crate is preferable unless the payload policy must be custom. Use SmallVec when the element count is genuinely usually small; ArrayVec (sibling variant) when it must never allocate.",
+  "code_sketch": "use smallvec::{smallvec, SmallVec};\n\n// up to 4 elements inline; the 5th spills to the heap\nlet mut v: SmallVec<[u8; 4]> = smallvec![1, 2, 3, 4];\nassert!(!v.spilled());\nv.push(5);                     // allocation happens here\nassert!(v.spilled());          // SmallVec tracks which representation is live\nlet s: &[u8] = &v[..2];        // borrows die at the next mutation, as with Vec",
+  "pitfalls": [
+    "A SmallVec is larger than a Vec by its inline capacity, and every move copies those bytes: use it where the distribution really is small and cheap to move, or the container becomes the pessimization; the crate's union feature shrinks the header (Rust 1.49+) at the cost of an unsafe-adjacent representation.",
+    "Growth invalidates everything a Vec's growth invalidates: when the fifth element spills, the payload moves to the heap, so references, slices and raw pointers into the old inline storage dangle - the borrow checker prevents the common cases, but unsafe code and indices into a pinned buffer must be re-derived.",
+    "Rust moves values with memcpy: an element type that is address-sensitive or self-referential must never live in an inline buffer, because moving the SmallVec relocates the elements without running any move constructor."
+  ],
+  "sources": [
+    "docs.rs, smallvec - 'These store a certain number of elements inline, and fall back to the heap for larger allocations. This can be a useful optimization for improving cache locality and reducing allocator traffic for workloads that fit within the inline buffer': https://docs.rs/smallvec"
+  ],
+  "variants": [
+    {
+      "variant_id": "smallvec-inline-spill",
+      "name": "smallvec::SmallVec (inline buffer with heap spill)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust1.51",
+      "requires_features": [
+        "const generics"
+      ],
+      "idiom_name": "SmallVec<[T; N]>",
+      "implementation_notes": "Rust's standard library has no small-object container - Vec and String allocate as soon as they are non-empty - but the ecosystem settled the question: smallvec's SmallVec is 'a Vec-like container that can store a small number of elements inline, and fall back to the heap for larger allocations', which the crate frames as 'a useful optimization for improving cache locality and reducing allocator traffic for workloads that fit within the inline buffer'. That is the classic structure with the crate owning the details, so no hand-written union-plus-tag buffer is needed in application code: const generics give arbitrary inline sizes, an optional union feature removes the state tag word, and no_std is supported. For type-erased values (an Any/function-like wrapper), hand-rolling is possible with MaybeUninit plus a manual drop flag because Rust exposes unions and raw storage directly, but the crate is preferable unless the payload policy must be custom. Use SmallVec when the element count is genuinely usually small; ArrayVec (sibling variant) when it must never allocate.",
+      "code_sketch": "use smallvec::{smallvec, SmallVec};\n\n// up to 4 elements inline; the 5th spills to the heap\nlet mut v: SmallVec<[u8; 4]> = smallvec![1, 2, 3, 4];\nassert!(!v.spilled());\nv.push(5);                     // allocation happens here\nassert!(v.spilled());          // SmallVec tracks which representation is live\nlet s: &[u8] = &v[..2];        // borrows die at the next mutation, as with Vec",
+      "pitfalls": [
+        "A SmallVec is larger than a Vec by its inline capacity, and every move copies those bytes: use it where the distribution really is small and cheap to move, or the container becomes the pessimization; the crate's union feature shrinks the header (Rust 1.49+) at the cost of an unsafe-adjacent representation.",
+        "Growth invalidates everything a Vec's growth invalidates: when the fifth element spills, the payload moves to the heap, so references, slices and raw pointers into the old inline storage dangle - the borrow checker prevents the common cases, but unsafe code and indices into a pinned buffer must be re-derived.",
+        "Rust moves values with memcpy: an element type that is address-sensitive or self-referential must never live in an inline buffer, because moving the SmallVec relocates the elements without running any move constructor."
+      ],
+      "sources": [
+        "docs.rs, smallvec - 'These store a certain number of elements inline, and fall back to the heap for larger allocations. This can be a useful optimization for improving cache locality and reducing allocator traffic for workloads that fit within the inline buffer': https://docs.rs/smallvec"
+      ]
+    },
+    {
+      "variant_id": "arrayvec-fixed-capacity",
+      "name": "arrayvec::ArrayVec (fixed capacity, never allocates)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust1.51",
+      "idiom_name": "ArrayVec<T, N> / ArrayString<N>",
+      "implementation_notes": "ArrayVec is the fixed-capacity sibling: 'a vector with a fixed capacity' whose contents are stored inline, with ArrayString as the string equivalent. Because there is no heap fallback at all, the representation question disappears - the container is exactly N elements wide, push beyond N returns a CapacityError instead of allocating, and the type works in no_std and in environments where allocation is forbidden. Choose it when the capacity bound is a domain fact (a header with at most 8 addresses, a DNS name of at most 255 bytes) and when failure on overflow is acceptable or handled explicitly; choose SmallVec when the long tail of values must still be served, and note that the crate's docs list no allocation API at all, which is the point.",
+      "code_sketch": "use arrayvec::ArrayVec;\n\nlet mut v: ArrayVec<u8, 4> = ArrayVec::new();\nv.push(1); v.push(2); v.push(3); v.push(4);\nassert!(v.is_full());\nassert!(v.try_push(5).is_err());   // CapacityError: no heap, no growth\nassert_eq!(v.len(), 4);            // the failed element was dropped",
+      "pitfalls": [
+        "There is no heap fallback by design: exceeding N is a capacity error, so a workload with a long tail converts an allocation into an error path that the API (and the caller) must define - do not pick ArrayVec for data whose size is merely usually small.",
+        "The inline array is part of the struct, so a large N makes every instance and every move cost N element slots: ArrayVec<T, 1024> is usually worse than Box<[T]> even though it never allocates, especially when most instances stay near-empty.",
+        "try_push returns Err and drops the value it could not store (the element is consumed by the call), and ArrayVec has no remove-and-shift-free API surface as wide as Vec: porting Vec-based code needs attention to the losing element's lifetime."
+      ],
+      "sources": [
+        "docs.rs, arrayvec - 'arrayvec provides the types ArrayVec and ArrayString: array-backed vector and string types, which store their contents inline', with CapacityError as the overflow result: https://docs.rs/arrayvec"
+      ]
+    }
+  ],
+  "default_variant": "smallvec-inline-spill",
+  "version": "1.0"
+}

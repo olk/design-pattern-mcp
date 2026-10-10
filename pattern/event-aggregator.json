@@ -1,0 +1,230 @@
+{
+  "category": "workflow-messaging",
+  "name": "event-aggregator",
+  "aliases": [
+    "event bus",
+    "messenger",
+    "message bus",
+    "event hub"
+  ],
+  "intent": "Funnel the events of many source objects into one hub that owns the subscription wiring, so that subscribers register once with the aggregator instead of tracking down and registering with every publisher.",
+  "problem": "Many components raise events and many components want to react: if every consumer registers directly with every producer, each consumer has to find the sources and subscribe to each event type separately, each producer accumulates knowledge of who listens, and both sides repeat the same registration and unsubscribe code at every pair. The trigger is a many-publisher / many-subscriber setting in which the wiring itself has become the maintenance problem.",
+  "context": "In-process, event-driven software - a modular UI shell, a domain-event pipeline inside one bounded context, a plugin host, a simulation or instrumentation layer - where publishers and subscribers grow independently, both sides should stay unaware of each other, and registration plus lifetime management should live in one place. The aggregator is a component- or module-scope element of one process (one node); events that must cross a process boundary, survive a restart or be delivered reliably need a messaging channel instead.",
+  "benefits": [
+    "Registration is centralised: a subscriber locates one hub instead of discovering and subscribing to N publishers, and a publisher never sees a subscriber at all, so both sides add and remove participants without edits.",
+    "Many-to-many decoupling is real rather than nominal: N publishers and M subscribers cost N + M references through the hub instead of N x M direct subscriptions, and no component needs a reference to a peer module.",
+    "Lifetime management gets one owner: the hub can hold weak references, revoke subscriptions on teardown or drop a whole module's registrations at once, which is exactly the memory-management burden raw Observer leaves with every subject.",
+    "Cross-cutting plumbing has a single home: threading and queueing policy, filtering, replay, ordering, logging, dead-event handling and per-subscriber error isolation are implemented once in the hub instead of being re-created in every subject.",
+    "Events can be generalised: source-specific notifications can be republished as coarser application-level events so subscribers need far fewer subscriptions - Fowler's own guidance, paid for by extra notifications that have no material effect on the receiver.",
+    "Supports event Storm prevention: the hub can implement subscriber control (disable/enable dispatch) to prevent cascading re-entrant writes during model updates."
+  ],
+  "tradeoffs": [
+    "The hub becomes a hidden dependency and a coupling magnet: nothing at a publish or subscribe call site reveals who else is involved, so the real call graph exists only inside the registrations and cannot be read off the code.",
+    "Event flows are implicit and easy to loop: a handler that publishes while handling creates re-entrant cascades, and ordering between subscribers, between publishers and between publish/handle cycles is unspecified unless the hub defines it explicitly.",
+    "Synchronous fan-out couples the publisher to every subscriber: the publishing thread pays the sum of all handler costs, and one blocking or throwing handler affects the publisher and every subscriber behind it.",
+    "Lifetime is genuinely ambiguous: strong references leak removed-but-still-registered subscribers while weak references silently drop them (both are documented behaviour of the mainstream .NET and Java realizations), so an explicit unsubscribe discipline is unavoidable either way.",
+    "Generalised, often untyped events lower the compiler's ability to help: subscribers are notified of events with no effect on them, and outside typed frameworks the bus degrades into string-keyed payload bags where a typo fails at runtime.",
+    "A process-wide hub is a single point of failure and contention: an exception in dispatch, a saturated queue or an unbounded subscriber list affects every publisher in the process at once.",
+    "Fan-out can cascade unboundedly: one event triggering handlers that publish more events can produce exponentially growing message volumes - the 'event storm' failure mode that saturates queues and wedges workers."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 9,
+    "maintainability": 5,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 5,
+    "security": 4,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Event Source (Publisher)",
+      "responsibility": "Raises events about its own state changes or actions and knows nothing about subscribers; it either exposes an event the aggregator registers with (Fowler's original form) or publishes straight into the hub (the typical modern form)."
+    },
+    {
+      "role": "Event Aggregator (Hub)",
+      "responsibility": "Owns the subscription registry and the event-type (channel) mapping, receives events from sources and fans them out to matching subscribers; owns delivery policy, filtering, error isolation and the lifetime rules for registrations."
+    },
+    {
+      "role": "Channel (Event Type or Topic)",
+      "responsibility": "The partition of the registry that groups subscribers by what they care about - a class, a name or a topic string - and may carry the generalisation rule that maps source-specific events onto coarser public events."
+    },
+    {
+      "role": "Event (Notification)",
+      "responsibility": "The payload describing what happened, carrying enough context (source, identity, timestamp) for a handler to react without calling back into the source; it should be immutable while it is being dispatched."
+    },
+    {
+      "role": "Subscriber (Handler / Observer)",
+      "responsibility": "Registers a callback for the event types it handles through the hub, reacts without re-entering the hub if possible, and unsubscribes on teardown whenever registrations are not held weakly."
+    },
+    {
+      "role": "Delivery Policy (Dispatcher)",
+      "responsibility": "Optional but usually present: decides whether handlers run on the publisher's thread, a UI thread, a thread pool or a queue, how one failing handler is isolated from the rest, and what happens when a subscriber falls behind."
+    },
+    {
+      "role": "Subscriber Supervisor (Anti-Storm Guard)",
+      "responsibility": "Optional but recommended in high-fan-out systems: a scoped gate that disables event dispatch while handlers are executing write operations, preventing a handler from publishing an event that re-triggers the same handler (event storm prevention). The save must complete inside the disabled scope."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Modular UI shells (WPF/MAUI, Android, SwiftUI) where view models living in separate modules must react to each other without holding references — the classic Prism and CommunityToolkit.Mvvm scenario.",
+    "Domain-event fan-out inside one bounded context: 'order placed' reaches billing, stock, notification and audit services that each subscribe to the hub instead of to the Order aggregate.",
+    "Plugin, extension or rule hosts where the listener set is only known at runtime and plugins are loaded and unloaded while the application runs.",
+    "Test and simulation harnesses: a test subscribes to the hub, drives one publisher and asserts on the published events without wiring up the real consumers.",
+    "Cross-cutting instrumentation and audit: metrics, tracing, logging and audit collectors receive events from many components through one hub rather than being called from each component.",
+    "Long-running services broadcasting rare state changes (configuration reload, presence change, feature-flag flip) to every interested subsystem exactly once per change.",
+    "Micro-frontend communication: independent web apps in one page communicating via a shared event bus with typed event maps and cross-tab synchronization (BroadcastChannel bridge).",
+    "IoT sensor aggregation: many sensor streams funnelled through one hub for filtering, transformation and fan-out to display or downstream processing services.",
+    "CQRS command/event pipeline: commands are dispatched to handlers that publish domain events through a bus; read-model projectors subscribe to build consistent query views.",
+    "Redux/Flux-style frontend state updates where UI components subscribe to dispatched actions rather than mutating shared state directly.",
+    "Event storm prevention harness: wrapping a batch save operation in a scoped subscriber-disable guard so that handlers triggered by the save do not re-publish events that would cascade back through the same handler.",
+    "Transactional outbox companion: publishing domain events through the hub after a transaction commits, ensuring that state changes and event emission are not separated by a process crash (in-process equivalent of the outbox pattern).",
+    "Java in-JVM decoupling with Guava EventBus: objects register via @Subscribe-annotated methods and publishers post typed events that the bus routes by parameter type (superclasses and interfaces included), with unmatched events wrapped as DeadEvent for a second-chance subscriber.",
+    "Spring application-context event pipeline: beans publish through ApplicationEventPublisher and react via @EventListener methods - in-process domain-event fan-out with the ApplicationEventMulticaster owning the registry, no message broker involved.",
+    "Vue 2 cross-component communication through a shared root instance used as a global bus ($on/$emit); Vue 3 removed that instance-emitter API, making external typed emitters like mitt, provide/inject, or a store (Pinia) the supported replacement - a cautionary real-world case for untyped global buses."
+  ],
+  "avoid_when": [
+    "One subject with a small, fixed set of reactions: direct calls, a single callback parameter or plain Observer are simpler and keep the control flow visible in the code.",
+    "The events must cross a process boundary, survive a restart or be delivered exactly once: use a Publish-Subscribe Channel or Point-to-Point Channel with Guaranteed Delivery rather than an in-process hub.",
+    "The reaction needs an answer, an aggregate or a transformation: request/response (Request-Reply, Command Message, Messaging Gateway) fits, whereas a broadcast hub hides the response path.",
+    "A framework already supplies a hub (Spring ApplicationEventPublisher, Rails ActiveSupport::Notifications, .NET messengers, Swift NotificationCenter, an actor system's EventStream): do not run a second, parallel bus on top.",
+    "Event rate is high and each subscriber cares about a small slice: a stream with filtering and backpressure beats an O(subscribers) in-process fan-out that copies every event to everyone.",
+    "Business workflow requires explicit sequencing and decision logic: the hub forwards events but encapsulates no logic — a Mediator or Saga owns the workflow, not the aggregator."
+  ],
+  "language_files": {
+    "generic": "event-aggregator.generic.json",
+    "c": "event-aggregator.c.json",
+    "cplusplus": "event-aggregator.cplusplus.json",
+    "csharp": "event-aggregator.csharp.json",
+    "go": "event-aggregator.go.json",
+    "java": "event-aggregator.java.json",
+    "javascript": "event-aggregator.javascript.json",
+    "kotlin": "event-aggregator.kotlin.json",
+    "python": "event-aggregator.python.json",
+    "ruby": "event-aggregator.ruby.json",
+    "rust": "event-aggregator.rust.json",
+    "scala": "event-aggregator.scala.json",
+    "swift": "event-aggregator.swift.json",
+    "typescript": "event-aggregator.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional",
+    "concurrent"
+  ],
+  "scope": "module",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "observer",
+    "mediator",
+    "publisher-subscriber",
+    "facade",
+    "domain-event",
+    "event-message",
+    "control-bus",
+    "process-manager"
+  ],
+  "anti_patterns": [
+    "God event bus: one process-wide hub that every component subscribes to for everything, so the subscription list becomes an invisible call graph nobody can enumerate or safely change. Remedy: one focused hub per subsystem or domain; document what publishes what.",
+    "Event soup: end-to-end business flows expressed only as events with no owner of the use case, so nobody can say which steps ran, in which order, or whether they ran at all. Remedy: distinguish commands (expect a response) from events (fire-and-forget) and assign use-case ownership to a Mediator or Saga.",
+    "Publish-inside-handler cascades: handlers that publish to the hub they are handling, producing re-entrant loops, duplicate side effects and load-dependent behaviour. This is particularly dangerous in micro-frontends where cross-tab mirroring can amplify the loop, and in high-fan-out systems where one event triggers a cascade of publishes. Remedy: enforce one-way data flow, tag events with a source-id and ignore echoes, or use a subscriber-supervisor that disables dispatch during write operations.",
+    "Strong-reference registrations with no unsubscribe path: removed components stay reachable through the hub's subscription list, which is precisely the leak the hub was introduced to fix. Especially insidious with anonymous lambdas. Remedy: always store the subscription token and dispose it; prefer weak-reference implementations.",
+    "Using the hub as a data-transfer channel: mutable, entity-sized payloads that subscribers write back into, turning the aggregator into a shared mutable global. Remedy: treat events as immutable facts; use request/response (MediatR, IPC) when a return value is needed.",
+    "Adding a hub where one direct subscription would do, because 'decoupling' is assumed to be free while the indirection cost is never paid by a second consumer or a second publisher. Remedy: introduce the hub only when you have at least two publishers or two subscribers that genuinely should not know each other.",
+    "Subscription-list growth without pruning: implementations that prune dead weak references only on publish accumulate stale entries when events are rarely published (high subscribe, low publish). Remedy: call Prune() manually, use a LinkedList-based implementation, or switch to an explicit unsubscribe discipline.",
+    "Synchronous fan-out as the only delivery mode: publishing on a latency-sensitive thread (UI, request handling) couples the publisher to every handler's execution time. Remedy: offer BackgroundThread and UIThread delivery options and default to async for non-trivial handlers.",
+    "Event bus monolith: the event bus becomes a shared semantic dependency hub across the entire organisation — too many consumers on shared topics, enterprise-wide schemas, teams needing permission to change events, platform teams acting as change approval boards. The bus provides runtime decoupling but design-time coupling hides everywhere. Remedy: publish context-specific events in a clear published language per bounded context; keep workflow ownership explicit; use anti-corruption layers around legacy central topics.",
+    "Dual-write without outbox: writing to the database and publishing an event as two separate operations — if the process crashes between them the state is committed but the event is lost, leaving consumers with inconsistent data. Remedy: use the transactional outbox pattern — write events to a table inside the same transaction, then relay them after commit.",
+    "Bidirectional sync without source tracking: two systems each consuming the other's events to sync data creates an infinite loop — A publishes change, B consumes and publishes back, A consumes and publishes again. Remedy: include an x-source header identifying the originating system; a system ignores events that originated from itself.",
+    "No dead-letter handling: failed messages accumulate in a queue with no resolution strategy, or a DLQ is set up but nobody monitors it. Remedy: classify dead letters (transient, permanent, poison); set max retry counts; move to DLQ after exhaustion; monitor and investigate DLQ regularly."
+  ],
+  "design_principles": [
+    "Introduce an intermediary: many-to-many collaboration degrades to many-to-one-to-many, so N publishers and M subscribers share one contract instead of N x M references.",
+    "Information hiding (Law of Demeter): a publisher does not know its subscribers and a subscriber does not know its publishers; both know only the hub and the event contract.",
+    "Single responsibility: the hub owns registration, dispatch policy, filtering and lifetime; each component owns only its own reaction.",
+    "Inversion of control (Hollywood principle): the aggregator calls the subscriber, so control flow leaves component code and components become pluggable.",
+    "Open/closed principle: new reactions attach by subscription, without modifying publishers or existing subscribers.",
+    "Program to a stable event contract: publish coarse, meaningful, immutable events rather than mirroring internal object structure into the hub.",
+    "Immutability: treat event payloads as immutable facts; never let a handler mutate the event during dispatch as concurrent handlers may share the same instance.",
+    "Fail in isolation: one throwing handler must not prevent other handlers from receiving the same event; catch, log and continue.",
+    "Explicit over implicit: name event types explicitly (class or string key); avoid untyped string-keyed channels where typos fail at runtime."
+  ],
+  "best_practices": [
+    "Give every event an explicit type or name plus an immutable payload, and never let subscribers mutate the payload during dispatch (concurrent subscribers may share one instance).",
+    "Hand out a subscription token or disposable from subscribe and release it deterministically in the subscriber's teardown, even when the hub uses weak references — weak references only prevent the hub from keeping the subscriber alive, not the subscription entry itself from accumulating.",
+    "Choose the reference policy deliberately: weak references to avoid leaks (and accept that an otherwise unreferenced subscriber silently stops being called and the subscription list must be pruned), strong references for hot paths (and then unsubscribe manually).",
+    "Keep handlers short, non-blocking and non-throwing; isolate per-subscriber failures, and state the threading contract — which thread delivers and whether delivery is synchronous, queued or UI-thread-dispatched.",
+    "Dispatch over a snapshot of the registry and define subscribe/unsubscribe-during-dispatch behaviour explicitly rather than relying on registry internals.",
+    "Prefer several focused hubs or per-domain channels over one global bus, and document which component publishes which event type — a single process-wide bus becomes a hidden call graph nobody can enumerate.",
+    "Make the bus observable: subscriber counts, delivery failures, dead events and dropped messages should be logged or metered rather than silently swallowed.",
+    "For high-frequency event sources (scroll, resize, rapid input), apply debouncing or throttling at the publisher before the bus fans out, to avoid flooding subscribers and blocking the main thread.",
+    "Implement event schema versioning from the start: stamp every event with a version field, add new fields as optional, and never repurpose an existing field's meaning — treat the event contract as a public API.",
+    "Enforce one-way data flow: a subscriber should never re-emit the same event it is handling, to prevent silent re-entrant loops that produce duplicate side effects and load-dependent behaviour.",
+    "Use typed events (generics or payload classes) rather than string-keyed channels — compile-time type checking catches typos and refactoring errors that string keys hide until runtime.",
+    "For micro-frontend architectures, use a typed event map shared across teams as a source-of-truth contract; validate payloads at publish time and drop (do not throw on) malformed events so one buggy producer cannot take down the page.",
+    "Implement a subscriber supervisor (disable/enable dispatch) for write-heavy handlers: wrap save operations in a scope where event publishing is suppressed, then flush pending events after the commit — prevents a handler from re-publishing an event that cascades back through the same handler.",
+    "Pair the hub with a transactional outbox for any state change that must survive a process crash: write events to an in-process outbox array inside the same transaction, then flush to the hub after commit. This eliminates the dual-write hazard without requiring a message broker.",
+    "Make every event consumer idempotent: brokers retry, networks fail, processes restart — the same event may be delivered multiple times. Use a stable event ID and a deduplication check (database unique constraint, cache key) so reprocessing has no side effects.",
+    "Add a dead-letter queue or mechanism for each subscriber: when a handler exceeds its retry budget, move the poison message aside rather than blocking the entire fan-out. Classify failures (transient vs permanent) and handle each differently.",
+    "Avoid commands disguised as events: an event named SendEmailCommand or OrderShippedCommand carries the producer's intent about what should happen, re-coupling the publisher to consumer logic. Use facts (OrderConfirmed, PaymentReceived) and let consumers decide their reactions.",
+    "Enforce fan-out bounds: a hub with thousands of subscribers per event type should implement dispatch limits, timeouts per handler, and backpressure signalling so one slow or malicious handler cannot starve others."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Fowler, Event Aggregator (martinfowler.com, eaaDev writing, 2004) — the originating description: one object that registers with many sources and is the single registration point for targets, a form of Facade restricted to observer relationships.",
+    "https://martinfowler.com/eaaDev/EventAggregator.html — Martin Fowler's canonical Event Aggregator pattern page with consultant/aggregator example and event generalisation guidance.",
+    "https://martinfowler.com/eaaDev/OrganizingPresentations.html — Fowler's event pattern comparison including Event Aggregator vs Event Collaboration vs Message dispatch.",
+    "https://martinfowler.com/eaaDev/EventNarrative.html — Fowler's 'Focusing on Events' narrative covering Event Collaboration, Event Sourcing, and Parallel Models.",
+    "https://martinfowler.com/articles/201701-event-driven.html — Fowler's 2017 'What do you mean by Event-Driven?' summarising the summit with Thoughtworks colleagues, clarifying Event Notification, Event-Carried State Transfer, Event Sourcing and CQRS.",
+    "https://martinfowler.com/eaaDev/EventCollaboration.html — Fowler's Event Collaboration pattern: components signal events rather than making requests; covers coupling trade-offs, Event Sourcing compatibility and the 'architect's dream, developer's nightmare' observation.",
+    "https://martinfowler.com/eaaDev/MediatedSynchronization.html — Fowler's Mediated Synchronization pattern comparing fine-grained observer events vs Event Aggregator's coarse-grained approach for screen synchronisation.",
+    "https://prismlibrary.github.io/docs/event-aggregator.html — Prism Library's official Event Aggregator documentation covering PubSubEvent, ThreadOption, weak vs strong references, and subscription token lifecycle.",
+    "https://learn.microsoft.com/en-us/dotnet/communitytoolkit/mvvm/messenger — CommunityToolkit.Mvvm Messenger (successor to MVVM Light Messenger), a typed in-process event aggregator with weak-reference subscription semantics.",
+    "https://learn.microsoft.com/en-us/archive/technet-wiki/23314.using-the-event-aggregator-pattern-to-communicate-between-view-models — Microsoft TechNet wiki article on using Event Aggregator for ViewModel communication in WPF/MVVM applications.",
+    "https://lostechies.com/derickbailey/2013/03/18/event-aggregator-andorvs-mediator-a-tale-of-two-patterns — Derick Bailey's definitive comparison: Event Aggregator has zero business logic (pure forwarding), Mediator encapsulates workflow; includes composition example where EA triggers a Mediator.",
+    "https://lostechies.com/derickbailey/2012/04/03/revisiting-the-backbone-event-aggregator-lessons-learned — Backbone/Marionette Event Aggregator lessons: per-channel aggregators vs one global bus, command vs event semantics, and the 'God event bus' anti-pattern.",
+    "https://www.markheath.net/post/2012/10/19/understanding-and-avoiding-memory-leaks — Mark Heath on memory leaks in event handlers and Event Aggregators; covers weak references, strong references, and the Rx Disposable pattern.",
+    "https://ardalis.com/avoid-using-csharp-events-in-aspnetcore-apps — Steve Ardalis on why C# events cause memory leaks and thread-safety issues in ASP.NET Core; recommends Event Aggregator or MediatR as a safer alternative.",
+    "https://hackernoon.com/decouple-your-go-components-by-leveraging-mediator-and-event-aggregator-patterns — Go-language treatment of Mediator and Event Aggregator patterns; covers the 'mob' library's typed event broker with request-response and notify semantics; notes that aggregation is not free decoupling.",
+    "https://micro-frontend-architecture.com/cross-app-state-context-sharing/event-bus-patterns-for-decoupled-apps — Comprehensive guide to event bus patterns for micro-frontends: CustomEvent, RxJS Subject, BroadcastChannel trade-offs; covers memory leaks from dangling subscriptions, debouncing high-frequency events, and one-way data flow to prevent loops.",
+    "https://medium.com/@thorstensuckow/contracted-events-for-micro-frontend-communication-8e05769d9a74 — Contracted events for micro-frontend communication using consumer-driven contracts and versioned event schemas to prevent breaking changes across independently deployed frontends.",
+    "Hohpe and Woolf, Enterprise Integration Patterns (Addison-Wesley, 2003) — the broader EIP catalog covering Message Channel, Publish-Subscribe Channel, Event Message, and Message Bus patterns that contextualise Event Aggregator in integration scenarios; note: EIP's Aggregator is a separate stateful message-level pattern distinct from Fowler's in-process Event Aggregator.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/Aggregator.html — Hohpe and Woolf's EIP Aggregator pattern: stateful correlation-based message aggregation with completeness conditions (wait-for-all, timeout, external event); distinct from Fowler's Event Aggregator.",
+    "https://www.enterpriseintegrationpatterns.com/docs/EDA.pdf — Gregor Hohpe's 'Events Everywhere' essay on EDA characteristics: broadcast communications, asynchrony, fine-grained events, Complex Event Processing and the 'architect's dream, developer's nightmare' observation about implicit event flows.",
+    "https://github.com/PrismLibrary/Prism/issues/1505 — Prism GitHub issue documenting a real-world subscription-list growth bug when events are rarely published; illustrates the prune-on-subscribe performance trade-off and the need for manual Prune() calls in high-subscribe/low-publish scenarios.",
+    "https://www.itsnothing.de/post/post-commit-events-in-memory-outbox/ — Jan-Erik's in-memory transactional outbox variant for a synchronous event bus: events collected during a DB transaction, flushed after commit; surfaces the async-void hazard where a synchronous bus skips promises in handlers.",
+    "https://adhdecode.com/articles/event-driven/event-driven-antipatterns/ — ADHDecode on event-driven anti-patterns: event storms (cascading publish-inside-handler), eventual consistency illusions, implicit coupling via event naming; includes event storm prevention via workflow orchestrator.",
+    "https://sujeet.pro/articles/event-driven-architecture — Sujeet Jaiswal on EDA in practice: dual-write problem, transactional outbox, event schema evolution, idempotency, dead-letter queues, backpressure, fan-out limits, and temporal failure modes; covers Kafka/long-running workflow latency benchmarks.",
+    "https://www.nilus.be/blog/your_event_bus_became_your_monolith/ — Nilus on the 'event bus monolith' anti-pattern: shared enterprise topics become design-time coupling hubs; prescribes context-specific events, explicit workflow ownership, anti-corruption layers for migration, and reconciliation procedures.",
+    "https://oronts.com/en/guides/event-driven-architecture-practice — Oronts on production event-driven failures: event storms with EventSubscriberSupervisor fix, bidirectional sync loops with x-source header fix, duplicate processing, dead-letter accumulation; includes severity taxonomy and per-failure-type mitigation checklist.",
+    "https://github.com/google/guava/wiki/EventBusExplained — Guava's official EventBus wiki: in-process publish/subscribe via register/@Subscribe/post with type-based routing and the DeadEvent second-chance mechanism; the same wiki flags EventBus as outdated and recommends RxJava, Project Reactor or Kotlin coroutines (Flow/Channels) for new event-reacting designs.",
+    "https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/context/ApplicationEventPublisher.html — Spring Framework's official ApplicationEventPublisher javadoc: the ApplicationContext-owned hub that hands published events to the ApplicationEventMulticaster; documents payload wrapping, the no-guarantee on synchronous/immediate delivery and async/reactive publishing guidance.",
+    "https://v3-migration.vuejs.org/breaking-changes/events-api.html — Official Vue 3 migration guide: the instance event-emitter API ($on/$off/$once) was removed, ending the 'new Vue()' global event bus; recommends external emitters (mitt/tiny-emitter), provide/inject or a store instead - a canonical case of a platform retracting its built-in global bus.",
+    "https://tkacz.pro/vue-js-why-event-bus-is-bad-idea/ — Criticism of the global Vue event bus: no namespaces so event names collide across features, data flow invisible at call sites, subscribers leaking when components are destroyed - the concrete failure modes behind untyped process-wide buses."
+  ],
+  "related_patterns_notes": {
+    "observer": "The foundational pattern Event Aggregator is built on: subjects notify observers of state changes. Event Aggregator is a many-to-many Observer with a central hub; raw Observer is typically 1:1. Fowler explicitly notes Event Aggregator is 'a particular form of Facade that focuses only on observer relationships.",
+    "mediator": "Both Mediator and Event Aggregator introduce a third-party hub, but Mediator encapsulates business logic and workflow coordination while Event Aggregator has zero application logic — it only forwards events. Derick Bailey's canonical distinction: 'an event aggregator has no logic, other than forwarding events; a mediator encapsulates the potentially complex logic of coordinating multiple objects.' They compose well: Event Aggregator triggers a Mediator that coordinates a workflow. Conversely, a Mediator can sit behind an Event Aggregator, listening to coarse events and orchestrating fine-grained object interactions.",
+    "publisher-subscriber": "Pub-Sub typically crosses process boundaries via a message broker and provides location transparency, durability and guaranteed delivery; Event Aggregator operates in-process in a single address space. Both are multicast, but Pub-Sub adds network topology, delivery guarantees and schema registries. Fowler groups them under the same broad heading but notes Event Aggregator is specifically in-process.",
+    "facade": "Event Aggregator is architecturally a Facade: it presents a simplified interface (one registration point) to a complex underlying subsystem (N publishers, M subscribers, wiring, lifetime management). Unlike a typical Facade, it is a behavioural pattern — it actively mediates observer relationships rather than just hiding a complex subsystem.",
+    "event-channel": "A named channel (pipe) through which events pass; often used alongside Event Aggregator when events must survive process restarts or reach external systems. Event Channel is the transport layer; Event Aggregator is the in-process routing decision.",
+    "domain-event": "Domain events are the application-layer semantic events (e.g., OrderPlaced, PaymentProcessed) that are often distributed via an Event Aggregator. In DDD, domain events are immutable facts about the domain; the aggregator is the infrastructure that fans them out to interested handlers within the bounded context.",
+    "event-message": "An event wrapped as a message with its own identity, timestamp and metadata, suitable for durable queuing. Event Aggregator may emit event messages to external systems; equally, an event message arriving from outside may be republished into the in-process aggregator.",
+    "control-bus": "An architectural pattern where a separate system (the bus) manages how messages are routed. Event Aggregator is a lightweight in-process control bus: it owns routing decisions, delivery policy and error isolation for events within one process.",
+    "eip-aggregator": "Hohpe and Woolf's Enterprise Integration Patterns book describes a separate Aggregator pattern that is stateful and message-oriented: it collects related messages (identified by correlation) until a completeness condition is met, then publishes a single aggregated message. This is fundamentally different from Fowler's Event Aggregator — one aggregates messages over time with correlation and timeout logic; the other funnels live events from many sources to many subscribers. Both patterns share the name 'Aggregator' but solve different problems.",
+    "process-manager": "A saga coordinates a distributed workflow by chaining local transactions through events; it pairs naturally with Event Aggregator: the aggregator fans out domain events (OrderPlaced, PaymentCompleted) while the saga subscribes to them and publishes the next step in the workflow. Without a saga, workflows expressed purely through event fan-out become implicit and hard to trace.",
+    "transactional-outbox": "The outbox pattern writes domain events to a table inside the same database transaction as the state change, then a relay publishes them to the bus after commit. This prevents the dual-write problem (state committed but event lost, or event published but state rolled back). An Event Aggregator in-process can implement a lightweight in-memory outbox variant: collect pending events during a transaction and flush them after commit succeeds.",
+    "event-sourcing": "Event Sourcing persists state as a sequence of immutable domain events; the event store is the source of truth. Event Aggregator often serves as the fan-out mechanism that distributes events to projectors (CQRS read-model updates) and to external consumers. The aggregator does not replace the event store — it is the delivery layer on top of it."
+  }
+}

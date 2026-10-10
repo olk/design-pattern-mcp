@@ -1,0 +1,248 @@
+{
+  "category": "concurrency-resilience",
+  "name": "master-worker",
+  "aliases": [
+    "master/worker",
+    "controller-worker"
+  ],
+  "intent": "Parallelise one computation by letting a single master decompose it into independent subtasks, hand them to a pool of uniform workers and combine the partial results, so that the decomposition, dispatch and aggregation policy is written once while the workers stay ignorant of the surrounding program.",
+  "problem": "A computation is too large for one processing unit, but parallelising it by hand at each call site couples the application to a particular thread, process or network topology: work distribution, load balancing, failure handling and result reassembly are re-implemented for every task, and the actual computation is drowned in plumbing.",
+  "context": "Task-parallel software - CPU-bound batch processing, request fan-out over several backends, or processing of large key sets - where the work splits into many independent pieces with no ordering constraints between them, the workers are interchangeable, and the number of processing units (threads, cores, processes, machines) should be configurable without touching the task logic.",
+  "benefits": [
+    "Throughput scales with the number of workers: the same decomposition runs on one core, several processes or a cluster of machines, and adding capacity is a configuration change rather than a rewrite.",
+    "The master owns decomposition and aggregation, so every parallel job in the application shares one distribution and result-collection policy instead of a bespoke one per call site.",
+    "Workers are homogeneous and task-agnostic: one pool serves many task types, and a worker only has to take a task, compute a partial result and return it.",
+    "A shared queue gives dynamic load balancing for free: a fast worker simply takes the next task, so skewed or unpredictable task durations degrade gracefully instead of leaving workers idle.",
+    "Fault and completion policy is centralised: the master can bound concurrency, wait for the slowest task, cancel the rest on the first failure, or aggregate in completion order - all in one place.",
+    "The style forces the decomposition to be explicit, which surfaces hidden ordering or shared-state dependencies before they turn into race conditions.",
+    "Work stealing (idle workers stealing from busy workers' queues) further improves load balancing for heterogeneous task durations with minimal contention."
+  ],
+  "tradeoffs": [
+    "The master is a coordination bottleneck and a single point of failure: its dispatch rate and result collection bound total throughput, and nothing progresses while it is busy, blocked or dead.",
+    "Task granularity has no local optimum: fine tasks pay queue and dispatch overhead per item, coarse tasks leave workers idle on imbalance, and the right cut-off must be measured for the workload.",
+    "Tasks and results must cross a boundary - a queue, a process, a network - so payloads are copied, serialized or deep-cloned, which costs time and gives up data locality.",
+    "Failure and cancellation semantics are subtle: a dead worker must not leave the master waiting forever, partial results have to be defined explicitly, and shutdown requires a poison pill, a closed queue or cooperative cancellation.",
+    "Completion order is nondeterministic, so the aggregator must be order-independent (or reorder explicitly) and tests must tolerate every valid interleaving.",
+    "Speedup is bounded by Amdahl's law plus coordination cost: the serial fraction, dispatch latency and result gathering cap the gain no matter how many workers are added.",
+    "In distributed deployments, network partitions can cause the master to falsely conclude a worker is dead, leading to duplicate task execution unless idempotency or distributed locking is employed.",
+    "Head-of-line blocking on a FIFO shared queue: a long-running or blocked worker at the head of a per-worker queue stalls the entire queue, while shared-queue designs can experience contention on the queue head under high load."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 8,
+    "reliability": 5,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Master (Coordinator)",
+      "responsibility": "Decomposes the input into independent subtasks, publishes them on the shared queue, tracks progress and computes the final result from the partial results; owns the dispatch policy (concurrency bound, retries, cancellation)."
+    },
+    {
+      "role": "Worker",
+      "responsibility": "Repeatedly takes one subtask from the queue, executes it in isolation and returns the partial result; homogeneous, task-agnostic and reused across many tasks."
+    },
+    {
+      "role": "Subtask (Work Item)",
+      "responsibility": "The independent unit of work together with its input data; its granularity is the pattern's main tuning parameter."
+    },
+    {
+      "role": "Work Queue (Task Source)",
+      "responsibility": "Buffers pending subtasks between master and workers; a single shared queue gives pull-based dynamic load balancing, per-worker queues give push-based assignment, and work-stealing queues allow idle workers to steal from busy workers' deques."
+    },
+    {
+      "role": "Result Collector / Aggregator",
+      "responsibility": "Gathers partial results - in completion order, in submission order, or through a reduction - and combines them into the final answer; must tolerate arbitrary arrival order."
+    },
+    {
+      "role": "Completion / Failure Policy",
+      "responsibility": "Enforces the shutdown and error contract: how workers stop (poison pill, closed channel, interrupt), what happens to a failed subtask (retry, fail fast, degrade) and when the master gives up."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "CPU-bound batch jobs split by data: image and video transcoding, rendering, Monte Carlo simulation and parameter sweeps over many independent inputs.",
+    "Request fan-out: a server queries several shards, services or replicas in parallel and aggregates the replies under a single deadline.",
+    "MapReduce-style data processing: split an input, map each part independently, then reduce the partial results into the final answer (as in Hadoop MapReduce, Apache Spark, and Google Cloud Dataflow).",
+    "Crawlers, scanners and index builders that must process a large set of URLs, files or keys with a bounded number of workers.",
+    "Test suites, linters and build graphs that distribute independent units of work across a worker pool and report one combined result.",
+    "Distributed execution: a client-side master dispatches work units to remote worker processes or machines (grid and volunteer computing).",
+    "Distributed ETL pipelines: processing millions of records daily with dynamic worker scaling, dead-letter queues for failed records, and row-level error isolation (e.g., NestJS/BullMQ + Redis pipelines).",
+    "Cloud-native batch processing: petabyte-scale daily batch jobs on Ray clusters with zero-CPU head nodes, flexible actor pools, and custom resources for workload isolation (e.g., Netflix media processing pipeline).",
+    "Spring Batch remote partitioning: master step partitions input into N workers across JVMs via messaging (RabbitMQ/Kafka), with chunk-oriented processing and transactional boundaries.",
+    "Container orchestration control plane: Kubernetes API server acts as master, kubelet agents as workers, scheduling Pods and reconciling desired state (see also: Kubernetes Operator pattern).",
+    "Stream processing coordinators: Apache Flink JobManager (master) distributes tasks to TaskManagers; Trino/Presto coordinator dispatches query fragments to workers.",
+    "Scientific computing: Monte Carlo simulations, parameter sweeps, molecular dynamics, where embarrassingly parallel tasks are distributed across HPC cluster nodes.",
+    "ML inference batching and embedding generation: a master collects incoming inference requests into batches, dispatches them to a pool of GPU workers, and returns individual or batched results (e.g., Ray Serve, Hugging Face inference endpoints).",
+    "Real-time feature computation: a master decomposes a feature vector into independent column computations dispatched to a pool, aggregating into a unified feature map for online ML inference with latency budgets.",
+    "Database connection pool management: a pool manager (master) parcels SQL queries to a fixed set of DB connection workers, bounding concurrency to the pool size and enforcing per-query timeouts.",
+    "Apache Hadoop MapReduce on YARN: the ResourceManager and MRAppMaster coordinate map and reduce tasks across NodeManagers, monitor progress, and re-execute failed tasks.",
+    "Ray's ray.util.ActorPool: a fixed set of Ray actors accepts submitted or mapped work and exposes ordered or unordered result retrieval, providing a concrete actor-backed worker pool.",
+    "Spring Batch Integration remote partitioning: a manager partitions a step and sends requests through JMS/AMQP-backed channels to workers that execute complete steps and return replies, suited to I/O-bound batches."
+  ],
+  "avoid_when": [
+    "The work does not decompose into independent pieces: dependent stages belong in a pipeline, and mutually dependent tasks will deadlock a bounded pool.",
+    "The decomposition is a regular loop or collection: the runtime's parallel map/for (std::execution::par, Parallel.ForEachAsync, rayon par_iter, OpenMP parallel for, parallel streams) already provides dispatch and aggregation with less code.",
+    "There are only a handful of tasks, or each task is tiny compared with the dispatch overhead: a sequential run or a plain asynchronous call is faster and simpler.",
+    "A framework already owns the pool and the decomposition (a server's worker model, a batch scheduler, an actor runtime), so rebuilding the master and worker roles inside the application duplicates the infrastructure.",
+    "The underlying problem is flow control or streaming: an unbounded task backlog must first be bounded, or expressed as a pipeline or competing consumers rather than a master-worker pool.",
+    "Iterative algorithms requiring multiple passes over the same working set: Hadoop MapReduce writes all intermediate data to disk between passes, making it 10-100x slower than in-memory frameworks like Spark for graph processing or machine learning."
+  ],
+  "language_files": {
+    "generic": "master-worker.generic.json",
+    "c": "master-worker.c.json",
+    "cplusplus": "master-worker.cplusplus.json",
+    "csharp": "master-worker.csharp.json",
+    "go": "master-worker.go.json",
+    "java": "master-worker.java.json",
+    "javascript": "master-worker.javascript.json",
+    "kotlin": "master-worker.kotlin.json",
+    "python": "master-worker.python.json",
+    "ruby": "master-worker.ruby.json",
+    "rust": "master-worker.rust.json",
+    "scala": "master-worker.scala.json",
+    "swift": "master-worker.swift.json",
+    "typescript": "master-worker.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "posa1"
+  ],
+  "related_patterns": [
+    "fork-join",
+    "master-slave",
+    "thread-pool",
+    "divide-and-conquer",
+    "scatter-gather",
+    "leader-followers",
+    "async-method-invocation",
+    "structured-concurrency",
+    "producer-consumer",
+    "composed-message-processor"
+  ],
+  "anti_patterns": [
+    "The master doing worker work: the coordinator becomes the serial bottleneck and the workers starve.",
+    "One thread (or process, or Worker) per subtask instead of a bounded pool: creation cost and oversubscription replace queuing.",
+    "Workers that wait for other workers' results: the decomposition is no longer independent, and a bounded pool deadlocks.",
+    "Unbounded submission with no queue bound or back-pressure: tasks pile up in memory as soon as workers fall behind.",
+    "Fire-and-forget dispatch: futures, handles or promise rejections are discarded, so failed subtasks silently disappear from the aggregate.",
+    "Thundering herd: all workers released simultaneously after a queue lull, overwhelming the system.",
+    "Distributed split-brain: master falsely concludes a worker is dead due to network partition; same task runs on multiple workers.",
+    "Cascading failure death spiral: one failing job retries exponentially, consuming worker capacity and causing other jobs to time out and also retry.",
+    "Long-tail partition imbalance: coarse partition boundaries leave some workers idle while others process far more work than others.",
+    "Head-of-line blocking on a FIFO per-worker queue: a single large or stalled task at the queue head stalls all work behind it, even if subsequent tasks are trivially small.",
+    "Memory blowup from large futures accumulation: storing every submitted task's Future/AsyncResult without draining results concurrently can exhaust memory before any task completes."
+  ],
+  "design_principles": [
+    "Separation of concerns: coordination (decomposition, dispatch, aggregation) is distinct from execution (the worker's computation).",
+    "Single responsibility: the master coordinates and computes the final result; a worker computes one subtask and knows nothing else.",
+    "Divide and conquer: only an independent decomposition makes parallel execution correct, so dependency analysis precedes the pattern.",
+    "Dynamic load balancing (pull scheduling): workers competing for a shared queue absorb unpredictable task durations.",
+    "Reuse through a common work-item contract: one task-agnostic worker pool serves many task types.",
+    "Information hiding: workers see a task and a result slot, never the surrounding master state.",
+    "Idempotency by default: tasks must be safe to re-execute when a worker is falsely presumed dead.",
+    "Back-pressure propagation: bounded queues signal overload upstream rather than accumulating unbounded work.",
+    "Structured lifetime: all workers' lifetimes are scoped to a single lexical block (as in Python asyncio.TaskGroup, Java StructuredTaskScope, Go errgroup), so the master cannot return while workers are still running and cancellation propagates automatically.",
+    "Observability-first: instrument queue depth, worker utilization, task latency (P50/P99/max), and failure rates before going to production; these metrics are the primary signals for pool sizing and failure diagnosis."
+  ],
+  "best_practices": [
+    "Size subtasks by measurement: find the granularity where dispatch overhead is small relative to the work, and keep the cut-off configurable.",
+    "Prefer a single shared queue with pull-based workers over static assignment, unless affinity or data locality outweighs balancing.",
+    "Bound concurrency and the queue: a fixed worker count plus back-pressure (or a bounded queue) prevents overload and memory growth.",
+    "Give every task an explicit completion and error path; collect each result or its failure instead of discarding handles.",
+    "Define shutdown: poison pill, closed channel or cooperative cancellation, and join every worker before the master returns.",
+    "Make aggregation order-independent or carry an index; never depend on the order in which results arrive.",
+    "Keep workers stateless between tasks: per-task state belongs to the work item or the result.",
+    "Use flooding (batch) dispatch: give each worker multiple tasks on first contact and when it has no work, to reduce master contact frequency for small tasks. Default flooding factor ~2; increase for many small tasks.",
+    "Implement heartbeat-based failure detection with a timeout; when a worker misses N heartbeats, reassign its tasks.",
+    "Design tasks to be idempotent: if a task runs twice (due to false failure detection), the outcome must be the same.",
+    "Use exponential backoff with jitter for task retries; cap maximum retries and route repeated failures to a dead-letter queue.",
+    "Monitor queue depth: if depth consistently exceeds 2x worker count, the pool is undersized or workers are blocked.",
+    "Set maxtasksperchild in long-running pools to recycle workers and prevent memory leaks from per-task state accumulation.",
+    "For iterative workloads where workers need shared read-only data, use worker-memory or distributed cache patterns to avoid re-sending large data with every task.",
+    "Prefer work-stealing deques (Chase-Lev algorithm) over a single shared queue when workers have heterogeneous task durations, to minimize contention on the queue head.",
+    "Integrate with structured concurrency primitives (Python asyncio.TaskGroup, Java StructuredTaskScope via JEP 505, Go errgroup, Rust async-std::spawn) to enforce that the master only returns once all workers have completed, with automatic cancellation propagation on failure.",
+    "Instrument distributed tracing (OpenTelemetry span per task) to attribute latency, failures, and queue time to specific workers, task types, and inputs; this is the primary tool for diagnosing load-balancing skew in production.",
+    "Use adaptive concurrency control (AIMD: increase concurrency when latency is below target, reduce when above) to automatically size the dispatch rate without hard-coded limits; SEDA-style per-stage admission control provides the theoretical foundation.",
+    "For GPU/CPU heterogeneous workers, tag tasks with resource requirements (e.g., GPU memory, core count) and use affinity-aware scheduling to avoid moving large tensors across the network unnecessarily.",
+    "For long-running pools, profile worker memory usage periodically: set memory-per-child limits (e.g., worker_max_memory_per_child in Celery) and trigger recycling before OOM kills; monitor RSS trend to catch slow leaks that maxtasksperchild alone does not catch.",
+    "Drain results concurrently with dispatch: submit tasks and consume results in a single event loop or dedicated consumer thread so that memory is not held by pending futures; this avoids the common blowup pattern where a fast producer overwhelms the result queue.",
+    "Separate I/O-bound and CPU-bound task types into distinct pools with different concurrency limits: I/O tasks can tolerate higher concurrency (threads spend most time waiting), while CPU-bound tasks are bound by core count."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Buschmann, Meunner, Rohnert, Sommerlad & Stal, Pattern-Oriented Software Architecture Vol. 1: A System of Patterns (1996) - Master-Slave in the design-patterns chapter; the POSA Vol. 2 concurrency chapter cites Master-Slave as the concurrency-related form of the same structure.",
+    "Mattson, Sanders & Massingill, Patterns for Parallel Programming (Addison-Wesley, 2005, ISBN 0-321-22811-1) - the Master/Worker supporting structure: a single master manages the collection of tasks and collects results, while workers grab a task, do the work and send the results back.",
+    "Dean & Ghemawat, 'MapReduce: Simplified Data Processing on Large Clusters' (OSDI 2004) - foundational paper describing Google's master-worker implementation for distributed data processing, with fault tolerance, speculative execution, and load balancing at scale.",
+    "Chase & Lev, 'Dynamic Circular Work-Stealing Deque' (SPAA 2005) - the canonical lock-free work-stealing deque algorithm used in Java ForkJoinPool, Cilk, Intel TBB, and Go scheduler; requires only one CAS per steal, none on push.",
+    "Le, Pop, Cohen & Nardelli, 'Correct and Efficient Work-Stealing for Weak Memory Models' (PPoPP 2013) - rigorous correctness proof and memory barrier analysis for Chase-Lev deque on ARM/Power relaxed memory models; influences production implementations in Java ForkJoinPool.",
+    "Michael, Saraswat & Vechev, 'Idempotent Work Stealing' (PPoPP 2009) - extends Chase-Lev deque with idempotent steal operations, enabling safe interruption and migration of in-flight tasks.",
+    "Douglas C. Schmidt et al., 'POSA2: Concurrency Patterns' (Vanderbilt University) - pattern templates for master-worker, producer-consumer, and work-stealing in the context of distributed real-time and embedded systems.",
+    "Yizhuo Wang et al., 'A Work-Stealing Scheduling Framework Supporting Fault Tolerance' (2013) - hierarchical work-stealing on multicore clusters with transient fault detection via double execution and permanent fault tolerance via diskless checkpointing.",
+    "Jonas Posner & Claudia Fohry, 'A Java Task Pool Framework providing Fault-Tolerant Global Load Balancing' (2018) - application-level fault-tolerant work stealing using Hazelcast IMap for resilient backup storage, tolerating arbitrary worker failures without system-level support.",
+    "ProActive Master-Worker API documentation (Huihoo/OpenAD) - Java implementation with automatic task scheduling, load balancing, fault tolerance via ping/heartbeat, flooding parameter tuning, and worker memory for iterative computations.",
+    "GigaSpaces Master-Worker Pattern documentation - space-based implementation with designated workers (partition affinity) vs random workers (non-blocking round-robin scan), and task executors for collocated data.",
+    "Java Design Patterns: Master-Worker - practical Java implementation with Master/Worker/Input/Result classes, aggregation patterns, and throughput analysis.",
+    "Harphies, 'The Ubiquitous Master-Worker Architecture: A Technical Deep Dive' (Medium, 2024) - real-world applications in Kubernetes control plane, Hadoop Namenode/Datanode, YARN ResourceManager/NodeManager, Apache Flink JobManager/TaskManager, and Trino/Presto coordinator/workers.",
+    "Patrick Koss, 'Building a Distributed Job Scheduler That Won't Melt Down at 3 AM' (Medium, 2025) - ten production pitfalls: thundering herd, time zone traps, cascading failure death spirals, eventually consistent job loss, double execution, orphaned work, clock skew, poison pills, coordination overhead, and O(n) memory scalability.",
+    "Alibaba Cloud, 'Canary Release Challenges of Master-Worker Architectures' (2024) - cascading failure propagation through SDK libraries and master-worker control planes during rolling upgrades; split-brain risk when master and worker use incompatible protocol versions.",
+    "Netflix batch case study (Narcis Miclaus, 2026) - petabyte-scale daily batch on Ray: zero-CPU head nodes, flexible ActorPoolStrategy, custom 'batch' resource for workload isolation, fire-and-forget progress via Ray actors, and distributed writes via Ray Data Datasink.",
+    "YK Praveen, 'Building Distributed Data Processing with Spring Batch 6' (DEV Community, 2026) - Spring Batch remote partitioning with gridSize, ThreadPoolTaskExecutor, chunk-oriented processing, and adaptive work-stealing for long-tail partitions.",
+    "Niyaz Ahmad, 'Why I Replaced the Master-Worker in My Distributed Job Scheduler with a Ticker' (Medium, 2026) - case study replacing custom master-worker segment ownership with Kafka partition assignment and etcd leader election; addresses split-brain, false failure detection, and safe horizontal scaling.",
+    "CodeTalks, 'Spring Batch Remote Partitioning Explained' (Medium, 2026) - master-worker architecture in Spring Batch remote partitioning using messaging (RabbitMQ/Kafka); worker stateless design, idempotent writes, and partition-aware fault isolation.",
+    "Joshua Johal, 'Resolving Concurrency Bugs in Python Multiprocessing Pools' (2026) - seven common Python multiprocessing bugs: unprotected shared resource access, file handle leaks, unhandled exceptions, memory-intensive operations; worker initialization patterns reducing memory leaks by 92%.",
+    "Ray ActorPool documentation (Ray 2024-2025) - master-worker-style work pool managing a fixed set of Ray actors with work-stealing-like scheduling; distributes tasks to idle actors and queues pending submissions when all actors are busy; includes get_next/get_next_timeout for ordered result retrieval.",
+    "Tomoda Hinata, 'Celery + Redis Production-Operations Guide' (2025) - production-grade Celery deployment: at-least-once semantics, visibility_timeout overrun traps, ETA task memory bloat, idempotent task design, exponential backoff with jitter, Redis noeviction policy risks, and Flower observability.",
+    "maheshmahadevan, 'Practical Guide to Celery in Production' (GitHub, 2025) - AWS SQS-based Celery at scale: queue isolation by workload, spot instance graceful shutdown via AWS termination notice, custom CloudWatch/Athena/Grafana monitoring, prefetch tuning, and SQS visibility timeout calibration.",
+    "BackendBytes, 'Go Worker Pool Pattern: Production-Ready Concurrency Control' (2025) - bounded goroutine pools via buffered channels, context cancellation propagation, WaitGroup drain patterns, per-job context timeouts, and graceful shutdown vs abort semantics.",
+    "BytesizeGo, 'Worker Pools in Go: Bounded Concurrency Without Goroutine Leaks' (2025) - canonical Go worker-pool with typed Job interface, bounded queue, context-based cancellation, errgroup fan-out with SetLimit, and proper channel ownership for closing.",
+    "Escalopa, 'Designing Bounded Worker Pools in Go' (2025) - admission-boundary resilience design: bounded concurrency at the producer boundary, explicit overload signalling, deadline propagation, and deterministic unit tests for invariant preservation under failure injection.",
+    "Oracle, 'ForkJoinPool (Java SE 26 & JDK 26)' (2025) - Java ForkJoinPool work-stealing with asyncMode for FIFO event-style tasks, ManagedBlocker for extending synchronization, and submitWithTimeout API; optimal for recursive task trees with fine-grained parallelism.",
+    "JEP 505: Structured Concurrency (Fifth Preview, OpenJDK 2025) - StructuredTaskScope in java.util.concurrent: forked subtasks scoped as a lexical family, automatic cancellation propagation, first-success and all-fail policies; structured alternative to raw ForkJoinPool for master-worker coordination.",
+    "Python Software Foundation, 'Coroutines and Tasks — Python 3.14 Documentation' (2025) - asyncio.TaskGroup (3.11+): scoped child tasks with automatic cancellation on exception, compare with gather, uncancel usage for controlled regions; primary structured concurrency primitive for async master-worker in Python.",
+    "Rust Async Book, 'Structured Concurrency' (2025) - Rust async structured concurrency philosophy: lexical lifetime enforcement, nursery-style scoping via tokio::task::scope, the hazard of select/race macros breaking structure, and scoped threads vs free-floating spawn.",
+    "Matt Welsh, 'SEDA: An Architecture for Well-Conditioned, Scalable Internet Services' (SOSP 2001) - foundational SEDA (Staged Event-Driven Architecture) paper: services decomposed into a network of event-driven stages connected by explicit queues; per-stage admission control, adaptive load shedding, and AIMD rate tuning for well-conditioned operation under variable load.",
+    "Welsh et al., 'Adaptive Overload Control for Busy Internet Servers' (USITS 2003) - SEDA adaptive overload control: per-stage token-bucket AIMD rate limiting targeting P90 response time, queue-depth-based admission control, and load shedding as a last resort; foundational theory for modern adaptive concurrency implementations.",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html",
+    "https://patterns.eecs.berkeley.edu/?page_id=240",
+    "https://java-design-patterns.com/patterns/master-worker/",
+    "https://docs.ray.io/en/latest/%5Fmodules/ray/util/actor%5Fpool.html",
+    "https://tomodahinata.com/en/blog/celery-redis-production-async-task-queue-guide",
+    "https://github.com/maheshmahadevan/practical-guide-to-celery-in-production",
+    "https://backendbytes.com/articles/go-worker-pool-concurrency/",
+    "https://www.bytesizego.com/blog/worker-pools-in-go-bounded-concurrency-without-goroutine-lea",
+    "https://escalopa.com/en/posts/designing-bounded-worker-pools-in-go/",
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://openjdk.org/jeps/505",
+    "https://rust-lang.github.io/async-book/part-reference/structured.html",
+    "https://dev.to/ykpraveen/building-distributed-data-processing-with-spring-batch-6-spring-boot-4-5hf8",
+    "https://niyaz-ahmad.medium.com/why-i-replaced-the-master-worker-in-my-distributed-job-scheduler-with-a-ticker-3484a8c16e12",
+    "https://www.alibabacloud.com/blog/canary-release-challenges-of-master-worker-architectures_601512",
+    "https://johal.in/resolving-concurrency-bugs-in-python-multiprocessing-pools",
+    "https://doi.org/10.1145/502055.502057",
+    "https://docs.ray.io/en/latest/ray-core/api/doc/ray.util.ActorPool.html",
+    "https://docs.spring.io/spring-batch/reference/spring-batch-integration/externalizing-execution.html",
+    "https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html"
+  ],
+  "related_patterns_notes": {
+    "scheduler-actor": "scheduler-actor",
+    "kubernetes-operator": "kubernetes-operator",
+    "governor": "governor",
+    "seda": "seda"
+  }
+}

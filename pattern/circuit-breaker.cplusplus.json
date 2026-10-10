@@ -1,0 +1,59 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::atomic state snapshot + std::chrono::steady_clock deadline",
+  "implementation_notes": "C++ has no standard breaker, so this is the classic hand-written realization: a std::atomic state (or a mutex-protected copy), atomic counters or a small mutex-guarded window, and std::chrono::steady_clock for both the cooldown deadline and slow-call detection. Admission is a single atomic load on the hot path - closed returns immediately, open compares the deadline and compare-exchanges into half-open - which is what keeps the breaker cheaper than the call it protects; the protected call stays outside any lock. There is nothing to replace the structure with, so the classic form is always justified; the design decision is which parts stay lock-free (state reads, counters) and which are serialized (transitions, window updates).",
+  "code_sketch": "enum class State : std::uint8_t { closed, open, half_open };\n\nbool admit(Breaker& b) {                        // one breaker per dependency\n    auto s = b.st.load(std::memory_order_acquire);\n    if (s == State::closed) return true;\n    if (s == State::open) {\n        if (steady_now() - b.opened_at.load(std::memory_order_relaxed) < kCooldown)\n            return false;                       // still cooling down\n        return b.st.compare_exchange_strong(s, State::half_open);   // one trial call\n    }\n    return b.half_open_trials.fetch_add(1) < kTrials;               // limited trials\n}",
+  "pitfalls": [
+    "Using std::chrono::system_clock for the cooldown: it can jump backwards and keep the circuit open (or closed) for the wrong duration; use steady_clock.",
+    "A per-call CAS loop on shared counters turns the breaker into a contention point under high concurrency; keep the hot path to a single atomic load and batch or shard the counter updates.",
+    "std::atomic does not make the whole transition atomic: state and counters need deliberate acquire/release ordering, or a thread can admit a call against a stale state.",
+    "A breaker held by value in a policy object is copied, and each copy keeps its own counters, so the trip threshold is never reached."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/atomic/atomic",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "atomic-state-machine",
+      "name": "Hand-rolled atomic state machine with a steady-clock cooldown (C++11)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::atomic state snapshot + std::chrono::steady_clock deadline",
+      "implementation_notes": "C++ has no standard breaker, so this is the classic hand-written realization: a std::atomic state (or a mutex-protected copy), atomic counters or a small mutex-guarded window, and std::chrono::steady_clock for both the cooldown deadline and slow-call detection. Admission is a single atomic load on the hot path - closed returns immediately, open compares the deadline and compare-exchanges into half-open - which is what keeps the breaker cheaper than the call it protects; the protected call stays outside any lock. There is nothing to replace the structure with, so the classic form is always justified; the design decision is which parts stay lock-free (state reads, counters) and which are serialized (transitions, window updates).",
+      "code_sketch": "enum class State : std::uint8_t { closed, open, half_open };\n\nbool admit(Breaker& b) {                        // one breaker per dependency\n    auto s = b.st.load(std::memory_order_acquire);\n    if (s == State::closed) return true;\n    if (s == State::open) {\n        if (steady_now() - b.opened_at.load(std::memory_order_relaxed) < kCooldown)\n            return false;                       // still cooling down\n        return b.st.compare_exchange_strong(s, State::half_open);   // one trial call\n    }\n    return b.half_open_trials.fetch_add(1) < kTrials;               // limited trials\n}",
+      "pitfalls": [
+        "Using std::chrono::system_clock for the cooldown: it can jump backwards and keep the circuit open (or closed) for the wrong duration; use steady_clock.",
+        "A per-call CAS loop on shared counters turns the breaker into a contention point under high concurrency; keep the hot path to a single atomic load and batch or shard the counter updates.",
+        "std::atomic does not make the whole transition atomic: state and counters need deliberate acquire/release ordering, or a thread can admit a call against a stale state.",
+        "A breaker held by value in a policy object is copied, and each copy keeps its own counters, so the trip threshold is never reached."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    },
+    {
+      "variant_id": "asio-timer-integrated",
+      "name": "Asio-integrated breaker: strand-owned state + steady_timer cooldown (C++17)",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "idiom_name": "boost::asio::steady_timer cooldown + strand-serialised state",
+      "implementation_notes": "When the client is already Asio-based, the breaker lives in the same executor as the connection: state is owned by the strand (or by a single-threaded io_context) instead of atomics, admission is an ordinary function call on that strand, and the open-to-half-open transition is scheduled with a boost::asio::steady_timer rather than computed lazily on the next call - so recovery starts on time even when traffic is quiet, which is the reason to prefer this variant in event-driven servers. Completion handlers must record success or failure back on the same strand, the timer must outlive its wait, and a cancelled wait completes with operation_aborted, which is not a failure to count. Choose this over the atomic variant when timing accuracy of the half-open transition matters or when the whole client is already callback/coroutine based.",
+      "code_sketch": "void AsyncBreaker::trip() {                     // runs on the strand\n    st_ = State::open;\n    cooldown_.expires_after(kOpenDuration);     // the timer owns the recovery clock\n    cooldown_.async_wait(boost::asio::bind_executor(strand_, [this](error_code ec) {\n        if (!ec) { st_ = State::half_open; }    // operation_aborted is not a failure\n    }));\n}\n\n// admission elsewhere on the same strand:\n// if (breaker.state() == State::closed) { async_call(req, [&](error_code ec) { breaker.record(ec); }); }",
+      "pitfalls": [
+        "A cancelled timer completes with operation_aborted; counting that as a failure corrupts the statistics whenever the wait is re-armed or the service shuts down.",
+        "Without a strand (or a single-threaded io_context) the state becomes a data race, because handlers may run on any thread that runs the context.",
+        "The timer must outlive its pending wait: destroying a breaker with an async_wait outstanding leaves a dangling handler.",
+        "Blocking work inside a completion handler stalls the whole io_context and hides the dependency's slowness from both the breaker and the timeout."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    }
+  ],
+  "default_variant": "atomic-state-machine"
+}

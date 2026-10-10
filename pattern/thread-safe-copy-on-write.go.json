@@ -1,0 +1,18 @@
+{
+  "pattern": "thread-safe-copy-on-write",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "immutable value published by atomic.Pointer[T]; writers clone-and-swap under a mutex (maps.Clone)",
+  "implementation_notes": "Go's garbage collector already owns the reference count, so the pattern becomes publication plus discipline: keep the shared state behind a pointer that is swapped atomically and never mutate a published value. atomic.Pointer[T] is 'an atomic pointer of type *T' with Load/Store/Swap/CompareAndSwap (its zero value is nil); the memory model guarantees that an atomic operation observed by another 'synchronizes before' it, so a reader that loads the snapshot once sees the writer's fully initialised copy. Writers take a sync.Mutex, clone the current value (maps.Clone for maps, slices.Clone for slices), apply the change and Store the new pointer. That replaces the classic structure - there is no count to protect and no destructor to worry about - but the copies are still O(n) per publish, so the same read-must-outnumber-write rule applies; if writes dominate, hold the mutex (or sync.RWMutex) around a mutable value instead.",
+  "code_sketch": "type Table struct{ m map[string]int }\n\nvar current atomic.Pointer[Table]      // Go 1.19+\nvar write sync.Mutex\n\nfunc Lookup(k string) int { return current.Load().m[k] }   // lock-free read\n\nfunc Add(k string, v int) {\n    write.Lock()\n    defer write.Unlock()                                   // writers serialise\n    next := &Table{m: maps.Clone(current.Load().m)}         // copy-on-write, O(n)\n    next.m[k] = v\n    current.Store(next)                                     // publish the snapshot\n}",
+  "pitfalls": [
+    "A clone is shallow and slices share their backing array: slices.Clone/append-copy really copy, but s[1:], a copy into a shorter view, or an append that fits the capacity can write into memory another snapshot still references - the published snapshot must own its arrays exclusively.",
+    "atomic.Pointer must not be copied after first use (it carries a noCopy marker that go vet reports), and its zero value is a nil pointer, so a Load before the first Store panics - initialise eagerly, or guard construction with sync.Once.",
+    "Publication is not transactionality: two writers that each Load-clone-Store under different locks lose one update, and even one shared lock only works if every writer uses it - the invariant must live next to the pointer."
+  ],
+  "sources": [
+    "Go standard library, sync/atomic/type.go - 'A Pointer is an atomic pointer of type *T. The zero value is a nil *T. Pointer must not be copied after first use': https://github.com/golang/go/blob/master/src/sync/atomic/type.go",
+    "Go standard library, sync/atomic/doc.go - 'if the effect of an atomic operation A is observed by atomic operation B, then A synchronizes before B': https://github.com/golang/go/blob/master/src/sync/atomic/doc.go"
+  ],
+  "version": "1.0"
+}

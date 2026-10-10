@@ -1,0 +1,58 @@
+{
+  "pattern": "request-reply",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "mutex-protected correlation table + pthread_cond_timedwait reply wait",
+  "implementation_notes": "C has no request/reply runtime, so the requestor hand-writes the classic structure: a correlation table (request id -> waiter) guarded by a mutex, an atomically incremented request id carried in the request envelope, and a bounded wait for the reply with pthread_cond_timedwait - or mq_timedreceive, poll, or a socket read with SO_RCVTIMEO. The replier copies the id from the request into the reply and signals the matching waiter; on ETIMEDOUT the entry is removed and the caller gets a deadline error. libzmq's REQ/REP sockets (or the nng/nanomsg equivalents) replace the hand-built table when a messaging library is acceptable, because REQ/REP moves correlation into the socket pair.",
+  "code_sketch": "struct waiter { uint64_t id; int done; char reply[256]; size_t len; };\npthread_mutex_lock(&tbl_mu);                   /* publish the waiter */\nw.id = atomic_fetch_add(&next_id, 1) + 1; w.done = 0;\ntbl_put(&w);\nsend_request(sock, w.id, payload, payload_len);\nstruct timespec dl = abs_deadline_ms(5000);   /* CLOCK_MONOTONIC clock */\nwhile (!w.done && pthread_cond_timedwait(&reply_cv, &tbl_mu, &dl) == 0) { }\ntbl_del(&w);\npthread_mutex_unlock(&tbl_mu);\nreturn w.done ? send_reply(&w) : NULL;        /* NULL = deadline missed */",
+  "pitfalls": [
+    "pthread_cond_timedwait takes an absolute timespec and defaults to the CLOCK_REALTIME condvar clock: set CLOCK_MONOTONIC with pthread_condattr_setclock or a clock adjustment can expire - or silently extend - the wait.",
+    "The waiter is owned by the caller's stack frame, so a late reply must never write into an entry that already timed out and was removed; refcount the waiter or key replies by generation to avoid use-after-free.",
+    "One shared reply descriptor read by several threads needs a single demultiplexer thread that looks the id up and signals the right waiter; letting each thread read the socket hands replies to the wrong requester."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html",
+    "https://libzmq.readthedocs.io/en/latest/zmq_poll.html",
+    "https://zguide.zeromq.org/docs/chapter2"
+  ],
+  "variants": [
+    {
+      "variant_id": "posix-correlation-table",
+      "name": "Correlation table with pthread timed wait",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "idiom_name": "mutex-protected correlation table + pthread_cond_timedwait reply wait",
+      "implementation_notes": "C has no request/reply runtime, so the requestor hand-writes the classic structure: a correlation table (request id -> waiter) guarded by a mutex, an atomically incremented request id carried in the request envelope, and a bounded wait for the reply with pthread_cond_timedwait - or mq_timedreceive, poll, or a socket read with SO_RCVTIMEO. The replier copies the id from the request into the reply and signals the matching waiter; on ETIMEDOUT the entry is removed and the caller gets a deadline error. libzmq's REQ/REP sockets (or the nng/nanomsg equivalents) replace the hand-built table when a messaging library is acceptable, because REQ/REP moves correlation into the socket pair.",
+      "code_sketch": "struct waiter { uint64_t id; int done; char reply[256]; size_t len; };\npthread_mutex_lock(&tbl_mu);                   /* publish the waiter */\nw.id = atomic_fetch_add(&next_id, 1) + 1; w.done = 0;\ntbl_put(&w);\nsend_request(sock, w.id, payload, payload_len);\nstruct timespec dl = abs_deadline_ms(5000);   /* CLOCK_MONOTONIC clock */\nwhile (!w.done && pthread_cond_timedwait(&reply_cv, &tbl_mu, &dl) == 0) { }\ntbl_del(&w);\npthread_mutex_unlock(&tbl_mu);\nreturn w.done ? send_reply(&w) : NULL;        /* NULL = deadline missed */",
+      "pitfalls": [
+        "pthread_cond_timedwait takes an absolute timespec and defaults to the CLOCK_REALTIME condvar clock: set CLOCK_MONOTONIC with pthread_condattr_setclock or a clock adjustment can expire - or silently extend - the wait.",
+        "The waiter is owned by the caller's stack frame, so a late reply must never write into an entry that already timed out and was removed; refcount the waiter or key replies by generation to avoid use-after-free.",
+        "One shared reply descriptor read by several threads needs a single demultiplexer thread that looks the id up and signals the right waiter; letting each thread read the socket hands replies to the wrong requester."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html",
+        "https://libzmq.readthedocs.io/en/latest/zmq_poll.html",
+        "https://zguide.zeromq.org/docs/chapter2"
+      ]
+    },
+    {
+      "variant_id": "zeromq-req-rep",
+      "name": "ZeroMQ REQ/REP sockets with a poll timeout",
+      "paradigm": "concurrent",
+      "min_standard": "C99",
+      "idiom_name": "libzmq REQ/REP socket pair + zmq_poll deadline",
+      "implementation_notes": "The REQ/REP socket types are request-reply built into the transport: a REQ socket sends one request and accepts exactly one reply, which the socket pair routes back, so no application-level correlation table exists. The deadline comes from zmq_poll's millisecond timeout (or ZMQ_RCVTIMEO), and the server's REP socket strictly receives before it sends. Use it when the process can ship libzmq and one request is outstanding per socket; avoid it when requests must be pipelined over shared connections, where an identifier-based design or a ROUTER/DEALER topology is needed instead.",
+      "code_sketch": "void *req = zmq_socket(ctx, ZMQ_REQ);\nzmq_connect(req, \"tcp://service:5555\");\nzmq_msg_t m; zmq_msg_init_size(&m, len);\nmemcpy(zmq_msg_data(&m), req_bytes, len);\nzmq_msg_send(&m, req, 0); zmq_msg_close(&m);      /* send once */\nzmq_pollitem_t it = { req, 0, ZMQ_POLLIN, 0 };\nif (zmq_poll(&it, 1, 5000) > 0) {                 /* 5000 ms deadline */\n    zmq_msg_t r; zmq_msg_init(&r);\n    zmq_msg_recv(&r, req, 0);\n    handle(zmq_msg_data(&r), zmq_msg_size(&r));\n    zmq_msg_close(&r);\n}",
+      "pitfalls": [
+        "REQ/REP sockets alternate strictly: after a timeout the socket is still in the receive state, so it must be rebuilt (disconnect/reconnect or a fresh socket) or the next send fails.",
+        "Polling a REQ socket for a reply that never comes does not cancel the request: the peer may still process it and the reply is dropped when the socket closes."
+      ],
+      "sources": [
+        "https://libzmq.readthedocs.io/en/latest/zmq_poll.html",
+        "https://zguide.zeromq.org/docs/chapter2"
+      ]
+    }
+  ],
+  "default_variant": "posix-correlation-table",
+  "version": "1.0"
+}

@@ -1,0 +1,21 @@
+{
+  "pattern": "singleflight",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "Mutex<HashMap<K, Shared<Fut>>> (futures::future::Shared) or singleflight-async",
+  "implementation_notes": "The futures crate supplies the shareable completion handle: FutureExt::shared() turns a future into a cloneable Shared whose output must be Clone and which many tasks may await; a Tokio Mutex (or std Mutex) guarded HashMap<K, Shared<Fut>> is the registry, with the entry inserted before the work is polled and removed when the flight ends. singleflight-async packages exactly this contract - SingleFlight::work(key, fn) runs 'only one operation in-flight at a given moment' and duplicate callers wait for and return the same value - and tokio::sync::OnceCell covers the single-slot case where one key is enough. What replaces the classic structure is therefore a Shared future plus an async-aware registry rather than a hand-written wait queue.",
+  "code_sketch": "type Flight = Shared<BoxFuture<'static, Result<Value, Arc<Error>>>>;\nimpl Coalescer {\n    async fn load(&self, key: String, src: Arc<Source>) -> Result<Value, Arc<Error>> {\n        let fut = {\n            let mut m = self.flights.lock().await;        // never held across await\n            if let Some(f) = m.get(&key) { return f.clone().await; }   // join it\n            let f = async move { src.read(&key).await.map_err(Arc::new) }.boxed().shared();\n            m.insert(key.clone(), f.clone());             // announce the flight\n            f\n        };\n        let out = fut.await;                              // shared value or error\n        self.flights.lock().await.remove(&key);           // forget on completion\n        out\n    }\n}",
+  "pitfalls": [
+    "Never hold a std::sync::Mutex guard across .await: the guard is not Send and a task holding it cannot be spawned; scope the lock or use tokio::sync::Mutex.",
+    "shared() requires Output: Clone, so errors must be cloneable too (wrap them in Arc) - one shared error instance is delivered to every waiter.",
+    "A Shared future is driven by whoever polls it: if every clone is dropped before completion the underlying computation is cancelled, so the leader must keep its own handle (or an owning task) alive until the flight finishes.",
+    "Remove the entry when the flight ends (a drop guard around the registry entry) or completed flights accumulate and the map becomes a cache.",
+    "Cancelling one waiter's task must not cancel the shared handle: keep the flight in a task of its own and have waiters await clones of the handle."
+  ],
+  "sources": [
+    "https://docs.rs/futures/latest/futures/future/struct.Shared.html",
+    "https://docs.rs/singleflight-async/latest/singleflight_async/struct.SingleFlight.html",
+    "https://docs.rs/tokio/latest/tokio/sync/struct.OnceCell.html"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,59 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::promise/std::future + std::unordered_map<id, std::promise<Reply>>",
+  "implementation_notes": "The standard library supplies the one-shot awaitable, so the correlation table stores a std::promise<Reply> per id and the caller waits on the paired std::future with wait_for(deadline); the reader thread looks the id up, satisfies the promise with set_value or set_exception and erases the entry. Only the table, the id generation and the wire field stay hand-written - and the promise half must stay in the table because a std::future cannot be completed from the outside. Take this variant when no async framework is available or a dependency-free build matters.",
+  "code_sketch": "std::mutex mu_;\nstd::unordered_map<std::uint64_t, std::promise<Reply>> pending_;\n\nstd::optional<Reply> call(const std::string& body) {\n  const auto id = next_id_++;\n  std::promise<Reply> p; auto fut = p.get_future();\n  { std::lock_guard lk(mu_); pending_.emplace(id, std::move(p)); }   // BEFORE send\n  transport_.send({id, body});\n  if (fut.wait_for(5s) != std::future_status::ready) {\n    std::lock_guard lk(mu_); pending_.erase(id); return std::nullopt; }   // no reply\n  return fut.get();                        // throws if the replier failed the promise\n}\n// reader: if (auto n = pending_.extract(reply.correlation_id)) n.mapped().set_value(reply);",
+  "pitfalls": [
+    "A std::promise can be satisfied only once: a duplicate reply throws std::future_error, so extract or erase the entry under the lock and drop late replies instead of calling set_value again.",
+    "wait_for returning ready also covers a broken promise or an attached exception - always call get() and let it propagate, otherwise failures look like successes.",
+    "Destroying an unsatisfied promise makes the paired future fail with broken_promise, so a timeout path that erases the promise must not leave a caller believing its future is still live.",
+    "Never hold the table mutex while waiting: the reader thread needs it to deliver, so wait on the future outside the lock."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/promise"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-promise-future",
+      "name": "std::promise/std::future table (standard library)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::promise/std::future + std::unordered_map<id, std::promise<Reply>>",
+      "implementation_notes": "The standard library supplies the one-shot awaitable, so the correlation table stores a std::promise<Reply> per id and the caller waits on the paired std::future with wait_for(deadline); the reader thread looks the id up, satisfies the promise with set_value or set_exception and erases the entry. Only the table, the id generation and the wire field stay hand-written - and the promise half must stay in the table because a std::future cannot be completed from the outside. Take this variant when no async framework is available or a dependency-free build matters.",
+      "code_sketch": "std::mutex mu_;\nstd::unordered_map<std::uint64_t, std::promise<Reply>> pending_;\n\nstd::optional<Reply> call(const std::string& body) {\n  const auto id = next_id_++;\n  std::promise<Reply> p; auto fut = p.get_future();\n  { std::lock_guard lk(mu_); pending_.emplace(id, std::move(p)); }   // BEFORE send\n  transport_.send({id, body});\n  if (fut.wait_for(5s) != std::future_status::ready) {\n    std::lock_guard lk(mu_); pending_.erase(id); return std::nullopt; }   // no reply\n  return fut.get();                        // throws if the replier failed the promise\n}\n// reader: if (auto n = pending_.extract(reply.correlation_id)) n.mapped().set_value(reply);",
+      "pitfalls": [
+        "A std::promise can be satisfied only once: a duplicate reply throws std::future_error, so extract or erase the entry under the lock and drop late replies instead of calling set_value again.",
+        "wait_for returning ready also covers a broken promise or an attached exception - always call get() and let it propagate, otherwise failures look like successes.",
+        "Destroying an unsatisfied promise makes the paired future fail with broken_promise, so a timeout path that erases the promise must not leave a caller believing its future is still live.",
+        "Never hold the table mutex while waiting: the reader thread needs it to deliver, so wait on the future outside the lock."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/promise"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutines",
+      "name": "Boost.Asio awaitable coroutines over one connection",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await async_read/async_write (use_awaitable) + awaitable_operators for the deadline",
+      "implementation_notes": "With C++20 coroutines and Boost.Asio the requestor's code becomes linear: a single demultiplexing coroutine reads each frame, extracts the correlation id and resumes the waiter held in the per-connection table, while the caller awaits with co_await and expresses its deadline through awaitable_operators (for example co_await (async_read(...) || timer.async_wait(use_awaitable))). The identifier and the table do not disappear - only the callback plumbing around them does. Choose this variant when the toolchain is C++20 and the callback pyramid is the real cost; the promise/future table remains the smaller, dependency-free option.",
+      "code_sketch": "awaitable<void> on_connection(tcp::socket sock) {\n  char buf[4096];\n  for (;;) {\n    auto n = co_await sock.async_read_some(asio::buffer(buf), asio::use_awaitable);\n    auto reply = decode(buf, n);              // carries reply.correlation_id\n    if (auto node = pending.extract(reply.correlation_id))\n      node.mapped().promise.set_value(std::move(reply));   // same table, linear code\n  }\n}\n// caller deadline: co_await (sock.async_write(...) || timer.async_wait(use_awaitable));",
+      "pitfalls": [
+        "The demultiplexer and the waiters must share one table; giving each request its own read coroutine reintroduces a reader per request and lets concurrent reads steal each other's replies.",
+        "Forget as_tuple()/redirect_error and the error_code is turned into a thrown system_error at the co_await, so a missing reply looks like a transport failure.",
+        "Awaitable state lives on the coroutine frame: erasing a pending entry while its coroutine is still suspended on it leaves a frame nobody ever resumes."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html"
+      ]
+    }
+  ],
+  "default_variant": "std-promise-future",
+  "version": "1.0"
+}

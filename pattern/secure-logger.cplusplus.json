@@ -1,0 +1,56 @@
+{
+  "pattern": "secure-logger",
+  "language": "cplusplus",
+  "support": "library",
+  "version": "1.0",
+  "idiom_name": "spdlog custom sink (spdlog::sinks::base_sink<Mutex>) with chained HMAC",
+  "implementation_notes": "spdlog supplies the chokepoint: derive from spdlog::sinks::base_sink<Mutex> (or <spdlog::details::null_mutex> only under a single writer) and chain a MAC over the formatted payload, the sequence number and the previous tag, keeping the chain state in the sink. The classic hand-written form stays justified when spdlog must not enter the dependency set, when records need an asymmetric signature, or when the sink has to own its O_APPEND/fsync policy - the OpenSSL variant below covers exactly that case, and both variants share the same verifier contract.",
+  "code_sketch": "class secure_sink final : public spdlog::sinks::base_sink<std::mutex> {\n  std::array<unsigned char, 32> prev_{};                       // chain state, one sink\n public:\n  void sink_it_(const spdlog::details::log_msg &m) override {\n    std::string payload(m.payload.begin(), m.payload.end());\n    auto tag = hmac_sha256(key_, prev_, m.source.filename, payload);   // prev binds history\n    file_.append_line(tag, \" \", m.source.filename, \" \", payload);      // O_APPEND writer\n    prev_ = tag;                                                // publish only after the append\n  }\n  void flush_() override { file_.fsync(); }\n};\nauto audit = std::make_shared<spdlog::logger>(\"audit\", std::make_shared<secure_sink>(key));",
+  "pitfalls": [
+    "base_sink serialises sink_it_ across threads through its mutex template argument; using base_sink<null_mutex> without an external single writer makes the chain state race.",
+    "The chain state must be restored (or the head anchored) on rotation and restart - a fresh prev_ silently starts a new half-chain that verifies against nothing.",
+    "spdlog formats the message before the sink sees it, so redaction and canonicalisation must happen in the pattern formatter or before the log call; the sink cannot redact what it never saw."
+  ],
+  "sources": [
+    "https://github.com/gabime/spdlog/wiki/Sinks"
+  ],
+  "variants": [
+    {
+      "variant_id": "spdlog-sink",
+      "name": "spdlog custom sink with chained HMAC",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "spdlog custom sink (spdlog::sinks::base_sink<Mutex>) with chained HMAC",
+      "implementation_notes": "spdlog supplies the chokepoint: derive from spdlog::sinks::base_sink<Mutex> (or <spdlog::details::null_mutex> only under a single writer) and chain a MAC over the formatted payload, the sequence number and the previous tag, keeping the chain state in the sink. The classic hand-written form stays justified when spdlog must not enter the dependency set, when records need an asymmetric signature, or when the sink has to own its O_APPEND/fsync policy - the OpenSSL variant below covers exactly that case, and both variants share the same verifier contract.",
+      "code_sketch": "class secure_sink final : public spdlog::sinks::base_sink<std::mutex> {\n  std::array<unsigned char, 32> prev_{};                       // chain state, one sink\n public:\n  void sink_it_(const spdlog::details::log_msg &m) override {\n    std::string payload(m.payload.begin(), m.payload.end());\n    auto tag = hmac_sha256(key_, prev_, m.source.filename, payload);   // prev binds history\n    file_.append_line(tag, \" \", m.source.filename, \" \", payload);      // O_APPEND writer\n    prev_ = tag;                                                // publish only after the append\n  }\n  void flush_() override { file_.fsync(); }\n};\nauto audit = std::make_shared<spdlog::logger>(\"audit\", std::make_shared<secure_sink>(key));",
+      "pitfalls": [
+        "base_sink serialises sink_it_ across threads through its mutex template argument; using base_sink<null_mutex> without an external single writer makes the chain state race.",
+        "The chain state must be restored (or the head anchored) on rotation and restart - a fresh prev_ silently starts a new half-chain that verifies against nothing.",
+        "spdlog formats the message before the sink sees it, so redaction and canonicalisation must happen in the pattern formatter or before the log call; the sink cannot redact what it never saw."
+      ],
+      "sources": [
+        "https://github.com/gabime/spdlog/wiki/Sinks"
+      ]
+    },
+    {
+      "variant_id": "openssl-hmac-chain",
+      "name": "Application-owned appender over OpenSSL EVP_MAC",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "requires_features": [
+        "OpenSSL 3.0"
+      ],
+      "idiom_name": "EVP_MAC HMAC/SHA-256 chain in an application-owned appender class",
+      "implementation_notes": "No logging dependency: the sink is your own appender class that keeps the previous tag and a monotonic sequence number and computes the chained tag with the OpenSSL 3 EVP_MAC API (HMAC with SHA-256; the older HMAC_* context functions are deprecated). Choose this variant when the audit log must be verifiable against a published head tag, when records are signed rather than MACed, or when spdlog cannot be added; you now own rotation, fsync policy and thread-safety yourself.",
+      "code_sketch": "class chain_sink {                                        // no logging dependency\n  EVP_MAC_CTX *ctx_; std::array<unsigned char, 32> prev_{}; std::uint64_t seq_{0};\n public:\n  void record(std::span<const std::byte> canon) {\n    unsigned char tag[32], s[8]; std::size_t n = sizeof tag;\n    for (int i = 0; i < 8; ++i) s[7 - i] = (seq_ >> (8 * i)) & 0xffu;    // big-endian seq\n    EVP_MAC_init(ctx_, key_.data(), key_.size(), params_);      // params: digest = SHA256\n    EVP_MAC_update(ctx_, prev_.data(), prev_.size()); EVP_MAC_update(ctx_, s, sizeof s);\n    EVP_MAC_update(ctx_, reinterpret_cast<const unsigned char *>(canon.data()), canon.size());\n    EVP_MAC_final(ctx_, tag, &n, sizeof tag);\n    file_.append(seq_++, tag, canon); std::memcpy(prev_.data(), tag, n);   // O_APPEND + fsync\n  }\n};",
+      "pitfalls": [
+        "OpenSSL 3.0 deprecated HMAC_CTX_* in favour of EVP_MAC_*; code written against the old context API is on a removal path and hidden by OPENSSL_API_COMPAT.",
+        "The EVP_MAC_CTX is not thread-safe: one context per writer, and free it with EVP_MAC_CTX_free (it holds key material in memory)."
+      ],
+      "sources": [
+        "https://docs.openssl.org/3.0/man3/HMAC/"
+      ]
+    }
+  ],
+  "default_variant": "spdlog-sink"
+}

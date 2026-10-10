@@ -1,0 +1,185 @@
+{
+  "category": "concurrency-resilience",
+  "name": "load-leveller",
+  "aliases": [
+    "queue-based load leveling",
+    "load leveling"
+  ],
+  "intent": "Insert a bounded queue between producers and a service so that bursts are buffered and absorbed instead of being shed, and the service drains work at a rate it can actually sustain.",
+  "problem": "Traffic reaches a service in bursts whose peak rate is far above what the service - or the database, metered API or shared resource behind it - can absorb: concurrent direct calls time out, are throttled, or fail outright. Sizing the service for the peak wastes capacity the rest of the time, and rejecting the excess loses work that the producer has already accepted.",
+  "context": "Applies wherever the arrival rate is variable and the consumer's sustainable rate is roughly fixed: multi-client services calling a shared resource, batch ingestion into a store, fan-out to rate-limited third parties. It requires that the work can be decoupled in time - the caller does not need an immediate answer, or accepts a deferred one - and that a queue with a defined capacity, durability and delivery contract is acceptable operationally.",
+  "benefits": [
+    "Availability: intake keeps accepting work while the service is unavailable or saturated; the queue absorbs the interval instead of the caller seeing a failure.",
+    "Burst absorption: the peak is stored rather than shed - producers are paced by the buffer's bound, not rejected by the service.",
+    "Independent scalability: producer count, consumer count and queue depth become separate tuning knobs; consumers can be added or moved without touching producers.",
+    "Cost control: the serving tier is provisioned for the sustained load instead of the peak, because the peak is buffered instead of served immediately.",
+    "Failure isolation and a natural retry seam: with a durable queue, a consumer crash does not lose already-accepted work, and retry, backoff and dead-lettering attach at one place.",
+    "Steady downstream load: the dependency sees a smoothed request rate, which removes contention spikes and makes connection pools, caches and quotas plan-able."
+  ],
+  "tradeoffs": [
+    "Latency: every item now pays enqueue, queueing and dequeue time, so the pattern is unsuitable where the caller needs a low-latency synchronous answer.",
+    "The queue is an additional component with its own failure modes, quotas and cost - a single point of failure unless it is replicated, and the place where accepted work is lost if it is not durable.",
+    "Delivery is normally at-least-once, so consumers must be idempotent and the pipeline needs duplicate handling (deduplication, idempotency keys, or idempotent writes).",
+    "Ordering is not preserved once several consumers process in parallel unless ordering is explicitly keyed or partitioned.",
+    "A backlog grows whenever the average arrival rate exceeds the drain rate: without depth and age monitoring plus a shed-or-scale decision, overload becomes unbounded latency instead of a visible error.",
+    "Autoscaling consumers without bounding their aggregate downstream rate merely relocates the overload to the next dependency.",
+    "The message contract becomes an integration surface: independently deployed producers and consumers need self-contained, versioned messages and schema discipline.",
+    "Asynchronous reasoning cost: tracing, testing and debugging now span two runtime hops and a broker."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 7,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Producer / Task",
+      "responsibility": "Accepts or generates work at its own, variable rate and hands each item to the queue instead of calling the service directly; it owns the queue-full policy (wait, reject or drop) on its side of the hand-off."
+    },
+    {
+      "role": "Queue / Buffer",
+      "responsibility": "Stores items in order up to a declared capacity and decouples arrival rate from processing rate; its durability, ordering and delivery guarantees define what the rest of the system may assume about accepted work."
+    },
+    {
+      "role": "Consumer / Service Worker",
+      "responsibility": "Retrieves items at a rate it can sustain, processes them and acknowledges completion or failure; several workers may share the queue, and each is expected to be idempotent under at-least-once delivery."
+    },
+    {
+      "role": "Message / Envelope",
+      "responsibility": "Carries the request as a self-contained, versionable unit - payload plus correlation id, timestamp and retry count - so the consumer needs no access to the producer's runtime state."
+    },
+    {
+      "role": "Queue-depth Monitor / Autoscaler",
+      "responsibility": "Observes backlog size and message age and adjusts the consumer count within a bound, or triggers shedding, so the queue is never left to grow unobserved."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Web or mobile front-ends writing to a database that can only absorb a steady write rate: requests are enqueued and a worker tier performs the writes at its own pace.",
+    "Asynchronous job processing - thumbnail/video encoding, report generation, document conversion - offloaded from the request path to worker processes.",
+    "Order or payment intake during campaigns: a durable queue absorbs the burst and gives retry plus dead-letter handling, with consumers idempotent on the order id.",
+    "Fan-out to rate-limited third parties (email, SMS, push, payment providers): the queue converts a provider quota into a controlled drain rate.",
+    "Telemetry and log ingestion: agents push to a queue or collector and the store consumes at a rate it can index.",
+    "Batch scoring or model inference where expensive accelerators must run at steady utilization while requests arrive in spikes.",
+    "ML model inference pipelines: a queue sits in front of GPU workers and batches inference requests to improve accelerator utilisation, while the queue depth signals the autoscaler to provision more workers.",
+    "IoT data ingestion: thousands of sensors publish time-series readings into a message broker; a consumer tier batches writes to a time-series database (InfluxDB, TimescaleDB) at a rate the store can sustain.",
+    "Change-data-capture (CDC) streaming: a tool like Debezium or AWS DMS places database row changes on a queue; downstream consumers apply the changes to a search index or a cache at their own pace without overwhelming the source database.",
+    "Database migration and schema-tool operations: long-running DDL statements are submitted to a queue and executed sequentially by a single consumer with backoff, preventing lock contention and allowing operator intervention on failures.",
+    "Payment idempotency: a client submits a payment intent with an idempotency key; the request is enqueued, the client polls a status endpoint, and the worker processes the charge asynchronously - duplicate submissions are detected by key and return the original result.",
+    "Amazon SQS + AWS Lambda event source mappings: accept bursty jobs into SQS and tune batch size, maximum concurrency and visibility timeout so Lambda drains the queue without exceeding downstream capacity.",
+    "Azure Service Bus + Azure Functions queue triggers: buffer requests in a durable queue, cap per-instance trigger concurrency, and let failed deliveries move through retry/dead-letter handling instead of blocking the producer.",
+    "RabbitMQ work queues: distribute long-running tasks across workers with manual acknowledgements and a bounded prefetch so a fast consumer cannot monopolize in-flight work."
+  ],
+  "avoid_when": [
+    "The caller needs the result synchronously inside a tight latency budget - call directly and defend the call with timeout, retry and circuit breaker instead.",
+    "Load is predictably low and stable: the queue adds a component, a delivery contract and operational surface for no benefit.",
+    "The upstream rate is already limited (token bucket/rate limiter) and the dependency can absorb the remainder - explicit throttling is simpler than buffering.",
+    "The work must be globally ordered and the queue cannot provide ordered delivery; either partition by key or process it in a single consumer.",
+    "The buffered item will be stale before it is processed and cannot be rejected - buffering only postpones the failure; shedding or balking is the honest answer.",
+    "The operation is cheaper than the transport hop: queue overhead (serialization, broker round trip) costs more than doing the work inline."
+  ],
+  "language_files": {
+    "generic": "load-leveller.generic.json",
+    "c": "load-leveller.c.json",
+    "cplusplus": "load-leveller.cplusplus.json",
+    "csharp": "load-leveller.csharp.json",
+    "go": "load-leveller.go.json",
+    "java": "load-leveller.java.json",
+    "javascript": "load-leveller.javascript.json",
+    "kotlin": "load-leveller.kotlin.json",
+    "python": "load-leveller.python.json",
+    "ruby": "load-leveller.ruby.json",
+    "rust": "load-leveller.rust.json",
+    "scala": "load-leveller.scala.json",
+    "swift": "load-leveller.swift.json",
+    "typescript": "load-leveller.typescript.json"
+  },
+  "paradigm": [
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "producer-consumer",
+    "backpressure",
+    "rate-limiting",
+    "circuit-breaker",
+    "bulkhead",
+    "competing-consumers",
+    "dead-letter-channel",
+    "idempotent-receiver"
+  ],
+  "anti_patterns": [
+    "An unbounded queue presented as a buffer: memory or broker quota grows until the process or the broker dies - the bound is the pattern.",
+    "Queueing in front of a user-facing synchronous request and hiding the added latency until clients time out.",
+    "Scaling consumers on queue depth without limiting their aggregate rate to the downstream dependency, which moves the overload one hop further.",
+    "Using an in-memory queue for work that must survive a restart; accepted work disappears with the process.",
+    "No dead-letter path and no idempotency: a poison message is retried forever and duplicate deliveries corrupt data.",
+    "Treating the queue as an excuse not to monitor, so a monotonically growing backlog stays invisible until the disk or quota is full.",
+    "Enqueuing without bounding the consumer's downstream concurrency (e.g. no semaphore at the DB call) so that a growing queue triggers uncontrolled parallel downstream calls and overloads the dependency.",
+    "Pushing messages faster than the consumer can acknowledge, causing broker disk pressure and message loss before the consumer can apply backpressure upstream.",
+    "Forgetting to set a message visibility timeout (or setting it too long) so that a crashed consumer's messages are locked and invisible to the retry mechanism for the visibility timeout duration.",
+    "Routing all queue overflow to a single consumer without partitioning, creating a new bottleneck that negates the benefit of asynchronous decoupling."
+  ],
+  "design_principles": [
+    "Decouple in time: producer and consumer do not have to be available simultaneously (asynchronous hand-off).",
+    "Bound every buffer and make the full-policy explicit; unbounded growth is a defect, not a default.",
+    "Single responsibility: intake, transport and processing are distinct roles with distinct scaling characteristics.",
+    "Explicit contracts: the queue's delivery/ordering guarantees and the message schema are the interface between independently deployable parts.",
+    "Fail-safe over fail-silent: overflow must surface as a visible decision (wait, reject, shed or dead-letter)."
+  ],
+  "best_practices": [
+    "Size the bound from Little's law - capacity is roughly drain rate multiplied by the latency increase you are willing to pay - and keep it as an explicit configuration value.",
+    "Choose and document the full-policy (block the producer, reject, drop-oldest for telemetry, dead-letter for poison messages) instead of inheriting whatever the library defaults to.",
+    "Make consumers idempotent and keyed, and route repeatedly failing messages to a dead-letter queue with an operator path back in.",
+    "Monitor queue depth and message age, not only throughput; alert on age or on sustained growth.",
+    "Scale consumers on backlog but cap their combined downstream rate with a semaphore or rate limiter at the dependency.",
+    "Keep messages self-contained and versioned; never rely on in-process state or shared memory across the hop.",
+    "Persist the queue when the producer's acknowledgement means 'we will do it'; otherwise state explicitly that accepted work may be lost.",
+    "When the caller needs a result, provide a result path (correlation id plus result channel or callback) instead of blocking on the queue.",
+    "Integrate a circuit breaker at the consumer's downstream call so that a failing dependency stops dequeuing new work and allows the queue to act as a buffer instead of a conduit for cascading failures.",
+    "Use batch dequeue (fetch N messages per poll) when the downstream dependency supports bulk operations; batching amortises per-message broker overhead and improves throughput substantially.",
+    "For distributed queues (SQS, RabbitMQ, Kafka), place the queue in the same failure zone as the consumer to avoid cross-zone traffic during outages; and configure a dead-letter queue (DLQ) with a maximum receive count to trap poison messages.",
+    "When multiple consumers share a queue, use pre-fetch or prefetch-count limits to distribute work fairly and prevent one fast consumer from starving others; when strict ordering is required, partition by a message key so that related items always route to the same consumer.",
+    "Add request jitter (random delay before enqueue or between retries) to prevent thundering-herd surges when a rate-limit window resets or a circuit breaker half-opens.",
+    "Prefer pull-based consumption (consumers poll or subscribe) over push-based notification for bursty workloads; pull gives consumers control over intake rate and prevents inadvertent overload from a fast producer.",
+    "Instrument the enqueue timestamp on every message and monitor message age (oldest item in queue) as the primary overload signal; depth alone is insufficient because a fast producer can fill a queue without creating age pressure if consumers are keeping up.",
+    "When using Redis for distributed rate limiting alongside a queue, implement sliding-window or token-bucket algorithms in a Lua script to avoid the INCR + EXPIRE race condition that causes limit violations under concurrent requests.",
+    "Define explicit latency SLOs for the end-to-end queue residence time and alert when the 99th-percentile age approaches the SLO; this catches overload before it becomes a user-visible outage."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Homer, Sharp, Brader, Narumoto & Swanson, Cloud Design Patterns: Prescriptive Architecture Guidance for Cloud Applications (Microsoft patterns & practices, 2014) - Queue-Based Load Leveling Pattern (p. 116).",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling",
+    "https://download.microsoft.com/download/b/b/6/bb69622c-ab5d-4d5f-9a12-b81b952c1169/clouddesignpatternsbook-pdf.pdf",
+    "https://github.com/MicrosoftDocs/architecture-center/blob/main/docs/patterns/queue-based-load-leveling.md",
+    "Fowler, M. 'Message Queues' blog article (martinfowler.com) — authoritative treatment of queue semantics, delivery guarantees (at-least-once, exactly-once), and consumer patterns.",
+    "Nygard, M. Release It! Second Edition (Pragmatic Bookshelf, 2018) — definitive work on circuit breakers, bulkheads, and queue-based resilience; coined many of the failure modes documented here.",
+    "Google, Production Runtimes, and Beyer et al., 'Site Reliability Engineering' (O'Reilly, 2016) — Chapter 20 'Handling Overload' covers load shedding, backpressure, and queue-based decoupling in large-scale systems.",
+    "AWS Well-Architected Framework, Reliability Pillar — Queue-Based Load Leveling (https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_rel.html) — cloud-native guidance on using SQS, FIFO queues, and dead-letter queues for resilience.",
+    "Resilience4j Authors, 'Resilience4j Documentation v2' (https://resilience4j.readme.io) — Java library documentation covering RateLimiter, CircuitBreaker, and ThreadPoolBulkhead patterns with queue-based fallbacks.",
+    "Bryant et al., 'Designing Data-Intensive Applications' (O'Reilly, 2017) — Sections on message queues (Kafka, RabbitMQ), stream processing, and the connection between queuing theory, latency, and backpressure.",
+    "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter — covers request jitter as mitigation for thundering-herd on rate-limit reset windows in distributed systems.",
+    "https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html",
+    "https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-scaling.html",
+    "https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus",
+    "https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus-trigger",
+    "https://www.rabbitmq.com/tutorials/tutorial-two-go",
+    "https://docs.aws.amazon.com/wellarchitected/2023-04-10/framework/rel_mitigate_interaction_failure_fail_fast.html"
+  ]
+}

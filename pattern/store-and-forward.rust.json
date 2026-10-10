@@ -1,0 +1,65 @@
+{
+  "pattern": "store-and-forward",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "File::sync_all + std::fs::rename + tokio drain task",
+  "implementation_notes": "The standard library provides durability primitives but no queue: write the payload to a temp file in the spool directory, call File::sync_all() (the docs note that Drop swallows close errors, so sync and close explicitly when errors matter), and rename it into the spool; a Tokio task then drains in file-name order and removes each entry only after the acknowledgement (tokio::fs::File exposes the same sync_all for async code). Keep the JoinHandle: a spawned task that panics is silently discarded, and the forwarder must be restarted together with the process. Embedded SQLite via rusqlite is the alternative when the spool needs queries or must commit with other state, and it removes the file-name ordering problem.",
+  "code_sketch": "let mut f = File::create(spool.join(format!(\"tmp-{id}\")))?;\nf.write_all(&payload)?;\nf.sync_all()?;                                  // durability, not just buffered\nstd::fs::rename(spool.join(format!(\"tmp-{id}\")), spool.join(&id))?;\ntokio::spawn(async move {                       // keep this JoinHandle\n    for e in read_spool(&spool) {\n        match deliver(&e).await {\n            Ok(_) => fs::remove_file(&e).await?,\n            Err(_) => { backoff().await; break }\n        }\n    }\n});",
+  "pitfalls": [
+    "Dropping a File after write_all neither flushes nor reports close errors - the spool entry can be missing or empty after a crash.",
+    "Without a directory sync the rename itself may not survive a crash even though the file content was synced.",
+    "A spawned drain task that panics or is cancelled stops forwarding silently; keep the JoinHandle and restart it with backoff.",
+    "std::fs calls inside an async task block the runtime - use tokio::fs or spawn_blocking."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/fs/struct.File.html",
+    "https://docs.rs/tokio/latest/tokio/fs/struct.File.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "spool-file-sync",
+      "name": "Spool directory + File::sync_all + rename, drained by a Tokio task",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "tokio"
+      ],
+      "idiom_name": "File::sync_all + std::fs::rename + tokio drain task",
+      "implementation_notes": "The standard library provides durability primitives but no queue: write the payload to a temp file in the spool directory, call File::sync_all() (the docs note that Drop swallows close errors, so sync and close explicitly when errors matter), and rename it into the spool; a Tokio task then drains in file-name order and removes each entry only after the acknowledgement (tokio::fs::File exposes the same sync_all for async code). Keep the JoinHandle: a spawned task that panics is silently discarded, and the forwarder must be restarted together with the process. Embedded SQLite via rusqlite is the alternative when the spool needs queries or must commit with other state, and it removes the file-name ordering problem.",
+      "code_sketch": "let mut f = File::create(spool.join(format!(\"tmp-{id}\")))?;\nf.write_all(&payload)?;\nf.sync_all()?;                                  // durability, not just buffered\nstd::fs::rename(spool.join(format!(\"tmp-{id}\")), spool.join(&id))?;\ntokio::spawn(async move {                       // keep this JoinHandle\n    for e in read_spool(&spool) {\n        match deliver(&e).await {\n            Ok(_) => fs::remove_file(&e).await?,\n            Err(_) => { backoff().await; break }\n        }\n    }\n});",
+      "pitfalls": [
+        "Dropping a File after write_all neither flushes nor reports close errors - the spool entry can be missing or empty after a crash.",
+        "Without a directory sync the rename itself may not survive a crash even though the file content was synced.",
+        "A spawned drain task that panics or is cancelled stops forwarding silently; keep the JoinHandle and restart it with backoff.",
+        "std::fs calls inside an async task block the runtime - use tokio::fs or spawn_blocking."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/fs/struct.File.html",
+        "https://docs.rs/tokio/latest/tokio/fs/struct.File.html"
+      ]
+    },
+    {
+      "variant_id": "rusqlite-outbox",
+      "name": "Embedded SQLite outbox table (rusqlite) drained by a worker",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "rusqlite"
+      ],
+      "idiom_name": "rusqlite Connection + WAL pragmas + drain worker",
+      "implementation_notes": "rusqlite wraps the SQLite C API: enable WAL and synchronous=FULL through pragma_update, insert one row per accepted message, and let a worker (a std::thread or a blocking task) claim the oldest rows, deliver them and delete them after the acknowledgement. A transaction lets business state and the outbox row commit together, which the file spool cannot express; the classic file spool stays simpler when there is no other state to commit with the message.",
+      "code_sketch": "let con = Connection::open(\"spool.db\")?;\ncon.pragma_update(None, \"journal_mode\", \"WAL\")?;\ncon.pragma_update(None, \"synchronous\", \"FULL\")?;\ncon.execute(\"INSERT INTO outbox(payload) VALUES (?1)\", [payload])?;   // accept point\n// worker: SELECT ... ORDER BY id -> deliver -> DELETE after the acknowledgement",
+      "pitfalls": [
+        "SQLite's WAL commit is power-loss durable only with synchronous=FULL; the WAL default is not.",
+        "Connection is not Sync: share it behind a Mutex, open one per thread, or use a pool, or sender and drainer will not compile together.",
+        "Deleting rows before the acknowledgement, or claiming rows without a WHERE on the claimed state, double-sends under concurrency."
+      ],
+      "sources": [
+        "https://docs.rs/rusqlite/latest/rusqlite/",
+        "https://www.sqlite.org/wal.html"
+      ]
+    }
+  ],
+  "default_variant": "spool-file-sync",
+  "version": "1.0"
+}

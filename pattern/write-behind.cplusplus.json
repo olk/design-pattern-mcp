@@ -1,0 +1,18 @@
+{
+  "pattern": "write-behind",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "dirty std::unordered_map + std::jthread flusher (std::mutex/condition_variable)",
+  "implementation_notes": "There is no standard-library persistence context, so the accumulator is a dirty map keyed by row id and the flusher is a dedicated thread. Stage under a std::mutex and wake the flusher through a std::condition_variable; on C++20 use std::jthread, whose stop_token and joining destructor make the flusher's lifetime exception-safe, and pre-C++20 use std::thread with an explicit stop flag. The drained batch is executed in one transaction over prepared statements; what replaces the classic structure is only the thread and synchronization primitives, so the roles stay hand-written and are justified when write throughput matters.",
+  "code_sketch": "void stage(Key k, Row r) {\n  { std::lock_guard lk(m_); dirty_[std::move(k)] = std::move(r); }\n  cv_.notify_one();                     // one entry per key: coalesced\n}\nvoid run(std::stop_token st) {          // launched as std::jthread\n  std::unique_lock lk(m_);\n  while (cv_.wait(lk, st, [&]{ return !dirty_.empty(); })) {\n    auto batch = std::exchange(dirty_, {});\n    lk.unlock();\n    flush(batch);                       // one transaction per batch\n    lk.lock();\n  }\n}",
+  "pitfalls": [
+    "Use the predicated wait (or re-check after every wake-up): condition variables wake spuriously and a naive wait flushes an empty batch or misses the wake-up.",
+    "Destroying the flusher without draining loses staged writes - jthread joins but does not flush, so the destructor must drain explicitly.",
+    "Staging by copying whole rows under the lock serializes producers: stage a move-constructed snapshot and keep the critical section minimal."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable",
+    "https://en.cppreference.com/w/cpp/thread/jthread"
+  ],
+  "version": "1.0"
+}

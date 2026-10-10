@@ -1,0 +1,59 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "ConcurrentHashMap[String, Promise[Reply]] + firstCompletedOf with a scheduled timeout",
+  "implementation_notes": "scala.concurrent.Promise is the completer paired with a Future, so the table is a ConcurrentHashMap of promises and the transport callback resolves the matching one with trySuccess/tryFailure; the deadline is a second future produced by a scheduler and combined with Future.firstCompletedOf (or Await.result with a duration for blocking callers). Promise is stdlib, so no dependency is needed, but the pattern is not absorbed into the language: the id, the table and the timeout policy are still yours, and an uncompleted promise retains its callbacks and the state they close over. Completing through trySuccess keeps the late-reply path exception-free.",
+  "code_sketch": "private val pending = new ConcurrentHashMap[String, Promise[Reply]]()\n\ndef call(body: String)(implicit scheduler: Scheduler): Future[Reply] = {\n  val id = UUID.randomUUID().toString\n  val p  = Promise[Reply]()\n  pending.put(id, p)                                     // register BEFORE send\n  transport.send(Request(id, body))\n  val timeoutF = after(5.seconds, scheduler)(Future.failed(NoReply(id)))\n  Future.firstCompletedOf(Seq(p.future, timeoutF))\n        .andThen { case _ => pending.remove(id) }         // late reply then dropped\n}\n\ndef onReply(reply: Reply): Unit =\n  Option(pending.remove(reply.correlationId)).foreach(_.trySuccess(reply))",
+  "pitfalls": [
+    "Promise#success throws IllegalStateException when the promise is already completed; always use trySuccess/tryFailure so a duplicate or late reply is a no-op.",
+    "A promise that is never completed retains its callbacks and everything they capture - the timeout path must complete it (tryFailure), not merely remove it from the map.",
+    "scala.concurrent.Future cannot be cancelled: timing out the caller does not stop the request, so the id has to stay reserved (or the reply explicitly dropped) or the next request can match a stale reply.",
+    "The scheduled timeout future must come from an execution context that stays alive; a scheduler that shuts down silently turns every deadline into a caller that waits forever."
+  ],
+  "sources": [
+    "https://www.scala-lang.org/api/current/scala/concurrent/Promise.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "promise-map",
+      "name": "ConcurrentHashMap of scala.concurrent.Promise (stdlib, no actor runtime)",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "idiom_name": "ConcurrentHashMap[String, Promise[Reply]] + firstCompletedOf with a scheduled timeout",
+      "implementation_notes": "scala.concurrent.Promise is the completer paired with a Future, so the table is a ConcurrentHashMap of promises and the transport callback resolves the matching one with trySuccess/tryFailure; the deadline is a second future produced by a scheduler and combined with Future.firstCompletedOf (or Await.result with a duration for blocking callers). Promise is stdlib, so no dependency is needed, but the pattern is not absorbed into the language: the id, the table and the timeout policy are still yours, and an uncompleted promise retains its callbacks and the state they close over. Completing through trySuccess keeps the late-reply path exception-free.",
+      "code_sketch": "private val pending = new ConcurrentHashMap[String, Promise[Reply]]()\n\ndef call(body: String)(implicit scheduler: Scheduler): Future[Reply] = {\n  val id = UUID.randomUUID().toString\n  val p  = Promise[Reply]()\n  pending.put(id, p)                                     // register BEFORE send\n  transport.send(Request(id, body))\n  val timeoutF = after(5.seconds, scheduler)(Future.failed(NoReply(id)))\n  Future.firstCompletedOf(Seq(p.future, timeoutF))\n        .andThen { case _ => pending.remove(id) }         // late reply then dropped\n}\n\ndef onReply(reply: Reply): Unit =\n  Option(pending.remove(reply.correlationId)).foreach(_.trySuccess(reply))",
+      "pitfalls": [
+        "Promise#success throws IllegalStateException when the promise is already completed; always use trySuccess/tryFailure so a duplicate or late reply is a no-op.",
+        "A promise that is never completed retains its callbacks and everything they capture - the timeout path must complete it (tryFailure), not merely remove it from the map.",
+        "scala.concurrent.Future cannot be cancelled: timing out the caller does not stop the request, so the id has to stay reserved (or the reply explicitly dropped) or the next request can match a stale reply.",
+        "The scheduled timeout future must come from an execution context that stays alive; a scheduler that shuts down silently turns every deadline into a caller that waits forever."
+      ],
+      "sources": [
+        "https://www.scala-lang.org/api/current/scala/concurrent/Promise.html"
+      ]
+    },
+    {
+      "variant_id": "akka-ask",
+      "name": "Akka ask: temporary actor as the correlator",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "akka-typed"
+      ],
+      "idiom_name": "ActorRef replyTo field / AskPattern.ask temporary actor",
+      "implementation_notes": "The actor model supplies the association structurally instead of with an id: the sender encodes its own ActorRef in the message (replyTo), or uses ask, which creates a temporary actor whose reference is the correlation handle, and the replier simply tells the response to that address - no shared table and no id space. The Akka documentation makes the trade-off explicit: unless the protocol already carries a request id, an interaction cannot be tied to a specific context, which is exactly why ask introduces the temporary actor. Choose this variant when the system is already actor-based; the promise map remains the right tool for a raw socket or queue transport that cannot address an actor.",
+      "code_sketch": "case class Request(query: String, replyTo: ActorRef[Response])\ncase class Response(result: String)\n\ncookieFabric ! CookieFabric.Request(\"give me cookies\", context.self)   // self = correlator\nBehaviors.receiveMessage {\n  case Response(result) => context.log.info(result); Behaviors.same\n}\n\n// one-shot alternative: import AskPattern._\n// val f: Future[Response] = cookieFabric.ask(Response(_))   // temporary actor per call",
+      "pitfalls": [
+        "ask needs an ActorSystem, an implicit Timeout and a scheduler: the future fails with AskTimeoutException and the temporary actor only keeps the reply address alive for that window.",
+        "A response sent to a stopped or wrong replyTo is dead-lettered silently, which is the actor world's unknown correlation id - watch the dead-letter stream instead of assuming a lost reply is a network fault.",
+        "One temporary actor per call is expensive in hot paths; for high fan-out prefer a protocol that carries a request id and keep context.self for streaming responses.",
+        "Message adapters must map the response into the asking actor's protocol, and a forgotten adapter silently drops the reply while the future still times out."
+      ],
+      "sources": [
+        "https://doc.akka.io/libraries/akka-core/current/typed/interaction-patterns.html"
+      ]
+    }
+  ],
+  "default_variant": "promise-map",
+  "version": "1.0"
+}

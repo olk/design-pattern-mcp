@@ -1,0 +1,57 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "gobreaker.NewCircuitBreaker[T](Settings).Execute",
+  "implementation_notes": "The de-facto Go breaker is gobreaker: gobreaker.NewCircuitBreaker[T](Settings{...}) owns the state machine and Execute(func() (T, error)) is the guarded call. Settings carries ReadyToTrip (the trip predicate over Counts), Timeout (cooldown), MaxRequests (half-open trials), Interval and BucketPeriod (fixed versus rolling window), IsSuccessful and IsExcluded (failure classification) and OnStateChange (observability), so the Go-specific decisions are the error-first signature and the fact that Execute re-panics a panic after counting it as a failure. The standard library has no breaker, so this library (or the stdlib-only variant) is the realization; keep one instance per dependency, because Counts are per instance and a breaker built per request never accumulates enough failures to trip.",
+  "code_sketch": "var payments = gobreaker.NewCircuitBreaker[Receipt](gobreaker.Settings{\n    Name:    \"payments\",\n    Timeout: 15 * time.Second,                 // cooldown in the open state\n    MaxRequests: 3,                            // half-open trial calls\n    ReadyToTrip: func(c gobreaker.Counts) bool {\n        return c.Requests >= 20 && float64(c.TotalFailures)/float64(c.Requests) > 0.5\n    },\n    IsExcluded: func(err error) bool { return errors.Is(err, context.Canceled) },\n})\n\nreceipt, err := payments.Execute(func() (Receipt, error) {\n    return api.Authorize(ctx, order)            // context timeout still needed\n})",
+  "pitfalls": [
+    "Executing a request that blocks forever still occupies the caller: the breaker decides admission only, so pass a context with a timeout to the dependency call.",
+    "Counts live in the instance, so a breaker created per request never accumulates failures while one shared across dependencies merges failure domains.",
+    "A panic inside Execute is counted as a failure and then re-panicked; recovering it elsewhere without re-arming the call path hides it from the metrics.",
+    "ReadyToTrip is only consulted on failures in the closed state and receives a copy of Counts, so trip on a ratio with a minimum Requests floor or a cold breaker trips on its first errors."
+  ],
+  "sources": [
+    "https://github.com/sony/gobreaker"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "gobreaker",
+      "name": "sony/gobreaker v2 generic CircuitBreaker",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "gobreaker.NewCircuitBreaker[T](Settings).Execute",
+      "implementation_notes": "The de-facto Go breaker is gobreaker: gobreaker.NewCircuitBreaker[T](Settings{...}) owns the state machine and Execute(func() (T, error)) is the guarded call. Settings carries ReadyToTrip (the trip predicate over Counts), Timeout (cooldown), MaxRequests (half-open trials), Interval and BucketPeriod (fixed versus rolling window), IsSuccessful and IsExcluded (failure classification) and OnStateChange (observability), so the Go-specific decisions are the error-first signature and the fact that Execute re-panics a panic after counting it as a failure. The standard library has no breaker, so this library (or the stdlib-only variant) is the realization; keep one instance per dependency, because Counts are per instance and a breaker built per request never accumulates enough failures to trip.",
+      "code_sketch": "var payments = gobreaker.NewCircuitBreaker[Receipt](gobreaker.Settings{\n    Name:    \"payments\",\n    Timeout: 15 * time.Second,                 // cooldown in the open state\n    MaxRequests: 3,                            // half-open trial calls\n    ReadyToTrip: func(c gobreaker.Counts) bool {\n        return c.Requests >= 20 && float64(c.TotalFailures)/float64(c.Requests) > 0.5\n    },\n    IsExcluded: func(err error) bool { return errors.Is(err, context.Canceled) },\n})\n\nreceipt, err := payments.Execute(func() (Receipt, error) {\n    return api.Authorize(ctx, order)            // context timeout still needed\n})",
+      "pitfalls": [
+        "Executing a request that blocks forever still occupies the caller: the breaker decides admission only, so pass a context with a timeout to the dependency call.",
+        "Counts live in the instance, so a breaker created per request never accumulates failures while one shared across dependencies merges failure domains.",
+        "A panic inside Execute is counted as a failure and then re-panicked; recovering it elsewhere without re-arming the call path hides it from the metrics.",
+        "ReadyToTrip is only consulted on failures in the closed state and receives a copy of Counts, so trip on a ratio with a minimum Requests floor or a cold breaker trips on its first errors."
+      ],
+      "sources": [
+        "https://github.com/sony/gobreaker"
+      ]
+    },
+    {
+      "variant_id": "stdlib-atomic",
+      "name": "Hand-rolled breaker with sync/atomic and time.Now (stdlib only)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.19",
+      "idiom_name": "atomic.Int32 state + atomic.Int64 counters + atomic trip instant",
+      "implementation_notes": "Without any dependency the breaker is a small struct of stdlib Go: an atomic.Int32 state, atomic.Int64 failure and total counters (the typed atomics added in Go 1.19), and an atomic.Int64 holding the trip time; admission is one load plus, in the open state, a compare-and-swap into half-open, and counting happens after the call returns. time.Now() is the monotonic source in Go - it carries the monotonic reading that the runtime uses for timers - so a cooldown expressed with time.Since survives wall-clock adjustments. Choose this over gobreaker when the dependency budget is zero, when the trip rule is unusual, or when the breaker is a field of an existing struct; choose gobreaker when you want the rolling window, exclusion and state-change callbacks for free.",
+      "code_sketch": "type Breaker struct { // one per dependency; time.Now() has a monotonic reading in Go\n    state atomic.Int32                   // 0 closed, 1 open, 2 half-open\n    fails, total, tripped atomic.Int64   // tripped = UnixNano of the open transition\n}\nfunc (b *Breaker) Admit() bool {\n    if b.state.Load() != Open {\n        return true                                  // closed: admit and count\n    }\n    cooling := time.Since(time.Unix(0, b.tripped.Load())) < cooldown\n    return !cooling && b.state.CompareAndSwap(Open, HalfOpen)  // else one trial call\n}",
+      "pitfalls": [
+        "Mixing clocks (storing wall-clock seconds while comparing against time.Since) breaks the cooldown whenever the clock is adjusted; keep the monotonic reading.",
+        "Counters updated as plain int fields across goroutines are a data race that go test -race catches and production tolerates silently.",
+        "A ratio computed from counters that are never reset grows stale in the closed state, so add a window or a periodic reset.",
+        "The half-open transition needs its own trial counter: a bare CAS either admits every caller or rejects all of them once the state flips."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync/atomic"
+      ]
+    }
+  ],
+  "default_variant": "gobreaker"
+}

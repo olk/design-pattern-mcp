@@ -1,0 +1,62 @@
+{
+  "pattern": "non-copyable-mixin",
+  "language": "swift",
+  "support": "native",
+  "idiom_name": "struct X: ~Copyable (unique ownership, consuming/borrowing parameters, deinit)",
+  "implementation_notes": "Swift 5.9 (SE-0390) lets a struct or enum suppress the implicit Copyable conformance with `~Copyable`: values then have unique ownership and any attempt to copy is a compile error, which is exactly the classic guarantee, and such a type may declare `deinit` so its resource is released exactly once. Because copies are impossible, parameters of noncopyable type must state `borrowing`/`consuming`/`inout`, and a `consuming` method ends the value's lifetime - the compiler then catches use-after-consume, retiring manual 'already closed' flags. This is the realization for unique resources (file handles, transfers, guards); the pre-5.9 fallback is a class, which shares ownership instead of forbidding duplication.",
+  "code_sketch": "struct FileHandle: ~Copyable {\n    private let fd: Int32\n    init(path: String) { fd = open(path, O_RDONLY) }\n    borrowing func read(_ n: Int) -> Data { /* uses fd; caller keeps ownership */ return Data() }\n    consuming func close() { closeDescriptor(fd); discard self }  // at most once\n    deinit { closeDescriptor(fd) }                                // only if never closed\n}",
+  "pitfalls": [
+    "Noncopyable types are viral: a struct or enum that stores one must itself be `~Copyable`, so introducing one into an existing copyable container forces ownership changes through the API (a class, which shares references, is the other place such a value can live).",
+    "`discard self` inside a consuming method suppresses `deinit`; forgetting it double-releases, while calling `close()` twice is already a compile error because the value was consumed - do not re-add manual isClosed flags.",
+    "Conditional conformances must be guarded deliberately: `extension Job: Copyable where Action: Copyable {}` makes a generic container copyable exactly when its payload is, and getting that wrong makes the noncopyable value copyable through the generic type.",
+    "Pre-5.9 toolchains and libraries whose generic constraints assume `Copyable` reject the type, so the language floor must be declared in the package manifest and in the API."
+  ],
+  "sources": [
+    "https://github.com/swiftlang/swift-evolution/blob/main/proposals/0390-noncopyable-structs-and-enums.md",
+    "https://developer.apple.com/videos/play/wwdc2024/10170/"
+  ],
+  "variants": [
+    {
+      "variant_id": "noncopyable-struct",
+      "name": "Noncopyable struct (~Copyable, unique ownership)",
+      "paradigm": "declarative",
+      "min_standard": "Swift5.9",
+      "requires_features": [
+        "noncopyable-types"
+      ],
+      "idiom_name": "struct X: ~Copyable (unique ownership, consuming/borrowing parameters, deinit)",
+      "implementation_notes": "Swift 5.9 (SE-0390) lets a struct or enum suppress the implicit Copyable conformance with `~Copyable`: values then have unique ownership and any attempt to copy is a compile error, which is exactly the classic guarantee, and such a type may declare `deinit` so its resource is released exactly once. Because copies are impossible, parameters of noncopyable type must state `borrowing`/`consuming`/`inout`, and a `consuming` method ends the value's lifetime - the compiler then catches use-after-consume, retiring manual 'already closed' flags. This is the realization for unique resources (file handles, transfers, guards); the pre-5.9 fallback is a class, which shares ownership instead of forbidding duplication.",
+      "code_sketch": "struct FileHandle: ~Copyable {\n    private let fd: Int32\n    init(path: String) { fd = open(path, O_RDONLY) }\n    borrowing func read(_ n: Int) -> Data { /* uses fd; caller keeps ownership */ return Data() }\n    consuming func close() { closeDescriptor(fd); discard self }  // at most once\n    deinit { closeDescriptor(fd) }                                // only if never closed\n}",
+      "pitfalls": [
+        "Noncopyable types are viral: a struct or enum that stores one must itself be `~Copyable`, so introducing one into an existing copyable container forces ownership changes through the API (a class, which shares references, is the other place such a value can live).",
+        "`discard self` inside a consuming method suppresses `deinit`; forgetting it double-releases, while calling `close()` twice is already a compile error because the value was consumed - do not re-add manual isClosed flags.",
+        "Conditional conformances must be guarded deliberately: `extension Job: Copyable where Action: Copyable {}` makes a generic container copyable exactly when its payload is, and getting that wrong makes the noncopyable value copyable through the generic type.",
+        "Pre-5.9 toolchains and libraries whose generic constraints assume `Copyable` reject the type, so the language floor must be declared in the package manifest and in the API."
+      ],
+      "sources": [
+        "https://github.com/swiftlang/swift-evolution/blob/main/proposals/0390-noncopyable-structs-and-enums.md",
+        "https://developer.apple.com/videos/play/wwdc2024/10170/"
+      ]
+    },
+    {
+      "variant_id": "class-reference-identity",
+      "name": "final class with reference identity (pre-5.9 fallback)",
+      "paradigm": "oo",
+      "min_standard": "Swift5",
+      "idiom_name": "final class + private init; references shared by ARC",
+      "implementation_notes": "Before noncopyable types, the Swift answer was a `final class`: instances have a unique identity, assignment copies only the ARC reference, and because no copy constructor exists the object cannot be duplicated - copying is impossible, but sharing is easy and every owner must respect the shared lifetime. Keep the initialiser private (or internal) and construct through a factory so no second instance appears by accident, and treat this as the fallback whose weakness is shared ownership: SE-0390 notes that classes always demand shared ownership, with reference counting and the need to reason about concurrent access, which is why a `~Copyable` struct is preferred when a single owner is the point.",
+      "code_sketch": "final class FileHandle {            // identity, not value\n    private let fd: Int32\n    init(path: String) { fd = open(path, O_RDONLY) }\n    func read(_ n: Int) -> Data { /* ... */ return Data() }\n    deinit { closeDescriptor(fd) }  // one owner must close exactly once\n}",
+      "pitfalls": [
+        "References are copyable, so 'non-copyable' here means only 'the object is unique': two variables can point at the same instance and share mutable state, which is a common source of double-close and data-race bugs.",
+        "Thread safety is now yours: a shared class instance needs locking or actor isolation, whereas a single-owner `~Copyable` struct avoids that problem by construction.",
+        "ARC keeps the object alive past the point where the last owner logically 'closed' it, and deinitialiser order is not deterministic relative to other deinits - do not rely on it for ordering-sensitive cleanup."
+      ],
+      "sources": [
+        "https://github.com/swiftlang/swift-evolution/blob/main/proposals/0390-noncopyable-structs-and-enums.md",
+        "https://forums.swift.org/t/what-is-copyable-for/84437"
+      ]
+    }
+  ],
+  "default_variant": "noncopyable-struct",
+  "version": "1.0"
+}

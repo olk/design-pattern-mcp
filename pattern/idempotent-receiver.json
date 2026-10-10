@@ -1,0 +1,195 @@
+{
+  "category": "workflow-messaging",
+  "name": "idempotent-receiver",
+  "aliases": [
+    "idempotent consumer",
+    "de-duplicating receiver"
+  ],
+  "intent": "Make duplicate delivery harmless by design: the receiver recognizes repeat deliveries of the same logical message through a stable key and absorbs them, so that processing an at-least-once channel has the same effect as processing each message exactly once.",
+  "problem": "A channel that delivers at least once hands the same logical message to the receiver more than once - a producer retries after losing an acknowledgement, a consumer crashes after applying effects but before acknowledging, a lock expires mid-processing, or an operator replays dead-lettered messages. Without an explicit guard the handler executes the same business action twice (double charges, duplicate rows, repeated notifications), because delivery guarantees cannot be improved from the receiver side.",
+  "context": "Message-driven receivers on queues, topics or log partitions where redelivery, retry and resubmission are normal and the handler's side effects are not naturally repeatable: at-least-once brokers, competing consumers, redelivery after lock or visibility timeout, and operator replays from a dead-letter channel. Applies whether the deduplication state lives in the receiver process, in a shared store, or partially in the broker's own duplicate detection.",
+  "benefits": [
+    "Turns an at-least-once transport into effectively-once processing: retries, redeliveries and dead-letter resubmissions stop creating duplicate charges, records or notifications.",
+    "Correctness is enforced where the side effects happen instead of being assumed from the broker's guarantee, so it survives lock expiry, consumer crashes and operator replays alike.",
+    "Retry and redelivery policies can stay aggressive (fail fast, redeliver freely) because the receiver absorbs the duplicates those policies create.",
+    "Duplicate handling becomes an explicit, testable and observable concern with a named mechanism, rather than an unstated assumption spread across every handler.",
+    "Horizontal scaling with competing consumers becomes safe: several instances may receive the same message and only one effect survives.",
+    "The stable message identity it introduces is reusable downstream, so each called service can deduplicate its own work with the same key."
+  ],
+  "tradeoffs": [
+    "Requires an extra shared, durable store whose retention policy must be tuned to the broker's redelivery window: too short reopens the duplicate window, too long grows without bound.",
+    "The claim record and the business effects must commit atomically, which pushes the receiver into inbox-style transactions; effects that cannot join the transaction need in-progress/completed bookkeeping and reconciliation.",
+    "Check-then-act races under competing consumers are only closed by a store-level uniqueness constraint or an atomic claim primitive - application-level existence checks cannot close them.",
+    "Choosing the deduplication key is a silent-failure surface: broker-regenerated identifiers disable the protection, over-broad keys suppress distinct messages, and correlation identifiers group several messages under one key.",
+    "A recorded claim can outlive a permanently failing delivery, so the failure path must dead-letter and reconcile rather than silently swallow, which costs extra states and operational tooling.",
+    "Every message pays for the claim (store round trip or lock); a naive read-through cache in front of the store reintroduces the race unless the claim itself stays atomic.",
+    "The pattern says nothing about ordering: a late duplicate applied as a relative update can overwrite newer state unless handlers are also version- or order-aware."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 9,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Message Receiver (Endpoint)",
+      "responsibility": "Consumes each delivery from the channel, extracts the deduplication key and invokes the idempotency guard before any business effect is applied; acknowledges, discards or dead-letters according to the guard's verdict."
+    },
+    {
+      "role": "Message Producer",
+      "responsibility": "Assigns every logical message a stable identity and may resend it after a timeout, crash or resubmission; the receiver must not depend on the producer sending exactly once."
+    },
+    {
+      "role": "Idempotency Guard (Duplicate Detector)",
+      "responsibility": "Checks whether the key was already processed and atomically claims it for this delivery, shielding the business handler from duplicate invocations and deciding process / absorb / dead-letter."
+    },
+    {
+      "role": "Deduplication Store",
+      "responsibility": "Shared, durable-enough record of claimed keys with a retention window at least as long as the broker can redeliver; the single arbiter of whether a message is a duplicate."
+    },
+    {
+      "role": "Message Handler (Business Service)",
+      "responsibility": "Applies the business effects exactly once per key; its writes commit atomically with the claim record, or the effects are made naturally idempotent so that repetition is harmless."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Payment and order consumers that must never charge or ship twice when a queue redelivers after a lost acknowledgement (idempotency keys sent with the request).",
+    "Webhook receivers for payment providers and SaaS event callbacks that retry on timeout or non-2xx responses.",
+    "Competing-consumer worker fleets where a crashed instance causes an in-flight message to be redelivered to another instance mid-write.",
+    "Event-carried-state projections that apply upserts keyed by a business identifier, where the key itself makes reapplication harmless.",
+    "Operator replays of dead-lettered messages, long after the broker's own deduplication window has closed.",
+    "Kafka read-process-write consumers that use transactions plus a deduplication record to make reprocessing from an offset safe.",
+    "Change Data Capture (CDC) pipelines using Debezium or similar connectors, where a database transaction that modifies multiple tables produces several events that may each be redelivered independently after a connector restart.",
+    "ETL and stream reprocessing jobs where an operator rewinds a Kafka consumer group offset to replay historical events for backfill, schema migration, or analytics recomputation — far outside any broker-level deduplication window.",
+    "Feature flag and entitlement propagation systems where a configuration change triggers targeted notification events; without idempotent receiver, a crash mid-notification could cause the same flag update to be applied twice, creating inconsistent rollout state.",
+    "Cross-region disaster recovery replication where a message is replicated to a secondary region before the primary acknowledges it, causing apparent duplicates on failover.",
+    "GraphQL subscription event delivery where a subscription update is pushed to multiple connected clients; network retries from individual client disconnections require the delivery system to be idempotent at the event level.",
+    "Apache Camel routes that wrap a processor in the Idempotent Consumer EIP and persist message IDs in an IdempotentRepository so redeliveries are skipped.",
+    "Spring Integration endpoints that apply IdempotentReceiverInterceptor with a MetadataStoreSelector to reject or mark messages already seen by the flow.",
+    "Azure Service Bus queues or topics configured for MessageId-based duplicate detection as a transport complement to receiver-side durable claims; application handling still covers redelivery outside the broker window."
+  ],
+  "avoid_when": [
+    "The operation is already naturally idempotent - upserting absolute state, HTTP PUT addressed by resource id, INSERT ... ON CONFLICT derived from the payload; prefer that over a deduplication store.",
+    "Occasional duplicate processing is tolerable and cheaper than the store: analytics counters, best-effort notifications, cache warmers.",
+    "The workload has a single delivery with no retry, redelivery or replay (synchronous in-process calls, deterministic batch loads into a fresh target).",
+    "The broker's feature covers exactly the effects you control inside its window (SQS FIFO deduplication ids for send retries, Kafka transactions inside Kafka); deduplication then remains only a residual safety net.",
+    "Delivery is at-most-once by design and message loss is acceptable - the receiver never sees the duplicates this pattern absorbs."
+  ],
+  "language_files": {
+    "generic": "idempotent-receiver.generic.json",
+    "c": "idempotent-receiver.c.json",
+    "cplusplus": "idempotent-receiver.cplusplus.json",
+    "csharp": "idempotent-receiver.csharp.json",
+    "go": "idempotent-receiver.go.json",
+    "java": "idempotent-receiver.java.json",
+    "javascript": "idempotent-receiver.javascript.json",
+    "kotlin": "idempotent-receiver.kotlin.json",
+    "python": "idempotent-receiver.python.json",
+    "ruby": "idempotent-receiver.ruby.json",
+    "rust": "idempotent-receiver.rust.json",
+    "scala": "idempotent-receiver.scala.json",
+    "swift": "idempotent-receiver.swift.json",
+    "typescript": "idempotent-receiver.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "guaranteed-delivery",
+    "idempotent-client",
+    "transactional-message-queue",
+    "retry",
+    "competing-consumers",
+    "correlation-identifier",
+    "dead-letter-channel",
+    "claim-check",
+    "process-manager"
+  ],
+  "anti_patterns": [
+    "Keying deduplication on broker or delivery metadata that changes on redelivery (receive count, delivery tag, lock token, receive timestamp): every redelivery looks new and the store never matches.",
+    "An in-memory seen-set in a scaled-out or restart-prone deployment, giving false confidence once the process moves or dies.",
+    "Check-then-process with a non-atomic marker write (or a cache EXISTS followed by SET), reopening the very race the pattern closes.",
+    "Unbounded deduplication records - or a TTL shorter than the maximum redelivery window, including operator replays from the dead-letter channel.",
+    "Silently discarding every key collision: when the same key arrives with different content the producer is broken and the message is not a duplicate - dead-letter and alert instead.",
+    "Using the receiver-side guard to compensate for a producer that never assigns stable identities; the key is the pattern's contract, not an implementation detail.",
+    "Using save() instead of saveAndFlush() in JPA: the default flush mode writes only at transaction commit, allowing two concurrent duplicate processors to both pass the existence check before either throws DataIntegrityViolationException — any non-transactional side effects (REST calls, non-outbox Kafka writes) fire twice.",
+    "Committing the business effect before the deduplication claim: if the transaction aborts after the business write commits but before the claim is persisted, the message will be redelivered and accepted as new on the next attempt — the business state becomes permanently duplicated.",
+    "Missing consumer offset advancement on duplicate absorb: when a duplicate is detected and absorbed, the consumer must still commit its offset so the broker does not redeliver the same message; forgetting this causes an infinite loop on that message.",
+    "Using a cache-aside pattern (check cache → miss → query DB) without making the cache entry creation and the claim insertion atomic: a race between two concurrent consumers can result in both writing the same key to the cache, then both proceeding to business processing.",
+    "Unbounded deduplication store growth: when messages are consumed and acknowledged but the deduplication record is never expired (TTL too long or missing), the store grows without bound and eventually degrades query performance or exhausts storage.",
+    "Treating all key collisions as duplicates to absorb: when the same idempotency key arrives with semantically different content, the producer is malfunctioning or the key is mis-scoped — silently absorbing the second message loses data; dead-letter and alert instead.",
+    "Relying on the deduplication store for ordering guarantees: idempotent receiver makes no ordering promise; a late-arriving duplicate that overwrites newer state (e.g., a relative counter update) corrupts the business state unless handlers are order-aware or version-stamped.",
+    "Composite key errors in multi-tenant or multi-consumer setups: forgetting to include the consumer or tenant identity in the deduplication key causes cross-consumer or cross-tenant duplicate false positives, silently suppressing legitimate new messages."
+  ],
+  "design_principles": [
+    "Separation of concerns: duplicate suppression and business processing are separate responsibilities joined by one guard.",
+    "Single arbiter: correctness is decided by the store's uniqueness constraint or another atomic claim, never by an application-level pre-check.",
+    "Prefer natural idempotency over bookkeeping: do not maintain deduplication state when the operation itself can be made repeatable.",
+    "Correctness spans the whole path: propagate the idempotency key to downstream calls so each tier can deduplicate its own work.",
+    "Fail safe on ambiguity: suspicious collisions are routed to a dead-letter channel with the key and correlation id, never dropped silently.",
+    "Retention is derived from an observed property of the system (the redelivery window), not from a guessed constant."
+  ],
+  "best_practices": [
+    "Use a producer-assigned, stable, business-meaningful key (idempotency key, Service Bus MessageId, CloudEvents source+id); never a broker-regenerated or timestamp-derived value.",
+    "Commit the claim record and the business effects in one transaction, or let the business write itself be the uniqueness check (unique index / INSERT ... ON CONFLICT).",
+    "Claim atomically: putIfAbsent, LoadOrStore, insert-returns-bool, SET NX PX, or a unique-constraint insert whose zero-row result means 'duplicate'.",
+    "Key the store per consumer (composite consumer identity + message id) when several subscribers share one deduplication store.",
+    "Set record retention at least to the maximum redelivery window (attempts x visibility timeout x TTL) including operator resubmissions, then expire deliberately.",
+    "Track the duplicate rate and log the deduplication key together with the correlation identifier; a rising rate signals producer or consumer misconfiguration.",
+    "For non-transactional external effects, record in-progress then completed and reconcile stale in-progress entries before acknowledging.",
+    "In JPA/Hibernate idempotent consumers, use saveAndFlush() instead of save() so the INSERT acquires a DB lock synchronously — the second concurrent duplicate will throw DataIntegrityViolationException immediately rather than at commit, preventing duplicate REST calls or external events from being issued.",
+    "For Kafka, set isolation.level='read_committed' on the consumer to skip uncommitted transactions, and enable processing.guarantee='exactly_once_v2' in Kafka Streams applications so offsets, state stores, and output topics update atomically.",
+    "In Postgres, use INSERT ... ON CONFLICT DO NOTHING as the atomic claim — the RETURNING clause distinguishes 'claimed first' from 'already existed', and the unique constraint on (consumer_id, message_id) closes the competing-consumer race without a pre-check.",
+    "Batch consumers should deduplicate the entire poll batch upfront by collecting all message IDs, querying the store for existing keys in one shot, then filtering the batch before processing — this reduces per-message round trips and simplifies crash-recovery.",
+    "For multi-tenant systems, scope the idempotency key to the tenant: composite key (tenant_id, message_id) prevents a message from one tenant being mistaken for a duplicate in another tenant's deduplication store.",
+    "Consumer offset must always be committed after the deduplication claim and business effects commit, even when the message is a duplicate — failing to advance offsets causes infinite redelivery of already-processed messages.",
+    "When the idempotency store is also used for saga state or outbox progress, partition the store's namespace per concern so a corrupted entry for one pattern cannot interfere with another.",
+    "Prefer database-backed idempotency for transactional workloads; prefer Redis SET NX PX for non-transactional or latency-sensitive workloads, but acknowledge Redis persistence risk (use a Redis Cluster with AOF or accept eventual-consistency windows).",
+    "For long-running business transactions triggered by messages, split the idempotency claim (fast, in-memory or Redis) from the completion flag (durable DB) so that a mid-flight crash is recoverable without false duplicate detection on restart."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe, G. & Woolf, B., Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Idempotent Receiver (Messaging Endpoints chapter).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/IdempotentReceiver.html",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/idempotent-consumer",
+    "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagededuplicationid-property.html",
+    "https://camel.apache.org/components/latest/eips/idempotentConsumer-eip.html",
+    "https://docs.spring.io/spring-integration/reference/handler-advice/idempotent-receiver.html",
+    "Confluent Developer, \"Idempotent Reader Pattern\", Confluent Developer Guide, 2024. https://developer.confluent.io/patterns/event-processing/idempotent-reader/ — Derived from EIP; covers Kafka read_committed, exactly_once_v2, and tracking-ID deduplication.",
+    "Confluent Blog, \"Exactly Once Semantics Are Possible: Here's How Apache Kafka Does It\", Confluent, 2017 (updated). https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/ — Technical deep-dive on Kafka transactions, idempotent producers, and exactly-once processing guarantees.",
+    "Lydtech Consulting, \"Kafka Idempotent Consumer & Transactional Outbox\", September 2025. https://www.lydtechconsulting.com/blog/kafka-idempotent-consumer-transactional-outbox — Covers poll-timeout duplicate delivery, saveAndFlush() flush strategy, DataIntegrityViolationException handling, and CDC/Outbox coupling.",
+    "AWS Documentation, \"Using the message deduplication ID in Amazon SQS\", Amazon Web Services, August 2023. https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagededuplicationid-property.html — SQS FIFO 5-minute deduplication window, content-based vs explicit deduplication IDs.",
+    "Microsoft Azure Architecture Pattern, \"Idempotent Consumer\", Azure Architecture Center. https://learn.microsoft.com/en-us/azure/architecture/patterns/idempotent-consumer — Cloud-native idempotency patterns, Azure Service Bus duplicate detection window.",
+    "Stripe Engineering, \"Designing robust and predictable APIs with idempotency\", Stripe, February 2017. https://stripe.com — Practical API design for idempotent requests, idempotency key lifecycle, 4xx retry-abort rules.",
+    "Kleppmann, M. et al., \"A Critique of the CAP Theorem\", ACM PODC, 2015 — Relevant for the consistency vs availability tradeoffs in deduplication store design.",
+    "Newcombe, C. et al., \"TLA+ in Practice\", ACM TOSEM, 2015 — Formal specification of exactly-once delivery guarantees aids understanding of idempotency scope.",
+    "AWS Prescriptive Guidance, \"Transactional Outbox Pattern\", Amazon Web Services. https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/transactional-outbox-pattern.html — Companion to idempotent receiver: atomic business write + outbox event in one DB transaction.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessagingEndpointsIntro.html",
+    "https://camel.apache.org/components/4.22.x/eips/idempotentConsumer-eip.html",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection",
+    "https://hld.handbook.academy/curriculum/distributed-systems-theory/idempotency-exactly-once/"
+  ],
+  "related_patterns_notes": {
+    "transactional-outbox": "transactional-outbox",
+    "idempotent-writer": "idempotent-writer",
+    "event-sourcing": "event-sourcing"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "ResiliencePipelineBuilder.AddCircuitBreaker(CircuitBreakerStrategyOptions)",
+  "implementation_notes": "The .NET default is Polly's pipeline: new ResiliencePipelineBuilder().AddCircuitBreaker(new CircuitBreakerStrategyOptions { ... }).Build() produces one pipeline per dependency whose ExecuteAsync records outcomes through ShouldHandle and trips on FailureRatio inside SamplingDuration once MinimumThroughput calls have been seen, staying open for BreakDuration and throwing the breaker's open-circuit exception instead of invoking the callback. It replaces the legacy v7 Policy.Handle<T>().CircuitBreakerAsync API, and the protected call runs inside the pipeline, so no hand-written state machine is needed. The remaining decisions are the predicate (which exceptions and results count as failures) and instance management: one pipeline per dependency, because a shared breaker opens for everything the moment one target fails.",
+  "code_sketch": "var payments = new ResiliencePipelineBuilder()\n    .AddCircuitBreaker(new CircuitBreakerStrategyOptions\n    {\n        FailureRatio = 0.5, MinimumThroughput = 20,\n        SamplingDuration = TimeSpan.FromSeconds(30),\n        BreakDuration = TimeSpan.FromSeconds(15),\n        ShouldHandle = new PredicateBuilder().Handle<HttpRequestException>(),\n    })\n    .Build();\n\nvar receipt = await payments.ExecuteAsync(\n    ct => api.AuthorizeAsync(order, ct), cancellationToken);   // open throws, so no retry",
+  "pitfalls": [
+    "Sharing one pipeline across unrelated dependencies opens the circuit for all of them as soon as one target fails; a pipeline is a per-dependency instance.",
+    "ShouldHandle decides everything: without an explicit predicate business exceptions trip the breaker, and with too narrow a predicate a hanging dependency never trips it.",
+    "The MinimumThroughput and SamplingDuration defaults are tuned for busy HTTP endpoints, so a low-traffic call site can sit below the throughput floor and never trip.",
+    "Retry or hedging strategies layered around the breaker must exclude its open-circuit exception, or the retry policy hammers a circuit that is deliberately open.",
+    "Polly v7 examples still circulate: Policy.CircuitBreaker is the legacy API with different option names and semantics, so mixing documentation produces wrong thresholds."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/core/resilience/http-resilience",
+    "https://github.com/App-vNext/Polly"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "polly-pipeline",
+      "name": "Polly v8 resilience pipeline with a circuit-breaker strategy",
+      "paradigm": "oo",
+      "min_standard": "NET8",
+      "idiom_name": "ResiliencePipelineBuilder.AddCircuitBreaker(CircuitBreakerStrategyOptions)",
+      "implementation_notes": "The .NET default is Polly's pipeline: new ResiliencePipelineBuilder().AddCircuitBreaker(new CircuitBreakerStrategyOptions { ... }).Build() produces one pipeline per dependency whose ExecuteAsync records outcomes through ShouldHandle and trips on FailureRatio inside SamplingDuration once MinimumThroughput calls have been seen, staying open for BreakDuration and throwing the breaker's open-circuit exception instead of invoking the callback. It replaces the legacy v7 Policy.Handle<T>().CircuitBreakerAsync API, and the protected call runs inside the pipeline, so no hand-written state machine is needed. The remaining decisions are the predicate (which exceptions and results count as failures) and instance management: one pipeline per dependency, because a shared breaker opens for everything the moment one target fails.",
+      "code_sketch": "var payments = new ResiliencePipelineBuilder()\n    .AddCircuitBreaker(new CircuitBreakerStrategyOptions\n    {\n        FailureRatio = 0.5, MinimumThroughput = 20,\n        SamplingDuration = TimeSpan.FromSeconds(30),\n        BreakDuration = TimeSpan.FromSeconds(15),\n        ShouldHandle = new PredicateBuilder().Handle<HttpRequestException>(),\n    })\n    .Build();\n\nvar receipt = await payments.ExecuteAsync(\n    ct => api.AuthorizeAsync(order, ct), cancellationToken);   // open throws, so no retry",
+      "pitfalls": [
+        "Sharing one pipeline across unrelated dependencies opens the circuit for all of them as soon as one target fails; a pipeline is a per-dependency instance.",
+        "ShouldHandle decides everything: without an explicit predicate business exceptions trip the breaker, and with too narrow a predicate a hanging dependency never trips it.",
+        "The MinimumThroughput and SamplingDuration defaults are tuned for busy HTTP endpoints, so a low-traffic call site can sit below the throughput floor and never trip.",
+        "Retry or hedging strategies layered around the breaker must exclude its open-circuit exception, or the retry policy hammers a circuit that is deliberately open.",
+        "Polly v7 examples still circulate: Policy.CircuitBreaker is the legacy API with different option names and semantics, so mixing documentation produces wrong thresholds."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/core/resilience/http-resilience",
+        "https://github.com/App-vNext/Polly"
+      ]
+    },
+    {
+      "variant_id": "standard-http-handler",
+      "name": "Microsoft.Extensions.Http.Resilience standard handler (configuration-only breaker)",
+      "paradigm": "oo",
+      "min_standard": "NET8",
+      "idiom_name": "httpClientBuilder.AddStandardResilienceHandler() circuit-breaker stage",
+      "implementation_notes": "For HttpClient the breaker can be configuration instead of code: AddStandardResilienceHandler() installs the standard chain (rate limiter, total timeout, retry, circuit breaker, attempt timeout) and ConfigureHttpClientDefaults can apply it to every client, with the circuit-breaker stage configured through options.CircuitBreaker on the handler options and 5xx/408/429 responses plus HttpRequestException and TimeoutRejectedException handled by default. The hedging variant keeps one breaker per endpoint so unhealthy endpoints are not hedged against, selected by URL authority unless SelectPipelineBy overrides it. Choose this when the dependency is HTTP and the defaults are acceptable; drop to an explicit pipeline when the policy must differ per call site or must wrap a non-HTTP operation.",
+      "code_sketch": "services.AddHttpClient<PaymentsClient>(c => c.BaseAddress = new(\"https://payments\"))\n        .AddStandardResilienceHandler(o =>\n        {\n            o.CircuitBreaker.FailureRatio = 0.25;          // default 0.1\n            o.CircuitBreaker.MinimumThroughput = 50;       // default 100\n            o.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(10);\n            o.Retry.DisableForUnsafeHttpMethods();         // POST/PUT/PATCH/DELETE\n        });",
+      "pitfalls": [
+        "Only one resilience handler should be added per client: stacking the standard and hedging handlers installs several breakers and hides which one opened.",
+        "The default failure ratio of 10 percent with a minimum throughput of 100 is tuned for busy endpoints; a low-volume route never reaches the throughput floor.",
+        "A custom chain must make its retry stage recognize the breaker's rejection, otherwise retries keep re-injecting load while the circuit is open.",
+        "Endpoint-pooled breakers are keyed by URL authority by default, so several services behind one host share a circuit unless SelectPipelineBy is configured."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/core/resilience/http-resilience",
+        "https://github.com/App-vNext/Polly"
+      ]
+    }
+  ],
+  "default_variant": "polly-pipeline"
+}

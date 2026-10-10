@@ -1,0 +1,75 @@
+{
+  "pattern": "virtual-proxy",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "std::sync::OnceLock::get_or_init as a per-instance slot",
+  "implementation_notes": "std ships the guard, not the lazy object: store a OnceLock<Image> in the stand-in and call get_or_init(|| Image::load(&path)) from the accessor, so the closure runs once even when threads race and every caller sees the same reference. Unlike the static-oriented LazyLock, OnceLock works per instance and its get() answers 'was it ever built?' without forcing construction, which is what lifecycle and diagnostic code needs. A panic propagates to the caller and leaves the cell uninitialized, so the next caller retries; reentrant initialization is documented as an error that currently deadlocks, and the accessor keeps the classic proxy class unnecessary unless several interface methods must be forwarded.",
+  "code_sketch": "struct Page {\n    path: PathBuf,\n    image: OnceLock<Image>,\n}\n\nimpl Page {\n    fn image(&self) -> &Image {\n        self.image.get_or_init(|| Image::load(&self.path))\n    }\n}",
+  "pitfalls": [
+    "get_or_init must not re-enter the same cell: the documented outcome for reentrant initialization is unspecified and currently deadlocks.",
+    "A panicking initializer leaves the cell uninitialized, so the next access retries; if that is not wanted, cache the error beside the cell instead of relying on once semantics.",
+    "OnceLock is not Sync unless T: Send + Sync, and it makes the stand-in neither Copy nor trivially cloneable - sharing the built value across threads constrains both T and the container."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+    "https://doc.rust-lang.org/std/sync/struct.LazyLock.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-once-lock",
+      "name": "std::sync::OnceLock per-instance cell",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "idiom_name": "std::sync::OnceLock::get_or_init as a per-instance slot",
+      "implementation_notes": "std ships the guard, not the lazy object: store a OnceLock<Image> in the stand-in and call get_or_init(|| Image::load(&path)) from the accessor, so the closure runs once even when threads race and every caller sees the same reference. Unlike the static-oriented LazyLock, OnceLock works per instance and its get() answers 'was it ever built?' without forcing construction, which is what lifecycle and diagnostic code needs. A panic propagates to the caller and leaves the cell uninitialized, so the next caller retries; reentrant initialization is documented as an error that currently deadlocks, and the accessor keeps the classic proxy class unnecessary unless several interface methods must be forwarded.",
+      "code_sketch": "struct Page {\n    path: PathBuf,\n    image: OnceLock<Image>,\n}\n\nimpl Page {\n    fn image(&self) -> &Image {\n        self.image.get_or_init(|| Image::load(&self.path))\n    }\n}",
+      "pitfalls": [
+        "get_or_init must not re-enter the same cell: the documented outcome for reentrant initialization is unspecified and currently deadlocks.",
+        "A panicking initializer leaves the cell uninitialized, so the next access retries; if that is not wanted, cache the error beside the cell instead of relying on once semantics.",
+        "OnceLock is not Sync unless T: Send + Sync, and it makes the stand-in neither Copy nor trivially cloneable - sharing the built value across threads constrains both T and the container."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html"
+      ]
+    },
+    {
+      "variant_id": "std-lazy-lock",
+      "name": "std::sync::LazyLock for a process-wide subject",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.80",
+      "idiom_name": "static LazyLock<T> = LazyLock::new(|| ...)",
+      "implementation_notes": "LazyLock is the deref-shaped sibling: `static IMAGE: LazyLock<Image> = LazyLock::new(|| Image::load(PATH));` initializes on the first dereference and every later use looks like a reference to the value, which is the cleanest shape for a process-wide subject. It blocks any dereferencing thread while another thread is initializing, and it cannot take extra inputs after new(), so per-instance or parameterized construction stays with OnceLock. Choose it for process-wide singletons whose construction needs no runtime arguments; note that statics are never dropped, so the subject's destructor does not run.",
+      "code_sketch": "static TEMPLATE: LazyLock<Template> = LazyLock::new(|| {\n    Template::parse(include_str!(\"template.html\"))   // tens of milliseconds\n});\n\nfn render(page: &Page) -> String {\n    TEMPLATE.render(page)\n}",
+      "pitfalls": [
+        "Every deref blocks while the initializer runs, so a slow construction serializes all readers even after startup.",
+        "Statics are never dropped: the subject's destructor does not run at exit, so resources that need explicit release must be closed by hand.",
+        "LazyLock::new cannot receive per-instance inputs, and a poisoned initializer panics every future access - parameterized or fallible construction belongs behind OnceLock."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html",
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    },
+    {
+      "variant_id": "once-cell-crate",
+      "name": "once_cell crate (pre-std and unsync flavours)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "idiom_name": "once_cell::sync::Lazy / once_cell::{sync,unsync}::OnceCell",
+      "implementation_notes": "Before OnceLock and LazyLock were stabilized the once_cell crate was the standard route: sync::Lazy for statics and sync::OnceCell / unsync::OnceCell for owned slots, with get_or_init mirroring the std API today. The unsync flavour is the interesting extra - it skips atomics entirely for stand-ins that never cross threads, where std has no equivalent (OnceLock is always thread-safe). Choose the crate when the MSRV is pinned below 1.70, or when the single-threaded cell is a measurable win; otherwise the std types are equivalent and dependency-free.",
+      "code_sketch": "use once_cell::sync::Lazy;\n\nstatic GLOBAL_DATA: Lazy<Mutex<HashMap<i32, String>>> = Lazy::new(|| {\n    let mut m = HashMap::new();\n    m.insert(13, \"Spica\".to_string());\n    Mutex::new(m)\n});",
+      "pitfalls": [
+        "unsync::OnceCell is not Sync: using it behind a shared reference across threads does not compile, so it only fits stand-ins confined to one thread.",
+        "Mixing once_cell types with std OnceLock/LazyLock in one codebase duplicates the abstraction and confuses which guarantees apply; migrate rather than sprinkle both.",
+        "Lazy's deref behaves like a reference, so mutating the stored subject still requires interior mutability (Mutex/RwLock), exactly as with the std types."
+      ],
+      "sources": [
+        "https://docs.rs/once_cell/latest/once_cell/",
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    }
+  ],
+  "default_variant": "std-once-lock",
+  "version": "1.0"
+}

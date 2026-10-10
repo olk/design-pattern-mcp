@@ -1,0 +1,69 @@
+{
+  "pattern": "pipe-and-filter",
+  "language": "csharp",
+  "support": "native",
+  "idiom_name": "source.Where(..).Select(..) - iterator methods make each stage lazy",
+  "implementation_notes": "LINQ is the language-level realisation in C#: an iterator method (yield return) makes a filter a lazily evaluated source, and Where/Select/SelectMany compose the stages either as operators or as query syntax, so no Filter or Pipe classes are needed and the pipeline is ordinary code. Deferred execution gives streaming without intermediate collections; the chain is synchronous and single-threaded, executes again on each enumeration, and returns IEnumerable<T> unless materialised. Use System.IO.Pipelines for byte-level stages and TPL Dataflow when stages should run concurrently.",
+  "code_sketch": "IEnumerable<Order> Pipeline(IEnumerable<string> raw) =>\n    from line in raw\n    where !string.IsNullOrWhiteSpace(line)          // stage 1\n    let order = Order.Parse(line)                    // stage 2\n    select order with { Total = order.Total * tax };\n\nforeach (var o in Pipeline(File.ReadLines(path)))    // terminal: drives the chain\n    sink.Write(o);",
+  "pitfalls": [
+    "Deferred execution means the pipeline re-runs on every enumeration: side-effecting filters repeat their effects and exceptions surface at the consuming loop, far from the failing stage.",
+    "The chain is pull-based and synchronous; one blocking stage stalls the whole enumeration unless it is switched to IAsyncEnumerable or moved behind a queue."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/csharp/linq/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "linq-ienumerable",
+      "name": "LINQ over IEnumerable<T> (query syntax and operator methods)",
+      "paradigm": "declarative",
+      "min_standard": "C#3",
+      "idiom_name": "source.Where(..).Select(..) - iterator methods make each stage lazy",
+      "implementation_notes": "LINQ is the language-level realisation in C#: an iterator method (yield return) makes a filter a lazily evaluated source, and Where/Select/SelectMany compose the stages either as operators or as query syntax, so no Filter or Pipe classes are needed and the pipeline is ordinary code. Deferred execution gives streaming without intermediate collections; the chain is synchronous and single-threaded, executes again on each enumeration, and returns IEnumerable<T> unless materialised. Use System.IO.Pipelines for byte-level stages and TPL Dataflow when stages should run concurrently.",
+      "code_sketch": "IEnumerable<Order> Pipeline(IEnumerable<string> raw) =>\n    from line in raw\n    where !string.IsNullOrWhiteSpace(line)          // stage 1\n    let order = Order.Parse(line)                    // stage 2\n    select order with { Total = order.Total * tax };\n\nforeach (var o in Pipeline(File.ReadLines(path)))    // terminal: drives the chain\n    sink.Write(o);",
+      "pitfalls": [
+        "Deferred execution means the pipeline re-runs on every enumeration: side-effecting filters repeat their effects and exceptions surface at the consuming loop, far from the failing stage.",
+        "The chain is pull-based and synchronous; one blocking stage stalls the whole enumeration unless it is switched to IAsyncEnumerable or moved behind a queue."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/linq/"
+      ]
+    },
+    {
+      "variant_id": "system-io-pipelines",
+      "name": "System.IO.Pipelines byte-stream stages",
+      "paradigm": "oo",
+      "min_standard": "C#7",
+      "idiom_name": "PipeWriter.GetMemory/Advance/FlushAsync + PipeReader.ReadAsync/AdvanceTo",
+      "implementation_notes": "For byte-oriented filters the pipe is an actual API: System.IO.Pipelines gives a PipeWriter (GetMemory, Advance, FlushAsync) whose output is read as ReadOnlySequence<byte> through a PipeReader (ReadAsync, AdvanceTo, CompleteAsync), with flow control built into the read/write pair so a slow consumer throttles the producer. This is the form for protocol parsing, network framing and other high-throughput byte stages where per-record allocation and copying dominate; choose LINQ for in-memory object pipelines and keep the object model out of the byte path.",
+      "code_sketch": "var pipe = new Pipe();\nTask writing = FillAsync(socket, pipe.Writer), filtering = FilterAsync(pipe.Reader, next.Writer);\nawait Task.WhenAll(writing, filtering);                   // pipeline driver\nasync Task FilterAsync(PipeReader reader, PipeWriter writer) {\n    while (true) {\n        ReadResult r = await reader.ReadAsync();\n        foreach (var line in SplitLines(r.Buffer)) writer.Write(Transform(line));\n        reader.AdvanceTo(r.Buffer.End);   // releases the consumed buffers\n        if (r.IsCompleted) break;\n    }\n    await writer.CompleteAsync();         // EOF for the next stage\n}",
+      "pitfalls": [
+        "Forgetting AdvanceTo or CompleteAsync pins the consumed buffers, so the Pipe never releases memory and throughput degrades over time.",
+        "A ReadOnlySequence<byte> from ReadResult is only valid until the next ReadAsync/AdvanceTo; holding a slice beyond that point reads recycled memory.",
+        "FlushResult.IsCompleted means the reader is gone - continuing to produce work is wasted, and the writer loop should stop and complete."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.io.pipelines",
+        "https://learn.microsoft.com/en-us/dotnet/standard/io/pipelines"
+      ]
+    },
+    {
+      "variant_id": "tpl-dataflow",
+      "name": "TPL Dataflow blocks linked into a parallel pipeline",
+      "paradigm": "concurrent",
+      "min_standard": "C#5",
+      "idiom_name": "TransformBlock<TIn,TOut> + ActionBlock linked with LinkTo and BoundedCapacity",
+      "implementation_notes": "System.Threading.Tasks.Dataflow models each filter as a block: TransformBlock<TInput,TOutput> transforms, BufferBlock or a bounded block buffers, ActionBlock terminates, and LinkTo wires them into a running pipeline whose per-stage queues, MaxDegreeOfParallelism and BoundedCapacity are configuration. Completion and faults propagate along the links, which makes this the natural C# realization when stages must overlap, run in parallel or be monitored individually; it is heavier than LINQ and unnecessary for pure in-memory transformations.",
+      "code_sketch": "var parse = new TransformBlock<string, Order>(Order.Parse,\n    new ExecutionDataflowBlockOptions { BoundedCapacity = 1000, MaxDegreeOfParallelism = 4 });\nvar write = new ActionBlock<Order>(sink.Write,\n    new ExecutionDataflowBlockOptions { BoundedCapacity = 1000 });\nparse.LinkTo(write, new DataflowLinkOptions { PropagateCompletion = true });\nforeach (var line in input) await parse.SendAsync(line);\nparse.Complete();\nawait write.Completion;",
+      "pitfalls": [
+        "Without BoundedCapacity every block buffers without limit, so a slow stage turns into unbounded memory growth instead of backpressure.",
+        "Completion must be propagated (PropagateCompletion) or the terminal block never finishes; a faulted block stops accepting items and upstream SendAsync waits forever unless faults are observed."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library"
+      ]
+    }
+  ],
+  "default_variant": "linq-ienumerable"
+}

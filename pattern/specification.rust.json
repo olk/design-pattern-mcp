@@ -1,0 +1,85 @@
+{
+  "pattern": "specification",
+  "language": "rust",
+  "support": "idiomatic",
+  "variants": [
+    {
+      "variant_id": "closure-composition",
+      "name": "Closures with iterator adapters",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "requires_features": [],
+      "idiom_name": "Fn(&T) -> bool closures composed in iterator pipelines",
+      "implementation_notes": "Rust's rule is a closure behind the Fn traits: `let overdue = |i: &Invoice| i.days_past_due >= 30;` and composition is either a closure over the parts or a small generic combinator, consumed by Iterator::filter/all/any or Option::filter. Generic parameters (`fn matching<'a, T, P: Fn(&T) -> bool>(items: impl IntoIterator<Item = &'a T>, spec: P)`) keep the pipeline monomorphized with no allocation and no dynamic dispatch. The named-trait form (trait Specification<T> { fn is_satisfied_by(&self, candidate: &T) -> bool; } plus And/Or/Not structs) is warranted when rules are stored in collections, chosen at runtime, sent across threads, or translated into a query; the enum form is warranted when the rule tree must be serialized or rendered - those two are the sibling variants.",
+      "code_sketch": "fn and<'a, T, P, Q>(left: P, right: Q) -> impl Fn(&T) -> bool + 'a\nwhere P: Fn(&T) -> bool + 'a, Q: Fn(&T) -> bool + 'a {\n    move |candidate| left(candidate) && right(candidate)\n}\n\nlet overdue = |i: &Invoice| i.days_past_due >= 30;\nlet collectable = and(overdue, |i: &Invoice| !i.in_collection);\nlet rows: Vec<&Invoice> = invoices.iter().filter(|i| collectable(i)).collect();",
+      "pitfalls": [
+        "Every closure has a unique anonymous type, so rules cannot be stored in a homogeneous collection or named in a struct field without boxing or an enum ('expected closure, found a different closure').",
+        "A closure borrowing captured state ties the rule's lifetime to that data; storing it requires a lifetime parameter or a move closure.",
+        "Option::filter takes a predicate by value rather than composing, so chaining filters deepens nesting instead of building one rule; combine the predicates instead.",
+        "Closures are not comparable or loggable: deduplication, equality and diagnostics need a named type."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/ops/trait.Fn.html",
+        "https://doc.rust-lang.org/stable/std/iter/struct.Filter.html"
+      ]
+    },
+    {
+      "variant_id": "trait-object-composition",
+      "name": "Box<dyn Specification<T>> combinator structs",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "trait-objects"
+      ],
+      "idiom_name": "trait Specification<T> with And/Or/Not structs behind Box<dyn>",
+      "implementation_notes": "For rules chosen at runtime - plugin registries, configuration, vectors of heterogeneous rules - keep the trait: `trait Specification<T> { fn is_satisfied_by(&self, candidate: &T) -> bool; }` with And/Or/Not structs holding children (boxed, or generic parameters when the shape is static) and a blanket `impl<T, F: Fn(&T) -> bool> Specification<T> for F` so closures stand in wherever an owned rule is expected. The boxed form buys nameability, storage and dynamic composition at the cost of a heap allocation per node and one vtable dispatch per evaluation, plus explicit lifetime/Send/Sync bounds when rules borrow or cross threads.",
+      "code_sketch": "pub trait Specification<T> {\n    fn is_satisfied_by(&self, candidate: &T) -> bool;\n}\nimpl<T, F: Fn(&T) -> bool> Specification<T> for F {\n    fn is_satisfied_by(&self, candidate: &T) -> bool { self(candidate) }\n}\n\npub struct And<T>(pub Vec<Box<dyn Specification<T> + Send + Sync>>);\nimpl<T> Specification<T> for And<T> {\n    fn is_satisfied_by(&self, c: &T) -> bool {\n        self.0.iter().all(|s| s.is_satisfied_by(c))\n    }\n}",
+      "pitfalls": [
+        "dyn Specification<T> is unsized: every combinator boxes its children, so a deep rule tree allocates per node - use generic parameters where the shape is known at compile time.",
+        "Trait objects are not Send/Sync by default; a rule set moved to another thread needs the bounds spelled out on every boxed type.",
+        "Borrowing rules need an explicit lifetime on the trait object, and 'static bounds silently exclude them.",
+        "Without the blanket impl for Fn, every closure must be wrapped by hand; the orphan rule also stops other crates from implementing the trait for their own types if the trait is foreign."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/reference/types/trait-object.html",
+        "https://doc.rust-lang.org/std/ops/trait.Fn.html"
+      ]
+    },
+    {
+      "variant_id": "enum-rule-tree",
+      "name": "Enum rule tree evaluated by match",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "enums",
+        "derive"
+      ],
+      "idiom_name": "enum Spec { ... And(Box<Spec>, Box<Spec>), Or(..), Not(..) } with a match evaluator",
+      "implementation_notes": "When rules must be built from data, logged, sent over a wire, or translated into another query language (SQL, an API filter), model the rule as a data enum with And/Or/Not nodes and give it a match-based evaluator. Unlike closures and trait objects, the tree is inspectable and Serialize/Deserialize can be derived, which is exactly what a query translator needs; the price is boilerplate per leaf, a closed set of leaves fixed at compile time, and an evaluator plus every translator that must be kept in sync.",
+      "code_sketch": "#[derive(Debug, Clone, serde::Serialize)]\npub enum Spec {\n    InStock,\n    PriceAtMost(u32),\n    And(Box<Spec>, Box<Spec>),\n    Not(Box<Spec>),\n}\n\nimpl Spec {\n    pub fn is_satisfied_by(&self, p: &Product) -> bool {\n        match self {\n            Spec::InStock => p.in_stock,\n            Spec::PriceAtMost(max) => p.price_cents <= *max,\n            Spec::And(l, r) => l.is_satisfied_by(p) && r.is_satisfied_by(p),\n            Spec::Not(inner) => !inner.is_satisfied_by(p),\n        }\n    }\n}",
+      "pitfalls": [
+        "Every new leaf edits the enum, the evaluator and every translator; exhaustive match makes the compiler find the evaluator but not the SQL renderer, which lives in another crate.",
+        "Boxed children put the tree on the heap and make immutable sharing awkward; an arena plus indices is the usual alternative when the tree is large or traversed often.",
+        "If a translator exists, the rule is defined twice (enum semantics plus SQL semantics) and the two can drift - the pattern's classic double-definition risk in its purest form."
+      ],
+      "sources": [
+        "https://softwarepatternslexicon.com/rust/behavioral-design-patterns-in-rust/specification-pattern-for-complex-criteria/"
+      ]
+    }
+  ],
+  "default_variant": "closure-composition",
+  "version": "1.0",
+  "idiom_name": "Fn(&T) -> bool closures composed in iterator pipelines",
+  "implementation_notes": "Rust's rule is a closure behind the Fn traits: `let overdue = |i: &Invoice| i.days_past_due >= 30;` and composition is either a closure over the parts or a small generic combinator, consumed by Iterator::filter/all/any or Option::filter. Generic parameters (`fn matching<'a, T, P: Fn(&T) -> bool>(items: impl IntoIterator<Item = &'a T>, spec: P)`) keep the pipeline monomorphized with no allocation and no dynamic dispatch. The named-trait form (trait Specification<T> { fn is_satisfied_by(&self, candidate: &T) -> bool; } plus And/Or/Not structs) is warranted when rules are stored in collections, chosen at runtime, sent across threads, or translated into a query; the enum form is warranted when the rule tree must be serialized or rendered - those two are the sibling variants.",
+  "code_sketch": "fn and<'a, T, P, Q>(left: P, right: Q) -> impl Fn(&T) -> bool + 'a\nwhere P: Fn(&T) -> bool + 'a, Q: Fn(&T) -> bool + 'a {\n    move |candidate| left(candidate) && right(candidate)\n}\n\nlet overdue = |i: &Invoice| i.days_past_due >= 30;\nlet collectable = and(overdue, |i: &Invoice| !i.in_collection);\nlet rows: Vec<&Invoice> = invoices.iter().filter(|i| collectable(i)).collect();",
+  "pitfalls": [
+    "Every closure has a unique anonymous type, so rules cannot be stored in a homogeneous collection or named in a struct field without boxing or an enum ('expected closure, found a different closure').",
+    "A closure borrowing captured state ties the rule's lifetime to that data; storing it requires a lifetime parameter or a move closure.",
+    "Option::filter takes a predicate by value rather than composing, so chaining filters deepens nesting instead of building one rule; combine the predicates instead.",
+    "Closures are not comparable or loggable: deduplication, equality and diagnostics need a named type."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/ops/trait.Fn.html",
+    "https://doc.rust-lang.org/stable/std/iter/struct.Filter.html"
+  ]
+}

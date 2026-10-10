@@ -1,0 +1,65 @@
+{
+  "pattern": "watchman",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "asyncio.wait_for / asyncio.timeout around the queue receive (TimeoutError as the absence alarm)",
+  "implementation_notes": "The blocking receive makes the pattern local: awaiting queue.get() inside asyncio.wait_for(...) - or asyncio.timeout() on Python 3.11+, which raises TimeoutError from a context manager - turns 'nothing arrived within the budget' into an ordinary exception, so the monitor needs no scheduled sweep and no last-seen bookkeeping beyond reporting. The arrival path is simply the successful branch, which restarts the budget. In thread/process-based stacks the same role is played by threading.Timer (one-shot, re-armed per arrival) or a monotonic stamp checked by a periodic sweep; and because an in-process watcher dies with the process, the escalation usually reports to something outside it (a metrics registry, a heartbeat ping to an external check service).",
+  "code_sketch": "async def watch(queue: asyncio.Queue[str], budget: float = 60.0) -> None:\n    while True:\n        try:\n            msg = await asyncio.wait_for(queue.get(), timeout=budget)   # 3.11+: async with asyncio.timeout(budget)\n        except asyncio.TimeoutError:               # the same class as builtin TimeoutError from 3.11 on\n            await alert(f\"no messages for {budget}s\")                   # absence == exception\n        else:\n            await handle(msg)                                          # arrival restarts the budget",
+  "pitfalls": [
+    "asyncio.wait_for cancels the awaited operation on timeout: wrapping more than the receive (e.g. receive plus processing) can drop a message that was handed over before cancellation - keep the timeout around queue.get() only.",
+    "Blocking stdlib calls (time.sleep, requests, database drivers) inside the watcher coroutine stall the whole event loop and make the watchman miss other subjects' deadlines; use asyncio primitives or asyncio.to_thread.",
+    "threading.Timer is one-shot: forgetting to re-arm it after each arrival silently disables the watchman with no error at all (a monitor that reports health by being silent) - prefer a monotonic stamp plus one periodic check.",
+    "time.monotonic() must stamp last-seen; time.time() is wall-clock and can move backwards, producing negative silence or alarms that never fire.",
+    "An asyncio task created without a strong reference can be garbage-collected mid-flight: keep the monitor task referenced (or run it under asyncio.TaskGroup) or the watchman disappears silently.",
+    "On Python 3.8-3.10 asyncio.wait_for raises asyncio.TimeoutError, which only became an alias of the builtin TimeoutError in 3.11: an except TimeoutError around the receive lets the timeout escape on older runtimes and kills the monitor task instead of alerting, so except asyncio.TimeoutError is the portable spelling."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://docs.python.org/3/library/asyncio-queue.html",
+    "https://docs.python.org/3/library/asyncio-exceptions.html",
+    "https://docs.python.org/3/library/threading.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "py-asyncio-wait-for",
+      "name": "asyncio timed receive",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "idiom_name": "asyncio.wait_for / asyncio.timeout around the queue receive (TimeoutError as the absence alarm)",
+      "implementation_notes": "The blocking receive makes the pattern local: awaiting queue.get() inside asyncio.wait_for(...) - or asyncio.timeout() on Python 3.11+, which raises TimeoutError from a context manager - turns 'nothing arrived within the budget' into an ordinary exception, so the monitor needs no scheduled sweep and no last-seen bookkeeping beyond reporting. The arrival path is simply the successful branch, which restarts the budget. In thread/process-based stacks the same role is played by threading.Timer (one-shot, re-armed per arrival) or a monotonic stamp checked by a periodic sweep; and because an in-process watcher dies with the process, the escalation usually reports to something outside it (a metrics registry, a heartbeat ping to an external check service).",
+      "code_sketch": "async def watch(queue: asyncio.Queue[str], budget: float = 60.0) -> None:\n    while True:\n        try:\n            msg = await asyncio.wait_for(queue.get(), timeout=budget)   # 3.11+: async with asyncio.timeout(budget)\n        except asyncio.TimeoutError:               # the same class as builtin TimeoutError from 3.11 on\n            await alert(f\"no messages for {budget}s\")                   # absence == exception\n        else:\n            await handle(msg)                                          # arrival restarts the budget",
+      "pitfalls": [
+        "asyncio.wait_for cancels the awaited operation on timeout: wrapping more than the receive (e.g. receive plus processing) can drop a message that was handed over before cancellation - keep the timeout around queue.get() only.",
+        "Blocking stdlib calls (time.sleep, requests, database drivers) inside the watcher coroutine stall the whole event loop and make the watchman miss other subjects' deadlines; use asyncio primitives or asyncio.to_thread.",
+        "threading.Timer is one-shot: forgetting to re-arm it after each arrival silently disables the watchman with no error at all (a monitor that reports health by being silent) - prefer a monotonic stamp plus one periodic check.",
+        "time.monotonic() must stamp last-seen; time.time() is wall-clock and can move backwards, producing negative silence or alarms that never fire.",
+        "An asyncio task created without a strong reference can be garbage-collected mid-flight: keep the monitor task referenced (or run it under asyncio.TaskGroup) or the watchman disappears silently.",
+        "On Python 3.8-3.10 asyncio.wait_for raises asyncio.TimeoutError, which only became an alias of the builtin TimeoutError in 3.11: an except TimeoutError around the receive lets the timeout escape on older runtimes and kills the monitor task instead of alerting, so except asyncio.TimeoutError is the portable spelling."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://docs.python.org/3/library/asyncio-queue.html",
+        "https://docs.python.org/3/library/asyncio-exceptions.html",
+        "https://docs.python.org/3/library/threading.html"
+      ]
+    },
+    {
+      "variant_id": "py-threading-timer",
+      "name": "Threading/process stack with a re-armed one-shot timer",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "threading.Timer re-armed on arrival + time.monotonic() stamp",
+      "implementation_notes": "For consumers that are threads or separate processes (socket servers, Celery workers, os.fork-based daemons): keep a monotonic last-seen stamp behind a lock and either re-arm a threading.Timer on every arrival or let one sweep thread compare stamps. Timer objects are one-shot and daemon threads die at interpreter exit, so the stamp, not the timer, is the durable state.",
+      "code_sketch": "lock = threading.Lock(); last = time.monotonic()\ndef sweep():\n    while running:\n        time.sleep(5)\n        with lock:\n            silent = time.monotonic() - last\n        if silent > budget:\n            alert(subject, silent)",
+      "pitfalls": [
+        "Daemon threads are killed at interpreter exit without running finally blocks, so an alert in flight can be lost exactly during a shutdown that is itself worth alarming about.",
+        "A sweep thread holding the lock while alerting serialises every arrival path behind a slow notifier."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/threading.html"
+      ]
+    }
+  ],
+  "default_variant": "py-asyncio-wait-for",
+  "version": "1.0"
+}

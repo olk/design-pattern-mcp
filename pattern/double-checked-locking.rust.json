@@ -1,0 +1,76 @@
+{
+  "pattern": "double-checked-locking",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "static CELL: OnceLock<T> = OnceLock::new(); CELL.get_or_init(build)",
+  "implementation_notes": "The std answer and the default: a static OnceLock<T> starts empty, get_or_init runs the builder on first call with the synchronisation and memory ordering handled by std, and every caller then receives an immutable &T. The classic structure disappears together with its hazard - the borrow checker only hands out a reference to a fully initialised value, so a partially published object is unrepresentable rather than merely unlikely.",
+  "code_sketch": "use std::sync::OnceLock;\n\nfn index() -> &'static Index {              // no lock on the fast path\n    static INDEX: OnceLock<Index> = OnceLock::new();\n    INDEX.get_or_init(|| Index::build(SOURCE))\n}",
+  "pitfalls": [
+    "A check-then-initialise accessor built on get() (or on a lock-guarded Option) is still the race the pattern is about: get() returns None while another thread initialises, so two builders run and the loser's value is dropped.",
+    "OnceLock is one-shot and cannot be reset - take() needs &mut self - so reloading needs RwLock<Option<T>> or an ArcSwap, and a failed build cannot be retried through the same cell.",
+    "The cell hands out &T only, so post-initialisation mutability must live inside the value (Mutex/RwLock/atomic) and types needing interior mutability pay for it.",
+    "Initialisation happens on the first caller's thread: a slow or panicking builder blocks every other caller (and a panic inside get_or_init leaves the cell unset, so the next caller retries)."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "once-lock",
+      "name": "OnceLock::get_or_init",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "idiom_name": "static CELL: OnceLock<T> = OnceLock::new(); CELL.get_or_init(build)",
+      "implementation_notes": "The std answer and the default: a static OnceLock<T> starts empty, get_or_init runs the builder on first call with the synchronisation and memory ordering handled by std, and every caller then receives an immutable &T. The classic structure disappears together with its hazard - the borrow checker only hands out a reference to a fully initialised value, so a partially published object is unrepresentable rather than merely unlikely.",
+      "code_sketch": "use std::sync::OnceLock;\n\nfn index() -> &'static Index {              // no lock on the fast path\n    static INDEX: OnceLock<Index> = OnceLock::new();\n    INDEX.get_or_init(|| Index::build(SOURCE))\n}",
+      "pitfalls": [
+        "A check-then-initialise accessor built on get() (or on a lock-guarded Option) is still the race the pattern is about: get() returns None while another thread initialises, so two builders run and the loser's value is dropped.",
+        "OnceLock is one-shot and cannot be reset - take() needs &mut self - so reloading needs RwLock<Option<T>> or an ArcSwap, and a failed build cannot be retried through the same cell.",
+        "The cell hands out &T only, so post-initialisation mutability must live inside the value (Mutex/RwLock/atomic) and types needing interior mutability pay for it.",
+        "Initialisation happens on the first caller's thread: a slow or panicking builder blocks every other caller (and a panic inside get_or_init leaves the cell unset, so the next caller retries)."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    },
+    {
+      "variant_id": "lazy-lock",
+      "name": "LazyLock for static values built by a closure",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.80",
+      "idiom_name": "static CONFIG: LazyLock<T> = LazyLock::new(build)",
+      "implementation_notes": "LazyLock (Rust 1.80) is OnceLock plus the closure: the deref of the static runs the builder on first use, which keeps the declaration to one line and removes the accessor function entirely. Prefer it for configuration-like statics that are read directly; prefer OnceLock when the value needs arguments known only at run time or when the initialisation must be fallible.",
+      "code_sketch": "use std::sync::LazyLock;\n\nstatic CONFIG: LazyLock<Config> = LazyLock::new(Config::load);\n\nfn port() -> u16 { CONFIG.port }   // deref initialises once, then it is a read",
+      "pitfalls": [
+        "Deref-ing the static from inside its own initialiser deadlocks (the guard is non-reentrant), so LazyLock must not be used to break a cyclic dependency between statics.",
+        "The initialiser cannot fail: a fallible build needs OnceLock plus a Result payload (or a panic, which poisons nothing here but aborts the work).",
+        "Lazy statics hidden behind Deref make start-up work appear at an arbitrary first use, which is harder to trace than an explicit initialisation point."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html"
+      ]
+    },
+    {
+      "variant_id": "once-call",
+      "name": "Once::call_once with a manually managed cell",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.0",
+      "idiom_name": "static INIT: Once = Once::new(); INIT.call_once(|| { ... })",
+      "implementation_notes": "The low-level form, stable since Rust 1.0 and still the only one when the initialised state is not a single owned value (several interdependent statics, or side-effecting setup such as installing a panic hook). The data itself must then be managed by hand - a static mut behind unsafe, or a wrapper - which is exactly the unsafe code that OnceLock exists to remove; use it for side effects, not for values.",
+      "code_sketch": "use std::sync::Once;\n\nstatic INIT: Once = Once::new();\nstatic mut PORT: u16 = 0;\n\nfn port() -> u16 {\n    INIT.call_once(|| unsafe { PORT = read_port() });\n    unsafe { PORT }   // relies on call_once's happens-before edge\n}",
+      "pitfalls": [
+        "The unsafe cell is only sound because call_once establishes the happens-before edge: reading it outside a call_once/wait pair, or writing it elsewhere, is undefined behaviour.",
+        "A panic inside call_once poisons the Once: every later call panics as well (call_once_force is the escape hatch), so panicking initialisers change the failure mode of the whole process.",
+        "Recursive call_once on the same Once is unspecified (panic or deadlock), which is the low-level analogue of the re-entrancy hazard in the classic pattern."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.Once.html"
+      ],
+      "requires_features": [
+        "unsafe"
+      ]
+    }
+  ],
+  "default_variant": "once-lock",
+  "version": "1.0"
+}

@@ -1,0 +1,179 @@
+{
+  "category": "concurrency-resilience",
+  "name": "lock-striping",
+  "aliases": [
+    "striped locks"
+  ],
+  "intent": "Bound lock contention on keyed shared state by hashing keys onto a small fixed set of locks, so operations on different keys usually proceed in parallel while lock memory stays independent of the number of keys.",
+  "problem": "A single lock guards a large keyed data structure (cache, registry, map) and serializes unrelated operations under concurrent access, capping throughput; the opposite extreme - one lock per key - restores parallelism but keeps a lock object alive for every key, which is prohibitive for millions of entries or a rapidly changing key set. The recurring decision is how to keep per-key mutual exclusion without paying per-key lock cost.",
+  "context": "Shared in-memory state with many hashable keys and high operation rates - caches, session or connection registries, concurrent map implementations, in-memory job stores - guarded by blocking locks. It applies when operations on distinct keys are independent, when the key domain is much larger than the number of threads, and when the structure cannot simply be replaced by a ready-made concurrent container or a lock-free design.",
+  "benefits": [
+    "Throughput grows with the stripe count: unrelated keys normally touch different locks, so one serialization point becomes as many as there are stripes, while lock memory stays O(stripes) instead of O(keys).",
+    "Memory becomes a tuning knob rather than a consequence of the key population: a few dozen to a few hundred stripes cover millions of keys, and weak stripes let unused locks be reclaimed.",
+    "Collisions degrade performance, not correctness: two keys sharing a stripe merely serialize as they would have under a single lock.",
+    "The mapping is deterministic, so equal keys always resolve to the same lock; check-then-act sequences, compute-if-absent operations and other per-key invariants can be kept inside one stripe critical section.",
+    "It composes with other lock flavors and disciplines: stripes may be mutexes, read-write locks or semaphores, and multi-key operations can be made deadlock-free with an ordered bulk acquisition."
+  ],
+  "tradeoffs": [
+    "Unrelated keys can collide onto one stripe; with few stripes the birthday paradox makes collisions far more common than expected (Guava's documentation warns about this for bulkGet), and a skewed hash concentrates load on a single lock.",
+    "Operations spanning several keys must acquire their stripes in a globally consistent order (for example ascending stripe index, as Guava's bulkGet provides); inconsistent order, or locking one stripe twice when two keys collide, creates a stripe-level deadlock that a single lock could never produce.",
+    "Adjacent stripes typically share cache lines, so contention can become cache-line ping-pong rather than lock contention unless the stripes are padded or separately allocated (dashmap pads each shard with CachePadded for exactly this reason).",
+    "The stripe count is fixed at construction, so it is a static tuning decision: too few stripes keep the bottleneck, too many waste memory and add collision-collection work, and resizing usually means rebuilding the structure.",
+    "Striping is still blocking mutual exclusion: it gives no fairness guarantee by itself (Java's ReentrantLock requires an explicit fairness flag), and holding a stripe across slow I/O serializes every key that hashes to it; it also does nothing for lock-free or wait-free requirements.",
+    "The mapping inherits the key's hash contract: mutable keys or unstable hashes move a key between stripes and silently break per-key mutual exclusion.",
+    "Stripe count tuning requires application-specific knowledge: too few stripes leaves a bottleneck, too many wastes memory and can increase cache pressure from more lock objects.",
+    "Dynamic re-striping (changing the stripe count at runtime) is complex and rarely implemented; most systems rebuild the structure if the concurrency target changes significantly."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 8,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Shared keyed state",
+      "responsibility": "The map, registry or per-key resource protected by the stripes; every compound operation on a key must run under that key's stripe."
+    },
+    {
+      "role": "Stripe set",
+      "responsibility": "The bounded, pre-allocated array of locks (mutexes, read-write locks or semaphores) that replaces the single lock."
+    },
+    {
+      "role": "Stripe function",
+      "responsibility": "Deterministic mapping from a key to a stripe (stable hash reduced modulo the stripe count); equal keys must always produce the same stripe."
+    },
+    {
+      "role": "Client operation",
+      "responsibility": "Acquires the stripe(s) covering the keys it touches, performs the critical section and releases them; multi-key operations acquire distinct stripes in a global order."
+    },
+    {
+      "role": "Stripe manager",
+      "responsibility": "Optional library role (Guava Striped, dashmap, ConcurrentDictionary internals) that constructs the stripes, implements the mapping, decides strong versus weak lifetime and offers ordered bulk acquisition."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Concurrent caches and session stores where per-entry locking must not keep a lock object per entry.",
+    "Concurrent map implementations whose buckets or shards replace one table-wide lock with a bounded lock array.",
+    "Registries of per-tenant or per-connection resources (rate limiters, connection pools, file handles) where compound check-then-act operations must be atomic per key.",
+    "Read-heavy keyed data with per-stripe read-write locks, so readers of different keys proceed in parallel (Guava's Striped<ReadWriteLock> flavor).",
+    "Job or status registries where in-memory state transitions for one job must be serialized without serializing unrelated jobs.",
+    "In-memory rate limiting where each counter (per-IP, per-user, per-endpoint) requires an atomic check-and-increment under its own stripe, without the memory overhead of one lock per counter.",
+    "Database connection or thread-pool registries where a check-out/check-in sequence must be atomic per connection handle but connections are pooled across many threads.",
+    "Distributed-system local caches where a partition key (shard) maps to a local in-process cache entry, and multiple goroutines/threads access the same partition concurrently.",
+    "Feature-flag or feature-toggle registries in long-running servers where toggles are read frequently but updated rarely, benefiting from per-flag read-write stripes.",
+    "Pagination or cursor registries where concurrent cursor advancement across multiple workers must be serialized per cursor without blocking unrelated cursor operations.",
+    "Guava's Striped<Lock>, Striped<ReadWriteLock> and Striped<Semaphore> map equal keys to one stripe while bulkGet orders stripes for multi-key locking, making the utility a reusable lock-striping implementation.",
+    "Rust's DashMap shards keys across CachePadded<RwLock<HashMap>> instances and requires a power-of-two shard count, demonstrating padded read-write stripes in a concurrent map.",
+    ".NET's ConcurrentDictionary<TKey,TValue> allocates a lock array from the configured concurrency level and can grow that striped lock array as the table grows; use it when map semantics suffice instead of hand-rolling."
+  ],
+  "avoid_when": [
+    "The keyed state is a plain map and a ready-made concurrent container exists (ConcurrentHashMap, ConcurrentDictionary, sync.Map, TrieMap, dashmap): use it instead of rebuilding striping.",
+    "Contention is provably not the bottleneck (short critical sections, few threads): a single lock, or no explicit locking at all, is simpler.",
+    "The key population is small and long-lived: one lock per key gives full parallelism at the same memory cost as a stripe array.",
+    "Operations routinely span many keys and no global acquisition order can be imposed: striping turns simple serialization into a deadlock hazard; prefer a single lock, a database transaction or a different partition key.",
+    "Hard lock-free or wait-free progress is required: striping is still blocking."
+  ],
+  "language_files": {
+    "generic": "lock-striping.generic.json",
+    "c": "lock-striping.c.json",
+    "cplusplus": "lock-striping.cplusplus.json",
+    "csharp": "lock-striping.csharp.json",
+    "go": "lock-striping.go.json",
+    "java": "lock-striping.java.json",
+    "javascript": "lock-striping.javascript.json",
+    "kotlin": "lock-striping.kotlin.json",
+    "python": "lock-striping.python.json",
+    "ruby": "lock-striping.ruby.json",
+    "rust": "lock-striping.rust.json",
+    "scala": "lock-striping.scala.json",
+    "swift": "lock-striping.swift.json",
+    "typescript": "lock-striping.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "module",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "guardian-object",
+    "lockable-object",
+    "monitor-object",
+    "counting-semaphore",
+    "coarse-grained-lock",
+    "lock-free-queue",
+    "data-locality",
+    "actor"
+  ],
+  "anti_patterns": [
+    "Striping in name only: keeping a single global lock and adding a stripe array that no code path uses, so the bottleneck remains.",
+    "Acquiring stripes in different orders on different code paths, or locking one stripe twice when two keys collide, and then blaming the library for the resulting deadlock.",
+    "Hashing mutable or identity-based state (a changing field, default identity hash) so keys migrate between stripes and per-key invariants silently break.",
+    "Unbounded growth disguised as striping: one lock per key kept forever in a map, which is exactly the memory profile striping exists to avoid.",
+    "Choosing one or two stripes for a heavily contended structure and calling it striping, leaving all threads on one lock with extra indirection."
+  ],
+  "design_principles": [
+    "Divide and conquer contention: replace one contended resource with a bounded set of interchangeable ones.",
+    "Bound the resource by design: choose the number of locks from desired concurrency, never from the number of keys.",
+    "Deterministic mapping as an invariant: equal keys must always map to the same stripe, or per-key mutual exclusion is lost.",
+    "A global acquisition order is mandatory for multi-stripe operations; deadlock freedom must be a property of the protocol, not of luck.",
+    "Encapsulate the mapping: callers name keys, never stripe indices, and the hash/reduction stays inside the component."
+  ],
+  "best_practices": [
+    "Size the stripe count from the expected concurrency (Guava's own example is a small multiple of availableProcessors) and document it as a tuning parameter.",
+    "Pad or separately allocate stripes so they do not share cache lines; a stripe array that fits in one cache line reintroduces the contention it was meant to remove.",
+    "For multi-stripe operations, collect the distinct stripe indices, sort them ascending and acquire in that order; use libraries whose bulk acquisition guarantees the order (Guava bulkGet).",
+    "De-duplicate stripes when two keys collide before locking, and never start a new stripe acquisition inside a stripe critical section unless the ordering rule is kept.",
+    "Keep the key hash stable and independent of mutable state; document that keys must not change while stored.",
+    "Prefer a ready-made concurrent container for plain keyed maps and reserve hand-rolled striping for compound operations on non-map resources.",
+    "Use read-write stripes only when reads dominate; writers and readers on the same stripe exclude each other as usual, and the bookkeeping has a cost.",
+    "Use power-of-two stripe counts so the modulo operation reduces to a cheap bit-mask (hash & (N-1)); this also improves CPU branch prediction compared to arbitrary division.",
+    "Expose the stripe count as a constructor or configuration parameter rather than a hardcoded constant; allow tuning under load without rebuilding the structure.",
+    "Consider weakly-referenced stripes (Guava Striped<Lock>.weak()) when the key space is sparse or keys are frequently evicted, so idle locks are garbage-collected instead of accumulating.",
+    "Prefer RwLock-based stripes (dashmap pattern) for read-heavy workloads; writers still serialize but readers of distinct keys proceed in parallel with minimal coordination.",
+    "Instrument stripe acquisition with timing metrics in production; a hot stripe exposed via p99 latency skew is the clearest signal that the stripe count or hash distribution needs adjustment.",
+    "When using a custom hasher, prefer one with uniform distribution across stripe indices; a skewed hasher concentrates load on one or a few stripes, defeating the striping purpose.",
+    "Avoid storing a stripe count of 1 or 2 in high-concurrency paths; at those counts the overhead of striping is paid with almost none of the benefit, and a single lock would be simpler."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Goetz, Peierls, Bloch, Bowbeer, Holmes & Lea, Java Concurrency in Practice (2006) - lock striping, section 11.4.3 (names the pattern and the ConcurrentHashMap example).",
+    "https://javadoc.io/static/com.google.guava/guava/33.4.0-jre/com/google/common/util/concurrent/Striped.html",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2",
+    "https://docs.rs/dashmap/latest/dashmap/struct.DashMap.html",
+    "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html",
+    "Lea, Doug. java.util.concurrent Javadoc, SynchronizedHashMap / ConcurrentHashMap locking notes (describes why striping beats per-bucket locks at scale).",
+    "https://github.com/google/guava/wiki/StripedExplained - Guava Striped documentation covering lazy/weakly-referenced stripes, power-of-two sizing, and bulk acquisition ordering.",
+    "https://docs.rs/dashmap/latest/src/dashmap/lib.rs.html - DashMap source: default shard count = available parallelism × 4, rounded up to power of two; shards are CachePadded<RwLock<HashMap>>.",
+    "https://github.com/dotnet/docs/blob/main/docs/standard/collections/thread-safe/how-to-add-and-remove-items.md - .NET ConcurrentDictionary thread-safe usage patterns and lock-per-bucket design notes.",
+    "Sadowski, Michał. 'Dissecting the Go sync.Map' (source available in Go repository sync/map_reference_test.go) - double-checked locking pattern for load-or-store operations.",
+    "https://guava.dev/releases/33.5.0-jre/api/docs/com/google/common/util/concurrent/Striped.html - Guava's Striped API defines lock striping, equal-key mapping, strong/weak stripes and ordered bulkGet.",
+    "https://docs.rs/dashmap/latest/src/dashmap/lib.rs.html - DashMap source shows CachePadded<RwLock<HashMap>> shards and power-of-two shard sizing.",
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html - Java's concurrent map documents non-locking retrievals and high expected concurrency for updates without a table-wide lock.",
+    "https://github.com/dotnet/runtime/blob/a70005f4d89e03622b4dd3bea058f102e60702af/src/libraries/System.Collections.Concurrent/src/System/Collections/Concurrent/ConcurrentDictionary.cs - .NET source shows the dictionary's striped lock array, concurrency-level sizing and optional lock-array growth.",
+    "https://github.com/google/guava/issues/2653 - Guava issue documents deadlock from assuming distinct keys map to distinct stripes and recommends ordered bulkGet when all locks are known."
+  ],
+  "related_patterns_notes": {
+    "read-copy-update": "read-copy-update",
+    "sharding": "sharding",
+    "fine-grained-lock": "fine-grained-lock"
+  }
+}

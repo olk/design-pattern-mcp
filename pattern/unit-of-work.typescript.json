@@ -1,0 +1,75 @@
+{
+  "pattern": "unit-of-work",
+  "language": "typescript",
+  "support": "idiomatic",
+  "idiom_name": "one ORM transaction per business operation (dataSource.transaction / db.transaction / trx)",
+  "implementation_notes": "TypeScript's typed persistence stacks stop at the boundary: TypeORM gives dataSource.transaction(async em => ...) or a QueryRunner with startTransaction/commitTransaction/rollbackTransaction and warns that every operation must use the transactional EntityManager rather than the global one; Prisma gives db.transaction(async tx => ...) which commits when the callback returns and rolls back when it throws; Knex hands the callback a promise-aware trx. The idiomatic unit of work is therefore the transaction callback plus an explicit write set - the types make the write set checkable, but nothing tracks changes for you. MikroORM is the exception that ships the classic structure (UnitOfWork with identity map and snapshot diffing plus em.flush()), and TypeORM's QueryRunner is the low-level handle when you want manual control of the boundary.",
+  "code_sketch": "await dataSource.transaction(async (em: EntityManager) => {   // one unit of work\n  const customer = await em.findOneOrFail(Customer, { where: { id } });\n  customer.name = name;                       // dirty in memory only\n  await em.save(customer);                    // written through the transaction\n  await em.save(Audit, { customerId: id });   // use em, never the global manager\n});                                           // commit on return, rollback on throw",
+  "pitfalls": [
+    "Using the global EntityManager inside the callback escapes the transaction - the TypeORM docs call this the single most important restriction.",
+    "Helper functions must accept the transactional manager as a parameter, or their writes commit on a separate connection.",
+    "Prisma does not nest transactions: an inner db.transaction is an independent transaction the outer one cannot roll back, so pass tx down instead.",
+    "Prisma 8 exposes no isolationLevel or timeout options; set them yourself as the first statement of the callback if you need them."
+  ],
+  "sources": [
+    "https://typeorm.io/transactions",
+    "https://www.prisma.io/docs/orm/fundamentals/transactions",
+    "https://mikro-orm.io/docs/unit-of-work"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "transaction-scoped-write-set",
+      "name": "ORM transaction callback + explicit write set",
+      "paradigm": "functional",
+      "min_standard": "ES2017",
+      "idiom_name": "one ORM transaction per business operation (dataSource.transaction / db.transaction / trx)",
+      "implementation_notes": "TypeScript's typed persistence stacks stop at the boundary: TypeORM gives dataSource.transaction(async em => ...) or a QueryRunner with startTransaction/commitTransaction/rollbackTransaction and warns that every operation must use the transactional EntityManager rather than the global one; Prisma gives db.transaction(async tx => ...) which commits when the callback returns and rolls back when it throws; Knex hands the callback a promise-aware trx. The idiomatic unit of work is therefore the transaction callback plus an explicit write set - the types make the write set checkable, but nothing tracks changes for you. MikroORM is the exception that ships the classic structure (UnitOfWork with identity map and snapshot diffing plus em.flush()), and TypeORM's QueryRunner is the low-level handle when you want manual control of the boundary.",
+      "code_sketch": "await dataSource.transaction(async (em: EntityManager) => {   // one unit of work\n  const customer = await em.findOneOrFail(Customer, { where: { id } });\n  customer.name = name;                       // dirty in memory only\n  await em.save(customer);                    // written through the transaction\n  await em.save(Audit, { customerId: id });   // use em, never the global manager\n});                                           // commit on return, rollback on throw",
+      "pitfalls": [
+        "Using the global EntityManager inside the callback escapes the transaction - the TypeORM docs call this the single most important restriction.",
+        "Helper functions must accept the transactional manager as a parameter, or their writes commit on a separate connection.",
+        "Prisma does not nest transactions: an inner db.transaction is an independent transaction the outer one cannot roll back, so pass tx down instead.",
+        "Prisma 8 exposes no isolationLevel or timeout options; set them yourself as the first statement of the callback if you need them."
+      ],
+      "sources": [
+        "https://typeorm.io/transactions",
+        "https://www.prisma.io/docs/orm/fundamentals/transactions",
+        "https://mikro-orm.io/docs/unit-of-work"
+      ]
+    },
+    {
+      "variant_id": "typeorm-query-runner",
+      "name": "TypeORM QueryRunner with manual start/commit/rollback",
+      "paradigm": "oo",
+      "min_standard": "ES2017",
+      "idiom_name": "dataSource.createQueryRunner() + startTransaction/commitTransaction/release",
+      "implementation_notes": "When the boundary must be controlled explicitly - several service methods participating in one transaction, or statements that must run outside the repository API - TypeORM's QueryRunner owns a single connection and exposes startTransaction, commitTransaction, rollbackTransaction and release, with queryRunner.manager as the transactional EntityManager. The write set is still application code; the QueryRunner only guarantees that every statement runs on the same connection inside the transaction.",
+      "code_sketch": "const qr = dataSource.createQueryRunner();\nawait qr.connect();\nawait qr.startTransaction();\ntry {\n  await qr.manager.save(customer);          // transactional EntityManager\n  await qr.manager.save(Audit, { customerId: id });\n  await qr.commitTransaction();\n} catch (e) {\n  await qr.rollbackTransaction(); throw e;\n} finally {\n  await qr.release();                       // never leak the connection\n}",
+      "pitfalls": [
+        "A QueryRunner that is not released leaks a pooled connection and eventually stalls the pool under load.",
+        "Mixing dataSource.manager calls into a QueryRunner transaction commits them outside it, exactly like the global-manager mistake."
+      ],
+      "sources": [
+        "https://typeorm.io/transactions"
+      ]
+    },
+    {
+      "variant_id": "mikro-orm-unit-of-work",
+      "name": "MikroORM UnitOfWork with identity map and flush()",
+      "paradigm": "oo",
+      "min_standard": "ES2017",
+      "idiom_name": "EntityManager + UnitOfWork: persist() then flush()",
+      "implementation_notes": "MikroORM implements the classic structure in TypeScript: the UnitOfWork keeps an identity map and a snapshot of every loaded entity, flush() diffs the snapshots and queues INSERT/UPDATE/DELETE for the changed columns, and em.transactional(cb) defines the boundary around one or more flushes. Choose it when deferred writes and dirty tracking are wanted in a typed codebase; the cost is snapshot memory per loaded entity and a flush-mode setting that must be understood.",
+      "code_sketch": "const user = await em.findOneOrFail(User, id);   // identity map hit\nuser.email = \"new@example.com\";                  // diffed at flush\nem.persist(new Audit({ userId: id }));\nawait em.flush();                                // one transaction, changed columns only\nawait em.transactional(async (em) => { /* wider unit of work */ });",
+      "pitfalls": [
+        "FlushMode.ALWAYS writes before every query, so intermediate states reach the database and a later rollback no longer restores the earlier picture.",
+        "Long-lived EntityManagers accumulate identity-map entries and snapshots; fork the EntityManager per request."
+      ],
+      "sources": [
+        "https://mikro-orm.io/docs/unit-of-work"
+      ]
+    }
+  ],
+  "default_variant": "transaction-scoped-write-set"
+}

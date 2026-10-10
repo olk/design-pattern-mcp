@@ -1,0 +1,85 @@
+{
+  "pattern": "cancellation-token",
+  "language": "scala",
+  "support": "library",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "cats-effect-fiber",
+      "name": "cats-effect fiber cancelation",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "cats-effect"
+      ],
+      "idiom_name": "Fiber#cancel with uncancelable/poll and Outcome.Canceled",
+      "implementation_notes": "In cats-effect the token is the fiber handle: Fiber#cancel interrupts the fiber, the MonadCancel instance makes cancelation a distinct termination state (Outcome.Canceled), bracket/guarantee finalizers always run, and uncancelable with its poll function delimits regions where cancelation is deferred so resource acquisition and release stay atomic. Canceling a fiber is unconditional - it cannot be recovered, only suppressed inside an uncancelable region - and it lands at effect boundaries, so long pure computations need explicit IO.cede (or IO.async checkpoints) to stay responsive. This replaces the classic token object with the runtime's own interrupt status, at the price of doing concurrency inside the effect system.",
+      "code_sketch": "val fiber = (for {\n  _ <- IO.println(\"working\")\n  _ <- IO.never\n} yield ()).onCancel(IO.println(\"cancelled\"))\n             .start\n\n// later\n_ <- fiber.cancel          // runs finalizers and waits for the unwinding",
+      "pitfalls": [
+        "uncancelable regions that never end block cancelation: Fiber#cancel waits for finalizers, and an uncancelable wait can hang both the fiber and the canceller - keep such regions small and always poll the blocking step.",
+        "Cancelation is not an error: catching Throwable or using handleError does not stop it, and code that treats Outcome.Canceled as a failure reports false incidents - handle it as a normal outcome.",
+        "Finalizers run uncancelably but must be idempotent and short; a finalizer that blocks on an external system or awaits forever turns a cancel into a hang.",
+        "Cancelation only lands at effect boundaries: a long pure CPU loop inside one IO does not observe it without IO.cede."
+      ],
+      "sources": [
+        "https://typelevel.org/cats-effect/docs/typeclasses/monadcancel"
+      ]
+    },
+    {
+      "variant_id": "zio-fiber-interrupt",
+      "name": "ZIO fiber interruption",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "ZIO"
+      ],
+      "idiom_name": "Fiber#interrupt with uninterruptible regions and ensuring/onInterrupt",
+      "implementation_notes": "ZIO delivers interruption asynchronously at safe points: Fiber#interrupt asks the target fiber to stop and returns only after every finalizer has run, uninterruptible (or interruptibleMask) protects critical regions with deferred interrupts that fire when the region ends, and ZIO#ensuring/onExit/onInterrupt run cleanup uncancelably. Structured by default, a parent's completion or interruption interrupts its forked children, and parallel combinators (zipPar, race, timeout) interrupt the loser, so interruption is a normal part of composition rather than an error path. Use it where the effect system already owns the concurrency; it is the same contract as cats-effect with different names.",
+      "code_sketch": "val fiber = (for {\n  _ <- ZIO.sleep(1.minute)\n} yield ()).onInterrupt(ZIO.debug(\"interrupted\"))\n             .fork\n\n// later: interrupt and wait for finalizers\nfiber.interrupt",
+      "pitfalls": [
+        "Interruption is recorded, not discarded, inside uninterruptible regions: if the region never ends the interrupt never fires, and ZIO#timeout cannot bound it either - keep such regions short.",
+        "Interruption is not a typed error, so catchAll never sees it and code that logs only failures misses the common case where a sibling's failure interrupted the healthy branch of a race.",
+        "Fiber#interrupt can appear to hang because it waits for finalizers; use interruptFork for fire-and-forget interruption or disconnect when the cleanup itself must not be awaited.",
+        "Finalizers must be short and non-blocking - they run uncancelably, so a slow finalizer delays every interrupt that touches the fiber."
+      ],
+      "sources": [
+        "https://zio.dev/reference/interruption/"
+      ]
+    },
+    {
+      "variant_id": "jvm-interrupt-bridge",
+      "name": "JVM interrupt bridge outside an effect system",
+      "paradigm": "oo",
+      "min_standard": "Scala2.12",
+      "requires_features": [
+        "java.lang.Thread",
+        "interruptible blocking calls"
+      ],
+      "idiom_name": "Thread.interrupt + InterruptedException on the JVM",
+      "implementation_notes": "Plain Scala has no cancellation of its own - scala.concurrent.Future is not cancellable at all - so code outside an effect system falls back to the JVM mechanism: the interrupt status flag and InterruptedException from blocking methods, with the same obligations as Java (poll Thread.interrupted()/isInterrupted(), restore the flag when catching, never swallow the exception). Futures can be left to complete while their result is discarded, but the work itself continues, which is exactly the gap the effect-system variants close. Use this bridge only in legacy or library code that cannot adopt cats-effect or ZIO.",
+      "code_sketch": "val worker = new Thread(() => {\n  try {\n    while (!Thread.currentThread.isInterrupted) {   // safe point\n      queue.take()                                  // throws InterruptedException\n    }\n  } catch {\n    case _: InterruptedException =>\n      Thread.currentThread.interrupt()              // preserve the request\n  }\n})\nworker.start()\nworker.interrupt()                                  // request",
+      "pitfalls": [
+        "scala.concurrent.Future cannot be cancelled: cancelling that abstraction is impossible, and the closest honest options are a custom Promise-backed token or an effect system - do not report a discarded Future as cancelled work.",
+        "Swallowing InterruptedException without restoring the flag loses the request for the enclosing layer, which is a classic bug when mixing legacy libraries with executor code.",
+        "Work in uninterruptible sections (native I/O, uninterruptible locks) cannot be stopped; isolate it or add timeouts.",
+        "After interrupt() the thread may still be unwinding: join before releasing resources it may still touch."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/essential/concurrency/interrupt.html"
+      ]
+    }
+  ],
+  "default_variant": "cats-effect-fiber",
+  "idiom_name": "Fiber#cancel with uncancelable/poll and Outcome.Canceled",
+  "implementation_notes": "In cats-effect the token is the fiber handle: Fiber#cancel interrupts the fiber, the MonadCancel instance makes cancelation a distinct termination state (Outcome.Canceled), bracket/guarantee finalizers always run, and uncancelable with its poll function delimits regions where cancelation is deferred so resource acquisition and release stay atomic. Canceling a fiber is unconditional - it cannot be recovered, only suppressed inside an uncancelable region - and it lands at effect boundaries, so long pure computations need explicit IO.cede (or IO.async checkpoints) to stay responsive. This replaces the classic token object with the runtime's own interrupt status, at the price of doing concurrency inside the effect system.",
+  "code_sketch": "val fiber = (for {\n  _ <- IO.println(\"working\")\n  _ <- IO.never\n} yield ()).onCancel(IO.println(\"cancelled\"))\n             .start\n\n// later\n_ <- fiber.cancel          // runs finalizers and waits for the unwinding",
+  "pitfalls": [
+    "uncancelable regions that never end block cancelation: Fiber#cancel waits for finalizers, and an uncancelable wait can hang both the fiber and the canceller - keep such regions small and always poll the blocking step.",
+    "Cancelation is not an error: catching Throwable or using handleError does not stop it, and code that treats Outcome.Canceled as a failure reports false incidents - handle it as a normal outcome.",
+    "Finalizers run uncancelably but must be idempotent and short; a finalizer that blocks on an external system or awaits forever turns a cancel into a hang.",
+    "Cancelation only lands at effect boundaries: a long pure CPU loop inside one IO does not observe it without IO.cede."
+  ],
+  "sources": [
+    "https://typelevel.org/cats-effect/docs/typeclasses/monadcancel"
+  ]
+}

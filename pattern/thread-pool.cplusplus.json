@@ -1,0 +1,73 @@
+{
+  "pattern": "thread-pool",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "boost::asio::thread_pool with post()/join()",
+  "implementation_notes": "Boost.Asio supplies the pattern as a first-class class: thread_pool pool(n) starts n worker threads inside an execution_context, boost::asio::post(pool, fn) enqueues a task without blocking, and pool.join() drains and joins. There is no queue and no condition variable to write (or get wrong), tasks are ordinary callables, and the pool's executor can also be handed to I/O objects so completion handlers share the same workers. Prefer it when Boost is already a dependency; for data-parallel number crunching TBB or the C++17 parallel algorithms are the better fit, and neither replaces a pool that must bound blocking work.",
+  "code_sketch": "boost::asio::thread_pool pool(4);              // 4 worker threads\nboost::asio::post(pool, [] { handle(job); });  // enqueue a task, returns at once\npool.join();                                   // drain the queue, then join workers",
+  "pitfalls": [
+    "Posting a task that blocks while waiting for another task of the same pool depletes the workers; chain with post() from the completion instead of blocking.",
+    "join() or wait() called from a pool thread deadlocks; stop() is the cooperative exit and does not cancel work that is already running.",
+    "The pool's task queue is unbounded: overload is invisible unless the submitting side bounds concurrency itself."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/thread_pool.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "boost-asio-thread-pool",
+      "name": "Boost.Asio thread_pool",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "boost::asio::thread_pool with post()/join()",
+      "implementation_notes": "Boost.Asio supplies the pattern as a first-class class: thread_pool pool(n) starts n worker threads inside an execution_context, boost::asio::post(pool, fn) enqueues a task without blocking, and pool.join() drains and joins. There is no queue and no condition variable to write (or get wrong), tasks are ordinary callables, and the pool's executor can also be handed to I/O objects so completion handlers share the same workers. Prefer it when Boost is already a dependency; for data-parallel number crunching TBB or the C++17 parallel algorithms are the better fit, and neither replaces a pool that must bound blocking work.",
+      "code_sketch": "boost::asio::thread_pool pool(4);              // 4 worker threads\nboost::asio::post(pool, [] { handle(job); });  // enqueue a task, returns at once\npool.join();                                   // drain the queue, then join workers",
+      "pitfalls": [
+        "Posting a task that blocks while waiting for another task of the same pool depletes the workers; chain with post() from the completion instead of blocking.",
+        "join() or wait() called from a pool thread deadlocks; stop() is the cooperative exit and does not cancel work that is already running.",
+        "The pool's task queue is unbounded: overload is invisible unless the submitting side bounds concurrency itself."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/thread_pool.html"
+      ]
+    },
+    {
+      "variant_id": "std-thread-queue",
+      "name": "Hand-rolled std::thread pool with condition variable",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::vector<std::thread> + std::queue + mutex/condition_variable",
+      "implementation_notes": "The classic structure written directly on the standard library: N std::thread objects run a loop that locks a std::mutex, waits on a std::condition_variable while the std::queue is empty, moves out a std::function<void()> and runs it. The condition variable plus predicate replaces the busy-wait that would otherwise idle-spin the workers, and a stop flag plus notify_all is the shutdown protocol. Keep this form when third-party dependencies are unacceptable or the queue policy must be custom (priority, LIFO, work stealing); if the need is only 'run these elements in parallel', the parallel algorithms are less code.",
+      "code_sketch": "std::mutex m; std::condition_variable cv; std::queue<Task> q; bool stop = false;\nfor (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i)\n    workers.emplace_back([&] {\n        for (;;) {\n            Task t;\n            { std::unique_lock lk(m);\n              cv.wait(lk, [&] { return stop || !q.empty(); });\n              if (q.empty()) return;\n              t = std::move(q.front()); q.pop(); }\n            t();\n        }\n    });\n{ std::lock_guard lk(m); q.push(std::move(task)); }\ncv.notify_one();",
+      "pitfalls": [
+        "cv.wait must always be called with a predicate: notify_one without holding the mutex can race the wait and lose the wakeup.",
+        "Capturing the pool by reference in worker lambdas ties its lifetime to a local scope; own the state in the pool object and join in the destructor.",
+        "A naive stop flag exits workers while tasks are still queued: termination and draining are separate steps."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/thread"
+      ]
+    },
+    {
+      "variant_id": "cpp20-jthread-pool",
+      "name": "C++20 std::jthread pool with stop tokens",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "stop_token"
+      ],
+      "idiom_name": "std::jthread workers with std::stop_token cooperative cancellation",
+      "implementation_notes": "C++20's std::jthread auto-joins on destruction and carries a std::stop_token, so workers can be asked to stop cooperatively: the loop checks the token in the wait predicate and returns, and the pool destructor joins for you (RAII teardown). Use it where the toolchain is C++20 and clean, exception-safe shutdown matters more than library uniformity; there is still no built-in task queue, so the queue and its bounds remain hand-written, and a stop request only stops work that notices it.",
+      "code_sketch": "class pool {\n  std::vector<std::jthread> workers_;\n  std::mutex m_; std::condition_variable cv_; std::queue<Task> q_;\npublic:\n  explicit pool(unsigned n) { for (unsigned i = 0; i < n; ++i)\n      workers_.emplace_back([this](std::stop_token st) { loop(st); }); }\n  void stop() { { std::lock_guard lk(m_); stop_ = true; } cv_.notify_all(); }\n  // ~pool(): each jthread is asked to stop and joined automatically\n};",
+      "pitfalls": [
+        "A stop request is cooperative only: a task that never returns still blocks shutdown, so the queue must also be drained or poison-pilled.",
+        "request_stop does not wake a worker parked in a plain condition_variable wait unless the wait uses the stop_token overload."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    }
+  ],
+  "default_variant": "boost-asio-thread-pool",
+  "version": "1.0"
+}

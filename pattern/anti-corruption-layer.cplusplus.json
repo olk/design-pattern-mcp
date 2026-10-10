@@ -1,0 +1,71 @@
+{
+  "pattern": "anti-corruption-layer",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "abstract port interface + adapter class; vendor headers only in the .cpp",
+  "implementation_notes": "The domain declares a pure abstract port (virtual ~OrderPort() = default; virtual Receipt place_order(const Order&) = 0;) and the layer supplies an adapter whose .cpp is the only file including the vendor header; models cross the seam as local aggregates converted by free functions (Order to_domain(const legacy::order&)). std::unique_ptr owns the adapter and the vendor library is linked into the layer target alone. What replaces the classic facade/translator pair is the port plus these conversion functions; the fuller class hierarchy is still justified when several adapters implement one port or when the boundary must be injected for tests.",
+  "code_sketch": "// acl/port.hpp - domain-owned; no vendor type appears here\nstruct OrderPort {\n    virtual ~OrderPort() = default;\n    virtual Receipt place_order(const Order& o) = 0;\n};\n\n// acl/legacy_order_adapter.cpp - the only TU including legacy.hpp\nReceipt LegacyOrderAdapter::place_order(const Order& o) {\n    legacy::order dto = to_legacy(o);        // free conversion function\n    auto r = client_.submit(dto);            // gateway: transport + retry\n    return to_receipt(r);                    // back to local types\n}",
+  "pitfalls": [
+    "A vendor type in the port header (by value, or a forward-declared pointer handed to callers) silently re-couples the domain and defeats the firewall; keep vendor includes in the .cpp.",
+    "The adapter must own or outlive the vendor client: a raw pointer to a stack-allocated client is a classic dangling reference.",
+    "Vendor exceptions crossing the port break the local error vocabulary; catch at the seam and translate."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/abstract_class"
+  ],
+  "variants": [
+    {
+      "variant_id": "port-interfaces-and-dtos",
+      "name": "Abstract port interface + adapter in a translation unit",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "abstract port interface + adapter class; vendor headers only in the .cpp",
+      "implementation_notes": "The domain declares a pure abstract port (virtual ~OrderPort() = default; virtual Receipt place_order(const Order&) = 0;) and the layer supplies an adapter whose .cpp is the only file including the vendor header; models cross the seam as local aggregates converted by free functions (Order to_domain(const legacy::order&)). std::unique_ptr owns the adapter and the vendor library is linked into the layer target alone. What replaces the classic facade/translator pair is the port plus these conversion functions; the fuller class hierarchy is still justified when several adapters implement one port or when the boundary must be injected for tests.",
+      "code_sketch": "// acl/port.hpp - domain-owned; no vendor type appears here\nstruct OrderPort {\n    virtual ~OrderPort() = default;\n    virtual Receipt place_order(const Order& o) = 0;\n};\n\n// acl/legacy_order_adapter.cpp - the only TU including legacy.hpp\nReceipt LegacyOrderAdapter::place_order(const Order& o) {\n    legacy::order dto = to_legacy(o);        // free conversion function\n    auto r = client_.submit(dto);            // gateway: transport + retry\n    return to_receipt(r);                    // back to local types\n}",
+      "pitfalls": [
+        "A vendor type in the port header (by value, or a forward-declared pointer handed to callers) silently re-couples the domain and defeats the firewall; keep vendor includes in the .cpp.",
+        "The adapter must own or outlive the vendor client: a raw pointer to a stack-allocated client is a classic dangling reference.",
+        "Vendor exceptions crossing the port break the local error vocabulary; catch at the seam and translate."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/abstract_class"
+      ]
+    },
+    {
+      "variant_id": "pimpl-compilation-firewall",
+      "name": "Pimpl compilation firewall (vendor headers hidden entirely)",
+      "paradigm": "oo",
+      "min_standard": "C++98",
+      "idiom_name": "one boundary class with pImpl; vendor headers live in the .cpp",
+      "implementation_notes": "When the upstream ships heavy, macro-laden or ABI-fragile headers, the whole layer collapses into one class with a pimpl: the public header declares only local types and a private struct impl*, while the .cpp includes the vendor headers, owns the vendor client and does both translation and transport. This is the classic C++ boundary-as-compilation-firewall form - it also keeps vendor macros and ABI out of your build - and it is justified precisely when header hygiene matters more than role separation. Because the class hides its implementation, tests substitute it through the port interface the class implements.",
+      "code_sketch": "// acl/legacy_acl.hpp - vendor headers are never included here\nclass LegacyAcl : public OrderPort {\npublic:\n    explicit LegacyAcl(const std::string& endpoint);\n    ~LegacyAcl();\n    Receipt place_order(const Order& o);\nprivate:\n    struct impl;                 // defined in the .cpp, holds the vendor client\n    impl* self_;                 // C++98 floor: raw pointer (unique_ptr from C++11)\n};",
+      "pitfalls": [
+        "A raw impl* means hand-written destructor, copy constructor and assignment operator (or deleted copies) - otherwise double frees and shallow copies appear.",
+        "The pimpl hides vendor types but not vendor behaviour: error codes, retries and units still have to be translated explicitly inside the .cpp.",
+        "One class doing translation, transport and retry grows unwieldy; split translator functions out of the .cpp once the mapping gets large."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/pimpl"
+      ]
+    },
+    {
+      "variant_id": "functional-mappers",
+      "name": "Free mapping functions with injected translators (no class hierarchy)",
+      "paradigm": "functional",
+      "min_standard": "C++11",
+      "idiom_name": "pure to_legacy/to_domain functions + std::function injection",
+      "implementation_notes": "When the boundary is a handful of small conversions, skip the port/adapter classes: write a pure function per upstream operation (Receipt place_order(const Order&, const Submit&)) that translates, calls and translates back, and inject as std::function only what genuinely varies (the client call, the clock, the retry policy). This keeps the layer testable with lambdas and makes each translation visible in one place; the class-based port is still justified when several adapters implement one contract or callers need a stable injectable type.",
+      "code_sketch": "using Submit = std::function<legacy::response(const legacy::order&)>;\n\nReceipt place_order(const Order& o, const Submit& submit) {\n    auto dto = to_legacy(o);                  // pure translation\n    auto r   = submit(dto);                   // injected gateway call\n    return to_receipt(r);                     // pure translation back\n}\n// wiring: place_order(order, [&](const auto& d) { return client.submit(d); });",
+      "pitfalls": [
+        "std::function copies and indirects on every call and hides the concrete type in diagnostics; template the mapper on the callable in hot paths.",
+        "A stored std::function capturing by reference dangles once the client it captured is gone - the failure surfaces far from the assignment.",
+        "Without a named port type callers can pass any callable, so the contract drifts; document or wrap the signature once more than one call site exists."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/functional/function"
+      ]
+    }
+  ],
+  "default_variant": "port-interfaces-and-dtos",
+  "version": "1.0"
+}

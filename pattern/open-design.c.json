@@ -1,0 +1,54 @@
+{
+  "pattern": "open-design",
+  "language": "c",
+  "support": "library",
+  "idiom_name": "OpenSSL EVP_CIPHER API: EVP_aes_256_gcm",
+  "implementation_notes": "C has no cryptography in its standard library, so the realization is a library choice made once and kept: link a dominant, publicly specified implementation - OpenSSL's EVP interfaces, or libsodium's high-level AEAD API - and treat the algorithm names (\"AES-256-GCM\") as the mechanism. What replaces the classic \"secret scheme\" is the documented primitive: the code is reviewable, the algorithm is published with test vectors, and the only secret passed around is the key buffer, whose lifetime and wipe the program must own explicitly. Hand-rolled encipherment - XOR loops, a private byte permutation, a \"randomized\" algorithm hidden in the source - is the anti-pattern; if OpenSSL is too large or FIPS/provider configuration is not needed, libsodium is the smaller, misuse-resistant answer.",
+  "code_sketch": "#include <openssl/evp.h>\nunsigned char key[32], iv[12];                   /* only these are secret */\nEVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();\nEVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);\nEVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof iv, NULL);\nEVP_EncryptInit_ex(ctx, NULL, NULL, key, iv);    /* public algorithm, secret key */\n/* ... EVP_EncryptUpdate / EVP_EncryptFinal_ex + GET_TAG ... */",
+  "pitfalls": [
+    "Hand-rolled or \"optimized\" encipherment in C is the archetypal violation: a private algorithm is not reviewed, has no test vectors, and its readability is exactly what the principle demands - the fix is a library call, not cleverness.",
+    "Secrets embedded in the artifact (a static key array, a string constant, a shipped configuration file) make the design and the key one object; extracting the binary or the repository defeats everything (CWE-321).",
+    "Key material in C is just a buffer: uninitialized memory, copies on the stack and a missing OPENSSL_cleanse leave the only secret scattered through the process image.",
+    "Relying on pointer or obfuscation tricks (\"the address is hidden\", \"the string is split\") as a control is obscurity carrying the design."
+  ],
+  "sources": [
+    "https://docs.openssl.org/3.0/man7/EVP_CIPHER-AES/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "openssl-evp",
+      "name": "OpenSSL EVP (AES-GCM via the default/FIPS provider)",
+      "paradigm": "procedural",
+      "idiom_name": "OpenSSL EVP_CIPHER API: EVP_aes_256_gcm",
+      "implementation_notes": "C has no cryptography in its standard library, so the realization is a library choice made once and kept: link a dominant, publicly specified implementation - OpenSSL's EVP interfaces, or libsodium's high-level AEAD API - and treat the algorithm names (\"AES-256-GCM\") as the mechanism. What replaces the classic \"secret scheme\" is the documented primitive: the code is reviewable, the algorithm is published with test vectors, and the only secret passed around is the key buffer, whose lifetime and wipe the program must own explicitly. Hand-rolled encipherment - XOR loops, a private byte permutation, a \"randomized\" algorithm hidden in the source - is the anti-pattern; if OpenSSL is too large or FIPS/provider configuration is not needed, libsodium is the smaller, misuse-resistant answer.",
+      "code_sketch": "#include <openssl/evp.h>\nunsigned char key[32], iv[12];                   /* only these are secret */\nEVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();\nEVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);\nEVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof iv, NULL);\nEVP_EncryptInit_ex(ctx, NULL, NULL, key, iv);    /* public algorithm, secret key */\n/* ... EVP_EncryptUpdate / EVP_EncryptFinal_ex + GET_TAG ... */",
+      "pitfalls": [
+        "Hand-rolled or \"optimized\" encipherment in C is the archetypal violation: a private algorithm is not reviewed, has no test vectors, and its readability is exactly what the principle demands - the fix is a library call, not cleverness.",
+        "Secrets embedded in the artifact (a static key array, a string constant, a shipped configuration file) make the design and the key one object; extracting the binary or the repository defeats everything (CWE-321).",
+        "Key material in C is just a buffer: uninitialized memory, copies on the stack and a missing OPENSSL_cleanse leave the only secret scattered through the process image.",
+        "Relying on pointer or obfuscation tricks (\"the address is hidden\", \"the string is split\") as a control is obscurity carrying the design."
+      ],
+      "sources": [
+        "https://docs.openssl.org/3.0/man7/EVP_CIPHER-AES/"
+      ]
+    },
+    {
+      "variant_id": "libsodium-aead",
+      "name": "libsodium high-level AEAD (misuse-resistant defaults)",
+      "paradigm": "procedural",
+      "idiom_name": "libsodium crypto_aead_* / crypto_secretbox with randombytes",
+      "implementation_notes": "libsodium is the opinionated alternative: its high-level APIs choose the construction for you (crypto_secretbox, or crypto_aead_aes256gcm_* when AES-GCM is required), generate keys with the AEAD's keygen helpers and randombytes, and its own documentation warns that raw AES-GCM is easy to misuse (nonce reuse, roughly 350 GB per key) and recommends AEGIS-256 or crypto_secretbox instead. Choose it when you want conservative defaults and a smaller dependency and do not need the FIPS provider or TLS; the mechanism stays public and the key stays the only secret either way.",
+      "code_sketch": "#include <sodium.h>\nunsigned char key[crypto_aead_aes256gcm_KEYBYTES];\nunsigned char nonce[crypto_aead_aes256gcm_NPUBBYTES];\nunsigned char ct[MESSAGE_LEN + crypto_aead_aes256gcm_ABYTES];\nunsigned long long ct_len;\nsodium_init();                                   /* check the result */\nif (crypto_aead_aes256gcm_is_available() == 0) abort();\ncrypto_aead_aes256gcm_keygen(key);               /* secret */\nrandombytes_buf(nonce, sizeof nonce);            /* public, unique per message */\ncrypto_aead_aes256gcm_encrypt(ct, &ct_len, m, MESSAGE_LEN, ad, ad_len, NULL, nonce, key);",
+      "pitfalls": [
+        "libsodium's AES-GCM is hardware-accelerated only (AES-NI or ARM crypto); on other targets the docs say to use ChaCha20-Poly1305 rather than a software fallback.",
+        "The public nonce is as critical as the key: reusing a (key, nonce) pair destroys GCM completely, so nonces come from an atomic counter or randombytes and are tracked per key.",
+        "sodium_init() must run once before any other call and its failure return must be checked; skipping it leaves the library's RNG and constants uninitialized."
+      ],
+      "sources": [
+        "https://doc.libsodium.org/secret-key_cryptography/aead/aes-256-gcm"
+      ]
+    }
+  ],
+  "default_variant": "openssl-evp"
+}

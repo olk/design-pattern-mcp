@@ -1,0 +1,73 @@
+{
+  "pattern": "double-buffer",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "AtomicReference.getAndSet / lazySet publication",
+  "implementation_notes": "Model the buffered state as an immutable snapshot referenced by an `AtomicReference`: the writer builds the next frame privately and calls `getAndSet(finished)`, which 'atomically sets the value to newValue and returns the old value' with VarHandle memory effects, then retires the returned buffer; readers call `get()` (volatile semantics) and never lock. `lazySet`/`setRelease` is the cheaper release-store publication when a single writer is guaranteed and readers only need the acquire side. The swap is one reference exchange, so buffer size is irrelevant.",
+  "code_sketch": "private final AtomicReference<Frame> current = new AtomicReference<>(Frame.EMPTY);\n\nvoid publish() {\n    Frame finished = renderNextFrame();          // build the back buffer\n    Frame old = current.getAndSet(finished);     // atomic swap\n    retire(old);                                 // recycle the previous frame\n}\n\nFrame snapshot() { return current.get(); }       // readers never block",
+  "pitfalls": [
+    "`lazySet`/`setPlain` relax ordering deliberately: use them only for an immutable snapshot with a single writer, never for a mutable buffer.",
+    "Publishing a snapshot and then mutating it (a reused mutable `ArrayList` as the frame) tears exactly as without the pattern.",
+    "Ignore the reference `getAndSet` returns and buffers leak; recycle it immediately and a slow reader may still be using it.",
+    "The field must be `final` and never reassigned - assigning a new AtomicReference defeats the publication guarantee."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "atomic-reference-swap",
+      "name": "AtomicReference snapshot swap",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "AtomicReference.getAndSet / lazySet publication",
+      "implementation_notes": "Model the buffered state as an immutable snapshot referenced by an `AtomicReference`: the writer builds the next frame privately and calls `getAndSet(finished)`, which 'atomically sets the value to newValue and returns the old value' with VarHandle memory effects, then retires the returned buffer; readers call `get()` (volatile semantics) and never lock. `lazySet`/`setRelease` is the cheaper release-store publication when a single writer is guaranteed and readers only need the acquire side. The swap is one reference exchange, so buffer size is irrelevant.",
+      "code_sketch": "private final AtomicReference<Frame> current = new AtomicReference<>(Frame.EMPTY);\n\nvoid publish() {\n    Frame finished = renderNextFrame();          // build the back buffer\n    Frame old = current.getAndSet(finished);     // atomic swap\n    retire(old);                                 // recycle the previous frame\n}\n\nFrame snapshot() { return current.get(); }       // readers never block",
+      "pitfalls": [
+        "`lazySet`/`setPlain` relax ordering deliberately: use them only for an immutable snapshot with a single writer, never for a mutable buffer.",
+        "Publishing a snapshot and then mutating it (a reused mutable `ArrayList` as the frame) tears exactly as without the pattern.",
+        "Ignore the reference `getAndSet` returns and buffers leak; recycle it immediately and a slow reader may still be using it.",
+        "The field must be `final` and never reassigned - assigning a new AtomicReference defeats the publication guarantee."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+      ]
+    },
+    {
+      "variant_id": "volatile-snapshot",
+      "name": "volatile field + full-snapshot write (single writer)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "private volatile Frame current with one publishing thread",
+      "implementation_notes": "With exactly one publishing thread, a `private volatile Frame current` field is the cheapest realization: the JLS gives volatile reads and writes the visibility and ordering needed for a reader to see either the previous or the new complete snapshot, and readers pay no CAS. The writer builds the next frame and assigns it; nothing else writes the field. As soon as more than one thread can publish, use the `AtomicReference` variant - two threads assigning a volatile field silently lose frames.",
+      "code_sketch": "private volatile Frame current = Frame.EMPTY;   // written by ONE thread only\n\nvoid publish() {\n    current = renderNextFrame();                // release; readers see a whole frame\n}\n\nFrame snapshot() { return current; }             // volatile read, no lock",
+      "pitfalls": [
+        "A volatile field is not mutual exclusion: concurrent writers still lose updates, and read-modify-write of the field is not atomic.",
+        "Volatile orders the reference, not the object graph: everything reachable from the frame must be safely published (final fields or effectively immutable).",
+        "Rebuilding the whole frame per publish allocates; only reuse buffers once the last reader of the previous snapshot has dropped it."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+      ]
+    },
+    {
+      "variant_id": "buffer-strategy",
+      "name": "AWT BufferStrategy (flip/blt rendering)",
+      "paradigm": "oo",
+      "min_standard": "Java1.4",
+      "idiom_name": "java.awt.image.BufferStrategy getDrawGraphics/show/contentsLost",
+      "implementation_notes": "For rendering on a `Canvas` or `Window`, the JDK provides the double buffer: `getDrawGraphics()` 'creates a graphics context for the drawing buffer' (the back buffer), `show()` makes the drawing buffer visible (flip strategies are hardware-accelerated, blt strategies copy), and `contentsLost()`/`contentsRestored()` report that the platform invalidated or restored the buffer, so the frame must be redrawn. The documented `do { ... } while (contentsRestored()); show(); while (contentsLost())` loop is the canonical usage. Modern code should prefer JavaFX/Canvas or a GPU path, which composites offscreen.",
+      "code_sketch": "BufferStrategy strategy = canvas.getBufferStrategy();\ndo {\n    do {\n        Graphics g = strategy.getDrawGraphics();\n        try { drawFrame(g); } finally { g.dispose(); }\n    } while (strategy.contentsRestored());\n    strategy.show();                 // present the finished frame\n} while (strategy.contentsLost());",
+      "pitfalls": [
+        "Skipping the `contentsLost`/`contentsRestored` loops produces black or half-drawn frames after a resize or display change.",
+        "You must `dispose()` the Graphics obtained from `getDrawGraphics()` every iteration; leaking it leaks the back buffer.",
+        "`BufferStrategy` is per Canvas/Window - creating one per frame, or for an invisible component, throws or silently falls back to blt."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.desktop/java/awt/image/BufferStrategy.html"
+      ]
+    }
+  ],
+  "default_variant": "atomic-reference-swap"
+}

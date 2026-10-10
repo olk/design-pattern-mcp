@@ -1,0 +1,179 @@
+{
+  "category": "persistence-state",
+  "name": "identity-map",
+  "aliases": [
+    "first-level cache",
+    "session cache"
+  ],
+  "intent": "Guarantee that within one session every database row is represented by exactly one in-memory object, by keeping a keyed registry of loaded objects that every load consults before hitting the database.",
+  "problem": "Two code paths in the same session load the same row into two different objects: updates through one are invisible to the other, the last flush silently wins, and every load pays the remote-call cost again. The catalog states the invariant as: the same row must never be two different in-memory objects in one session.",
+  "context": "Object-oriented persistence (data mappers, repositories, unit of work) where entities carry a stable database identity (an Identity Field) and several parts of one business transaction or request refer to the same rows. Applies whenever duplicate in-memory instances would break graph consistency or lose updates - typically inside an ORM session or a hand-written persistence context whose lifetime bounds staleness.",
+  "benefits": [
+    "One instance per database identity per session: two lookups of the same row return the same object, so an update made through one path is visible to the other instead of being silently overwritten at flush time.",
+    "Fewer database round trips: repeated lookups are answered from the map, which matters when object graphs are navigated and re-fetched inside one transaction.",
+    "Identity comparison becomes meaningful (is/==/=== on entities), and relationship wiring stays consistent because back-references point at the same instance.",
+    "Identity semantics are defined in one place - the identity key and the session scope - so mappers and repositories do not each invent their own caching rules.",
+    "Bounded per-session memory plus a natural foundation for Unit of Work change tracking: the session knows exactly which objects are managed and dirty.",
+    "Consistent graph reconstruction: cycles and shared references materialise once per session instead of being duplicated along each navigation path."
+  ],
+  "tradeoffs": [
+    "Scope discipline is everything: a map that outlives the unit of work becomes an unbounded, stale cache (rows stay alive and old values shadow new ones), while a per-query map does nothing at all.",
+    "It is not a result cache: an object already in the map hides later database state until it is refreshed or expired, so a refresh/eviction policy becomes part of the design.",
+    "Thread-safety is the caller's problem: identity maps are session- and thread-confined (ORM sessions are not thread-safe, shared maps need locking, and a global map is a documented anti-pattern).",
+    "Only stable persistent identity works as the key: rows without a key yet (unsaved entities), composite or mutable keys, and value objects without identity cannot be mapped reliably.",
+    "Lifetime mechanics leak into application code: some implementations reference weakly (instances can be collected and re-materialised), others hold everything until cleared, so how long an instance lives must be understood.",
+    "A second instance with the same key is an error at attach/merge time, so importing external graphs requires explicit merge/detach handling instead of plain assignment.",
+    "Debugging and tests become session-history-sensitive: behaviour differs between the first and the second load, and tests must simulate session scope to reproduce production identity semantics.",
+    "In implementations that use weak references (e.g. SQLAlchemy), objects dereferenced by all external code are also dropped from the identity map and can be garbage-collected mid-session, causing an unnecessary re-load if accessed again — understand the reference semantics of your ORM.",
+    "Using the identity map as a performance cache for queries filtered on non-primary-key attributes is a misunderstanding: the map is only consulted when the primary key is known, so queries by other columns always hit the database regardless of whether the result is already in memory."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Identity Map",
+      "responsibility": "The session-scoped registry itself: stores at most one instance per identity key, answers lookups, and is cleared or discarded when the session/unit of work ends."
+    },
+    {
+      "role": "Identity Key",
+      "responsibility": "The value that identifies a row - typically entity type plus primary key (an Identity Field carried by the object); lookups and registration are keyed on it, never on mutable attributes or object identity."
+    },
+    {
+      "role": "Session / Unit of Work",
+      "responsibility": "Owns the map and defines its lifetime and thread of control; clears, detaches or discards it at the end of the transaction."
+    },
+    {
+      "role": "Finder / Mapper (Repository)",
+      "responsibility": "Consults the map before loading, performs the query only on a miss, registers the new instance, and returns the shared object from then on."
+    },
+    {
+      "role": "Entity (Domain Object)",
+      "responsibility": "The persisted object whose identity is mapped; within one session it must not exist twice, and its equality should follow the identity key rather than structural equality."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "ORM sessions in web request handling (JPA EntityManager, EF Core DbContext, SQLAlchemy Session, MikroORM EntityManager) where several services touch the same entities in one request.",
+    "Batch import and synchronisation jobs that re-read the same rows repeatedly inside one transaction and must not operate on divergent copies.",
+    "Object graph reconstruction in data mappers, where cycles and shared references need one in-memory instance per row.",
+    "Desktop and document applications with a context-scoped object space (Core Data contexts) where objects are edited, undone and saved as one unit.",
+    "Hand-written persistence layers over plain SQL where two repositories serve the same table and must agree on identity.",
+    "CQRS command handlers where the same aggregate is loaded multiple times within one command execution — the identity map prevents duplicate instances from forming across repository calls within the same session.",
+    "Event-sourced aggregate reconstruction: replaying events to rebuild aggregate state requires the same aggregate instance to accumulate state across multiple event applications; identity map guarantees a single instance per aggregate ID per reconstruction session.",
+    "Microservices saga and choreography: within one service's unit-of-work, multiple steps may load the same entity; identity map ensures all steps operate on the same instance even when the entity is referenced across different event handlers.",
+    "DDD bounded-context integration: when one bounded context holds a reference to an entity from another context (by ID), that entity is resolved through the local identity map — multiple resolution paths must all consult the same map to stay consistent.",
+    "Testing scenarios where the same entity is accessed via multiple repository paths: identity map guarantees test assertions see the same instance regardless of which repository method returned it, enabling meaningful state verification.",
+    "Multi-tenant applications where each tenant request gets its own session/identity-map scope, preventing cross-tenant data leakage by construction — a shared/global map would allow one tenant's rows to shadow another's.",
+    "SQLAlchemy Session.get in a unit of work: repeated primary-key loads return the same Python object from the Session identity map, while the Session is deliberately not a cross-session query cache.",
+    "EF Core tracked queries and AsNoTrackingWithIdentityResolution: the DbContext keeps one entity instance per key for tracked results, while no-tracking identity resolution is opt-in for read models.",
+    "Hibernate Session persistence contexts: repeated loads of the same entity type and identifier resolve to the one managed instance per Session, so entity graphs and dirty checking share state."
+  ],
+  "avoid_when": [
+    "Read-only batch processing where each row is streamed once and discarded: the map adds bookkeeping without preventing any duplicate.",
+    "Stateless request handling where objects never outlive the query and nothing cross-references them: plain queries, or a framework without such a context, are simpler.",
+    "Value objects and immutable data transfer objects: they have no database identity, so identity comparison is meaningless - use value equality instead.",
+    "When the framework deliberately omits the pattern and offers an alternative (ActiveRecord/Rails with its request-scoped query cache): rebuilding a session map fights the framework's concurrency model."
+  ],
+  "language_files": {
+    "generic": "identity-map.generic.json",
+    "c": "identity-map.c.json",
+    "cplusplus": "identity-map.cplusplus.json",
+    "csharp": "identity-map.csharp.json",
+    "go": "identity-map.go.json",
+    "java": "identity-map.java.json",
+    "javascript": "identity-map.javascript.json",
+    "kotlin": "identity-map.kotlin.json",
+    "python": "identity-map.python.json",
+    "ruby": "identity-map.ruby.json",
+    "rust": "identity-map.rust.json",
+    "scala": "identity-map.scala.json",
+    "swift": "identity-map.swift.json",
+    "typescript": "identity-map.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "unit-of-work",
+    "lazy-load",
+    "identity-field",
+    "data-mapper",
+    "repository",
+    "cache-aside",
+    "aggregate"
+  ],
+  "anti_patterns": [
+    "A global or application-scoped identity map shared across requests and threads: stale rows, cross-request data leakage and unbounded memory - the classic misuse.",
+    "Treating the identity map as a cross-request result cache instead of a per-session identity guarantee, and relying on it for performance after the session ended.",
+    "Keying the map on mutable business attributes, object identity or DTO values instead of the persistent identity, which produces duplicates instead of preventing them.",
+    "Maintaining a hand-written map next to an ORM's persistence context, so two maps disagree about which instance is current.",
+    "Letting entities escape the session and re-entering them elsewhere without merge/detach discipline, producing already-tracked errors or divergent copies."
+  ],
+  "design_principles": [
+    "Single source of truth: one in-memory instance per database identity per session.",
+    "Separation of concerns: identity resolution belongs to the session/persistence layer, not to entities or callers.",
+    "Encapsulation: finders and mappers consult and register the map; application code never manipulates it directly.",
+    "Bounded lifetime: scope the map to the unit of work so staleness and memory are bounded by the transaction.",
+    "DRY: the identity key is derived once (Identity Field) and shared by the map and the mappers."
+  ],
+  "best_practices": [
+    "Scope the map to exactly one unit of work or request and discard (or clear) it at the end; never share it across requests or threads.",
+    "Key on entity type plus primary key, and keep the key immutable; never key on mutable attributes or on the object reference.",
+    "Route every load through the same session/repository so all instances are registered; treat deserialisation and raw queries as boundary cases that must merge or attach explicitly.",
+    "Decide and document the reference policy (strong vs. weak) and the refresh/eviction policy, e.g. session clear, context reset, expunge, or per-request forks.",
+    "Pair the map with Unit of Work for a single flush and with version numbers or optimistic locking for conflicts between sessions.",
+    "Handle unsaved entities explicitly: assign identities before insertion, or keep pending objects in a separate structure.",
+    "Adopt session-per-request (or equivalent) lifecycle: create the session at request start, use it for all loads in that request, and discard it at request end. This bounds memory and staleness automatically.",
+    "Prefer weak references (SQLAlchemy default) for the identity map to avoid memory leaks when objects fall out of application scope; use strong references only when objects must survive even without external references, with explicit lifecycle management.",
+    "Call session.expire() or session.refresh() (or equivalents) when you need to see database state that changed outside the current session, e.g. after raw SQL, concurrent transactions with READ COMMITTED isolation, or optimistic-locking conflicts.",
+    "Use populate_existing() (or equivalent) when a query must refresh already-tracked objects, e.g. with SELECT ... FOR UPDATE to avoid returning stale cached instances instead of freshly locked rows.",
+    "In CQRS architectures, the write side uses the identity map to load aggregates for commands; the read side typically bypasses it (no-tracking queries) but can use AsNoTrackingWithIdentityResolution() to avoid object duplication without polluting the write session.",
+    "Design aggregate identities as early as possible (at creation, not at persistence time): database-assigned auto-increment IDs break idempotent creation, event sourcing, and distributed system identity coordination."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (Addison-Wesley, 2002) — Identity Map, Chapter 11, Object-Relational Behavioral Patterns.",
+    "https://martinfowler.com/eaaCatalog/identityMap.html — Fowler's online PoEAA catalog entry for Identity Map.",
+    "https://docs.sqlalchemy.org/en/21/orm/session_state_management.html — SQLAlchemy ORM session state management: transient, persistent, detached states; identity map lifecycle.",
+    "https://docs.sqlalchemy.org/en/21/orm/session_basics.html — SQLAlchemy Session identity map definition: 'a data structure that maintains unique copies of each object, where unique means only one object with a particular primary key'.",
+    "https://learn.microsoft.com/en-us/ef/core/change-tracking/identity-resolution — EF Core identity resolution: 'A DbContext can only track one entity instance with any given primary key value.'",
+    "https://vladmihalcea.com/jpa-hibernate-first-level-cache/ — Hibernate/JPA first-level cache (Persistence Context): 'there can be only one and only one entity stored using the same identifier and entity class type'.",
+    "https://docs.hibernate.org/orm/3.5/reference/en-US/html/architecture.html — Hibernate architecture: Session holds a 'mandatory first-level cache of persistent objects'.",
+    "https://docs.hibernate.org/stable/orm/javadocs/org/hibernate/Session.html — Hibernate ORM Session Javadoc: 'Each persistent instance has a persistent identity determined by its type and identifier value. There may be at most one persistent instance with a given persistent identity associated with a given session.'",
+    "Eric Evans, Domain-Driven Design: Tackling Complexity in the Heart of Software (Addison-Wesley, 2003) — Entities (Chapter 5): 'An object defined by its identity rather than its attributes'; repositories load and persist aggregates by identity.",
+    "https://martinfowler.com/books/eaa.html — PoEAA book page: 'Each pattern describes details of how it works and when to use it' for forty enterprise patterns including Identity Map.",
+    "https://www.informit.com/articles/article.aspx?p=30661&seqNum=4 — InformIT's canonical structural mapping discussion of Identity Map and its single-object-per-record purpose.",
+    "https://docs.sqlalchemy.org/en/21/orm/session_api.html — SQLAlchemy 2.1 Session API: Session.get() consults the identity map and maintains one object per database identity within a Session.",
+    "https://learn.microsoft.com/en-gb/ef/core/change-tracking/identity-resolution — EF Core identity resolution: a DbContext tracks one entity instance per key, with explicit no-tracking identity-resolution support.",
+    "https://docs.hibernate.org/orm/6.5/javadocs/org/hibernate/Session.html — Hibernate Session persistence context and the one persistent instance per type-and-identifier rule.",
+    "https://softwareengineering.stackexchange.com/questions/253285/limitations-of-the-identity-map-pattern — discussion of Identity Map limitations, including stale data and unbounded scope when misused."
+  ],
+  "related_patterns_notes": {
+    "unit-of-work": "Unit of Work shares the session's identity map to track dirty, new, and deleted objects for a single atomic flush; identity map provides the object-identity guarantee that Unit of Work relies on.",
+    "lazy-load": "Lazy Load and identity map cooperate: the identity map prevents duplicate loading when a lazy reference is accessed multiple times, and it breaks cyclic loading chains by returning a placeholder (ghost) already registered in the map.",
+    "identity-field": "Identity Field (the database primary key carried by an entity) is the natural key for the identity map; the map keys on entity type plus the value of the identity field.",
+    "data-mapper": "Data Mapper checks the identity map before loading and registers newly loaded objects; in Fowler's example the abstract mapper's load() method checks the map in both the subclass finder and the superclass, proving the double-check is intentional.",
+    "repository": "Repository typically delegates to a mapper and wraps the identity map for the domain layer; clients consult the repository interface and are unaware of the underlying identity map. Some repository implementations expose identity-key-based get() methods that are direct identity-map lookups.",
+    "cache-aside": "Cache-aside (Lazy Load applied to a cross-session cache) and identity map both prevent redundant loads, but cache-aside operates across sessions and is not bounded by a unit-of-work, making it a separate pattern with different consistency guarantees.",
+    "aggregate": "In DDD, the aggregate root is the only entity in a cluster that may be looked up directly; repositories are defined per aggregate root. The identity map enforces that within one session, only one instance of the aggregate root (and its internal entities) exists per identity.",
+    "first-class-collection": "First-Class Collection (a collection encapsulated as a singleton with its own lifecycle) can use an identity map internally to deduplicate entities added to the collection, ensuring no duplicates by identity even when the same entity is added from different code paths."
+  }
+}

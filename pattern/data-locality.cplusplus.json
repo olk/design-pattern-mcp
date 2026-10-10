@@ -1,0 +1,81 @@
+{
+  "pattern": "data-locality",
+  "language": "cplusplus",
+  "support": "native",
+  "idiom_name": "contiguous std::vector<T> of records addressed by u32 index handles",
+  "implementation_notes": "std::vector guarantees that its elements are stored contiguously, so the packed array the pattern asks for is the default container: keep records by value in one vector, reserve() once so growth happens at most once, and address elements through index handles instead of pointers. What replaces the classic structure: one vector per record type plus handles replaces the class hierarchy of owning pointers, and the hot loop iterates values - no virtual dispatch, no per-object allocation. Handles survive reallocation, pointer/reference/iterator invalidation is averted by never storing them, and swap-and-pop keeps the active prefix packed. This is the default realization; struct-of-arrays and pmr arenas are the C++17/20 follow-ups when the profile demands more.",
+  "code_sketch": "struct Particle { float x, y, vx, vy; };\nstd::vector<Particle> pool;\npool.reserve(maxParticles);\npool.push_back({0, 0, 1, 0});\nfor (auto& p : pool) { p.x += p.vx * dt; p.y += p.vy * dt; }  // contiguous sweep\n// handle: std::uint32_t index;  deactivate(i): pool[i] = pool.back(); pool.pop_back();",
+  "pitfalls": [
+    "push_back, insert, resize and erase invalidate references, pointers and iterators into the vector (and reserve changes capacity); storage APIs must return handles, not T&.",
+    "std::vector<bool> is a bitset specialization whose references are proxies; it cannot be traversed as a packed byte array.",
+    "std::vector<std::unique_ptr<T>> looks like a container of values but keeps one allocation and one pointer hop per element - prefer vector<T> (or std::pmr) for records.",
+    "Range-for over the vector is fine, but taking a reference to an element and then mutating the container (or reentering the loop) is the classic invalidation bug."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/container/vector"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "packed-vector-handles",
+      "name": "Packed std::vector of values with index handles (C++11)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "idiom_name": "contiguous std::vector<T> of records addressed by u32 index handles",
+      "implementation_notes": "std::vector guarantees that its elements are stored contiguously, so the packed array the pattern asks for is the default container: keep records by value in one vector, reserve() once so growth happens at most once, and address elements through index handles instead of pointers. What replaces the classic structure: one vector per record type plus handles replaces the class hierarchy of owning pointers, and the hot loop iterates values - no virtual dispatch, no per-object allocation. Handles survive reallocation, pointer/reference/iterator invalidation is averted by never storing them, and swap-and-pop keeps the active prefix packed. This is the default realization; struct-of-arrays and pmr arenas are the C++17/20 follow-ups when the profile demands more.",
+      "code_sketch": "struct Particle { float x, y, vx, vy; };\nstd::vector<Particle> pool;\npool.reserve(maxParticles);\npool.push_back({0, 0, 1, 0});\nfor (auto& p : pool) { p.x += p.vx * dt; p.y += p.vy * dt; }  // contiguous sweep\n// handle: std::uint32_t index;  deactivate(i): pool[i] = pool.back(); pool.pop_back();",
+      "pitfalls": [
+        "push_back, insert, resize and erase invalidate references, pointers and iterators into the vector (and reserve changes capacity); storage APIs must return handles, not T&.",
+        "std::vector<bool> is a bitset specialization whose references are proxies; it cannot be traversed as a packed byte array.",
+        "std::vector<std::unique_ptr<T>> looks like a container of values but keeps one allocation and one pointer hop per element - prefer vector<T> (or std::pmr) for records.",
+        "Range-for over the vector is fine, but taking a reference to an element and then mutating the container (or reentering the loop) is the classic invalidation bug."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/vector"
+      ]
+    },
+    {
+      "variant_id": "soa-span-fields",
+      "name": "Struct of arrays with std::span views (C++20)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++20",
+      "requires_features": [
+        "std::span",
+        "contiguous iterators"
+      ],
+      "idiom_name": "parallel std::vector<double> fields per column, passed around as std::span",
+      "implementation_notes": "The columnar realization: keep one vector (or one arena allocation) per field, so a sweep touches only the columns it reads and vectorizes cleanly - 'a span can refer to a contiguous sequence of objects with the first element at position zero' makes the view explicit and cheap to pass without templating on the container. What replaces the classic structure: the record disappears as a physical unit and is addressed by the shared index across columns (or reassembled indirectly), which removes padding waste (a struct of x,y,vx,vy in float wastes nothing, but mixed-width records do). Choose it when a loop reads one or two fields of many records; prefer the packed-record variant when the loop needs most fields of each record.",
+      "code_sketch": "std::vector<double> x(n), y(n), vx(n), vy(n);   // columns, one field each\nvoid step(std::span<double> x, std::span<const double> vx, double dt) {\n    for (std::size_t i = 0; i < x.size(); ++i) x[i] += vx[i] * dt;\n}\nstep(x, vx, dt);   // pass views, not containers; a view can start at any subspan",
+      "pitfalls": [
+        "Parallel columns must stay in lockstep: any insert/remove/reorder has to touch every column or the shared index starts mixing records.",
+        "span is a non-owning view whose extent may be dynamic; a view outliving its vector (or built from a temporary) is a dangling reference the type system does not catch.",
+        "std::span does not own or copy, so passing containers where a view is expected tempts callers into creating temporaries; take spans only as parameters, never store them past the call."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/container/span"
+      ]
+    },
+    {
+      "variant_id": "pmr-arena",
+      "name": "Arena allocation with std::pmr::monotonic_buffer_resource (C++17)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::pmr",
+        "polymorphic_allocator"
+      ],
+      "idiom_name": "pmr containers backed by monotonic_buffer_resource (bump arena), released all at once",
+      "implementation_notes": "Locality also comes from allocation strategy: a monotonic_buffer_resource 'releases the allocated memory only when the resource is destroyed' and is intended for fast allocations where memory is built up and freed all at once, so pmr containers over it pack many records into few large blocks instead of scattering them across the heap. What replaces the classic structure: instead of per-record new/delete (the source of fragmentation and pointer chasing), a frame- or level-scoped arena owns the storage and the records are addressed by handle or by pointer that stays valid until the arena is released. It is the C++ default for per-frame scratch data; combine with the packed-record or columnar variants for the records themselves.",
+      "code_sketch": "std::array<std::byte, 1 << 20> buffer;               // frame-local arena\nstd::pmr::monotonic_buffer_resource arena{buffer.data(), buffer.size()};\nstd::pmr::vector<Particle> pool{&arena};             // grows inside the arena\nfor (auto& p : pool) { p.x += p.vx * dt; }\n// arena.release() (or destruction) frees everything at once - no per-record delete",
+      "pitfalls": [
+        "monotonic_buffer_resource is not thread-safe and never reuses freed blocks; anything that frees individual records must not use it.",
+        "do_deallocate is a no-op, so a short-lived arena must not be used for objects whose memory is expected back before the arena dies.",
+        "Pointer stability is only as good as the arena's lifetime: records handed to longer-lived code become dangling when the arena is released."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/monotonic_buffer_resource"
+      ]
+    }
+  ],
+  "default_variant": "packed-vector-handles"
+}

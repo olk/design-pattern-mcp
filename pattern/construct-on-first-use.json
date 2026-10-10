@@ -1,0 +1,186 @@
+{
+  "category": "persistence-state",
+  "name": "construct-on-first-use",
+  "aliases": [
+    "nifty counter",
+    "schwarz counter",
+    "lazy construction",
+    "lazy initialization",
+    "initialization-on-demand"
+  ],
+  "intent": "Ensure that a shared, non-local object is fully constructed before its first use - and, in the counter-guard form, destroyed only after its last use - so that any module, including other static initializers, can depend on it without relying on an unspecified static initialization order: lifetime follows use through a single accessor, not build or link order.",
+  "problem": "A namespace-scope (static) object is used by code in several translation units or modules - including other static objects with non-trivial constructors - but the order in which the runtime performs dynamic initialization across those units is unspecified, so an object can be touched before its constructor has run (the static initialization order fiasco).",
+  "context": "Applies to module- or class-scope state with non-trivial construction: logging and stream objects, allocators, registries, configuration tables, caches, or any library object that other static objects may use during their own initialization. It matters most in ahead-of-time-compiled languages with per-translation-unit static initialization (C and C++), and wherever a header must make a shared object usable from any including unit; in runtimes that initialize classes, modules or globals on first access, the same intent is met by language semantics.",
+  "benefits": [
+    "Deterministic initialization regardless of link order or translation-unit order: the object is constructed on first use, so no caller can observe it half-initialized.",
+    "The fix lives at the point of definition instead of constraining build order, and keeps working when sources are added, split or reordered.",
+    "Laziness is a side benefit where the object is expensive and often unused: cost and side effects are paid only if the program actually reaches the object.",
+    "Construction, configuration and error handling are centralized in one access point, which gives diagnostics and policy a single home.",
+    "The counter form bounds lifetime precisely: the object exists from before the first including unit may use it until after the last unit that can use it is gone.",
+    "Hides construction cost from program startup, improving time-to-first-meaningful-work especially in large binaries with many static constructors."
+  ],
+  "tradeoffs": [
+    "The classical nifty counter costs a guard object in every including translation unit plus a shared counter, aligned storage and placement new; C++17 inline variables and function-local statics make it unnecessary for most header-defined globals.",
+    "The dynamic-allocation form of construct-on-first-use never destroys the object (a deliberate leak): acceptable for memory reclaimed at process exit, wrong when the destructor has side effects such as flushing a file. The function-local static form does run the destructor, but then destruction order across units is still unspecified and use during static destruction is undefined.",
+    "First use is an arbitrary point in the program: an expensive initializer moves latency to an unpredictable caller, and an initializer failure surfaces there too - often permanently (a failed type initializer stays failed, a poisoned once keeps failing).",
+    "Hidden lifetime coupling replaces visible wiring: the dependency on the object disappears from signatures, which is convenient at call sites and hostile to unit testing and dependency injection.",
+    "The once-only machinery is paid for on every access in some languages (guard variables on function-local statics, initialization locks, synchronized lazy delegates), and the naive double-checked variant was unsound before the memory model made it definable.",
+    "Debuggability suffers: the actual construction point is a function call deep in execution, not a visible declaration at the top of a translation unit, making it harder to trace initialization order in crash dumps and profilers."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Guarded object",
+      "responsibility": "The non-local object whose construction must precede first use; it may be expensive, may itself depend on other globals, and may have a non-trivial destructor."
+    },
+    {
+      "role": "Access point",
+      "responsibility": "The single function, module attribute, lazy value or once-guarded accessor through which every client reaches the object; it triggers construction exactly once and hands out the reference or value."
+    },
+    {
+      "role": "Guard",
+      "responsibility": "The mechanism that establishes 'constructed once, before use': a function-local static's initialization guard, a once flag, a lazy-cell state machine, or - in the counter form - a per-translation-unit guard object sharing a reference counter."
+    },
+    {
+      "role": "Client unit",
+      "responsibility": "Every translation unit, module or class that may use the object, including other static objects. In the counter form each such unit carries its own guard instance, which is exactly what makes the ordering per-unit."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "A header-defined stream or logger object that other static objects may write to during their own initialization (the std::cout case the idiom was invented for).",
+    "A process-wide configuration table, registry or plugin map that any module may consult and that must not be read before it is built.",
+    "An expensive shared resource - font atlas, compiled regex, thread pool, connection pool - that should be created only if some code path actually needs it.",
+    "Legacy code bases where a global must stay a global for compatibility, but its initialization must be independent of module and link order.",
+    "Library headers that must remain usable when the including unit's static initializers run before the library's own initializers do.",
+    "Database connection pools and session factories in ORM frameworks (Hibernate, Django ORM) where the pool must be initialized before any unit that may issue queries.",
+    "Service locators in legacy EJB containers and early Spring frameworks, where JNDI lookups served as hidden first-use accessors for shared resources.",
+    "React component lazy loading and code-splitting (React.lazy, dynamic imports), where the module is loaded on first render rather than at startup.",
+    "Template engines and serialization registries that register handlers at startup but the registry itself must be ready before any handler runs.",
+    "Process-wide logging subsystems in long-running servers, where the logger must be alive for the entire process but is expensive to construct eagerly.",
+    "Font servers and GPU resource managers in graphics applications, where context creation is GPU-dependent and cannot occur during static initialization.",
+    "Language runtimes that need to initialize the garbage collector, VM, or interpreter state before any user code runs.",
+    "Chromium globals under the style-guide ban on global constructors: non-POD process state is moved into function-local statics wrapped in base::NoDestructor, constructed on first use and deliberately never destroyed (the sanctioned fix prescribed in the Chromium 'Static Initializers' doc).",
+    "Google Abseil's absl::NoDestructor: a production wrapper that makes a function-local static of a non-trivially-destructible type a lazily constructed, exactly-once, thread-safe, never-destroyed global - the construct-on-first-use accessor as a library type.",
+    "LLVM's llvm::ManagedStatic globals in lib/Support (Timer.cpp, CommandLine.cpp): timer groups and statistics-output strings built lazily on first use to dodge static-destructor ordering; PR #121663 later consolidated the independently-ordered ManagedStatics into a single lazily-built TimerGlobals after their shutdown interleaving caused use-after-free."
+  ],
+  "avoid_when": [
+    "A local or explicitly passed dependency would do: constructor parameters, a context object or a DI container make the lifetime explicit and testable.",
+    "Initialization is cheap and unconditional: construct it eagerly at startup and keep the data flow obvious.",
+    "A framework already owns creation and lifetime (Spring, the .NET generic host, ASP.NET DI): do not reintroduce hidden first-use state beside it.",
+    "The object must be torn down at a known point (flush, close, unregister): prefer an explicit lifecycle handle over lazy global state.",
+    "The language already guarantees first-access initialization of module, class or global state and the object is not expensive - there the classic structure is pure ceremony.",
+    "The codebase supports dependency injection and tests exercise the full integration path: prefer injected singletons with explicit lifetimes."
+  ],
+  "language_files": {
+    "generic": "construct-on-first-use.generic.json",
+    "c": "construct-on-first-use.c.json",
+    "cplusplus": "construct-on-first-use.cplusplus.json",
+    "csharp": "construct-on-first-use.csharp.json",
+    "go": "construct-on-first-use.go.json",
+    "java": "construct-on-first-use.java.json",
+    "javascript": "construct-on-first-use.javascript.json",
+    "kotlin": "construct-on-first-use.kotlin.json",
+    "python": "construct-on-first-use.python.json",
+    "ruby": "construct-on-first-use.ruby.json",
+    "rust": "construct-on-first-use.rust.json",
+    "scala": "construct-on-first-use.scala.json",
+    "swift": "construct-on-first-use.swift.json",
+    "typescript": "construct-on-first-use.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "procedural"
+  ],
+  "scope": "module",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "singleton",
+    "lazy-initialization",
+    "lazy-acquisition",
+    "double-checked-locking",
+    "raii",
+    "eager-acquisition",
+    "virtual-proxy",
+    "service-locator"
+  ],
+  "anti_patterns": [
+    "Hand-rolling a nifty counter for a header-defined global where a function-local static, a C++17 inline variable or a constinit constant already gives the guarantee.",
+    "Using first-use construction to keep a dependency hidden - the global becomes an undeclared parameter of every function that touches it.",
+    "Turning 'not yet needed' into 'never really validated': callers read a half-configured object because checking was deferred to the accessor.",
+    "One guard or counter shared by several unrelated globals, so touching one drags in the construction and failure of all of them.",
+    "Treating the idiom as a thread-safety story by itself: an unsynchronized check-then-construct accessor (naive double-checked locking) is a data race.",
+    "Using lazy initialization to avoid designing a proper lifecycle for a resource that genuinely needs deterministic teardown (file handles, database connections, GPU contexts).",
+    "Stacking multiple lazy accessors in a chain where A lazily acquires B which lazily acquires C, creating a fragile initialization order that is hard to debug."
+  ],
+  "design_principles": [
+    "Make lifetime follow use: initialize on first access instead of imposing a global initialization order on every module.",
+    "Single point of control: one accessor owns construction, so the object's invariants hold before any caller can observe it.",
+    "Decouple correctness from build and link order - never depend on an unspecified implementation detail.",
+    "Prefer explicit ownership where it is available (dependency injection, RAII scopes); the idiom is a compatibility tool, not a default.",
+    "Make the hidden explicit in tests: the accessor should be mockable or replaceable so that tests can inject a test double without relying on the real lazy initialization path.",
+    "Fail fast and loudly: if initialization can fail, surface the error at first use with a clear message rather than poisoning the singleton silently."
+  ],
+  "best_practices": [
+    "Route every access through the accessor; keep the raw object private or file-static so bypassing it cannot compile.",
+    "Use the runtime's once primitive - function-local static, once flag, lazy value - for the check-and-construct instead of a hand-rolled test-then-set.",
+    "Choose destruction semantics deliberately (local static, never-destroyed allocation, counter guarantee) and document which one callers get.",
+    "Keep the initializer short and side-effect-light: do everything that can be done at compile time statically and defer only what is genuinely dynamic.",
+    "Do not make the accessor reachable from static destructors unless destruction order has been handled; and never make first use a requirement for correctness of shutdown.",
+    "For new code prefer injecting the dependency; keep the idiom at compatibility boundaries (headers, legacy globals) and note the reason next to the definition.",
+    "In C++, prefer C++11 function-local statics (magic statics) over the classic nifty counter - the runtime guarantees thread-safe, once-only initialization with destruction at program exit.",
+    "In C++17+, prefer inline variables for header-defined shared objects; the inline keyword gives the same one-definition-rule guarantee as the nifty counter with zero runtime overhead.",
+    "In Java, prefer the Initialization-on-Demand Holder idiom (private static class holding the instance) over synchronized methods - it is lazy, thread-safe, and incurs no locking after initialization.",
+    "In Rust, prefer std::sync::LazyLock (stable since 1.80) or std::sync::OnceLock for thread-safe lazy initialization; LazyLock wraps a closure and guarantees exactly-once initialization.",
+    "In Python, use threading.Lock around the initialization check when accessed from multiple threads; the GIL does not protect against interleaved bytecodes during complex __init__ logic.",
+    "Make the accessor idempotent: if initialization fails, catch the exception, log it, and either fall back to a known-good default or re-raise with context identifying which accessor was at fault.",
+    "Document the initialization contract in the accessor's docstring: what state the program is in when first use occurs, what can go wrong, and whether destruction is expected.",
+    "In test suites, provide a mechanism to reset or replace the lazy state so that tests can run in isolation without relying on process-wide initialization order."
+  ],
+  "version": "1.2",
+  "sources": [
+    "More C++ Idioms (Wikibooks) - 'Runtime Static Initialization Order Idioms', 'Construct On First Use' and 'Nifty Counter (Schwarz Counter)': the definitive language-idiom catalog entries for controlling static initialization order.",
+    "C++ FAQ (isocpp.org), 'How do I prevent the static initialization order problem?' - Construct On First Use, its pointer and function-local-static variants, and their destruction caveats.",
+    "The 'Double-Checked Locking is Broken' Declaration, P. Boehm and H. Sutter, University of Maryland / Microsoft Research (https://www.cs.umd.edu/~pugh/java/memoryModel/cdll.html): documents why naive double-checked locking is broken on all multiprocessors and requires memory barriers or language-level once primitives.",
+    "Wikipedia, 'Initialization-on-demand holder idiom' (https://en.wikipedia.org/wiki/Initialization-on-demand_holder_idiom): describes the Java-specific lazy-singleton form leveraging the Java Memory Model's class-initialization guarantees.",
+    "Game Programming Patterns, 'Singleton' chapter (gameprogrammingpatterns.com): covers lazy initialization as a core motivation for the Singleton pattern, with C++ and other language examples.",
+    "Effective Java, 3rd Ed., Item 83: 'Use lazy initialization judiciously' - Josh Bloch's guidance on when lazy initialization helps vs. hurts performance and clarity, including the holder class idiom.",
+    "cppreference.com, 'Static local variables' (https://en.cppreference.com/w/cpp/language/static): documents C++11+ magic statics and their thread-safe, once-only semantics.",
+    "cppreference.com, 'std::call_once' (https://en.cppreference.com/w/cpp/thread/call_once): the C++11 mechanism for exactly-once initialization across threads.",
+    "cppreference.com, 'Static initialization order fiasco' (https://en.cppreference.com/w/cpp/language/siof): formal definition of the problem construct-on-first-use solves.",
+    "pthread_once(3P) man page (man7.org): POSIX.1-2001 exactly-once initialization primitive underlying the C++11 once mechanism.",
+    "Boost Library Documentation, 'call_once' (boost.org): historical C++03 cross-platform implementation of exactly-once initialization before C++11.",
+    "C++17 Standard (ISO/IEC 14882:2017), §6.6.3 [stmt.dcl]/3: specifies inline variables guarantee one initialization, eliminating the need for nifty-counter-style reference counting in most cases.",
+    "Rust std::sync::LazyLock and OnceLock documentation (doc.rust-lang.org): modern thread-safe lazy initialization primitives introduced in the Rust standard library.",
+    "Parashift C++ FAQ, 'Why doesn't the construct-on-first-use idiom use a static object instead of a static pointer?' (https://www.parashift.com/c++-faq/construct-on-first-use-v2.html): canonical analysis of the two variants' trade-off - a leaked static pointer is never destroyed, a static object risks de-initialization order.",
+    "CERT Secure Coding Standards, DCL56-CPP, 'Avoid cycles during initialization of static objects' (https://cmu-sei.github.io/secure-coding-standards/sei-cert-cpp-coding-standard/rules/declarations-and-initialization-dcl/dcl56-cpp/): recommends construct-on-first-use against cross-translation-unit initialization dependencies and documents the UB/deadlock from re-entering a thread-safe static's guard.",
+    "Chromium Docs, 'Static Initializers' (https://chromium.googlesource.com/chromium/src/+/HEAD/docs/static_initializers.md): global constructors are banned and counted; the prescribed remediation is function-local statics wrapped in base::NoDestructor - construct-on-first-use as enforced house style.",
+    "Abseil, absl/base/no_destructor.h (https://github.com/abseil/abseil-cpp/blob/master/absl/base/no_destructor.h): production wrapper for exactly-once, thread-safe, never-destroyed function-local statics; Chromium's base::NoDestructor (https://chromium.googlesource.com/chromium/src/+/accf099ab335e21228dfa324f75d145e08e208c8/base/no_destructor.h) is the same idiom.",
+    "LLVM lib/Support/Timer.cpp (https://llvm.googlesource.com/llvm/+/c8c4a422420860f7d11d080f0bf5969d2bb4ebbb/lib/Support/Timer.cpp) and llvm/llvm-project PR #121663 (https://github.com/llvm/llvm-project/pull/121663): ManagedStatic lazily-constructed globals in production, and the real-world rework consolidating independently-ordered ManagedStatics into one lazily-built TimerGlobals after shutdown use-after-free.",
+    "WG21 paper N2917, 'The trouble with detached threads and static destruction' (https://www.open-std.org/JTC1/sc22/WG21/docs/papers/2009/n2917.pdf) and LWG issue 462 (https://timsong-cpp.github.io/lwg-issues/462): the residual shutdown hazard - lazily constructed statics racing detached threads and atexit handlers - that construct-on-first-use does not by itself solve.",
+    "Boost.Serialization issue #105 (https://github.com/boostorg/serialization/issues/105): a construct-on-first-use singleton in a dynamically loaded library failing under dlopen/dlclose static-destruction ordering - the concrete misuse case for never-destroyed lazy state in unloadable modules."
+  ],
+  "related_patterns_notes": {
+    "initialization-on-demand-holder": "initialization-on-demand-holder",
+    "value-holder": "value-holder",
+    "plugin-registry": "plugin-registry"
+  }
+}

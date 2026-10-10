@@ -1,0 +1,24 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "splitter + routing table + per-kind part handlers + aggregator with correlation state",
+  "implementation_notes": "Language-neutral form: the splitter decomposes the composite into parts and stamps each with a correlation identifier, its index and the expected part count; a routing table maps part kind to destination and forwards the part without inspecting it further; the part handler processes exactly one element kind and emits one result carrying the same identifier; the aggregator buffers results per identifier, decides completeness (all parts, quorum or deadline) and runs the merge algorithm that produces the single outgoing message. Keep the routing table and the aggregation algorithm as data/strategy so new element kinds and new merge policies do not touch the split or the completion logic. The completion bookkeeping (expected versus received parts, deadline) must be durable when crossing a broker - use a MessageStore (Spring Integration) or a durable aggregation repository (Camel). Bounded parallelism is enforced by configuring a fixed worker pool or concurrency limit on the splitter so that a large composite does not overwhelm downstream systems. The aggregator must de-duplicate by part index or correlation ID, never merely count arrivals.",
+  "code_sketch": "on_message(msg):\n    parts = split(msg)                        # each: {corr_id, idx, of_n, kind, payload}\n    for p in parts:\n        route_table[p.kind](p)                # routing, not processing\non_result(r):\n    slot = store.get_or_create(r.corr_id)     # expected count fixed by the first part\n    slot.add(r.idx, r.payload)                # idempotent: same idx replaces, never double-counts\n    if slot.complete():                       # all parts, quorum, or deadline reached\n        emit(merge(slot.results()), complete=slot.complete())",
+  "pitfalls": [
+    "Letting the routing step also process the part collapses the pattern back into one component with a switch statement.",
+    "Counting results without de-duplicating by part index makes redeliveries look like extra parts and emits a wrong aggregate.",
+    "No deadline and no dead-letter path on the correlation state leaks incomplete composites forever.",
+    "Unbounded fan-out: spawning one goroutine/thread/task per part without a worker pool exhausts system resources on large composites.",
+    "Missing per-branch circuit breakers: a slow or failing downstream handler blocks the aggregator indefinitely without a fallback or timeout.",
+    "Aggregation without a visibility mechanism: opaque partial failure where the composite appears to succeed but a key component defaulted to null or unknown.",
+    "Wrong move: waiting for all parts with no propagated deadline -> failure: with n parts the chance that at least one hits its tail latency grows as 1-(1-p)^n, so the fan-in wait quietly becomes the composite's normal latency -> instead: budget the response end to end, push the remaining time budget with each part and release at the deadline with an explicit completeness flag.",
+    "Wrong move: retrying a slow or failing part while the composite keeps waiting, uncapped -> failure: retries multiply load on the already-degraded handler and late duplicates arrive after the aggregate was released -> instead: bound retries with jitter to idempotent parts, propagate cancellation on abandonment and de-duplicate late results by part index.",
+    "Wrong move: letting the aggregator own field mapping, enrichment and cross-domain rules -> failure: it grows into a shadow service every team must change and flattens distinct domain semantics into one generic status blob -> instead: keep the merge algorithm generic (ordering, de-duplication, envelope assembly) and leave per-kind semantics to the part handler that owns the data."
+  ],
+  "sources": [
+    "Apache Camel Composed Message Processor: https://camel.apache.org/components/4.22.x/eips/composed-message-processor.html",
+    "Spring Integration Splitter and Aggregator Reference: https://docs.enterprise.spring.io/spring-integration/reference/splitter.html"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,25 @@
+{
+  "pattern": "deadline-propagation",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "deadline carried in request-scoped state + monotonic clock + cooperative cancellation checkpoints",
+  "implementation_notes": "Language-neutral form: at ingress convert the request's time budget into one absolute deadline on a monotonic clock and attach it, together with a cancellation signal, to the request's scope. Every hop computes remaining = deadline - now before starting a stage or a downstream call, refuses or degrades when the remainder is smaller than a sensible threshold, and passes the budget on - as remaining time, not as an absolute instant, so clock skew cannot corrupt it. Wait for downstream results together with the cancellation signal (select/race) so an expired budget aborts the wait, and give every blocking primitive the remaining time as its own timeout. On expiry, cancel the request scope so the whole call tree stops; on completion, release it explicitly so timers, listeners and connections do not leak. Never create a new full timeout at a hop: a hop may only shorten the inherited budget.",
+  "code_sketch": "def handle(req, ctx):                      # ctx carries deadline + cancel signal\n    left = ctx.deadline - mono_now()\n    if left <= 0:\n        raise DeadlineExceeded()\n    with ctx.shortened(min(left, hop_cap)) as hop:   # never a fresh full timeout\n        return call_downstream(req, hop)      # remaining time travels onward",
+  "pitfalls": [
+    "Inventing a fresh timeout at each hop: the end-to-end budget becomes a sum and work continues after the caller has given up.",
+    "Forwarding an absolute timestamp on the wire, so unsynchronized clocks turn the deadline into a random value.",
+    "Checking the budget only at ingress and not between stages (parse -> call -> post-process), so doomed work continues after it expired.",
+    "Leaving the cancellation signal unobserved in blocking waits, so expiry is noticed only when the operation happens to return.",
+    "Using a wall clock for budget arithmetic: an NTP step makes remaining time jump or go negative.",
+    "Propagating deadlines without accounting for per-hop overhead: downstream services use their full budget but leave no time for the response to travel back up the chain.",
+    "Retrying inside a global budget without deriving per-attempt timeouts from the remaining time: retries either never fire or instantly exhaust the budget.",
+    "Configuring circuit breakers to open on deadline-exceeded errors from propagated contexts: this causes blanket circuit opens when the upstream deadline is tight rather than when the local service is genuinely unhealthy.",
+    "Propagating deadlines into fan-out branches without a shared budget pool: each branch gets the full remaining time, so N parallel branches multiply the effective budget by N.",
+    "Setting a deadline but not wiring cancellation into the database statement timeout or the HTTP client connect/read timeout, so the query or HTTP call outlasts the deadline.",
+    "Wrong move: spawning a background goroutine or detached task from context.Background() (a fresh root) inside a request handler -> the detached work sits outside the cancellation tree, so the expired deadline never reaches it and it leaks past the response -> instead thread the request context explicitly, or derive a deliberately detached scope with its own bounded deadline.",
+    "Wrong move: applying WithTimeout(parent, 5s) and assuming the call gets five seconds -> if the parent's remaining budget is shorter, the child deadline is silently clamped to the parent's and the call dies before its own timeout ever fires -> instead derive each per-call timeout as min(call_budget, remaining) and log which one bound it.",
+    "Wrong move: expecting the server to report deadline-exceeded when the budget expires -> the client's transport sends RST_STREAM the instant its deadline fires, so the server observes a plain cancellation and attribution between client cancellation and upstream expiry is lost -> instead log the remaining budget at ingress, treat both signals as budget exhaustion for early exit, and keep them distinct only for breaker/alerting policy."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

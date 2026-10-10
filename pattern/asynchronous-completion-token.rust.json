@@ -1,0 +1,62 @@
+{
+  "pattern": "asynchronous-completion-token",
+  "language": "rust",
+  "support": "native",
+  "variants": [
+    {
+      "variant_id": "async-await-future",
+      "name": "async/await with the future as the token",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.39",
+      "requires_features": [
+        "async-await"
+      ],
+      "idiom_name": "async fn + Future::poll / Waker",
+      "implementation_notes": "Rust makes the ACT structural: an async block compiles to a self-referential, Pin-protected state machine that owns the operation's state, and the executor keeps exactly one Waker per task, so the completing resource wakes precisely that task - the demultiplexing the pattern describes is done by the runtime, with no token table and no lookup by request identity. The executor and I/O driver come from a runtime crate (tokio, async-std); spawning gives the mirrored one-operation-one-handle form (tokio::spawn returns a JoinHandle whose .await demultiplexes that completion). Where no future owns the completion yet - raw epoll/io_uring registration, a C callback, a channel reply - you either implement Future yourself (the manual variant) or send a oneshot reply channel with the request, which is the pointer-era ACT in channel form.",
+      "code_sketch": "let handle = tokio::spawn(async move {\n    let reply = conn.call(request).await?;   // waker demultiplexes this completion\n    conn.apply(reply)\n});\nlet result = handle.await?;                  // JoinHandle = the client-side token",
+      "pitfalls": [
+        "A finished future must not be polled again - behaviour is unspecified (panic, block forever, or worse) - so never keep a completed future as a token.",
+        "A stored Waker must be the most recent one; scheduling an older waker misses wakeups, so refresh it with clone_from(cx.waker()) on every poll (will_wake avoids the clone).",
+        "A spawned task is dropped on runtime shutdown and a detached JoinHandle's completion is never demultiplexed - keep the handle when you need the result or the cancellation path.",
+        "async futures are address-sensitive: the pinned state must not move, and a hand-rolled RawWaker must point at a thread-safe value (Arc) or be replaced by implementing Wake."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/future/trait.Future.html",
+        "https://doc.rust-lang.org/std/task/struct.Waker.html"
+      ]
+    },
+    {
+      "variant_id": "future-poll-waker",
+      "name": "Manual Future/Waker implementation",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.36",
+      "idiom_name": "impl Future for a hand-written completion registration",
+      "implementation_notes": "The manual ACT: when the completion comes from something no future owns (a raw epoll/io_uring registration, a C library callback, a custom completion queue), you implement Future yourself - poll attempts to reap the completion, and on Pending stores the passed Waker in the registration so the completer can wake this task. The token is then literally the registration object plus its stored waker, and the ownership rules of the pattern apply again: the registration must be removed when the operation ends, and the waker must be refreshed.",
+      "code_sketch": "impl Future for ReadOp {\n    type Output = Bytes;\n    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes> {\n        match self.registration.reap() {\n            Some(bytes) => Poll::Ready(bytes),\n            None => { self.registration.set_waker(cx.waker().clone()); Poll::Pending }\n        }\n    }\n}",
+      "pitfalls": [
+        "Storing a stale waker silently loses wakeups - overwrite it on every poll, because the executor may hand out a new one each time.",
+        "The registration must be unregistered when the operation completes or is dropped, or the completion path keeps a dangling entry.",
+        "Implement Wake (an Arc-backed safe trait) rather than assembling RawWaker vtables by hand: the data pointer of a wake handle must be thread-safe."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/task/struct.Waker.html",
+        "https://docs.rs/tokio/latest/tokio/task/fn.spawn.html"
+      ]
+    }
+  ],
+  "version": "1.0",
+  "idiom_name": "async fn + Future::poll / Waker",
+  "implementation_notes": "Rust makes the ACT structural: an async block compiles to a self-referential, Pin-protected state machine that owns the operation's state, and the executor keeps exactly one Waker per task, so the completing resource wakes precisely that task - the demultiplexing the pattern describes is done by the runtime, with no token table and no lookup by request identity. The executor and I/O driver come from a runtime crate (tokio, async-std); spawning gives the mirrored one-operation-one-handle form (tokio::spawn returns a JoinHandle whose .await demultiplexes that completion). Where no future owns the completion yet - raw epoll/io_uring registration, a C callback, a channel reply - you either implement Future yourself (the manual variant) or send a oneshot reply channel with the request, which is the pointer-era ACT in channel form.",
+  "code_sketch": "let handle = tokio::spawn(async move {\n    let reply = conn.call(request).await?;   // waker demultiplexes this completion\n    conn.apply(reply)\n});\nlet result = handle.await?;                  // JoinHandle = the client-side token",
+  "pitfalls": [
+    "A finished future must not be polled again - behaviour is unspecified (panic, block forever, or worse) - so never keep a completed future as a token.",
+    "A stored Waker must be the most recent one; scheduling an older waker misses wakeups, so refresh it with clone_from(cx.waker()) on every poll (will_wake avoids the clone).",
+    "A spawned task is dropped on runtime shutdown and a detached JoinHandle's completion is never demultiplexed - keep the handle when you need the result or the cancellation path.",
+    "async futures are address-sensitive: the pinned state must not move, and a hand-rolled RawWaker must point at a thread-safe value (Arc) or be replaced by implementing Wake."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/future/trait.Future.html",
+    "https://doc.rust-lang.org/std/task/struct.Waker.html"
+  ],
+  "default_variant": "async-await-future"
+}

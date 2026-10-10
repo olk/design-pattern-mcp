@@ -1,0 +1,70 @@
+{
+  "pattern": "contravariant-validators",
+  "language": "rust",
+  "support": "library",
+  "version": "1.0",
+  "idiom_name": "predicate::function + Predicate / PredicateBooleanExt (and/or/not)",
+  "implementation_notes": "Closures (impl Fn(&T) -> bool) are the raw carrier, but the combinator layer comes from the predicates crate: predicate::function(f) lifts any Fn(&T) -> bool, PredicateBooleanExt adds .and(), .or() and .not() returning composed AndPredicate/OrPredicate/NotPredicate values, and BoxPredicate type-erases a rule tree assembled at runtime - divide, choose and negation for predicates, with eval(&self, item: &T) taking the input by reference. Generic composition monomorphises; only the BoxPredicate boundary allocates.",
+  "code_sketch": "use predicates::prelude::*;\n\nlet port_ok = predicate::function(|c: &Config| (1..=65_535).contains(&c.port));\nlet host_ok = predicate::function(|c: &Config| !c.host.is_empty());\nlet valid   = host_ok.and(port_ok);        // divide; .or() branches, .not() negates\nassert!(valid.eval(&config));",
+  "pitfalls": [
+    "eval takes &self and the item by reference: a rule that mutates shared state (a counter, a cache) makes the verdict depend on evaluation order - keep predicates pure.",
+    "BoxPredicate erases the type and allocates per node, so a rule set rebuilt per request pays for it; keep the typed AndPredicate/OrPredicate chain when the rule set is fixed."
+  ],
+  "sources": [
+    "https://docs.rs/predicates/latest/predicates/",
+    "https://doc.rust-lang.org/std/ops/trait.Fn.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "predicates-crate",
+      "name": "predicates crate combinators over closures",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "idiom_name": "predicate::function + Predicate / PredicateBooleanExt (and/or/not)",
+      "implementation_notes": "Closures (impl Fn(&T) -> bool) are the raw carrier, but the combinator layer comes from the predicates crate: predicate::function(f) lifts any Fn(&T) -> bool, PredicateBooleanExt adds .and(), .or() and .not() returning composed AndPredicate/OrPredicate/NotPredicate values, and BoxPredicate type-erases a rule tree assembled at runtime - divide, choose and negation for predicates, with eval(&self, item: &T) taking the input by reference. Generic composition monomorphises; only the BoxPredicate boundary allocates.",
+      "code_sketch": "use predicates::prelude::*;\n\nlet port_ok = predicate::function(|c: &Config| (1..=65_535).contains(&c.port));\nlet host_ok = predicate::function(|c: &Config| !c.host.is_empty());\nlet valid   = host_ok.and(port_ok);        // divide; .or() branches, .not() negates\nassert!(valid.eval(&config));",
+      "pitfalls": [
+        "eval takes &self and the item by reference: a rule that mutates shared state (a counter, a cache) makes the verdict depend on evaluation order - keep predicates pure.",
+        "BoxPredicate erases the type and allocates per node, so a rule set rebuilt per request pays for it; keep the typed AndPredicate/OrPredicate chain when the rule set is fixed."
+      ],
+      "sources": [
+        "https://docs.rs/predicates/latest/predicates/",
+        "https://doc.rust-lang.org/std/ops/trait.Fn.html"
+      ]
+    },
+    {
+      "variant_id": "validator-derive",
+      "name": "validator crate derive attributes (declarative, accumulating)",
+      "paradigm": "declarative",
+      "min_standard": "Rust2018",
+      "idiom_name": "#[derive(Validate)] + #[validate(...)] field attributes",
+      "implementation_notes": "The validator crate puts rules on the data model: #[derive(Validate)] implements Validate and field attributes declare the checks (#[validate(email)], #[validate(url)], #[validate(length(min = 1))]) with custom(function = \"...\") for your own predicate. validate(&self) returns ValidationErrors, a map keyed by field path, so all field failures come back at once - the accumulating verdict an API or form needs. Composite structures are validated by deriving Validate at each level and calling validate() on the nested value from a custom function or the caller.",
+      "code_sketch": "use validator::{Validate, ValidationError};\n\nfn port_ok(p: &i32) -> Result<(), ValidationError> {\n    if (1..=65_535).contains(p) { Ok(()) } else { Err(ValidationError::new(\"port\")) }\n}\n\n#[derive(Validate)]\nstruct Config {\n    #[validate(length(min = 1))] host: String,\n    #[validate(custom(function = \"port_ok\"))] port: i32,\n}\nlet errors = config.validate().unwrap_err();   // one entry per failing field",
+      "pitfalls": [
+        "ValidationErrors is a map keyed by field path: flattening it into a single String at the boundary throws away the paths clients need to highlight a field.",
+        "Custom functions must have the exact signature fn(&T) -> Result<(), ValidationError>; a closure or an &str error does not compile, and the diagnostic points at the attribute rather than the signature."
+      ],
+      "sources": [
+        "https://docs.rs/validator/latest/validator/"
+      ]
+    },
+    {
+      "variant_id": "closure-enum-core",
+      "name": "Zero-dependency closures plus enum dispatch",
+      "paradigm": "functional",
+      "min_standard": "Rust2015",
+      "idiom_name": "Box<dyn Fn(&T) -> Result<(), E>> rule vectors + match on enums",
+      "implementation_notes": "With no dependencies the pattern is closures and enums: a rule is Box<dyn Fn(&T) -> Result<(), E>> (or impl Fn for monomorphised sets), a rule set is a Vec folded with accumulation or short-circuit, and choose is a match on an enum whose variants carry the branch data, which the compiler forces to be exhaustive. Reach for this in no_std crates, in zero-dependency libraries, and whenever a crate's fixed trait surface does not fit the rules you need; prefer impl Fn parameters over Box<dyn Fn> when the rule set is static, because they monomorphise to direct calls.",
+      "code_sketch": "type Rule<T, E> = Box<dyn Fn(&T) -> Result<(), E>>;\n\nfn all<T: Copy, E>(rules: &[Rule<T, E>], v: T) -> Result<(), Vec<E>> {\n    let errs: Vec<E> = rules.iter().filter_map(|r| r(&v).err()).collect();   // accumulate\n    if errs.is_empty() { Ok(()) } else { Err(errs) }\n}\n\nfn valid(plane: Plane) -> bool {\n    match plane { Plane::Num(n) => n > 0, Plane::Name(s) => !s.is_empty() }   // choose\n}",
+      "pitfalls": [
+        "Box<dyn Fn> is neither Clone nor thread-safe by default: sharing a rule set across threads needs dyn Fn(&T) -> Result<(), E> + Send + Sync behind an Arc.",
+        "Returning heap-allocated error strings from every rule allocates on the happy path; in hot loops return Option<&'static str> or a small enum instead."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/ops/trait.Fn.html",
+        "https://docs.rs/predicates/latest/predicates/"
+      ]
+    }
+  ],
+  "default_variant": "predicates-crate"
+}

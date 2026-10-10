@@ -1,0 +1,238 @@
+{
+  "category": "concurrency-resilience",
+  "name": "circuit-breaker",
+  "aliases": [
+    "circuit breaker"
+  ],
+  "intent": "Stop calling a dependency that keeps failing: wrap each dependency call in a per-dependency state machine that counts classified failures, trips to an open state once a threshold is reached, fails fast instead of waiting for timeouts, and admits a limited trial call after a cooldown to detect recovery.",
+  "problem": "A remote dependency - a service, database, broker or third-party API - becomes slow or starts failing, and every caller keeps calling it. Each call holds a thread, a connection and a slot in a shared pool until its timeout expires, so the dependency's latency leaks into the caller's own resource pools and requests that have nothing to do with that dependency start queueing and failing. Retrying makes it worse, because the dependency is flooded exactly while it needs to recover, and giving up entirely keeps the feature broken long after the dependency is healthy again.",
+  "context": "The client side of any call across a process or network boundary: service-to-service calls, database and cache access, third-party APIs, message publishing, serverless invocations. It applies when faults are persistent rather than transient (retrying alone is not enough), when the caller can exhaust its own resources while waiting (threads, connections, sockets, memory), and when one dependency failing should degrade one feature instead of the whole application. The classic form assumes a stable dependency identity - one breaker per dependency, shard or endpoint - and the state is per process unless it is shared or the failure domain is deliberately per instance.",
+  "benefits": [
+    "Fail fast instead of waiting: while open, calls return an error immediately, so callers stop spending threads, connections, latency budget and memory on an operation that is very likely to fail.",
+    "Gives the failing dependency room to recover: the load that was amplifying the outage is removed, which shortens the outage that started the cascade.",
+    "Contains cascading failure: the fault stays in the feature that uses the dependency instead of consuming the shared resource pools that unrelated requests also need.",
+    "Recovers automatically and observably: the half-open trial re-enables traffic as soon as the dependency answers again, and state transitions plus counts are a natural health signal for dashboards and alerts.",
+    "Turns an implicit policy into configured code: thresholds, windows, cooldowns and which outcomes count as failures become explicit, reviewable and testable instead of emerging from timeout values.",
+    "Composes with the other stability patterns: a breaker with a timeout, jittered retry and fallback is the standard stack, and the breaker is the component that decides when retrying has become pointless."
+  ],
+  "tradeoffs": [
+    "Partial protection: only calls routed through the breaker are protected, and one instance shared across endpoints, shards or tenants merges independent failure domains, so a healthy shard is rejected because a sibling shard is failing.",
+    "Threshold tuning is the pattern's real cost: too sensitive and the circuit flaps, rejecting healthy traffic; too lax and it never trips. It also needs a minimum number of calls before a rate is computed, otherwise a cold window trips on its first errors.",
+    "The half-open trial must be limited: releasing full traffic at the first sign of recovery floods a dependency that is still fragile, which is why permitted-trial counts and trial timeouts exist.",
+    "Short-circuit errors are a new failure mode: callers now receive a distinguishable, non-transient rejection, so they need a fallback path and their retry logic must exclude that error instead of retrying it.",
+    "The breaker bounds willingness, not duration: a call it admits can still hang for the dependency's own timeout, so without an accompanying timeout (and usually a bulkhead) threads and connections still pile up.",
+    "State is per process by default: N replicas each learn independently, so the dependency receives N waves of failing calls before every instance has tripped, unless state is shared through an external store with the extra dependency and latency that implies.",
+    "It costs something even when everything is healthy (counter update, clock read, threshold evaluation), and it forces a degradation decision on every caller, because an open circuit has to return something.",
+    "A stuck-open circuit is possible when failures are actually client-side errors, when the classification is too broad, or when the recovery signal never arrives, so monitoring, a manual trip/reset path and honest failure classification are part of the pattern rather than optional extras.",
+    "In serverless environments, in-memory breaker state is lost between invocations, requiring distributed state via DynamoDB, Redis or a durable entity so that one invocation's open state survives into the next."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 6,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Circuit Breaker (proxy)",
+      "responsibility": "One instance per dependency that wraps the protected call and decides from its own state whether to allow the call, to reject it immediately with a distinguishable error, or to let a limited trial through."
+    },
+    {
+      "role": "Protected operation",
+      "responsibility": "The dependency invocation (remote call, query, publish) whose outcome is classified as success, failure or ignored, and which is never executed while the circuit is open."
+    },
+    {
+      "role": "Failure classifier",
+      "responsibility": "Decides which outcomes count as failures, successes or ignored (business errors, cancellations, not-found, throttling), because a breaker that counts everything trips on normal application errors."
+    },
+    {
+      "role": "Window and counters",
+      "responsibility": "The rolling aggregation of classified outcomes (count- or time-based) plus the minimum number of calls required before a rate is evaluated - the data the trip decision is computed from."
+    },
+    {
+      "role": "Clock and cooldown timer",
+      "responsibility": "Monotonic time and the open-duration bookkeeping that decide when the open state may move to half-open; wall-clock time that can jump is never used."
+    },
+    {
+      "role": "State machine",
+      "responsibility": "The closed -> open -> half-open -> closed/open transitions, including the trip condition (failure rate, slow-call rate, consecutive failures) and the limited trial allowance in half-open."
+    },
+    {
+      "role": "Fallback / degradation policy",
+      "responsibility": "What the caller does when the breaker rejects or the call fails: cached or default value, reduced functionality, queued work or an honest error to the user."
+    },
+    {
+      "role": "State monitor and operations hook",
+      "responsibility": "State-transition events, counters, rejects and a manual trip/reset path, so the open state is visible and an operator can intervene when recovery behaviour is unpredictable."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "A service calling a flaky downstream API: trip on a failure-rate threshold so the caller's thread pool and connection pool survive the downstream outage instead of being consumed by waits.",
+    "Database or shard access where one node is slow: a breaker per shard keeps a degraded shard from consuming the whole connection pool and makes the failure visible per shard.",
+    "Third-party integrations with quotas or outages (payment, identity, geocoding, model providers): trip on 429/5xx and serve cached or degraded results instead of queueing requests behind a timeout.",
+    "Client libraries and SDKs used by many applications: ship the breaker inside the client so every consumer gets fail-fast and automatic recovery without writing it again.",
+    "Batch and background pipelines calling an external system: stop the run from burning its window on a dependency that is down, and resume on its own when the dependency returns.",
+    "Edge, gateway and worker tiers where a failing backend must leave rotation for a cooldown without an operator, while a limited trial call or health probe decides when it comes back.",
+    "Multi-instance deployments where per-host breakers can cascade after load redistribution: scope the breaker at the service-pool level rather than per host to prevent one node's failure from pushing traffic to the next in a wave.",
+    "Sharded or multi-tenant dependencies where partitions fail independently: one breaker per shard or tenant so that a single degraded partition does not take down the entire service.",
+    "Serverless functions (AWS Lambda, Azure Functions) calling external APIs: use a distributed breaker backed by DynamoDB or Redis so one invocation's open state is visible to subsequent invocations of the same function.",
+    "Kubernetes sidecar or service mesh (Istio/Envoy, Linkerd): implement circuit breaking at the infrastructure layer so application code is decoupled from resilience configuration and the mesh handles outlier detection and pool limits automatically.",
+    "Cell-based or multi-region architectures: a breaker per cell or region isolates a degraded region's dependency failures from healthy ones, enabling selective failover rather than a full-site incident.",
+    "Multi-tenant SaaS platforms: a per-tenant resource-level breaker (e.g., payments.charge per tenant) prevents one misbehaving tenant from exhausting shared infrastructure and taking down others.",
+    "Streaming ingest pipelines: stop a pipeline from consuming its output window on a downstream that is back-pressured, and resume when the backpressure clears without losing the pipeline's processing slot.",
+    "Service proxy and gateway data planes (Envoy): enforce distributed, non-coordinated circuit breaking per upstream cluster and per priority - max connections, pending requests, active retries and connection pools with overflow counters - so applications fail fast without resilience code in the application.",
+    "Netflix-style microservice clients (Hystrix, Resilience4j): wrap each remote dependency in a breaker with thread-pool or semaphore isolation and a fallback; Hystrix established the canonical closed/open/half-open state machine and its maintenance-mode status marks Resilience4j as the successor for new JVM work.",
+    "Node.js async clients (opossum): wrap promise-returning network or disk operations in a breaker configured by timeout, errorThresholdPercentage and resetTimeout with a fallback hook, so every SDK consumer gets fail-fast semantics without writing the state machine."
+  ],
+  "avoid_when": [
+    "The dependency is in-process or local (in-memory structures, local computation): a breaker only adds bookkeeping and can trip on application errors.",
+    "Failures are genuinely transient and a bounded retry with backoff plus a timeout recovers them; add the breaker when the retry budget is repeatedly exhausted, not by default.",
+    "Failure isolation already happens in infrastructure (orchestrator health checks, proxy retries, service mesh outlier detection): configure that layer instead of rebuilding it in application code.",
+    "The architecture is message-driven and the platform already isolates failure (dead-letter channel, durable retry, consumer pause): a breaker on top usually duplicates existing handling.",
+    "The call must not be skipped for correctness reasons (ledger writes, mandatory security checks): refusing to call is a business decision that belongs in application code, not in a resilience library.",
+    "A cooldown of hard failures is worse than waiting or degrading in place: when answers may be stale and latency is cheap, an explicit fallback with a generous timeout is enough.",
+    "The system is in a cold-start, low-traffic phase where minimum-call thresholds cannot be met: the breaker will stay closed regardless of failures or will trip on statistical noise from a handful of calls, so threshold tuning and separate traffic-light alerts are required."
+  ],
+  "language_files": {
+    "generic": "circuit-breaker.generic.json",
+    "c": "circuit-breaker.c.json",
+    "cplusplus": "circuit-breaker.cplusplus.json",
+    "csharp": "circuit-breaker.csharp.json",
+    "go": "circuit-breaker.go.json",
+    "java": "circuit-breaker.java.json",
+    "javascript": "circuit-breaker.javascript.json",
+    "kotlin": "circuit-breaker.kotlin.json",
+    "python": "circuit-breaker.python.json",
+    "ruby": "circuit-breaker.ruby.json",
+    "rust": "circuit-breaker.rust.json",
+    "scala": "circuit-breaker.scala.json",
+    "swift": "circuit-breaker.swift.json",
+    "typescript": "circuit-breaker.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "module",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "bulkhead",
+    "timeout",
+    "retry-with-backoff",
+    "graceful-degradation",
+    "fail-fast",
+    "health-check-endpoint",
+    "state",
+    "proxy",
+    "cache-aside",
+    "dead-letter-channel",
+    "rate-limiting"
+  ],
+  "anti_patterns": [
+    "One global breaker for all dependencies (or for every endpoint of one dependency), so unrelated failures merge and a single fault opens everything.",
+    "Retrying inside the breaker, or retrying the breaker's rejection: by definition the failure is not transient while the circuit is open.",
+    "A breaker without a timeout around the protected call: threads are still held until the dependency's own timeout, so only willingness is protected.",
+    "Treating the open state as an outage substitute: returning a generic server error instead of designing a fallback, cached or degraded response.",
+    "Self-healing by assumption: no state visibility, no alert on transitions and no manual trip/reset, so an open circuit is discovered from user reports.",
+    "Copying thresholds between services: minimum-call counts and cooldowns that fit a high-volume endpoint silently disable or flap a low-volume one.",
+    "Synchronized half-open without jitter: all instances transition to half-open simultaneously after the cooldown, creating a coordinated recovery spike that re-trips the dependency.",
+    "Percentage-only threshold with no minimum-call floor: at low traffic a handful of failures reaches the percentage threshold and trips on noise, creating artificial outages.",
+    "Per-host breaker without aggregate scope: when one host's breaker opens and load is redistributed, surviving hosts see elevated error rates that cascade into their own breakers.",
+    "In-memory state in serverless: a Lambda circuit breaker that does not persist state to DynamoDB/Redis allows each cold-start invocation to re-flood a still-down dependency before learning it is open.",
+    "Misaligned slow-call threshold: setting slowCallDurationThreshold longer than the HTTP client timeout means requests exhaust thread pools before the breaker registers slowness, defeating the pattern's purpose.",
+    "Insufficient success threshold in half-open: requiring only one probe success before closing means a single lucky call on a partially-recovered dependency re-closes the circuit and floods it with real traffic before recovery is confirmed."
+  ],
+  "design_principles": [
+    "Fail fast: a bounded, cheap rejection beats an unbounded wait for an operation that is very likely to fail.",
+    "Separation of concerns: admission policy (breaker), duration policy (timeout), volume policy (rate limit, bulkhead) and recovery policy (retry, fallback) are distinct decisions.",
+    "State belongs to the dependency, not the request: failure history must span many calls, so the unit of decision is the dependency instance.",
+    "Explicit policy: thresholds, windows and failure classification are design decisions made visible in code and configuration rather than left implicit in timeout values.",
+    "Observability as a first-class outcome: the open state is information about a broken dependency, so transitions and counts are always instrumented.",
+    "Isolation per failure domain: one instance per dependency, shard or tenant, never one instance for unrelated targets.",
+    "Half-open is probation, not recovery: the half-open state admits limited probe traffic to detect recovery, not real production load, and must be treated as a fragile testing window.",
+    "Layer timeouts at every level: HTTP/client timeout < slow-call threshold < breaker's cooldown; each layer handles a different failure mode.",
+    "Serverless state is distributed: Lambda invocations are stateless, so breaker state must survive across invocations via an external store or durable entity.",
+    "Slow-call detection precedes failure detection: a dependency returning HTTP 200 with high latency is accumulating resource cost before it fails outright; trip on slow-call rate before the failure rate spikes.",
+    "Layer at the right boundary: application-level breakers protect business logic, service-mesh breakers (Istio outlier detection) protect infrastructure; do not duplicate both without a clear reason."
+  ],
+  "best_practices": [
+    "One breaker per dependency (or per shard/tenant that fails independently), named after it - never per call site and never shared across unrelated targets.",
+    "Classify failures explicitly: count connection errors, timeouts and server-side faults; ignore business, validation and cancellation outcomes.",
+    "Require a minimum number of calls before evaluating a rate, and trip on a rate (optionally slow-call rate) rather than on raw failure counts.",
+    "Pair the breaker with a timeout and usually a bulkhead: the breaker bounds willingness, the timeout bounds duration, the bulkhead bounds concurrency.",
+    "Teach the other patterns about it: retries and hedging must exclude the short-circuit error, and fallbacks must be fast, side-effect free and safe to repeat.",
+    "Instrument transitions, counts and rejects, alert on open and keep a manual trip/reset path for recovery patterns that are hard to predict.",
+    "Tune the cooldown to the dependency's real recovery time and prefer a limited trial or an active health probe over restarting traffic all at once.",
+    "Share or persist breaker state only when replica-level double learning actually hurts, and account for the extra dependency and latency if you do.",
+    "Add jitter to the wait duration when running multiple instances: even 200-500ms of random jitter prevents all replicas from synchronizing their half-open transitions and creating a coordinated recovery spike.",
+    "Scope the breaker at the service-pool level, not per host: per-host breakers change the input signal when load is redistributed after one host opens, which can cascade into a wave of openings.",
+    "Trip on slow-call rate in addition to failure rate: a dependency that returns HTTP 200 but slowly is just as dangerous as one that returns 5xx, and slow-call tripping prevents resource accumulation before the dependency is fully unresponsive.",
+    "Keep the half-open probe timeout shorter than the normal call timeout: a probe that would succeed but is merely slow must not be counted as a failure, or the breaker reopens before recovery is confirmed.",
+    "Enable automatic half-open transition with caution in multi-instance deployments: without jitter, every instance transitions at the same instant; consider a wrapper that adds random jitter or disable automatic transition and rely on the first real request to trigger the transition.",
+    "Combine the breaker with a bulkhead even when the breaker is healthy: bulkheads cap the concurrent probe traffic during half-open, preventing the recovery test itself from overwhelming a still-fragile dependency.",
+    "Configure success threshold in half-open as at least 2: a single lucky probe can re-close a circuit on a dependency that is only partially recovered; require multiple successful probes before committing to full traffic.",
+    "Exercise the breaker in failure scenarios before production: chaos inject latency and faults to verify state transitions, fallback paths and recovery behaviour; a breaker that has never been observed to open cannot be trusted.",
+    "Alert on transition frequency, not just open state: a breaker that flaps (multiple closed-open-closed transitions per minute) signals a threshold misconfiguration or an intermittent issue that the breaker is only partially masking.",
+    "In serverless (Lambda/Azure Functions): use a distributed breaker backed by DynamoDB, Redis or a durable entity so that an open state from one invocation persists into the next; avoid in-memory state which resets on every cold start.",
+    "In Kubernetes/service mesh: prefer Istio outlier detection for infrastructure-level circuit breaking and reserve application-level breakers for business-critical calls that need custom failure classification and fallback logic.",
+    "For multi-tenant systems: use per-tenant resource keys (e.g., tenantId:payment:charge) so one misbehaving tenant's failures do not open the circuit for other tenants sharing the same service.",
+    "Coordinate slow-call threshold with HTTP timeouts: set slowCallDurationThreshold below the HTTP/client timeout so slowness is detected before threads are held for the full timeout duration.",
+    "When using a service mesh breaker alongside an application breaker, disable one layer to avoid double-protection that amplifies latency or causes premature tripping."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Nygard, M. - Release It! Design and Deploy Production-Ready Software (Pragmatic Bookshelf, 2007; 2nd ed. 2018), Stability Patterns: Circuit Breaker - originating catalog entry for the pattern.",
+    "https://martinfowler.com/bliki/CircuitBreaker.html",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker",
+    "https://pragprog.com/titles/mnee2/release-it-second-edition/",
+    "https://resilience4j.readme.io/docs/circuitbreaker",
+    "https://www.pollydocs.org/strategies/circuit-breaker.html",
+    "https://github.com/resilience4j/resilience4j - Resilience4j official documentation on circuit breaker configuration, sliding windows, and best practices.",
+    "https://www.youngju.dev/blog/architecture/2026-03-06-architecture-circuit-breaker-resilience4j-patterns.en - Chaos and Order blog: Resilience4j circuit breaker practical implementation with case studies on permanent open circuits and half-open bottlenecks.",
+    "https://www.michal-drozd.com/en/blog/circuit-breaker-anti-patterns/ - Circuit Breaker Anti-Patterns: shared breakers, hypersensitive thresholds, half-open stampedes, missing fallbacks, and testing gaps.",
+    "https://systemweakness.com/%EF%B8%8F-the-half-open-state-that-caused-a-second-outage-b1ab189ab6fe - Real incident analysis: synchronized recovery spike from too-short wait duration and too many permitted half-open calls per pod.",
+    "https://sujeet.pro/articles/circuit-breaker-patterns - Comprehensive circuit breaker patterns guide including Shopify Semian analysis, per-host cascading, half-open oscillation, and retry amplification.",
+    "https://medium.com/@systemdesignwithsage/the-circuit-breaker-that-tripped-at-the-wrong-threshold-4b23d1355e38 - Incident report: percentage-only threshold causing false positives at low volume, per-host cascade, and half-open recovery oscillation.",
+    "https://knowledgelib.io/software/patterns/circuit-breaker/2026 - Implementation guide with parameter tables, library comparisons (opossum, pybreaker, Resilience4j, Polly, gobreaker), and common pitfalls.",
+    "https://istio.io/latest/docs/tasks/traffic-management/circuit-breaking/ - Istio official documentation on circuit breaking via DestinationRule and Envoy outlier detection at the service mesh layer.",
+    "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/circuit-breaker.html - AWS Prescriptive Guidance: serverless circuit breaker implementation using AWS Step Functions and DynamoDB for distributed state.",
+    "https://aws.amazon.com/blogs/compute/using-the-circuit-breaker-pattern-with-aws-lambda-extensions-and-amazon-dynamodb/ - AWS Compute Blog: Lambda extension-based circuit breaker with DynamoDB-backed distributed state for serverless environments.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker - Azure Architecture Center: circuit breaker guidance tailored for serverless (Azure Functions) and multi-cloud resilient architectures.",
+    "https://www.usenix.org/system/files/nsdi25-lu.pdf - USENIX NSDI 2025: 'One-Size-Fits-None' study on slow-fault tolerance, demonstrating that circuit breaker slow-call thresholds must be workload-tuned and that conservative defaults can cause 98% degradation under injected network delays.",
+    "https://arxiv.org/pdf/2512.16959 - Systematic literature review (SLR) of microservice recovery strategies 2014-2025, synthesizing evidence on circuit breakers, retry with jitter, and backoff strategies across 75+ primary studies.",
+    "http://acme.able.cs.cmu.edu/pubs/uploads/pdf/spe2023-resilence-bench-accepted.pdf - ACM SPE 2023: declarative benchmark tool for Retry and Circuit Breaker patterns; empirical evaluation across Polly (C#) and Resilience4j (Java) under varying failure rates and workloads.",
+    "https://www-users.york.ac.uk/~jcm567/files/ICSA2020.pdf - IEEE ICSA 2020: model-based analysis of Circuit Breaker and Retry using PRISM probabilistic model checker to quantify how pattern parameters affect availability under varying service availability.",
+    "https://timderzhavets.com/blog/ambassador-pattern-building-resilient-proxies-that/ - Ambassador pattern as a sidecar resilience layer: deploying circuit breakers alongside application containers in Kubernetes for language-agnostic, zero-code-change resilience.",
+    "https://www.scien.cx/2026/05/02/postmortem-the-2026-slack-outage-due-to-istio-1-22-circuit-breaker-misconfiguration/ - March 2026 postmortem: Slack-wide 2h27m outage caused by misconfigured Istio 1.22 circuit breaker (outlier detection) with overly aggressive settings affecting 18.2M users.",
+    "https://blog.stackademic.com/we-lost-340k-in-47-minutes-because-our-circuit-breaker-was-too-slow-75e1e97a3242 - $340K payment incident: Stripe timeout increase from 5s to 15s desynchronized with existing circuit breaker thresholds, causing connection pool exhaustion before fail-fast activated.",
+    "https://dev.to/pponali/circuit-breakers-under-stress-anatomy-of-a-payment-cascade-hn0 - Circuit Breakers Under Stress: flash-sale spike (10x RPS) caused cascading payment service failure, highlighting connection pool and threshold interaction under burst load.",
+    "https://github.com/blackblacktigerHQ/resilience-circuitbreaker - Distributed, tenant-aware, resource-level circuit breaker for multi-tenant SaaS: per-tenant-per-resource keys with Redis-backed shared state across Lambda replicas.",
+    "https://gunnargrosch.com/posts/circuit-breakers-on-aws-lambda-why-in-memory-state-silently-fails - Why in-memory circuit breaker state silently fails in AWS Lambda: cold starts reset state, requiring DynamoDB or durable entity persistence for meaningful serverless protection.",
+    "https://johal.in/envoy-130-istio-121-implement-circuit-breaking-retries - Envoy 1.30 and Istio 1.21: per-subsystem circuit breaking (HTTP/1.1, HTTP/2, gRPC) with per-priority limits to reduce false positives compared to a single global threshold.",
+    "https://theclarity.today/story/half-open-twice-is-not-the-same-state-the-bug-that-shaped-breakwater-1-0-0601f3ef - Breakwater 1.0 post-mortem: the ABA bug in globally shared circuit breaker state where two separate half-open periods are incorrectly treated as equivalent, creating correctness failures in distributed recovery.",
+    "https://bffrepositorio.unal.edu.co/server/api/core/bitstreams/05054c00-1ac5-4de5-a7ba-9b08ff4bef5b/content - Model-driven engineering study: empirical evaluation of Circuit Breaker and Retry performance impact on microservice architectures under controlled failure injection.",
+    "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking - Envoy official architecture documentation: distributed, non-coordinated per-cluster, per-priority circuit breaking (max connections, pending requests, active retries, concurrent connection pools) with overflow counters - the canonical infrastructure-layer implementation.",
+    "https://github.com/Netflix/Hystrix - Netflix Hystrix README: the implementation that popularized the closed/open/half-open state machine with thread-pool isolation and fallbacks; officially in maintenance mode, with Netflix pointing new projects at adaptive concurrency and Resilience4j.",
+    "https://github.com/nodeshift/opossum - opossum official repository: Node.js fail-fast circuit breaker for async functions configured by timeout, errorThresholdPercentage and resetTimeout with optional fallback function.",
+    "https://www.javacodegeeks.com/2026/07/the-circuit-breaker-patterns-hidden-assumptions-when-fail-fast-fails-slow.html - Criticism: the pattern assumes failure is binary and recovery is easy to detect, but production failures are partial and gradual, so naive fail-fast thresholds misfire on degraded rather than dead dependencies."
+  ],
+  "related_patterns_notes": {
+    "rate-limiter": "rate-limiter",
+    "hedged-requests": "hedged-requests",
+    "ambassador": "ambassador",
+    "outlier-detection": "outlier-detection"
+  }
+}

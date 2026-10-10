@@ -1,0 +1,77 @@
+{
+  "pattern": "competing-consumers",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::mutex + std::condition_variable work queue (C++11 baseline)",
+  "implementation_notes": "The default in-process realization: a std::queue guarded by std::mutex with a std::condition_variable waking one waiting worker per item, and N std::thread consumers that pop under the lock and process outside it. Only one thread can complete a pop, so the queue itself is the arbiter; a second condition variable (not_full) adds the capacity bound that std::queue lacks.",
+  "code_sketch": "std::queue<Job> q; std::mutex m; std::condition_variable cv;\nfor (int i = 0; i < n; ++i)\n  workers.emplace_back([&] {\n    for (;;) {\n      std::unique_lock lk(m);\n      cv.wait(lk, [&] { return !q.empty() || stopping; });\n      if (q.empty()) return;                // stopping\n      Job j = std::move(q.front()); q.pop();\n      lk.unlock();                          // never hold the lock while working\n      process(j); ack(j);\n    }\n  });",
+  "pitfalls": [
+    "Condition-variable waits must loop on the predicate; a missed notification otherwise parks workers with items still queued.",
+    "Processing inside the critical section serialises the pool - the dequeue must release the lock before the handler runs.",
+    "std::queue has no capacity, so the producer side grows memory without backpressure unless a not_full condition is added."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-mutex-condvar-queue",
+      "name": "std::mutex + std::condition_variable work queue (C++11 baseline)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::mutex + std::condition_variable work queue (C++11 baseline)",
+      "implementation_notes": "The default in-process realization: a std::queue guarded by std::mutex with a std::condition_variable waking one waiting worker per item, and N std::thread consumers that pop under the lock and process outside it. Only one thread can complete a pop, so the queue itself is the arbiter; a second condition variable (not_full) adds the capacity bound that std::queue lacks.",
+      "code_sketch": "std::queue<Job> q; std::mutex m; std::condition_variable cv;\nfor (int i = 0; i < n; ++i)\n  workers.emplace_back([&] {\n    for (;;) {\n      std::unique_lock lk(m);\n      cv.wait(lk, [&] { return !q.empty() || stopping; });\n      if (q.empty()) return;                // stopping\n      Job j = std::move(q.front()); q.pop();\n      lk.unlock();                          // never hold the lock while working\n      process(j); ack(j);\n    }\n  });",
+      "pitfalls": [
+        "Condition-variable waits must loop on the predicate; a missed notification otherwise parks workers with items still queued.",
+        "Processing inside the critical section serialises the pool - the dequeue must release the lock before the handler runs.",
+        "std::queue has no capacity, so the producer side grows memory without backpressure unless a not_full condition is added."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "jthread-stop-token",
+      "name": "std::jthread workers with cooperative stop",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "jthread",
+        "stop_token"
+      ],
+      "idiom_name": "std::jthread workers with cooperative stop",
+      "implementation_notes": "C++20 removes the shutdown boilerplate: std::jthread joins on destruction and carries a std::stop_token, so workers wait on condition_variable_any with the token's stop callback and the pool stops without a hand-rolled 'stopping' flag and last-worker notification. The competing-consumer mechanics are unchanged - one mutex-guarded queue, N threads - but lifetime management moves into the language.",
+      "code_sketch": "std::vector<std::jthread> workers;\nfor (int i = 0; i < n; ++i)\n  workers.emplace_back([&](std::stop_token st) {\n    while (!st.stop_requested()) {\n      std::unique_lock lk(m);\n      cv.wait(lk, st, [&] { return !q.empty(); });\n      if (q.empty()) return;                 // stop requested\n      Job j = std::move(q.front()); q.pop(); lk.unlock();\n      process(j); ack(j);\n    }\n  });\n",
+      "pitfalls": [
+        "Forget to pass the stop_token into the wait and a stopped pool finishes its current item but never exits the loop.",
+        "A jthread that owns the queue must outlive it: member declaration order decides destruction order, and stopping after the queue is gone is undefined behaviour."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    },
+    {
+      "variant_id": "zeromq-pull",
+      "name": "ZeroMQ PULL workers (broker in the socket)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "libzmq"
+      ],
+      "idiom_name": "ZeroMQ PULL workers (broker in the socket)",
+      "implementation_notes": "When the competing consumers are processes rather than threads, ZeroMQ supplies the queue as a socket type: PUSH producers bind and N PULL workers connect, and libzmq distributes each message to exactly one connected worker (fair-queuing), which is the pattern across processes and hosts without writing a broker or a lock. The trade-off is an external dependency and its own failure model - no persistence, no acknowledgement, no redelivery.",
+      "code_sketch": "// worker:\nzmq::context_t ctx;\nzmq::socket_t pull(ctx, zmq::socket_type::pull);\npull.connect(\"tcp://producer:5555\");\nfor (;;) {\n  zmq::message_t msg;\n  auto r = pull.recv(msg, zmq::recv_flags::none);\n  if (!r) break;\n  process(msg);                          // exactly one PULL peer gets each message\n}",
+      "pitfalls": [
+        "PUSH/PULL has no acknowledgement or persistence: a worker that dies after recv loses the message unless the application adds an ack layer or a broker.",
+        "Fair-queuing only holds for connected peers - slow-joiner effects (a worker connecting late misses work) are a common surprise when scaling out."
+      ],
+      "sources": [
+        "https://zguide.zeromq.org/docs/chapter1/",
+        "https://zeromq.org/socket-api/"
+      ]
+    }
+  ],
+  "default_variant": "std-mutex-condvar-queue"
+}

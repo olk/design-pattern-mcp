@@ -1,0 +1,66 @@
+{
+  "pattern": "revocable-forwarder",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "class with __getattr__/__setattr__/__delattr__ plus a revoked flag",
+  "implementation_notes": "Python has no revocable proxy in the standard library, so the forwarder is hand-written: a class holding the target and a flag, forwarding attribute access through __getattr__ (and __setattr__/__delattr__ when the target's attributes are written through) and raising on every path once revoked. The data model supplies two caveats that shape the code: __getattr__ runs only after normal lookup fails, so anything defined on the proxy class shadows the target's member of the same name, and implicit special-method invocation bypasses __getattribute__, so len(), subscripting, iteration or await reach the target unless the proxy defines them too. Raise a dedicated exception subclass so callers can tell revocation apart from a genuine target error.",
+  "code_sketch": "class SessionFwd:\n    def __init__(self, target):\n        object.__setattr__(self, \"_t\", target)\n        object.__setattr__(self, \"_revoked\", False)\n    def __getattr__(self, name):\n        if self._revoked: raise CapabilityRevoked(name)\n        return getattr(self._t, name)          # methods resolve on the target\n    def revoke(self):\n        object.__setattr__(self, \"_revoked\", True)",
+  "pitfalls": [
+    "Implicit special-method lookup bypasses __getattribute__ and __getattr__, so len(proxy), proxy[k], iteration and await reach the target and stay callable after revocation unless the proxy defines them explicitly.",
+    "__getattr__ is consulted only when normal lookup fails, so a convenience method or attribute defined on the proxy class silently shadows the target's; keep the proxy's own API minimal and document it as unrevokable surface.",
+    "A proxy that keeps a strong reference to the target keeps it alive after revocation (hold weakref.ref if revocation should end the target's life), and one shared proxy instance reused for several grants revokes them all at once."
+  ],
+  "sources": [
+    "https://docs.python.org/3/reference/datamodel.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "dunder-proxy",
+      "name": "Hand-written attribute-forwarding proxy",
+      "paradigm": "oo",
+      "idiom_name": "class with __getattr__/__setattr__/__delattr__ plus a revoked flag",
+      "implementation_notes": "Python has no revocable proxy in the standard library, so the forwarder is hand-written: a class holding the target and a flag, forwarding attribute access through __getattr__ (and __setattr__/__delattr__ when the target's attributes are written through) and raising on every path once revoked. The data model supplies two caveats that shape the code: __getattr__ runs only after normal lookup fails, so anything defined on the proxy class shadows the target's member of the same name, and implicit special-method invocation bypasses __getattribute__, so len(), subscripting, iteration or await reach the target unless the proxy defines them too. Raise a dedicated exception subclass so callers can tell revocation apart from a genuine target error.",
+      "code_sketch": "class SessionFwd:\n    def __init__(self, target):\n        object.__setattr__(self, \"_t\", target)\n        object.__setattr__(self, \"_revoked\", False)\n    def __getattr__(self, name):\n        if self._revoked: raise CapabilityRevoked(name)\n        return getattr(self._t, name)          # methods resolve on the target\n    def revoke(self):\n        object.__setattr__(self, \"_revoked\", True)",
+      "pitfalls": [
+        "Implicit special-method lookup bypasses __getattribute__ and __getattr__, so len(proxy), proxy[k], iteration and await reach the target and stay callable after revocation unless the proxy defines them explicitly.",
+        "__getattr__ is consulted only when normal lookup fails, so a convenience method or attribute defined on the proxy class silently shadows the target's; keep the proxy's own API minimal and document it as unrevokable surface.",
+        "A proxy that keeps a strong reference to the target keeps it alive after revocation (hold weakref.ref if revocation should end the target's life), and one shared proxy instance reused for several grants revokes them all at once."
+      ],
+      "sources": [
+        "https://docs.python.org/3/reference/datamodel.html"
+      ]
+    },
+    {
+      "variant_id": "wrapt-object-proxy",
+      "name": "wrapt.ObjectProxy subclass",
+      "paradigm": "oo",
+      "idiom_name": "wrapt transparent object proxy with a guarded __getattribute__",
+      "implementation_notes": "wrapt ships a transparent object proxy: subclass wrapt.ObjectProxy and either override the members you must gate or override __getattribute__ to check the flag before delegating, and the proxy already implements most special methods so the hand-written proxy's dunder leaks are covered. Proxy-local state must be prefixed with _self_ (the documented convention) or assignments are written through to the wrapped object; since wrapt 2.0 the recommended base class is BaseObjectProxy, because ObjectProxy retains the legacy __iter__ that makes every proxy look iterable.",
+      "code_sketch": "import wrapt\n\nclass SessionFwd(wrapt.ObjectProxy):\n    def __init__(self, target):\n        super().__init__(target)\n        self._self_revoked = False          # _self_ keeps it off the wrapped object\n    def __getattr__(self, name):\n        if self._self_revoked: raise CapabilityRevoked(name)\n        return super().__getattr__(name)\n    def revoke(self):\n        self._self_revoked = True",
+      "pitfalls": [
+        "Forgetting the _self_ prefix stores the flag on the wrapped object (or raises for objects without a __dict__), so the revocation state leaks into the target or vanishes.",
+        "ObjectProxy's legacy __iter__ makes the proxy look iterable even when the target is not, which produces confusing failures; derive from BaseObjectProxy where that matters."
+      ],
+      "sources": [
+        "https://wrapt.readthedocs.io/en/latest/wrappers.html"
+      ]
+    },
+    {
+      "variant_id": "scoped-context",
+      "name": "Scope-bound grant through a context manager",
+      "paradigm": "oo",
+      "idiom_name": "contextlib.contextmanager factory: yields the forwarder, revokes on exit",
+      "implementation_notes": "Revocation can be made a property of control flow instead of an operation someone must remember: a contextlib.contextmanager factory creates the forwarder, yields it inside the with block and revokes in the finally path, so leaving the block - normally or through an exception - ends the grant. exitStack/AsyncExitStack generalise the same idea to many simultaneous grants. This is the variant to choose when grants are short and lexically scoped; it cannot revoke early on demand, so manual grants still need the plain proxy.",
+      "code_sketch": "from contextlib import contextmanager\n\n@contextmanager\ndef lent(target):\n    fwd = SessionFwd(target)\n    try:\n        yield fwd                        # collaborator works inside the block\n    finally:\n        fwd.revoke()                     # leaving the block always revokes\n\nwith lent(session) as s: s.write(b\"...\")   # after the block: revoked",
+      "pitfalls": [
+        "Context managers built with @contextmanager are single-use: entering the same one twice raises, so a reusable grant factory must be called again for each grant.",
+        "A revoke in the finally path runs while the exception is propagating, so if revocation itself uses resources (locks, network) it can mask or delay the original error."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/contextlib.html"
+      ]
+    }
+  ],
+  "default_variant": "dunder-proxy",
+  "version": "1.0"
+}

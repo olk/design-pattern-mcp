@@ -1,0 +1,59 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "javascript",
+  "support": "library",
+  "idiom_name": "assertQueue arguments + channel.nack(msg, false, false)",
+  "implementation_notes": "On Node the dead-letter channel is a pair of declarations plus one acknowledgement decision. Declare the dead-letter exchange and its queue, pass {'x-dead-letter-exchange': ..., 'x-dead-letter-routing-key': ...} in the arguments of assertQueue for the source queue, and call channel.nack(msg, false, false) when the handler decides the message is terminal - the broker handles the routing, and it also dead-letters on TTL expiry and queue-length overflow. There is no application-level 'DeadLetterQueue' object to write: the source of truth is the queue argument, and the DLQ side is an ordinary consumer that reads the x-death header. Prefer a broker policy over hardcoded arguments once the queue exists in production.",
+  "code_sketch": "const ch = await conn.createChannel();\nawait ch.assertExchange('dlx', 'direct', { durable: true });\nawait ch.assertQueue('orders.dlq', { durable: true });\nawait ch.bindQueue('orders.dlq', 'dlx', 'failed');\nawait ch.assertQueue('orders', { durable: true, arguments: {\n  'x-dead-letter-exchange': 'dlx', 'x-dead-letter-routing-key': 'failed' } });\nawait ch.consume('orders', msg => {\n  try { handle(msg); ch.ack(msg); }\n  catch (e) { ch.nack(msg, false, false); }   // requeue=false -> broker dead-letters\n});",
+  "pitfalls": [
+    "nack with requeue=true (the third argument) puts the poison message back at the head of the queue, where it spins in a hot loop and starves every other consumer.",
+    "Dead-lettering silently drops the message when the dead-letter exchange does not exist at dead-letter time, and a redeploy that recreates the queue with different arguments fails with PRECONDITION_FAILED.",
+    "An exception inside the consume callback leaves the message unacked; after the channel closes the broker redelivers it, and the path to the DLQ is then decided by delivery counts rather than by your code.",
+    "message.content is a Buffer: JSON.parse on it throws for exactly the malformed payloads that need parking, so the DLQ path must handle unparseable bodies without rethrowing."
+  ],
+  "sources": [
+    "https://amqp-node.github.io/amqplib/channel_api.html",
+    "https://www.rabbitmq.com/docs/dlx"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "amqplib-dlx",
+      "name": "RabbitMQ dead-letter exchange declared with amqplib",
+      "paradigm": "declarative",
+      "min_standard": "ES2017",
+      "idiom_name": "assertQueue arguments + channel.nack(msg, false, false)",
+      "implementation_notes": "On Node the dead-letter channel is a pair of declarations plus one acknowledgement decision. Declare the dead-letter exchange and its queue, pass {'x-dead-letter-exchange': ..., 'x-dead-letter-routing-key': ...} in the arguments of assertQueue for the source queue, and call channel.nack(msg, false, false) when the handler decides the message is terminal - the broker handles the routing, and it also dead-letters on TTL expiry and queue-length overflow. There is no application-level 'DeadLetterQueue' object to write: the source of truth is the queue argument, and the DLQ side is an ordinary consumer that reads the x-death header. Prefer a broker policy over hardcoded arguments once the queue exists in production.",
+      "code_sketch": "const ch = await conn.createChannel();\nawait ch.assertExchange('dlx', 'direct', { durable: true });\nawait ch.assertQueue('orders.dlq', { durable: true });\nawait ch.bindQueue('orders.dlq', 'dlx', 'failed');\nawait ch.assertQueue('orders', { durable: true, arguments: {\n  'x-dead-letter-exchange': 'dlx', 'x-dead-letter-routing-key': 'failed' } });\nawait ch.consume('orders', msg => {\n  try { handle(msg); ch.ack(msg); }\n  catch (e) { ch.nack(msg, false, false); }   // requeue=false -> broker dead-letters\n});",
+      "pitfalls": [
+        "nack with requeue=true (the third argument) puts the poison message back at the head of the queue, where it spins in a hot loop and starves every other consumer.",
+        "Dead-lettering silently drops the message when the dead-letter exchange does not exist at dead-letter time, and a redeploy that recreates the queue with different arguments fails with PRECONDITION_FAILED.",
+        "An exception inside the consume callback leaves the message unacked; after the channel closes the broker redelivers it, and the path to the DLQ is then decided by delivery counts rather than by your code.",
+        "message.content is a Buffer: JSON.parse on it throws for exactly the malformed payloads that need parking, so the DLQ path must handle unparseable bodies without rethrowing."
+      ],
+      "sources": [
+        "https://amqp-node.github.io/amqplib/channel_api.html",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    },
+    {
+      "variant_id": "bullmq-failed-set",
+      "name": "BullMQ job queue: attempt budget plus the failed set",
+      "paradigm": "oo",
+      "min_standard": "Node14",
+      "idiom_name": "attempts/backoff + Queue.getFailed() as the dead-letter view",
+      "implementation_notes": "For job queues the dead-letter channel is a state, not a second queue: BullMQ retries each job according to attempts and backoff, and when the budget is exhausted the job moves into the failed set, where it is queryable (getFailed, getFailedCount) and replayable (job.retry()) or removable. The pattern's obligations are unchanged - keep the payload and failedReason/stacktrace (removeOnFail must be false), alert on failed counts, and replay deliberately - but the mechanism is a Redis-backed failed set instead of a broker DLX, so 'parking' costs nothing until someone looks. When the same payload should also be visible to non-BullMQ consumers, publish it to a broker DLQ in the failed event handler as well.",
+      "code_sketch": "const q = new Queue('orders', { connection });\nawait q.add('apply', payload, {\n  attempts: 5,\n  backoff: { type: 'exponential', delay: 1000 },\n  removeOnFail: false,                       // keep the dead letter\n});\nconst dead = await q.getFailed(0, 50);       // operator view of the failed set\nawait dead[0].retry();                       // deliberate replay, idempotency required",
+      "pitfalls": [
+        "removeOnFail defaults often mean the failed job is deleted after success or on new attempts: without removeOnFail:false there is no dead letter to inspect.",
+        "retry() re-executes the processor with the stored data, so replaying a payment or email without an idempotency guard duplicates the side effect.",
+        "A monitor script that retries the failed set on a timer turns the dead-letter view into a retry queue and hides failures that need a code fix.",
+        "The failed set lives in Redis: an eviction policy or a flushdb during incident response erases the parked payloads, so a durable copy (log, object store or broker DLQ) is worth having."
+      ],
+      "sources": [
+        "https://docs.bullmq.io/guide/retrying-failing-jobs"
+      ]
+    }
+  ],
+  "default_variant": "amqplib-dlx"
+}

@@ -1,0 +1,230 @@
+{
+  "category": "concurrency-resilience",
+  "name": "async-method-invocation",
+  "aliases": [
+    "asynchronous method invocation",
+    "asynchronous procedure call"
+  ],
+  "intent": "Let the caller initiate a potentially long-running operation without blocking its current thread, then collect the value, failure, cancellation or completion notification later through an owned handle, callback or awaitable that makes the result a first-class value.",
+  "problem": "A remote request, file or network I/O, or expensive computation holds the calling thread until it finishes, even when independent work could proceed. Hand-starting a worker and separately marshalling the value, failure, cancellation and completion signal back at every call site duplicates that policy per call and invites lost wake-ups, swallowed exceptions, lifetime races and unbounded queues; there is no reusable invocation contract for the initiate-now / collect-later split.",
+  "context": "Concurrent programs in which the result of a call is not needed immediately: event-loop or UI threads that must stay responsive, servers that want many requests in flight without one OS thread per request, and call graphs with several independent long-running operations that should overlap. It presupposes a runtime facility that can run the call out of band - a thread or thread pool, an event loop with non-blocking I/O, a coroutine scheduler, or asynchronous I/O completion notification - plus a way to carry the outcome back to the caller.",
+  "benefits": [
+    "Latency hiding: the caller continues with independent work while the operation runs, so a task made of several independent calls takes about as long as its slowest call instead of the sum of all of them.",
+    "Throughput and scalability: a request no longer holds an OS thread while it waits, so thousands of outstanding operations fit into one process.",
+    "The result becomes a first-class value: a future, handle or deferred can be stored, returned, passed around, combined with other results, timed out or cancelled - impossible with a plain blocking call.",
+    "A uniform completion and error channel: the outcome of an out-of-band operation is delivered through the same handle, callback or await path as a value, instead of being lost in a worker thread or aborting the process.",
+    "Policy is separated from logic: the operation says what to do, the executor decides where and when it runs, so the same logic runs synchronously in tests and asynchronously in production.",
+    "The pattern composes: fan-out over many independent calls, race, all-settled and cancellation are expressible once the caller holds handles instead of blocked stacks."
+  ],
+  "tradeoffs": [
+    "The call stack stops telling the story: the continuation runs on another thread, tick or coroutine, so breakpoints, stack traces and thread-local context (security subject, transaction, logging/tracing correlation, tenant) do not automatically follow the result and must be propagated explicitly.",
+    "Asynchrony brings its own failure modes: results and exceptions that nobody collects are silently dropped, callbacks race with shutdown, and code that blocks inside a bounded pool or event loop deadlocks or starves the very scheduler the awaited work needs.",
+    "Concurrency becomes unbounded unless the caller adds admission control: the resource limit moves from the number of threads to the number of queued tasks, their buffers and their memory, so overload now shows up as latency and heap growth instead of refused work.",
+    "Every operation gains a second API: an async twin must be maintained beside (or layered over) the synchronous form, with its own naming convention, return type and error path, and callers must know which one to call.",
+    "Testing and debugging need determinism controls the synchronous case never required - injected executors or clocks, fake awaitables, and explicit synchronisation to observe intermediate states.",
+    "Fire-and-forget use is seductive and usually wrong: without an owner that collects or reports the outcome, the pattern hides failures that a synchronous call would have surfaced immediately."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 5,
+    "simplicity": 4,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Client (Caller)",
+      "responsibility": "Invokes the asynchronous variant of the operation and continues its own work; later collects the result by awaiting/joining it, tests completion, or receives the notification."
+    },
+    {
+      "role": "Asynchronous Method Invariant (async variant / proxy)",
+      "responsibility": "The operation entry point that returns immediately: it captures the arguments, hands the work to an executor and returns the result handle instead of running the operation inline."
+    },
+    {
+      "role": "Async Result (handle / future / deferred / Task)",
+      "responsibility": "Carries the completion state, the value or the failure of the operation, and the operations to test, wait for, combine, time out or cancel it; the sole channel through which the outcome may be observed."
+    },
+    {
+      "role": "Completion Callback (optional)",
+      "responsibility": "Continuation invoked by the runtime when the operation completes; must not assume it runs on the caller's thread and therefore must re-establish any context it needs."
+    },
+    {
+      "role": "Executor / Scheduler",
+      "responsibility": "Runs the operation out of band (thread or pool, event loop, coroutine dispatcher, virtual-thread scheduler, AIO completion) and completes the handle; owns the concurrency policy while the operation stays policy-free."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "User interfaces: a long computation, file read or network call is started and the result applied when it arrives, so the UI thread keeps rendering and reacting to input.",
+    "Server request handlers that fan out several independent downstream calls (database, cache, remote service) and collect them together instead of issuing them serially.",
+    "Batch and ETL jobs that start many independent units of work, collect results as they complete, and bound how many run at once.",
+    "Generated client stubs for middleware and RPC (Ice AMI, .NET APM, generated async proxies): the caller keeps a handle or a callback while the reply is awaited out of band.",
+    "Background work triggered from a request path when the response does not depend on the outcome, provided the task keeps an explicit completion/error sink.",
+    "Interactive applications polling-shedding: expensive refreshes triggered by user actions where the previous computation is cancelled or superseded rather than awaited.",
+    "Async streaming and chunked responses: server-sent events, WebSocket message streams, or async iterators where each chunk is produced by an independent async call and the caller processes them as they arrive.",
+    "Async database drivers and connection pools: connection acquisition, query execution, and transaction management where the caller must stay responsive while the database I/O completes.",
+    "Async middleware and interceptor chains: web frameworks where each middleware step is an async operation and the chain must compose without blocking the request-handling thread.",
+    "Webhook and callback registration with async sinks: registering an async callback with an external service where the caller must remain reactive while the remote event is processed out of band.",
+    "Distributed tracing across async boundaries: propagating trace context (trace ID, span ID) through async method invocations so that a single request can be followed across process and network boundaries.",
+    "CORBA Messaging AMI: poll objects and result callbacks let a client overlap remote invocations while still collecting replies, with a completion token when one callback handles many calls.",
+    ".NET TAP APIs such as HttpClient.GetAsync and Stream.ReadAsync: Task<T> carries completion and failure while UI or server code awaits without holding a thread during I/O.",
+    "Python asyncio services: create_task or TaskGroup overlaps non-blocking network calls while an owning scope collects results, cancels children and surfaces failures.",
+    "Tokio async Rust: tokio::spawn starts a task on the runtime and returns a JoinHandle that carries its output, reports panics as JoinError, and abort()s the task; dropping the handle detaches the task, so the handle itself encodes the ownership choice.",
+    "Go fan-out with golang.org/x/sync/errgroup: Group.Go starts subtask goroutines, Wait blocks until all finish and returns the first non-nil error, and WithContext derives a context cancelled on the first error or at Wait; SetLimit bounds concurrent subtasks.",
+    "Swift async/await: async functions return at each await suspension point; async let and withThrowingTaskGroup start child tasks whose results the enclosing scope awaits, with cancellation and priority flowing down the task tree."
+  ],
+  "avoid_when": [
+    "The caller cannot do anything useful before the result: use the synchronous method because an async twin adds a handle, scheduler hop and second error path without hiding useful latency.",
+    "The operation is cheap and CPU-bound: use a direct call or an explicitly bounded CPU executor because handle, queue and context-switch overhead can dwarf the work.",
+    "The work is genuinely fire-and-forget and no outcome matters: use an explicit background queue or worker with logging, retry/loss policy and metrics, not a detached task nobody owns.",
+    "The runtime already exposes framework-level await, generated async stubs or an async ORM/HTTP client: use that contract instead of rebuilding a handle/callback layer that can defeat its scheduling.",
+    "Ordering, transaction scope or ambient context must hold across the call and cannot be propagated: keep the call synchronous inside that scope rather than letting an async boundary violate its invariants.",
+    "Use future-promise when the missing piece is only an eventual-result abstraction for work that is already scheduled; AMI also defines how invocation starts and who owns completion.",
+    "Use active-object when a stateful object needs an activation queue, serialized servant execution or method-level scheduling; AMI decouples one call and does not imply object confinement or serialization.",
+    "Use asynchronous-completion-token when a callback needs correlation data to identify a completion; a token is a delivery aid inside AMI, not a complete asynchronous invocation contract."
+  ],
+  "language_files": {
+    "generic": "async-method-invocation.generic.json",
+    "c": "async-method-invocation.c.json",
+    "cplusplus": "async-method-invocation.cplusplus.json",
+    "csharp": "async-method-invocation.csharp.json",
+    "go": "async-method-invocation.go.json",
+    "java": "async-method-invocation.java.json",
+    "javascript": "async-method-invocation.javascript.json",
+    "kotlin": "async-method-invocation.kotlin.json",
+    "python": "async-method-invocation.python.json",
+    "ruby": "async-method-invocation.ruby.json",
+    "rust": "async-method-invocation.rust.json",
+    "scala": "async-method-invocation.scala.json",
+    "swift": "async-method-invocation.swift.json",
+    "typescript": "async-method-invocation.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "active-object",
+    "future-promise",
+    "event-based-asynchronous",
+    "asynchronous-completion-token",
+    "callback",
+    "thread-pool",
+    "structured-concurrency",
+    "proactor",
+    "reactor",
+    "pipe-and-filter",
+    "retry"
+  ],
+  "anti_patterns": [
+    "Wrong move: put long-running work before the async entry point returns -> the caller still blocks and only the name/return type is asynchronous -> instead validate arguments, schedule the work and return the active handle promptly.",
+    "Wrong move: drop a task, future or promise without an owner -> value and failure disappear, shutdown can lose work, or an unhandled rejection aborts the host -> instead await/join it, use a structured scope, or route errors to an explicit sink.",
+    "Wrong move: call get(), result() or join() inside the coroutine, event loop, UI thread or bounded pool that must run the awaited task -> latency becomes deadlock or a frozen loop -> instead await without blocking or move blocking work to separate capacity.",
+    "Wrong move: create one unbounded task per request or item -> the limit moves from threads to queues and memory while latency grows without bound -> instead enforce admission, bounded queues and backpressure.",
+    "Wrong move: add an async twin to every method, including calls whose result is needed immediately -> the API and error paths double without useful overlap -> keep the synchronous method where no latency can be hidden.",
+    "Wrong move: nest callbacks even though the handle supports composition -> control inversion and error paths become a callback pyramid -> compose futures/promises or use structured async scopes.",
+    "Wrong move: await independent operations one by one in a loop -> total latency becomes the sum of each operation -> start the handles first and await them together with the language's all/join combinator.",
+    "Wrong move: expose async void outside a UI event-handler contract -> callers cannot await completion and exceptions escape to SynchronizationContext -> return Task or Task<T> so an owner can observe the outcome.",
+    "Wrong move: call asyncio.create_task without retaining the Task -> the event loop's weak reference allows premature collection and an unobserved exception -> store it, use TaskGroup, or attach an explicit done callback.",
+    "Wrong move: pass an async callback to a synchronous API such as Array.prototype.forEach or a void-returning Action -> the returned Promise is ignored and failures escape -> use a native async API, for...of with await, or Promise.all over map.",
+    "Wrong move: create a Promise inside try/catch and return it without awaiting it -> the try boundary does not catch a later rejection -> await inside the try or return it to a caller that owns the rejection path."
+  ],
+  "design_principles": [
+    "Separation of concerns: the operation's logic, the scheduling decision and the delivery of the outcome are three independent responsibilities.",
+    "Single responsibility per participant: the handle reports state and outcome, the executor chooses where work runs, the callback reacts to completion - none of them contains domain logic.",
+    "Dependency inversion: callers depend on an executor/scheduler abstraction, not on a concrete thread, pool or event loop.",
+    "Make the implicit explicit: completion, failure and cancellation are part of the contract (returned handle, error channel, token/deadline), never ambient side effects.",
+    "Do not block a resource you still need: a design that waits for work inside the scheduler that must perform it is self-defeating.",
+    "Ownership: every started operation has exactly one owner responsible for collecting or reporting its outcome.",
+    "Context propagation: ambient state (tenant ID, trace context, security principal, transaction) must be captured and restored explicitly at the async boundary; it does not travel with the continuation automatically.",
+    "Composition over nesting: prefer composing handles with all-settled, race, or structured scopes rather than nesting callbacks or awaiting sequentially when independence allows parallel execution."
+  ],
+  "best_practices": [
+    "Keep the synchronous part of an async operation to argument validation and starting the work; everything else belongs to the scheduled task.",
+    "Give every invocation an owner: a handle you await or join, a structured scope that joins its children, or an explicit error sink - never a bare detached task.",
+    "Propagate cancellation, deadlines and context (tenant, tracing, transaction) explicitly into the operation; thread-local and ambient state do not travel with the continuation.",
+    "Bound concurrency at the executor (pool size, semaphore, admission limit) and add backpressure instead of starting unbounded tasks.",
+    "Test the failure path: an exception raised inside the operation must arrive at the collector, and a dropped result must be a test failure, not a log line.",
+    "Prefer the language's standard handle/await mechanism over hand-rolled result structures; hand-write them only when an external contract (an interface, a middleware API, a framework callback shape) demands it.",
+    "Collect results as they complete when the caller can act on partial progress, instead of joining handles in start order.",
+    "Python asyncio: use asyncio.TaskGroup (Python 3.11+) instead of asyncio.gather - TaskGroup holds strong references to child tasks, cancels all siblings on the first failure, and surfaces all exceptions as an ExceptionGroup. Use asyncio.gather only for best-effort batches where partial success is acceptable.",
+    "Python asyncio: propagate context across task boundaries using the context parameter of asyncio.create_task() and asyncio.TaskGroup.create_task(), or by wrapping contextvars.Context.copy_context() - without explicit propagation, ContextVar values do not flow between tasks.",
+    "Python asyncio: always store Task objects in a collection if they must survive beyond the current scope; the event loop holds only weak references. Use add_done_callback to auto-remove completed tasks from tracking collections.",
+    "JavaScript/TypeScript: prefer Promise.all for independent operations that must all succeed; use Promise.allSettled when partial results are acceptable so one failure does not discard the results of already-succeeded siblings.",
+    "JavaScript/TypeScript: always add timeouts to external calls using AbortController / AbortSignal.timeout() or a Promise.race against a delay; without a timeout, a stalled request hangs indefinitely.",
+    "JavaScript/TypeScript: avoid async callbacks in Array.prototype.forEach, Array.prototype.map with in-place side effects, or synchronous APIs expecting void callbacks - the returned Promise is always ignored. Use for...of with await for sequential loops, or Promise.all with map for parallel batches.",
+    "C# / .NET: in library code, use ConfigureAwait(false) to avoid posting continuations back to the original SynchronizationContext; this prevents deadlocks in single-threaded contexts and improves throughput.",
+    "C# / .NET: prefer ValueTask<T> over Task<T> for async methods that frequently complete synchronously (hot paths, cached reads); avoid ValueTask<T> when the same task may be awaited multiple times.",
+    "C# / .NET: when creating a TaskCompletionSource<T>, always pass TaskCreationOptions.RunContinuationsAsynchronously to avoid running continuations inline on the completing thread, which can cause deadlocks and starvation.",
+    "C# / .NET: never use async void except in UI event handlers where the API requires a void delegate type; always return Task or Task<T> so callers can observe completion and exceptions.",
+    "C# / .NET: avoid Task.Run for long-running blocking work; it queues to the thread pool and steals threads from other work. Use a dedicated thread or TaskCreationOptions.LongRunning for true long-running tasks, and prefer async I/O for I/O-bound work.",
+    "Rust async: use JoinSet or explicit CancellationToken propagation instead of abruptly dropping futures; abrupt cancellation does not notify the dropped future or trigger cleanup. Always await the join handle to observe the task's final state.",
+    "Rust async: be explicit about Send bounds on async fn when the result will be awaited across thread boundaries; the compiler enforces this but the error message is clearer when anticipated during design.",
+    "Java: always attach a timeout to CompletableFuture chains using orTimeout() or CompletableFuture.allOf() with a delayed future; a chain without a timeout can hang the thread indefinitely on a dropped or never-completed future.",
+    "Java: use structured concurrency via StructuredTaskScope (Java 21+) for related tasks - the scope owns the child threads, waits for all of them, cancels all on the first failure, and eliminates orphaned thread-of-the-week bugs.",
+    "Global: register a process-level unhandled rejection/exception handler so that escaped async errors are logged before process exit - never silently swallow errors that escaped the caller's try/catch."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Allan Vermeulen, \"An Asynchronous Design Pattern\", Dr. Dobb's Journal, June 1996 - the IOU (\"I owe you\") pattern, documented as equivalent to asynchronous method invocation.",
+    "ZeroC, Distributed Programming with Ice 3.2.1, section 33.2.1 \"Asynchronous Method Invocation (AMI)\" (archived): the call does not block the calling thread while the run time awaits the reply, and the application is notified through a callback. https://web.archive.org/web/20080105093534/http://www.zeroc.com/doc/Ice-3.2.1/manual/Async.34.2.html",
+    "Wikipedia, \"Asynchronous method invocation\": definition, the equivalence to Vermeulen's IOU pattern, the common use inside Active Object, and the Java (FutureTask) and .NET (APM/EAP/TAP) realization history. https://en.wikipedia.org/wiki/Asynchronous_method_invocation",
+    "Java Design Patterns, \"Async Method Invocation Pattern in Java\": modern catalog entry with the AsyncExecutor/AsyncResult/AsyncCallback roles and the CompletableFuture-based Java realization. https://java-design-patterns.com/patterns/async-method-invocation/",
+    "Microsoft, \"Task-based Asynchronous Pattern (TAP)\": one method represents initiation and completion, the return type carries the result and the failure, and the legacy APM/EAP shapes are contrasted with it. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/task-based-asynchronous-pattern-tap",
+    "Stephen Toub, \"Async/Await FAQ\", Microsoft .NET Blog, 2012 - deep technical explanation of async/await semantics, SynchronizationContext capture, ConfigureAwait, async void, Task vs Task.Run, and the difference between blocking and awaiting. https://devblogs.microsoft.com/dotnet/asyncawait-faq/",
+    "Microsoft, \"Common Async Mistakes and How to Solve Them\": async void hazards, deadlock from blocking on async, missing await warnings (CS4014), Task.Run vs async, ContinueWith vs await, TaskCompletionSource.RunContinuationsAsynchronously. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/common-async-bugs",
+    "Microsoft, \"Async Lambda Pitfalls\": async lambdas matching void-returning delegate types (Action), Parallel.ForEach with async lambdas becoming fire-and-forget, Task.Factory.StartNew with async lambdas returning Task<Task>. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/async-lambda-pitfalls",
+    "Python documentation, \"Coroutines and Tasks\", asyncio-task module: TaskGroup, contextvars propagation, create_task() weak-reference hazard, cancellation mechanics, shield(), timeout(). https://docs.python.org/3/library/asyncio-task.html",
+    "async-concurrency.com, \"Structured Concurrency with asyncio.TaskGroup\": TaskGroup vs gather, ExceptionGroup, except* syntax, nested groups, timeout composition, GC hazard and diagnostic hooks. https://async-concurrency.com/asyncio-fundamentals-event-loop-architecture/coroutine-design-patterns/structured-concurrency-with-asyncio-taskgroup/",
+    "async-concurrency.com, \"Asyncio Cancellation Patterns\": cooperative cancellation, task.cancel(), CancelledError semantics, shield(), uncancel(), cancel-and-drain pattern, shutdown hygiene. https://async-concurrency.com/resilience-cancellation-error-handling/cancellation-patterns/",
+    "PEP 789 (Python), \"Preventing task-cancellation bugs by limiting yield in async generators\": yield inside cancel scopes (TaskGroup, asyncio.timeout) causes wrong-task cancellation, dropped exceptions, and ignored deadlines; async context managers are the safe replacement. https://peps.python.org/pep-0789/",
+    "Hamed Bouare, \"Asyncio in Production: The Pitfalls Tutorials Never Cover\", 2024: gather failure modes, TaskGroup ownership, weak-reference hazard, asyncio.timeout(), lifespan shutdown pattern for FastAPI. https://hamedbouare.me/en/blog/asyncio-production",
+    "Alexi Turcotte et al., \"DrAsync: Identifying and Visualizing Anti-Patterns in Asynchronous JavaScript\", ICPC 2023: empirical study finding 2.6K static anti-pattern instances across 20 popular JS repositories; 8 anti-patterns including asyncFunctionNoAwait, loopOverArrayWithAwait, explicitPromiseConstructor. https://reallytg.github.io/files/papers/drasync.pdf",
+    "Syed J., \"Async/Await in TypeScript: Promises, Types, and Traps\", DevNook 2026: typed async functions, Promise.all/allSettled/race/any, floating promises, React useEffect with async, strict unknown catch variables, top-level await. https://devnook.dev/languages/typescript/async-await/",
+    "Logeshwaran, \"JavaScript Async/Await: Every Pattern, Pitfall, and Performance Trick\", CheatCoders 2026: sequential vs parallel awaits, Promise combinators, AbortController, concurrency limits, top-10 async mistakes. https://cheatcoders.net/javascript-async-await-patterns-pitfalls/",
+    "Nazar Boyko, \"Promises Are Simple Until They Are Not\", 2024: Promise combinator failure semantics, AbortController cancellation, three-layer error handling (per-call, per-feature, global unhandledrejection). https://www.nazarboyko.com/articles/promises-are-simple-until-they-are-not",
+    "Baransel Arslan, \"Mastering Async/Await in JavaScript: 7 Mistakes to Avoid\", 2025: forgetting await, sequential awaits in loops, missing error handling, mixing .then() and await, async constructors. https://baransel.dev/post/mastering-async-await-javascript-mistakes/",
+    "OpenJDK, JEP 525: \"Structured Concurrency (Sixth Preview)\": StructuredTaskScope as a preview feature, fork/join model, virtual threads, FailedException, ShutdownOnSuccess/ShutdownOnFailure policies. https://openjdk.org/jeps/525",
+    "Oracle, \"Structured Concurrency\", Java SE 25 docs: StructuredTaskScope usage with try-with-resources, fork/join, cancellation propagation, thread dump JSON format showing scope hierarchy. https://docs.oracle.com/en/java/javase/25/core/structured-concurrency.html",
+    "Rust documentation, \"Structured Concurrency\", The Rust Async Book: structured concurrency philosophy, temporal scope follows lexical scope, Trio nursery comparison, Tokio select cancellation, async destructor gap. https://rust-lang.github.io/async-book/part-reference/structured.html",
+    "Markus Voelter, Michael Kircher, Uwe Zdun and Michael Englbrecht, \"Patterns for Asynchronous Invocations in Distributed Object Frameworks\" (EuroPLoP 2003): defines Fire and Forget, Sync with Server, Poll Objects and Result Callback as client-side asynchrony patterns with POSA lineage. https://hillside.net/europlop/HillsideEurope/Papers/EuroPLoP2003/2003_VoelterEtAl_PatternsForAsynchronousInvocations.pdf",
+    "Microsoft, \"Task-based Asynchronous Pattern (TAP): Introduction and overview\": Task and Task<TResult> represent initiation and completion, while TAP contrasts with APM and EAP and specifies cancellation and progress conventions. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/task-based-asynchronous-pattern-tap",
+    "Oracle, \"CompletableFuture\", Java SE 21 API: a Future and CompletionStage supporting dependent actions, explicit executors, allOf/anyOf and timeout-aware collection. https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+    "Python documentation, \"Futures\": asyncio.ensure_future schedules a coroutine or awaitable into a Task, recommends retaining a reference, and points to create_task and TaskGroup for modern ownership. https://docs.python.org/3/library/asyncio-future.html",
+    "MDN, \"async function\": every call returns a Promise, the synchronous prefix runs through the first await, and uncaught exceptions reject that Promise. https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/async_function",
+    "Kotlin documentation, \"Composing suspending functions\": async returns Deferred, await collects its result, and coroutineScope provides structured ownership and sibling cancellation. https://kotlinlang.org/docs/composing-suspending-functions.html",
+    "Microsoft, \"Synchronous wrappers for asynchronous methods\": sync-over-async can deadlock single-threaded contexts and starve thread pools; avoid blocking wrappers where possible. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/synchronous-wrappers-for-asynchronous-methods",
+    "Microsoft, \"Common async/await bugs\": async void loses awaitability and exception observation, blocking can deadlock, and missing await creates fire-and-forget bugs. https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/common-async-bugs",
+    "Tokio documentation, \"JoinHandle\": an owned handle to a spawned task; awaiting yields the task's output or a JoinError on panic or cancellation, abort() cancels the task, and dropping the handle detaches it with its return value lost. https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html",
+    "Go documentation, \"errgroup package\" (golang.org/x/sync/errgroup): Group runs a set of goroutines working on subtasks, Wait returns the first non-nil error, WithContext cancels the derived context on the first error, and SetLimit/TryGo bound concurrency. https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "Swift Evolution SE-0304, \"Structured Concurrency\": Task and TaskGroup as the async invocation and collection contract, with cancellation, priority and errors propagating down a structured task tree. https://github.com/apple/swift-evolution/blob/main/proposals/0304-structured-concurrency.md",
+    "Apple Developer Documentation, \"Concurrency\" (Swift): Task as a unit of asynchronous work, AsyncSequence/AsyncStream for deferred element delivery, and executors that run scheduled jobs. https://developer.apple.com/documentation/swift/concurrency",
+    "typescript-eslint, \"no-floating-promises\" rule: a Promise-valued expression is unsafe unless awaited, returned, handled with .then/.catch, or explicitly voided; voiding silences the lint but does not handle runtime rejections. https://typescript-eslint.io/rules/no-floating-promises"
+  ],
+  "related_patterns_notes": {
+    "active-object": "owns an activation queue and usually serializes a stateful servant; AMI only decouples a call and does not imply object confinement or serialization.",
+    "future-promise": "represents an eventual result and its completion state; AMI is the invocation contract that schedules work and assigns ownership, often returning a Future or Promise.",
+    "event-based-asynchronous": "reports completion through events or handlers; AMI may use callbacks but gives the call a first-class result/error handle and collection contract.",
+    "asynchronous-completion-token": "correlates a completion callback with its originating invocation; AMI is the larger invocation pattern and may use a token as one delivery mechanism.",
+    "callback": "supplies a continuation to run on completion; AMI can expose the same callback shape but also defines scheduling, result ownership and failure observation.",
+    "thread-pool": "supplies bounded worker capacity; AMI is the caller-facing invocation contract that may run on a pool, event loop, coroutine scheduler or I/O completion facility.",
+    "structured-concurrency": "scopes child lifetimes and propagates cancellation/failure; AMI can be implemented inside such a scope but does not require lexical ownership.",
+    "proactor": "dispatches completion handlers for operations initiated asynchronously; AMI describes the method call and result ownership, while a proactor can be its I/O executor.",
+    "reactor": "demultiplexes readiness events and invokes handlers; AMI represents the deferred operation and its outcome, which a reactor may help drive.",
+    "pipe-and-filter": "composes a stream of transformations through stages; AMI is a single invocation boundary and should not be mistaken for a data-flow topology.",
+    "retry": "repeats failed work under a policy; AMI only transports one invocation's result or failure, so retries must be an explicit layer with idempotency and deadline rules."
+  }
+}

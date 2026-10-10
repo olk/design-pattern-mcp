@@ -1,0 +1,19 @@
+{
+  "pattern": "caching",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hash table + intrusive recency list + mutex (no stdlib cache)",
+  "implementation_notes": "C has no cache abstraction, so the pattern is assembled from parts: a hash table (POSIX hcreate/hsearch, or a hand-rolled open-addressing table) stores values under string keys while an intrusive doubly linked list next to it gives O(1) recency updates and O(1) eviction of the least recently used entry. The policy layer - when to evict (entries or bytes), when an entry is stale (compare time() against a TTL), who removes an entry when its source changes - is application code, and so is concurrency control: hsearch is not thread-safe and its default table is process-global state, so a shared cache needs a mutex (or hsearch_r with a per-cache handle plus a lock) around every lookup and insertion. Ownership must be explicit, because the cache - not the caller - usually frees the value of an evicted entry; the classic structure stays justified in long-running daemons and embedded targets where no cache library is available.",
+  "code_sketch": "entry_t *cache_get(cache_t *c, const char *key) {\n    pthread_mutex_lock(&c->lock);\n    entry_t *e = map_find(c, key);                  /* hsearch_r / open addressing */\n    if (e) {\n        lru_touch(c, e);                            /* move to MRU head: O(1) */\n        entry_retain(e);                            /* eviction unlinks; release frees later */\n    }\n    pthread_mutex_unlock(&c->lock);\n    return e;                                       /* caller must entry_release(e) */\n}\n/* put: lock; if (count == capacity) lru_evict_unreferenced(c); map_insert(strdup(key), value); unlock */\n/* writer path after commit: cache_del(c, key) - invalidation is never automatic */",
+  "pitfalls": [
+    "hcreate/hsearch share one process-global table and are not thread-safe; use hsearch_r with your own handle and guard it, or concurrent readers corrupt the table.",
+    "A looked-up value is only borrowed: another thread can evict and free it while the caller still uses it - return reference-counted handles or copy under the lock whenever eviction can run concurrently.",
+    "The POSIX hash table cannot grow (hcreate fixes nel up front) and stores no recency, TTL or size metadata, so capacity, eviction and expiry must be implemented next to it rather than delegated.",
+    "Keys are pointers: copy key strings on insert and free them on eviction, or the cache keeps dangling pointers into caller-owned buffers."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/hsearch.3.html",
+    "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+  ],
+  "version": "1.1"
+}

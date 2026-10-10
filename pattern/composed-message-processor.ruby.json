@@ -1,0 +1,56 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "ruby",
+  "support": "manual",
+  "idiom_name": "parts.map { Thread.new { route(_1) } } + map(&:value) + inject",
+  "implementation_notes": "Ruby's core gives threads and queues, not a composite: map the parts to Thread.new { route(p) } (or push them into a Thread::Queue drained by a fixed worker pool) and then call Thread#value on each thread - it joins the thread and returns the block's value, so the collected array is the aggregation input and a plain inject performs the merge. The GVL means CPU-bound parts do not run truly in parallel, so threads pay off for I/O-bound parts; reach for concurrent-ruby (next variant) when a promise/executor abstraction is wanted instead of raw threads.",
+  "code_sketch": "threads = split(order).map { |part| Thread.new { route(part) } }\nresults = threads.map(&:value)                    # join + collect (barrier)\nresults.inject(Report.empty) { |acc, r| acc.merge(r) }",
+  "pitfalls": [
+    "Thread#value re-raises the part's exception at the join point while the remaining threads keep running; abort_on_exception only changes visibility, not the semantics.",
+    "The GVL serialises CPU-bound work: use threads for I/O-bound parts and processes (or a worker fleet) for CPU-bound ones.",
+    "Thread.new per part is unbounded and expensive; a Thread::Queue with N workers is the pool equivalent of the same fan-out."
+  ],
+  "sources": [
+    "https://ruby-doc.org/core-3.1.2/Thread.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "thread-value",
+      "name": "Thread per part + Thread#value fan-in",
+      "paradigm": "concurrent",
+      "min_standard": "Ruby3.0",
+      "idiom_name": "parts.map { Thread.new { route(_1) } } + map(&:value) + inject",
+      "implementation_notes": "Ruby's core gives threads and queues, not a composite: map the parts to Thread.new { route(p) } (or push them into a Thread::Queue drained by a fixed worker pool) and then call Thread#value on each thread - it joins the thread and returns the block's value, so the collected array is the aggregation input and a plain inject performs the merge. The GVL means CPU-bound parts do not run truly in parallel, so threads pay off for I/O-bound parts; reach for concurrent-ruby (next variant) when a promise/executor abstraction is wanted instead of raw threads.",
+      "code_sketch": "threads = split(order).map { |part| Thread.new { route(part) } }\nresults = threads.map(&:value)                    # join + collect (barrier)\nresults.inject(Report.empty) { |acc, r| acc.merge(r) }",
+      "pitfalls": [
+        "Thread#value re-raises the part's exception at the join point while the remaining threads keep running; abort_on_exception only changes visibility, not the semantics.",
+        "The GVL serialises CPU-bound work: use threads for I/O-bound parts and processes (or a worker fleet) for CPU-bound ones.",
+        "Thread.new per part is unbounded and expensive; a Thread::Queue with N workers is the pool equivalent of the same fan-out."
+      ],
+      "sources": [
+        "https://ruby-doc.org/core-3.1.2/Thread.html"
+      ]
+    },
+    {
+      "variant_id": "concurrent-promises",
+      "name": "concurrent-ruby Promises zip_futures_over",
+      "paradigm": "concurrent",
+      "min_standard": "Ruby3.0",
+      "requires_features": [
+        "concurrent-ruby"
+      ],
+      "idiom_name": "Concurrent::Promises.zip_futures_over(parts) { |p| route(p) }.value!",
+      "implementation_notes": "concurrent-ruby's Promises expose zip_futures_over(enumerable) { |element| ... }, which becomes resolved after all per-element futures resolve - split, fan-out and barrier in one call; .value! blocks and returns the results array (or re-raises), and the merge is a reduce over it. The library advertises a lock-free synchronization layer, executors with a controllable concurrency level and back-pressure-aware channels, which is what you would otherwise hand-roll on Thread + Queue.",
+      "code_sketch": "results = Concurrent::Promises.zip_futures_over(parts) { |p| route(p) }.value!\nresults.inject(Report.empty) { |acc, r| acc.merge(r) }",
+      "pitfalls": [
+        "value!/value blocks the calling thread; calling it from inside a promise executor can deadlock the pool.",
+        "zip_futures_over resolves only when all futures resolve and value! re-raises the first rejection, so partial aggregates need explicit rescue/future chaining."
+      ],
+      "sources": [
+        "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/Promises.html"
+      ]
+    }
+  ],
+  "default_variant": "thread-value",
+  "version": "1.0"
+}

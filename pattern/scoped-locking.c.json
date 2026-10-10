@@ -1,0 +1,78 @@
+{
+  "pattern": "scoped-locking",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread_mutex_lock + single-exit goto ladder",
+  "implementation_notes": "ISO C has no destructors and no scope-exit hook, so the scope-bound release is a convention: acquire at the top of the function, send every failure path through one `goto out;`, and unlock exactly once at the `out:` label. This is the portable realization and the one that works on every C compiler; its discipline is enforced by review, not by the language.",
+  "code_sketch": "pthread_mutex_lock(&mutex);\nint rc = -1;\nEntry *e = table_find_or_create(key);     /* may fail           */\nif (e == NULL) goto out;                  /* unlock happens once */\ne->hits++;\nrc = 0;\nout:\npthread_mutex_unlock(&mutex);             /* every path passes here */\nreturn rc;",
+  "pitfalls": [
+    "Any `return` between the lock and the `out:` label leaks the lock and the compiler will not warn.",
+    "New failure paths added by maintenance must be routed to the label; that is the same maintenance risk the pattern removes elsewhere.",
+    "Early exits that must return a value need the value carried in a variable, which is easy to get wrong when the label is shared."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "goto-unwind-ladder",
+      "name": "Single-exit goto ladder (portable)",
+      "paradigm": "procedural",
+      "min_standard": "C89",
+      "idiom_name": "pthread_mutex_lock + single-exit goto ladder",
+      "implementation_notes": "ISO C has no destructors and no scope-exit hook, so the scope-bound release is a convention: acquire at the top of the function, send every failure path through one `goto out;`, and unlock exactly once at the `out:` label. This is the portable realization and the one that works on every C compiler; its discipline is enforced by review, not by the language.",
+      "code_sketch": "pthread_mutex_lock(&mutex);\nint rc = -1;\nEntry *e = table_find_or_create(key);     /* may fail           */\nif (e == NULL) goto out;                  /* unlock happens once */\ne->hits++;\nrc = 0;\nout:\npthread_mutex_unlock(&mutex);             /* every path passes here */\nreturn rc;",
+      "pitfalls": [
+        "Any `return` between the lock and the `out:` label leaks the lock and the compiler will not warn.",
+        "New failure paths added by maintenance must be routed to the label; that is the same maintenance risk the pattern removes elsewhere.",
+        "Early exits that must return a value need the value carried in a variable, which is easy to get wrong when the label is shared."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+      ]
+    },
+    {
+      "variant_id": "pthread-cleanup-stack",
+      "name": "POSIX cancellation cleanup stack",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "pthreads",
+        "pthread-cleanup-push"
+      ],
+      "idiom_name": "pthread_cleanup_push / pthread_cleanup_pop(1)",
+      "implementation_notes": "POSIX threads offer a real scope-bound mechanism: pthread_cleanup_push registers a handler that runs when the thread is cancelled or calls pthread_exit, and pthread_cleanup_pop(1) runs the same handler on the normal path - register pthread_mutex_unlock as the handler and the mutex is released on cancellation-driven unwinding, which the goto ladder cannot do. Use it for critical sections in cancellable threads; note the macros must be lexically paired inside one block.",
+      "code_sketch": "pthread_mutex_lock(&mutex);\npthread_cleanup_push(unlock_cleanup, &mutex);  /* handler registered */\n...                                            /* critical section    */\npthread_cleanup_pop(1);                        /* release on exit too */",
+      "pitfalls": [
+        "push and pop are macros that expand to an opening and closing brace: they must appear in the same block, cannot be split across functions, and cannot be conditionally unbalanced.",
+        "The handler covers cancellation and pthread_exit, not a plain `return` - mixing the cleanup stack with early returns still leaks the lock.",
+        "Cancellation can arrive between the lock and the push, so the acquisition order matters (lock first, then push)."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cleanup_pop.3p.html"
+      ]
+    },
+    {
+      "variant_id": "gnu-cleanup-attribute",
+      "name": "GCC/Clang cleanup attribute (RAII emulation)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "gnu-cleanup-attribute"
+      ],
+      "idiom_name": "__attribute__((cleanup(unlock_cleanup)))",
+      "implementation_notes": "GCC and Clang accept `__attribute__((cleanup(fn)))` on a local variable: the function runs when the variable goes out of scope, including through return, break and goto. Declaring a dummy variable that points at the mutex gives C the closest thing to RAII - a release that survives every path, including early returns that the cleanup stack does not cover. It is a compiler extension, so restrict it to codebases that already target GCC/Clang on all platforms.",
+      "code_sketch": "static void unlock_cleanup(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }\n\npthread_mutex_lock(&mutex);\npthread_mutex_t *guard __attribute__((cleanup(unlock_cleanup))) = &mutex;\n...                                            /* released on block exit */",
+      "pitfalls": [
+        "The attribute is a GNU extension: MSVC, strict ISO-C modes and some embedded toolchains reject it, so the portable default stays the goto ladder.",
+        "The cleanup callback's parameter type is unchecked; a mismatched pointer is undefined behaviour rather than a compile error.",
+        "setjmp/longjmp out of the block and _exit bypass the cleanup entirely."
+      ],
+      "sources": [
+        "https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html#Common-Variable-Attributes"
+      ]
+    }
+  ],
+  "default_variant": "goto-unwind-ladder",
+  "version": "1.0"
+}

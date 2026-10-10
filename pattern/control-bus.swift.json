@@ -1,0 +1,56 @@
+{
+  "pattern": "control-bus",
+  "language": "swift",
+  "support": "library",
+  "idiom_name": "ServiceGroup/Service for ordered startup and shutdown + swift-nio control listener + Task cancellation",
+  "implementation_notes": "Server-side Swift takes its control surface from the server packages: swift-service-lifecycle defines Service and ServiceGroup so the process starts components in order, waits for the first to finish and then shuts the rest down, releasing resources before exiting - a stop command is a graceful ServiceGroup shutdown rather than a kill. swift-nio provides the non-blocking channel and handler stack on which a dedicated control listener (a small admin route or a bounded line protocol) is added, and structured-concurrency cancellation propagates shutdown to the component's async work; OSLog/os_signpost and swift-metrics carry the status half. No framework supplies a management bus, so the command vocabulary and its authorisation are the project's own; the classic message-bus form is justified only when the fleet already runs a broker with a Swift client.",
+  "code_sketch": "struct AdapterService: Service {\n    let control: ChannelHandler                     // swift-nio control listener on its own port\n\n    func run() async throws {\n        try await withThrowingTaskGroup(of: Void.self) { group in\n            group.addTask { try await serveData() }\n            group.addTask { try await serveControl(on: control) }   // suspend/status/shutdown\n            try await group.next()                                 // first child ends...\n            group.cancelAll()                                      // ...then the rest is cancelled\n        }\n    }\n}\n\nlet group = ServiceGroup(services: [AdapterService()], logger: logger)\ntry await group.run()",
+  "pitfalls": [
+    "Structured concurrency makes stop cooperative: unless every long-running loop checks Task.isCancelled or awaits a cancellation point, cancelling the group does not stop the component - blocking work must be wrapped in withTaskCancellationHandler.",
+    "A control listener sharing the public port or route is reachable by every client; swift-nio does not authenticate for you, so the control channel needs its own port (or unix socket) plus token or mTLS checks.",
+    "ServiceGroup shuts down when the first service returns, so a control service that exits early silently tears down the whole process - control loops must only end on an explicit shutdown signal."
+  ],
+  "sources": [
+    "https://github.com/swift-server/swift-service-lifecycle",
+    "https://github.com/apple/swift-nio"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "service-lifecycle-control",
+      "name": "swift-service-lifecycle ServiceGroup plus a dedicated swift-nio control channel",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.9",
+      "idiom_name": "ServiceGroup/Service for ordered startup and shutdown + swift-nio control listener + Task cancellation",
+      "implementation_notes": "Server-side Swift takes its control surface from the server packages: swift-service-lifecycle defines Service and ServiceGroup so the process starts components in order, waits for the first to finish and then shuts the rest down, releasing resources before exiting - a stop command is a graceful ServiceGroup shutdown rather than a kill. swift-nio provides the non-blocking channel and handler stack on which a dedicated control listener (a small admin route or a bounded line protocol) is added, and structured-concurrency cancellation propagates shutdown to the component's async work; OSLog/os_signpost and swift-metrics carry the status half. No framework supplies a management bus, so the command vocabulary and its authorisation are the project's own; the classic message-bus form is justified only when the fleet already runs a broker with a Swift client.",
+      "code_sketch": "struct AdapterService: Service {\n    let control: ChannelHandler                     // swift-nio control listener on its own port\n\n    func run() async throws {\n        try await withThrowingTaskGroup(of: Void.self) { group in\n            group.addTask { try await serveData() }\n            group.addTask { try await serveControl(on: control) }   // suspend/status/shutdown\n            try await group.next()                                 // first child ends...\n            group.cancelAll()                                      // ...then the rest is cancelled\n        }\n    }\n}\n\nlet group = ServiceGroup(services: [AdapterService()], logger: logger)\ntry await group.run()",
+      "pitfalls": [
+        "Structured concurrency makes stop cooperative: unless every long-running loop checks Task.isCancelled or awaits a cancellation point, cancelling the group does not stop the component - blocking work must be wrapped in withTaskCancellationHandler.",
+        "A control listener sharing the public port or route is reachable by every client; swift-nio does not authenticate for you, so the control channel needs its own port (or unix socket) plus token or mTLS checks.",
+        "ServiceGroup shuts down when the first service returns, so a control service that exits early silently tears down the whole process - control loops must only end on an explicit shutdown signal."
+      ],
+      "sources": [
+        "https://github.com/swift-server/swift-service-lifecycle",
+        "https://github.com/apple/swift-nio"
+      ]
+    },
+    {
+      "variant_id": "distributed-actor-control",
+      "name": "Distributed actors as a cluster control plane",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.9",
+      "idiom_name": "distributed actor + distributed funcs over an ActorTransport (Swift Distributed Actors cluster)",
+      "implementation_notes": "With distributed actors, remote control is a language feature rather than a channel convention: a component exposes distributed funcs (suspend(route:), snapshot()), another node resolves the actor reference through the receptionist or an ActorIdentity, and the call becomes a message over the ActorTransport - the Swift Distributed Actors cluster library supplies one built on swift-nio, with membership and failure detection. Cluster events and watchTermination give the status half (a terminated signal when a watched actor or its node goes down), and the compiler enforces that distributed parameters and results are Codable. Use this when the system is genuinely multi-node Swift; a single-node service is simpler with ServiceGroup plus an admin route.",
+      "code_sketch": "distributed actor Adapter {\n    distributed func snapshot() -> Status { Status(state: route.state, processed: processed) }\n    distributed func suspend(reason: String) throws { try route.suspend(reason) }\n}\n\n// console node:\nlet adapter = try Adapter.resolve(adapterID, using: system)   // remote reference, not a liveness check\ntry await adapter.suspend(reason: \"deploy\")\nlet status = try await adapter.snapshot()\nwatchTermination(of: adapter) { id in system.log.warning(\"adapter down: \\(id)\") }",
+      "pitfalls": [
+        "Remote calls fail for network reasons: distributed funcs must be throwing, and the caller must treat 'no answer' as unknown state rather than assuming the command was rejected or applied.",
+        "Cluster membership is eventually consistent: acting on a single terminated signal can race with a node rejoining, so destructive decisions should be based on quorum/membership state.",
+        "Resolving an actor identity is not a liveness check - a reference to a dead node resolves fine and only fails on the first call."
+      ],
+      "sources": [
+        "https://www.swift.org/blog/distributed-actors/"
+      ]
+    }
+  ],
+  "default_variant": "service-lifecycle-control"
+}

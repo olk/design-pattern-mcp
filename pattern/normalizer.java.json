@@ -1,0 +1,64 @@
+{
+  "pattern": "normalizer",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Jackson polymorphic binding (@JsonTypeInfo with @JsonSubTypes) into canonical records",
+  "implementation_notes": "Jackson carries both mechanical steps: @JsonTypeInfo(use = Id.NAME, include = As.PROPERTY, property = \"type\") on the canonical base type plus @JsonSubTypes({@Type(value = CsvPayment.class, name = \"csv\"), ...}) make the databind read the discriminator and instantiate the matching source type, which replaces the hand-written translator registry; each permitted subtype is the translator for one format and its mapping method converts to the canonical value. Model the canonical form as a record and keep the wire subtypes out of the domain, and prefer Id.NAME with an explicit subtype allow-list over Id.CLASS. A Translator interface plus an EnumMap registry is still the honest choice when the sources are not tagged JSON (CSV, fixed-width, EDIFACT), when detection is heuristic, or when the team refuses annotation-driven runtime configuration.",
+  "code_sketch": "@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = \"type\")\n@JsonSubTypes({ @JsonSubTypes.Type(value = CsvPayment.class, name = \"csv\"),\n                @JsonSubTypes.Type(value = XmlPayment.class, name = \"xml\") })\nsealed interface WirePayment permits CsvPayment, XmlPayment {\n    Payment toCanonical();          // the per-format translator, one subtype each\n}\n\nPayment p = JsonMapper.builder().build()\n        .readValue(raw, WirePayment.class)   // router = discriminator lookup\n        .toCanonical();                      // canonical form for every consumer",
+  "pitfalls": [
+    "Jackson's polymorphic binding trusts the type property: never enable global default typing on untrusted input, and prefer Id.NAME with an explicit @JsonSubTypes allow-list over Id.CLASS, which accepts attacker-chosen fully qualified class names.",
+    "An unknown discriminator fails with InvalidTypeIdException where the message is deserialized, so map that failure to the invalid-message channel instead of catching a broad Exception around the whole pipeline.",
+    "Mutable subtype fields plus setter-based binding let a partially decoded source object reach the translator if validation happens after conversion instead of before."
+  ],
+  "sources": [
+    "https://fasterxml.github.io/jackson-annotations/javadoc/2.4/com/fasterxml/jackson/annotation/JsonTypeInfo.html",
+    "https://docs.oracle.com/en/java/javase/22/language/pattern-matching-switch-expressions-and-statements.html",
+    "https://docs.oracle.com/en/java/javase/21/language/sealed-classes-and-interfaces.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "jackson-polymorphic",
+      "name": "Jackson annotation-driven polymorphic binding",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "Jackson polymorphic binding (@JsonTypeInfo with @JsonSubTypes) into canonical records",
+      "implementation_notes": "Jackson carries both mechanical steps: @JsonTypeInfo(use = Id.NAME, include = As.PROPERTY, property = \"type\") on the canonical base type plus @JsonSubTypes({@Type(value = CsvPayment.class, name = \"csv\"), ...}) make the databind read the discriminator and instantiate the matching source type, which replaces the hand-written translator registry; each permitted subtype is the translator for one format and its mapping method converts to the canonical value. Model the canonical form as a record and keep the wire subtypes out of the domain, and prefer Id.NAME with an explicit subtype allow-list over Id.CLASS. A Translator interface plus an EnumMap registry is still the honest choice when the sources are not tagged JSON (CSV, fixed-width, EDIFACT), when detection is heuristic, or when the team refuses annotation-driven runtime configuration.",
+      "code_sketch": "@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = \"type\")\n@JsonSubTypes({ @JsonSubTypes.Type(value = CsvPayment.class, name = \"csv\"),\n                @JsonSubTypes.Type(value = XmlPayment.class, name = \"xml\") })\nsealed interface WirePayment permits CsvPayment, XmlPayment {\n    Payment toCanonical();          // the per-format translator, one subtype each\n}\n\nPayment p = JsonMapper.builder().build()\n        .readValue(raw, WirePayment.class)   // router = discriminator lookup\n        .toCanonical();                      // canonical form for every consumer",
+      "pitfalls": [
+        "Jackson's polymorphic binding trusts the type property: never enable global default typing on untrusted input, and prefer Id.NAME with an explicit @JsonSubTypes allow-list over Id.CLASS, which accepts attacker-chosen fully qualified class names.",
+        "An unknown discriminator fails with InvalidTypeIdException where the message is deserialized, so map that failure to the invalid-message channel instead of catching a broad Exception around the whole pipeline.",
+        "Mutable subtype fields plus setter-based binding let a partially decoded source object reach the translator if validation happens after conversion instead of before."
+      ],
+      "sources": [
+        "https://fasterxml.github.io/jackson-annotations/javadoc/2.4/com/fasterxml/jackson/annotation/JsonTypeInfo.html",
+        "https://docs.oracle.com/en/java/javase/22/language/pattern-matching-switch-expressions-and-statements.html",
+        "https://docs.oracle.com/en/java/javase/21/language/sealed-classes-and-interfaces.html"
+      ]
+    },
+    {
+      "variant_id": "sealed-switch",
+      "name": "Sealed wire hierarchy plus switch pattern matching to canonical records",
+      "paradigm": "oo",
+      "min_standard": "Java21",
+      "requires_features": [
+        "sealed-classes",
+        "records",
+        "pattern-matching-switch"
+      ],
+      "idiom_name": "sealed WirePayment plus exhaustive switch into Payment",
+      "implementation_notes": "Language-level variant: seal the wire hierarchy (sealed interface WirePayment permits ...) and write one switch with record patterns that maps each source shape to the canonical record, so the compiler proves that every permitted subtype is handled and the format set cannot fall out of sync with the mapping the way a runtime registry can. No reflection and no polymorphic annotation binding are involved, which makes this the route to take when the payload is untrusted; the JSON side is then an explicit JsonNode/JsonParser read (or a converter per subtype) instead of Id.NAME binding.",
+      "code_sketch": "sealed interface WirePayment permits CsvPayment, XmlPayment, LegacyPayment {}\nrecord CsvPayment(String raw) implements WirePayment {}\nrecord XmlPayment(String document) implements WirePayment {}\n\nstatic Payment canonical(WirePayment w) {\n    return switch (w) {                       // exhaustive: compiler-checked\n        case CsvPayment c    -> CsvMap.toPayment(c.raw());\n        case XmlPayment x    -> XmlMap.toPayment(x.document());\n        case LegacyPayment l -> LegacyMap.toPayment(l.record());\n    };\n}",
+      "pitfalls": [
+        "Sealing requires owning the type: a partner SDK's wire class cannot be sealed, so SDK-provided types still need an adapter before the switch can be exhaustive.",
+        "Exhaustiveness proves every subtype is handled, not that a new partner format was added to the hierarchy - a format missing from the sealed set is still a silent gap in detection.",
+        "Records give value semantics but no defensive copies for arrays or mutable collections, so a canonical record holding byte[] or List can still be mutated by a consumer."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/441",
+        "https://docs.oracle.com/en/java/javase/21/language/sealed-classes-and-interfaces.html"
+      ]
+    }
+  ],
+  "default_variant": "jackson-polymorphic",
+  "version": "1.0"
+}

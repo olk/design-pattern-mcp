@@ -1,0 +1,61 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "amqp.Table{x-dead-letter-exchange, x-dead-letter-routing-key} at queue declaration",
+  "implementation_notes": "With RabbitMQ the dead-letter channel needs no consumer-side code: declare the DLX and DLQ once, pass amqp.Table{\"x-dead-letter-exchange\": \"dlx\", \"x-dead-letter-routing-key\": \"failed\"} when declaring the source queue, and call channel.Nack(tag, false, false) when the handler classifies the failure as terminal; the broker then dead-letters on reject, TTL expiry, queue-length overflow or quorum delivery-limit. Read the x-death header on the DLQ side to recover the original queue and reason, and prefer a broker policy over hardcoded arguments for queues that already exist, since arguments cannot be changed without redeclaring the queue.",
+  "code_sketch": "args := amqp.Table{\"x-dead-letter-exchange\": \"dlx\", \"x-dead-letter-routing-key\": \"failed\"}\nch.QueueDeclare(\"orders\", true, false, false, false, args)\ndeliveries, _ := ch.Consume(\"orders\", \"\", false, false, false, false, nil)\nfor d := range deliveries {\n    if err := handle(d.Body); err != nil && isPermanent(err) {\n        d.Nack(false, false)        // requeue=false -> broker dead-letters\n    } else if err != nil {\n        d.Nack(false, true)         // transient -> requeue (with a retry policy)\n    } else {\n        d.Ack(false)\n    }\n}",
+  "pitfalls": [
+    "Nack(requeue=true) on a poison message loops it forever; the terminal decision must be requeue=false so the broker dead-letters instead of redelivering.",
+    "Declaring the DLX after the source queue, or in another vhost, silently drops dead letters: the exchange must exist when the message is dead-lettered.",
+    "x-death is a slice of tables ordered most-recent-first; code that treats x-death[0] as the first dead-letter event reports the wrong history.",
+    "amqp091-go channels are not safe for concurrent publishing: several workers nacking on one channel corrupt the frame stream - give each goroutine its own channel or serialise."
+  ],
+  "sources": [
+    "https://pkg.go.dev/github.com/rabbitmq/amqp091-go",
+    "https://www.rabbitmq.com/docs/dlx"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "rabbitmq-dlx",
+      "name": "RabbitMQ dead-letter exchange declared from amqp091-go",
+      "paradigm": "declarative",
+      "min_standard": "Go1.22",
+      "idiom_name": "amqp.Table{x-dead-letter-exchange, x-dead-letter-routing-key} at queue declaration",
+      "implementation_notes": "With RabbitMQ the dead-letter channel needs no consumer-side code: declare the DLX and DLQ once, pass amqp.Table{\"x-dead-letter-exchange\": \"dlx\", \"x-dead-letter-routing-key\": \"failed\"} when declaring the source queue, and call channel.Nack(tag, false, false) when the handler classifies the failure as terminal; the broker then dead-letters on reject, TTL expiry, queue-length overflow or quorum delivery-limit. Read the x-death header on the DLQ side to recover the original queue and reason, and prefer a broker policy over hardcoded arguments for queues that already exist, since arguments cannot be changed without redeclaring the queue.",
+      "code_sketch": "args := amqp.Table{\"x-dead-letter-exchange\": \"dlx\", \"x-dead-letter-routing-key\": \"failed\"}\nch.QueueDeclare(\"orders\", true, false, false, false, args)\ndeliveries, _ := ch.Consume(\"orders\", \"\", false, false, false, false, nil)\nfor d := range deliveries {\n    if err := handle(d.Body); err != nil && isPermanent(err) {\n        d.Nack(false, false)        // requeue=false -> broker dead-letters\n    } else if err != nil {\n        d.Nack(false, true)         // transient -> requeue (with a retry policy)\n    } else {\n        d.Ack(false)\n    }\n}",
+      "pitfalls": [
+        "Nack(requeue=true) on a poison message loops it forever; the terminal decision must be requeue=false so the broker dead-letters instead of redelivering.",
+        "Declaring the DLX after the source queue, or in another vhost, silently drops dead letters: the exchange must exist when the message is dead-lettered.",
+        "x-death is a slice of tables ordered most-recent-first; code that treats x-death[0] as the first dead-letter event reports the wrong history.",
+        "amqp091-go channels are not safe for concurrent publishing: several workers nacking on one channel corrupt the frame stream - give each goroutine its own channel or serialise."
+      ],
+      "sources": [
+        "https://pkg.go.dev/github.com/rabbitmq/amqp091-go",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    },
+    {
+      "variant_id": "jetstream-maxdeliver-advisory",
+      "name": "NATS JetStream: MaxDeliver plus the max-deliveries advisory relay",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.22",
+      "requires_features": [],
+      "idiom_name": "nats.go JetStream MaxDeliver + $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES relay",
+      "implementation_notes": "JetStream has no built-in dead-letter queue: MaxDeliver only stops redelivery, and when a message reaches the limit it leaves the consumer's pending list silently while remaining in the stream. The Go realization makes that drop explicit - subscribe on core NATS to $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>, read the stream and stream sequence from the advisory, fetch the original message with js.GetMsg, and publish it with the failure context into a dedicated DLQ stream before letting the alert be considered handled. Use Term() when the handler can prove no future attempt will succeed, so the message leaves the pending list immediately instead of burning the remaining attempts; and remember that MaxDeliver defaults to -1 (unlimited), so the advisory never fires until a limit is set.",
+      "code_sketch": "var adv struct {\n    Stream    string `json:\"stream\"`\n    Consumer  string `json:\"consumer\"`\n    StreamSeq uint64 `json:\"stream_seq\"`\n}\nnc.Subscribe(\"$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.ORDERS.shipping\",\n    func(m *nats.Msg) {\n        if json.Unmarshal(m.Data, &adv) != nil { return }\n        raw, err := js.GetMsg(adv.Stream, adv.StreamSeq)\n        if err != nil { return }   // core NATS has no replay: reconcile from stream state\n        js.Publish(\"DLQ.ORDERS\", raw.Data,\n            jetstream.WithMsgID(fmt.Sprint(adv.StreamSeq)))\n    })",
+      "pitfalls": [
+        "MaxDeliver defaults to -1: without an explicit limit no advisory is ever published and the message is redelivered forever.",
+        "The advisory carries only stream/consumer/sequence - the payload must be fetched back from the stream, and a failed fetch has no retry path on core NATS, so the relay must reconcile from stream state rather than drop the alert.",
+        "JetStream keeps the original message in the stream after the limit, so nothing looks broken in the stream; only the consumer's pending list lost it, and the DLQ stream is the only place the failure is visible.",
+        "Term() is permanent and cannot be undone by the server: use it only when the code can prove the failure is not transient, and make sure the payload is already parked before terming."
+      ],
+      "sources": [
+        "https://docs.nats.io/learn/jetstream/acknowledgment",
+        "https://docs.nats.io/learn/jetstream/delivery-and-acknowledgment"
+      ]
+    }
+  ],
+  "default_variant": "rabbitmq-dlx"
+}

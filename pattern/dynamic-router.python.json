@@ -1,0 +1,57 @@
+{
+  "pattern": "dynamic-router",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "functools.singledispatch registry + dict rule table behind a lock",
+  "implementation_notes": "The in-process realization is a dispatch table: a dict from routing key to handler for key-based rules and functools.singledispatch for type-based rules, with the registry itself being the runtime-editable state. Because the GIL makes dict assignment atomic but a multi-entry rule swap is not, publish a whole new dict to one attribute (self._table = new_table) so each message reads a single generation via a local reference; protect writers with a threading.Lock and read without one. importlib.reload of the rules module, or a file watcher, plays the control channel, and the unmatched key must fall back to an explicit, monitored dead-letter handler.",
+  "code_sketch": "import functools, threading\nclass Router:\n    def __init__(self, initial): self._table, self._lock = dict(initial), threading.Lock()\n    def publish(self, rules):                      # control channel\n        with self._lock: self._table = dict(rules)\n    def route(self, msg):\n        table = self._table                        # one snapshot per message\n        return table.get(msg.key, self.dead_letter)(msg)\n@functools.singledispatch\ndef handle(msg): ...                               # type-based fallback",
+  "pitfalls": [
+    "Iterating the live table while another thread edits it raises RuntimeError: dictionary changed size during iteration - iterate the snapshot you took.",
+    "functools.singledispatch dispatches on the first argument's class and its registry is global to the decorated function, so two routers sharing one generic function overwrite each other's registrations.",
+    "A module-level dict used as the rule base is shared across imports and test runs; keep the table an instance attribute and publish new dicts, never mutate the published one."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/functools.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "singledispatch-registry",
+      "name": "In-process dispatch table with functools.singledispatch and dict rules",
+      "paradigm": "oo",
+      "min_standard": "Python3.4",
+      "idiom_name": "functools.singledispatch registry + dict rule table behind a lock",
+      "implementation_notes": "The in-process realization is a dispatch table: a dict from routing key to handler for key-based rules and functools.singledispatch for type-based rules, with the registry itself being the runtime-editable state. Because the GIL makes dict assignment atomic but a multi-entry rule swap is not, publish a whole new dict to one attribute (self._table = new_table) so each message reads a single generation via a local reference; protect writers with a threading.Lock and read without one. importlib.reload of the rules module, or a file watcher, plays the control channel, and the unmatched key must fall back to an explicit, monitored dead-letter handler.",
+      "code_sketch": "import functools, threading\nclass Router:\n    def __init__(self, initial): self._table, self._lock = dict(initial), threading.Lock()\n    def publish(self, rules):                      # control channel\n        with self._lock: self._table = dict(rules)\n    def route(self, msg):\n        table = self._table                        # one snapshot per message\n        return table.get(msg.key, self.dead_letter)(msg)\n@functools.singledispatch\ndef handle(msg): ...                               # type-based fallback",
+      "pitfalls": [
+        "Iterating the live table while another thread edits it raises RuntimeError: dictionary changed size during iteration - iterate the snapshot you took.",
+        "functools.singledispatch dispatches on the first argument's class and its registry is global to the decorated function, so two routers sharing one generic function overwrite each other's registrations.",
+        "A module-level dict used as the rule base is shared across imports and test runs; keep the table an instance attribute and publish new dicts, never mutate the published one."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/functools.html"
+      ]
+    },
+    {
+      "variant_id": "celery-task-routes",
+      "name": "Broker-level routing with Celery task_routes",
+      "paradigm": "declarative",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "celery"
+      ],
+      "idiom_name": "Celery task_routes / router objects over kombu exchanges and queues",
+      "implementation_notes": "When the messages are tasks on a broker, Celery's router is the rule base: task_routes maps task names (or glob and regex patterns, evaluated in list order when supplied in items format) to queue and routing-key destinations, and Celery also accepts router objects whose route_for_task returns a route per call, so a decision can consult live state. The control channel is a configuration update - app.conf.task_routes / app.conf.task_queues plus worker -Q consumption changes - and because the mapping is evaluated in the producing process it must reach every producer and every worker's queue table rather than one central router. Celery documents this as alternate routing, with exchanges, routing keys and priorities applying to the AMQP transports.",
+      "code_sketch": "from kombu import Queue\n\napp.conf.task_queues = (Queue(\"feeds\",  routing_key=\"feed.#\"),\n                        Queue(\"orders\", routing_key=\"order.#\"))\napp.conf.task_routes = ([\n    (\"feeds.tasks.*\",        {\"queue\": \"feeds\",  \"routing_key\": \"feed.import\"}),\n    (r\"orders\\.tasks\\..*\",   {\"queue\": \"orders\", \"routing_key\": \"order.new\"}),\n],)\n# control channel: reload the rule table without restarting producers\napp.conf.task_routes = load_rules_from_control_plane()",
+      "pitfalls": [
+        "task_routes is evaluated in each producer and worker process, so a rule change must be pushed everywhere; a partial rollout sends the same task to different queues from different producers.",
+        "Pattern evaluation order matters and only the items-format list preserves it - a plain dict can silently change which rule wins.",
+        "task_create_missing_queues (on by default) silently creates a queue for a typo'd destination name, hiding a bad rule instead of failing."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/routing.html"
+      ]
+    }
+  ],
+  "default_variant": "singledispatch-registry"
+}

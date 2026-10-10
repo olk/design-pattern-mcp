@@ -1,0 +1,18 @@
+{
+  "pattern": "message-expiration",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "expires_at field plus clock_gettime(CLOCK_MONOTONIC) check before dispatch",
+  "implementation_notes": "C has no runtime facility for message expiry, so the receiver hand-builds the mechanism: the message struct carries an absolute deadline in monotonic milliseconds and the consumer compares clock_gettime(CLOCK_MONOTONIC) against it before doing any work. A bounded blocking receive can be built with pthread_cond_timedwait, whose abstime argument is an absolute deadline, but the condition variable must be created with pthread_condattr_setclock(CLOCK_MONOTONIC) - otherwise it waits on the settable CLOCK_REALTIME and a clock step can wake the consumer early or hold it past its deadline. Because a monotonic origin is per-boot and meaningless to peers, the value on the wire must be an absolute wall-clock timestamp (CLOCK_REALTIME or TIME_UTC) that each hop converts once into its local monotonic deadline.",
+  "code_sketch": "struct msg { int64_t expires_ms; /* CLOCK_MONOTONIC ms, 0 = never */ char *body; };\n\nstatic int64_t mono_ms(void) {\n    struct timespec ts;\n    clock_gettime(CLOCK_MONOTONIC, &ts);\n    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;\n}\n\n/* consumer: last line of defence before the work is done */\nif (msg->expires_ms != 0 && mono_ms() >= msg->expires_ms)\n    dead_letter(msg, \"expired\");\nelse\n    dispatch(msg);",
+  "pitfalls": [
+    "CLOCK_REALTIME is settable: a TTL computed from it silently changes when NTP steps or an operator sets the clock. Derive local deadlines from CLOCK_MONOTONIC and convert only at the wire boundary.",
+    "pthread_cond_timedwait waits on CLOCK_REALTIME unless the condition variable was created with pthread_condattr_setclock(CLOCK_MONOTONIC), and its abstime is absolute - recomputing it inside the wait loop is a classic source of hangs.",
+    "Without a broker enforcing TTL, an unconsumed queue grows without bound; the dequeue check only protects messages that are actually consumed, and a priority heap of deadlines must still be swept."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/clock_gettime.3.html",
+    "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html"
+  ],
+  "version": "1.0"
+}

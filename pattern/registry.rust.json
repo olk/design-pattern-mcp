@@ -1,0 +1,80 @@
+{
+  "pattern": "registry",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "OnceLock + RwLock<HashMap>",
+  "implementation_notes": "Default std-only realization: a static OnceLock holding a RwLock<HashMap<&str, Factory>>, reached through a registry() accessor that get_or_init's it; registration takes a write lock, lookup a read lock. LazyLock (Rust 1.80) is the same thing with an initializer expression and no accessor boilerplate.",
+  "code_sketch": "use std::collections::HashMap;\nuse std::sync::{OnceLock, RwLock};\ntype Factory = fn() -> Box<dyn Plugin>;\nfn registry() -> &'static RwLock<HashMap<&'static str, Factory>> {\n    static REGISTRY: OnceLock<RwLock<HashMap<&'static str, Factory>>> =\n        OnceLock::new();\n    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))\n}\npub fn register(name: &'static str, f: Factory) -> Result<(), &'static str> {\n    let mut map = registry().write().unwrap();\n    if map.insert(name, f).is_some() { return Err(\"duplicate registration\"); }\n    Ok(())\n}",
+  "pitfalls": [
+    "A panicking writer poisons the RwLock and every later read().unwrap() panics too, turning one bad registration into a process-wide failure; use parking_lot, catch_unwind, or recover from poisoning explicitly.",
+    "Never hold the write guard across arbitrary user code (factory invocation, plugin callbacks): it deadlocks re-entrant registration and stalls all readers.",
+    "Entries live for the whole program - a registry that stores handles or instances pins them forever (no eviction); store factories, not instances, when lifetime matters."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+    "https://doc.rust-lang.org/std/sync/struct.LazyLock.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "once-lock-map",
+      "name": "static OnceLock<RwLock<HashMap<..>>>",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "idiom_name": "OnceLock + RwLock<HashMap>",
+      "implementation_notes": "Default std-only realization: a static OnceLock holding a RwLock<HashMap<&str, Factory>>, reached through a registry() accessor that get_or_init's it; registration takes a write lock, lookup a read lock. LazyLock (Rust 1.80) is the same thing with an initializer expression and no accessor boilerplate.",
+      "code_sketch": "use std::collections::HashMap;\nuse std::sync::{OnceLock, RwLock};\ntype Factory = fn() -> Box<dyn Plugin>;\nfn registry() -> &'static RwLock<HashMap<&'static str, Factory>> {\n    static REGISTRY: OnceLock<RwLock<HashMap<&'static str, Factory>>> =\n        OnceLock::new();\n    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))\n}\npub fn register(name: &'static str, f: Factory) -> Result<(), &'static str> {\n    let mut map = registry().write().unwrap();\n    if map.insert(name, f).is_some() { return Err(\"duplicate registration\"); }\n    Ok(())\n}",
+      "pitfalls": [
+        "A panicking writer poisons the RwLock and every later read().unwrap() panics too, turning one bad registration into a process-wide failure; use parking_lot, catch_unwind, or recover from poisoning explicitly.",
+        "Never hold the write guard across arbitrary user code (factory invocation, plugin callbacks): it deadlocks re-entrant registration and stalls all readers.",
+        "Entries live for the whole program - a registry that stores handles or instances pins them forever (no eviction); store factories, not instances, when lifetime matters."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html"
+      ]
+    },
+    {
+      "variant_id": "inventory-link-time",
+      "name": "inventory crate (link-time distributed slice)",
+      "paradigm": "declarative",
+      "requires_features": [
+        "inventory crate",
+        "life-before-main initialization"
+      ],
+      "idiom_name": "inventory::collect!/submit!/iter",
+      "implementation_notes": "Registration without runtime locking: inventory::collect!(T) declares the registry type and inventory::submit!(expr) entries run as life-before-main initializers, so iterating inventory::iter::<T> yields &'static entries with no map, no lock and no duplicate policy. The classic structure survives only as the collected type plus the iteration site.",
+      "code_sketch": "use inventory::{collect, iter, submit};\n\npub struct Codec {\n    pub name: &'static str,\n    pub create: fn() -> Box<dyn Encoder>,\n}\n\ncollect!(Codec);\n\nsubmit! { Codec { name: \"json\", create: || Box::new(JsonCodec) } }\n\npub fn find(name: &str) -> Option<&'static Codec> {\n    iter::<Codec>.into_iter().find(|c| c.name == name)\n}",
+      "pitfalls": [
+        "Registration runs as life-before-main, which is not available on every target (embedded, some no_std and sandboxed configurations) and confuses readers who expect main() to be the entry point.",
+        "Linkers can drop or duplicate submissions in static-library and -C link-dead-code builds; inventory's own docs point at linkme for a life-before-main-free approach.",
+        "Lookup is a linear scan over &'static entries with no duplicate detection; the table cannot change at runtime."
+      ],
+      "sources": [
+        "https://docs.rs/inventory/latest/inventory/index.html"
+      ]
+    },
+    {
+      "variant_id": "typeid-map",
+      "name": "TypeId-keyed type registry",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "requires_features": [
+        "std::any::TypeId"
+      ],
+      "idiom_name": "OnceLock<RwLock<HashMap<TypeId, Arc<dyn Any>>>>",
+      "implementation_notes": "When the key is the service type rather than a name, key a OnceLock<RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>> by TypeId::of::<T>() and downcast on lookup - this is how Rust DI-style containers and dynamic extension points model 'resolve T'. It trades compile-time safety for runtime type erasure and needs one registration per type.",
+      "code_sketch": "use std::any::{Any, TypeId};\nuse std::collections::HashMap;\nuse std::sync::{Arc, OnceLock, RwLock};\n\ntype AnyService = Arc<dyn Any + Send + Sync>;\n\nfn services() -> &'static RwLock<HashMap<TypeId, AnyService>> {\n    static SERVICES: OnceLock<RwLock<HashMap<TypeId, AnyService>>> =\n        OnceLock::new();\n    SERVICES.get_or_init(|| RwLock::new(HashMap::new()))\n}\n\npub fn put<T: Any + Send + Sync>(service: T) {\n    services().write().unwrap().insert(TypeId::of::<T>(), Arc::new(service));\n}",
+      "pitfalls": [
+        "TypeId is opaque and only comparable within one compilation: keys are not stable across crates built with different compiler versions, so exported or serialized ids must not be persisted.",
+        "Every value must be Send + Sync + 'static to go into the shared map, and downcast_ref silently returns None on a type mismatch unless you check.",
+        "A type-keyed registry cannot express two implementations of one trait: the key is the concrete type, so trait-object lookup needs a wrapper newtype or a name key."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/any/struct.TypeId.html",
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    }
+  ],
+  "default_variant": "once-lock-map",
+  "version": "1.0"
+}

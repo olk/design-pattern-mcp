@@ -1,0 +1,63 @@
+{
+  "pattern": "dirty-flag",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "sync.Mutex-guarded primary fields, dirty bool and cached value",
+  "implementation_notes": "Go has no properties, so the pattern is method discipline: a struct keeps the primary fields, the cached derived value and a dirty bool, every mutator sets the flag, and the accessor recomputes and clears it while holding a sync.Mutex. The Go memory model makes unsynchronised access to that bool a data race that `go build -race` reports (and race-free programs are sequentially consistent), so a shared flag needs a mutex or the sync/atomic package; a mutex is the safe default and the standard-library documentation itself prefers channels or sync over bare atomics. sync.Once/sync.OnceValue replace the flag for the one-shot case but can never be reset, so they serve lazy initialisation, not invalidation.",
+  "code_sketch": "type Node struct {\n    mu       sync.Mutex\n    x, world float64\n    dirty    bool\n}\nfunc (n *Node) Move(dx float64) { n.mu.Lock(); n.x += dx; n.dirty = true; n.mu.Unlock() }\nfunc (n *Node) World() float64 {\n    n.mu.Lock(); defer n.mu.Unlock()\n    if n.dirty { n.world = worldOf(n.x); n.dirty = false }   // recompute once\n    return n.world\n}",
+  "pitfalls": [
+    "A plain bool read and written by several goroutines is a data race; without the mutex the compiler and CPU may keep stale values in registers, and the race detector reports it.",
+    "Copying a struct that contains a sync.Mutex (or an atomic value after first use) splits the lock; pass pointers and run `go vet`, which flags it.",
+    "The mutex is not reentrant: holding it while the recomputation calls back into the same object, or into another locked object, deadlocks.",
+    "sync.Once cannot be reset, so a mutex-guarded recomputation must not be replaced by OnceValue when invalidation is needed."
+  ],
+  "sources": [
+    "https://go.dev/ref/mem",
+    "https://gameprogrammingpatterns.com/dirty-flag.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutex-guarded",
+      "name": "Mutex-guarded dirty cell",
+      "paradigm": "concurrent",
+      "min_standard": "Go1",
+      "idiom_name": "sync.Mutex-guarded primary fields, dirty bool and cached value",
+      "implementation_notes": "Go has no properties, so the pattern is method discipline: a struct keeps the primary fields, the cached derived value and a dirty bool, every mutator sets the flag, and the accessor recomputes and clears it while holding a sync.Mutex. The Go memory model makes unsynchronised access to that bool a data race that `go build -race` reports (and race-free programs are sequentially consistent), so a shared flag needs a mutex or the sync/atomic package; a mutex is the safe default and the standard-library documentation itself prefers channels or sync over bare atomics. sync.Once/sync.OnceValue replace the flag for the one-shot case but can never be reset, so they serve lazy initialisation, not invalidation.",
+      "code_sketch": "type Node struct {\n    mu       sync.Mutex\n    x, world float64\n    dirty    bool\n}\nfunc (n *Node) Move(dx float64) { n.mu.Lock(); n.x += dx; n.dirty = true; n.mu.Unlock() }\nfunc (n *Node) World() float64 {\n    n.mu.Lock(); defer n.mu.Unlock()\n    if n.dirty { n.world = worldOf(n.x); n.dirty = false }   // recompute once\n    return n.world\n}",
+      "pitfalls": [
+        "A plain bool read and written by several goroutines is a data race; without the mutex the compiler and CPU may keep stale values in registers, and the race detector reports it.",
+        "Copying a struct that contains a sync.Mutex (or an atomic value after first use) splits the lock; pass pointers and run `go vet`, which flags it.",
+        "The mutex is not reentrant: holding it while the recomputation calls back into the same object, or into another locked object, deadlocks.",
+        "sync.Once cannot be reset, so a mutex-guarded recomputation must not be replaced by OnceValue when invalidation is needed."
+      ],
+      "sources": [
+        "https://go.dev/ref/mem",
+        "https://gameprogrammingpatterns.com/dirty-flag.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-pointer-publish",
+      "name": "Atomic publication with a lock-free fast path",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.19",
+      "requires_features": [
+        "sync/atomic typed atomics"
+      ],
+      "idiom_name": "atomic.Bool dirty flag plus atomic.Pointer[T] cached value",
+      "implementation_notes": "Go 1.19 added the typed atomics (atomic.Bool, atomic.Pointer[T], ...) that hide the unsafe.Pointer conversions and force every access through the atomic API; they make a lock-free read path practical. The flag and the published value are a pair: writers rebuild under a mutex, store the new value, then clear the flag; readers check the flag first and only take the lock when it is set, which is correct because Go's atomics are sequentially consistent (the Go memory model aligns with C/C++/Java/Rust/Swift) and the store-then-clear order establishes the publication. The cached value must be immutable after publication, since readers use it without holding the lock.",
+      "code_sketch": "type Node struct {\n    mu    sync.Mutex\n    x     float64\n    dirty atomic.Bool\n    world atomic.Pointer[World]\n}\nfunc (n *Node) World() World {\n    if !n.dirty.Load() { return *n.world.Load() }   // lock-free fast path\n    n.mu.Lock(); defer n.mu.Unlock()\n    if n.dirty.Load() { n.world.Store(buildWorld(n.x)); n.dirty.Store(false) }\n    return *n.world.Load()\n}",
+      "pitfalls": [
+        "The typed atomics must not be copied after first use (`go vet` reports it), and an atomic.Pointer value must be zero-initialised rather than assigned a struct copy.",
+        "Order is the contract: storing the flag false before the pointer publishes a clean flag over the old value; readers may then never rebuild.",
+        "The published value must be treated as immutable - mutating it in place after Store is a data race, so rebuild a fresh value and store it.",
+        "A nil pointer is the initial dirty state; a reader that forgets the flag check dereferences nil, so the constructor must publish an initial value or the fast path must test for nil."
+      ],
+      "sources": [
+        "https://go.dev/doc/go1.19",
+        "https://go.dev/src/sync/atomic/doc.go"
+      ]
+    }
+  ],
+  "default_variant": "mutex-guarded"
+}

@@ -1,0 +1,75 @@
+{
+  "pattern": "active-object",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Executors.newSingleThreadExecutor() + Callable/Future",
+  "implementation_notes": "The classic JVM realization: java.util.concurrent supplies the scheduler and the activation queue as one object - Executors.newSingleThreadExecutor() runs tasks sequentially on one worker but uses an unbounded queue - so the proxy submits a Callable per method call and returns the Future. The servant runs only on the executor thread and needs no synchronized blocks; CompletableFuture returns and virtual threads change the execution style but not the roles. When bounded admission is required, construct ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(capacity)) rather than trying to configure the queue inside the ExecutorService returned by Executors.newSingleThreadExecutor().",
+  "code_sketch": "final class ActiveQueue {\n    private final ExecutorService scheduler = Executors.newSingleThreadExecutor();\n    private final MQServant servant = new MQServant();\n    Future<?> put(Message m) {                       // proxy: returns at once\n        return scheduler.submit(() -> servant.put_i(m));\n    }\n    Future<Message> get() {\n        return scheduler.submit(servant::get_i);      // rendezvous happens later\n    }\n}\n// caller: Message m = active.get().get();",
+  "pitfalls": [
+    "The single-thread executor's queue is unbounded: a producer that outruns the servant grows the heap; use an explicit ThreadPoolExecutor with an ArrayBlockingQueue when back-pressure is required.",
+    "submit() stores exceptions in the Future, so a dropped Future hides every failure; return or handle it.",
+    "Calling get() from a task already running on the same single-thread executor deadlocks the only worker."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html",
+    "https://openjdk.org/jeps/444"
+  ],
+  "variants": [
+    {
+      "variant_id": "single-thread-executor",
+      "name": "Single-thread ExecutorService + Future (classic)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "Executors.newSingleThreadExecutor() + Callable/Future",
+      "implementation_notes": "The classic JVM realization: java.util.concurrent supplies the scheduler and the activation queue as one object - Executors.newSingleThreadExecutor() runs tasks sequentially on one worker but uses an unbounded queue - so the proxy submits a Callable per method call and returns the Future. The servant runs only on the executor thread and needs no synchronized blocks; CompletableFuture returns and virtual threads change the execution style but not the roles. When bounded admission is required, construct ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(capacity)) rather than trying to configure the queue inside the ExecutorService returned by Executors.newSingleThreadExecutor().",
+      "code_sketch": "final class ActiveQueue {\n    private final ExecutorService scheduler = Executors.newSingleThreadExecutor();\n    private final MQServant servant = new MQServant();\n    Future<?> put(Message m) {                       // proxy: returns at once\n        return scheduler.submit(() -> servant.put_i(m));\n    }\n    Future<Message> get() {\n        return scheduler.submit(servant::get_i);      // rendezvous happens later\n    }\n}\n// caller: Message m = active.get().get();",
+      "pitfalls": [
+        "The single-thread executor's queue is unbounded: a producer that outruns the servant grows the heap; use an explicit ThreadPoolExecutor with an ArrayBlockingQueue when back-pressure is required.",
+        "submit() stores exceptions in the Future, so a dropped Future hides every failure; return or handle it.",
+        "Calling get() from a task already running on the same single-thread executor deadlocks the only worker."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html",
+        "https://openjdk.org/jeps/444"
+      ]
+    },
+    {
+      "variant_id": "completable-future",
+      "name": "CompletableFuture composition on a single-thread executor",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.supplyAsync(..., singleThreadExecutor)",
+      "implementation_notes": "Returning CompletableFuture<T> and letting callers compose with thenApply/thenCompose removes the blocking rendezvous of Future.get() while keeping the same role structure. The executor argument is the critical detail: async methods without one run on the ForkJoinPool common pool, which destroys the object's single-thread confinement. Use it when clients are naturally reactive; the classic Future form remains clearer for request/response code.",
+      "code_sketch": "private final ExecutorService scheduler = Executors.newSingleThreadExecutor();\n\nCompletableFuture<Message> get() {\n    return CompletableFuture.supplyAsync(servant::get_i, scheduler);\n}\n\n// caller: active.get().thenAccept(this::handle);  // no blocking rendezvous",
+      "pitfalls": [
+        "Omitting the executor moves the servant onto ForkJoinPool.commonPool and silently breaks serialization.",
+        "Non-async then* stages may run on the thread that completed the future; blocking inside them stalls the scheduler.",
+        "A CompletableFuture that nobody completes (for example after an exception in a custom stage) hides the failure until a timeout elsewhere."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "Virtual-thread-per-request scheduler",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + per-object guard",
+      "implementation_notes": "JEP 444 makes one thread per active object (or per request) affordable: newVirtualThreadPerTaskExecutor() schedules each submitted task on its own virtual thread, and a virtual thread that blocks on I/O unmounts instead of pinning its carrier, so the servant may keep ordinary blocking code. Serialization is no longer implied by the executor, so give each object an explicit single permit guard (Semaphore, ReentrantLock or a synchronous servant) and return the Future as before. Choose it when thread-per-object simplicity matters more than hand-tuned scheduling.",
+      "code_sketch": "private final ExecutorService perTask = Executors.newVirtualThreadPerTaskExecutor();\nprivate final Semaphore one = new Semaphore(1);          // serialize per object\n\nFuture<?> put(Message m) {\n    return perTask.submit(() -> {\n        one.acquire();\n        try { servant.put_i(m); } finally { one.release(); }\n        return null;\n    });\n}",
+      "pitfalls": [
+        "Virtual threads give scalability, not serialization: without the per-object guard the servant runs concurrently and races.",
+        "Blocking inside synchronized blocks or native frames pins the carrier thread; prefer ReentrantLock for long blocking sections.",
+        "Unbounded virtual-thread fan-out floods downstream resources just like unbounded platform threads; bound in-flight work."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/444",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html"
+      ]
+    }
+  ],
+  "default_variant": "single-thread-executor",
+  "version": "1.1"
+}

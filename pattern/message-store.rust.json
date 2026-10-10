@@ -1,0 +1,67 @@
+{
+  "pattern": "message-store",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "Connection::open + prepared INSERT with params!, writer thread owning the connection",
+  "implementation_notes": "rusqlite gives a safe, blocking SQLite binding: Connection::open creates the file, pragma_update sets journal_mode and synchronous once, Connection::prepare builds the append statement, and params! maps the record's fields into bound values; the classic Store and interceptor roles collapse into a struct plus a writer loop. The connection is not Sync, which the type system makes useful: either wrap it in a Mutex<Connection> for a small store, or - better - move it into a dedicated thread fed by an mpsc channel, so the single-writer invariant is expressed by ownership instead of by discipline. Payloads are serde-serialised JSON or typed columns, and retention is a DELETE by timestamp plus VACUUM. Choose this variant for an embedded, synchronous store; choose the sqlx variant when the service is already async and the store is a shared database.",
+  "code_sketch": "let conn = Connection::open(\"audit.sqlite\")?;\nconn.pragma_update(None, \"journal_mode\", \"WAL\")?;   // readers do not block the writer\nlet (tx, rx) = std::sync::mpsc::channel::<StoredMessage>();\nstd::thread::spawn(move || {\n    let mut ins = conn.prepare(\"INSERT OR IGNORE INTO msg_store VALUES (?1,?2,?3,?4)\")?;\n    for m in rx {                                     // single owner: no lock, no sharing\n        ins.execute(params![m.id, m.channel, m.ts, serde_json::to_string(&m.body)?])?;\n    }\n});\n// tap side: if tx.send(m).is_err() { drops.inc() }   (never blocks, never panics)",
+  "pitfalls": [
+    "A Mutex<Connection> serialises reporting behind the writer; WAL plus a second read-only connection (OpenFlags::SQLITE_OPEN_READ_ONLY) keeps audit queries off the tap's path.",
+    "rusqlite is blocking: calling it from an async task stalls the executor, so the writer belongs on its own thread or inside spawn_blocking.",
+    "serde_json rendering changes when fields are renamed or made optional; version the stored payload type or store an explicit serde_json::Value so history stays readable.",
+    "A dropped Receiver (writer thread exited) turns every send into a silent Err; count it, or the store stops recording without any error on the delivery path."
+  ],
+  "sources": [
+    "https://docs.rs/rusqlite/latest/rusqlite/",
+    "https://sqlite.org/wal.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "rusqlite-embedded-store",
+      "name": "rusqlite embedded store behind a single-owner writer thread",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "rusqlite"
+      ],
+      "idiom_name": "Connection::open + prepared INSERT with params!, writer thread owning the connection",
+      "implementation_notes": "rusqlite gives a safe, blocking SQLite binding: Connection::open creates the file, pragma_update sets journal_mode and synchronous once, Connection::prepare builds the append statement, and params! maps the record's fields into bound values; the classic Store and interceptor roles collapse into a struct plus a writer loop. The connection is not Sync, which the type system makes useful: either wrap it in a Mutex<Connection> for a small store, or - better - move it into a dedicated thread fed by an mpsc channel, so the single-writer invariant is expressed by ownership instead of by discipline. Payloads are serde-serialised JSON or typed columns, and retention is a DELETE by timestamp plus VACUUM. Choose this variant for an embedded, synchronous store; choose the sqlx variant when the service is already async and the store is a shared database.",
+      "code_sketch": "let conn = Connection::open(\"audit.sqlite\")?;\nconn.pragma_update(None, \"journal_mode\", \"WAL\")?;   // readers do not block the writer\nlet (tx, rx) = std::sync::mpsc::channel::<StoredMessage>();\nstd::thread::spawn(move || {\n    let mut ins = conn.prepare(\"INSERT OR IGNORE INTO msg_store VALUES (?1,?2,?3,?4)\")?;\n    for m in rx {                                     // single owner: no lock, no sharing\n        ins.execute(params![m.id, m.channel, m.ts, serde_json::to_string(&m.body)?])?;\n    }\n});\n// tap side: if tx.send(m).is_err() { drops.inc() }   (never blocks, never panics)",
+      "pitfalls": [
+        "A Mutex<Connection> serialises reporting behind the writer; WAL plus a second read-only connection (OpenFlags::SQLITE_OPEN_READ_ONLY) keeps audit queries off the tap's path.",
+        "rusqlite is blocking: calling it from an async task stalls the executor, so the writer belongs on its own thread or inside spawn_blocking.",
+        "serde_json rendering changes when fields are renamed or made optional; version the stored payload type or store an explicit serde_json::Value so history stays readable.",
+        "A dropped Receiver (writer thread exited) turns every send into a silent Err; count it, or the store stops recording without any error on the delivery path."
+      ],
+      "sources": [
+        "https://docs.rs/rusqlite/latest/rusqlite/",
+        "https://sqlite.org/wal.html"
+      ]
+    },
+    {
+      "variant_id": "sqlx-async-store",
+      "name": "sqlx async pool store with a spawned writer task",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "sqlx",
+        "async"
+      ],
+      "idiom_name": "SqlitePool + spawn'ed writer task fed by tokio mpsc",
+      "implementation_notes": "When the service is already async, sqlx keeps the store on the same runtime: SqlitePool multiplexes a small pool of connections, a prepared query (sqlx::query or the compile-time checked query! macro) performs the append, and migrations are managed with sqlx::migrate!. The audit copy runs on a spawned task fed by tokio::sync::mpsc, so the request path only offers the record (try_send) and a slow store becomes a drop counter rather than a latency spike, which is what replaces the classic interceptor. Retention is a scheduled DELETE by timestamp. Choose it over rusqlite when the application is tokio-based and the store is shared; prefer the embedded variant when the audit log is a local file and dependency weight matters.",
+      "code_sketch": "let pool = SqlitePool::connect(\"sqlite:audit.db?mode=rwc\").await?;\nsqlx::query(\"CREATE TABLE IF NOT EXISTS msg_store\"\n            \"(id TEXT PRIMARY KEY, chan TEXT, ts INTEGER, body TEXT)\")\n    .execute(&pool).await?;\n\nlet (tx, mut rx) = tokio::sync::mpsc::channel::<StoredMessage>(10_000);\ntokio::spawn(async move {\n    while let Some(m) = rx.recv().await {             // one writer task, serialised writes\n        sqlx::query(\"INSERT OR IGNORE INTO msg_store VALUES (?1,?2,?3,?4)\")\n            .bind(&m.id).bind(&m.channel).bind(m.ts).bind(&m.body)\n            .execute(&pool).await.map(|_| ()).unwrap_or_else(|_| drops.inc());\n    }\n});\n// request path: if tx.try_send(m).is_err() { drops.inc(); }",
+      "pitfalls": [
+        "SQLite still allows only one writer: a large pool turns concurrent writes into SQLITE_BUSY, so size the pool for readers and serialise the tap (one writer task) or accept the retries.",
+        "sqlx::query! checks SQL against the schema at build time and therefore needs DATABASE_URL or a cached offline metadata file; without it the build breaks in CI.",
+        "A dropped Sender/Receiver ends the writer task silently; monitor it, because nothing on the delivery path will report that auditing stopped.",
+        "Backups must include the -wal and -shm files (or use VACUUM INTO); restoring only the main database file loses the tail of the audit log."
+      ],
+      "sources": [
+        "https://docs.rs/sqlx/latest/sqlx/",
+        "https://sqlite.org/wal.html"
+      ]
+    }
+  ],
+  "default_variant": "rusqlite-embedded-store"
+}

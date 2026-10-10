@@ -1,0 +1,84 @@
+{
+  "pattern": "splitter",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "AbstractMessageSplitter / @Splitter endpoint",
+  "implementation_notes": "The framework implements the roles: AbstractMessageSplitter.splitMessage(Message<?>) returns a Collection, an Iterator, a Stream or even a Flux, and the endpoint fills CORRELATION_ID, SEQUENCE_NUMBER and SEQUENCE_SIZE on every derived message so a downstream aggregator can recombine them. Return an Iterator/Iterable (rather than a materialised collection) to split without holding all parts in memory - SEQUENCE_SIZE is then 0, so the default SequenceSizeReleaseStrategy cannot complete a group and a custom ReleaseStrategy or group timeout is required. A plain POJO method taking one argument and returning a collection works as well and is easier to unit-test than subclassing the splitter.",
+  "code_sketch": "@Splitter\nList<LineItem> extractItems(Order order) {\n    return order.getItems();   // one message per item\n}\n// the endpoint adds correlationId / sequenceNumber / sequenceSize to each part",
+  "pitfalls": [
+    "An Iterator/Iterable result leaves SEQUENCE_SIZE at 0, so the default aggregator release strategy never completes the group; configure a custom ReleaseStrategy or send-partial-result-on-expiry.",
+    "Returning null ends the flow without splitting, and an empty collection is only reported if a discardChannel is configured - silent drops are easy to miss.",
+    "The splitter must only split: per-part enrichment belongs in a following transformer, otherwise a route change forces a rewrite of the splitter.",
+    "Reusing one handler bean across several <splitter> definitions with injected output channels is rejected at configuration time; use prototype scope or a dedicated bean."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-integration/reference/splitter.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "spring-integration-splitter",
+      "name": "Spring Integration splitter endpoint (@Splitter / AbstractMessageSplitter)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "Spring Integration"
+      ],
+      "idiom_name": "AbstractMessageSplitter / @Splitter endpoint",
+      "implementation_notes": "The framework implements the roles: AbstractMessageSplitter.splitMessage(Message<?>) returns a Collection, an Iterator, a Stream or even a Flux, and the endpoint fills CORRELATION_ID, SEQUENCE_NUMBER and SEQUENCE_SIZE on every derived message so a downstream aggregator can recombine them. Return an Iterator/Iterable (rather than a materialised collection) to split without holding all parts in memory - SEQUENCE_SIZE is then 0, so the default SequenceSizeReleaseStrategy cannot complete a group and a custom ReleaseStrategy or group timeout is required. A plain POJO method taking one argument and returning a collection works as well and is easier to unit-test than subclassing the splitter.",
+      "code_sketch": "@Splitter\nList<LineItem> extractItems(Order order) {\n    return order.getItems();   // one message per item\n}\n// the endpoint adds correlationId / sequenceNumber / sequenceSize to each part",
+      "pitfalls": [
+        "An Iterator/Iterable result leaves SEQUENCE_SIZE at 0, so the default aggregator release strategy never completes the group; configure a custom ReleaseStrategy or send-partial-result-on-expiry.",
+        "Returning null ends the flow without splitting, and an empty collection is only reported if a discardChannel is configured - silent drops are easy to miss.",
+        "The splitter must only split: per-part enrichment belongs in a following transformer, otherwise a route change forces a rewrite of the splitter.",
+        "Reusing one handler bean across several <splitter> definitions with injected output channels is rejected at configuration time; use prototype scope or a dedicated bean."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-integration/reference/splitter.html"
+      ]
+    },
+    {
+      "variant_id": "streams-flatmap",
+      "name": "In-process Stream pipeline (flatMap / mapMulti)",
+      "paradigm": "functional",
+      "min_standard": "Java8",
+      "requires_features": [
+        "Streams"
+      ],
+      "idiom_name": "Stream.flatMap (Java 8) / Stream.mapMulti (Java 16)",
+      "implementation_notes": "Inside the JVM the splitter is a stream operator: flatMap replaces each composite element with the stream of its parts, and mapMulti (Java 16+) emits several parts from one element without allocating an intermediate Stream, so one pipeline expresses split-then-send. This is the right form when the composite is already an in-memory collection and no messaging topology is involved; a Stream is lazy and single-use, so only the terminal operation publishes and the pipeline cannot be replayed.",
+      "code_sketch": "order.getItems().stream()\n     .map(item -> new Part(order.getId(), item))\n     .forEach(bus::publish);\n// Java 16+: order.getItems().stream()\n//   .mapMulti((item, out) -> { out.accept(new Part(order.getId(), item)); })",
+      "pitfalls": [
+        "A Stream is consumed once: reusing a stored stream (or a 'forked' one) throws IllegalStateException.",
+        "flatMap's mapper must be stateless and non-interfering; a counter mutated in the lambda is a data race under parallel(), and forEach in a parallel stream does not preserve encounter order.",
+        "Close resource-backed streams (Files.lines) with try-with-resources or the file descriptor leaks after the split."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html"
+      ]
+    },
+    {
+      "variant_id": "camel-split-eip",
+      "name": "Apache Camel split() EIP in a route DSL",
+      "paradigm": "declarative",
+      "min_standard": "Java17",
+      "requires_features": [
+        "Apache Camel"
+      ],
+      "idiom_name": "Camel split() route node (tokenize/XPath/JSONPath expressions)",
+      "implementation_notes": "Camel exposes the pattern as a route node: split(expression) evaluates an expression - body, tokenize, XPath, JSONPath - into an Iterator, Iterable, array, Collection, Map, NodeList or delimited String and routes one exchange per element, with the exchange properties CamelSplitIndex / CamelSplitSize / CamelSplitComplete carrying correlation and completion. streaming splits on demand instead of materialising all parts, parallelProcessing adds a thread pool, group batches N parts into one message, and stopOnException / errorThreshold / maxFailedRecords decide what a failed part means. Camel 4 requires Java 17, so this form has a higher floor than the Spring Integration one.",
+      "code_sketch": "from(\"activemq:orders\")\n    .split(body().tokenize(\"\\n\")).streaming()\n        .to(\"direct:line-item\")\n    .end();",
+      "pitfalls": [
+        "Without streaming=true the whole composite is materialised into exchanges before the first part is processed.",
+        "A String body is split on commas by default - a route that forgets tokenize/delimiter silently splits on commas.",
+        "parallelProcessing with an AggregationStrategy requires a thread-safe strategy, otherwise results interleave; error thresholds also become non-deterministic under parallelism.",
+        "Resume/watermark support requires a configured watermark store; without it a restart replays the whole composite instead of resuming at the last completed part."
+      ],
+      "sources": [
+        "https://camel.apache.org/components/4.22.x/eips/split-eip.html",
+        "https://camel.apache.org/manual/camel-4-migration-guide.html"
+      ]
+    }
+  ],
+  "default_variant": "spring-integration-splitter"
+}

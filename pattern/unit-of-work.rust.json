@@ -1,0 +1,75 @@
+{
+  "pattern": "unit-of-work",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "sqlx Transaction (begin/commit, rollback on drop) + hand-written change set",
+  "implementation_notes": "Rust's ecosystem provides the boundary with a safety net and nothing else: sqlx's Pool::begin or Connection::begin returns a Transaction that dereferences to the connection, must end in commit() or rollback(), and calls rollback on drop if neither happened, so a forgotten commit is a silent rollback rather than a partial write. There is no identity map and no dirty tracking in std, so the register half is yours: keep a change set (new, dirty, removed) keyed by id and flush it inside the transaction. Diesel offers the same boundary as a closure (conn.transaction(|conn| ...)) and uses savepoints when nested; SeaORM adds ActiveModel with Set(...)/save() plus a closure or begin/commit transaction, but still writes eagerly per model rather than deferring a flush.",
+  "code_sketch": "let mut tx = pool.begin().await?;                 // rollback on drop if not committed\nfor c in uow.added()   { insert_customer(&mut *tx, c).await?; }\nfor c in uow.dirty()   { update_customer(&mut *tx, c).await?; }\nfor id in uow.removed(){ delete_customer(&mut *tx, id).await?; }\ntx.commit().await?;                               // atomic; uow.clear() afterwards\n// diesel: conn.transaction(|conn| { ... }) commits on Ok, rolls back on Err",
+  "pitfalls": [
+    "Borrow rules bite here: the change set must not borrow the connection while the transaction is open - own the data or split the phases.",
+    "A missing commit() rolls back silently, which looks like a successful write that changed nothing.",
+    "A Transaction borrows the connection mutably, so helpers must take &mut *tx (or &mut **tx for executors); holding two references is a compile error, not a runtime bug.",
+    "SeaORM's save() writes immediately - wrapping it in a transaction makes the writes atomic but not batched into one round trip."
+  ],
+  "sources": [
+    "https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html",
+    "https://docs.diesel.rs/master/diesel/connection/trait.Connection.html",
+    "https://www.sea-ql.org/SeaORM/docs/advanced-query/transaction/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sqlx-async-transaction",
+      "name": "sqlx async Transaction with rollback on drop",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "sqlx Transaction (begin/commit, rollback on drop) + hand-written change set",
+      "implementation_notes": "Rust's ecosystem provides the boundary with a safety net and nothing else: sqlx's Pool::begin or Connection::begin returns a Transaction that dereferences to the connection, must end in commit() or rollback(), and calls rollback on drop if neither happened, so a forgotten commit is a silent rollback rather than a partial write. There is no identity map and no dirty tracking in std, so the register half is yours: keep a change set (new, dirty, removed) keyed by id and flush it inside the transaction. Diesel offers the same boundary as a closure (conn.transaction(|conn| ...)) and uses savepoints when nested; SeaORM adds ActiveModel with Set(...)/save() plus a closure or begin/commit transaction, but still writes eagerly per model rather than deferring a flush.",
+      "code_sketch": "let mut tx = pool.begin().await?;                 // rollback on drop if not committed\nfor c in uow.added()   { insert_customer(&mut *tx, c).await?; }\nfor c in uow.dirty()   { update_customer(&mut *tx, c).await?; }\nfor id in uow.removed(){ delete_customer(&mut *tx, id).await?; }\ntx.commit().await?;                               // atomic; uow.clear() afterwards\n// diesel: conn.transaction(|conn| { ... }) commits on Ok, rolls back on Err",
+      "pitfalls": [
+        "Borrow rules bite here: the change set must not borrow the connection while the transaction is open - own the data or split the phases.",
+        "A missing commit() rolls back silently, which looks like a successful write that changed nothing.",
+        "A Transaction borrows the connection mutably, so helpers must take &mut *tx (or &mut **tx for executors); holding two references is a compile error, not a runtime bug.",
+        "SeaORM's save() writes immediately - wrapping it in a transaction makes the writes atomic but not batched into one round trip."
+      ],
+      "sources": [
+        "https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html",
+        "https://docs.diesel.rs/master/diesel/connection/trait.Connection.html",
+        "https://www.sea-ql.org/SeaORM/docs/advanced-query/transaction/"
+      ]
+    },
+    {
+      "variant_id": "sea-orm-active-model",
+      "name": "SeaORM ActiveModel save() inside a transaction",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "ActiveModel::save(&txn) / db.transaction(|txn| ...)",
+      "implementation_notes": "SeaORM models the writable side with ActiveModel: Set(...) marks changed fields, save(txn) emits the INSERT or UPDATE immediately, and db.transaction(|txn| ...) or begin/commit wraps the sequence atomically (nested transactions use SAVEPOINT). It is the closest Rust gets to a framework-provided unit of work without deferred flush: the transaction is the unit of work and ActiveModel is the per-row mapper, but nothing collects changes for you.",
+      "code_sketch": "db.transaction::<_, (), DbErr>(|txn| {\n    Box::pin(async move {\n        bakery::ActiveModel { name: Set(\"SeaSide\".to_owned()), ..Default::default() }\n            .save(txn).await?;\n        Ok(())\n    })\n}).await;   // commits on Ok, rolls back on Err",
+      "pitfalls": [
+        "The async closure must be pinned (Box::pin) because async closures are not stable; capturing references across it is the usual source of lifetime errors.",
+        "Dropping the transaction without commit rolls back, so an early return path can discard work that looked finished."
+      ],
+      "sources": [
+        "https://www.sea-ql.org/SeaORM/docs/advanced-query/transaction/"
+      ]
+    },
+    {
+      "variant_id": "diesel-sync-transaction",
+      "name": "Diesel Connection::transaction closure (sync, savepoint-aware)",
+      "paradigm": "oo",
+      "min_standard": "Rust2018",
+      "idiom_name": "conn.transaction(|conn| { ... }) with nested savepoints",
+      "implementation_notes": "Diesel exposes the unit of work as a closure on the connection: the block runs inside a transaction, commits when it returns Ok and rolls back on Err, and a nested transaction on the same connection becomes a savepoint instead of a second transaction. Error::RollbackTransaction forces a rollback without inventing an error, and the change set is whatever the closure executes, so tracking stays in application code.",
+      "code_sketch": "conn.transaction::<_, diesel::result::Error, _>(|conn| {\n    diesel::insert_into(users).values(name.eq(\"Ruby\")).execute(conn)?;\n    diesel::update(users.filter(id.eq(1))).set(active.eq(true)).execute(conn)?;\n    Ok(())\n})?;   // Ok commits; Err rolls back (Error::RollbackTransaction forces it)",
+      "pitfalls": [
+        "The closure receives the connection mutably, so the change set cannot hold it - collect ids/values before the call.",
+        "A failed commit triggers an attempted rollback; if that also fails the connection is marked broken and all further transaction work on it errors."
+      ],
+      "sources": [
+        "https://docs.diesel.rs/master/diesel/connection/trait.Connection.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlx-async-transaction"
+}

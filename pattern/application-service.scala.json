@@ -1,0 +1,51 @@
+{
+  "pattern": "application-service",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "class of ZIO methods + Transactor.transact (doobie/zio-jdbc)",
+  "implementation_notes": "In a ZIO/doobie stack the service is a class whose methods return ZIO, its dependencies are provided through a ZLayer graph resolved at the edge of the program, and repository ports expose ConnectionIO values. ZIO.serviceWithZIO obtains the Transactor[Task] from the environment and transact(xa) interprets the composed ConnectionIO in one transaction. What replaces the classic structure is the environment type and the interpreter: injection is the layer graph, the unit of work is the transaction interpreter, and the service itself stays a plain class of effect descriptions.",
+  "code_sketch": "final class PlaceOrderService(orders: OrderRepository, customers: CustomerRepository) {\n  def place(cmd: PlaceOrderCommand): ZIO[Transactor[Task], Throwable, OrderId] =\n    ZIO.serviceWithZIO[Transactor[Task]] { xa =>\n      (for {                                        // repositories return ConnectionIO values\n        customer <- customers.ofId(cmd.customerId)\n        order = customer.placeOrder(cmd.items)      // the aggregate decides\n        _ <- orders.add(order)\n      } yield order.id).transact(xa)                // commit on success, rollback on failure\n    }\n}",
+  "pitfalls": [
+    "Wrong move: run a repository call as a standalone ZIO effect outside the ConnectionIO program; failure: it uses another connection or transaction; instead: compose every database operation as ConnectionIO and interpret the whole program with one Transactor.",
+    "Wrong move: provide the same ZLayer graph independently at multiple call sites; failure: resourceful services can be constructed more than once; instead: build and share one layer at the application edge.",
+    "Wrong move: catchAll an error and return success inside the transaction effect; failure: the interpreter sees a successful effect and commits partial work; instead: re-fail expected errors after logging or map them to a failed result."
+  ],
+  "sources": [
+    "https://typelevel.org/doobie/docs/14-Managing-Connections.html",
+    "https://zio.dev/reference/contextual/zlayer.md"
+  ],
+  "variants": [
+    {
+      "variant_id": "zio-doobie-effectful",
+      "name": "Effectful service over a doobie/ZIO transaction",
+      "paradigm": "functional",
+      "idiom_name": "class of ZIO methods + Transactor.transact (doobie/zio-jdbc)",
+      "implementation_notes": "In a ZIO/doobie stack the service is a class whose methods return ZIO, its dependencies are provided through a ZLayer graph resolved at the edge of the program, and repository ports expose ConnectionIO values. ZIO.serviceWithZIO obtains the Transactor[Task] from the environment and transact(xa) interprets the composed ConnectionIO in one transaction. What replaces the classic structure is the environment type and the interpreter: injection is the layer graph, the unit of work is the transaction interpreter, and the service itself stays a plain class of effect descriptions.",
+      "code_sketch": "final class PlaceOrderService(orders: OrderRepository, customers: CustomerRepository) {\n  def place(cmd: PlaceOrderCommand): ZIO[Transactor[Task], Throwable, OrderId] =\n    ZIO.serviceWithZIO[Transactor[Task]] { xa =>\n      (for {                                        // repositories return ConnectionIO values\n        customer <- customers.ofId(cmd.customerId)\n        order = customer.placeOrder(cmd.items)      // the aggregate decides\n        _ <- orders.add(order)\n      } yield order.id).transact(xa)                // commit on success, rollback on failure\n    }\n}",
+      "pitfalls": [
+        "Wrong move: run a repository call as a standalone ZIO effect outside the ConnectionIO program; failure: it uses another connection or transaction; instead: compose every database operation as ConnectionIO and interpret the whole program with one Transactor.",
+        "Wrong move: provide the same ZLayer graph independently at multiple call sites; failure: resourceful services can be constructed more than once; instead: build and share one layer at the application edge.",
+        "Wrong move: catchAll an error and return success inside the transaction effect; failure: the interpreter sees a successful effect and commits partial work; instead: re-fail expected errors after logging or map them to a failed result."
+      ],
+      "sources": [
+        "https://typelevel.org/doobie/docs/14-Managing-Connections.html",
+        "https://zio.dev/reference/contextual/zlayer.md"
+      ]
+    },
+    {
+      "variant_id": "oo-jdbc-service",
+      "name": "Plain OO service class with constructor-injected traits and manual JDBC demarcation",
+      "paradigm": "oo",
+      "idiom_name": "final class with trait dependencies + setAutoCommit(false)/commit/rollback",
+      "implementation_notes": "The framework-free realization: a final class taking its ports as constructor parameters (traits), instantiated once at the composition root (manually, with MacWire or a Cake-style module); the transaction is demarcated explicitly on a JDBC connection with setAutoCommit(false), commit and a rollback in the catch, all in a try/finally that closes the connection. Choose it where the team wants neither an effect system nor a DI framework: everything is ordinary Scala, and the boundary is visible in the method body.",
+      "code_sketch": "final class PlaceOrderService(orders: OrderRepository, customers: CustomerRepository, ds: DataSource) {\n  def place(cmd: PlaceOrderCommand): OrderId = {\n    val conn = ds.getConnection\n    conn.setAutoCommit(false)                     // explicit demarcation\n    try {\n      val customer = customers.ofId(conn, cmd.customerId)\n      val order = customer.placeOrder(cmd.items)  // the aggregate decides\n      orders.add(conn, order)\n      conn.commit()\n      order.id\n    } catch { case e: Throwable => conn.rollback(); throw e } finally conn.close()\n  }\n}",
+      "pitfalls": [
+        "A rollback that itself throws in the catch clause masks the original failure; log and preserve the first error.",
+        "Passing java.sql.Connection through service signatures leaks JDBC into the domain; narrow it behind a transactor trait once more than one service needs it.",
+        "Blocking JDBC inside a Future without a dedicated execution context starves the global pool."
+      ]
+    }
+  ],
+  "default_variant": "zio-doobie-effectful",
+  "version": "1.1"
+}

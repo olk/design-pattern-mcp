@@ -1,0 +1,51 @@
+{
+  "pattern": "authentication-enforcer",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "dispatch-loop guard + injected Authenticator interface",
+  "implementation_notes": "Without an HTTP framework the checkpoint is a guard object called by the request dispatcher before it routes to a handler; verification is delegated through an abstract Authenticator interface (virtual std::optional<Principal> verify(std::string_view credential)), injected so the mechanism can be swapped in tests and at configuration time. The guard owns the policy map and the challenge (401 response); the authenticator owns hashing, token parsing and constant-time comparison. Keep the guard framework-neutral only while no framework owns the HTTP stack - once one does, use its filter mechanism instead.",
+  "code_sketch": "struct Authenticator {\n  virtual std::optional<Principal> verify(std::string_view cred) = 0;\n  virtual ~Authenticator() = default;\n};\nbool enforce(const Request& req, Response& res, Authenticator& auth, Principal& out) {\n  if (is_public(req.path())) return true;                     // explicit public surface\n  if (auto p = auth.verify(bearer(req))) { out = *p; return true; }  // delegated\n  res = challenge_401(req);                                   // single challenge site\n  return false;\n}",
+  "pitfalls": [
+    "The guard must not own the credential store: an Authenticator that parses headers, hashes passwords and stores users recreates the coupling the pattern removes.",
+    "The principal must be request-scoped data (passed by reference into the request object); a shared member of the guard leaks identity between concurrent connections."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/utility/optional"
+  ],
+  "variants": [
+    {
+      "variant_id": "manual-dispatch-guard",
+      "name": "Hand-written dispatch chokepoint",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "dispatch-loop guard + injected Authenticator interface",
+      "implementation_notes": "Without an HTTP framework the checkpoint is a guard object called by the request dispatcher before it routes to a handler; verification is delegated through an abstract Authenticator interface (virtual std::optional<Principal> verify(std::string_view credential)), injected so the mechanism can be swapped in tests and at configuration time. The guard owns the policy map and the challenge (401 response); the authenticator owns hashing, token parsing and constant-time comparison. Keep the guard framework-neutral only while no framework owns the HTTP stack - once one does, use its filter mechanism instead.",
+      "code_sketch": "struct Authenticator {\n  virtual std::optional<Principal> verify(std::string_view cred) = 0;\n  virtual ~Authenticator() = default;\n};\nbool enforce(const Request& req, Response& res, Authenticator& auth, Principal& out) {\n  if (is_public(req.path())) return true;                     // explicit public surface\n  if (auto p = auth.verify(bearer(req))) { out = *p; return true; }  // delegated\n  res = challenge_401(req);                                   // single challenge site\n  return false;\n}",
+      "pitfalls": [
+        "The guard must not own the credential store: an Authenticator that parses headers, hashes passwords and stores users recreates the coupling the pattern removes.",
+        "The principal must be request-scoped data (passed by reference into the request object); a shared member of the guard leaks identity between concurrent connections."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/optional"
+      ]
+    },
+    {
+      "variant_id": "crow-middleware",
+      "name": "Crow middleware over crow::App",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "crow::Middleware before_handle + per-request context",
+      "implementation_notes": "When the service runs on Crow, the checkpoint is a middleware class: a request-local context struct plus a before_handle(crow::request&, crow::response&, context&) hook that runs before the route handler, rejects with res.code = 401 followed by res.end(), or stores the verified principal in the context the handler receives. Middleware is listed on the application type (crow::App<AuthMiddleware>), so the protected surface is fixed per application, and the verifier is injected into the middleware as a service. This replaces the hand-written dispatcher guard once Crow owns the HTTP stack; prefer it over a custom chokepoint whenever the framework is already in use.",
+      "code_sketch": "struct AuthMiddleware {\n  struct context { std::optional<Principal> principal; };\n  TokenVerifier* verify = nullptr;                        // injected mechanism\n  void before_handle(crow::request& req, crow::response& res, context& ctx) {\n    if (req.url == \"/health\") return;                     // explicit public route\n    auto p = verify->check(req.get_header_value(\"Authorization\"));\n    if (!p) { res.code = 401; res.end(); return; }        // challenge ends the chain\n    ctx.principal = *p;                                   // request-local principal\n  }\n  void after_handle(crow::request&, crow::response&, context&) {}\n};\ncrow::App<AuthMiddleware> app;                            // middleware applied app-wide",
+      "pitfalls": [
+        "crow::response::end() is what stops the chain: forgetting it lets the request continue to the handler unauthenticated (fail-open).",
+        "Local (route-level) middleware and additional app instances can leave routes outside the guard; keep the authentication middleware at application level and treat route-level middleware as a deliberate exception."
+      ],
+      "sources": [
+        "https://crowcpp.org/master/guides/middleware/"
+      ]
+    }
+  ],
+  "default_variant": "manual-dispatch-guard",
+  "version": "1.1"
+}

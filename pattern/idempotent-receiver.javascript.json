@@ -1,0 +1,55 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "javascript",
+  "support": "idiomatic",
+  "idiom_name": "Set/Map synchronous check-and-claim",
+  "implementation_notes": "In Node.js a synchronous `if (seen.has(key)) return; seen.add(key);` block is atomic with respect to other event-loop turns - provided no await sits between the check and the add - so a Map/Set replaces the classic store for single-process receivers. It survives neither cluster workers, nor several pods, nor a process recycle, so production receivers whose duplicates can outlive the process use the Redis claim below or a SQL claim. Retention is manual: store an expiry with each key and sweep on a timer, because Map entries never expire.",
+  "code_sketch": "const seen = new Map();                       // key -> expiry epoch ms\nfunction claim(key, ttlMs) {\n  if (seen.has(key)) return false;            // no await between check and add\n  seen.set(key, Date.now() + ttlMs);\n  return true;\n}\nasync function onMessage(msg) {\n  if (!claim(msg.key, REDELIVERY_WINDOW_MS)) return ack(msg);  // duplicate: absorb\n  await applyEffects(msg);\n  await ack(msg);\n}",
+  "pitfalls": [
+    "An await between the existence check and the insert in the in-process guard reopens the race: other event-loop turns interleave.",
+    "cluster workers and worker_threads each own their Set, so the guard must move to Redis or a database to protect a fleet.",
+    "Map/Set entries never expire on their own; sweeping only while traffic arrives leaves stale keys behind on a quiet queue."
+  ],
+  "sources": [
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Set/add",
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "in-process-set-guard",
+      "name": "In-process Set/Map guard (single event loop)",
+      "paradigm": "oo",
+      "implementation_notes": "In Node.js a synchronous `if (seen.has(key)) return; seen.add(key);` block is atomic with respect to other event-loop turns - provided no await sits between the check and the add - so a Map/Set replaces the classic store for single-process receivers. It survives neither cluster workers, nor several pods, nor a process recycle, so production receivers whose duplicates can outlive the process use the Redis claim below or a SQL claim. Retention is manual: store an expiry with each key and sweep on a timer, because Map entries never expire.",
+      "code_sketch": "const seen = new Map();                       // key -> expiry epoch ms\nfunction claim(key, ttlMs) {\n  if (seen.has(key)) return false;            // no await between check and add\n  seen.set(key, Date.now() + ttlMs);\n  return true;\n}\nasync function onMessage(msg) {\n  if (!claim(msg.key, REDELIVERY_WINDOW_MS)) return ack(msg);  // duplicate: absorb\n  await applyEffects(msg);\n  await ack(msg);\n}",
+      "pitfalls": [
+        "An await between the existence check and the insert in the in-process guard reopens the race: other event-loop turns interleave.",
+        "cluster workers and worker_threads each own their Set, so the guard must move to Redis or a database to protect a fleet.",
+        "Map/Set entries never expire on their own; sweeping only while traffic arrives leaves stale keys behind on a quiet queue."
+      ],
+      "sources": [
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Set/add",
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map"
+      ],
+      "min_standard": "ES2015",
+      "idiom_name": "Set/Map synchronous check-and-claim"
+    },
+    {
+      "variant_id": "redis-set-nx",
+      "name": "Distributed claim with Redis SET NX PX",
+      "paradigm": "concurrent",
+      "implementation_notes": "`SET key 1 NX PX <ttl>` is a single-command compare-and-set: it returns OK only for the first caller, so one round trip both claims the key and arms its expiry - the standard distributed claim behind several Node processes. A null reply means duplicate; a connection error must be treated as retryable, never as duplicate. Size the TTL to the broker's redelivery window and keep the key in a namespace per consumer group when several subscribers share the store.",
+      "code_sketch": "const client = createClient();\n\nasync function claim(key, ttlMs) {\n  const ok = await client.set(`seen:${key}`, '1', { NX: true, PX: ttlMs });\n  return ok === 'OK';                          // null => already claimed\n}\n\nasync function onMessage(msg) {\n  if (!(await claim(msg.key, REDELIVERY_WINDOW_MS))) return ack(msg);\n  await applyEffects(msg);\n  await ack(msg);\n}",
+      "pitfalls": [
+        "A failed Redis call must not be mapped to 'duplicate': only the conditional-set result distinguishes the cases, errors must propagate for redelivery.",
+        "NX keys expire on their own, so a retention shorter than the redelivery window silently reopens duplicates; longer retention merely costs memory."
+      ],
+      "sources": [
+        "https://redis.io/docs/latest/commands/set/"
+      ],
+      "min_standard": "ES2017",
+      "idiom_name": "SET key value NX PX (redis client)"
+    }
+  ],
+  "default_variant": "in-process-set-guard"
+}

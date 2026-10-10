@@ -1,0 +1,54 @@
+{
+  "pattern": "counting-semaphore",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "tokio::sync::Semaphore with acquire().await returning a drop-released permit",
+  "implementation_notes": "Rust's standard library has no semaphore, and in async code the ecosystem realization is tokio::sync::Semaphore: acquire().await returns a SemaphorePermit that releases on drop - the RAII form of 'release on every exit path', including panics - acquire_many(n) takes several permits, try_acquire returns a TryAcquireError instead of blocking, acquire_owned moves a permit across task boundaries, and add_permits/forget_permits adjust the bound at runtime. Because the permit is a guard, the classic 'forgot to release' bug becomes an ownership question the compiler helps with, rather than a discipline problem.",
+  "code_sketch": "static SLOTS: Semaphore = Semaphore::const_new(8);\n\nasync fn handle(req: Request) -> Result<(), Error> {\n    let _permit = SLOTS.acquire().await.map_err(|_| Error::Closed)?;\n    serve(req).await                    // _permit dropped on every exit path\n}",
+  "pitfalls": [
+    "mem::forget(permit) (or leaking the guard) loses the permit permanently - the same failure mode as a forgotten release, and the reason forget_permits exists explicitly.",
+    "The semaphore is fair (FIFO): a queued acquire_many at the head can block later single acquires even when enough permits are available for them, so weights must be planned together.",
+    "The Semaphore must outlive every waiter and every live permit; dropping it while permits are outstanding is legal but the bound no longer exists, which is easy to miss in long-lived tasks."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tokio-permits",
+      "name": "tokio::sync::Semaphore permits (RAII)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "tokio::sync::Semaphore with acquire().await returning a drop-released permit",
+      "implementation_notes": "Rust's standard library has no semaphore, and in async code the ecosystem realization is tokio::sync::Semaphore: acquire().await returns a SemaphorePermit that releases on drop - the RAII form of 'release on every exit path', including panics - acquire_many(n) takes several permits, try_acquire returns a TryAcquireError instead of blocking, acquire_owned moves a permit across task boundaries, and add_permits/forget_permits adjust the bound at runtime. Because the permit is a guard, the classic 'forgot to release' bug becomes an ownership question the compiler helps with, rather than a discipline problem.",
+      "code_sketch": "static SLOTS: Semaphore = Semaphore::const_new(8);\n\nasync fn handle(req: Request) -> Result<(), Error> {\n    let _permit = SLOTS.acquire().await.map_err(|_| Error::Closed)?;\n    serve(req).await                    // _permit dropped on every exit path\n}",
+      "pitfalls": [
+        "mem::forget(permit) (or leaking the guard) loses the permit permanently - the same failure mode as a forgotten release, and the reason forget_permits exists explicitly.",
+        "The semaphore is fair (FIFO): a queued acquire_many at the head can block later single acquires even when enough permits are available for them, so weights must be planned together.",
+        "The Semaphore must outlive every waiter and every live permit; dropping it while permits are outstanding is legal but the bound no longer exists, which is easy to miss in long-lived tasks."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html"
+      ]
+    },
+    {
+      "variant_id": "std-condvar-manual",
+      "name": "std Mutex + Condvar hand-rolled semaphore",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.0",
+      "idiom_name": "std::sync::{Mutex, Condvar} with a permit counter",
+      "implementation_notes": "Synchronous Rust code has no semaphore in std, so the manual realization pairs a Mutex<usize> with a Condvar: acquire locks, waits with wait_while(|p| *p == 0) (the predicate form protects against spurious wakeups), then decrements; release increments and notify_one. It works on every Rust version with no runtime dependency, at the cost of writing and testing the waiter loop, and it must decide explicitly whether to use wait_timeout for a bounded wait. Use it when the callers are OS threads and pulling in an async runtime for a counter is not justified.",
+      "code_sketch": "let slots = Mutex::new(8usize);\nlet cv = Condvar::new();\n\n// acquire\nlet mut permits = slots.lock().unwrap();\npermits = cv.wait_while(permits, |p| *p == 0).unwrap();\n*permits -= 1;\ndrop(permits);\n\n// release\nlet mut permits = slots.lock().unwrap();\n*permits += 1;\ndrop(permits);\ncv.notify_one();",
+      "pitfalls": [
+        "Mutex poisoning makes every unwrap() after a panicking holder a second failure; decide whether the permit counter may be poisoned and handle PoisonError deliberately.",
+        "notify_one after releasing the lock is usually preferable to notifying while holding it, but the counter must be updated under the same lock or a wakeup can be lost.",
+        "Condvar::wait can wake spuriously, so a bare if around it hands out permits that do not exist; always use the predicate (wait_while) form."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.Condvar.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-permits"
+}

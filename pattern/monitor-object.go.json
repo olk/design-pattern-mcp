@@ -1,0 +1,63 @@
+{
+  "pattern": "monitor-object",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "struct with sync.Mutex + sync.Cond (methods lock, defer unlock)",
+  "implementation_notes": "Go has no per-object monitors, so the classic structure is a struct that holds a sync.Mutex together with the state, and methods that lock, defer mu.Unlock() and touch only the guarded fields; the Go wiki recommends exactly this for caches and shared state and warns against over-using channels because they look more idiomatic. Waiting uses sync.Cond, which is built from a Locker, waited on in a loop and signalled with Signal or Broadcast; for a fixed number of waiting consumers a buffered channel used as a counting semaphore is simpler. The language's doctrine points the other way when ownership can move: share memory by communicating, and replace the monitor with a channel-owning goroutine.",
+  "code_sketch": "type Queue struct {\n    mu   sync.Mutex\n    cond *sync.Cond\n    buf  []Msg\n    cap  int\n}\nfunc (q *Queue) Put(m Msg) {\n    q.mu.Lock(); defer q.mu.Unlock()\n    for len(q.buf) == q.cap { q.cond.Wait() }   // predicate loop\n    q.buf = append(q.buf, m)\n    q.cond.Broadcast()\n}",
+  "pitfalls": [
+    "sync.Cond must never be copied after first use (go vet reports it) and Wait must run while holding the same Locker the Cond was created with, otherwise the unlock/wait pair is not atomic.",
+    "A mutex-guarded struct shares one lock across all methods: holding it across channel sends, I/O or callbacks serialises the whole object and hides lock-ordering deadlocks.",
+    "sync.Cond has no timeout and no cancellation; if callers must give up, model the wait with select on a channel instead, or the goroutine blocks forever."
+  ],
+  "sources": [
+    "https://go.dev/wiki/MutexOrChannel",
+    "https://go.dev/blog/codelab-share"
+  ],
+  "variants": [
+    {
+      "variant_id": "sync-mutex-cond",
+      "name": "mutex-guarded struct with sync.Cond",
+      "paradigm": "oo",
+      "requires_features": [
+        "sync.Mutex",
+        "sync.Cond"
+      ],
+      "idiom_name": "struct with sync.Mutex + sync.Cond (methods lock, defer unlock)",
+      "implementation_notes": "Go has no per-object monitors, so the classic structure is a struct that holds a sync.Mutex together with the state, and methods that lock, defer mu.Unlock() and touch only the guarded fields; the Go wiki recommends exactly this for caches and shared state and warns against over-using channels because they look more idiomatic. Waiting uses sync.Cond, which is built from a Locker, waited on in a loop and signalled with Signal or Broadcast; for a fixed number of waiting consumers a buffered channel used as a counting semaphore is simpler. The language's doctrine points the other way when ownership can move: share memory by communicating, and replace the monitor with a channel-owning goroutine.",
+      "code_sketch": "type Queue struct {\n    mu   sync.Mutex\n    cond *sync.Cond\n    buf  []Msg\n    cap  int\n}\nfunc (q *Queue) Put(m Msg) {\n    q.mu.Lock(); defer q.mu.Unlock()\n    for len(q.buf) == q.cap { q.cond.Wait() }   // predicate loop\n    q.buf = append(q.buf, m)\n    q.cond.Broadcast()\n}",
+      "pitfalls": [
+        "sync.Cond must never be copied after first use (go vet reports it) and Wait must run while holding the same Locker the Cond was created with, otherwise the unlock/wait pair is not atomic.",
+        "A mutex-guarded struct shares one lock across all methods: holding it across channel sends, I/O or callbacks serialises the whole object and hides lock-ordering deadlocks.",
+        "sync.Cond has no timeout and no cancellation; if callers must give up, model the wait with select on a channel instead, or the goroutine blocks forever."
+      ],
+      "sources": [
+        "https://go.dev/wiki/MutexOrChannel",
+        "https://go.dev/blog/codelab-share"
+      ]
+    },
+    {
+      "variant_id": "channel-ownership",
+      "name": "goroutine owning the state, methods as messages",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "channels",
+        "goroutines"
+      ],
+      "idiom_name": "state-owning goroutine + request channel (share memory by communicating)",
+      "implementation_notes": "Instead of locking the object, one goroutine owns the state and every method call becomes a message - a closure, a request struct with a reply channel, or a select over several channels - so the owner processes calls one at a time; this is Go's preferred realisation of serialised method execution and the slogan share memory by communicating. There is no monitor lock and no condition variable: waiting is a goroutine blocked on a receive or a select, and the caller blocks on the reply. Choose it when callers can be asynchronous, when the object also owns a blocking resource such as a connection, or when the state is too complex to reason about under a lock; the cost is a channel hop per call and a goroutine that must be shut down explicitly.",
+      "code_sketch": "type Queue struct{ ops chan func(*state) }\nfunc NewQueue() *Queue { q := &Queue{ops: make(chan func(*state))}; go q.run(); return q }\nfunc (q *Queue) Put(m Msg) {\n    done := make(chan struct{})\n    q.ops <- func(s *state) { s.push(m); close(done) }\n    <-done                       // blocks until the owner applied the call\n}\nfunc (q *Queue) run() { s := &state{}; for f := range q.ops { f(s) } }",
+      "pitfalls": [
+        "The owning goroutine must be stopped explicitly (close(q.ops)) or it leaks; every request must carry exactly one reply or the caller blocks forever.",
+        "A panic inside the owner loop kills the object silently unless recovered, and a long-running operation inside the owner blocks every other method call.",
+        "Channel ownership does not compose with a mutex elsewhere: as soon as another path touches the state directly the serialisation guarantee is gone."
+      ],
+      "sources": [
+        "https://go.dev/blog/codelab-share",
+        "https://go.dev/doc/effective_go"
+      ]
+    }
+  ],
+  "default_variant": "sync-mutex-cond",
+  "version": "1.0"
+}
