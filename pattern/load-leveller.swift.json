@@ -1,0 +1,63 @@
+{
+  "pattern": "load-leveller",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "actor + [CheckedContinuation] buffer + TaskGroup consumers",
+  "implementation_notes": "The Swift standard library has no bounded blocking queue: AsyncStream buffers, but its documented default limit is Int.max and its buffering policies keep or drop the newest/oldest elements - dropping is shedding, the opposite of levelling. The honest realization is therefore hand-written: an actor owns the pending array and a list of CheckedContinuation waiters; push hands the job to a waiter if one is parked (or buffers it up to capacity) and pop suspends with withCheckedContinuation when the buffer is empty. Consumers are a TaskGroup iterating an AsyncStream or looping over pop(); because actors are reentrant, capacity and waiter checks must happen in the same synchronous section as the state change.",
+  "code_sketch": "actor BoundedQueue {\n  private var buffer: [Job] = []; private var waiters: [CheckedContinuation<Job, Never>] = []\n  private let capacity = 1000\n  func push(_ job: Job) {\n    if let w = waiters.first { waiters.removeFirst(); w.resume(returning: job) }\n    else { precondition(buffer.count < capacity); buffer.append(job) }\n  }\n  func pop() async -> Job {\n    if !buffer.isEmpty { return buffer.removeFirst() }\n    return await withCheckedContinuation { waiters.append($0) }   // suspends while empty\n  }\n}",
+  "pitfalls": [
+    "Actor reentrancy: any await between a capacity check and the state change lets another task interleave, so the bound must be enforced in one synchronous step or with an explicit backpressure continuation.",
+    "AsyncStream's default buffer is unbounded and its policies drop elements; neither levels load by itself.",
+    "Forgetting to resume every stored continuation (on cancellation or shutdown) leaks waiting tasks forever; onTermination/cancellation must resume them.",
+    "A TaskGroup whose child tasks never return prevents the parent scope from completing - workers need a termination signal such as closing the stream."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/swift/asyncstream"
+  ],
+  "variants": [
+    {
+      "variant_id": "actor-buffer",
+      "name": "Actor-managed bounded buffer of continuations",
+      "paradigm": "concurrent",
+      "implementation_notes": "The Swift standard library has no bounded blocking queue: AsyncStream buffers, but its documented default limit is Int.max and its buffering policies keep or drop the newest/oldest elements - dropping is shedding, the opposite of levelling. The honest realization is therefore hand-written: an actor owns the pending array and a list of CheckedContinuation waiters; push hands the job to a waiter if one is parked (or buffers it up to capacity) and pop suspends with withCheckedContinuation when the buffer is empty. Consumers are a TaskGroup iterating an AsyncStream or looping over pop(); because actors are reentrant, capacity and waiter checks must happen in the same synchronous section as the state change.",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "async-await",
+        "actors"
+      ],
+      "idiom_name": "actor + [CheckedContinuation] buffer + TaskGroup consumers",
+      "code_sketch": "actor BoundedQueue {\n  private var buffer: [Job] = []; private var waiters: [CheckedContinuation<Job, Never>] = []\n  private let capacity = 1000\n  func push(_ job: Job) {\n    if let w = waiters.first { waiters.removeFirst(); w.resume(returning: job) }\n    else { precondition(buffer.count < capacity); buffer.append(job) }\n  }\n  func pop() async -> Job {\n    if !buffer.isEmpty { return buffer.removeFirst() }\n    return await withCheckedContinuation { waiters.append($0) }   // suspends while empty\n  }\n}",
+      "pitfalls": [
+        "Actor reentrancy: any await between a capacity check and the state change lets another task interleave, so the bound must be enforced in one synchronous step or with an explicit backpressure continuation.",
+        "AsyncStream's default buffer is unbounded and its policies drop elements; neither levels load by itself.",
+        "Forgetting to resume every stored continuation (on cancellation or shutdown) leaks waiting tasks forever; onTermination/cancellation must resume them.",
+        "A TaskGroup whose child tasks never return prevents the parent scope from completing - workers need a termination signal such as closing the stream."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/swift/asyncstream"
+      ]
+    },
+    {
+      "variant_id": "async-channel-package",
+      "name": "AsyncChannel from swift-async-algorithms",
+      "paradigm": "concurrent",
+      "implementation_notes": "Apple's swift-async-algorithms package provides AsyncChannel, described as an asynchronous sequence with back-pressure sending semantics: send suspends while the consumer is behind, which is exactly the bounded hand-off, delivered as a maintained package rather than hand-written actor code. Consumers are for-await loops, typically one per task in a TaskGroup for parallel draining, and finish() ends the sequence. Choose it when the project already depends on the package or when a hand-written continuation buffer is judged riskier than a dependency; the stdlib-only project keeps the actor variant.",
+      "min_standard": "Swift5.7",
+      "requires_features": [
+        "swift-async-algorithms"
+      ],
+      "idiom_name": "AsyncChannel with for-await consumers in a TaskGroup",
+      "code_sketch": "let channel = AsyncChannel<Job>()          // sending applies back pressure\n\nawait withTaskGroup(of: Void.self) { group in\n  for _ in 0..<8 {\n    group.addTask { for await job in channel { await process(job) } }\n  }\n  for job in requests { await channel.send(job) }   // suspends while consumers lag\n  channel.finish()\n}",
+      "pitfalls": [
+        "It is a package dependency, not the standard library; version readiness and platform minimums must be part of the decision.",
+        "Sendable requirements propagate: jobs crossing the channel must be Sendable, or the compiler rejects the concurrency.",
+        "Without finish() the for-await loops never end and the TaskGroup never completes."
+      ],
+      "sources": [
+        "https://github.com/apple/swift-async-algorithms"
+      ]
+    }
+  ],
+  "default_variant": "actor-buffer",
+  "version": "1.0"
+}

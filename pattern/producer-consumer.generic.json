@@ -1,0 +1,26 @@
+{
+  "pattern": "producer-consumer",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "bounded hand-off queue: mutex + not-empty/not-full conditions (or the runtime's channel) between producer and consumer tasks",
+  "implementation_notes": "Language-neutral form: give the hand-off a bounded FIFO with two waiting conditions - not_empty for consumers and not_full for producers - and make insert and remove atomic under one lock, or use the runtime's channel/queue type, which packages exactly this. Insert waits while full, appends and wakes one consumer; remove waits while empty, takes the head and wakes one producer; every wait re-checks its predicate on wakeup. Choose the full-queue policy once (block, wait with timeout, reject, drop oldest/newest), design the termination protocol up front (sentinel item, close/disconnect, cancellation) so blocked waiters are released and the tail is drained, and keep items immutable or move-only across the hand-off. Scale by adding…",
+  "code_sketch": "buffer = Queue(capacity=N)            # FIFO with an explicit bound\n\nproducer:                             # once per item\n    buffer.put_waiting_if_full(item)  # or try_put / timeout / drop per policy\n\nconsumer:                             # loop\n    item = buffer.get_waiting_if_empty()   # or try_get / timeout\n    handle(item)\n\n# shutdown: close(buffer) or one sentinel item per consumer; release all waiters",
+  "pitfalls": [
+    "Leaving the queue unbounded (or effectively unbounded) so decoupling becomes memory growth.",
+    "Writing only the happy path: no full/empty policy, no timeout and no shutdown, so blocked waiters are never released and the service cannot stop.",
+    "Handing over mutable payloads by reference while the producer keeps mutating them - the queue's synchronization is correct and the application data still races.",
+    "One queue for all work classes, coupling unrelated rates and creating head-of-line blocking.",
+    "The convoy problem: one slow consumer holding the queue lock while processing causes all other consumers (and producers via backpressure) to serialize behind it, collapsing throughput even when the queue depth is healthy.",
+    "Thread starvation: if wakeup is not distributed fairly, one consumer can monopolize the queue lock and starve others, especially under high throughput with many waiters.",
+    "Priority inversion in semaphore-based implementations: acquiring the mutex before the counting semaphore causes circular wait - always wait on the resource semaphore first, then acquire the mutex.",
+    "Using if instead of while to guard wait conditions: spurious wakeups cause the consumer to proceed on an empty buffer; always re-check the predicate in a loop.",
+    "Signaling the wrong condition variable: waking producers with not_empty or consumers with not_full wakes the wrong waiters and can cause deadlock or lost wakeups.",
+    "Not accounting for the lock convoy effect: a strict FIFO lock policy under high contention causes threads to context-switch on every lock operation once there is any queue of waiters, dramatically reducing throughput. Mitigate by keeping critical sections short, reducing lock hold time, or using a lock-free queue design.",
+    "Consumer work that blocks the event loop or executor thread: a consumer running synchronous I/O or a blocking syscall between get() and task_done() starves the loop, no getter is rescheduled, and queue depth climbs even though workers exist. Offload via executor or to_thread(), not more consumers.",
+    "Wrong move: use asyncio.Queue() with its default maxsize=0 for an unbounded burst -> memory and queueing delay grow without backpressure -> instead set a finite maxsize and choose whether put() waits, times out or sheds work.",
+    "Wrong move: let a Go pipeline stage stop reading its input while upstream keeps sending -> blocked goroutines leak and the pipeline never drains -> instead propagate cancellation through a done channel or context and close outbound channels as stages return.",
+    "Wrong move: treat Java BlockingQueue.put()/take() as a shutdown protocol -> waiters can remain blocked because BlockingQueue has no intrinsic close operation -> instead coordinate interruption or an explicit sentinel/termination protocol and drain deliberately."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

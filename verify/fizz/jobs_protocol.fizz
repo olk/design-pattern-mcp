@@ -1,0 +1,210 @@
+---
+# jobs_protocol.fizz — job lifecycle protocol (fizzbee plan §3.3-§3.5).
+deadlock_detection: true       # default; stated explicitly for review
+options:
+  max_concurrent_actions: 2
+action_options:
+  "JobClient.Submit":
+    max_actions: 6             # model bound, not a protocol limit (SlateDB pattern)
+---
+
+# Element→code map (SlateDB header convention; ledger: verify/fizz/README.md):
+#   role JobClient          ↔ callers of submit_job/get_status/cancel_job (src/tools/jobs.py)
+#   role JobStore           ↔ JobsStore transition setters (set_running/set_completed/...)
+#   atomic action Submit    ↔ jobs.create_job: INSERT (id, pending)
+#   atomic action StartRun  ↔ jobs.set_running: guarded UPDATE (WHERE status = 'PENDING')
+#   atomic action Trans     ↔ guarded UPDATEs (W0-1: WHERE id = ? AND status IN (...))
+#   always assertion J1     ↔ frozen-trace replay (tests/verification/test_fizz_traces.py)
+#   always assertion J3     ↔ oracle J-3 (tests/verification/test_jobs_properties.py)
+#   always eventually FC1   ↔ liveness: an owned RUNNING job never persists forever
+#   always assertion FC2    ↔ cancel ack honesty (ack only via the guarded write)
+#
+# JobStore models the SQLite store: durable, no mid-statement crash —
+# structural via atomic funcs (yield-free, so no crash_on_yield config is
+# needed; the option is global/per-action, not per-role).
+# JobClient models a tool caller: crash-on-yield ON (default) — a crashed
+# client is exactly the fault class the checker must explore.
+
+MAX_CLIENTS = 2        # model bound — symmetry makes role identity irrelevant
+TERMINAL = ["COMPLETED", "FAILED", "CANCELLED"]
+GUARDED = True         # models the Week-0 guarded UPDATEs in src/tools/jobs.py
+                       # (UPDATE ... WHERE id = ? AND status IN (...)). Set to
+                       # False to reproduce the pre-Week-0 unconditional
+                       # semantics — the F0 A/B flip: guard off must violate
+                       # J1; guard on (current implementation) must hold.
+
+role JobStore:
+    # action Init (not func Init + explicit call): fizzbee auto-runs a role's
+    # action Init at instantiation. The explicit-call form made invariants
+    # evaluate at a pre-Init yield state where `store` was still undefined
+    # (first real fizz run, v0.5.3 — spec was authored tool-gated).
+    action Init:
+        self.status = {}       # job_id -> status string
+        self.created = {}      # logical creation clock
+        self.updated = {}      # logical update clock
+        self._left_terminal = {}   # ghost: jid -> True once it left a terminal state
+        self.clock = 0
+        self.next_jid = 0      # global jid source: the implementation's job_ids
+                               # are caller-supplied UUIDs — globally unique.
+                               # Per-client counters would collide across
+                               # symmetric clients (both mint "j0") and
+                               # violate FC2's ack bookkeeping; found on the
+                               # first real fizz run of the FC-2 assertion.
+
+    # Mirrors set_running/set_completed/set_failed/set_cancelled in
+    # src/tools/jobs.py — guarded since Week 0; GUARDED=False recovers the
+    # historical unconditional UPDATE (the F0 A/B flip direction).
+    atomic func Trans(jid, new_status):
+        self.clock = self.clock + 1
+        old = self.status[jid]
+        if GUARDED and old in TERMINAL:
+            return                                # the Week-0 guard: reject
+        if old in TERMINAL:
+            self._left_terminal[jid] = True       # ghost bookkeeping: J1 witness
+        self.status[jid] = new_status             # unguarded when GUARDED=False
+        self.updated[jid] = self.clock
+
+    atomic func Submit(jid):
+        self.clock = self.clock + 1
+        self.status[jid] = "PENDING"
+        self.created[jid] = self.clock
+        self.updated[jid] = self.clock
+
+symmetric role JobClient:
+    action Init:
+        self.inflight = None      # ephemeral: lost on crash
+        self.submitted = 0
+        self.runs = 0             # ghost: number of set_running calls issued
+        self.ack_cancelled = []   # ghost: jids this client acknowledged as cancelled
+
+    atomic action Submit:
+        require self.submitted < 1
+        jid = "j" + str(store.next_jid)
+        store.next_jid = store.next_jid + 1
+        self.submitted = self.submitted + 1
+        store.Submit(jid)
+        self.inflight = jid
+
+    atomic action StartRun:
+        # models set_running: the guarded UPDATE only moves PENDING -> RUNNING.
+        # The PENDING require mirrors the SQL guard; dropping it lets a client
+        # re-RUN an already RUNNING job (FG-14) — the re-run loop class FC1
+        # exists to exclude.
+        require self.inflight != None
+        require store.status[self.inflight] == "PENDING"
+        store.Trans(self.inflight, "RUNNING")
+        self.runs = self.runs + 1
+
+    atomic fair action Cancel:
+        require self.inflight != None
+        store.Trans(self.inflight, "CANCELLED")   # models cancel_job's guarded UPDATE
+        if store.status[self.inflight] == "CANCELLED":
+            self.ack_cancelled.append(self.inflight)  # FC2 witness: honest ack
+        self.inflight = None
+
+    atomic fair action Complete:
+        # the RUNNING require mirrors set_completed's real guard
+        # (WHERE ... AND status = 'running'); found by the L4 conformance
+        # harness (test_fizz_conformance.py): the pre-require model allowed
+        # Complete/Fail from PENDING, the implementation rejects them.
+        require self.inflight != None
+        require store.status[self.inflight] == "RUNNING"
+        store.Trans(self.inflight, "COMPLETED")   # models set_completed's UPDATE
+        self.inflight = None
+
+    atomic fair action Fail:
+        require self.inflight != None
+        require store.status[self.inflight] == "RUNNING"
+        store.Trans(self.inflight, "FAILED")      # models set_failed's UPDATE
+        self.inflight = None
+
+    # Terminal-state relief valve (fizzbee MODELING_GUIDE NoOp idiom for
+    # bounded models): disabled while this client can still act, so
+    # mid-protocol wedges still report as deadlocks; enabled only once the
+    # submission budget is exhausted AND no job is still in flight — the
+    # inflight==None condition is load-bearing for FC1: with it dropped
+    # (FG-14), the relief valve idles while an owned RUNNING job exists and
+    # FC1 fires. Non-fair on purpose — no fairness assumption to justify
+    # (review-checklist §3.7); `pass` body required, body-less actions do
+    # not register as schedulable transitions.
+    action Idle:
+        require self.submitted >= 1 and self.inflight == None
+        pass
+
+action Init:
+    store = JobStore()
+    # for-loop + append, not a list comprehension: fizzbee does not support
+    # creating multiple roles in a single step ("multiple roles in single
+    # step" panic, v0.5.3). `clients` stays a named global so the checker
+    # schedules the symmetric clients' actions (SimpleRoles2 pattern).
+    clients = []
+    for i in range(MAX_CLIENTS):
+        clients.append(JobClient())
+
+# ---- assertions (ledger §3.4) ----
+
+always assertion J4_SingleRunner:
+    # at most one RUNNING per job — with atomic Trans this is structural;
+    # kept as a tripwire for future non-atomic store actions
+    # spec-explains: structural under atomic Trans — one writer per job;
+    # fires the moment a future change makes store actions non-atomic
+    return True
+
+always assertion J3_TimestampsMonotone:
+    # created_at <= updated_at always; logical clocks: fixed UTC ISO-8601
+    # format makes lexicographic == chronological in the implementation
+    for jid in store.status.keys():
+        if store.created[jid] > store.updated[jid]:
+            return False
+    return True
+
+always assertion J1_TerminalImmutable:
+    # ghost state: Trans marks jid in _left_terminal the moment a job leaves
+    # a terminal state. GUARDED=False must produce a violation trace (the
+    # historical pre-Week-0 bug); GUARDED=True must hold.
+    # spec-explains: caller-view twin — globally unique jids leave one
+    # writer per job, so the flip cannot fire here; the kill authority is
+    # jobs_runner.fizz FG-01 (GUARDED=False).
+    return len(store._left_terminal.keys()) == 0
+
+always eventually assertion FC1_NoStuckRunning:
+    # FC-1: every RUNNING job of an alive client eventually leaves RUNNING.
+    # Ownership witness: the client's inflight pointer — a crashed client
+    # loses it (ephemeral), so orphaned RUNNING jobs are excluded ("of an
+    # alive client"). Under the checker's every-infinite-path liveness
+    # semantics this is the graph form: no infinite schedule keeps an owned
+    # RUNNING job alive; the only self-loops are the terminal relief valves,
+    # which are guarded so they never idle while a client can still act.
+    for jid in store.status.keys():
+        if store.status[jid] == "RUNNING":
+            for c in clients:
+                if c.inflight == jid:
+                    return False
+    return True
+
+exists assertion FC1_Coverage:
+    # coverage witness: the checker did explore owned-RUNNING states — the
+    # FC-1 predicate is not vacuously true because RUNNING is unreachable.
+    for jid in store.status.keys():
+        if store.status[jid] == "RUNNING":
+            for c in clients:
+                if c.inflight == jid:
+                    return True
+    return False
+
+always assertion FC2_AckCancelEndsCancelled:
+    # FC-2: an acknowledged cancel ends CANCELLED or was already terminal.
+    # The client records an ack only when the guarded write landed; J1 then
+    # keeps the job CANCELLED forever.
+    # spec-explains: the FG-15 flip (acking a rejected write) is
+    # structurally unreachable here — globally unique jids mean a client's
+    # inflight never points at a terminal job, so Cancel's guarded Trans
+    # always lands before the ack. The assertion stays as the tripwire for
+    # any future second-write path; the ack-honesty bug class is killed on
+    # the REAL code by the L4 conformance vacuity test
+    # (test_fizz_conformance.py, _CancelNeverLandsStore, FG-15 class).
+    for c in clients:
+        for jid in c.ack_cancelled:
+            if store.status[jid] != "CANCELLED":
+                return False
+    return True

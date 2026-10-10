@@ -1,0 +1,20 @@
+{
+  "pattern": "process-manager",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "enum state + switch decider + SQLite instance row + timer_create deadlines",
+  "implementation_notes": "Nothing in C supplies any part of the pattern, so all three parts are written by hand: an enum for the states, a switch (or a table of function pointers) for the (state, event) decision, and a durable row per process instance in SQLite or another embedded store. The rule that matters is that the row update and the outbox insert happen inside one transaction - a bare UPDATE followed by a send is the classic source of duplicated steps. Deadlines come from timer_create/clock_gettime or, more portably, from a sweeper that selects rows whose due_at has passed; compensations are ordinary functions called in reverse completion order. Hand-writing this is justified when the flow is small and no runtime may be linked in; past a handful of states the transition table should become data so it can be reviewed and unit-tested separately from the switch.",
+  "code_sketch": "static order_state step(order_state st, const event *ev, sqlite3 *db) {\n    switch (st) {\n    case AWAITING_PAYMENT:\n        if (ev->kind != PAYMENT_OK) break;        /* ignore stale replies */\n        if (enqueue(db, ev->corr_id, \"reserve\") == 0)\n            return AWAITING_STOCK;\n        return COMPENSATING;                      /* reserve rejected */\n    case AWAITING_STOCK:\n        if (ev->kind == RESERVE_OK) return DONE;\n        break;\n    case COMPENSATING:\n        release_credit(db, ev->corr_id);\n        return FAILED;\n    }\n    return st;\n}\n\n/* sweeper: select corr_id from process where due_at < now() */",
+  "pitfalls": [
+    "Process state held only in memory, or written without flushing/committing, is lost at the first crash and the flow re-runs steps whose side effects already happened.",
+    "A single global state variable instead of a row per correlation id makes concurrent instances interfere as soon as two flows run at once.",
+    "A signal-based timer handler that touches the SQLite handle or the process table is undefined behaviour; signal handlers may only set a flag and wake the event loop.",
+    "timer_create needs -lrt on older glibc and carries a per-process signal or thread configuration that surprises anyone reusing the process for other timers."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/c/language/enum",
+    "https://man7.org/linux/man-pages/man2/timer_create.2.html",
+    "https://sqlite.org/c3ref/intro.html"
+  ],
+  "version": "1.0"
+}

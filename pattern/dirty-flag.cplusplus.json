@@ -1,0 +1,84 @@
+{
+  "pattern": "dirty-flag",
+  "language": "cplusplus",
+  "support": "idiomatic",
+  "idiom_name": "mutable dirty_ bit plus cached member recomputed in a const accessor",
+  "implementation_notes": "The classic member-state realization: keep the cached derived value and a mutable bool (or an in-class-initialized flag) next to the primary members, set the bit in every setter, and let the const accessor recompute and clear it. Marking the cache and the flag `mutable` is the language feature that lets the accessor keep logical constness while physically updating the cache - the pattern collapses into ordinary member state, so no separate role objects are needed. The full structure is still justified when the derived value has several primary inputs, when the recomputation is expensive and when the value is read far less often than the inputs change; for a single cheap computation, computing on demand is simpler.",
+  "code_sketch": "class Node {\npublic:\n    void set_local(Transform t) { local_ = t; dirty_ = true; }\n    const Transform& world() const {              // const accessor, lazy cache\n        if (dirty_) { world_ = local_.combine(parent()); dirty_ = false; }\n        return world_;\n    }\nprivate:\n    Transform local_;\n    mutable Transform world_;\n    mutable bool dirty_ = true;                   // a fresh node has no cache\n};",
+  "pitfalls": [
+    "The compiler will not tell you when a setter forgets to mark: funnel every mutation through one setter (or an invalidate() helper) instead of scattering assignments.",
+    "`mutable` is only for caches: marking real state mutable lets const member functions change observable behaviour and breaks const-correct reasoning.",
+    "Dependents are not invalidated automatically: a node whose parent moves must recompute too, so pass a parent-dirty argument through the traversal rather than walking children on every set.",
+    "The accessor must not recompute when the flag is clear - a stray `world_ = ...` in a const getter silently defeats the cache."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/keyword/mutable",
+    "https://gameprogrammingpatterns.com/dirty-flag.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutable-cache-bit",
+      "name": "Mutable cached member with a bool dirty bit",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "mutable dirty_ bit plus cached member recomputed in a const accessor",
+      "implementation_notes": "The classic member-state realization: keep the cached derived value and a mutable bool (or an in-class-initialized flag) next to the primary members, set the bit in every setter, and let the const accessor recompute and clear it. Marking the cache and the flag `mutable` is the language feature that lets the accessor keep logical constness while physically updating the cache - the pattern collapses into ordinary member state, so no separate role objects are needed. The full structure is still justified when the derived value has several primary inputs, when the recomputation is expensive and when the value is read far less often than the inputs change; for a single cheap computation, computing on demand is simpler.",
+      "code_sketch": "class Node {\npublic:\n    void set_local(Transform t) { local_ = t; dirty_ = true; }\n    const Transform& world() const {              // const accessor, lazy cache\n        if (dirty_) { world_ = local_.combine(parent()); dirty_ = false; }\n        return world_;\n    }\nprivate:\n    Transform local_;\n    mutable Transform world_;\n    mutable bool dirty_ = true;                   // a fresh node has no cache\n};",
+      "pitfalls": [
+        "The compiler will not tell you when a setter forgets to mark: funnel every mutation through one setter (or an invalidate() helper) instead of scattering assignments.",
+        "`mutable` is only for caches: marking real state mutable lets const member functions change observable behaviour and breaks const-correct reasoning.",
+        "Dependents are not invalidated automatically: a node whose parent moves must recompute too, so pass a parent-dirty argument through the traversal rather than walking children on every set.",
+        "The accessor must not recompute when the flag is clear - a stray `world_ = ...` in a const getter silently defeats the cache."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/keyword/mutable",
+        "https://gameprogrammingpatterns.com/dirty-flag.html"
+      ]
+    },
+    {
+      "variant_id": "optional-cache-slot",
+      "name": "std::optional cache slot (absence is the dirty state)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::optional"
+      ],
+      "idiom_name": "mutable std::optional<T> cache whose empty state means dirty",
+      "implementation_notes": "std::optional folds the flag into the cache: an empty optional is 'not computed since the last change' and reset() is the invalidation, so there is no separate bool to keep in sync and no way to desynchronise the two. It also distinguishes 'computed and the value is empty' from 'never computed', which a bool plus a default-constructed value cannot. The trade-off is a second empty-state check inside the optional and a slightly larger object; use the bool form when the cached type is huge or trivially constructible and the separate flag is measurably cheaper.",
+      "code_sketch": "class Node {\npublic:\n    void set_local(Transform t) { local_ = t; world_.reset(); }   // invalidate\n    const Transform& world() const {\n        if (!world_) world_ = local_.combine(parent());           // absent == dirty\n        return *world_;\n    }\nprivate:\n    Transform local_;\n    mutable std::optional<Transform> world_;\n};",
+      "pitfalls": [
+        "`reset()` on every setter is easy to forget in one place - the same completeness problem as a bool flag, just with fewer moving parts.",
+        "An optional-returning accessor leaks the cache's absence to callers; keep the optional private and return `const T&` so the interface stays cache-agnostic.",
+        "Concurrent readers of the optional need the same publication discipline as the bool form: std::optional is not atomic, so publishing pointer-free requires a mutex or an atomic<shared_ptr> indirection."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/optional"
+      ]
+    },
+    {
+      "variant_id": "atomic-publish",
+      "name": "std::atomic<bool> flag with mutex-guarded republication",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "std::atomic",
+        "std::mutex"
+      ],
+      "idiom_name": "std::atomic<bool> dirty flag plus std::mutex-protected cache rebuild",
+      "implementation_notes": "When several threads share the object, the flag becomes publication state: keep std::atomic<bool> for the dirty bit (release store when marking, acquire load when checking) and rebuild under a std::mutex so two readers cannot both recompute, storing the new cache before the flag is cleared. std::atomic gives the ordering guarantees that plain bool access lacks, and the mutex gives mutual exclusion for the rebuild itself; a lock-free read of the cached value requires that the value be published through something atomic, for example std::atomic<std::shared_ptr<const T>>, otherwise the guarded read must also take the lock.",
+      "code_sketch": "class Node {\npublic:\n    void set_local(Transform t) { std::lock_guard g{mu_}; local_ = t; dirty_.store(true, std::memory_order_release); }\n    Transform world() const {\n        std::lock_guard g{mu_};                    // cache and flag move together\n        if (dirty_.load(std::memory_order_acquire)) { cache_ = local_.combine(parent());\n            dirty_.store(false, std::memory_order_release); }   // publish, then clear\n        return cache_;\n    }\nprivate:\n    mutable std::mutex mu_; Transform local_; Transform cache_; std::atomic<bool> dirty_{true};\n};",
+      "pitfalls": [
+        "Clearing the flag before the cache is assigned exposes a clean-but-stale state to other threads; the order (rebuild, store cache, clear flag) is the whole contract.",
+        "A lock-free fast path that reads a non-atomic cache alongside the atomic flag is a data race and, on a weak memory model, a torn read - the cache needs its own atomic publication or the lock.",
+        "std::atomic<bool> is only lock-free if the platform says so (`is_lock_free()`); on unusual targets the 'cheap' flag can secretly take a lock.",
+        "A const accessor that locks and mutates mutable members is fine for the compiler but must not hold the mutex while calling out to user code - the recomputation runs inside the critical section by design, so it must not re-enter the same object."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic",
+        "https://en.cppreference.com/w/cpp/language/data_members"
+      ]
+    }
+  ],
+  "default_variant": "mutable-cache-bit"
+}

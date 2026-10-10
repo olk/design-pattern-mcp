@@ -1,0 +1,72 @@
+{
+  "pattern": "cache-aside",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Caffeine Cache.get(key, k -> load(k)) / LoadingCache with invalidate",
+  "implementation_notes": "Caffeine is the modern JVM default: cache.get(key, k -> loadFromSource(k)) computes and inserts atomically on a miss, expireAfterWrite and maximumSize carry the TTL and eviction policy, and invalidate(key) is the invalidation step after the store commit. Building a LoadingCache moves the loader into the cache itself (CacheLoader.load), which is the read-through shape of the same protocol; AsyncCache/AsyncLoadingCache return CompletableFuture for asynchronous paths so that a miss can be shared rather than recomputed per caller.",
+  "code_sketch": "Cache<String, Entity> cache = Caffeine.newBuilder()\n    .expireAfterWrite(5, TimeUnit.MINUTES)\n    .maximumSize(100_000)\n    .build();\n\nEntity read(String id) {\n    return cache.get(id, key -> store.find(key));   // read, populate on miss\n}\nvoid update(Entity e) {\n    store.save(e);                                  // source of truth first\n    cache.invalidate(e.id());                       // then invalidate\n}",
+  "pitfalls": [
+    "The mapping function of get(key, fn) must not call back into the same cache entry and must be idempotent - it can be invoked once per key while other callers wait on the result.",
+    "Caffeine is a heap cache: entries are per instance, so a multi-instance service needs a shared tier (Redis, JCache) and a way to broadcast invalidations.",
+    "invalidate must run after the store commit; deleting first lets a concurrent reader reload the pre-update row."
+  ],
+  "sources": [
+    "https://github.com/ben-manes/caffeine/wiki/Population"
+  ],
+  "variants": [
+    {
+      "variant_id": "caffeine",
+      "name": "Caffeine Cache with get(key, mappingFunction)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "Caffeine Cache.get(key, k -> load(k)) / LoadingCache with invalidate",
+      "implementation_notes": "Caffeine is the modern JVM default: cache.get(key, k -> loadFromSource(k)) computes and inserts atomically on a miss, expireAfterWrite and maximumSize carry the TTL and eviction policy, and invalidate(key) is the invalidation step after the store commit. Building a LoadingCache moves the loader into the cache itself (CacheLoader.load), which is the read-through shape of the same protocol; AsyncCache/AsyncLoadingCache return CompletableFuture for asynchronous paths so that a miss can be shared rather than recomputed per caller.",
+      "code_sketch": "Cache<String, Entity> cache = Caffeine.newBuilder()\n    .expireAfterWrite(5, TimeUnit.MINUTES)\n    .maximumSize(100_000)\n    .build();\n\nEntity read(String id) {\n    return cache.get(id, key -> store.find(key));   // read, populate on miss\n}\nvoid update(Entity e) {\n    store.save(e);                                  // source of truth first\n    cache.invalidate(e.id());                       // then invalidate\n}",
+      "pitfalls": [
+        "The mapping function of get(key, fn) must not call back into the same cache entry and must be idempotent - it can be invoked once per key while other callers wait on the result.",
+        "Caffeine is a heap cache: entries are per instance, so a multi-instance service needs a shared tier (Redis, JCache) and a way to broadcast invalidations.",
+        "invalidate must run after the store commit; deleting first lets a concurrent reader reload the pre-update row."
+      ],
+      "sources": [
+        "https://github.com/ben-manes/caffeine/wiki/Population"
+      ]
+    },
+    {
+      "variant_id": "spring-cacheable",
+      "name": "Spring @Cacheable / @CacheEvict (declarative)",
+      "paradigm": "declarative",
+      "min_standard": "Java8",
+      "idiom_name": "@Cacheable(cacheNames = ..., key = ...) on the reader, @CacheEvict on the writer",
+      "implementation_notes": "Spring's caching abstraction expresses the pattern as annotations: @Cacheable marks the read method so the framework checks the cache before invoking it and stores the result on a miss, and @CacheEvict (or @CachePut) on the update method performs the invalidation around the store write. The abstraction locks nothing by default, so concurrent misses recompute unless sync = true is set (or an async cache manager such as Caffeine in async mode is configured). The classic trap is self-invocation: an internal call to an @Cacheable method bypasses the proxy and silently skips the cache.",
+      "code_sketch": "@Cacheable(cacheNames = \"books\", key = \"#isbn\")\nBook findBook(ISBN isbn) { return store.find(isbn); }        // miss: invoke + populate\n\n@CacheEvict(cacheNames = \"books\", key = \"#book.isbn\")\nvoid updateBook(Book book) { store.save(book); }             // store commit, then evict\n\n// hot key: @Cacheable(cacheNames = \"books\", key = \"#isbn\", sync = true)",
+      "pitfalls": [
+        "Self-invocation (this.findBook(...)), private methods and calls outside the Spring context bypass the caching proxy, so the annotation silently does nothing.",
+        "By default the abstraction does not lock: every concurrent miss runs the method body, so sync = true (or a provider-specific lock) is required to compute once - and not every cache provider supports it.",
+        "The default key generator derives keys from parameters; use an explicit key or a KeyGenerator when the arguments are not natural keys or entries collide."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html"
+      ]
+    },
+    {
+      "variant_id": "concurrent-hash-map",
+      "name": "ConcurrentHashMap.computeIfAbsent (dependency-free)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "ConcurrentHashMap.computeIfAbsent with an entry wrapper holding the deadline",
+      "implementation_notes": "Without a cache library the store is a ConcurrentHashMap and the populate step is computeIfAbsent(key, k -> load(k)), which performs the check-and-insert atomically per key; TTL, size bounds and eviction are then hand-written around a value wrapper (value plus expiresAt) or the map grows forever. Choose it for small dependency-free maps where the read path must stay simple; anything with real eviction or a shared cache moves to Caffeine or JCache.",
+      "code_sketch": "private final ConcurrentHashMap<String, Entry> map = new ConcurrentHashMap<>();\n\nEntity read(String id) {\n    Entry e = map.computeIfAbsent(id, k -> new Entry(store.find(k), deadline()));\n    return e.isExpired() ? refresh(id) : e.value();   // TTL is application code\n}\nvoid update(Entity e) { store.save(e); map.remove(e.id()); }",
+      "pitfalls": [
+        "The mapping function must not modify the map during computation (the javadoc forbids recursive updates) and should be short: a slow loader holds the bin lock and can block unrelated keys that hash to the same bin.",
+        "Expired entries stay in the map until something removes them - TTL without eviction is a leak.",
+        "No maximum size and no eviction policy: a user-driven key space grows without bound."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ConcurrentMap.html",
+        "https://github.com/ben-manes/caffeine/wiki/Population"
+      ]
+    }
+  ],
+  "default_variant": "caffeine",
+  "version": "1.0"
+}

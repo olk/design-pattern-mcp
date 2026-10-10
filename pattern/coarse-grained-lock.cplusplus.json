@@ -1,0 +1,51 @@
+{
+  "pattern": "coarse-grained-lock",
+  "language": "cplusplus",
+  "support": "manual",
+  "implementation_notes": "The in-process default: one std::mutex per aggregate root, held in a registry keyed by the cluster id, plus an RAII guard (std::lock_guard or std::scoped_lock) for the duration of the edit so every exit path unlocks. The guard replaces the classic lock manager - the lock is a value whose lifetime is the critical section - and members are reached only through the cluster handle, never locked individually. Choose it for single-process servers that keep the cluster in memory; it does not coordinate other processes.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutex-per-aggregate",
+      "name": "std::mutex per aggregate root with an RAII guard",
+      "paradigm": "concurrent",
+      "implementation_notes": "The in-process default: one std::mutex per aggregate root, held in a registry keyed by the cluster id, plus an RAII guard (std::lock_guard or std::scoped_lock) for the duration of the edit so every exit path unlocks. The guard replaces the classic lock manager - the lock is a value whose lifetime is the critical section - and members are reached only through the cluster handle, never locked individually. Choose it for single-process servers that keep the cluster in memory; it does not coordinate other processes.",
+      "min_standard": "C++11",
+      "idiom_name": "std::mutex registry + std::lock_guard / std::scoped_lock",
+      "code_sketch": "class ClusterRegistry {                       // one mutex per root id\n  std::mutex table_mutex_;\n  std::unordered_map<ClusterId, std::shared_ptr<std::mutex>> locks_;\npublic:\n  std::shared_ptr<std::mutex> for_root(ClusterId id);\n};\n\nauto lock = registry.for_root(id);\nstd::lock_guard<std::mutex> guard(*lock);      // covers root + members\napply_cluster(cluster(id), edit_fn);",
+      "pitfalls": [
+        "A registry that returns a fresh mutex per call silently locks nothing; cache the shared_ptr per root id and never erase an entry that a thread may still hold.",
+        "Holding the cluster mutex while doing I/O or calling user callbacks turns a short critical section into a throughput cliff (and can re-enter the registry)."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/mutex.html"
+      ]
+    },
+    {
+      "variant_id": "sql-row-lock",
+      "name": "root-row lock inside a transaction (libpqxx / ODBC / SQLite)",
+      "paradigm": "declarative",
+      "implementation_notes": "The durable default for multi-process deployments: inside one transaction, lock the aggregate root row with SELECT ... FOR UPDATE (PostgreSQL/MySQL) or an equivalent hint, then read and write every member; the root row is the lock identity, so no per-member lock is taken. The transaction boundary replaces the lock manager's bookkeeping - the database releases the lock on commit or rollback. Prefer it when several processes or hosts must serialise on the same cluster.",
+      "min_standard": "C++11",
+      "idiom_name": "SELECT ... FOR UPDATE on the root row through the C++ database client",
+      "code_sketch": "pqxx::work tx{conn};\ntx.exec(\"SELECT id FROM orders WHERE id = $1 FOR UPDATE\", pqxx::params{id});\nauto cluster = load_cluster(tx, id);   // members need no own locks\napply(cluster, edit_fn);\nsave_members(tx, cluster);\ntx.commit();                            // lock released here",
+      "pitfalls": [
+        "A root row lock is released at transaction end, so an offline edit session cannot span user think time; use a lock table/version token for that case instead of holding transactions open.",
+        "Locking the root and then updating members in a different order across code paths reintroduces deadlocks - always go root first."
+      ],
+      "sources": [
+        "https://www.postgresql.org/docs/current/explicit-locking.html"
+      ]
+    }
+  ],
+  "default_variant": "mutex-per-aggregate",
+  "idiom_name": "std::mutex registry + std::lock_guard / std::scoped_lock",
+  "code_sketch": "class ClusterRegistry {                       // one mutex per root id\n  std::mutex table_mutex_;\n  std::unordered_map<ClusterId, std::shared_ptr<std::mutex>> locks_;\npublic:\n  std::shared_ptr<std::mutex> for_root(ClusterId id);\n};\n\nauto lock = registry.for_root(id);\nstd::lock_guard<std::mutex> guard(*lock);      // covers root + members\napply_cluster(cluster(id), edit_fn);",
+  "pitfalls": [
+    "A registry that returns a fresh mutex per call silently locks nothing; cache the shared_ptr per root id and never erase an entry that a thread may still hold.",
+    "Holding the cluster mutex while doing I/O or calling user callbacks turns a short critical section into a throughput cliff (and can re-enter the registry)."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/mutex.html"
+  ]
+}

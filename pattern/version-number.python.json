@@ -1,0 +1,55 @@
+{
+  "pattern": "version-number",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "SQLAlchemy mapper version_id_col (+ version_id_generator)",
+  "implementation_notes": "SQLAlchemy owns the token through mapper options: declare an integer version_id column (NOT NULL) and set __mapper_args__ = {'version_id_col': version_id}; the ORM then emits UPDATE ... WHERE id = :id AND version_id = :seen and raises sqlalchemy.orm.exc.StaleDataError when zero rows matched, deletes included. Django deliberately has no first-party counter, so its realization is manual: QuerySet.update() returns the number of rows matched, so Model.objects.filter(pk=..., version=seen).update(version=F('version') + 1, ...) returning 0 is the stale signal, and packages such as django-concurrency add the version field and its convention. Use the ORM-managed form for flushed unit-of-work writes; keep the filter-update when the framework has no counter or the statement is set-based.",
+  "code_sketch": "class Doc(Base):                       # SQLAlchemy 2.0\n    __tablename__ = \"doc\"\n    id = mapped_column(Integer, primary_key=True)\n    version_id = mapped_column(Integer, nullable=False)\n    body = mapped_column(Text)\n    __mapper_args__ = {\"version_id_col\": version_id}\n\ndoc.body = new_body\nsession.commit()   # UPDATE ... WHERE id = :id AND version_id = :v\n                   # zero rows -> StaleDataError (re-read, merge, retry)",
+  "pitfalls": [
+    "Session.flush() is what performs the check: Query.update()/Query.delete() and raw SQL bypass the version counter entirely.",
+    "A NULL version column disables the comparison - SQLAlchemy documents the feature as not supporting NULL, so the column must be NOT NULL.",
+    "expire_on_commit=False reuses rows across transactions; without a refresh a later flush compares an old token and can raise StaleDataError against your own earlier commit.",
+    "Server-side counters (xmin, trigger-maintained columns) need RETURNING support, otherwise the ORM re-selects the value and re-opens the race it was trying to close."
+  ],
+  "sources": [
+    "https://docs.sqlalchemy.org/en/20/orm/versioning.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "sqlalchemy-version-counter",
+      "name": "SQLAlchemy version_id_col counter",
+      "paradigm": "oo",
+      "min_standard": "Python3.7",
+      "idiom_name": "SQLAlchemy mapper version_id_col (+ version_id_generator)",
+      "implementation_notes": "SQLAlchemy owns the token through mapper options: declare an integer version_id column (NOT NULL) and set __mapper_args__ = {'version_id_col': version_id}; the ORM then emits UPDATE ... WHERE id = :id AND version_id = :seen and raises sqlalchemy.orm.exc.StaleDataError when zero rows matched, deletes included. Django deliberately has no first-party counter, so its realization is manual: QuerySet.update() returns the number of rows matched, so Model.objects.filter(pk=..., version=seen).update(version=F('version') + 1, ...) returning 0 is the stale signal, and packages such as django-concurrency add the version field and its convention. Use the ORM-managed form for flushed unit-of-work writes; keep the filter-update when the framework has no counter or the statement is set-based.",
+      "code_sketch": "class Doc(Base):                       # SQLAlchemy 2.0\n    __tablename__ = \"doc\"\n    id = mapped_column(Integer, primary_key=True)\n    version_id = mapped_column(Integer, nullable=False)\n    body = mapped_column(Text)\n    __mapper_args__ = {\"version_id_col\": version_id}\n\ndoc.body = new_body\nsession.commit()   # UPDATE ... WHERE id = :id AND version_id = :v\n                   # zero rows -> StaleDataError (re-read, merge, retry)",
+      "pitfalls": [
+        "Session.flush() is what performs the check: Query.update()/Query.delete() and raw SQL bypass the version counter entirely.",
+        "A NULL version column disables the comparison - SQLAlchemy documents the feature as not supporting NULL, so the column must be NOT NULL.",
+        "expire_on_commit=False reuses rows across transactions; without a refresh a later flush compares an old token and can raise StaleDataError against your own earlier commit.",
+        "Server-side counters (xmin, trigger-maintained columns) need RETURNING support, otherwise the ORM re-selects the value and re-opens the race it was trying to close."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/versioning.html"
+      ]
+    },
+    {
+      "variant_id": "django-conditional-update",
+      "name": "Django conditional update with rowcount test",
+      "paradigm": "data-oriented",
+      "min_standard": "Python3.10",
+      "idiom_name": "Django QuerySet.filter(pk, version).update(...) rowcount check",
+      "implementation_notes": "Django has no built-in optimistic locking, so the token is application-owned: add an integer version field to the model, include the version you read in the filter of an update() call, set the new value with F('version') + 1 so the increment happens in the database, and treat the returned row count (the number of rows matched) of 0 as the stale signal. This keeps the check inside one UPDATE statement without any ORM feature, which is also why it survives across the framework's iterations, and third-party helpers simply package the same convention. The trade-off is that every write path must repeat the filter and the F() increment.",
+      "code_sketch": "updated = (Doc.objects\n    .filter(pk=doc_id, version=seen_version)\n    .update(body=next_body, version=F('version') + 1))\nif updated == 0:\n    raise StaleCopyError        # re-read, merge or 409\n# never Doc.save() here: it would overwrite without the check",
+      "pitfalls": [
+        "Model.save() writes every field and carries no version predicate, so mixing it with the conditional update re-opens the lost update.",
+        "Filtering on a version that a concurrent transaction already changed is the expected path, not an error case - but the caller must not silently drop the user's edit without telling them."
+      ],
+      "sources": [
+        "https://docs.djangoproject.com/en/5.2/ref/models/querysets/"
+      ]
+    }
+  ],
+  "default_variant": "sqlalchemy-version-counter",
+  "version": "1.0"
+}

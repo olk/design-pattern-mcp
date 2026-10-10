@@ -1,0 +1,62 @@
+{
+  "pattern": "temporal-property",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Hibernate Envers @Audited + AuditReader as-of queries",
+  "implementation_notes": "The dominant JVM realization is an auditing framework rather than a hand-written collection: annotate the entity (or just the properties that need history) with @Audited and Envers writes an entity_table_AUD audit table per revision; AuditReader, obtained from AuditReaderFactory, answers the pattern's questions - getRevisionNumberForDate(LocalDateTime) turns a date into the revision current at that instant, find(Entity.class, id, rev) / createQuery().forEntitiesAtRevision(...) read the entity as it was, forRevisionsOfEntity lists the changes, and AuditEntity.property(\"salary\").hasChanged() filters the revisions that touched one property. What replaces the classic structure: revision numbering, the AUD tables and the as-of read; the domain class keeps ordinary getters. Keep a hand-written temporal collection when the index is business (valid) time, when the property must be read without a persistence context, or when the store is not JPA.",
+  "code_sketch": "@Entity\n@Audited                                       // or @Audited on the single property\nclass Employee { @Id UUID id; String name; Money salary; }\n\nAuditReader reader = AuditReaderFactory.get(entityManager);\nNumber rev = reader.getRevisionNumberForDate(LocalDateTime.of(2024, 4, 1, 0, 0));\nEmployee then = reader.find(Employee.class, id, rev);        // as of 2024-04-01\nList<?> touched = reader.createQuery()\n    .forRevisionsOfEntity(Employee.class, false, true)\n    .add(AuditEntity.id().eq(id))\n    .add(AuditEntity.property(\"salary\").hasChanged())\n    .getResultList();",
+  "pitfalls": [
+    "Audit queries are much slower than live queries (correlated subselects) and the AUD tables grow without bound: index the revision columns, partition or prune, and never use the audit path for hot reads.",
+    "Envers records transaction time (global revision + commit timestamp), not business validity: a back-dated correction is visible as a new revision, not as the value that was in force last quarter - that needs the entity's own valid-from column.",
+    "A part-audited entity produces partially historical objects: non-audited fields carry their current value in an as-of read, so mixing audited and non-audited state in one domain object is a silent correctness bug.",
+    "LocalDate/LocalDateTime have no zone: converting a stored UTC instant with the JVM default zone (or vice versa) shifts the as-of date, so the conversion zone must be explicit."
+  ],
+  "sources": [
+    "https://docs.hibernate.org/devguide/en-US/html/ch15.html",
+    "https://docs.hibernate.org/stable/orm/javadocs/org/hibernate/envers/AuditReader.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/LocalDate.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "envers-audited",
+      "name": "Hibernate Envers audit tables (framework)",
+      "paradigm": "oo",
+      "min_standard": "Java11",
+      "idiom_name": "Hibernate Envers @Audited + AuditReader as-of queries",
+      "implementation_notes": "The dominant JVM realization is an auditing framework rather than a hand-written collection: annotate the entity (or just the properties that need history) with @Audited and Envers writes an entity_table_AUD audit table per revision; AuditReader, obtained from AuditReaderFactory, answers the pattern's questions - getRevisionNumberForDate(LocalDateTime) turns a date into the revision current at that instant, find(Entity.class, id, rev) / createQuery().forEntitiesAtRevision(...) read the entity as it was, forRevisionsOfEntity lists the changes, and AuditEntity.property(\"salary\").hasChanged() filters the revisions that touched one property. What replaces the classic structure: revision numbering, the AUD tables and the as-of read; the domain class keeps ordinary getters. Keep a hand-written temporal collection when the index is business (valid) time, when the property must be read without a persistence context, or when the store is not JPA.",
+      "code_sketch": "@Entity\n@Audited                                       // or @Audited on the single property\nclass Employee { @Id UUID id; String name; Money salary; }\n\nAuditReader reader = AuditReaderFactory.get(entityManager);\nNumber rev = reader.getRevisionNumberForDate(LocalDateTime.of(2024, 4, 1, 0, 0));\nEmployee then = reader.find(Employee.class, id, rev);        // as of 2024-04-01\nList<?> touched = reader.createQuery()\n    .forRevisionsOfEntity(Employee.class, false, true)\n    .add(AuditEntity.id().eq(id))\n    .add(AuditEntity.property(\"salary\").hasChanged())\n    .getResultList();",
+      "pitfalls": [
+        "Audit queries are much slower than live queries (correlated subselects) and the AUD tables grow without bound: index the revision columns, partition or prune, and never use the audit path for hot reads.",
+        "Envers records transaction time (global revision + commit timestamp), not business validity: a back-dated correction is visible as a new revision, not as the value that was in force last quarter - that needs the entity's own valid-from column.",
+        "A part-audited entity produces partially historical objects: non-audited fields carry their current value in an as-of read, so mixing audited and non-audited state in one domain object is a silent correctness bug.",
+        "LocalDate/LocalDateTime have no zone: converting a stored UTC instant with the JVM default zone (or vice versa) shifts the as-of date, so the conversion zone must be explicit."
+      ],
+      "sources": [
+        "https://docs.hibernate.org/devguide/en-US/html/ch15.html",
+        "https://docs.hibernate.org/stable/orm/javadocs/org/hibernate/envers/AuditReader.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/LocalDate.html"
+      ]
+    },
+    {
+      "variant_id": "temporal-collection",
+      "name": "hand-written temporal collection (Fowler's original)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "NavigableMap<LocalDate, T> + floorEntry",
+      "implementation_notes": "Fowler's original Java realization: a temporal collection held as a NavigableMap keyed by effective date, with get(LocalDate) returning floorEntry(when), a no-argument get() defaulting to an injected Clock's today, and put(from, value) appending a version. java.time.LocalDate is the Time Point and the map's ordering makes milestones() a descendingMap() traversal; a bi-temporal collection is simply a temporal collection whose values are temporal collections. Choose it when the index is business validity, when the history must be read without a persistence context, or when the store is not JPA - the classic form is also the only one that can hold a value valid over two disjoint ranges.",
+      "code_sketch": "final class TemporalCollection<T> {\n    private final NavigableMap<LocalDate, T> milestones = new TreeMap<>();\n    private final Clock clock;\n    TemporalCollection(Clock clock) { this.clock = clock; }\n\n    T get(LocalDate when) {\n        Map.Entry<LocalDate, T> e = milestones.floorEntry(when);   // latest start <= when\n        if (e == null) throw new NoSuchElementException(\"not yet effective: \" + when);\n        return e.getValue();\n    }\n    T get() { return get(LocalDate.now(clock)); }                  // default: today\n    void put(LocalDate from, T value) { milestones.put(from, value); }\n}",
+      "pitfalls": [
+        "LocalDate.now() / Instant.now() without an injected Clock makes tests and replays non-deterministic and hides the zone (LocalDate.now() uses the JVM default zone) - inject the clock, as above.",
+        "floorEntry returns null before the first milestone and TreeMap.put at an existing key silently replaces the version, so same-date updates and range-splitting corrections need entry-level keys or a second dimension.",
+        "A TreeMap cannot store null values in a meaningful way: a null lookup result is indistinguishable from an absent key, so a legitimate null value must be wrapped.",
+        "The map is not thread-safe: concurrent put/get need external synchronisation, a ConcurrentSkipListMap, or the collection must be confined to one thread - and a ConcurrentSkipListMap has no floorEntry/floorKey combination plus atomic update, so the read-then-write of a retroactive range rewrite is still not atomic."
+      ],
+      "sources": [
+        "https://martinfowler.com/eaaDev/TemporalProperty.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/LocalDate.html"
+      ]
+    }
+  ],
+  "default_variant": "envers-audited",
+  "version": "1.0"
+}

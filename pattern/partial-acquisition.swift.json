@@ -1,0 +1,64 @@
+{
+  "pattern": "partial-acquisition",
+  "language": "swift",
+  "support": "idiomatic",
+  "idiom_name": "AsyncSequence with for try await for staged parts; lazy stored property for the shared stage",
+  "implementation_notes": "Swift models the staged resource as a sequence: the AsyncSequence documentation states that such a sequence does not generate or contain the values and only defines how they are accessed, and that it may have all, some or none of its values available when it is first used - which is exactly the contract of a partially acquired resource, with for try await pulling one part at a time and cancellation travelling through the structured-concurrency task. On the local side a lazy stored property defers the expensive shared part until it is first read, and the synchronous Sequence/IteratorProtocol pair covers staged reads that need no concurrency. A hand-written plan is still justified when parts must be shared between several consumers (an AsyncSequence is consumed per iteration, so fan-out needs an explicit share, relay or cache) or when staging must be checkpointed across process lifetimes.",
+  "code_sketch": "struct PartStream: AsyncSequence {              // stage 1: cheap reference only\n    let source: PartRef\n    func makeAsyncIterator() -> Iterator { Iterator(source: source) }\n}\nfor try await chunk in PartStream(source: ref) { // stage 2: parts as they arrive\n    try sink.write(chunk)                        // cancellation lands in next()\n}",
+  "pitfalls": [
+    "A lazy stored property is computed on first read with no synchronisation of its own, so concurrent first access can compute the shared expensive part more than once (and exclusivity enforcement surfaces some of these as runtime traps instead of preventing them); a shared stage needs an explicit once primitive.",
+    "An AsyncSequence that is half consumed and then abandoned releases its provider only through iterator deallocation, and SE-0298 expects iterators to handle cancellation by throwing CancellationError or returning nil - otherwise the provider side stays busy.",
+    "After an iterator returns nil or throws, every later next() must return nil (documented in the proposal), so an interrupted, partially acquired resource cannot be resumed; a new iterator must be built.",
+    "Structured concurrency binds the staged read to the task that started it, so cancelling a parent cancels the parts in flight - desirable for a request, surprising for a background prefetch."
+  ],
+  "sources": [
+    "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+    "https://developer.apple.com/documentation/swift/asyncsequence",
+    "https://github.com/swiftlang/swift-evolution/blob/main/proposals/0298-asyncsequence.md"
+  ],
+  "variants": [
+    {
+      "variant_id": "async-sequence",
+      "name": "AsyncSequence consumed with for try await",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "async",
+        "async-await"
+      ],
+      "idiom_name": "AsyncSequence with for try await for staged parts; lazy stored property for the shared stage",
+      "implementation_notes": "Swift models the staged resource as a sequence: the AsyncSequence documentation states that such a sequence does not generate or contain the values and only defines how they are accessed, and that it may have all, some or none of its values available when it is first used - which is exactly the contract of a partially acquired resource, with for try await pulling one part at a time and cancellation travelling through the structured-concurrency task. On the local side a lazy stored property defers the expensive shared part until it is first read, and the synchronous Sequence/IteratorProtocol pair covers staged reads that need no concurrency. A hand-written plan is still justified when parts must be shared between several consumers (an AsyncSequence is consumed per iteration, so fan-out needs an explicit share, relay or cache) or when staging must be checkpointed across process lifetimes.",
+      "code_sketch": "struct PartStream: AsyncSequence {              // stage 1: cheap reference only\n    let source: PartRef\n    func makeAsyncIterator() -> Iterator { Iterator(source: source) }\n}\nfor try await chunk in PartStream(source: ref) { // stage 2: parts as they arrive\n    try sink.write(chunk)                        // cancellation lands in next()\n}",
+      "pitfalls": [
+        "A lazy stored property is computed on first read with no synchronisation of its own, so concurrent first access can compute the shared expensive part more than once (and exclusivity enforcement surfaces some of these as runtime traps instead of preventing them); a shared stage needs an explicit once primitive.",
+        "An AsyncSequence that is half consumed and then abandoned releases its provider only through iterator deallocation, and SE-0298 expects iterators to handle cancellation by throwing CancellationError or returning nil - otherwise the provider side stays busy.",
+        "After an iterator returns nil or throws, every later next() must return nil (documented in the proposal), so an interrupted, partially acquired resource cannot be resumed; a new iterator must be built.",
+        "Structured concurrency binds the staged read to the task that started it, so cancelling a parent cancels the parts in flight - desirable for a request, surprising for a background prefetch."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+        "https://developer.apple.com/documentation/swift/asyncsequence",
+        "https://github.com/swiftlang/swift-evolution/blob/main/proposals/0298-asyncsequence.md"
+      ]
+    },
+    {
+      "variant_id": "lazy-sequence",
+      "name": "Lazy stored property plus synchronous Sequence staging",
+      "paradigm": "oo",
+      "min_standard": "Swift1.0",
+      "idiom_name": "lazy var for the shared part, Sequence/IteratorProtocol for parts",
+      "implementation_notes": "The synchronous variant: a lazy stored property holds the expensive shared part and computes it on first read (the language guide defines it as a property whose initial value is not calculated until the first time it is used), while Sequence plus IteratorProtocol walks the remaining parts on demand, so the consumer decides how far the acquisition goes. Choose it for local, non-suspending sources and for sharing one index or decoded structure across many readers without any concurrency machinery; choose the async variant as soon as a part can block on the network or must be cancellable.",
+      "code_sketch": "final class Bundle {\n    lazy var index: Index = Index.load(path)   // shared part: computed once, on demand\n    func chunk(_ i: Int) throws -> Chunk {     // stage 2: acquired only when asked\n        try Chunk.fetch(index.range(i))\n    }\n}\nlet b = Bundle()\nfor i in b.index.wanted { try sink.write(b.chunk(i)) }  // pay only for wanted parts",
+      "pitfalls": [
+        "The lazy initialiser runs again if the property is declared on a value type that is copied, so sharing only works on a reference type held in one place.",
+        "Lazy properties are not thread-safe by themselves: concurrent first access can run the initialiser twice, and the surrounding exclusivity rules may turn the mistake into a crash rather than a duplicated acquisition.",
+        "Sequence-based staging is synchronous, so a slow provider blocks the caller; a cancelled or abandoned iteration simply stops, leaving the provider to be released by ARC."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/"
+      ]
+    }
+  ],
+  "default_variant": "async-sequence",
+  "version": "1.0"
+}

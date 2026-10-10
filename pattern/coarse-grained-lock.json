@@ -1,0 +1,186 @@
+{
+  "category": "persistence-state",
+  "name": "coarse-grained-lock",
+  "aliases": [
+    "aggregate lock",
+    "cluster lock"
+  ],
+  "intent": "Give a cluster of objects that must change together one shared lock — held on the cluster's root object, on a lock entry keyed by that root, or on a version token the root carries — so a caller locks one thing instead of discovering and locking every member.",
+  "problem": "Changing one object really means changing a cluster: an edit that touches any member (a line item, an address, a child entity) has to be atomic with respect to the others, but a separate lock per member forces every caller to find and lock the whole set, makes the amount of locking grow with the object graph, and produces deadlocks whenever two callers acquire member locks in different orders.",
+  "context": "Domain layers whose natural unit of change spans several related objects (an aggregate root plus its members) and whose edit sessions outlive a single statement — multi-user applications, rich clients, batch jobs — on stores that offer row locks, lock tables or version columns and where the team must pick one lock granularity that matches the unit of change.",
+  "benefits": [
+    "One lock per cluster: callers lock, version-check or serialize on the root, so lock acquisition is a single operation with a stable identity instead of a search over the member set.",
+    "Cluster invariants are protected as a unit: because every write path must pass through the root, members cannot drift apart unnoticed, and no per-member bookkeeping is needed to keep them consistent.",
+    "No need to load the whole cluster in order to lock it: a root-row lock or a shared version token locks without reading every member (Fowler's argument for large groups).",
+    "Fewer locks in the lock table or registry: less memory and less contention than one lock per object, and the lock-ordering problem disappears because there is exactly one lock per cluster.",
+    "Growth is absorbed: adding a member to the cluster adds no lock, no lock-acquisition call and no new deadlock edge.",
+    "The rule is documentable and testable: 'write through the root' is one sentence, checkable in code review and enforceable at the repository boundary.",
+    "Matches the aggregate boundary: aligns lock scope with DDD aggregate boundary, the natural transactional consistency unit, eliminating impedance mismatch between locking strategy and domain model."
+  ],
+  "tradeoffs": [
+    "False conflicts: two users editing different members of the same cluster now collide on the root token, so conflict and retry rates rise as clusters grow.",
+    "The critical section is as long as the edit session: a pessimistic cluster lock blocks every other writer of the cluster, and of anything else reachable through the same root, for the whole session.",
+    "Choosing the root becomes a consequential design decision: too high and the lock serializes unrelated work, too low and you are back to multi-lock bookkeeping and lock-ordering bugs.",
+    "It adds a mandatory first step: many realizations require the root to be locked, loaded or version-bumped before members are written, costing a round trip even when one member changes.",
+    "Guarantees are only as wide as the mechanism: a root row lock does not lock member rows, and JPA's extended lock scope covers join tables rather than the state of referenced entities, so correctness depends on every write path touching the root.",
+    "Lock-manager realizations need lifecycle management: timeouts, stale-lock cleanup after crashes, and contention on the registry or lock table itself.",
+    "Optimal granularity is workload-dependent: empirical studies (Ries & Stonebraker 1979; Böttcher et al. 2025) show coarse granularity is preferred for large transactions and sequential access patterns, but fine granularity wins for small random-access transactions — and the optimal number of lock granules is often far smaller than one per record."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 8,
+    "simplicity": 6,
+    "performance": 5,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 4
+  },
+  "participants": [
+    {
+      "role": "Root (aggregate root)",
+      "responsibility": "Carries the shared lock: its row is locked, or its version token is bumped, and its identity is the only handle a caller needs in order to lock the whole cluster."
+    },
+    {
+      "role": "Cluster Member",
+      "responsibility": "Object whose changes are covered by the root's lock; it holds no lock and no version token of its own, and must not be written without the root having been locked or version-checked."
+    },
+    {
+      "role": "Lock Manager",
+      "responsibility": "Persistence-layer component that acquires, records and releases the shared lock for a cluster in the pessimistic realization, including timeouts and stale-lock cleanup."
+    },
+    {
+      "role": "Version Token",
+      "responsibility": "Version number, timestamp or GUID stored with the root; one increment covers every member change and is checked once per commit in the optimistic realization."
+    },
+    {
+      "role": "Edit Session / Unit of Work",
+      "responsibility": "Scopes the lock's lifetime: its boundaries decide when the cluster lock is taken, when the version is checked, and when the lock is released on commit or abort."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Editing an order together with its lines and delivery addresses in one user session: the order is locked or versioned once and every line edit is covered.",
+    "A customer with its addresses and contacts that must stay consistent, where leaving one member stale breaks a business rule.",
+    "Pessimistic offline edit sessions in a rich client that hold a lock for minutes without locking dozens of rows across several tables.",
+    "Optimistic commit of a whole aggregate: the root's version token detects that any member changed since load, so members need no version columns of their own.",
+    "Batch jobs that rewrite every member of a cluster: one lock or one version check for the batch instead of thousands of row locks.",
+    "Sharded or multi-tenant stores where the cluster root is also the shard key, so locking the root pins the partitions that the edit will touch.",
+    "DDD aggregates where an invariant spans multiple child entities (e.g., total order quantity must not exceed 10) — the coarse-grained lock on the aggregate root prevents parallel transactions from breaking the invariant at the per-line level.",
+    "Saga state machines where concurrent messages may touch the same saga instance — NHibernate pessimistic locking combined with forced version increment on child updates ensures the saga instance stays consistent.",
+    "Multi-granularity lock hierarchies in database systems: coarse area/file locks for large scans paired with fine row locks for point updates, using intention-lock protocols (IS/IX/SIX) to prevent deadlocks.",
+    "Kubernetes control plane: kube-scheduler and kube-controller-manager contend for a single coordination.k8s.io Lease object — one coarse lock covering a whole controller, renewed at about half the lease duration, with resourceVersion optimistic concurrency so only one candidate can hold it.",
+    "CockroachDB epoch-based node leases: one lease per node covers every Raft range that node holds instead of one lease per range, cutting lease-renewal traffic; bumping the node's liveness epoch revokes all of its range leases at once.",
+    "JPA/Hibernate applications locking an aggregate with a single LockModeType.PESSIMISTIC_WRITE on the root row (SELECT … FOR UPDATE) and relying on the root's @Version column as the version token for the whole cluster."
+  ],
+  "avoid_when": [
+    "Members are genuinely independent and edited by different workflows — a coarse lock converts unrelated work into conflicts; use per-object version number checks instead.",
+    "A single database transaction already gives the isolation you need — a normal transaction around the member writes is simpler than a lock manager and releases deterministically.",
+    "The cluster is a value or an immutable tree that is replaced wholesale — copy-on-write or an immutable object removes the need to lock members at all.",
+    "Conflicts are rare and sessions are short — an optimistic token on the root (or plain row versioning) is enough, and a pessimistic cluster lock only lowers concurrency.",
+    "The unit of change is a single row — putting the lock on a root adds indirection, a mandatory extra step and a false-conflict surface with nothing to protect.",
+    "Your transactions are uniformly small and randomly distributed across the dataset — simulation studies show fine-grained locking outperforms coarse when access patterns have no sequentiality (Ries & Stonebraker 1979)."
+  ],
+  "language_files": {
+    "generic": "coarse-grained-lock.generic.json",
+    "c": "coarse-grained-lock.c.json",
+    "cplusplus": "coarse-grained-lock.cplusplus.json",
+    "csharp": "coarse-grained-lock.csharp.json",
+    "go": "coarse-grained-lock.go.json",
+    "java": "coarse-grained-lock.java.json",
+    "javascript": "coarse-grained-lock.javascript.json",
+    "kotlin": "coarse-grained-lock.kotlin.json",
+    "python": "coarse-grained-lock.python.json",
+    "ruby": "coarse-grained-lock.ruby.json",
+    "rust": "coarse-grained-lock.rust.json",
+    "scala": "coarse-grained-lock.scala.json",
+    "swift": "coarse-grained-lock.swift.json",
+    "typescript": "coarse-grained-lock.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "aggregate",
+    "optimistic-offline-lock",
+    "pessimistic-offline-lock",
+    "implicit-lock",
+    "unit-of-work",
+    "version-number",
+    "identity-map",
+    "repository",
+    "process-manager",
+    "domain-event"
+  ],
+  "anti_patterns": [
+    "Locking every member and calling it coarse-grained: acquiring N row locks per edit session brings back the bookkeeping, the lock-ordering problem and the load cost the pattern exists to remove.",
+    "A root token that not every write path touches: member saves that bypass the root (bulk update, raw SQL, back-office script) make the cluster look protected while it is not.",
+    "One root for everything: a global or tenant-wide lock row serializes the whole application under the name of coarse-grained locking.",
+    "Mistaking the cluster lock for a transaction boundary: the root lock serializes writers but does not make a multi-row write atomic.",
+    "Pessimistic locks that never expire: a crashed session leaves the cluster locked for all other users with no timeout, no owner record and no cleanup.",
+    "Lock escalation invisibly widening scope: a transaction accumulating many row locks triggers automatic table-level escalation, serializing work the design intended to keep parallel.",
+    "Distributed lock without fencing token: a process GC-paused beyond TTL expiry yields the lock to a new holder while the original process resumes and writes stale data to the resource."
+  ],
+  "design_principles": [
+    "Match lock granularity to the unit of change: one invariant boundary, one lock — the same reasoning that makes the aggregate the consistency and transaction boundary.",
+    "Single enforcement point: the root is the one thing every write path can be made to pass through, so the invariant is enforced once instead of per member.",
+    "Choose the lock family from conflict economics: optimistic where conflicts are rare, pessimistic where conflicts are expensive.",
+    "Information hiding: callers reason about the cluster id and the root, never about the member set they must lock.",
+    "Smallest sufficient scope: lock the smallest cluster that still protects the invariant; widening it trades concurrency for guarantees you may not need.",
+    "Version-token homogeneity: every member of a cluster must reference the same version entity; mixed references break the cross-member conflict detection guarantee.",
+    "Lock identity stability: the lock target (root id, version row id) must not change during the cluster's lifetime, or all existing lock holders become orphaned."
+  ],
+  "best_practices": [
+    "Define the cluster boundary first and put the lock or version token on its root — never derive the boundary from where the lock happens to live.",
+    "Make the root mandatory: repository APIs take the cluster id, load and save through the root, and direct member writes are rejected or funnelled.",
+    "Prefer the shared optimistic token when conflicts are rare; reserve pessimistic root locks for expensive conflicts and keep the lock's lifetime as short as the business operation allows.",
+    "Use one identity everywhere — cluster id in the lock table, the root row lock and the version token — so locks can be found, logged and reasoned about.",
+    "Give every pessimistic lock a timeout, an owner record and a cleanup path, so stale locks are diagnosable and recoverable rather than permanent.",
+    "Watch cluster size and false-conflict rate: when unrelated edits inside one cluster collide regularly, the cluster is too big and should be split.",
+    "Enforce the root lock at the framework or ORM layer so bypass paths (bulk updates, raw SQL) cannot silently break the guarantee — use Implicit Lock or a LockingMapper decorator.",
+    "In distributed deployments, pair every pessimistic cluster lock with a monotonically increasing fencing token that resource servers validate before accepting writes.",
+    "Size clusters to match business transactions: a cluster that spans multiple bounded contexts requires cross-context coarse locks, which often signals a design problem better solved by eventual consistency and domain events.",
+    "For ORM implementations (JPA, Hibernate, NHibernate), use an event listener to force a version increment on the aggregate root whenever any member is modified — this closes the gap where a developer forgets to manually bump the version."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Martin Fowler, Patterns of Enterprise Application Architecture (Addison-Wesley, 2003) — Coarse-Grained Lock, in Offline Concurrency Patterns (ch. 16); original pattern credited to David Rice and Matt Foemmel.",
+    "https://martinfowler.com/eaaCatalog/coarseGrainedLock.html",
+    "https://jakarta.ee/specifications/persistence/3.1/apidocs/jakarta.persistence/jakarta/persistence/pessimisticlockscope",
+    "https://docs.oracle.com/javaee/7/tutorial/persistence-locking002.htm",
+    "https://www.postgresql.org/docs/current/explicit-locking.html",
+    "Daniel R. Ries and Michael Stonebraker, 'Locking Granularity Revisited', ACM Transactions on Database Systems, Vol. 4, No. 2, 1979 — seminal simulation study establishing that optimal lock granularity is workload-dependent; coarse granularity preferred for large sequential transactions, fine granularity for small random-access transactions; optimal granule counts often ≤100.",
+    "J.N. Gray, R.A. Lorie, G.R. Putzolu, and J.L. Traiger, 'Granularity of Locks and Degrees of Consistency in a Shared Data Base', IBM Research Report RJ 1588, 1976 (later published) — foundational paper introducing hierarchical locking with intention modes (IS/IX/S/SIX/X), formalizing the concurrency-overhead tradeoff of lock granularity and proving protocol equivalence with conventional two-mode locking.",
+    "Victor Chircu, 'Saga Concurrency and Coarse-Grained Locks when using NHibernate Persistence', Simple Oriented Architecture, 2016 — practical analysis of aggregate invariant enforcement with NHibernate, forced version increment via ISaveOrUpdateEventListener, and the constraint that bidirectional associations are required for ORM-driven root-version bumping.",
+    "Andy Clymer, '.NET Mutterings: Entity Framework and Coarse Grain Locking', 2009 — EF implementation of shared optimistic lock via a Version entity referenced by all aggregate members; custom SaveChanges override to auto-increment the shared version on any member modification.",
+    "https://docs.proteanhq.com/patterns/one-aggregate-per-transaction/ — One Aggregate Per Transaction pattern; emphasizes that aggregate boundaries are the transaction boundary and that crossing them with coarse-grained locks blurs consistency guarantees.",
+    "Jan Böttcher, Viktor Leis, Jana Giceva, Thomas Neumann, Alfons Kemper, 'Scalable and Robust Latches for Database Systems', CIDR 2025 — modern analysis of lock granularity sweet spots; finds optimistic/hybrid locks reach peak throughput at ~1000-tuples granularity; pessimistic locks need 10× larger granules to amortize acquisition cost.",
+    "Thomas Neumann, 'Transaction Systems' (TUM lecture slides) — multi-granularity locking protocols, intention-lock modes, lock escalation policies, and data-contention thrashing at high multiprogramming levels.",
+    "https://www.distributedrequest.com/distributed-coordination-locking-strategies/optimistic-vs-pessimistic-concurrency-control/ — Production guide covering pessimistic vs optimistic concurrency control tradeoffs, lock convoy risk, retry storm patterns, timeout configuration, and index requirements for lock/version targets.",
+    "https://www.distributedrequest.com/distributed-coordination-locking-strategies/distributed-lock-acquisition-patterns/ — Distributed lock acquisition patterns including atomic SET NX, TTL/lease management, renewal at 50% TTL, fencing tokens, clock-drift margins, and Redlock analysis.",
+    "https://devuly.com/optimistic-locking-vs-pessimistic-locking-vs-distributed-locks/ — Comparative guide: optimistic locking for read-heavy/low-conflict workloads, pessimistic locking for high-conflict/strong-consistency paths, distributed locks for cross-node execution ownership; covers Redis SET NX pattern and idempotency pairing.",
+    "https://thecodeforge.io/system-design/distributed-locking/ — Practical guide to Redis Redlock, ZooKeeper ephemeral nodes, database-backed locks; covers split-brain scenarios, fencing tokens, lock TTL sizing, GC-pause risks, and when to prefer ZooKeeper/etcd over Redis.",
+    "https://database.guide/what-is-lock-granularity/ — Accessible explanation of lock granularity levels (database, table, page, row); lock escalation behavior; tradeoffs between concurrency and overhead; guidance on matching granularity to workload characteristics.",
+    "George, 'Optimistic Concurrency Locking and Inter-Aggregate Invariants in Clean DDD', Unil CI Software Engineering, 2025 — demonstrates how Spring Data JDBC's automatic version augmentation on unmodified aggregate roots can protect inter-aggregate invariants by re-saving the root in the same transaction as a modified aggregate.",
+    "https://reintech.io/blog/managing-transactions-concurrency-domain-driven-approach — DDD-aligned guide: transaction scope matching aggregate boundaries, optimistic concurrency with version columns, pessimistic locking with FOR UPDATE, hybrid approaches, and domain event-driven eventual consistency for cross-aggregate operations.",
+    "https://kubernetes.io/docs/concepts/cluster-administration/coordinated-leader-election/ — official Kubernetes docs: control-plane components elect a single active writer through one coordination.k8s.io Lease object, a coarse lock renewed at leaseDurationSeconds/2 under resourceVersion optimistic concurrency.",
+    "https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160210_range_leases.md — CockroachDB RFC 20160210: epoch-based leases replace per-range leases with a coarse-grained per-node lease (node liveness plus epoch) to cut lease-renewal traffic; an epoch bump revokes every range lease on that node.",
+    "https://vladmihalcea.com/hibernate-locking-patterns-how-do-pessimistic_read-and-pessimistic_write-work/ — Vlad Mihalcea on how JPA/Hibernate realize LockModeType.PESSIMISTIC_READ/PESSIMISTIC_WRITE as SELECT … FOR UPDATE with NO_WAIT/SKIP_LOCKED variants, and why lock semantics stay database-specific under the ORM abstraction.",
+    "https://mkasperczyk.com/ddd-aggregate-design-consistency-boundaries/ — criticism of wide coarse-grained boundaries: large aggregates lock too much and hurt throughput; draw the boundary at a single invariant and coordinate cross-boundary rules with domain events, re-check gates and converging sweeps instead of one big lock."
+  ],
+  "related_patterns_notes": {
+    "eventual-consistency": "eventual-consistency",
+    "fencing-token": "fencing-token"
+  }
+}

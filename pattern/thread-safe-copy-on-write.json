@@ -1,0 +1,163 @@
+{
+  "category": "concurrency-resilience",
+  "name": "thread-safe-copy-on-write",
+  "aliases": [],
+  "intent": "Share one body between many threads so that copying a value stays cheap and reading it never blocks, and protect the sharing state itself - the reference count or the published pointer - so that a writer clones the body and swaps in a new snapshot instead of mutating storage other threads can see.",
+  "problem": "A value is copied often and mutated rarely, so the copies should share storage until one of them diverges. That decision works single-threaded, but the moment several threads hold the value the sharing state becomes shared mutable state in its own right: a reference count incremented without atomics loses updates or frees a body another thread is still reading, a plain pointer dereferenced while another thread replaces it is a data race, and a 'copy' that still aliases its source turns a reader's snapshot into a moving target. The trigger is a read-mostly shared value - configuration, routing table, registry, cache snapshot - that must be read without locking and updated by cloning.",
+  "context": "Applies where one object, or one immutable snapshot of an aggregate, is read by many threads and written rarely: configuration reloads, registries and symbol tables, caches with rare invalidation, listener registries, and large immutable values handed between threads. Manual memory management, non-atomic reference counts or a separate publication step make the problem sharpest (C, C++, hand-rolled counting); garbage-collected languages apply the same structure with the published reference replacing the count. It is an object/value-level data-sharing decision, not a lock strategy for write-heavy state.",
+  "benefits": [
+    "Readers never block and never acquire a lock: they load the published snapshot once, in one atomic step, and work on it, so read throughput scales with cores instead of serialising on a mutex.",
+    "Copies stay cheap while the value is shared: cloning a handle is one counter increment or one pointer load, and the deep copy is deferred until the value actually diverges.",
+    "Readers get a consistent snapshot: a writer publishes a whole new body, so a reader sees either the old version or the new one, never a half-updated structure.",
+    "Readers and writers stop disturbing each other's cache lines: only writers touch the shared coordination state, so a read-mostly workload no longer bounces a lock or a counter between cores.",
+    "Failure containment: a writer that fails or rejects an update simply does not publish, leaving the previous snapshot intact for every reader.",
+    "The write path is explicit and local - clone, modify the clone, publish once - which makes the mutation sequence easy to serialise, review and test."
+  ],
+  "tradeoffs": [
+    "Every write pays the full price of a copy plus publication; under a write-heavy workload the pattern is strictly worse than a lock, turning waiting into O(n) copying and garbage.",
+    "Publication is atomic, transactions are not: concurrent read-modify-write loses updates unless writers share a mutex or a compare-and-swap retry loop, and even then the update is not a transaction.",
+    "Readers must pin their snapshot for the whole logical read: any reference - iterator, raw pointer, borrowed view - that outlives the publish point keeps the old body alive, so a real reclamation discipline is required (ownership of a counted reference, hazard pointers or epochs, or a garbage collector).",
+    "Protecting the count is not protecting the publication: a plain pointer read while a writer swaps it is still a data race, so the safe form publishes the pointer atomically as well; 'the count is atomic' is not enough.",
+    "Value semantics become non-obvious: two handles look like independent values but share a body, and any leaked interior reference - a non-const operator[], a shallow copy of a nested object, a mutable element inside an 'immutable' snapshot - voids the copy-on-write barrier silently.",
+    "Contention is invisible: clone-and-retry loops never block, so a badly balanced workload quietly burns CPU on discarded copies instead of showing up as lock wait.",
+    "Memory overhead: every published generation is a full body, and in reference-counted languages cycles pin bodies forever unless back-edges are weak."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 5,
+    "simplicity": 4,
+    "performance": 8,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Handle (proxy)",
+      "responsibility": "Cheap value-like handle that owns a reference to the body; copying it shares the body, and mutating through it detaches (clones) first."
+    },
+    {
+      "role": "Body",
+      "responsibility": "The shared payload. Once published it is treated as immutable; a writer replaces it rather than mutating it in place."
+    },
+    {
+      "role": "Sharing state (protected)",
+      "responsibility": "The reference count and/or the published pointer - exactly the state the thread-safe variant must protect atomically instead of by mutual exclusion."
+    },
+    {
+      "role": "Reader",
+      "responsibility": "Loads the current body in one atomic step, holds its reference for the whole operation, and never locks."
+    },
+    {
+      "role": "Writer (updater)",
+      "responsibility": "Serialises with other writers, clones the snapshot it loaded, applies the change and publishes the new body in one store or compare-and-swap."
+    },
+    {
+      "role": "Reclaimer",
+      "responsibility": "Decides when a replaced body's last reference is gone - the atomic count reaching zero, the last owning handle dropping, or the collector collecting it - and returns the memory."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Read-mostly configuration or routing tables that are reloaded occasionally and read on every request by every worker thread.",
+    "Registries, symbol tables and interning tables built once and consulted constantly, with rare additions or invalidations.",
+    "Caches and memo tables where invalidation is rare and readers must never wait behind a writer.",
+    "Listener and observer registries traversed on every event and modified rarely - the classic CopyOnWriteArrayList use.",
+    "Large immutable values - strings, byte buffers, message payloads, compiled artefacts - handed between threads, where a deep copy at each hand-off would dominate.",
+    "Language runtimes, interpreters and plugin hosts that keep configuration or environment objects read by many threads and updated by a single owner.",
+    "The Linux kernel's RCU (read-copy-update) mechanism in its purest form: readers enter an rcu_read_lock() critical section with no lock, atomic or shared-memory write, updaters publish a replacement with rcu_assign_pointer(), and the superseded body is freed only after a grace period proves no reader can still hold it - the dentry cache, routing tables and network-device lists.",
+    "Rust's std::sync::Arc as the atomically counted body of the standard library: cloning an Arc increments the count, and Arc::make_mut detaches - cloning the inner value only when other Arc handles exist - so the sharing state is protected by the type rather than by convention.",
+    "Go services publishing an immutable configuration or routing snapshot through sync/atomic's atomic.Pointer[T]: readers Load it once per request without locking, writers build a fresh snapshot under a writer lock and Store or Swap the pointer, and the collector reclaims each superseded snapshot when no reader references it."
+  ],
+  "avoid_when": [
+    "Writes are not rare: a plain mutex or read-write lock around a mutable body is less machinery and less copying, because copy-per-write is O(n) per update.",
+    "The value is already deeply immutable: share it directly; no count or publication protocol is needed when nothing can mutate it.",
+    "The runtime already removes the sharing problem (actors/workers with message passing, or collections that are persistent by default): use message passing or a persistent data structure instead of a counted body.",
+    "Readers cannot hold a reference for the whole operation (they keep raw pointers or iterators into the body): use a lock, or an RCU-like protocol with an explicit grace period, instead of a count nobody owns.",
+    "The value is small enough that copying it is cheaper than the coordination (small strings, small structs): just copy it.",
+    "The platform already ships the pattern for your shape of data (java.util.concurrent.CopyOnWriteArrayList, .NET System.Collections.Immutable, persistent collections): use those rather than a hand-rolled counted handle."
+  ],
+  "language_files": {
+    "generic": "thread-safe-copy-on-write.generic.json",
+    "c": "thread-safe-copy-on-write.c.json",
+    "cplusplus": "thread-safe-copy-on-write.cplusplus.json",
+    "csharp": "thread-safe-copy-on-write.csharp.json",
+    "go": "thread-safe-copy-on-write.go.json",
+    "java": "thread-safe-copy-on-write.java.json",
+    "javascript": "thread-safe-copy-on-write.javascript.json",
+    "kotlin": "thread-safe-copy-on-write.kotlin.json",
+    "python": "thread-safe-copy-on-write.python.json",
+    "ruby": "thread-safe-copy-on-write.ruby.json",
+    "rust": "thread-safe-copy-on-write.rust.json",
+    "scala": "thread-safe-copy-on-write.scala.json",
+    "swift": "thread-safe-copy-on-write.swift.json",
+    "typescript": "thread-safe-copy-on-write.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "copy-on-write",
+    "intrusive-reference-counting",
+    "smart-pointer",
+    "immutability",
+    "read-write-lock",
+    "monitor-object",
+    "weak-reference",
+    "double-buffer"
+  ],
+  "anti_patterns": [
+    "A hand-rolled copy-on-write handle whose reference count is a plain integer touched from several threads: increments get lost, bodies are freed while another thread reads them, or they leak.",
+    "Protecting the count but not the publication: dereferencing a shared pointer that another thread replaces - an atomic count does not make the pointer swap safe.",
+    "Handing out an interior reference into the shared body (an operator[] returning a writable reference, a mutable nested object inside an 'immutable' snapshot), so a reader mutates a snapshot every other reader sees.",
+    "Copying on every write in a write-heavy path with no batching or bound: the pattern degenerates into an allocation storm and the lock it replaced starts looking cheap.",
+    "Concurrent read-modify-write with no writer serialisation: two writers clone the same snapshot and one update is silently lost - copy-on-write gives atomic publication, not atomic updates.",
+    "Using copy-on-write to avoid deciding who owns the data: replaced bodies stay alive because a handle, iterator or registry still references them, and in reference-counted languages cycles pin them forever."
+  ],
+  "design_principles": [
+    "Prefer immutability for shared state: readers of an immutable body need no synchronisation; only publication needs an atomic step.",
+    "Separate the read path from the write path: readers never block and writers never disturb readers - an asymmetric, RCU-like discipline.",
+    "Make the sharing state part of the type, not a convention: the count or the published pointer lives in the handle/control block so no caller can forget it.",
+    "Lazy copy: pay for divergence, not for sharing - copy-on-write is lazy initialisation applied to copying.",
+    "Encapsulate the barrier: only the handle may detach or republish, and the body must not leak a mutation path around it.",
+    "Ownership must be explicit: every handle owns exactly one reference, and every replaced body has a defined last owner."
+  ],
+  "best_practices": [
+    "Make the count atomic and the publication atomic: use the language's atomic reference-counted pointer (std::shared_ptr with std::atomic<std::shared_ptr>, Rust Arc, C11 _Atomic) or an atomically published reference (AtomicReference, atomic.Pointer, ImmutableInterlocked) - never a bare integer incremented by two threads.",
+    "Serialise writers around clone-and-publish: clone the snapshot you loaded, mutate the clone, publish once (mutex or CAS retry loop); never mutate the body after publication.",
+    "Load the snapshot once into a local and hold it for the whole logical read - never read the handle twice for parts of one consistent view.",
+    "Batch updates: apply a group of changes to one clone and publish once, so the copy cost is paid per transaction rather than per field.",
+    "Keep the body deeply immutable (freeze the leaves, store immutable values) so nothing can route around the barrier.",
+    "Give replaced bodies a way to die: drop references promptly, use weak references for back-edges and registries in reference-counted languages, and pair manual memory with an explicit hand-off discipline (hazard pointers or epochs).",
+    "Prefer the platform's implementation when it exists (CopyOnWriteArrayList, System.Collections.Immutable, Arc::make_mut, persistent collections) and hand-roll only for the shape it does not cover.",
+    "Measure the write rate before adopting: if writes are not rare, use a lock - copy-on-write is a read-path optimisation."
+  ],
+  "version": "1.1",
+  "sources": [
+    "More C++ Idioms (Wikibooks): 'Copy-on-write' and 'Thread-safe Copy-on-write' - the catalogue entry this record materializes; the first documents the reference-counted body with detach-on-write and its unshareable-flag pitfall (citing Sutter), the second the atomic-snapshot form with mutex-serialized writers: https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Thread-safe_Copy-on-write",
+    "Herb Sutter, More Exceptional C++ (Addison-Wesley, 2002), Items 13-16 - the copy-on-write string analysis and the unshareable fix for interior references, cited by the Copy-on-write idiom page.",
+    "GCC libstdc++ manual, Dual ABI - the C++11 conformance change that 'forbids Copy-On-Write strings', replacing libstdc++'s COW std::string in GCC 5.1: https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html",
+    "cppreference, std::atomic<std::shared_ptr> - the shared_ptr control block is thread-safe for distinct shared_ptr objects, but unsynchronized access to the same shared_ptr object is a data race: https://en.cppreference.com/w/cpp/memory/shared_ptr/atomic2",
+    "Paul E. McKenney, 'What is RCU? - Read, Copy, Update' (Linux kernel documentation) - the canonical definition of the lock-free-read / copy / update / deferred-reclaim split this pattern generalises: https://docs.kernel.org/RCU/whatisRCU.html",
+    "Linux kernel documentation, 'RCU Concepts' - grace-period reclamation: remove the reference first, free only after synchronize_rcu()/call_rcu() proves all pre-existing readers finished, and why RCU read sides use no locks, atomics or shared-memory writes: https://docs.kernel.org/RCU/rcu.html",
+    "Oracle Java SE documentation, java.util.concurrent.CopyOnWriteArrayList - mutative ops copy the whole backing array and iterators traverse a fixed snapshot: the GC-language realisation of this pattern and its own 'avoid when writes are frequent' warning: https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html",
+    "Rust standard library documentation, std::sync::Arc - atomic reference counting across threads, with Arc::make_mut implementing detach-on-write by cloning the inner value only when other handles exist: https://doc.rust-lang.org/std/sync/struct.Arc.html",
+    "Go documentation, sync/atomic - atomic.Pointer[T] (Go 1.19+) with Load/Store/Swap/CompareAndSwap for lock-free publication and replacement of immutable snapshots: https://pkg.go.dev/sync/atomic",
+    "javamex, 'Copy-on-write collections in Java' - the misuse analysis: reads cost a volatile read and never block, but writes are serialised and each pays a full-array copy, so the structure degrades into an allocation storm under write load: https://www.javamex.com/tutorials/synchronization_concurrency_8_copy_on_write.shtml"
+  ]
+}

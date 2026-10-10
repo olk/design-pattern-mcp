@@ -1,0 +1,63 @@
+{
+  "pattern": "implicit-lock",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "guard struct + __attribute__((cleanup(guard_release))) + pthread_mutex_lock",
+  "implementation_notes": "C has no destructors and no scoped block for locks, so the structure has to be assembled by hand: wrap pthread_mutex_t in a one-field guard struct whose release function calls pthread_mutex_unlock, and attach it to an automatic variable with __attribute__((cleanup)). GCC documents that the cleanup attribute runs a function when the variable goes out of scope, so every return, break or goto path releases the mutex, which is what makes the lock implicit in the scope rather than in the programmer's memory. This is the practical default on GCC/Clang toolchains; the classic explicit pthread_mutex_lock/pthread_mutex_unlock pair remains justified for tiny leaf functions with a single exit path and for lock hand-off between scopes, which a scope guard cannot express.",
+  "code_sketch": "typedef struct { pthread_mutex_t *mu; } guard_t;\nstatic inline void guard_release(guard_t *g) { pthread_mutex_unlock(g->mu); }\n\nvoid transfer(account_t *from, account_t *to, long cents) {\n    guard_t g __attribute__((cleanup(guard_release))) = { .mu = &from->lock };\n    pthread_mutex_lock(g.mu);      /* released on every return path below */\n    from->balance -= cents;\n    to->balance += cents;\n}",
+  "pitfalls": [
+    "The cleanup function runs on normal scope exit, return, break and goto, but not when the guarded code releases the mutex manually: never mix manual unlock with a guard.",
+    "Guard acquisition order must stay canonical across functions, and a plain pthread mutex is not reentrant - a guarded function that calls another guarded function on the same mutex deadlocks.",
+    "The attribute is a compiler extension (GCC/Clang); MSVC and some embedded toolchains ignore or reject it, so a portable build needs the POSIX cleanup-handler variant instead."
+  ],
+  "sources": [
+    "https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Common-Variable-Attributes.html",
+    "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "cleanup-attribute-scope-guards",
+      "name": "GNU/Clang __attribute__((cleanup)) scope guards around pthread_mutex",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "cleanup-attribute"
+      ],
+      "idiom_name": "guard struct + __attribute__((cleanup(guard_release))) + pthread_mutex_lock",
+      "implementation_notes": "C has no destructors and no scoped block for locks, so the structure has to be assembled by hand: wrap pthread_mutex_t in a one-field guard struct whose release function calls pthread_mutex_unlock, and attach it to an automatic variable with __attribute__((cleanup)). GCC documents that the cleanup attribute runs a function when the variable goes out of scope, so every return, break or goto path releases the mutex, which is what makes the lock implicit in the scope rather than in the programmer's memory. This is the practical default on GCC/Clang toolchains; the classic explicit pthread_mutex_lock/pthread_mutex_unlock pair remains justified for tiny leaf functions with a single exit path and for lock hand-off between scopes, which a scope guard cannot express.",
+      "code_sketch": "typedef struct { pthread_mutex_t *mu; } guard_t;\nstatic inline void guard_release(guard_t *g) { pthread_mutex_unlock(g->mu); }\n\nvoid transfer(account_t *from, account_t *to, long cents) {\n    guard_t g __attribute__((cleanup(guard_release))) = { .mu = &from->lock };\n    pthread_mutex_lock(g.mu);      /* released on every return path below */\n    from->balance -= cents;\n    to->balance += cents;\n}",
+      "pitfalls": [
+        "The cleanup function runs on normal scope exit, return, break and goto, but not when the guarded code releases the mutex manually: never mix manual unlock with a guard.",
+        "Guard acquisition order must stay canonical across functions, and a plain pthread mutex is not reentrant - a guarded function that calls another guarded function on the same mutex deadlocks.",
+        "The attribute is a compiler extension (GCC/Clang); MSVC and some embedded toolchains ignore or reject it, so a portable build needs the POSIX cleanup-handler variant instead."
+      ],
+      "sources": [
+        "https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Common-Variable-Attributes.html",
+        "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+      ]
+    },
+    {
+      "variant_id": "posix-cleanup-handlers",
+      "name": "POSIX cancellation cleanup handlers (pthread_cleanup_push/pop)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "posix-threads"
+      ],
+      "idiom_name": "pthread_cleanup_push(pthread_mutex_unlock) ... pthread_cleanup_pop(1)",
+      "implementation_notes": "The portable POSIX route: pthread_cleanup_push installs a cancellation cleanup handler that runs when the thread is cancelled, calls pthread_exit, or when pthread_cleanup_pop is invoked with a non-zero execute argument. Pushing pthread_mutex_unlock with the mutex as its argument therefore releases the lock on every normal and cancellation exit from the guarded region, which is the standard answer when the thread may be cancelled or exit inside the critical section. Its price is that push and pop are macros that must be paired inside one lexical scope, so a return between them is a bug; the compiler-attribute variant is preferable when the toolchain supports it.",
+      "code_sketch": "pthread_mutex_lock(&tx->lock);\npthread_cleanup_push((void (*)(void *))pthread_mutex_unlock, &tx->lock);\n/* critical section: cancellation or pthread_exit still unlocks */\npthread_cleanup_pop(1);   /* 1 = also run the handler on normal exit */",
+      "pitfalls": [
+        "push and pop must be balanced in the same lexical block: an early return between them skips the handler on the normal path (it only runs for cancellation/pthread_exit), so returns inside the block are a defect.",
+        "pthread_mutex_unlock takes pthread_mutex_t * while handlers receive void *; keep the cast exact or write a real handler function, and remember the handler receives the argument, not the lock itself.",
+        "Cancellation handlers need deferred cancellation to be enabled for pthread_cancel to reach them; asynchronous cancellation can leave the handler's assumptions broken."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cleanup_push.3p.html",
+        "https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html"
+      ]
+    }
+  ],
+  "default_variant": "cleanup-attribute-scope-guards"
+}

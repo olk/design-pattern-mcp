@@ -1,0 +1,61 @@
+{
+  "pattern": "partial-acquisition",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "HttpResponse.BodyHandlers.ofInputStream (headers now, body on demand) plus JDBC fetch batches",
+  "implementation_notes": "The JDK turns a response into an explicit staged resource: HttpClient.send returns once the response headers are available, and the BodyHandler chosen by the caller decides what happens to the body - ofInputStream hands back an InputStream read on demand, ofLines a Stream<String> fed as lines arrive, ofPublisher a Flow.Publisher for push-based consumption with back-pressure, while ofString and ofByteArray are the full acquisition. The same staged discipline exists on the database side: Statement.setFetchSize gives the driver a hint for how many rows to fetch when more are needed, so a large result is consumed in batches instead of being materialised, and FileChannel.map exposes a memory-mapped window for the expensive bytes of a local file. A hand-written stage plan is still justified when a stage must be resumed, audited per part or shared across holders, because the JDK types stage a single acquisition but do not coordinate many.",
+  "code_sketch": "HttpResponse<InputStream> res =\n    client.send(req, HttpResponse.BodyHandlers.ofInputStream());  // stage 1: headers\nif (res.statusCode() != 200) return;                              // cheap rejection\ntry (InputStream body = res.body()) {        // staged release via try-with-resources\n    body.transferTo(sink);                   // stage 2: bytes pulled on demand\n}",
+  "pitfalls": [
+    "The body of an ofInputStream response must be closed (try-with-resources): an abandoned body holds the HTTP connection and its buffers, and dropping the response object does not release it deterministically.",
+    "setFetchSize is only a hint - the javadoc states the driver is given a hint and that zero is ignored - so a driver may still materialise the whole result; batch behaviour must be verified against the driver in use.",
+    "A java.util.stream.Stream is single-use (a second terminal operation throws IllegalStateException) and a Stream backed by a ResultSet is invalidated when its statement is re-executed, so it must be consumed or closed before the next query on the same statement.",
+    "A MappedByteBuffer window is unmapped by the garbage collector rather than deterministically, so a staged file access can keep the file busy or the address space reserved long after the last read."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/java/net/http/HttpResponse.BodyHandlers.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.sql/java/sql/Statement.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "body-stream",
+      "name": "Pull-based body stream (ofInputStream / ofLines)",
+      "paradigm": "oo",
+      "min_standard": "Java11",
+      "idiom_name": "HttpResponse.BodyHandlers.ofInputStream (headers now, body on demand) plus JDBC fetch batches",
+      "implementation_notes": "The JDK turns a response into an explicit staged resource: HttpClient.send returns once the response headers are available, and the BodyHandler chosen by the caller decides what happens to the body - ofInputStream hands back an InputStream read on demand, ofLines a Stream<String> fed as lines arrive, ofPublisher a Flow.Publisher for push-based consumption with back-pressure, while ofString and ofByteArray are the full acquisition. The same staged discipline exists on the database side: Statement.setFetchSize gives the driver a hint for how many rows to fetch when more are needed, so a large result is consumed in batches instead of being materialised, and FileChannel.map exposes a memory-mapped window for the expensive bytes of a local file. A hand-written stage plan is still justified when a stage must be resumed, audited per part or shared across holders, because the JDK types stage a single acquisition but do not coordinate many.",
+      "code_sketch": "HttpResponse<InputStream> res =\n    client.send(req, HttpResponse.BodyHandlers.ofInputStream());  // stage 1: headers\nif (res.statusCode() != 200) return;                              // cheap rejection\ntry (InputStream body = res.body()) {        // staged release via try-with-resources\n    body.transferTo(sink);                   // stage 2: bytes pulled on demand\n}",
+      "pitfalls": [
+        "The body of an ofInputStream response must be closed (try-with-resources): an abandoned body holds the HTTP connection and its buffers, and dropping the response object does not release it deterministically.",
+        "setFetchSize is only a hint - the javadoc states the driver is given a hint and that zero is ignored - so a driver may still materialise the whole result; batch behaviour must be verified against the driver in use.",
+        "A java.util.stream.Stream is single-use (a second terminal operation throws IllegalStateException) and a Stream backed by a ResultSet is invalidated when its statement is re-executed, so it must be consumed or closed before the next query on the same statement.",
+        "A MappedByteBuffer window is unmapped by the garbage collector rather than deterministically, so a staged file access can keep the file busy or the address space reserved long after the last read."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/java/net/http/HttpResponse.BodyHandlers.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.sql/java/sql/Statement.html"
+      ]
+    },
+    {
+      "variant_id": "reactive-publisher",
+      "name": "Reactive publisher with back-pressure (ofPublisher)",
+      "paradigm": "concurrent",
+      "min_standard": "Java11",
+      "requires_features": [
+        "java.util.concurrent.Flow"
+      ],
+      "idiom_name": "HttpResponse.BodyHandlers.ofPublisher plus a Flow.Subscriber",
+      "implementation_notes": "ofPublisher exposes the body as a Flow.Publisher of byte-buffer lists, so part granularity is negotiated at runtime: the subscriber requests as many parts as it can absorb and the transfer slows down accordingly. The body is deliberately not available through the HttpResponse API in this variant, and completion or failure arrives on the subscriber callbacks, which makes it the right carrier when the consumer is already reactive (or must merge several staged sources) and the wrong one for a blocking call site that simply wants bytes on demand.",
+      "code_sketch": "HttpResponse<Flow.Publisher<List<ByteBuffer>>> res =\n    client.send(req, HttpResponse.BodyHandlers.ofPublisher());\ntry (Flow.Publisher<List<ByteBuffer>> pub = res.body()) {\n    pub.subscribe(new Flow.Subscriber<>() {\n        public void onSubscribe(Flow.Subscription s) { s.request(1); }  // demand\n        public void onNext(List<ByteBuffer> part) { sink.write(part); /* request more */ }\n        public void onError(Throwable t) { fail(t); }\n        public void onComplete() { done(); }\n    });\n}",
+      "pitfalls": [
+        "Demand must be requested explicitly: a subscriber that never calls request() receives nothing, and an unbounded request turns the staged body into a buffered full acquisition inside the operator chain.",
+        "The body is not reachable through the HttpResponse API, so this variant forces the whole consumption path into reactive style - mixing it with a blocking read of the same response is a data race.",
+        "Cancellation travels through the subscription (cancel()), not through closing the response alone; a subscriber that abandons the subscription without cancelling can leave the connection busy."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/java/net/http/HttpResponse.BodyHandlers.html"
+      ]
+    }
+  ],
+  "default_variant": "body-stream",
+  "version": "1.0"
+}

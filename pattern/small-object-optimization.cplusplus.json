@@ -1,0 +1,77 @@
+{
+  "pattern": "small-object-optimization",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::string SSO / std::any small-object buffer / std::function small-callable buffer",
+  "implementation_notes": "Modern C++ usually does not make you write the buffer: std::basic_string keeps short strings inside the object (libstdc++ defines _S_local_capacity = 15 / sizeof(_CharT) over a union of _M_local_buf and _M_allocated_capacity), std::any implementations are 'encouraged to avoid dynamic allocations for small objects' whenever the payload is nothrow move-constructible, and std::function implementations store small callables inline. That replaces the classic structure completely for strings, callables and any-values - use these types first. Hand-rolling a buffer is justified only for a new type-erased wrapper that needs a different capacity, allocator or dispatch policy (for example a fixed-signature function with a custom small-object policy, or a short-string type with an inline capacity chosen from your own distribution).",
+  "code_sketch": "std::string key = \"eu-west-1\";        // 9 chars: stored inside the string object\nstd::any v = 42;                      // nothrow move-constructible payload: inline buffer\nstd::function<int(int)> f = [](int x) { return x * 2; };  // small capture: no allocation\n\n// Past the inline capacity (or a payload that is not nothrow move-constructible),\n// the same object spills to the heap without changing its interface.",
+  "pitfalls": [
+    "The small representation makes the payload's address unstable: c_str()/data() of a short string changes when the string is moved or crosses the inline capacity, so never cache the pointer - this is exactly the behaviour the C++11 string move was designed around.",
+    "The buffer is an implementation detail, not a contract: sizeof(std::string) and the effective capacity differ between libstdc++, libc++ and the MSVC STL, and std::any/function apply their optimization only to types that meet their conditions, so verify against the standard library you ship rather than assuming the allocation is gone."
+  ],
+  "sources": [
+    "cppreference, std::any - 'Implementations are encouraged to avoid dynamic allocations for small objects, but such an optimization may only be applied to types for which std::is_nothrow_move_constructible returns true': https://en.cppreference.com/w/cpp/utility/any",
+    "libstdc++ source, bits/basic_string.h - _S_local_capacity, the _M_local_buf/_M_allocated_capacity union and _M_is_local(): https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/include/bits/basic_string.h"
+  ],
+  "variants": [
+    {
+      "variant_id": "stdlib-type-erasure",
+      "name": "Standard-library types with built-in small-object buffers",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "std::string SSO / std::any small-object buffer / std::function small-callable buffer",
+      "implementation_notes": "Modern C++ usually does not make you write the buffer: std::basic_string keeps short strings inside the object (libstdc++ defines _S_local_capacity = 15 / sizeof(_CharT) over a union of _M_local_buf and _M_allocated_capacity), std::any implementations are 'encouraged to avoid dynamic allocations for small objects' whenever the payload is nothrow move-constructible, and std::function implementations store small callables inline. That replaces the classic structure completely for strings, callables and any-values - use these types first. Hand-rolling a buffer is justified only for a new type-erased wrapper that needs a different capacity, allocator or dispatch policy (for example a fixed-signature function with a custom small-object policy, or a short-string type with an inline capacity chosen from your own distribution).",
+      "code_sketch": "std::string key = \"eu-west-1\";        // 9 chars: stored inside the string object\nstd::any v = 42;                      // nothrow move-constructible payload: inline buffer\nstd::function<int(int)> f = [](int x) { return x * 2; };  // small capture: no allocation\n\n// Past the inline capacity (or a payload that is not nothrow move-constructible),\n// the same object spills to the heap without changing its interface.",
+      "pitfalls": [
+        "The small representation makes the payload's address unstable: c_str()/data() of a short string changes when the string is moved or crosses the inline capacity, so never cache the pointer - this is exactly the behaviour the C++11 string move was designed around.",
+        "The buffer is an implementation detail, not a contract: sizeof(std::string) and the effective capacity differ between libstdc++, libc++ and the MSVC STL, and std::any/function apply their optimization only to types that meet their conditions, so verify against the standard library you ship rather than assuming the allocation is gone."
+      ],
+      "sources": [
+        "cppreference, std::any - 'Implementations are encouraged to avoid dynamic allocations for small objects, but such an optimization may only be applied to types for which std::is_nothrow_move_constructible returns true': https://en.cppreference.com/w/cpp/utility/any",
+        "libstdc++ source, bits/basic_string.h - _S_local_capacity, the _M_local_buf/_M_allocated_capacity union and _M_is_local(): https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/include/bits/basic_string.h"
+      ]
+    },
+    {
+      "variant_id": "union-buffer",
+      "name": "Hand-rolled aligned union buffer with a discriminator",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "unrestricted unions",
+        "alignas"
+      ],
+      "idiom_name": "aligned union storage + placement new + tag/vtable in your own wrapper",
+      "implementation_notes": "The classic realization: a union of an aligned byte buffer for the small payload and of a pointer (plus allocator/capacity) for the spilled payload, with a discriminator that says which member is active. C++11 supplies the pieces - alignas storage, unions with non-trivial members, placement new for construction in the buffer and move semantics - and the union rules require you to track the active member yourself (cppreference: after initializing one member, reading the other is undefined behaviour). Choose it when you own the type and need a capacity, allocator or dispatch policy the standard types do not expose, and keep construction, destruction and the spill transition in one place; before C++11 the same layout was built with a char buffer and casts, with all the lifetime problems that implies.",
+      "code_sketch": "struct SmallCallable {\n    union Storage {\n        void *heap;\n        alignas(void *) unsigned char buf[32];   // inline payload\n    } s;\n    bool spilled;\n    void (*invoke)(Storage &);\n\n    // construct small:  ::new (s.buf) F(std::move(f));\n    // spill(): one place where the payload is moved to the heap and spilled = true\n    // destroy:  spilled ? delete heap : destructor-of-inline-object\n};",
+      "pitfalls": [
+        "Placement new without lifetime management is undefined behaviour: the buffer must be aligned (alignas), the active member must be destroyed exactly once, and after re-reading a buffer whose object was replaced a std::launder/pointer-reinterpretation may be required.",
+        "Moves must repair the representation: copying the union bytes works only in the spilled state (the heap pointer survives); an inline payload must be re-constructed in the destination buffer, otherwise the moved-to object's discriminator points at the old object's bytes.",
+        "A non-trivial payload makes the union's special members user-provided, so copy, move, assignment and destruction must all be written; letting the compiler default them silently punishes the first non-trivial payload type with a compile error or, worse, a leak."
+      ],
+      "sources": [
+        "cppreference, Union declaration (C++) - after initializing one member, reading the other is undefined behaviour, and reading an inactive member is a common but non-standard extension: https://en.cppreference.com/w/cpp/language/union",
+        "cppreference, new expression - the placement form constructs an object in storage the caller already owns: https://en.cppreference.com/w/cpp/language/new"
+      ]
+    },
+    {
+      "variant_id": "inline-capacity-vector",
+      "name": "Inline-capacity container (std::inplace_vector / boost::container::small_vector)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++26",
+      "idiom_name": "std::inplace_vector<T, N> (C++26) or boost::container::small_vector<T, N>",
+      "implementation_notes": "The container-flavoured realization of the same optimization: the element storage is part of the container object, so a small container allocates nothing. std::inplace_vector is specified as a 'dynamically-resizable array with contiguous inplace storage' whose elements 'are stored and properly aligned within the object itself' and which throws std::bad_alloc when insertion exceeds the fixed capacity N; boost::container::small_vector keeps a small inline buffer and spills to the heap like SmallVec, which is the choice for older toolchains or when growth beyond the buffer must stay possible. Both make the address of the element storage part of the type's contract: inplace_vector documents that moving or swapping invalidates all iterators.",
+      "code_sketch": "std::inplace_vector<int, 4> v;          // storage lives inside v: no allocation\nv.push_back(1); v.push_back(2);         // O(1) while size <= N\ntry { v.insert(v.end(), 5, 0); }        // beyond capacity -> std::bad_alloc\ncatch (const std::bad_alloc &) { /* fixed capacity by design */ }\n\nboost::container::small_vector<int, 4> w;   // same idea, but spills to the heap\nw.insert(w.end(), 8, 0);                    // no throw: the 5th element allocates",
+      "pitfalls": [
+        "inplace_vector is fixed-capacity by definition: exceeding N throws std::bad_alloc instead of growing, so a workload with a long tail needs boost::container::small_vector (heap spill) or a std::vector with reserved capacity.",
+        "The elements live inside the container: moving or swapping an inplace_vector invalidates every iterator and reference (unlike std::vector), and a pointer cached into the inline storage dies with the move.",
+        "N is part of the type and therefore part of the object: a generous N bloats every instance, every copy and every move, and the type no longer interoperates with code that assumes a heap-backed vector's layout."
+      ],
+      "sources": [
+        "cppreference, std::inplace_vector (C++26): 'dynamically-resizable array with contiguous inplace storage. The elements of type T are stored and properly aligned within the object itself ... Any member function that would cause insertion beyond the capacity N throws std::bad_alloc': https://en.cppreference.com/w/cpp/container/inplace_vector",
+        "Boost.Container small_vector header: 'small_vector is a vector-like container optimized for the case when it contains few elements. It contains some preallocated elements in-place': https://github.com/boostorg/container/blob/develop/include/boost/container/small_vector.hpp"
+      ]
+    }
+  ],
+  "default_variant": "stdlib-type-erasure",
+  "version": "1.0"
+}

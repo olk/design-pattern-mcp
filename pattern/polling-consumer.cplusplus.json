@@ -1,0 +1,72 @@
+{
+  "pattern": "polling-consumer",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::condition_variable::wait_for over a mutex-guarded queue",
+  "implementation_notes": "The standard library has no message channel, so the polling consumer is assembled from the timed wait: a queue guarded by std::mutex where cv_.wait_for(lock, rel_time, pred) blocks at most the idle interval, returns false when it expires (the idle tick) and uses the predicate overload to absorb spurious wake-ups. The classic form is justified whenever the channel is in-process; where the transport is a socket or a broker client, Boost.Asio's steady_timer takes over the timer role and the completion handler becomes the poll tick.",
+  "code_sketch": "bool pop(T& out, std::chrono::milliseconds idle) {\n  std::unique_lock lk(m);\n  if (!cv.wait_for(lk, idle, [&]{ return !q.empty() || closed; }))\n    return false;                 // idle tick: back off, poll again\n  out = std::move(q.front()); q.pop();\n  return true;                    // ack: the element left the channel\n}",
+  "pitfalls": [
+    "wait_for may wake spuriously; without the predicate overload a wake-up is mistaken for an available message and the consumer processes an empty queue.",
+    "The queue, mutex and condition variable must outlive the polling thread - a detached poller holding references into a destroyed channel is the classic shutdown crash, and a stop flag checked by the predicate is the cure."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-queue-wait-for",
+      "name": "std::condition_variable timed wait over a queue (standard library)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::condition_variable::wait_for over a mutex-guarded queue",
+      "implementation_notes": "The standard library has no message channel, so the polling consumer is assembled from the timed wait: a queue guarded by std::mutex where cv_.wait_for(lock, rel_time, pred) blocks at most the idle interval, returns false when it expires (the idle tick) and uses the predicate overload to absorb spurious wake-ups. The classic form is justified whenever the channel is in-process; where the transport is a socket or a broker client, Boost.Asio's steady_timer takes over the timer role and the completion handler becomes the poll tick.",
+      "code_sketch": "bool pop(T& out, std::chrono::milliseconds idle) {\n  std::unique_lock lk(m);\n  if (!cv.wait_for(lk, idle, [&]{ return !q.empty() || closed; }))\n    return false;                 // idle tick: back off, poll again\n  out = std::move(q.front()); q.pop();\n  return true;                    // ack: the element left the channel\n}",
+      "pitfalls": [
+        "wait_for may wake spuriously; without the predicate overload a wake-up is mistaken for an available message and the consumer processes an empty queue.",
+        "The queue, mutex and condition variable must outlive the polling thread - a detached poller holding references into a destroyed channel is the classic shutdown crash, and a stop flag checked by the predicate is the cure."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable/wait_for",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    },
+    {
+      "variant_id": "asio-timer-callbacks",
+      "name": "Boost.Asio steady_timer poll chain (callbacks)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Asio steady_timer::async_wait driving poll()",
+      "implementation_notes": "When the channel is a socket or a broker client served by an io_context, the idle interval is not a sleep but a timer: expires_after(idle) plus async_wait, with the poll call inside the completion handler and the timer re-armed afterwards. Re-setting the expiry cancels a pending wait and reports boost::asio::error::operation_aborted, which is the defined shutdown path and must not be logged as a poll failure.",
+      "code_sketch": "void tick(const error_code& ec) {\n  if (ec == asio::error::operation_aborted) return;   // cancellation\n  auto batch = consumer.poll(max_batch);              // bounded batch\n  for (auto& m : batch) handle(m);\n  timer_.expires_after(idle_);\n  timer_.async_wait(tick);\n}",
+      "pitfalls": [
+        "Changing the expiry of a timer with a pending async_wait cancels that wait and delivers operation_aborted; code that treats every error as fatal turns a reschedule into a stopped consumer.",
+        "Blocking work inside a completion handler stalls the timer chain on that thread, so heavy batch processing must be posted to a worker or strictly bounded."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutines",
+      "name": "C++20 co_await timer loop",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await steady_timer::async_wait under C++20 coroutines",
+      "implementation_notes": "C++20 stackless coroutines turn the callback chain into linear control flow: the loop co_awaits the batch pull and the idle timer, so the idle policy and batch bound read like the synchronous algorithm while the roles stay those of the pattern. Errors surface as exceptions unless the as_tuple adapter is used, so shutdown and aborted waits must be modelled explicitly rather than inferred from an error_code.",
+      "code_sketch": "asio::awaitable<void> consume(Consumer& c) {\n  asio::steady_timer t(co_await asio::this_coro::executor);\n  for (;;) {\n    auto [ec, batch] = co_await c.poll(max_batch, asio::as_tuple(asio::use_awaitable));\n    if (ec) break;                                  // shutdown or fatal\n    if (batch.empty()) { t.expires_after(idle); co_await t.async_wait(asio::use_awaitable); }\n    else for (auto& m : batch) co_await handle(m);  // ack after handling\n  }\n}",
+      "pitfalls": [
+        "Forgetting as_tuple around an awaited operation converts the error_code into a thrown system_error, so the shutdown branch turns into an exception handler.",
+        "A coroutine spawned with co_spawn(..., detached) has no owner: one that outlives its channel state dereferences freed memory, so keep consumer coroutines inside a structured lifetime."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html"
+      ]
+    }
+  ],
+  "default_variant": "std-queue-wait-for",
+  "version": "1.0"
+}

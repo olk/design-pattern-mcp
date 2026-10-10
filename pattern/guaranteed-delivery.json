@@ -1,0 +1,209 @@
+{
+  "category": "workflow-messaging",
+  "name": "guaranteed-delivery",
+  "aliases": [
+    "guaranteed messaging"
+  ],
+  "intent": "Make a message survive the failure of any single participant by writing it to a durable store at every hop, so that a send is complete only once the message is at rest and the message is deleted only after the next hop - and finally the receiver - has acknowledged it.",
+  "problem": "An accepted message can still be lost: the sender's in-memory queue dies with the process, the broker's memory or disk fails, or a crash between 'processed' and 'acknowledged' drops the work. The naive send-and-forget path compiles and passes every test that does not kill a process, so the loss only shows up in production incidents.",
+  "context": "Asynchronous integration across process, host or trust boundaries where the business cost of a lost message exceeds the cost of latency, disk writes and duplicate handling: order and payment handoffs, cross-service commands and events, file/EDI transfers, and any channel whose endpoints may restart or be partitioned. The guarantee is per hop (sender store, broker store, receiver store) and does not by itself make the send atomic with the sender's database transaction.",
+  "benefits": [
+    "A message accepted by the sender is never silently lost: every hop keeps an at-rest copy, so a crash, restart or partition delays delivery instead of erasing it.",
+    "Failures become replay: recovery after an outage is 'resend from the store', a job the messaging system or a small recovery loop performs, instead of manual reconciliation.",
+    "The guarantee composes: each hop (producer to broker, broker to broker, broker to consumer) can be configured, verified and tested independently with the same store-then-acknowledge discipline.",
+    "Overload becomes visible: a durable queue that is not draining is a metric (depth, age, redelivery rate), not a silent memory leak.",
+    "Inspection and audit fall out of the store: messages wait in a defined place, so consumers can be paused, stores inspected and replays audited (with redaction and retention limits applied deliberately)."
+  ],
+  "tradeoffs": [
+    "Duplicates are the normal failure mode: an acknowledgement lost after the receiver processed the message causes redelivery, so 'exactly once' is really at-least-once delivery plus deduplication or idempotent handling - a second mechanism with its own state.",
+    "Every hop costs a durable write and a round trip: the send completes only as fast as the slowest store commits, so per-message latency rises and throughput drops sharply versus a fire-and-forget channel.",
+    "It stores state that must be operated: growing queues, deduplication tables and dedup windows that expire (a replay after the window duplicates again), plus backup, retention and redaction duties for payloads now sitting at rest.",
+    "The guarantee stops at the boundaries it covers: a database commit and a broker send are still two systems, and closing that gap needs a transactional outbox or XA - without it the pattern does not help.",
+    "Failure handling moves into infrastructure: dead-letter policy, poison messages, alerting on stalled stores and replay storms after an outage all become part of the design and of the on-call surface.",
+    "The store itself can become the bottleneck or single point of failure; durability must be configured per hop (durable queue, persistent message, replicated store), and a misconfigured hop silently degrades to at-most-once."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 4,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Sender",
+      "responsibility": "Hands the message to the channel and must not treat the send as complete until the message is at rest in the sender-side store; the stored copy, not the wire write, is the contract."
+    },
+    {
+      "role": "Durable Store (per hop)",
+      "responsibility": "Persists each message until the next hop stored or acknowledged it; it is the recovery source of truth and carries the retention, replication and redaction policy."
+    },
+    {
+      "role": "Transport Hop",
+      "responsibility": "Moves the message between two stores; failure, delay, reordering and duplication are expected rather than exceptional."
+    },
+    {
+      "role": "Store-and-Forward Agent",
+      "responsibility": "After a restart or a failure report, retransmits everything in the store that has not been acknowledged, with bounded retry rate, expiry and backoff."
+    },
+    {
+      "role": "Receiver",
+      "responsibility": "Processes the message and acknowledges it only after its own state change is committed, so the acknowledgement means 'the effect exists', not 'the bytes arrived'."
+    },
+    {
+      "role": "Deduplication / Idempotence Filter",
+      "responsibility": "Collapses repeated deliveries of the same message (broker duplicate detection, a seen-ids store or an idempotent handler) - the step that turns at-least-once into an exactly-once effect."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Order or payment commands that must not be lost when the downstream service or the broker restarts mid-flight.",
+    "Cross-service domain events (order shipped, invoice issued) that other bounded contexts replay from their own store after downtime.",
+    "File, EDI or batch handoffs to partners over unreliable links, retried until the partner acknowledges the payload.",
+    "Mobile or field devices that queue work offline and must deliver it once when connectivity returns (OS-persisted work items, spool files).",
+    "Broker-to-broker bridges and message buses that must not drop messages while a regional broker is unreachable.",
+    "Consume-transform-produce pipelines where the input offset and the produced output have to commit together.",
+    "Event-sourcing projections: rebuilding read-model state by replaying events stored durably requires that no event is silently dropped during projector crashes or subscription gaps.",
+    "Saga orchestrator checkpoints: long-running workflows spanning multiple services need each step durable so a crashed orchestrator can resume without double-invoking compensating or completion actions.",
+    "Change-data-capture (CDC) pipelines: database row changes streamed as messages must survive broker downtime without gaps or duplicates that would corrupt the target data warehouse.",
+    "Workflow engine durable tasks: long-running business processes (approval, onboarding) checkpointed as messages so the process survives node restarts without losing in-flight state.",
+    "Healthcare HL7 v2 or FHIR messaging: regulatory requirements (HIPAA, GDPR) mandate that patient records, lab results, or prescription orders are never lost, making guaranteed delivery with dead-letter handling a compliance necessity rather than an optimisation.",
+    "IoT sensor telemetry with intermittent connectivity: field devices that queue measurements offline and deliver them in bursts when connectivity resumes require per-message durability so that no reading is silently dropped across extended offline windows.",
+    "RabbitMQ publisher confirms with persistent messages to durable or quorum queues: the producer waits for broker acknowledgement and retransmits unconfirmed publishes after a connection failure, while the consumer remains idempotent for redelivery.",
+    "Apache Kafka transactional producers: an application sets transactional.id, publishes atomically, and uses read_committed consumers so aborted records stay hidden; topic replication and in-sync replica settings still determine durability.",
+    "Amazon SQS delivery choices: Standard queues provide at-least-once delivery, while FIFO queues with MessageDeduplicationId or content-based deduplication provide exactly-once processing only within the documented deduplication interval."
+  ],
+  "avoid_when": [
+    "Loss is acceptable or self-healing (metrics, cache invalidation, telemetry): a plain non-persistent channel is cheaper and far faster.",
+    "Sender and receiver already share one process and one transaction: a direct call or an outbox row is simpler than a durable channel.",
+    "Low volume with a single consumer: a database table plus a poller may be less machinery than a broker with confirms and replicated stores.",
+    "The consumer cannot be made idempotent and cannot deduplicate while duplicates are unacceptable - fix that first; guaranteed delivery alone will not give exactly-once.",
+    "Hard real-time budgets where a synchronous durable write per message is fatal (live bidding, control loops)."
+  ],
+  "language_files": {
+    "generic": "guaranteed-delivery.generic.json",
+    "c": "guaranteed-delivery.c.json",
+    "cplusplus": "guaranteed-delivery.cplusplus.json",
+    "csharp": "guaranteed-delivery.csharp.json",
+    "go": "guaranteed-delivery.go.json",
+    "java": "guaranteed-delivery.java.json",
+    "javascript": "guaranteed-delivery.javascript.json",
+    "kotlin": "guaranteed-delivery.kotlin.json",
+    "python": "guaranteed-delivery.python.json",
+    "ruby": "guaranteed-delivery.ruby.json",
+    "rust": "guaranteed-delivery.rust.json",
+    "scala": "guaranteed-delivery.scala.json",
+    "swift": "guaranteed-delivery.swift.json",
+    "typescript": "guaranteed-delivery.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "message-store",
+    "store-and-forward",
+    "transactional-message-queue",
+    "idempotent-receiver",
+    "dead-letter-channel",
+    "durable-subscriber",
+    "message-expiration",
+    "retry",
+    "polling-consumer",
+    "claim-check"
+  ],
+  "anti_patterns": [
+    "Half-durable configuration: persistent messages on a non-durable queue or transient exchange, or publisher confirms enabled but their result never inspected - it looks durable and still loses messages.",
+    "Acknowledge on receipt, then process: a crash after the ack silently drops the message, which is at-most-once masquerading as guaranteed delivery.",
+    "Claiming exactly-once from the durable channel alone, with a non-idempotent receiver and no duplicate detection - the second delivery doubles the business effect.",
+    "Using the pattern to paper over a dual write: committing to the database and then sending outside the same transaction, so one side succeeds while the other fails.",
+    "Unbounded stores and never-expired seen-id tables, turning a reliability feature into an outage.",
+    "Configuring a DLQ with its own redrive policy pointing back to the source queue - a poison message that fails again creates an infinite redrive loop.",
+    "Redriving a full DLQ without first fixing the root cause: replaying an unchanged poison message re-poisons the queue, often worse after a backlog builds up.",
+    "Relying on cloud exactly-once delivery across regions: GCP Pub/Sub explicitly states the guarantee only holds for same-region subscribers; cross-region setups can still duplicate."
+  ],
+  "design_principles": [
+    "At-least-once is the deliverable guarantee; exactly-once is at-least-once plus idempotence or deduplication.",
+    "Acknowledge only after the effect is committed - the acknowledgement describes state, not receipt.",
+    "Make the store the source of truth: recovery is replay from the last durable copy at each hop.",
+    "Design for duplicate and out-of-order delivery first; the happy path is then just the common case.",
+    "Name the durable boundary explicitly: which transaction (database, XA, broker transaction, outbox) makes the send atomic with the business change.",
+    "Every hop's durability is only as strong as its weakest configured layer: a durable queue with transient messages or an unconfirmed publisher-ack is still at-most-once."
+  ],
+  "best_practices": [
+    "Configure durability explicitly per hop and test it: durable queue/topic, persistent messages, replicated store, and a confirm/ack result that is actually inspected.",
+    "Acknowledge after the business commit, and make the handler idempotent on a business-derived message id so redelivery is harmless.",
+    "Carry a stable message id and keep dedup state bounded: a broker duplicate-detection window or a seen-ids table with expiry, plus a documented 'after the window' story.",
+    "Bound the store: message TTL/expiry, maximum depth and a dead-letter policy; alert on queue age and redelivery rate, not only on depth.",
+    "Size redelivery deliberately: exponential backoff with jitter, capped attempts and an explicit dead-letter path for messages that will never succeed.",
+    "Where the send must be atomic with a database write, use an outbox or transactional message queue instead of pretending the broker participates in the transaction.",
+    "Account for payloads at rest: classify, redact and expire durable copies, and encrypt the store where it is not trusted.",
+    "Pair visibility timeout with observed processing time: set it higher than the 99th-percentile processing duration, and extend the lease for long-running handlers with periodic RenewLock calls.",
+    "Use idempotency keys derived from business identifiers (orderId, eventId) rather than broker-assigned message ids, which can differ across duplicate publishes on GCP Pub/Sub.",
+    "On RabbitMQ: enable publisher confirms and handle both ack and nack callbacks; re-publish from within the nack callback's I/O thread is prohibited - enqueue to an in-memory buffer polled by a publisher thread instead.",
+    "On Kafka: set transactional.id for cross-session exactly-once; without it, a producer restart assigns a new PID and idempotent dedup covers only that session. Use read_committed isolation level on consumers for transactional topics.",
+    "On AWS SQS: use FIFO queues with content-based deduplication for exactly-once; for standard queues assume at-least-once and make every handler idempotent. Set maxReceiveCount (，建议 3-5) on the redrive policy so poison messages reach the DLQ instead of looping.",
+    "On Azure Service Bus: enable duplicate detection with a window matching your retry schedule; use sessions for per-key FIFO ordering. Set MaxDeliveryCount explicitly (default 10) and dead-letter deliberately rather than letting the lock expire silently.",
+    "On GCP Pub/ Sub: enable exactly-once only for pull subscriptions; push subscriptions cannot honour the guarantee. Set minDurationPerAckExtension high to avoid unintentional deadline expirations that trigger invalid-ack-id responses.",
+    "Design DLQ message envelopes to carry failure context (error code, attempt count, first-failure timestamp, consumer version) so operators can triage without searching logs; redact sensitive fields before writing to the DLQ store.",
+    "Implement a bounded retry budget per message: classify failures as transient (retry with backoff) or permanent (dead-letter immediately) rather than treating all errors the same; a schema validation error will never succeed by retrying.",
+    "Monitor redelivery rate as a health signal: a rising redelivery rate under normal load indicates consumer slowness, visibility timeout misconfiguration, or an upstream poison message blocking the queue head.",
+    "Test durability explicitly with chaos engineering: inject broker crashes, network partitions, and consumer process kills to verify messages survive. A guarantee that has never been failure-tested is an assumption, not a guarantee.",
+    "On Kafka: set min.insync.replicas >= 2 and disable unclean.leader.election.enable to prevent the ISR from shrinking to one node and silently dropping acknowledged writes during unclean leader elections. Without these, Kafka's durability guarantee degrades to at-most-once under failure.",
+    "Size the visibility timeout / prefetch window above the 99th-percentile processing duration, not the median. Under tail load, a correctly-set timeout prevents premature redelivery while a median-sized timeout causes duplicate delivery every time processing exceeds the limit.",
+    "Implement explicit failure classification: distinguish transient errors (retry with backoff) from permanent errors (dead-letter immediately). Retrying a schema validation error or an unsupported operation wastes retry budget and delays the DLQ path.",
+    "For batch consumers: prefer batch acknowledgment semantics where available (Kafka's commit_offsets, RabbitMQ's multiple ack) but instrument each batch with per-message redelivery tracking — a single poison message in a batch can cause the entire batch to redeliver if the batch is rolled back.",
+    "Instrument redelivery rate as a first-class metric alongside queue depth. A rising redelivery rate under normal load signals consumer slowness, visibility timeout misconfiguration, or a head-of-queue blocking poison message — often earlier than queue depth alerts fire.",
+    "On GCP Pub/Sub: use idempotency keys derived from business identifiers rather than broker-assigned message IDs, because the same logical publish can result in different broker message IDs on retry, defeating broker-side deduplication."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003), chapter 4 'Messaging Channels' - Guaranteed Delivery.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/GuaranteedMessaging.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageStore.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/TransactionalClient.html",
+    "https://www.rabbitmq.com/docs/publishers",
+    "https://www.rabbitmq.com/docs/confirms",
+    "https://www.rabbitmq.com/docs/reliability",
+    "https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging",
+    "https://axonops.com/docs/data-platforms/kafka/concepts/delivery-semantics/exactly-once/",
+    "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-queue-types.html",
+    "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-message-loss-and-duplicates",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection",
+    "https://docs.cloud.google.com/pubsub/docs/exactly-once-delivery",
+    "https://microservices.io/patterns/data/transactional-outbox.html",
+    "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html",
+    "https://matthewpalma.dev/blog/dead-letter-queues-async-backends-redrive-and-operations",
+    "https://sysdespro.com/oleksandr-andrushchenko/dead-letter-queues-retries-and-poison-messages",
+    "https://www.task-queues.com/queue-fundamentals-architecture/dead-letter-queues-poison-messages/",
+    "Kyle Kingsbury (Aphyr), \"Jepsen: Kafka,\" 2013 — rigorous fault-injection testing of Kafka's replication and ISR model, demonstrating that under specific network partition conditions the ISR can shrink to one node and silently lose acknowledged writes. Found at https://aphyr.com/posts/293-jepsen-kafka",
+    "Conduktor, \"Kafka Exactly-Once: Producers + Transactions,\" 2026 — practitioner-oriented explanation of exactly-once semantics in Kafka via producer idempotency and consumer read_committed isolation. Found at https://www.conduktor.io/kafka/exactly-once-semantics",
+    "SystemDesignsSandbox, \"Idempotency & Deduplication,\" 2024 — covers business-key-derived idempotency keys vs broker-assigned message IDs, and consumer-side deduplication strategies (business logic check, inbox pattern, idempotent store). Found at https://www.systemdesignsandbox.com",
+    "Architecture Weekly, \"Deduplication in Distributed Systems: Myths, Realities,\" 2024 — compares broker-side deduplication, consumer-based deduplication with inbox pattern, and discusses the tradeoffs of dedup window sizing and exactly-once semantics across cloud providers. Found at https://www.architecture-weekly.com",
+    "RedPanda, \"Message Reprocessing: How to Implement the Dead Letter Queue,\" 2026 — DLQ implementation patterns for poison pill messages, including transient vs permanent failure classification and bounded retry strategies. Found at https://www.redpanda.com/docs/data-management/reprocessing",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/index.html",
+    "https://www.rabbitmq.com/docs/4.2/confirms",
+    "https://kafka.apache.org/43/configuration/producer-configs/",
+    "https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html",
+    "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html",
+    "https://bravenewgeek.com/you-cannot-have-exactly-once-delivery-redux/"
+  ],
+  "related_patterns_notes": {
+    "transactional-outbox": "transactional-outbox"
+  }
+}

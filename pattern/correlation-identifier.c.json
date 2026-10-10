@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pending-request hash (uthash macros or a hand-rolled bucket list) + pthread_cond_timedwait",
+  "implementation_notes": "C has no awaitable, so the requestor hand-builds all three parts: a request struct (id, mutex, condition variable, done flag, reply storage, absolute deadline), a hash table keyed by the id - uthash's HASH_ADD_INT / HASH_FIND_INT / HASH_DEL, or a hand-rolled bucket list - guarded by a table mutex, and a reader thread that extracts the correlation id from each reply, removes the entry and signals the condition variable. The caller waits with pthread_cond_timedwait against an absolute deadline and re-checks its predicate in a loop because condition waits wake spuriously, treating ETIMEDOUT as the no-reply outcome. Nothing replaces the structure in C; the parts to get right are the hand-off order (add to the table before sending) and ownership of the request struct after a timeout, since the table and the waiter must agree on who frees it.",
+  "code_sketch": "struct req { uint64_t id; pthread_mutex_t m; pthread_cond_t cv;\n             int done; reply_t reply; struct timespec deadline; UT_hash_handle hh; };\n\nstruct req *r = calloc(1, sizeof *r);\nr->id = next_id(); pthread_mutex_init(&r->m, NULL); pthread_cond_init(&r->cv, NULL);\nclock_gettime(CLOCK_MONOTONIC, &r->deadline); r->deadline.tv_sec += 5;\npthread_mutex_lock(&table_m); HASH_ADD_INT(pending, id, r); pthread_mutex_unlock(&table_m);  /* BEFORE send */\nsend_request(r->id, body);\npthread_mutex_lock(&r->m);\nwhile (!r->done && pthread_cond_timedwait(&r->cv, &r->m, &r->deadline) != ETIMEDOUT) { }\nint timed_out = !r->done; pthread_mutex_unlock(&r->m);",
+  "pitfalls": [
+    "pthread_cond_timedwait takes an ABSOLUTE time (clock_gettime plus seconds), not a relative delay, and may return 0 spuriously - always re-check the done predicate in a while loop and use the same clock for both.",
+    "A fast reply can arrive before the entry is in the hash table: register the request before publishing it, otherwise the reader finds no entry and drops the reply.",
+    "The reader must remove the entry and signal while holding the table mutex, and the timeout path must agree with it on who frees the request struct; touching it after the caller timed out and freed it is a use-after-free.",
+    "ETIMEDOUT does not prove the predicate is false - the reply may have arrived at the same instant - so re-check under the mutex before reporting a timeout."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3p.html",
+    "https://troydhanson.github.io/uthash/userguide.html"
+  ],
+  "version": "1.0"
+}

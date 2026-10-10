@@ -1,0 +1,57 @@
+{
+  "pattern": "page-cache",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "servlet Filter with a JCache (JSR-107) or Caffeine store",
+  "implementation_notes": "The classic JVM realization is a javax.servlet/jakarta.servlet Filter that wraps the response in a caching wrapper: on a hit it copies the stored headers and bytes back and never calls chain.doFilter(); on a miss it captures the rendered bytes, stores them in a JCache (JSR-107) provider or Caffeine under a key built from method + request URI + the Vary axes, and lets the response through. The container supplies the interception point (URL mapping, filter order, encoding), so the hand-written lookup layer other languages need is replaced by configuration, while TTL and eviction policy come from the cache provider. It remains the right shape for servlet-based, anonymous, expensive pages; when an MVC framework renders the page, caching the render step instead (see the spring-cacheable-render variant) keeps the response out of the wrapper's reach.",
+  "code_sketch": "public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)\n        throws IOException, ServletException {\n    HttpServletRequest r = (HttpServletRequest) req;\n    String key = r.getMethod() + \" \" + r.getRequestURI() + \" \" + r.getHeader(\"Accept-Encoding\");\n    CachedPage hit = store.getIfPresent(key);           // Caffeine or JCache\n    if (hit != null) { hit.writeTo((HttpServletResponse) res); return; }\n    CapturingResponse capture = new CapturingResponse((HttpServletResponse) res);\n    chain.doFilter(req, capture);                       // origin path on a miss\n    store.put(key, capture.toPage(TTL));                // only GET/HEAD 200s\n    capture.writeTo((HttpServletResponse) res);\n}",
+  "pitfalls": [
+    "A response wrapper must buffer without flushing: HttpServletResponse commits headers early, so a wrapper that leaks a flush breaks sendRedirect/error handling downstream, and it must never be applied to authenticated or cookie-setting endpoints.",
+    "JCache and Caffeine stores are per-JVM, so in a cluster every node caches privately: purge means a shared provider (Redis, memcached, Hazelcast) or accepting per-node staleness with short TTLs.",
+    "Caching filters interact badly with frameworks that stream output or read the request body themselves; scope the filter by URL pattern to the static-ish pages it is meant to serve."
+  ],
+  "sources": [
+    "https://github.com/ben-manes/caffeine",
+    "https://jakarta.ee/specifications/servlet/"
+  ],
+  "variants": [
+    {
+      "idiom_name": "servlet Filter with a JCache (JSR-107) or Caffeine store",
+      "implementation_notes": "The classic JVM realization is a javax.servlet/jakarta.servlet Filter that wraps the response in a caching wrapper: on a hit it copies the stored headers and bytes back and never calls chain.doFilter(); on a miss it captures the rendered bytes, stores them in a JCache (JSR-107) provider or Caffeine under a key built from method + request URI + the Vary axes, and lets the response through. The container supplies the interception point (URL mapping, filter order, encoding), so the hand-written lookup layer other languages need is replaced by configuration, while TTL and eviction policy come from the cache provider. It remains the right shape for servlet-based, anonymous, expensive pages; when an MVC framework renders the page, caching the render step instead (see the spring-cacheable-render variant) keeps the response out of the wrapper's reach.",
+      "code_sketch": "public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)\n        throws IOException, ServletException {\n    HttpServletRequest r = (HttpServletRequest) req;\n    String key = r.getMethod() + \" \" + r.getRequestURI() + \" \" + r.getHeader(\"Accept-Encoding\");\n    CachedPage hit = store.getIfPresent(key);           // Caffeine or JCache\n    if (hit != null) { hit.writeTo((HttpServletResponse) res); return; }\n    CapturingResponse capture = new CapturingResponse((HttpServletResponse) res);\n    chain.doFilter(req, capture);                       // origin path on a miss\n    store.put(key, capture.toPage(TTL));                // only GET/HEAD 200s\n    capture.writeTo((HttpServletResponse) res);\n}",
+      "pitfalls": [
+        "A response wrapper must buffer without flushing: HttpServletResponse commits headers early, so a wrapper that leaks a flush breaks sendRedirect/error handling downstream, and it must never be applied to authenticated or cookie-setting endpoints.",
+        "JCache and Caffeine stores are per-JVM, so in a cluster every node caches privately: purge means a shared provider (Redis, memcached, Hazelcast) or accepting per-node staleness with short TTLs.",
+        "Caching filters interact badly with frameworks that stream output or read the request body themselves; scope the filter by URL pattern to the static-ish pages it is meant to serve."
+      ],
+      "sources": [
+        "https://github.com/ben-manes/caffeine",
+        "https://jakarta.ee/specifications/servlet/"
+      ],
+      "variant_id": "servlet-filter-cache",
+      "name": "Servlet filter page cache over JCache/Caffeine",
+      "paradigm": "oo",
+      "min_standard": "Java8"
+    },
+    {
+      "variant_id": "spring-cacheable-render",
+      "name": "Spring @Cacheable on the rendering service (+ ShallowEtagHeaderFilter)",
+      "paradigm": "declarative",
+      "min_standard": "Java17",
+      "idiom_name": "@Cacheable(\"pages\") on the page-assembly method, backed by a CacheManager",
+      "implementation_notes": "If a Spring MVC controller produces a rendered body, the cache belongs one level down at the rendering service: annotate the pure method that assembles the page with @Cacheable(cacheNames = \"pages\", key = ...), back it with a CacheManager (Caffeine in-process, Redis for a shared cache) and let Spring's proxy return the stored value, while the freshness metadata is declared separately - CacheControl/max-age on the response or a ShallowEtagHeaderFilter for conditional GETs. This keeps caching out of the controller (annotation-on-controller is a known misuse), gives declarative eviction via @CacheEvict, and per the framework docs has been the API since Spring 3.1; the floor recorded here is the current Spring Boot 3 / Spring Framework 6 baseline of Java 17.",
+      "code_sketch": "@Cacheable(cacheNames = \"pages\", key = \"#slug + '|' + #locale\")\npublic String renderArticlePage(String slug, Locale locale) {\n    // called by the controller; no request or response object involved\n    return templates.render(\"article\", articles.bySlug(slug));\n}\n\n@CacheEvict(cacheNames = \"pages\", allEntries = true)\npublic void onPublish() { }               // purge hook for the publish path",
+      "pitfalls": [
+        "Self-invocation bypasses the proxy: calling renderArticlePage(...) from another method of the same bean renders on every request, with no error and no cache hit.",
+        "Keys built only from method arguments leak personalisation - anything the method reads from the SecurityContext, RequestContextHolder or a ThreadLocal must be part of the SpEL key.",
+        "@Cacheable hands the same instance to every caller: the returned value must be immutable, or one caller's mutation is served to all of them."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html",
+        "https://docs.spring.io/spring-framework/reference/integration/cache.html"
+      ]
+    }
+  ],
+  "default_variant": "servlet-filter-cache",
+  "version": "1.0"
+}

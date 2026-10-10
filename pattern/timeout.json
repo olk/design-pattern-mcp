@@ -1,0 +1,216 @@
+{
+  "category": "concurrency-resilience",
+  "name": "timeout",
+  "aliases": [
+    "call timeout",
+    "operation timeout",
+    "deadline",
+    "request deadline"
+  ],
+  "intent": "Bound the time a call may take so that a slow, stuck or unresponsive peer is abandoned at a known point instead of holding the caller's threads, connections and memory until it eventually answers.",
+  "problem": "A call that crosses a process, host or trust boundary may never return: the peer hangs, the network stalls, a lock or queue is never released. Unbounded waiting is not a neutral state - every waiting call keeps its threads, sockets, buffers and queue slots occupied, so one slow dependency consumes the shared capacity of everything that talks to it and the failure spreads outward as a cascading failure.",
+  "context": "Applies to every call whose completion is outside the caller's control: synchronous and asynchronous RPC/HTTP/database calls, blocking socket reads, lock, semaphore and queue acquisitions, and waits on futures or thread-pool work. It matters most where the caller itself has bounded capacity (a fixed worker pool, a request budget) or is serving someone with a latency promise, and it is the prerequisite for retrying or short-circuiting a dependency, because those policies need a definite failure to react to.",
+  "benefits": [
+    "Bounded blocking: threads, sockets, buffers and queue slots are released at a known point, so one hung dependency cannot consume the caller's capacity indefinitely.",
+    "Turns an unbounded latency risk into a definite, testable failure the caller can classify, log, degrade or retry, instead of an outage that shows up only as 'everything is slow'.",
+    "Protects the wider system from cascading failure: in-flight work stays bounded when a dependency slows down instead of piling up until memory, threads or descriptors run out.",
+    "Makes capacity and SLO arithmetic possible: with every call bounded, the worst case of an operation is computable and can be promised to its own callers.",
+    "Produces the failure signal that retry, circuit-breaker and fail-fast policies switch on; without a deadline they cannot tell 'slow' from 'down'.",
+    "Exposes latent defects: a call that hangs only under load or on one path becomes visible as a timeout instead of quietly degrading the service.",
+    "Enables graceful degradation: a timeout allows the caller to fall back to a cached value, default, or degraded response instead of hanging indefinitely."
+  ],
+  "tradeoffs": [
+    "The abandoned call is not necessarily stopped: unless cancellation propagates, the remote work, its side effects and its resource usage continue after the caller gave up — and a retry can duplicate them.",
+    "Tuning is empirical and percentile-based: too tight converts healthy tail latency into spurious failures and retry amplification, too loose still lets resources accumulate.",
+    "A timeout changes business semantics: work that would have succeeded slowly becomes a hard failure, which is the wrong trade for operations that must complete.",
+    "Budgets compose badly: a fresh timeout re-armed at every hop multiplies the worst case and starts work whose caller's deadline has already passed, so the budget has to propagate as an absolute deadline with elapsed time deducted.",
+    "The timeout path is the least-exercised path in the code — it only runs under load or failure — so its error mapping, cleanup and idempotency assumptions are usually untested.",
+    "Cancellation is cooperative in most runtimes: a non-interruptible syscall or a CPU loop keeps running after the cancel signal, so the timeout bounds the caller's wait, not the system's work.",
+    "Timeout, retry, circuit breaker and bulkhead are a single coordinated policy — tuning one in isolation produces hidden failure modes: a circuit breaker that trips on client-side timeouts rather than real dependency failures, or a retry storm when a too-tight timeout amplifies load."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 9,
+    "security": 6,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Caller",
+      "responsibility": "Issues the call, arms the budget and treats expiry as a definite failure of that call rather than as a slow answer."
+    },
+    {
+      "role": "Callee / Dependency",
+      "responsibility": "Performs the remote operation; it keeps working after the caller gave up unless cancellation reaches it."
+    },
+    {
+      "role": "Timer / Clock",
+      "responsibility": "Measures elapsed time against the budget from a defined start point, using a monotonic clock so clock adjustments cannot move the deadline."
+    },
+    {
+      "role": "Cancellation mechanism",
+      "responsibility": "The token, future handle, signal, interrupt or socket option through which the caller stops waiting and (where the protocol allows) tells the callee to stop as well."
+    },
+    {
+      "role": "Timeout policy",
+      "responsibility": "Decides the budget per call class: connect vs request vs overall, duration vs absolute deadline, derived from the caller's own latency budget and the dependency's latency distribution."
+    },
+    {
+      "role": "Retry policy",
+      "responsibility": "Decides whether to retry on timeout, with what backoff, and how many attempts; must be coordinated with the timeout and circuit-breaker budget to avoid amplification."
+    },
+    {
+      "role": "Circuit breaker",
+      "responsibility": "Stops calling a dependency when failure or timeout rate exceeds a threshold, preventing the retry amplification that timeouts alone cannot stop."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Outbound RPC/HTTP clients: a connect timeout, a per-request timeout and an overall deadline on every call to another service.",
+    "Database access: statement or query timeouts so a lock wait or a runaway query cannot pin a connection from the pool.",
+    "Sockets and accept loops in low-level servers: SO_RCVTIMEO/SO_SNDTIMEO or poll budgets so a silent peer cannot block a worker thread forever.",
+    "Lock, semaphore and queue acquisition: bounded waits so a stuck producer cannot wedge a consumer that is holding other resources.",
+    "Requests with a user-facing latency promise: each downstream call is bounded by what remains of the budget of the request that triggered it.",
+    "Test harnesses and CI jobs: a watchdog timeout turns a deadlock into a failing test instead of a run that hangs until the pipeline kills it.",
+    "Worker and job supervision: a watchdog reports or restarts a unit of work that exceeded its slot.",
+    "Message queue consumers: a consume timeout so a stuck message does not block the consumer loop indefinitely, allowing the message to be re-queued or dead-lettered.",
+    "Streaming and long-running operations: heartbeat/stall watchdog that fires if no progress is reported within the budget, rather than bounding total duration.",
+    "Health check endpoints in orchestrators (Kubernetes readiness/liveness probes): internal dependency checks must carry their own tight timeouts so a hung dependency does not freeze the probe.",
+    "Go services: context.WithTimeout/WithDeadline on every outbound and DB call, with the context handed down the call tree so one deadline bounds the whole request and ctx.Err() == context.DeadlineExceeded is the definite failure every layer reacts to.",
+    "Edge and API gateways: Envoy route timeout (default 15s, includes all retries), per_try_timeout for individual attempts and max_stream_duration for total stream lifetime, so the proxy abandons a slow upstream instead of accumulating streams.",
+    "Async Python: asyncio.timeout() around an await block and asyncio.wait_for() around a single awaitable — expiry cancels the task and the CancelledError surfaces as TimeoutError, so the budget and the cancellation are the same mechanism."
+  ],
+  "avoid_when": [
+    "The call is local, CPU-bound and never blocks: a timeout adds a timer and a second failure mode where profiling or an algorithmic fix is the answer.",
+    "The client library already carries one integrated deadline (an RPC stub configured with a deadline, an HTTP client with a total request timeout): configure that one instead of stacking a second timer on top.",
+    "Interrupting the call would leave inconsistent state that cannot be compensated: make the operation resumable, idempotent or asynchronous (queue, saga) instead of cutting it off.",
+    "The operation is legitimately unbounded or long-running (streaming, batch, backup): bound progress with a heartbeat or a stall watchdog rather than total duration.",
+    "Latency is unknown and cutting a call off is worse than waiting: use fail-fast admission control and backpressure rather than guessing a number.",
+    "You have not yet tuned retries, backoff and circuit-breaker thresholds: an untuned timeout layer on top of an untuned retry layer amplifies load instead of containing it."
+  ],
+  "language_files": {
+    "generic": "timeout.generic.json",
+    "c": "timeout.c.json",
+    "cplusplus": "timeout.cplusplus.json",
+    "csharp": "timeout.csharp.json",
+    "go": "timeout.go.json",
+    "java": "timeout.java.json",
+    "javascript": "timeout.javascript.json",
+    "kotlin": "timeout.kotlin.json",
+    "python": "timeout.python.json",
+    "ruby": "timeout.ruby.json",
+    "rust": "timeout.rust.json",
+    "scala": "timeout.scala.json",
+    "swift": "timeout.swift.json",
+    "typescript": "timeout.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "declarative"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "deadline-propagation",
+    "circuit-breaker",
+    "retry-with-backoff",
+    "cancellation-token",
+    "bulkhead",
+    "fail-fast",
+    "graceful-degradation",
+    "health-check-endpoint"
+  ],
+  "related_patterns_notes": {
+    "deadline-propagation": "A timeout sets a per-call budget; deadline propagation propagates an absolute deadline across hop boundaries with elapsed time deducted, preventing the multiplicative worst-case explosion of a fresh timer at each hop. gRPC implements this automatically: it converts a propagated deadline to a remaining timeout so clock skew cannot corrupt it.",
+    "circuit-breaker": "A timeout tells the caller when one call has taken too long; a circuit breaker stops all calls to a dependency when its timeout or error rate exceeds a threshold. Without a breaker, repeated timeouts from a genuinely down dependency keep hammering it with retries. The breaker observes timeout rate to decide when to open; the timeout is the failure signal the breaker acts on. The composition order matters: CircuitBreaker(Retry(Call)) observes logical outcomes; Retry(CircuitBreaker(Call)) observes each physical attempt.",
+    "retry-with-backoff": "A timeout tells the caller a single attempt failed; retry with backoff decides whether to try again. Without a timeout, retry has no trigger; without a bounded retry budget, timeout-triggered retries amplify load during an outage. Retries require idempotency: if a call timed out but may have succeeded on the server, a blind retry can duplicate side effects.",
+    "cancellation-token": "A timeout fires the timer's deadline; a cancellation token is the broader mechanism — it carries the deadline and may be cancelled for other reasons. The timeout's expiry should write to the token so the callee can observe it. Without cancellation propagation, the callee keeps running after the caller gave up.",
+    "bulkhead": "A timeout bounds how long one call waits; a bulkhead bounds how many concurrent calls can wait on one dependency at all. A slow dependency without a bulkhead can exhaust the shared thread pool even if each call eventually times out. Bulkhead exhaustion produces fail-fast rejections, a different failure mode from timeouts — both must be monitored separately. Size the bulkhead to the dependency's actual capacity and align it with the overall latency budget.",
+    "fail-fast": "A timeout bounds waiting; fail-fast (via bulkhead or rate-limiting) stops accepting new requests when capacity is reached. Fail-fast and timeout complement each other: fail-fast protects resources before the wait starts, timeout releases them if the wait exceeds the budget. They are not substitutes.",
+    "graceful-degradation": "A timeout is the trigger: when the dependency times out, the caller switches to a cached value, a default response, or a degraded feature set. Without a timeout, graceful degradation has no trigger; with it, the caller can distinguish 'slow' from 'down' and degrade accordingly.",
+    "health-check-endpoint": "Health checks (liveness, readiness probes) must carry their own internal timeouts on dependency calls. A health check without a timeout on its downstream calls can hang when the dependency is slow, making the probe itself a failure point that cascades into removing instances from rotation. Readiness probes should check only truly required dependencies; optional services should cause degradation, not readiness failure."
+  },
+  "anti_patterns": [
+    "The infinite default: leaving client timeouts unset or zero and calling 'never' a policy, so every cross-process call has a worst-case latency of infinity.",
+    "One global timeout copied across every call: unrelated endpoints with different latency profiles share a number that is too tight for one and uselessly loose for the other.",
+    "Fresh per-hop timeouts, so a five-hop chain multiplies the worst case and downstream services keep working on requests whose caller has already given up.",
+    "Timeouts as the retry trigger with no backoff, no jitter and no overall budget: the retry storm makes the overload that caused the timeouts worse.",
+    "Catching the expiry and returning a default or stale value without logging or degrading the contract, so the caller cannot tell a degraded answer from a real one.",
+    "Using a timeout to paper over a deadlock, a leak or a dependency that is simply too slow: the contention or the capacity problem remains, now hidden behind retries.",
+    "Setting timeouts from the healthy-system p95: this creates spurious failures during normal load variance; use p99.9 or higher percentiles derived from load-tested data.",
+    "Designing timeout, retry, bulkhead and circuit breaker as four independent features: untuned interactions produce retry storms, breaker trips on noise, and bulkhead exhaustion masquerading as timeout.",
+    "Retrying a non-idempotent operation after a timeout without confirming the server-side state, producing duplicate side effects.",
+    "A health check without an internal timeout on its dependency calls, so a slow dependency freezes the probe and removes a seemingly unhealthy instance from rotation."
+  ],
+  "design_principles": [
+    "Bounded latency by design: the duration of an operation is a declared property, not an accident of the network.",
+    "Explicit contracts at boundaries: every cross-process call states its budget, which makes latency assumptions reviewable instead of implicit.",
+    "Separation of policy and mechanism: the timer and cancellation mechanism are distinct from the timeout value, which is configuration derived from the caller's budget.",
+    "Self-protection (defence in depth): each component bounds the calls it makes, so it does not depend on the remote side being well-behaved.",
+    "Single responsibility: a timeout bounds time, a retry recovers a transient failure and a circuit breaker stops calling — three decisions that compose instead of one conflated mechanism.",
+    "Timeouts are a system: timeout, retry, bulkhead and circuit breaker must be designed and tuned together; isolated tuning of any one produces hidden failures in the others."
+  ],
+  "best_practices": [
+    "Set a timeout on every call that crosses a process boundary — including calls to a process on the same host — and make the default explicit rather than infinite.",
+    "Derive the value from the dependency's latency distribution under load (p99.9 or higher), not from the healthy-system p95, plus worst-case network latency, and revisit it after incidents instead of copying a constant.",
+    "Separate connect, request and overall budgets, remembering that DNS, TLS and connection setup may be excluded from a request-level timeout.",
+    "Propagate an absolute deadline with elapsed time deducted instead of re-arming a fresh timeout at every hop; gRPC, .NET gRPC client factory, and Go's context do this automatically when context is forwarded.",
+    "Classify expiry as its own failure (TimeoutError / DEADLINE_EXCEEDED / ETIMEDOUT) and keep it distinguishable from a caller-initiated cancellation, so retry and fallback policies can discriminate.",
+    "Make the callee aware: pass the cancellation token or deadline through so abandoned work stops; if it cannot be stopped, make the operation idempotent before retrying.",
+    "Design timeout, retry with exponential backoff and jitter, bulkhead, and circuit breaker as a single coordinated policy: the timeout caps per-attempt wait, the retry caps total attempts, the bulkhead caps concurrency, and the breaker stops calling when the dependency is clearly down.",
+    "Test the timeout path under load and with jitter — a timeout that has never fired in a test is a code path you do not actually own. Include the timeout failure mode in integration tests and chaos experiments.",
+    "Emit timeouts as a first-class metric (timeout rate, timeout latency) and alert on the ratio of timeouts to total calls, not only on error rate; a rising timeout rate is an early warning of overload before error rate rises.",
+    "Use histogram metrics with bucket boundaries aligned to your timeout values so slow responses near the boundary are visible; default buckets that group all long-tail responses together obscure timeout-adjacent behavior.",
+    "Distinguish timeout failures from bulkhead rejections and circuit-breaker opens in metrics and alerts; they have different root causes and different responses.",
+    "Health check endpoints must carry their own internal timeouts on downstream dependency calls; set a tight timeout (e.g., sub-100ms) and return a partial or degraded status rather than hanging.",
+    "Use separate liveness and readiness endpoints: liveness should be cheap and never depend on downstream calls; readiness should check only required dependencies and allow graceful degradation for optional ones.",
+    "Periodically audit timeout values against current latency distributions; as the system evolves, a timeout that was once appropriate can become too tight or dangerously loose.",
+    "Prefer per-dependency timeout configuration over a global constant; different downstream services have different latency profiles and different business criticality."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Catalog home: docs/design-patterns.md, section 7 'Execute under concurrency, time and failure', subgroup 'Dependency failure and overload' — 'Timeout: a call that can hang must stop hanging' (the catalog row this record materializes).",
+    "Nygard, M. — Release It! Design and Deploy Production-Ready Software (Pragmatic Bookshelf, 1st ed. 2007, 2nd ed. 2018), Stability Patterns: Timeouts — never wait forever: timeouts on every integration point, because slow responses tie up resources and turn into cascading failures.",
+    "Brooker, M. — Timeouts, retries, and backoff with jitter (Amazon Builders' Library, 2019): a timeout is the maximum time a client waits; choose it from the downstream latency metrics (e.g. the p99.9) plus network allowance, because too low causes retry amplification and too high still holds resources. https://d1.awsstatic.com/builderslibrary/pdfs/timeouts-retries-and-backoff-with-jitter.pdf",
+    "Google SRE Book, chapter 22 'Addressing Cascading Failures' (Ulrich, 2017): overload shows up as missed RPC deadlines and wasted work that clients then retry, so deadlines propagated through the stack keep the work bounded. https://sre.google/sre-book/addressing-cascading-failures/",
+    "gRPC — Deadlines (guide): a deadline is the point in time past which a client will not wait; by default gRPC sets none, servers cancel after it passes, and propagation converts the deadline to a remaining timeout so clock skew cannot corrupt it. https://grpc.io/docs/guides/deadlines/",
+    "gRPC — gRPC and Deadlines (blog): always set a client deadline; client and server make independent local success determinations; servers should check for cancellation before expensive work. https://grpc.io/blog/deadlines/",
+    "AWS Well-Architected Framework REL05-BP05 — Set client timeouts: set both connection and request timeouts on all service dependencies; balance tight enough to release resources against loose enough to avoid retry amplification; per-dependency values, not global constants; emit timeout metrics and alert on timeout ratio. https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_mitigate_interaction_failure_client_timeouts.html",
+    "AWS Prescriptive Guidance — Circuit Breaker pattern: the breaker prevents retry calls to a failing callee after repeated timeouts, and detects when the callee recovers. https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/circuit-breaker.html",
+    "Microsoft ASP.NET Core — Reliable gRPC services with deadlines and cancellation: deadline propagation via gRPC client factory with EnableCallContextPropagation, using the smallest deadline when multiple exist; server must honor CancellationToken to free resources promptly. https://learn.microsoft.com/en-us/aspnet/core/grpc/deadlines-cancellation",
+    "Drozd, M. — gRPC Deadline Propagation: Preventing Cascading Failures: propagate deadlines across the call chain; if A passes a 5s deadline to B and B calls C, B must pass the remaining time to C to avoid wasted work on requests whose caller has already given up. https://www.michal-drozd.com/en/blog/grpc-deadline-propagation/",
+    "Gazar — Resilience Patterns: Retry, Circuit Breaker, and Timeouts: timeout, retry and circuit breaker are composable, not a menu; they must be designed together; CircuitBreaker(Retry) vs Retry(CircuitBreaker) composition changes what the breaker observes. https://gazar.dev/system-design/resilience-patterns-retry-circuit-breaker-timeouts",
+    "Jorel del Portal — Timeout, Retry, and Circuit Breaker: Order and Setup: the three patterns form a single coordinated policy for time and capacity; shared constraints mean all three compete for the same deadline and resource capacity; proper design assigns responsibility for failures to the appropriate layer. https://joreldelportal.com/blog/timeout-retry-circuit-breaker-orden-configuracion-en.html",
+    "Codemia — Retries, Timeouts, and Bulkheads: The Resilience Patterns That Only Work Together: these three patterns are interdependent; a Black Friday incident is analyzed where retries with no timeouts or bulkheads caused threads to pile up as a payment gateway slowed, cascading into system-wide unresponsiveness. https://codemia.io/archive/retries-timeouts-and-bulkheads",
+    "ScaleMind — Resilience4j patterns in Spring: timeout, bulkhead, circuit breaker: per-dependency tuning is required, not a global policy; timeouts, bulkheads and breakers must be designed together with explicit latency and concurrency budgets; monitor timeout rates, bulkhead rejections and breaker states together. https://scalemind.dev/java/spring-boot/backend/spring-resilience4j-patterns-production-part-1/",
+    "ADHDecode — Timeout-Induced Cascades: retry amplification and recovery: timeouts trigger ripple effects when many clients retry simultaneously, creating retry storms that push the system deeper into overload; differentiate between timeout causes to select the right response. https://adhdecode.com/distributed-systems/failure-modes-and-incident-response/timeout-induced-cascades/",
+    "ADHDecode — Timeout Cascade Pattern: when every service in a call chain uses a large uniform timeout, a slow downstream dependency causes upstream services to hold threads long after the caller has already given up; propagate absolute deadlines, not fresh timers. https://adhdecode.com/debugging/system-design/timeout-cascade-pattern/",
+    "StatusCodeFYI — Health Check Endpoint Design Guide: implement three distinct endpoints (liveness, readiness, startup); readiness should only check required dependencies with tight sub-100ms timeouts; use pass/warn/fail statuses; do not return 200 when degraded. https://statuscodefyi.com/guides/health-check-endpoint-guide/",
+    "Sridharan, C. — Health Checks and Graceful Degradation in Distributed Systems: binary health signals are insufficient; partial failures require graceful handling; overloaded services may fluctuate between healthy and unhealthy; overload detectors (inspired by CoDel) can trigger backpressure when latency exceeds thresholds. https://copyconstruct.medium.com/health-checks-in-distributed-systems-aa8a0e8c1672",
+    "Johal.in — Handling Production Health Check Cascading Failures: health check timeout strategy: determine optimal timeouts using the function's latency profile; overly strict checks cascade failures by removing all instances simultaneously. https://johal.in/handling-production-health-check-cascading-failures",
+    "Unixy.io — Timeout Cascades: The Failure Mode Nobody Diagrams: uniform large timeouts at every hop allow a slow dependency to hold threads in every upstream service simultaneously; deadline propagation with elapsed time deduction is the solution. https://unixy.io/blog/timeout-cascades-failure-mode-nobody-diagrams/",
+    "Slys, I. — Timeouts: the most important number in distributed systems (and the easiest one to get wrong): common failure modes include no timeouts, too-tight timeouts, naive retries without backoff, misaligned end-to-end timing, and lack of idempotency; treat timeouts as part of an end-to-end time budget. https://iam.slys.dev/p/timeouts-the-most-important-number",
+    "Ladhani, S. — Timeouts: The Hardest Easy Problem: without timeouts requests hang forever tying up threads and exhausting pools; timeout design is central to reliability. https://sohilladhani.com/blog/post/2026-02-02-timeouts/",
+    "HLD Handbook — Resilience Patterns: Timeouts, Retries, Circuit Breakers, and Bulkheads: core anti-patterns are infinite timeouts, retry storms, and cascading failures; set explicit timeouts based on downstream p99.9 latency. https://hld.handbook.academy/curriculum/reliability-and-operations/resilience-patterns/",
+    "System Design Space — Fault Tolerance Patterns: Circuit Breaker, Bulkhead, Retry: these patterns must be designed to work together to contain blast radius, preserve availability, and avoid cascading failures. https://system-design.space/en/chapter/resilience-patterns/",
+    ".NET Docs — Partial Failure Strategies: bulkhead pattern limits concurrent requests per dependency; combined with timeout (to avoid indefinite blocking), retry with backoff (for transient failures), and circuit breaker (to stop calling when down). https://github.com/dotnet/docs/blob/main/docs/architecture/microservices/implement-resilient-applications/partial-failure-strategies.md",
+    "OneUptime — How to Monitor gRPC Deadline Propagation and Timeout Cascades: deadlines set on a gRPC client must propagate through the entire call chain; if A passes a 5s deadline to B and B calls C, B should pass the remaining time to C to avoid timeout cascades. https://oneuptime.com/blog/post/2026-02-06-grpc-deadline-timeout-cascades-opentelemetry/view",
+    "Go stdlib — context package: context.WithTimeout/WithDeadline return a derived Context cancelled when the deadline passes, propagating cancellation to all derived contexts; the returned CancelFunc must be called on every control-flow path (defer cancel()) or the context subtree and its resources leak until the deadline; an expired call surfaces as ctx.Err() == context.DeadlineExceeded. https://pkg.go.dev/context",
+    "Envoy documentation — How do I configure timeouts? and HTTP route components: the route timeout defaults to 15s and spans the whole request including retries; per_try_timeout bounds individual attempts (ignored unless shorter than the route timeout), per_try_idle_timeout detects stalled attempts and max_stream_duration caps total stream lifetime — distinct timers for distinct failure modes at the edge. https://www.envoyproxy.io/docs/envoy/latest/faq/configuration/timeouts",
+    "Python asyncio — Coroutines and tasks: asyncio.timeout(delay) cancels the current task when the block exceeds the delay and converts the CancelledError into a TimeoutError raised outside the context manager; asyncio.wait_for cancels the awaited task on expiry and, per the docs, waits for that cancellation to finish, so the total wait can exceed the timeout. https://docs.python.org/3/library/asyncio-task.html",
+    "Java SE API — java.sql.Statement: setQueryTimeout(seconds) bounds how long the driver waits for statement execution and throws SQLTimeoutException on expiry; zero means NO LIMIT — the 'infinite default' the pattern warns about is the specification default, so a query timeout must be set explicitly. https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/Statement.html",
+    "Multigrid — Timeouts: Choosing One That Isn't a Guess (misuse analysis): a too-low timeout abandons viable work and triggers wasteful retries while a too-high one converts a dependency slowdown into an outage through resource occupancy; 'decorative' equal timeouts re-armed on each step of a multi-call flow silently shrink the effective budget — prefer an absolute edge deadline and take the minimum of each step's timeout and the remaining budget. https://multigrid.ai/learn/llm-timeouts"
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "pattern": "coarse-grained-lock",
+  "language": "python",
+  "support": "library",
+  "implementation_notes": "Default realization: declare version_id_col on the aggregate root's mapper and nothing on the members, so the ORM emits UPDATE ... WHERE id = :id AND version_id = :old and raises StaleDataError when the cluster changed since it was loaded. One token declared in the mapper replaces per-member version columns and lock rows, and a server-side generator (PostgreSQL xmin, version_id_generator=False) keeps the token honest. It applies to the flush path only - bulk Query.update()/delete() bypass it - so member writes must go through the ORM object graph or bump the root explicitly.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sqlalchemy-version-id",
+      "name": "SQLAlchemy version_id_col on the root mapper",
+      "paradigm": "declarative",
+      "implementation_notes": "Default realization: declare version_id_col on the aggregate root's mapper and nothing on the members, so the ORM emits UPDATE ... WHERE id = :id AND version_id = :old and raises StaleDataError when the cluster changed since it was loaded. One token declared in the mapper replaces per-member version columns and lock rows, and a server-side generator (PostgreSQL xmin, version_id_generator=False) keeps the token honest. It applies to the flush path only - bulk Query.update()/delete() bypass it - so member writes must go through the ORM object graph or bump the root explicitly.",
+      "min_standard": "Python3.7",
+      "idiom_name": "__mapper_args__ = {\"version_id_col\": ...} on the aggregate root",
+      "code_sketch": "class Order(Base):                    # aggregate root\n    __tablename__ = \"orders\"\n    id: Mapped[int] = mapped_column(primary_key=True)\n    version: Mapped[int] = mapped_column(nullable=False)\n    __mapper_args__ = {\"version_id_col\": version}\n\nroot = session.get(Order, order_id)\nroot.lines[0].qty += 1              # any member change\nsession.commit()                    # StaleDataError if cluster changed",
+      "pitfalls": [
+        "The version column must not be NULL and must be touched by the root's UPDATE; a member-only write that misses the root leaves the guard silent.",
+        "Session identity-map caching can return stale members after a conflict; expire or use a fresh Session when retrying, or the same version is checked again."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/versioning.html"
+      ]
+    },
+    {
+      "variant_id": "sqlalchemy-for-update",
+      "name": "with_for_update() on the root query",
+      "paradigm": "procedural",
+      "implementation_notes": "Pessimistic realization: load the root with select(Order).where(...).with_for_update() (or Query.with_for_update()) inside a transaction, which renders SELECT ... FOR UPDATE (or the dialect's equivalent) and holds that row lock until commit. Every member touched afterwards is covered by the root lock, and a single lock identity replaces per-member locking; the standard knobs - nowait, skip_locked, of - control what happens when the root is already locked.",
+      "min_standard": "Python3.7",
+      "idiom_name": "select(Order).with_for_update() in a Session transaction",
+      "code_sketch": "with Session(engine) as session, session.begin():\n    root = session.execute(\n        select(Order).where(Order.id == order_id).with_for_update()\n    ).scalar_one()\n    for line in root.lines:          # covered by the root lock\n        line.qty += delta\n# lock released when the transaction ends",
+      "pitfalls": [
+        "with_for_update() outside an explicit transaction is pointless: autocommit releases the lock immediately, so the next statement is unprotected.",
+        "On SQLite the clause is a no-op (writer locks are database-wide), and joining with it can lock more rows than intended - check the emitted SQL per dialect."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/queryguide/query.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlalchemy-version-id",
+  "idiom_name": "__mapper_args__ = {\"version_id_col\": ...} on the aggregate root",
+  "code_sketch": "class Order(Base):                    # aggregate root\n    __tablename__ = \"orders\"\n    id: Mapped[int] = mapped_column(primary_key=True)\n    version: Mapped[int] = mapped_column(nullable=False)\n    __mapper_args__ = {\"version_id_col\": version}\n\nroot = session.get(Order, order_id)\nroot.lines[0].qty += 1              # any member change\nsession.commit()                    # StaleDataError if cluster changed",
+  "pitfalls": [
+    "The version column must not be NULL and must be touched by the root's UPDATE; a member-only write that misses the root leaves the guard silent.",
+    "Session identity-map caching can return stale members after a conflict; expire or use a fresh Session when retrying, or the same version is checked again."
+  ],
+  "sources": [
+    "https://docs.sqlalchemy.org/en/20/orm/versioning.html"
+  ]
+}

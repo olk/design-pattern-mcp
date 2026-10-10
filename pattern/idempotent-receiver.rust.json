@@ -1,0 +1,56 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "Mutex<HashSet<T>>::insert",
+  "implementation_notes": "Rust's stdlib gives the claim directly: HashSet::insert returns true only when the value was newly inserted, so a Mutex<HashSet<_>> (or a DashMap for sharded contention) makes check-and-claim one operation and there is no separate lock discipline to get wrong. It remains process-local, so a scaled-out or restart-prone receiver needs the durable variant; unwrap() on a poisoned lock should be replaced by an explicit policy in production.",
+  "code_sketch": "struct Receiver { seen: Mutex<HashSet<String>> }\n\nimpl Receiver {\n    fn claim(&self, key: &str) -> bool {\n        // true => newly inserted => we won; false => duplicate\n        self.seen.lock().unwrap().insert(key.to_owned())\n    }\n    fn on_message(&self, msg: Message) -> Result<()> {\n        if !self.claim(&msg.key) { return ack(msg); }   // duplicate: absorb\n        apply_effects(&msg)?; ack(msg)\n    }\n}",
+  "pitfalls": [
+    "Mutex poisoning after a panicking holder makes every later claim fail; decide explicitly whether to recover or fail the receiver.",
+    "A HashSet has no TTL - sweep by age or move retention into the store.",
+    "Holding the lock guard across the effects turns the guard into a global serialization point; claim, drop the guard, then process."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/collections/struct.HashSet.html",
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutex-hashset-claim",
+      "name": "In-process claim with Mutex<HashSet>",
+      "paradigm": "concurrent",
+      "implementation_notes": "Rust's stdlib gives the claim directly: HashSet::insert returns true only when the value was newly inserted, so a Mutex<HashSet<_>> (or a DashMap for sharded contention) makes check-and-claim one operation and there is no separate lock discipline to get wrong. It remains process-local, so a scaled-out or restart-prone receiver needs the durable variant; unwrap() on a poisoned lock should be replaced by an explicit policy in production.",
+      "code_sketch": "struct Receiver { seen: Mutex<HashSet<String>> }\n\nimpl Receiver {\n    fn claim(&self, key: &str) -> bool {\n        // true => newly inserted => we won; false => duplicate\n        self.seen.lock().unwrap().insert(key.to_owned())\n    }\n    fn on_message(&self, msg: Message) -> Result<()> {\n        if !self.claim(&msg.key) { return ack(msg); }   // duplicate: absorb\n        apply_effects(&msg)?; ack(msg)\n    }\n}",
+      "pitfalls": [
+        "Mutex poisoning after a panicking holder makes every later claim fail; decide explicitly whether to recover or fail the receiver.",
+        "A HashSet has no TTL - sweep by age or move retention into the store.",
+        "Holding the lock guard across the effects turns the guard into a global serialization point; claim, drop the guard, then process."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/collections/struct.HashSet.html",
+        "https://doc.rust-lang.org/std/sync/struct.Mutex.html"
+      ],
+      "min_standard": "Rust2021",
+      "idiom_name": "Mutex<HashSet<T>>::insert"
+    },
+    {
+      "variant_id": "sqlx-unique-claim",
+      "name": "Durable claim with a unique index (sqlx)",
+      "paradigm": "oo",
+      "implementation_notes": "The durable realization inserts the claim into a table with a UNIQUE key inside the same transaction as the effects: `INSERT ... ON CONFLICT (id) DO NOTHING` with rows_affected() == 1 is the claim, and sqlx surfaces the affected-row count on the query result. Prefer it for any receiver whose duplicates can outlive a process, and prune rows older than the redelivery window.",
+      "code_sketch": "let mut tx = pool.begin().await?;\nlet n = sqlx::query(\"INSERT INTO seen(id, at) VALUES($1, now()) ON CONFLICT (id) DO NOTHING\")\n    .bind(&msg.key)\n    .execute(&mut *tx)\n    .await?\n    .rows_affected();\nif n == 0 { tx.rollback().await?; ack(msg).await?; return Ok(()); }  // duplicate\napply_effects(&mut tx, &msg).await?;\ntx.commit().await?; ack(msg).await",
+      "pitfalls": [
+        "Only the claim statement's affected-row count is meaningful; reuse the same transaction for the effects but check n first.",
+        "A connection or constraint error must return as a failure for redelivery, never as 'already processed'."
+      ],
+      "sources": [
+        "https://docs.rs/sqlx/latest/sqlx/macro.query.html",
+        "https://www.postgresql.org/docs/current/sql-insert.html"
+      ],
+      "min_standard": "Rust2021",
+      "idiom_name": "sqlx + unique index with ON CONFLICT DO NOTHING"
+    }
+  ],
+  "default_variant": "mutex-hashset-claim"
+}

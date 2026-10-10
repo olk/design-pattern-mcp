@@ -1,0 +1,82 @@
+{
+  "pattern": "memoization",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "final class holding [Key: Value] with NSLock",
+  "implementation_notes": "Swift provides no memoization facility, so the memo is a Dictionary keyed by a Hashable argument, held by a type (often a final class) with an explicit lock for shared use; the keyed subscript returns an optional, which makes the hit test natural - and unlike a sentinel scheme, a stored value that happens to be nil-ish is still distinguishable because the subscript itself is optional. NSLock (Foundation) around the read-compute-insert sequence is the smallest correct shared form, at the cost that the computation runs under the lock unless you take the more elaborate unlock/recheck approach. The classic class-based structure is justified here because Swift's language features cover only the nullary case (lazy var); the compiler will not let a struct's cache mutate from a non-mutating method, which is a useful reminder that the cache is state.",
+  "code_sketch": "final class Memo {\n    private var cache: [Key: Value] = [:]\n    private let lock = NSLock()\n\n    func value(for key: Key) -> Value {\n        lock.lock(); defer { lock.unlock() }\n        if let hit = cache[key] { return hit }   // subscript is optional: miss vs stored value\n        let computed = compute(key)               // runs under the lock: keep it short\n        cache[key] = computed\n        return computed\n    }\n}",
+  "pitfalls": [
+    "Dictionary keys must be Hashable: structs hash by their stored properties, so a struct containing an array or a class reference may not hash the way the caller expects (classes hash by identity unless they implement Hashable).",
+    "Running the computation under the lock serializes all misses and deadlocks if the memoized function recurses through the same cache.",
+    "A cache held by a long-lived object retains every key and result; for object keys this leaks the graph unless the cache is cleared or keyed weakly.",
+    "Swift's value semantics mean a struct-held cache must be mutated through a mutating method, or boxed in a class - the compiler enforces that the cache is state."
+  ],
+  "sources": [
+    "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+    "https://developer.apple.com/documentation/swift/dictionary"
+  ],
+  "variants": [
+    {
+      "variant_id": "dictionary-with-lock",
+      "name": "Dictionary cache behind a lock",
+      "paradigm": "oo",
+      "min_standard": "Swift5.0",
+      "idiom_name": "final class holding [Key: Value] with NSLock",
+      "implementation_notes": "Swift provides no memoization facility, so the memo is a Dictionary keyed by a Hashable argument, held by a type (often a final class) with an explicit lock for shared use; the keyed subscript returns an optional, which makes the hit test natural - and unlike a sentinel scheme, a stored value that happens to be nil-ish is still distinguishable because the subscript itself is optional. NSLock (Foundation) around the read-compute-insert sequence is the smallest correct shared form, at the cost that the computation runs under the lock unless you take the more elaborate unlock/recheck approach. The classic class-based structure is justified here because Swift's language features cover only the nullary case (lazy var); the compiler will not let a struct's cache mutate from a non-mutating method, which is a useful reminder that the cache is state.",
+      "code_sketch": "final class Memo {\n    private var cache: [Key: Value] = [:]\n    private let lock = NSLock()\n\n    func value(for key: Key) -> Value {\n        lock.lock(); defer { lock.unlock() }\n        if let hit = cache[key] { return hit }   // subscript is optional: miss vs stored value\n        let computed = compute(key)               // runs under the lock: keep it short\n        cache[key] = computed\n        return computed\n    }\n}",
+      "pitfalls": [
+        "Dictionary keys must be Hashable: structs hash by their stored properties, so a struct containing an array or a class reference may not hash the way the caller expects (classes hash by identity unless they implement Hashable).",
+        "Running the computation under the lock serializes all misses and deadlocks if the memoized function recurses through the same cache.",
+        "A cache held by a long-lived object retains every key and result; for object keys this leaks the graph unless the cache is cleared or keyed weakly.",
+        "Swift's value semantics mean a struct-held cache must be mutated through a mutating method, or boxed in a class - the compiler enforces that the cache is state."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+        "https://developer.apple.com/documentation/swift/dictionary"
+      ]
+    },
+    {
+      "variant_id": "lazy-var",
+      "name": "lazy var for a single value",
+      "paradigm": "oo",
+      "min_standard": "Swift5.0",
+      "idiom_name": "lazy var value: T = compute()",
+      "implementation_notes": "For the nullary case Swift's own lazy stored property is the memo: the language reference states that the initial value is not calculated until the first time it is used, and the value is then stored, which is the whole pattern with no cache, key or library. The same chapter draws the boundary explicitly - if such a property is accessed by multiple threads simultaneously before initialization, there is no guarantee that it will be initialized only once - so a lazy var is the single-threaded or confined form, and shared state needs the lock above or an actor. Use it for expensive per-object or per-type constants where the type is genuinely immutable; keyed memoization remains the Dictionary form.",
+      "code_sketch": "final class Layout {\n    lazy var metrics: Metrics = computeMetrics()   // built on first access, then stored\n}\n\nenum Theme {\n    static let palette = Palette.build()           // let: initialized once, thread-safe\n}",
+      "pitfalls": [
+        "Concurrent first access is not guaranteed to initialize only once (documented), so a shared lazy var needs external synchronisation.",
+        "It caches for the lifetime of the instance or type and cannot be invalidated without replacing the property.",
+        "A lazy var can reference self, which makes it easy to retain reference cycles; be explicit about who owns the object graph.",
+        "It has no key: using it inside a function that takes parameters does not memoize anything."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/"
+      ]
+    },
+    {
+      "variant_id": "actor-cache",
+      "name": "Actor-isolated cache (Swift concurrency)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.9",
+      "requires_features": [
+        "actors",
+        "async/await"
+      ],
+      "idiom_name": "actor Memo { private var cache: [Key: Value] } with an async method",
+      "implementation_notes": "With Swift concurrency the shared memo is an actor: the Dictionary lives inside the actor, and actor isolation serializes access so no lock is written by hand and no data race is possible. The cost is viral - the memoized operation becomes async because crossing the actor boundary is awaited - and the computation should still be awaited outside the isolation when it is slow (a second check then guards against duplicate work), otherwise the actor serializes every consumer. This is the modern replacement for the lock-based variant wherever the call sites can be async; a synchronous or performance-critical call site keeps the NSLock form.",
+      "code_sketch": "actor Memo {\n    private var cache: [Key: Value] = [:]\n\n    func value(for key: Key) async -> Value {\n        if let hit = cache[key] { return hit }\n        let computed = await compute(key)   // actor isolation serializes cache access\n        cache[key] = computed\n        return computed\n    }\n}",
+      "pitfalls": [
+        "Awaiting a slow computation inside the actor keeps other callers waiting on that actor; compute outside the isolation and re-check before storing.",
+        "Actor isolation is reentrant across await points, so two callers can both miss and compute the same key unless the entry is marked in flight.",
+        "Making the memoized operation async propagates to every caller, which can force an API change on code that must stay synchronous.",
+        "The cache still has no eviction and retains keys for the actor's lifetime."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/",
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/"
+      ]
+    }
+  ],
+  "default_variant": "dictionary-with-lock",
+  "version": "1.0"
+}

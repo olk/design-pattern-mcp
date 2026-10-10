@@ -1,0 +1,60 @@
+{
+  "pattern": "functional-core-imperative-shell",
+  "language": "csharp",
+  "support": "idiomatic",
+  "idiom_name": "static pure methods returning records + Result<T>; handler as the shell",
+  "implementation_notes": "The core is a static class of pure methods that take and return `record` types (immutable properties, value equality, `with` for non-destructive updates) and return a `Result<T>` value instead of throwing; the clock, ids and flags are parameters. The shell - a controller, a minimal-API handler or `Main` - loads through EF/Dapper, calls the core once, and applies the returned decision (save, publish, log). An object-oriented aggregate is still fine inside the core as long as it never touches infrastructure: the local idiom replaces the classic 'domain service with injected repositories', and the injected repository is only justified where the conversation with the world is the logic itself.",
+  "code_sketch": "public static Result<TripCompletion> Complete(Trip trip, DateTime completedAt) =>\n    trip.Status != TripStatus.Active\n        ? Result.Failure<TripCompletion>(\"Trip is not active.\")\n        : Result.Success(new TripCompletion(\n            trip.Complete(completedAt, requiresReview: trip.Distance > 100),\n            new TripCompleted(trip.Id, completedAt, trip.Distance)));\n// shell\nvar trip   = await repo.Get(id);\nvar result = TripCompletionService.Complete(trip, clock.UtcNow);\nif (result.IsFailure) return BadRequest(result.Error);\nawait repo.Save(result.Value.Trip);\nawait bus.Publish(result.Value.Event);",
+  "pitfalls": [
+    "A `record` is only shallowly immutable: a `List<T>` property is still the caller's mutable list (and shares it), so copy with `ImmutableArray`/`IReadOnlyList` at construction if the shell may keep the reference.",
+    "`DateTime.Now`, `Guid.NewGuid()` and `Random` inside the 'pure' method are invisible effects - pass `completedAt`, the id and any randomness in, which is also what makes the core's tests deterministic.",
+    "An `async` method in the core is effectful by definition (it may suspend, resume on a pool thread and capture context): keep the core synchronous and let the shell compose the awaits (or the Either/TaskEither pipeline)."
+  ],
+  "sources": [
+    "https://renedekkers.nl/posts/functional-core-imperative-shell/",
+    "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record"
+  ],
+  "variants": [
+    {
+      "variant_id": "records-pure-core",
+      "name": "Static pure methods over records (C# 9)",
+      "paradigm": "functional",
+      "min_standard": "C#9",
+      "idiom_name": "static pure methods returning records + Result<T>; handler as the shell",
+      "implementation_notes": "The core is a static class of pure methods that take and return `record` types (immutable properties, value equality, `with` for non-destructive updates) and return a `Result<T>` value instead of throwing; the clock, ids and flags are parameters. The shell - a controller, a minimal-API handler or `Main` - loads through EF/Dapper, calls the core once, and applies the returned decision (save, publish, log). An object-oriented aggregate is still fine inside the core as long as it never touches infrastructure: the local idiom replaces the classic 'domain service with injected repositories', and the injected repository is only justified where the conversation with the world is the logic itself.",
+      "code_sketch": "public static Result<TripCompletion> Complete(Trip trip, DateTime completedAt) =>\n    trip.Status != TripStatus.Active\n        ? Result.Failure<TripCompletion>(\"Trip is not active.\")\n        : Result.Success(new TripCompletion(\n            trip.Complete(completedAt, requiresReview: trip.Distance > 100),\n            new TripCompleted(trip.Id, completedAt, trip.Distance)));\n// shell\nvar trip   = await repo.Get(id);\nvar result = TripCompletionService.Complete(trip, clock.UtcNow);\nif (result.IsFailure) return BadRequest(result.Error);\nawait repo.Save(result.Value.Trip);\nawait bus.Publish(result.Value.Event);",
+      "pitfalls": [
+        "A `record` is only shallowly immutable: a `List<T>` property is still the caller's mutable list (and shares it), so copy with `ImmutableArray`/`IReadOnlyList` at construction if the shell may keep the reference.",
+        "`DateTime.Now`, `Guid.NewGuid()` and `Random` inside the 'pure' method are invisible effects - pass `completedAt`, the id and any randomness in, which is also what makes the core's tests deterministic.",
+        "An `async` method in the core is effectful by definition (it may suspend, resume on a pool thread and capture context): keep the core synchronous and let the shell compose the awaits (or the Either/TaskEither pipeline)."
+      ],
+      "sources": [
+        "https://renedekkers.nl/posts/functional-core-imperative-shell/",
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record"
+      ]
+    },
+    {
+      "variant_id": "either-composition-shell",
+      "name": "Either/TaskEither pipeline in the shell",
+      "paradigm": "functional",
+      "min_standard": "C#8",
+      "requires_features": [
+        "monadic-either"
+      ],
+      "idiom_name": "Either/TaskEither composed with LINQ query syntax (CSharpFunctionalExtensions, LanguageExt)",
+      "implementation_notes": "Keep the pure steps as plain functions, but express the *workflow* in the shell as `Task<Either<L, R>>` (or `Try`/`Option`) values composed with `SelectMany`/LINQ query syntax, so the handler contains no `if`s and the failure path is a value travelling beside the success path. `let` in the middle of the query is where the pure decision is invoked; the first `Left` short-circuits the rest. Choose it when the shell otherwise accumulates branching and try/catch per step; the plain load-call-save shell stays smaller and needs no library when there are only one or two effects.",
+      "code_sketch": "// shell: load → (pure) decide → save/publish, no business ifs\nvar sandwich =\n    from id        in ParseGuid(rawId)\n    from trip      in LoadTrip(id)                       // Task<Either<...>>\n    let  completed  = TripCompletionService.Complete(trip, clock.UtcNow)  // pure\n    from saved     in completed.Match(\n                          ok  => SaveAndPublish(ok),\n                          err => Task.FromResult(Result.Failure(err)))\n    select saved;\nEither<ActionResult, OkObjectResult> result = await sandwich;\nreturn result.Match(x => x, x => x);",
+      "pitfalls": [
+        "Errors become values, so an unwrapped chain (`no Match/IfLeft/Map`) silently carries a failure through the object graph until something finally ignores it - make the boundary unwrap explicitly.",
+        "The pure call becomes an easily-missed `let` inside the monadic pipeline; keep it a synchronous function so a captured `Task` cannot make the 'decision' lazy or run twice.",
+        "Library Eithers (LanguageExt vs CSharpFunctionalExtensions) do not interoperate with each other or with `Task`, so pick one per code base or convert at the edge, and do not mix `SelectMany` from different monads."
+      ],
+      "sources": [
+        "https://blog.ploeh.dk/2024/12/16/a-restaurant-sandwich/",
+        "https://renedekkers.nl/posts/functional-core-imperative-shell/"
+      ]
+    }
+  ],
+  "default_variant": "records-pure-core",
+  "version": "1.0"
+}

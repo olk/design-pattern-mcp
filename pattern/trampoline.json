@@ -1,0 +1,191 @@
+{
+  "category": "behavior-selection",
+  "name": "trampoline",
+  "aliases": [
+    "bounce",
+    "tail-call optimization"
+  ],
+  "intent": "Run deep or mutually recursive computations without growing the call stack by having every step return its next step as a value (a thunk) and letting a single driver loop invoke those thunks until a final result is produced.",
+  "problem": "A group of mutually recursive functions - or a self-recursive function that the compiler cannot or will not optimise - must handle inputs deep enough to exhaust the stack; the runtime promises no tail-call elimination, and rewriting the algorithm around an explicit stack would destroy its shape.",
+  "context": "Applies where recursion is the clearest formulation of an algorithm whose depth is data-driven and effectively unbounded - recursive-descent parsers, CPS evaluators, stack-safe folds over long sequences, tree walks - and where the target runtime gives no tail-call guarantee (JVM, .NET, Python, Ruby, JavaScript engines after V8 dropped proper tail calls, Rust, Swift). It is also the internal mechanism functional libraries use to offer stack-safe map, fold and monadic chaining.",
+  "benefits": [
+    "Constant stack usage: logical recursion depth lives in heap-allocated steps and the driver loop is the only frame that persists, so deep inputs cannot overflow the stack.",
+    "Mutual recursion becomes expressible in languages without tail-call elimination: each function returns its next step instead of calling its partners.",
+    "The step boundary is a natural control point: step counting, budgets, cancellation, tracing and interleaving can be added in the driver without touching the algorithms.",
+    "Control flow becomes data: step values can be inspected, scheduled, memoised or interpreted differently in tests and in production.",
+    "A single done/more combinator pair keeps call sites close to direct style, which is what standard-library forms such as scala.util.control.TailCalls or Kotlin's DeepRecursiveFunction exploit.",
+    "Unbounded input becomes safe by construction rather than by tuning a stack size or a recursion limit."
+  ],
+  "tradeoffs": [
+    "Every logical step allocates a step value and usually a closure; heap churn, GC pressure and cache misses can cost more than the native frame they replace.",
+    "The discipline is not enforceable: one direct call left inside the mutual group reintroduces exactly the stack growth the pattern removed, and the defect appears only on deep inputs.",
+    "Stack traces lose the logical call chain, so errors must carry the algorithm's own context and debugging happens through the driver.",
+    "Indirect calls through thunks or dispatch tables defeat inlining and JIT specialisation; at shallow depth a trampolined loop is often measurably slower than the recursion it replaced.",
+    "Readability drops: the algorithm must be written in step or continuation-passing style, and non-tail calls force explicit continuations.",
+    "The failure mode moves rather than disappears: non-terminating recursion exhausts the heap or a step budget instead of the stack.",
+    "Interop friction around exceptions, resource lifetimes and async composition, because unwinding and cancellation no longer follow the logical call chain."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 5,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Step value (Bounce / TailRec)",
+      "responsibility": "The value every recursive function returns: either a finished result (done) or a suspended next step (more / tailcall)."
+    },
+    {
+      "role": "Thunk / continuation",
+      "responsibility": "The deferred zero-argument computation carried by a suspended step; it captures the arguments of the next logical call so no frame is needed to remember them."
+    },
+    {
+      "role": "Recursive functions",
+      "responsibility": "The mutually recursive set rewritten to return step values instead of calling each other; each remains an ordinary function of its arguments."
+    },
+    {
+      "role": "Driver loop (Trampoline)",
+      "responsibility": "The single loop that keeps invoking returned steps until a finished step appears and then returns its value to the original caller."
+    },
+    {
+      "role": "Combinators (done / more, tailcall / result)",
+      "responsibility": "Factories or extension functions that build and run step values, keeping call sites free of the sum-type plumbing."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "value"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Mutually recursive predicates and grammars: even/odd over long ranges, or expression/term/factor in a recursive-descent parser.",
+    "Continuation-passing evaluators and interpreters that walk deeply nested ASTs with no fixed depth bound.",
+    "Stack-safe foldRight, traversal and monadic chaining inside functional libraries, as scala.util.control.TailCalls and cats Eval do for Scala.",
+    "Deep tree or JSON walks in languages without tail-call elimination, for example JavaScript and TypeScript renderers and event pipelines.",
+    "Stepping a state machine or simulation loop where each iteration returns the next state and the driver enforces budgets or cancellation.",
+    "Hardening a parser for untrusted input: deeply nested structures must not crash the process because a recursive call exhausted the stack.",
+    "Async/await event-loop internals: Python's asyncio.Task.__step__ and Node.js callback scheduling are structurally trampolines — they queue steps rather than nest calls — enabling cooperative concurrency on a single thread.",
+    "Free monad interpreters: cats Free[S, A].foldMap and scalaz's free monad use trampolining internally so that stack-safe monadic chains hold regardless of chain depth.",
+    "GraphQL query execution: GraphQL-Ruby applied trampolining to its recursive resolver, reducing stack traces by 80% and live objects by 15% in production without runtime slowdown.",
+    "Rust recursive async functions: deep async state machines in Rust require trampolining or explicit async-std task spawning because the Rust runtime does not guarantee tail-call elimination.",
+    "Game loop and physics simulation: each update tick returns the next simulation state; the driver loop enforces frame budgets, pause, and cancellation while keeping the simulation logic pure.",
+    "Compiler AST walkers and IR traversals: deep nested expressions in source code (e.g., deeply nested macro expansions) can overflow the stack when walked recursively; trampolining makes the traversal stack-safe at bounded heap cost.",
+    "Kotlin standard library's DeepRecursiveFunction with callRecursive (since Kotlin 1.7): the stdlib ships a trampoline, keeping activation frames for deep or mutually recursive functions on a heap-allocated DeepRecursiveScope so tree-depth computations run without StackOverflowError on JVM, JS and Native.",
+    "Haskell's free package: iter, iterM and foldFree interpret Free structures in tail-recursive loops and Control.Monad.Free.Church encodes bind to avoid building deep thunk chains - the Haskell counterpart of Scala's stack-safe monadic chaining.",
+    "kotlinx.coroutines' EventLoopImplBase: the dispatch core behind Dispatchers.Unconfined and runBlocking is a trampoline-like loop that drains a thread-local task queue instead of nesting calls, executing coroutine continuations without growing the stack."
+  ],
+  "avoid_when": [
+    "Recursion depth is small and bounded by the data model: plain recursive calls are shorter and keep usable stack traces.",
+    "The language already eliminates the calls you need (self-recursive tail calls in Scala or Kotlin, guaranteed tail calls in Scheme-like runtimes): use that instead of a hand-rolled driver.",
+    "A single self-recursive function with an accumulator can be written as a loop: prefer the Tail Recursion rewrite or an ordinary for/while loop.",
+    "The work is really traversal of an existing collection: an Iterator, a fold or a stream pipeline expresses it more directly.",
+    "Depth is fine and the real problem is scheduling, latency or I/O: use the runtime's futures, coroutines or task system instead of a trampoline.",
+    "The recursion is branching with a known bound: an explicit stack over a fixed-size structure is usually clearer than chains of thunks.",
+    "The problem is purely I/O-bound and the language's async/await runtime already provides cooperative scheduling through an internal trampoline: do not add a second trampoline layer on top of an existing event loop."
+  ],
+  "language_files": {
+    "generic": "trampoline.generic.json",
+    "c": "trampoline.c.json",
+    "cplusplus": "trampoline.cplusplus.json",
+    "csharp": "trampoline.csharp.json",
+    "go": "trampoline.go.json",
+    "java": "trampoline.java.json",
+    "javascript": "trampoline.javascript.json",
+    "kotlin": "trampoline.kotlin.json",
+    "python": "trampoline.python.json",
+    "ruby": "trampoline.ruby.json",
+    "rust": "trampoline.rust.json",
+    "scala": "trampoline.scala.json",
+    "swift": "trampoline.swift.json",
+    "typescript": "trampoline.typescript.json"
+  },
+  "paradigm": [
+    "functional",
+    "procedural"
+  ],
+  "scope": "module",
+  "provenance": [
+    "functional-catalog"
+  ],
+  "related_patterns": [
+    "tail-recursion",
+    "monad",
+    "fold-catamorphism",
+    "interpreter-as-data",
+    "iterator",
+    "currying-partial-application",
+    "generator"
+  ],
+  "anti_patterns": [
+    "Trampolining shallow, bounded recursion: allocation and step-style noise are paid for a depth that a direct call would never have threatened.",
+    "Half-converted recursion groups where one function still calls its partner directly, silently keeping the stack growth the pattern was meant to remove.",
+    "Using the trampoline as a general scheduler or async runtime, conflating step driving with fibers, coroutines or task queues.",
+    "Shipping a driver loop with no step budget or counter and then claiming stack safety while the recursion can still exhaust memory.",
+    "One driver per call or per step instead of one loop per recursion group.",
+    "Non-tail flatMap chains in free monads: appending map{_ => ()} after a recursive call moves the recursion off the tail position, turning O(1) space into O(N) and causing OutOfMemoryError on deep inputs even with trampolining.",
+    "Using the trampoline without profiling: the closure-allocation overhead can make trampolined code measurably slower than native recursion at shallow depths, and faster only after several thousand frames.",
+    "Tuning stack size instead of trampolining: increases the ceiling for recursive depth but does not eliminate the underlying structural problem and defers the failure mode rather than preventing it."
+  ],
+  "design_principles": [
+    "Reify control: represent the next step as a value so control transfer becomes ordinary data.",
+    "Separate iteration from computation: the driver owns looping and depth, the algorithm owns the decision.",
+    "Continuation-passing discipline: every recursive call must be returned, never performed.",
+    "Single responsibility: one driver per recursion group, and steps stay pure and unaware of the driver.",
+    "Treat constant stack usage as an invariant to enforce, not as an optimisation to hope for."
+  ],
+  "best_practices": [
+    "Model the step as a closed sum type (done/more, TailRec) and keep one driver per recursion group.",
+    "Provide done/more or tailcall/result combinators so call sites read like ordinary recursion.",
+    "Never call a recursive function of the group or the driver directly from inside a step.",
+    "Add a debug step counter or budget to catch accidental depth growth and runaway recursion in tests.",
+    "Keep steps cheap: prefer value steps over boxed closures where the language allows, because step allocation dominates the cost.",
+    "Test with inputs past the runtime's recursion limit and state in the code why the recursion is stack-safe.",
+    "Prefer the platform primitive where one exists (scala.util.control.TailCalls, cats Eval, DeepRecursiveFunction) instead of hand-rolling a driver.",
+    "Use a trampoline-specific step budget (e.g., maxSteps parameter) in tests and production to catch unbounded heap growth from non-terminating recursion before an OutOfMemoryError occurs.",
+    "Profile before and after trampolining: at shallow depth (< 1,000 steps) trampolining often adds measurable overhead; after ~5,000 frames the heap cost of trampolining is usually cheaper than a StackOverflowError.",
+    "When trampolining free monads, keep every flatMap chain in explicit tail position on the right-hand side; a trailing map appended by a for-comprehension can degrade O(1) space to O(N).",
+    "For state machine and game-loop use cases, model each step as a pure function (state -> (nextState, output)) and keep the driver free of business logic.",
+    "Document the maximum expected recursion depth in the code and add a loud assertion or exception if a step budget is exceeded, so developers know the stack-safety invariant was violated.",
+    "In languages where async/await exists (Python, JavaScript, Rust), prefer the native async runtime only when the work is genuinely I/O-bound or needs cooperative concurrency; use trampolining specifically for CPU-bound recursion depth problems."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Bjarnason, R. (2012), 'Stackless Scala with Free Monads' - trampolining as the stack-safety technique, the paper cited by the Scala standard library's scala.util.control.TailCalls. https://blog.higher-order.com/assets/trampolines.pdf",
+    "Java Design Patterns catalog, 'Trampoline Pattern in Java' (also known as Bounce, Tail-Call Optimization) - canonical intent, participants, benefits and trade-offs. https://java-design-patterns.com/patterns/trampoline",
+    "Bendersky, E. (2017), 'On Recursion, Continuations and Trampolines' - tail calls, continuation-passing style and the driver loop, with the even/odd mutual-recursion example. https://eli.thegreenplace.net/2017/on-recursion-continuations-and-trampolines/",
+    "Marmelab (2018), 'Understanding Recursion, Tail Call and Trampoline Optimizations' - why trampolines are the practical answer where tail-call optimisation is unavailable. https://marmelab.com/blog/2018/02/12/understanding-recursion.html",
+    "Moments Log (2025), 'Trampoline Pattern: Converting Deep Recursion to Iteration' - the step/loop structure and what it costs. https://www.momentslog.com/development/design-pattern/trampoline-pattern-converting-deep-recursion-to-iteration",
+    "Kindatechnical (2026), 'A Guide to Functional Programming - Trampolining and Tail-Call Optimization' - comprehensive modern overview of trampolining vs TCO, with mutual recursion examples and performance comparison table across JavaScript engines. https://kindatechnical.com/functional-programming/trampolining-and-tail-call-optimization.html",
+    "Verma, D. (2026), 'JavaScript Has No Reliable Tail Call Optimization: What Actually Happens at Runtime' - documents that V8 removed TCO support (2017) and SpiderMonkey never shipped it; covers trampolining, Babel plugins, and generator-based alternatives as the real-world solutions. https://www.devanshuverma.in/blog/javascript-tail-call-optimization-runtime-reality",
+    "Moertel, T. (2013), 'Tricks of the Trade: Recursion to Iteration, Part 4: The Trampoline' - explains the core idea of the trampoline: returning a call instruction instead of making one, forcing the current frame off the stack before transferring control. https://blog.moertel.com/posts/2013-06-12-recursion-to-iteration-4-trampolines.html",
+    "Ozkul, U. (2025), 'Trampoline Pattern | Functional Rust' - demonstrates the trampoline pattern in Rust using a Bounce enum (Done/More), the run loop, and mutual recursion examples; compares to OCaml which has native TCO. https://hightechmind.io/rust/595-trampoline-pattern.html",
+    "Mosolgo, R. (2018), 'Trampolining in Ruby' - a production case study applying trampolining to GraphQL-Ruby's recursive interpreter, reducing backtrace size by 80% and live object count by 15% with no runtime slowdown. https://rmosolgo.github.io/ruby/language%20implementation/2018/09/23/trampolining.html",
+    "Minamide, Y. (2003), 'Selective Tail Call Elimination' - academic paper from SAS 2003 proposing an effect system to selectively apply trampolining only where needed, reducing overhead while preserving asymptotic stack safety; implemented in the MLj SML-to-JVM compiler. https://sv.c.titech.ac.jp/minamide/papers/sas03.pdf",
+    "Higher-Kinded-J (2024), 'Trampoline Monad - Stack-Safe Recursion in Java' - Java implementation with Done/More/FlatMap variants, the 3-step mechanical conversion recipe, TrampolineUtils for stack-safe applicative traversal, and when to use Trampoline vs plain loops. https://higher-kinded-j.github.io/latest/monads/trampoline_monad.html",
+    "FP Insights (2025), 'Trampolining & Stack Safety' - practical guide showing trampolining's relationship to JavaScript's event loop, async/await internals, and Node.js scheduling patterns, with live benchmarks showing trampoline vs native recursion performance. https://fp-insights.avinashdalvi.com/concepts/trampolining",
+    "Ganz, S., Friedman, D., Wand, M. (1999), 'Trampolined Style' - the canonical paper defining a trampolined program as a single loop in which computations are scheduled and executed in discrete steps; source of the term for the functional-programming sense. https://doi.org/10.1145/317765.317779",
+    "Kotlin standard library, 'DeepRecursiveFunction' and 'callRecursive' Core API docs - production trampoline that places activation frames on a heap-allocated DeepRecursiveScope for deep or mutually recursive functions. https://kotlinlang.org/api/core/kotlin-stdlib/kotlin/-deep-recursive-function/",
+    "Hackage, 'Control.Monad.Free' package docs - iter, iterM and foldFree as tail-recursive interpreters of Free structures, with Control.Monad.Free.Church for cheaper stack behaviour. https://hackage.haskell.org/package/free/docs/Control-Monad-Free.html",
+    "Tratt, L. (2004), 'Tail Call Optimization' - criticism of constant-stack discipline: code must be shaped around tail calls and meaningful stack traces/error reports are hard to preserve, a cost trampolines inherit. https://tratt.net/laurie/blog/2004/tail_call_optimization.html",
+    "James, C., 'Trampolining in C' - empirical misuse case: explicit closures plus dynamic dispatch make a trampolined evaluator impractical for performance-critical C, with Valgrind evidence of heavy heap overhead per thunk. https://compiler.club/trampolining-in-c/"
+  ],
+  "related_patterns_notes": {
+    "continuation-passing-style": "continuation-passing-style",
+    "free-monad": "free-monad",
+    "async-iterator": "async-iterator",
+    "delimited-continuations": "delimited-continuations",
+    "state-machine": "state-machine",
+    "deep-recursive-function": "deep-recursive-function",
+    "fiber-coroutine": "fiber-coroutine"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "pattern": "scatter-gather",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "Concurrent::Promises.future per recipient + Promises.zip(...).value(timeout)",
+  "implementation_notes": "Core Ruby has threads and Thread::Queue but no futures, so the de-facto library supplies the aggregation: Concurrent::Promises.future { ask(r) } fans the calls out on the global IO executor, Promises.zip(*promises) is the wait-for-all gather (documented as resolving the enumerable and combining the results) and Promises.any is the first-success policy. Each promise exposes value(timeout), so the deadline is enforced at the merge point, where a nil return means 'not settled in time' - the promise itself keeps running. This is the default realization for Ruby applications; the dependency-free Thread and Queue form is the second variant.",
+  "code_sketch": "promises = recipients.map { |r| Concurrent::Promises.future { ask(r) } }\nzip = Concurrent::Promises.zip(*promises)\noffers = zip.value(budget)                 # nil on timeout: merge what is available\nreturn pick_best([]) if offers.nil?        # explicit deadline branch\npick_best(offers.compact)",
+  "pitfalls": [
+    "value(timeout) returns nil both on timeout and for a legitimately nil result: check state (fulfilled?/rejected?) before deciding what the merge saw.",
+    "Timed-out promises are not cancelled - the futures keep running and their results are discarded only by you; long fan-outs must bound the executor or the application's threads.",
+    "The GIL makes these threads useful for blocking I/O only; CPU-bound recipients need processes, and a large fan-out starves the shared executor."
+  ],
+  "sources": [
+    "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/Promises.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "concurrent-ruby-promises",
+      "name": "concurrent-ruby Promises zip/any",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "concurrent-ruby"
+      ],
+      "idiom_name": "Concurrent::Promises.future per recipient + Promises.zip(...).value(timeout)",
+      "implementation_notes": "Core Ruby has threads and Thread::Queue but no futures, so the de-facto library supplies the aggregation: Concurrent::Promises.future { ask(r) } fans the calls out on the global IO executor, Promises.zip(*promises) is the wait-for-all gather (documented as resolving the enumerable and combining the results) and Promises.any is the first-success policy. Each promise exposes value(timeout), so the deadline is enforced at the merge point, where a nil return means 'not settled in time' - the promise itself keeps running. This is the default realization for Ruby applications; the dependency-free Thread and Queue form is the second variant.",
+      "code_sketch": "promises = recipients.map { |r| Concurrent::Promises.future { ask(r) } }\nzip = Concurrent::Promises.zip(*promises)\noffers = zip.value(budget)                 # nil on timeout: merge what is available\nreturn pick_best([]) if offers.nil?        # explicit deadline branch\npick_best(offers.compact)",
+      "pitfalls": [
+        "value(timeout) returns nil both on timeout and for a legitimately nil result: check state (fulfilled?/rejected?) before deciding what the merge saw.",
+        "Timed-out promises are not cancelled - the futures keep running and their results are discarded only by you; long fan-outs must bound the executor or the application's threads.",
+        "The GIL makes these threads useful for blocking I/O only; CPU-bound recipients need processes, and a large fan-out starves the shared executor."
+      ],
+      "sources": [
+        "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/Promises.html"
+      ]
+    },
+    {
+      "variant_id": "threads-queue-deadline",
+      "name": "Core Thread + Thread::Queue#pop(timeout:) gather",
+      "paradigm": "concurrent",
+      "min_standard": "Ruby3.2",
+      "requires_features": [
+        "Thread",
+        "Thread::Queue"
+      ],
+      "idiom_name": "Thread per recipient pushing tagged replies into a Thread::Queue drained with pop(timeout:)",
+      "implementation_notes": "The dependency-free realization uses only core classes: one Thread per recipient pushes a tagged reply into a Thread::Queue, and the gather pops with an explicit timeout (Ruby 3.2 documents Queue#pop(non_block, timeout:)), counting replies until all arrived or the remaining budget reached zero. The queue is the only shared structure, so no mutex is needed, and per-recipient failures are carried in the message rather than raised in the main thread (Thread#join would re-raise the first failure and abort the merge). Prefer this form in libraries that must not depend on concurrent-ruby, or when the fan-out is small and bounded.",
+      "code_sketch": "replies = Thread::Queue.new\nrecipients.each_with_index { |r, i| Thread.new { replies << [i, safe_ask(r)] } }\noffers = []\ndeadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + budget\nwhile offers.size < recipients.size\n  left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)\n  break if left <= 0\n  reply = replies.pop(timeout: left) or break\n  offers << reply[1] if reply[1]\nend",
+      "pitfalls": [
+        "Threads abandoned by the deadline keep running and push into a queue nobody reads: their sockets stay open; kill them explicitly or bound the work inside safe_ask.",
+        "Thread#report_on_exception is enabled by default, so a worker's exception prints to stderr even when the gather handled the failure deliberately.",
+        "Queue#pop(timeout:) returns nil on timeout, which is indistinguishable from a nil payload unless the protocol wraps every reply in a tagged tuple."
+      ],
+      "sources": [
+        "https://docs.ruby-lang.org/en/3.2/Thread/Queue.html"
+      ]
+    }
+  ],
+  "default_variant": "concurrent-ruby-promises",
+  "version": "1.0"
+}

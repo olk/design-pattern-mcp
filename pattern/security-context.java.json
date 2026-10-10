@@ -1,0 +1,80 @@
+{
+  "pattern": "security-context",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "SecurityContextHolder.getContext().getAuthentication()",
+  "implementation_notes": "Spring Security's holder is the dominant Java realization: a SecurityContext carrying an Authentication (principal, authorities) is stored per request and read anywhere through SecurityContextHolder.getContext(), with ThreadLocal as the default storage and FilterChainProxy guaranteeing that the context is cleared after each request. Guards read the same holder, and the framework's strategies (MODE_THREADLOCAL, MODE_INHERITABLETHREADLOCAL, MODE_GLOBAL) make the population question explicit. Use it whenever the application already runs Spring Security; the classic hand-written container is unnecessary, and on JDK 25 the ScopedValue variant is the modern alternative for greenfield code.",
+  "code_sketch": "Authentication auth = SecurityContextHolder.getContext().getAuthentication();\nif (auth == null || !auth.isAuthenticated()) {\n    throw new AccessDeniedException(\"no authenticated principal\");\n}\nObject subject = auth.getPrincipal();        // guards read the same holder\n// The filter chain clears the holder after the request; do not assume it\n// survives a hop to another thread or executor.",
+  "pitfalls": [
+    "SecurityContextHolder defaults to a ThreadLocal: work handed to another thread or executor loses the context unless it is propagated explicitly, and inheritable thread-locals copied into long-lived pool threads are a leak.",
+    "The holder must be cleared before a pooled thread serves the next request (Spring's FilterChainProxy does this); manual thread pools, batch jobs and tests must clear it themselves.",
+    "Credentials held in the Authentication should be erased after authentication; never copy them into your own security context object."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-security/reference/servlet/authentication/architecture.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/javax/security/auth/Subject.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "spring-securitycontextholder",
+      "name": "Spring Security SecurityContextHolder (ThreadLocal)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "SecurityContextHolder.getContext().getAuthentication()",
+      "implementation_notes": "Spring Security's holder is the dominant Java realization: a SecurityContext carrying an Authentication (principal, authorities) is stored per request and read anywhere through SecurityContextHolder.getContext(), with ThreadLocal as the default storage and FilterChainProxy guaranteeing that the context is cleared after each request. Guards read the same holder, and the framework's strategies (MODE_THREADLOCAL, MODE_INHERITABLETHREADLOCAL, MODE_GLOBAL) make the population question explicit. Use it whenever the application already runs Spring Security; the classic hand-written container is unnecessary, and on JDK 25 the ScopedValue variant is the modern alternative for greenfield code.",
+      "code_sketch": "Authentication auth = SecurityContextHolder.getContext().getAuthentication();\nif (auth == null || !auth.isAuthenticated()) {\n    throw new AccessDeniedException(\"no authenticated principal\");\n}\nObject subject = auth.getPrincipal();        // guards read the same holder\n// The filter chain clears the holder after the request; do not assume it\n// survives a hop to another thread or executor.",
+      "pitfalls": [
+        "SecurityContextHolder defaults to a ThreadLocal: work handed to another thread or executor loses the context unless it is propagated explicitly, and inheritable thread-locals copied into long-lived pool threads are a leak.",
+        "The holder must be cleared before a pooled thread serves the next request (Spring's FilterChainProxy does this); manual thread pools, batch jobs and tests must clear it themselves.",
+        "Credentials held in the Authentication should be erased after authentication; never copy them into your own security context object."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-security/reference/servlet/authentication/architecture.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/javax/security/auth/Subject.html"
+      ]
+    },
+    {
+      "variant_id": "jaas-subject",
+      "name": "JAAS Subject.current() / callAs()",
+      "paradigm": "oo",
+      "min_standard": "Java18",
+      "requires_features": [
+        "Subject.current()",
+        "Subject.callAs()"
+      ],
+      "idiom_name": "javax.security.auth.Subject as the security context",
+      "implementation_notes": "The JDK ships its own container: a Subject groups a subject's principals and credentials, Subject.callAs(subject, action) binds it for the dynamic extent of the action, and Subject.current() reads the current subject inside that extent - the replacement the javadoc names for doAs/doAsPrivileged, which are deprecated for removal because they depend on the deprecated AccessControlContext. Prefer it when the application is framework-neutral or already uses JAAS login modules (Kerberos, certificate login); guards call Subject.current() and deny when it is null. Like the Spring holder it is per-thread, so the same propagation care applies.",
+      "code_sketch": "Subject subject = Subject.current();\nif (subject == null) {\n    throw new AccessDeniedException(\"unauthenticated\");\n}\nSet<Principal> principals = subject.getPrincipals();\n\n// boundary:\n// Subject.callAs(subject, () -> { handle(request); return null; });",
+      "pitfalls": [
+        "doAs/doAsPrivileged are deprecated for removal (JDK 17 onwards): new code must use callAs/current.",
+        "Subject.current() is per-thread: a binding does not follow work handed to an executor or a virtual-thread hop unless the action wraps that work.",
+        "The Subject also holds credentials - keep it out of logs and serialization, and do not hand it to code that only needs the principal."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/javax/security/auth/Subject.html"
+      ]
+    },
+    {
+      "variant_id": "scoped-value",
+      "name": "ScopedValue<SecurityContext> (JDK 25)",
+      "paradigm": "concurrent",
+      "min_standard": "Java25",
+      "requires_features": [
+        "ScopedValue"
+      ],
+      "idiom_name": "ScopedValue.where(CTX, ctx).run(...)",
+      "implementation_notes": "JDK 25's ScopedValue passes a value to a faraway callee without method parameters: the binding exists only for the bounded execution of the operation and reverts automatically, code in the callee cannot set it, and bindings are inherited by child threads started inside a StructuredTaskScope. The javadoc explicitly recommends it over ThreadLocal for one-way transmission (no unbounded lifetime to remove, no copying for inheritance), which makes it the modern alternative to the framework holder for new code on a current JDK. Guards read CTX.orElseThrow(...) and deny when unbound; bind one immutable context object rather than many keys, because the per-thread cache is small.",
+      "code_sketch": "static final ScopedValue<SecurityContext> CTX = ScopedValue.newInstance();\n\nScopedValue.where(CTX, context).run(() -> handle(request));  // bound for this scope\n\n// guard:\nSecurityContext ctx = CTX.orElseThrow(UnauthenticatedException::new);",
+      "pitfalls": [
+        "ScopedValue is final in JDK 25 but was a preview API on earlier JDKs, so the runtime floor matters for build configuration and CI.",
+        "Bindings are per-thread and inherited only through StructuredTaskScope: plain thread pools and unrelated executors see no binding.",
+        "The javadoc warns that many cyclically used scoped values thrash the small per-thread cache - bind a single immutable context, not one value per attribute."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ScopedValue.html"
+      ]
+    }
+  ],
+  "default_variant": "spring-securitycontextholder",
+  "version": "1.0"
+}

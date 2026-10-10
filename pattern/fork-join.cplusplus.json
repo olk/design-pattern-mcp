@@ -1,0 +1,80 @@
+{
+  "pattern": "fork-join",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "oneTBB task_group / parallel_reduce with TBB's work-stealing scheduler",
+  "implementation_notes": "Modern C++ answers fork/join with a task-parallel runtime instead of raw threads: oneTBB's task_group.run() forks tasks and wait() joins them, parallel_invoke/parallel_for/parallel_reduce express the common bulk shapes, and the TBB scheduler keeps per-thread task pools and lets idle threads participate, so the classic deque/stealing logic is never written by hand. C++17's <execution> parallel algorithms are a lighter option when the recursion can be phrased as a range algorithm, and C++26 std::execution (senders/receivers) is the standard-library successor with when_all/bulk for dynamic fan-out. Hand-rolled std::thread pools with deques are justified only where no runtime may be linked or a fixed platform API must be spoken.",
+  "code_sketch": "void sum(const float* v, size_t lo, size_t hi, double& out) {\n    if (hi - lo < 4096) { out = std::accumulate(v + lo, v + hi, 0.0); return; }\n    size_t mid = lo + (hi - lo) / 2;\n    double l = 0, r = 0;\n    tbb::task_group g;\n    g.run([&]{ sum(v, lo, mid, l); });        // fork\n    g.run([&]{ sum(v, mid, hi, r); });\n    g.wait();                                  // join\n    out = l + r;\n}",
+  "pitfalls": [
+    "Nested task groups or parallel_for calls inside an already-parallel region oversubscribe the machine - oneTBB is one global pool, so do not create additional pools.",
+    "Captured references must outlive the tasks; g.wait() must run inside the scope before the referenced locals die.",
+    "Blocking (I/O, locks, condition waits) inside TBB tasks throttles the scheduler - the runtime is tuned for compute-bound tasks."
+  ],
+  "sources": [
+    "https://uxlfoundation.github.io/oneTBB/",
+    "https://github.com/uxlfoundation/oneTBB"
+  ],
+  "variants": [
+    {
+      "variant_id": "tbb-task-group",
+      "name": "oneTBB task_group / parallel_reduce (C++11)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "oneTBB task_group / parallel_reduce with TBB's work-stealing scheduler",
+      "implementation_notes": "Modern C++ answers fork/join with a task-parallel runtime instead of raw threads: oneTBB's task_group.run() forks tasks and wait() joins them, parallel_invoke/parallel_for/parallel_reduce express the common bulk shapes, and the TBB scheduler keeps per-thread task pools and lets idle threads participate, so the classic deque/stealing logic is never written by hand. C++17's <execution> parallel algorithms are a lighter option when the recursion can be phrased as a range algorithm, and C++26 std::execution (senders/receivers) is the standard-library successor with when_all/bulk for dynamic fan-out. Hand-rolled std::thread pools with deques are justified only where no runtime may be linked or a fixed platform API must be spoken.",
+      "code_sketch": "void sum(const float* v, size_t lo, size_t hi, double& out) {\n    if (hi - lo < 4096) { out = std::accumulate(v + lo, v + hi, 0.0); return; }\n    size_t mid = lo + (hi - lo) / 2;\n    double l = 0, r = 0;\n    tbb::task_group g;\n    g.run([&]{ sum(v, lo, mid, l); });        // fork\n    g.run([&]{ sum(v, mid, hi, r); });\n    g.wait();                                  // join\n    out = l + r;\n}",
+      "pitfalls": [
+        "Nested task groups or parallel_for calls inside an already-parallel region oversubscribe the machine - oneTBB is one global pool, so do not create additional pools.",
+        "Captured references must outlive the tasks; g.wait() must run inside the scope before the referenced locals die.",
+        "Blocking (I/O, locks, condition waits) inside TBB tasks throttles the scheduler - the runtime is tuned for compute-bound tasks."
+      ],
+      "sources": [
+        "https://uxlfoundation.github.io/oneTBB/",
+        "https://github.com/uxlfoundation/oneTBB"
+      ]
+    },
+    {
+      "variant_id": "openmp-tasks",
+      "name": "OpenMP task/taskgroup (compiler runtime)",
+      "paradigm": "declarative",
+      "min_standard": "OpenMP3.0",
+      "requires_features": [
+        "openmp"
+      ],
+      "idiom_name": "#pragma omp task + taskgroup over the OpenMP worker team",
+      "implementation_notes": "The OpenMP route treated as C++: spawn the team once, let #pragma omp task fork subtasks and #pragma omp taskgroup join the child tasks and their descendants. It compiles with the same C++ toolchain and needs no library, which makes it the pragmatic choice in HPC code and on toolchains where adding TBB is not an option; the cost is pragma-based error checking and explicit data-sharing discipline (shared by default, reduction/task_reduction for leaf results).",
+      "code_sketch": "#pragma omp parallel\n#pragma omp single nowait\n{\n    #pragma omp taskgroup\n    {\n        #pragma omp task shared(v) in_reduction(+:total)\n        { total += sum(v, lo, mid); }      // fork\n        total += sum(v, mid, hi);          // compute the other half here\n    }\n}",
+      "pitfalls": [
+        "Data-sharing clauses decide correctness: shared is the default, so leaf results need reduction/task_reduction or firstprivate captures.",
+        "Forgetting taskgroup means the parent can read results before child tasks wrote them.",
+        "OpenMP task overhead is higher than TBB's; keep the granularity threshold generous in hot loops."
+      ],
+      "sources": [
+        "https://www.openmp.org/spec-html/5.0/openmpsu94.html"
+      ]
+    },
+    {
+      "variant_id": "cpp26-senders",
+      "name": "C++26 std::execution sender/receiver task graph",
+      "paradigm": "concurrent",
+      "min_standard": "C++26",
+      "requires_features": [
+        "senders",
+        "receivers"
+      ],
+      "idiom_name": "std::execution::bulk / when_all over a parallel scheduler",
+      "implementation_notes": "C++26 standardizes the sender/receiver model (P2300): describe the work as a composable task graph - bulk() fans a shape out over a scheduler, when_all() is the join - and connect/start it; the executor decides the threads. A parallel scheduler (plus when_all) is the standard-library replacement for a hand-owned pool; the sender graph additionally carries cancellation and error channels, which is exactly the structured-join discipline the pattern wants. Adopt when the toolchain implements it; until then oneTBB or OpenMP remain the practical choices.",
+      "code_sketch": "using namespace std::execution;\nauto work = when_all(                       // join the two halves\n    schedule(par) | bulk(n / 2,      [&](int i){ part(i); }),\n    schedule(par) | bulk(n - n / 2,  [&](int i){ part(n/2 + i); }));\nstd::this_thread::sync_wait(std::move(work));  // block until completion",
+      "pitfalls": [
+        "Only a parallel scheduler provides parallelism; an inline scheduler completes on the calling thread.",
+        "Senders are single-shot: connect exactly once and keep the operation state alive until it signals completion.",
+        "Through as_awaitable the completing thread is not necessarily the awaiting one - do not assume the caller's context resumes the coroutine."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/execution"
+      ]
+    }
+  ],
+  "default_variant": "tbb-task-group",
+  "version": "1.0"
+}

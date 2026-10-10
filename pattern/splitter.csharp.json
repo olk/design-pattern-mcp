@@ -1,0 +1,64 @@
+{
+  "pattern": "splitter",
+  "language": "csharp",
+  "support": "idiomatic",
+  "idiom_name": "Enumerable.SelectMany / Enumerable.Chunk + await foreach",
+  "implementation_notes": "In process the splitter is a LINQ projection: SelectMany projects one composite into many parts (flatMap) and Enumerable.Chunk (net6.0+, C# 10) groups a sequence into fixed-size parts when the channel wants batches, so no role structure is written at all - the send loop stays an ordinary await foreach. For byte-level framing the same loop runs over an IAsyncEnumerable<T> decoder, and System.Threading.Channels or Parallel.ForEachAsync take the place of the framework's dispatcher. The classic component form earns its keep only where a platform owns the topology (see the Durable Functions variant); otherwise a hand-written Splitter class is ceremony around a foreach.",
+  "code_sketch": "foreach (var item in order.Lines)          // SelectMany's shape\n{\n    await bus.PublishAsync(new PartMessage(item)\n    {\n        CorrelationId = order.Id,\n        SequenceNumber = seq++,\n        SequenceSize = order.Lines.Count\n    }, ct);\n}\n// chunked parts: foreach (var batch in items.Chunk(100)) await PublishAsync(batch, ct);",
+  "pitfalls": [
+    "LINQ operators are deferred: building the projection inside the publish loop re-enumerates the source and emits duplicate parts.",
+    "Chunk throws ArgumentOutOfRangeException for size < 1, and the last chunk is short (only the last one) - consumers must not assume equal part sizes.",
+    "Fire-and-forget publishes (or async void handlers) inside the loop drop ordering and swallow failures; await each publish or collect the tasks first.",
+    "Sequence headers must be per-composite state: a counter field on a singleton service produces colliding correlation metadata."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.linq.enumerable.chunk"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "linq-selectmany-chunk",
+      "name": "LINQ projection (SelectMany / Chunk) with a publish loop",
+      "paradigm": "functional",
+      "min_standard": "C#3",
+      "requires_features": [
+        "LINQ"
+      ],
+      "idiom_name": "Enumerable.SelectMany / Enumerable.Chunk + await foreach",
+      "implementation_notes": "In process the splitter is a LINQ projection: SelectMany projects one composite into many parts (flatMap) and Enumerable.Chunk (net6.0+, C# 10) groups a sequence into fixed-size parts when the channel wants batches, so no role structure is written at all - the send loop stays an ordinary await foreach. For byte-level framing the same loop runs over an IAsyncEnumerable<T> decoder, and System.Threading.Channels or Parallel.ForEachAsync take the place of the framework's dispatcher. The classic component form earns its keep only where a platform owns the topology (see the Durable Functions variant); otherwise a hand-written Splitter class is ceremony around a foreach.",
+      "code_sketch": "foreach (var item in order.Lines)          // SelectMany's shape\n{\n    await bus.PublishAsync(new PartMessage(item)\n    {\n        CorrelationId = order.Id,\n        SequenceNumber = seq++,\n        SequenceSize = order.Lines.Count\n    }, ct);\n}\n// chunked parts: foreach (var batch in items.Chunk(100)) await PublishAsync(batch, ct);",
+      "pitfalls": [
+        "LINQ operators are deferred: building the projection inside the publish loop re-enumerates the source and emits duplicate parts.",
+        "Chunk throws ArgumentOutOfRangeException for size < 1, and the last chunk is short (only the last one) - consumers must not assume equal part sizes.",
+        "Fire-and-forget publishes (or async void handlers) inside the loop drop ordering and swallow failures; await each publish or collect the tasks first.",
+        "Sequence headers must be per-composite state: a counter field on a singleton service produces colliding correlation metadata."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.linq.enumerable.chunk"
+      ]
+    },
+    {
+      "variant_id": "durable-fan-out",
+      "name": "Durable Functions fan-out/fan-in orchestrator",
+      "paradigm": "declarative",
+      "min_standard": "C#10",
+      "requires_features": [
+        "durable orchestration",
+        "OrchestrationTrigger"
+      ],
+      "idiom_name": "orchestrator CallActivityAsync per element + Task.WhenAll fan-in",
+      "implementation_notes": "When the split must be durable and distributed, the platform owns the roles: an orchestrator calls the activity once per element (the fan-out), collects the tasks and awaits Task.WhenAll (the fan-in), and the runtime checkpoints every call so a crash replays the split instead of losing parts. This is the closest .NET equivalent of a framework-native Splitter/Aggregator pair, and it also supplies the concurrency across machines that a plain loop cannot. Keep the classic in-process loop for splits that need no durability, and keep the orchestrator free of the splitting logic itself.",
+      "code_sketch": "string[] files = await context.CallActivityAsync<string[]>(\"GetItems\", root);\nTask<long>[] tasks = files\n    .Select(f => context.CallActivityAsync<long>(\"ProcessItem\", f))\n    .ToArray();\nlong[] results = await Task.WhenAll(tasks);   // fan-in\nreturn results.Sum();",
+      "pitfalls": [
+        "Orchestrator code must be deterministic and replay-safe: schedule activities instead of doing I/O, clocks or Guid.NewGuid() in the orchestrator.",
+        "Fanning out over an unbounded collection grows the orchestration history; page or throttle the split.",
+        "Task.WhenAll fails fast while the remaining activities keep running - decide explicitly whether to cancel or compensate.",
+        "Awaiting each call inside the loop serialises the fan-out and removes the reason to use an orchestrator."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-fan-in-fan-out"
+      ]
+    }
+  ],
+  "default_variant": "linq-selectmany-chunk"
+}

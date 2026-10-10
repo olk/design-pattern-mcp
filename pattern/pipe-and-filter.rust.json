@@ -1,0 +1,60 @@
+{
+  "pattern": "pipe-and-filter",
+  "language": "rust",
+  "support": "native",
+  "idiom_name": "src.iter().map(..).filter(..).collect() / for_each",
+  "implementation_notes": "The Iterator trait is the stage interface and its adapters (map, filter, flat_map, scan, take_while, peekable) are the filters; adapters are lazy, so the chain streams without intermediate allocation, and collect/fold/for_each are the terminal operations that drive it. Adapters are monomorphised so the chain compiles to roughly the fused loop, which is why the classic Filter and Pipe objects are unnecessary in-process. Use std::io adaptors (BufReader, Take, Chain) for byte streams, and futures Stream for stages that must await.",
+  "code_sketch": "let pipeline = lines\n    .map(|l| l.trim())              // stage 1\n    .filter(|l| !l.is_empty())      // stage 2\n    .map(Record::parse);            // still lazy: nothing runs yet\n\nfor rec in pipeline {               // terminal operation drives the chain\n    sink.write(&rec?)?;\n}",
+  "pitfalls": [
+    "Adapters borrow their source, so a chain over a temporary does not compile; collecting to fix it silently defeats the laziness - own the source or use into_iter().",
+    "Each adapter adds a monomorphised type, so returning a chain from a function needs impl Iterator<Item = _> or boxing, and deep chains produce long compiler diagnostics.",
+    "Iterator::map with a side-effecting closure is fine until the terminal operation is forgotten; nothing at all runs, and the compiler will not warn."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/book/ch13-02-iterators.html",
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "iterator-adapters",
+      "name": "Iterator adapter chain (lazy, zero-cost)",
+      "paradigm": "functional",
+      "min_standard": "Rust1.0",
+      "idiom_name": "src.iter().map(..).filter(..).collect() / for_each",
+      "implementation_notes": "The Iterator trait is the stage interface and its adapters (map, filter, flat_map, scan, take_while, peekable) are the filters; adapters are lazy, so the chain streams without intermediate allocation, and collect/fold/for_each are the terminal operations that drive it. Adapters are monomorphised so the chain compiles to roughly the fused loop, which is why the classic Filter and Pipe objects are unnecessary in-process. Use std::io adaptors (BufReader, Take, Chain) for byte streams, and futures Stream for stages that must await.",
+      "code_sketch": "let pipeline = lines\n    .map(|l| l.trim())              // stage 1\n    .filter(|l| !l.is_empty())      // stage 2\n    .map(Record::parse);            // still lazy: nothing runs yet\n\nfor rec in pipeline {               // terminal operation drives the chain\n    sink.write(&rec?)?;\n}",
+      "pitfalls": [
+        "Adapters borrow their source, so a chain over a temporary does not compile; collecting to fix it silently defeats the laziness - own the source or use into_iter().",
+        "Each adapter adds a monomorphised type, so returning a chain from a function needs impl Iterator<Item = _> or boxing, and deep chains produce long compiler diagnostics.",
+        "Iterator::map with a side-effecting closure is fine until the terminal operation is forgotten; nothing at all runs, and the compiler will not warn."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/book/ch13-02-iterators.html",
+        "https://doc.rust-lang.org/std/iter/trait.Iterator.html"
+      ]
+    },
+    {
+      "variant_id": "async-streams",
+      "name": "futures::Stream async stages over bounded channels",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.39",
+      "requires_features": [
+        "async"
+      ],
+      "idiom_name": "StreamExt combinators (map/filter/then) with tokio mpsc as the pipe",
+      "implementation_notes": "For asynchronous stages the futures crate supplies the Stream trait and StreamExt combinators (map, filter, then, buffered, chunks) that mirror iterator adapters but await each item, while a bounded tokio::sync::mpsc channel acts as the pipe and applies backpressure because send().await pauses when the buffer is full. Stages run as independent tasks, so this is the realization to use when items arrive from I/O or when stages should overlap; the synchronous iterator chain remains simpler, faster and easier to debug for pure computation.",
+      "code_sketch": "let (tx, rx) = tokio::sync::mpsc::channel::<Record>(64);   // bounded pipe\nlet mut stream = tokio_stream::wrappers::ReceiverStream::new(rx);\n\nwhile let Some(rec) = stream.next().await {   // StreamExt::next\n    if rec.valid() {\n        sink.send(rec.transform()).await?;    // awaits downstream backpressure\n    }\n}\ntx.send(record).await?;      // pauses when the channel is full",
+      "pitfalls": [
+        "An unbounded channel removes backpressure entirely and turns a fast producer into unbounded memory growth - prefer bounded send().await.",
+        "A dropped Receiver makes every send fail with SendError; stages must propagate that failure instead of retrying, and spawned stage tasks need their JoinHandles joined or aborted on shutdown.",
+        "Hand-written Stream implementations must be cancellation-safe; using async_stream or stream adapters avoids poll-state bugs that only appear when a task is cancelled mid-poll."
+      ],
+      "sources": [
+        "https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html",
+        "https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html"
+      ]
+    }
+  ],
+  "default_variant": "iterator-adapters"
+}

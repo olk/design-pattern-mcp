@@ -1,0 +1,53 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "sync.Map.LoadOrStore / map + sync.Mutex",
+  "implementation_notes": "Go's claim primitive is LoadOrStore: it returns the existing value and loaded=true when the key was present, or stores the given value and returns loaded=false - that false is the claim, in one operation. A plain map with a sync.Mutex works identically; sync.Map suits read-mostly, write-once key sets. Either is per-process, so it protects one replica only; the database variant takes over as soon as duplicates can outlive the process or several pods share the queue. Sweep entries by stored timestamp, because neither map has a TTL.",
+  "code_sketch": "var seen sync.Map // key -> time.Time\n\nfunc claim(id string) bool {\n    _, loaded := seen.LoadOrStore(id, time.Now())\n    return !loaded // false => another delivery already claimed this id\n}\n\nfunc (h *Handler) Handle(ctx context.Context, m Message) error {\n    if !claim(m.IdempotencyKey) { return h.ack(ctx, m) } // duplicate: absorb\n    return h.applyEffects(ctx, m)\n}",
+  "pitfalls": [
+    "LoadOrStore claims the key before the work is done: if processing fails permanently, the claim must be released or the retry is swallowed as a duplicate.",
+    "The in-process map is unbounded; sync.Map has no expiry, so a retention sweep over stored timestamps is mandatory.",
+    "Treating any database or store error as 'duplicate' is wrong: only a clean failed claim means duplicate, transient errors must return for redelivery."
+  ],
+  "sources": [
+    "https://pkg.go.dev/sync#Map.LoadOrStore"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sync-map-claim",
+      "name": "In-process claim with sync.Map.LoadOrStore",
+      "paradigm": "concurrent",
+      "implementation_notes": "Go's claim primitive is LoadOrStore: it returns the existing value and loaded=true when the key was present, or stores the given value and returns loaded=false - that false is the claim, in one operation. A plain map with a sync.Mutex works identically; sync.Map suits read-mostly, write-once key sets. Either is per-process, so it protects one replica only; the database variant takes over as soon as duplicates can outlive the process or several pods share the queue. Sweep entries by stored timestamp, because neither map has a TTL.",
+      "code_sketch": "var seen sync.Map // key -> time.Time\n\nfunc claim(id string) bool {\n    _, loaded := seen.LoadOrStore(id, time.Now())\n    return !loaded // false => another delivery already claimed this id\n}\n\nfunc (h *Handler) Handle(ctx context.Context, m Message) error {\n    if !claim(m.IdempotencyKey) { return h.ack(ctx, m) } // duplicate: absorb\n    return h.applyEffects(ctx, m)\n}",
+      "pitfalls": [
+        "LoadOrStore claims the key before the work is done: if processing fails permanently, the claim must be released or the retry is swallowed as a duplicate.",
+        "The in-process map is unbounded; sync.Map has no expiry, so a retention sweep over stored timestamps is mandatory.",
+        "Treating any database or store error as 'duplicate' is wrong: only a clean failed claim means duplicate, transient errors must return for redelivery."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync#Map.LoadOrStore"
+      ],
+      "min_standard": "Go1.9",
+      "idiom_name": "sync.Map.LoadOrStore / map + sync.Mutex"
+    },
+    {
+      "variant_id": "db-unique-claim",
+      "name": "Database claim with INSERT ... ON CONFLICT DO NOTHING",
+      "paradigm": "oo",
+      "implementation_notes": "The durable claim: a claim table with a UNIQUE key, where `INSERT ... ON CONFLICT DO NOTHING` (PostgreSQL, or INSERT OR IGNORE on SQLite) plus Result.RowsAffected() == 1 from database/sql is the atomic check-and-claim, and the business write joins the same transaction. Choose it whenever redeliveries can outlive the process or competing consumers (several pods) share the queue; the affected-rows check is the only reliable duplicate signal.",
+      "code_sketch": "res, err := tx.ExecContext(ctx,\n    `INSERT INTO seen(id, at) VALUES($1, now()) ON CONFLICT (id) DO NOTHING`, m.IdempotencyKey)\nif err != nil { return err }\nif n, err := res.RowsAffected(); err != nil || n == 0 {\n    return tx.Rollback()                       // duplicate: absorb\n}\nif err := applyEffects(ctx, tx, m); err != nil { return err }\nreturn tx.Commit()",
+      "pitfalls": [
+        "RowsAffected() == 0 is only meaningful for the claim insert; check it before the business writes reuse the same transaction.",
+        "A failed INSERT for any other reason (constraint, connection) must not be read as 'already processed'."
+      ],
+      "sources": [
+        "https://pkg.go.dev/database/sql",
+        "https://www.postgresql.org/docs/current/sql-insert.html"
+      ],
+      "idiom_name": "database/sql + unique index with ON CONFLICT"
+    }
+  ],
+  "default_variant": "sync-map-claim"
+}

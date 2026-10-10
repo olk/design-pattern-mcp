@@ -1,0 +1,75 @@
+{
+  "pattern": "structured-concurrency",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::jthread fan-out + std::stop_token (destructor joins at scope exit)",
+  "implementation_notes": "C++20 std::jthread is the language-level scope: its destructor requests stop and joins, so declaring the children as local jthreads (or a std::vector<std::jthread>) makes the enclosing block the join point and no detached thread can outlive it. Cancellation is cooperative through std::stop_token: give the children one shared stop_source's token so a failure or an external cancel can request_stop() across the whole group. For fixed subtrees std::async futures (C++11) or C++26 std::execution when_all are the alternatives; without C++20 the classic hand-written thread vector plus join loop remains.",
+  "code_sketch": "std::stop_source scope;\nstd::vector<std::jthread> kids;\nfor (auto& url : urls)\n    kids.emplace_back([&, st = scope.get_token()] { fetch(url, st); });\n// on any failure: scope.request_stop();\n// scope exit: every destructor requests stop, then joins",
+  "pitfalls": [
+    "A child that never inspects its stop_token turns scope exit into an unbounded wait; blocking calls must be made interruptible or bounded.",
+    "Each jthread owns a private stop_source, so parent-to-children cancellation needs one shared stop_source whose token is captured by every child.",
+    "An exception escaping a jthread's function calls std::terminate - collect failures in shared state or promises instead of throwing across the thread boundary."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/jthread"
+  ],
+  "variants": [
+    {
+      "variant_id": "jthread-stop-token",
+      "name": "std::jthread fan-out + std::stop_token (C++20 default)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "idiom_name": "std::jthread fan-out + std::stop_token (destructor joins at scope exit)",
+      "implementation_notes": "C++20 std::jthread is the language-level scope: its destructor requests stop and joins, so declaring the children as local jthreads (or a std::vector<std::jthread>) makes the enclosing block the join point and no detached thread can outlive it. Cancellation is cooperative through std::stop_token: give the children one shared stop_source's token so a failure or an external cancel can request_stop() across the whole group. For fixed subtrees std::async futures (C++11) or C++26 std::execution when_all are the alternatives; without C++20 the classic hand-written thread vector plus join loop remains.",
+      "code_sketch": "std::stop_source scope;\nstd::vector<std::jthread> kids;\nfor (auto& url : urls)\n    kids.emplace_back([&, st = scope.get_token()] { fetch(url, st); });\n// on any failure: scope.request_stop();\n// scope exit: every destructor requests stop, then joins",
+      "pitfalls": [
+        "A child that never inspects its stop_token turns scope exit into an unbounded wait; blocking calls must be made interruptible or bounded.",
+        "Each jthread owns a private stop_source, so parent-to-children cancellation needs one shared stop_source whose token is captured by every child.",
+        "An exception escaping a jthread's function calls std::terminate - collect failures in shared state or promises instead of throwing across the thread boundary."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    },
+    {
+      "variant_id": "std-async-futures",
+      "name": "std::async futures (C++11 classic)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::async(launch::async, ...) futures joined via get()",
+      "implementation_notes": "The pre-C++20 realization: launch each child with std::async(std::launch::async, ...); the returned std::future owns the child, and a waiting get() - or the destruction of the last future reference - joins it before the scope ends. There is no automatic sibling cancellation, so add a shared std::atomic<bool> stop flag that children poll, or bound each child so the join cannot stall. Choose when the toolchain predates C++20; prefer jthread where it is available.",
+      "code_sketch": "std::atomic<bool> stop{false};\nstd::vector<std::future<Result>> fs;\nfor (auto& url : urls)\n    fs.push_back(std::async(std::launch::async, fetch, url, std::ref(stop)));\nfor (auto& f : fs) results.push_back(f.get());   // join every child",
+      "pitfalls": [
+        "Calling std::async without an explicit launch::async policy may defer execution to get(), silently serializing the 'concurrent' subtasks.",
+        "Dropping a future whose task has not finished blocks in the destructor at an arbitrary point; keep every future alive until the scope's join loop.",
+        "Exceptions surface only at get(), so an unjoined future hides both its result and its failure."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async"
+      ]
+    },
+    {
+      "variant_id": "execution-when-all",
+      "name": "C++26 std::execution when_all + asynchronous scopes (senders)",
+      "paradigm": "concurrent",
+      "min_standard": "C++26",
+      "requires_features": [
+        "senders",
+        "asynchronous scopes"
+      ],
+      "idiom_name": "std::execution::when_all / counting_scope",
+      "implementation_notes": "The sender/receiver model turns the scope into a value: when_all joins a fixed group of senders into one sender that can only complete after every child has stopped, and std::execution's asynchronous scopes (scope_token/counting_scope) tie dynamically spawned work to a scope so it cannot be torn down while registered operations exist. Cancellation travels as set_stopped together with the stop tokens in each sender's environment. Choose this when the codebase is already sender-based; otherwise the jthread form is simpler.",
+      "code_sketch": "namespace ex = std::execution;\nauto work = ex::when_all(\n    ex::starts_on(pool, ex::just() | ex::then(fetch_user)),\n    ex::starts_on(pool, ex::just() | ex::then(fetch_order)));\nauto [user, order] = std::this_thread::sync_wait(std::move(work)).value();  // joins",
+      "pitfalls": [
+        "Senders are lazy: nothing runs until start/sync_wait, so a forgotten sender is silent omitted work rather than a compiler error.",
+        "when_all is only as cancellable as its children - stop tokens must be plumbed through the sender environment for set_stopped to reach the siblings.",
+        "Dynamic (unbounded) child sets need a counting scope; when_all only joins the senders named statically."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/execution"
+      ]
+    }
+  ],
+  "default_variant": "jthread-stop-token",
+  "version": "1.0"
+}

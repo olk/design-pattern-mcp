@@ -1,0 +1,63 @@
+{
+  "pattern": "singleflight",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "dict[key, asyncio.Task] guarded by asyncio.Lock",
+  "implementation_notes": "asyncio runs one thread, so the check-and-insert into a dict is atomic as long as no await separates them; the idiom is a dict from key to the in-flight Task (or a Future created with loop.create_future()) plus, when the section before the insert can await, an asyncio.Lock around it. Task is the shareable completion handle: many coroutines may await the same task and its result or exception is memoised for all of them; a done callback or a finally in the wrapper removes the key so only in-flight work is retained. The language still does not provide the registry itself, which is why this is an idiom rather than a library primitive.",
+  "code_sketch": "_inflight = {}                                  # key -> asyncio.Task\n\nasync def load(key: str, fetch):\n    task = _inflight.get(key)\n    if task is not None:\n        return await task                       # join the flight\n    task = asyncio.create_task(fetch(key))      # created before any await\n    _inflight.setdefault(key, task)             # single-threaded: no await here\n    try:\n        return await task\n    finally:\n        if _inflight.get(key) is task:\n            del _inflight[key]                  # forget on completion",
+  "pitfalls": [
+    "Create the task synchronously: if any await sits between the lookup and the insert, two coroutines can both miss and both start the work.",
+    "Delete the entry when the task completes, and delete conditionally (only if the stored task is still the same object) so a late completion cannot evict a newer flight.",
+    "An exception retrieved by nobody raises 'Task exception was never retrieved'; retrieving the exception is part of the contract, and every waiter sees the same one.",
+    "Cancelling a waiter's await does not cancel the shared task - but wrapping the shared task in a per-caller asyncio.wait_for cancels it for everyone; give waiters a race instead.",
+    "The registry is per event loop: work handed to threads or another loop needs its own registry, otherwise entries mix across loops."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://docs.python.org/3/library/asyncio-sync.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "asyncio-future-map",
+      "name": "asyncio task map",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "idiom_name": "dict[key, asyncio.Task] guarded by asyncio.Lock",
+      "implementation_notes": "asyncio runs one thread, so the check-and-insert into a dict is atomic as long as no await separates them; the idiom is a dict from key to the in-flight Task (or a Future created with loop.create_future()) plus, when the section before the insert can await, an asyncio.Lock around it. Task is the shareable completion handle: many coroutines may await the same task and its result or exception is memoised for all of them; a done callback or a finally in the wrapper removes the key so only in-flight work is retained. The language still does not provide the registry itself, which is why this is an idiom rather than a library primitive.",
+      "code_sketch": "_inflight = {}                                  # key -> asyncio.Task\n\nasync def load(key: str, fetch):\n    task = _inflight.get(key)\n    if task is not None:\n        return await task                       # join the flight\n    task = asyncio.create_task(fetch(key))      # created before any await\n    _inflight.setdefault(key, task)             # single-threaded: no await here\n    try:\n        return await task\n    finally:\n        if _inflight.get(key) is task:\n            del _inflight[key]                  # forget on completion",
+      "pitfalls": [
+        "Create the task synchronously: if any await sits between the lookup and the insert, two coroutines can both miss and both start the work.",
+        "Delete the entry when the task completes, and delete conditionally (only if the stored task is still the same object) so a late completion cannot evict a newer flight.",
+        "An exception retrieved by nobody raises 'Task exception was never retrieved'; retrieving the exception is part of the contract, and every waiter sees the same one.",
+        "Cancelling a waiter's await does not cancel the shared task - but wrapping the shared task in a per-caller asyncio.wait_for cancels it for everyone; give waiters a race instead.",
+        "The registry is per event loop: work handed to threads or another loop needs its own registry, otherwise entries mix across loops."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://docs.python.org/3/library/asyncio-sync.html"
+      ]
+    },
+    {
+      "variant_id": "thread-future-map",
+      "name": "concurrent.futures map under a threading.Lock",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.2",
+      "idiom_name": "threading.Lock + dict[key, concurrent.futures.Future]",
+      "implementation_notes": "In threaded code the same registry holds concurrent.futures.Future objects: the first caller registers a future under the lock and submits the work to a ThreadPoolExecutor, later callers take the future out and call result(), which blocks until completion and returns the value or re-raises the stored exception for each of them. set_result/set_exception is what replaces the classic broadcast - any number of threads may block in result(). Hold the lock only for the registry access, never across the computation, or coalescing degrades into global serialization.",
+      "code_sketch": "_lock = threading.Lock(); _inflight = {}; _pool = ThreadPoolExecutor()\n\ndef load(key, fetch):\n    with _lock:\n        fut = _inflight.get(key)\n        if fut is None:\n            fut = _pool.submit(fetch, key)              # the leader runs once\n            _inflight[key] = fut                        # register before publishing\n            fut.add_done_callback(lambda f, k=key: _forget(k, f))\n    return fut.result()                                 # shared value or error\n\ndef _forget(key, fut):\n    with _lock: _inflight.pop(key, None)                # forget on completion",
+      "pitfalls": [
+        "Hold the registry lock only for map access; computing under the lock makes coalescing indistinguishable from global serialization.",
+        "concurrent.futures.Future memoises its result or exception and result() re-raises the same exception object to every waiter; sharing a mutable result corrupts the shared answer.",
+        "Publish through the future's completion contract (submit, or set_result/set_exception when the work runs elsewhere) and remove the entry on completion even on failure, or the key stays in flight forever.",
+        "The registry is per process and per interpreter: forked workers and other processes do not share it, so multi-process servers still duplicate per worker.",
+        "A future whose waiters have all left keeps the error unobserved; retrieve it explicitly so suppressed failures are still logged."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/concurrent.futures.html",
+        "https://docs.python.org/3/library/threading.html"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-future-map"
+}

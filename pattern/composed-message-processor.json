@@ -1,0 +1,187 @@
+{
+  "category": "workflow-messaging",
+  "name": "composed-message-processor",
+  "aliases": [
+    "map-reduce",
+    "split-route-aggregate",
+    "fan-out-fan-in"
+  ],
+  "intent": "Process a composite message end to end by splitting it into single-element parts, routing each part by its kind to the handler that fits it, and re-aggregating the part results - joined by a correlation identifier under an explicit completion policy - into the one reply the overall flow expects.",
+  "problem": "One message carries several heterogeneous elements - line items, batch records, document sections - each needing a different destination, protocol or format, yet the surrounding flow expects exactly one reply for the whole message: processing cannot stop at the split, and the caller must not be handed N independent results to correlate by itself.",
+  "context": "Applies in messaging solutions where a message is composite by nature (order with line items, batch with records, document with heterogeneous sections), where the per-element handlers already exist as separate endpoints, channels or worker types, and where the next stage wants one correlated answer. The realization ranges from in-process fan-out/fan-in (futures, coroutines, streams, task groups) to a brokered splitter channel, routed part channels and an aggregator keyed by correlation identifier.",
+  "benefits": [
+    "The composite keeps its meaning: the caller receives one aggregated reply, so splitting, routing and re-joining stay an implementation detail of a single logical processing step.",
+    "Heterogeneous parts are served by the handler that fits them instead of a branching mega-consumer: the routing table (or per-kind channel) stays declarative and a new element type becomes a new route.",
+    "Parts proceed independently and usually concurrently, so wall-clock time approaches the slowest part instead of the sum of all parts.",
+    "Completion is explicit: the flow continues only when the aggregate is ready, which keeps downstream stages (validation, confirmation, archiving) free of partial-message states.",
+    "Failure and retry policy is per part: a failed element can be retried or reported without replaying the whole composite, and the aggregator decides whether it aborts or tolerates the loss."
+  ],
+  "tradeoffs": [
+    "The aggregate is a synchronization barrier: total latency is bounded below by the slowest - or stuck - part, so one bad element holds the whole composite hostage. Tail latency grows with the number of parallel branches; any branch with high variance (slow I/O, retries, GC pauses) directly determines p99 end-to-end latency.",
+    "Partial-failure semantics must be invented per use case (fail the composite, aggregate what arrived, or aggregate with an error slot); the pattern itself supplies no answer. Fan-in delay compounds this: an error in one branch does not abort other branches, so the orchestrator waits for all or times out before deciding what to do.",
+    "Correlation state leaks into the message contract: every part must carry a correlation identifier plus its part count or index, so splitter and aggregator are coupled through message metadata. Address-isolation failures (shared return addresses without per-task correlation IDs) cause results to be attributed to the wrong composite.",
+    "Fan-out multiplies traffic: one composite becomes N routed messages, so channel capacity, store-and-forward requirements and per-part bookkeeping grow with the element count. Bounded parallelism prevents resource exhaustion but adds per-batch scheduling overhead.",
+    "Redelivery makes idempotency mandatory - duplicate parts are normal on real channels, and an aggregator that counts instead of de-duplicating will emit wrong composites. Batch acknowledgements worsen this: a crash between consumption and commit makes it unclear which records were safely handled.",
+    "Observability degrades: a fault can surface in the aggregator while its cause sits in a part handler, so the correlation key must be carried into logs, traces and the message history. Context merging (stitching parallel branch outputs) adds invisible LLM call or reduce-operation overhead that does not show up in branch traces.",
+    "For a cheap, homogeneous, single-process fan-in the whole apparatus (correlation state, completion policy, aggregation algorithm) is more machinery than a plain loop."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 8,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 7,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Splitter",
+      "responsibility": "Breaks the composite message into one message per element, stamps each part with the correlation identifier, its part index and the expected part count, and forwards the parts."
+    },
+    {
+      "role": "Part Router",
+      "responsibility": "Decides where each part must be processed (content-based rule, routing table or channel per part kind) and forwards it; it never processes the part itself."
+    },
+    {
+      "role": "Part Processor",
+      "responsibility": "Applies the element-specific logic of one part kind (service endpoint, handler, worker) and emits one result message per part, carrying the correlation identifier."
+    },
+    {
+      "role": "Aggregator",
+      "responsibility": "Buffers results by correlation identifier, decides when the composite is complete (all parts, a quorum, or a deadline) and applies the merge algorithm that produces the single outgoing message."
+    },
+    {
+      "role": "Correlation State",
+      "responsibility": "The per-composite bookkeeping - expected and received parts, part results, deadline - that makes routing decisions and completion decidable; it must be durable whenever parts cross a broker."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Order processing: one order message with N line items, each checked against the inventory system responsible for that item, with all checks merged into a validated order for the next step.",
+    "Document pipelines: a document whose sections are text, tables and images, routed to the respective extractors, with the partial extracts reassembled into one structured record.",
+    "Batch integration: a batch message fanned out to per-tenant or per-region loaders, where the job continues only after every loader reported its slice.",
+    "Distributed job execution: partition a work item (map), process partitions on a worker pool, reduce the partial results into the job report - the message-shaped form of map-reduce.",
+    "Settlement and clearing hubs: split a settlement file into instructions routed per bank or protocol, then merge the per-instruction statuses into one acknowledgement.",
+    "Financial trade pipelines: an incoming trade event split across risk validation, compliance checks, position calculators, and settlement services, with confirmation aggregated back before the trade record is committed.",
+    "Healthcare EDI batch processing: a batch of heterogeneous medical records (claims, lab results, prescriptions) routed to domain-specific validators and enrichers, then merged into a compliance-ready batch response.",
+    "Telecom CDR (Call Detail Record) processing: a CDR batch split by region, carrier or service type for rating, billing enrichment and fraud scoring, with results reconciled into a single billing record.",
+    "Kafka event-driven microservices: a order.created event triggering parallel fan-out to inventory, payment, notification, and analytics services with responses aggregated to confirm or reject the order.",
+    "Serverless workflow orchestration: an image processing job where one request fans out to parallel resize, watermark, and thumbnail generation functions with results merged before returning to the caller.",
+    "AWS Step Functions Distributed Map state: an array or S3 CSV input is split into child workflow executions capped by MaxConcurrency (default up to 10,000), each child processes one item, and the Map Run collects every child result into the single output the parent workflow continues with.",
+    "Azure Durable Functions fan-out/fan-in: an orchestrator function fans out one activity invocation per work item, awaits them all (Task.WhenAll / Promise.all) and returns the aggregated total - e.g. bytes uploaded across every file of a site backup - as the one orchestration result.",
+    "WSO2 Micro Integrator CMP route: an Iterate mediator splits a multi-request envelope by XPath, Switch and Call mediators route each sub-request to the endpoint that handles its kind, and an Aggregate mediator releases one reply once the completeCondition (messageCount) is satisfied."
+  ],
+  "avoid_when": [
+    "The elements must be processed strictly in order or the whole message is one transaction: a single handler (plus a Resequencer where order is scrambled) is simpler than split and re-join.",
+    "The parts are independent and nobody wants a combined answer: publish them and let each consumer own its outcome (Splitter alone) instead of building an aggregator.",
+    "The same request must reach several endpoints and any answer may be merged: that is Scatter-Gather - one request broadcast to many recipients - not a composite split into different parts.",
+    "Processing each element is cheap and homogeneous: one loop inside an ordinary consumer beats correlation state, completion policy and an aggregation algorithm.",
+    "The reply is allowed to be N independent messages with no correlation contract: the split is a fan-out, not a composed processor.",
+    "Strong atomic transactional consistency across all parts is required: the pattern's eventual-consistency nature cannot provide a single ACID transaction boundary across heterogeneous processors.",
+    "The organization cannot support reconciliation and observability: event-driven aggregation without per-branch latency SLOs, tracing, and failure budgets is self-harm in production."
+  ],
+  "language_files": {
+    "generic": "composed-message-processor.generic.json",
+    "c": "composed-message-processor.c.json",
+    "cplusplus": "composed-message-processor.cplusplus.json",
+    "csharp": "composed-message-processor.csharp.json",
+    "go": "composed-message-processor.go.json",
+    "java": "composed-message-processor.java.json",
+    "javascript": "composed-message-processor.javascript.json",
+    "kotlin": "composed-message-processor.kotlin.json",
+    "python": "composed-message-processor.python.json",
+    "ruby": "composed-message-processor.ruby.json",
+    "rust": "composed-message-processor.rust.json",
+    "scala": "composed-message-processor.scala.json",
+    "swift": "composed-message-processor.swift.json",
+    "typescript": "composed-message-processor.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "splitter",
+    "aggregator",
+    "content-based-router",
+    "correlation-identifier",
+    "resequencer",
+    "scatter-gather",
+    "process-manager",
+    "dead-letter-channel",
+    "claim-check"
+  ],
+  "anti_patterns": [
+    "Counting-only aggregator: it assumes exactly N results with no timeout, quorum or dead-letter path, so one lost part blocks the composite forever.",
+    "Routing after the fact: all parts are sent to one processing destination and the aggregator branches on part kind, re-creating the mega-consumer the split was meant to remove.",
+    "Correlation by content instead of an explicit identifier: parts that happen to look alike are merged into the wrong composite.",
+    "Re-splitting the aggregated reply for every downstream stage instead of handling it as one document, multiplying traffic for no benefit.",
+    "Fan-out without a bound: one composite element becomes one thread, task or request, and a large message melts the runtime or the downstream systems.",
+    "Aggregator as mini-monolith: centralizing all merge logic, field mapping, and domain decisions in one aggregation service creates ownership disputes and gravity that attracts exceptions until it becomes an unmaintainable coordination hub.",
+    "Silent partial failure: the composite returns successfully but a key result slot silently defaulted to null because the branch timed out, leaving downstream systems with an apparently-valid but incomplete result.",
+    "Semantic drift: source systems evolve independently and field names that stayed the same begin to carry different business semantics; the aggregator silently produces wrong results without crashing.",
+    "Over-fan-in memory pressure: millions of concurrent fan-in state machines tracking individual response states exhausts the aggregator's memory when a traffic spike triggers many simultaneous composites."
+  ],
+  "design_principles": [
+    "Separation of concerns: splitting, routing, processing and aggregating are four responsibilities with exactly one owner each.",
+    "Open/closed principle: a new element kind is a new route plus a new handler, not an edit to the aggregator or the splitter.",
+    "Explicit contracts over shared memory: correlation identifier, part index and part count travel with the message so completion is decidable without global state.",
+    "Single responsibility with idempotency by design: every part may arrive twice, so the aggregator must tolerate duplicates instead of assuming exactly-once delivery.",
+    "Bounded parallelism as a first-class concern: the fan-out ceiling (worker pool size, concurrency limit, per-composite part cap) must be configured explicitly, not left to emerge from the input.",
+    "Completion policy is a business decision: the choice between all-parts, quorum, or deadline-with-partial must be made explicit and visible in the aggregated output contract.",
+    "Observability is end-to-end: the correlation key must appear in every log line, trace span, and message history entry so that a stuck composite can be traced to the specific part that never returned."
+  ],
+  "best_practices": [
+    "Stamp correlation identifier, part index and expected part count on every part before it leaves the splitter; derive them, do not let handlers invent them.",
+    "Choose the completion policy explicitly - all parts, quorum, or deadline-with-partial - and make the aggregator's decision visible in the outgoing message.",
+    "Keep aggregator state durable when parts cross a broker, and expire incomplete composites via message expiration plus a dead-letter channel rather than leaking them.",
+    "Make part processing idempotent and retry individual parts; replaying the whole composite wastes work and multiplies duplicates.",
+    "Bound the fan-out (worker pool, concurrency limit, per-composite part cap); a ten-thousand-part composite is a batch job, not a message.",
+    "Instrument the correlation key end to end (log/trace field, message history) so a stuck composite can be traced to the part that never came back.",
+    "Set a total response budget (e.g., 800 ms end-to-end) and allocate per-branch sub-budgets with explicit timeouts; fast failure is kinder than slow uncertainty.",
+    "Add circuit breakers or fallbacks on each branch so that a slow or failing handler does not block the aggregator; include a stale-read tolerance and partial response behavior in the aggregator contract.",
+    "Track per-branch latency SLOs independently: each parallel path needs its own p99 target and failure budget because any branch's tail latency directly becomes the composite's tail latency.",
+    "In streaming or event-driven deployments, model the aggregator as a read-side construct that composes data for a use case; avoid giving it write-side invariants that belong to other bounded contexts.",
+    "For Kafka or brokered deployments, wrap consume-transform-produce in a transaction and maintain application-level deduplication using the correlation ID as a key; the two-layer approach (broker exactly-once plus app-level idempotency) provides defense in depth.",
+    "Distinguish between fan-out for parallelism (independent sub-tasks where results must be merged) and Scatter-Gather (one request broadcast where any response may be returned); conflating them leads to wrong aggregation semantics.",
+    "Implement periodic and event-triggered reconciliation for event-built aggregate views: compare materialized records against source-of-truth snapshots and issue targeted corrections.",
+    "Use structured logs, distributed tracing (e.g., OpenTelemetry), and per-field freshness metadata so that semantic drift and partial failures are detectable before they become incidents."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (Addison-Wesley, 2003) - Composed Message Processor (Message Routing chapters; splitter, router and aggregator combined).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/DistributionAggregate.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/Sequencer.html",
+    "Apache Camel Composed Message Processor: https://camel.apache.org/components/4.22.x/eips/composed-message-processor.html",
+    "Spring Integration Splitter and Aggregator Reference: https://docs.enterprise.spring.io/spring-integration/reference/splitter.html and https://docs.enterprise.spring.io/spring-integration/reference/aggregator.html",
+    "Dean & Ghemawat, MapReduce: Simplified Data Processing on Large Clusters (Google, 2004): https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/",
+    "ADHDecode, Fan-Out and Fan-In Patterns — How It Works (2026): https://adhdecode.com/message-queues/messaging-patterns-and-integration/fan-out-fan/",
+    "NILUS Consulting, Fan-Out/Fan-In Aggregation in Microservices (2026): https://www.nilus.be/blog/fan-outfan-in_aggregation_in_microservices/",
+    "Software Patterns Lexicon, Fan-Out/Fan-In Workflows (2026): https://softwarepatternslexicon.com/serverless-patterns-and-anti-patterns/workflows/fan-out-fan-workflows/",
+    "Moltbook, Fan-out/fan-in breaks without address isolation (2026): https://moltbook.com/post/75f3f58a-da7e-40e1-9c00-ff263a8a56cc",
+    "Tammadge, Part 2: Sagas, Fan-In, and Correlation: Solving the Hard Problems of Eventual Consistency in EDA (2026): https://danieltammadge.com/2026/03/part-2-sagas-fan-in-and-correlation-solving-the-hard-problems-of-eventual-consistency-in-eda/",
+    "Pan, The Parallelism Trap in Agentic Pipelines: When Fan-Out Makes Latency Worse (2026): https://tianpan.co/blog/2026-05-02/parallelism-trap-agentic-pipelines-fan-out-latency",
+    "AWS Step Functions, Map workflow state - Inline/Distributed modes, MaxConcurrency, Map Run result collection: https://docs.aws.amazon.com/step-functions/latest/dg/state-map.html",
+    "Microsoft Learn, Fan-Out/Fan-In pattern scenarios in Azure Durable Functions and Durable Task SDKs: https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-fan-in-fan-out",
+    "WSO2 Integrator MI, Composed Message Processor - Iterate + Switch/Call + Aggregate mediators: https://mi.docs.wso2.com/en/4.5.0/learn/enterprise-integration-patterns/message-routing/composed-message-processor/",
+    "Temporal, Fan-Out with Child Workflows - chunked fan-out, in-flight child limits, per-child failure handling: https://docs.temporal.io/design-patterns/fanout-child-workflows",
+    "Dean & Barroso, The Tail at Scale (CACM, 2013) - why per-leaf tail latency amplifies at the aggregator as 1-(1-p)^n: https://research.google/pubs/the-tail-at-scale/",
+    "NILUS Consulting, API Aggregation Pitfalls in Microservices - fan-in bottlenecks, retry amplification, ownership drift: https://www.nilus.be/blog/api_aggregation_pitfalls_in_microservices/"
+  ],
+  "related_patterns_notes": {
+    "map-reduce": "map-reduce",
+    "event-streaming": "event-streaming"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "pattern": "rate-limiting",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "thread-safe token-bucket class over std::chrono::steady_clock",
+  "implementation_notes": "There is no rate limiter in the C++ standard library, so the classic structure is written by hand around std::chrono::steady_clock - the monotonic clock cppreference describes as most suitable for measuring intervals - with a std::mutex and a token count refilled by elapsed time. Two call shapes fall out: a non-blocking try_acquire that refuses and lets the caller answer 429 or back-pressure, and a blocking acquire that waits on a condition variable until the deficit clears. For asynchronous I/O stacks the same policy is realized with Boost.Asio timers instead (see the sibling variant); the blocking class remains justified when the limiter is shared by threads rather than by completion handlers.",
+  "code_sketch": "class TokenBucket {\n  double tokens_, rate_; int burst_; std::mutex m_;\n  std::chrono::steady_clock::time_point last_ = std::chrono::steady_clock::now();\npublic:\n  bool try_acquire(double cost = 1.0) {\n    std::lock_guard<std::mutex> lk(m_);\n    auto now = std::chrono::steady_clock::now();\n    tokens_ = std::min(tokens_ + rate_ * std::chrono::duration<double>(now - last_).count(), double(burst_));\n    last_ = now;\n    if (tokens_ < cost) return false;        // caller: 429 / shed\n    tokens_ -= cost; return true;\n  }\n};",
+  "pitfalls": [
+    "std::chrono::system_clock is not monotonic; refills computed from it jump when the wall clock is stepped.",
+    "Tokens must be capped at the burst size after every refill, otherwise an idle bucket accumulates unbounded credit.",
+    "A blocking acquire on a condition variable must re-check its predicate and recompute the refill after every wake-up, including spurious ones.",
+    "Floating-point token counts under heavy contention accumulate drift; integer tokens with a fixed refill tick avoid it."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/chrono/steady_clock",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "steady-clock-token-bucket",
+      "name": "Hand-written token bucket over std::chrono::steady_clock",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "thread-safe token-bucket class over std::chrono::steady_clock",
+      "implementation_notes": "There is no rate limiter in the C++ standard library, so the classic structure is written by hand around std::chrono::steady_clock - the monotonic clock cppreference describes as most suitable for measuring intervals - with a std::mutex and a token count refilled by elapsed time. Two call shapes fall out: a non-blocking try_acquire that refuses and lets the caller answer 429 or back-pressure, and a blocking acquire that waits on a condition variable until the deficit clears. For asynchronous I/O stacks the same policy is realized with Boost.Asio timers instead (see the sibling variant); the blocking class remains justified when the limiter is shared by threads rather than by completion handlers.",
+      "code_sketch": "class TokenBucket {\n  double tokens_, rate_; int burst_; std::mutex m_;\n  std::chrono::steady_clock::time_point last_ = std::chrono::steady_clock::now();\npublic:\n  bool try_acquire(double cost = 1.0) {\n    std::lock_guard<std::mutex> lk(m_);\n    auto now = std::chrono::steady_clock::now();\n    tokens_ = std::min(tokens_ + rate_ * std::chrono::duration<double>(now - last_).count(), double(burst_));\n    last_ = now;\n    if (tokens_ < cost) return false;        // caller: 429 / shed\n    tokens_ -= cost; return true;\n  }\n};",
+      "pitfalls": [
+        "std::chrono::system_clock is not monotonic; refills computed from it jump when the wall clock is stepped.",
+        "Tokens must be capped at the burst size after every refill, otherwise an idle bucket accumulates unbounded credit.",
+        "A blocking acquire on a condition variable must re-check its predicate and recompute the refill after every wake-up, including spurious ones.",
+        "Floating-point token counts under heavy contention accumulate drift; integer tokens with a fixed refill tick avoid it."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/chrono/steady_clock",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    },
+    {
+      "variant_id": "asio-timer-pacing",
+      "name": "Boost.Asio steady_timer pacing",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "boost-asio"
+      ],
+      "idiom_name": "boost::asio::steady_timer expires_after + async_wait",
+      "implementation_notes": "In an asynchronous client the limiter is a timer rather than a counter: before issuing a request to a quota'd dependency, expires_after the remaining interval and async_wait, then resume from the completion handler on the io_context. The timer runs on the same steady_clock basis, so the pacing is immune to wall-clock steps; the Boost docs note that changing an active timer's expiry cancels pending waits and that the handler then observes operation_aborted, which matters when the wait is re-armed from inside the handler.",
+      "code_sketch": "boost::asio::steady_timer timer(io);\nvoid send() {\n  timer.expires_after(std::chrono::milliseconds(10));   // ~100 req/s\n  timer.async_wait([&](boost::system::error_code ec) {\n    if (ec != boost::asio::error::operation_aborted) issue_request();\n  });\n}",
+      "pitfalls": [
+        "Re-arming the timer cancels pending waits and surfaces operation_aborted in the old handler; treating every error as fatal drops the pacing loop.",
+        "Blocking inside the completion handler stalls the io_context thread and destroys the rate control it was meant to enforce."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    }
+  ],
+  "default_variant": "steady-clock-token-bucket"
+}

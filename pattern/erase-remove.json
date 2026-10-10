@@ -1,0 +1,210 @@
+{
+  "category": "concurrency-resilience",
+  "name": "erase-remove",
+  "aliases": [
+    "remove-erase",
+    "erase-remove idiom"
+  ],
+  "intent": "Remove every element of a sequence that meets a condition in a single compaction pass - moving each survivor at most once - instead of deleting positions one by one and shifting the tail after every deletion.",
+  "problem": "A sequence must drop all elements matching a predicate or value - all of them, not the first match - and the removal should cost one pass rather than a tail shift per deleted element. Deleting each match with the container's positional erase is linear per removal, quadratic over k removals, and erasing while iterating invalidates iterators or silently skips elements; the decision is whether to compact the survivors in place and release the tail once, or to build a new sequence instead.",
+  "context": "In-place batch removal from a sequence that owns its storage, keeps order, and can shorten its length - dynamic arrays and vectors, strings and byte buffers, slices carried with a separate length, ring buffers. The predicate is cheap relative to moving an element, the survivors' relative order matters, and the code either shares the container with other references or cares about avoiding a second allocation. It is a value-level idiom: the decision is local to one container and one pass, not a structure spanning components, and it exists wherever the language offers both a compaction step and a way to release the tail - or a library call that fuses them.",
+  "benefits": [
+    "One pass instead of one shift per removal: every surviving element is moved at most once, so k removals cost O(n) element moves instead of O(n*k).",
+    "Order is preserved (the compaction is stable), which keeps indices, iteration order and downstream semantics intact - unlike swap-and-pop removal, which reorders the survivors.",
+    "The iterator-invalidation trap disappears: the compaction returns the new logical end and the container releases the tail once, in place of erase-while-iterating loops that invalidate iterators or skip elements.",
+    "Element lifetime is handled by construction in the library forms: erased elements are destroyed, the tail can be zeroed so removed references do not linger, and draining variants (extract_if-style APIs) hand the removed values back instead of dropping them.",
+    "Cache-friendly and allocation-free: survivors are written to the front of the existing buffer, so the whole operation stays inside memory that is already hot instead of allocating a fresh sequence and copying every survivor into it.",
+    "The predicate is the only policy: the same compaction serves value removal, predicate removal, character cleanup, and deduplication after a sort (sort + unique + erase)."
+  ],
+  "tradeoffs": [
+    "The two-step form is easy to get subtly wrong: the compaction step does not shorten the sequence, so omitting the erase leaves the removed elements in place, and the single-argument erase overload compiles while erasing exactly one element.",
+    "It only pays in contiguous storage: on a linked list or a node-based or hash container the per-element erase is already cheap and compaction adds a full scan for nothing.",
+    "Compaction moves every survivor that follows the first removed element, which is more work than a single swap with the last element when order does not matter.",
+    "Shrinking the logical size does not release capacity: the buffer stays as large as before, so freeing memory is a separate decision (shrink-to-fit, TrimExcess, keepingCapacity:).",
+    "Manual realizations leave copies of the removed elements in the tail until it is zeroed: stale pointers become double-free or use-after-free bugs, and values can remain readable in memory after they were 'removed'.",
+    "Predicate polarity differs across ecosystems - remove_if removes where the predicate returns true, retain/keep_if keep where it returns true - and getting it backwards fails silently with the complement of the intended set.",
+    "Draining variants introduce their own failure mode: an extract-if iterator that is dropped before exhaustion leaves the untouched elements in the container, which reads like 'extract' but behaves like 'retain'."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 4,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 9,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Sequence (range)",
+      "responsibility": "Owns the elements and the storage; only it can change the number of elements, and it decides whether the removed tail is destroyed, zeroed, or merely dropped from the count."
+    },
+    {
+      "role": "Predicate (or target value)",
+      "responsibility": "Decides which elements go: an equality test for a value, a user predicate for remove_if/retain/RemoveAll-style APIs. It is the operation's only policy, runs once per element, and must not mutate the sequence."
+    },
+    {
+      "role": "Compaction step",
+      "responsibility": "Scans the range once, moves each retained element down to the write position, and returns the new logical end - it partitions the range but leaves the size and the storage of the container untouched."
+    },
+    {
+      "role": "Erase (release) step",
+      "responsibility": "Takes the new end from the compaction step and shortens the sequence in one go - range erase, truncate, size update - destroying the removed elements or zeroing the tail so their resources and references are released."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Sweeping an in-memory collection: dropping expired sessions, stale cache rows or disconnected peers from a contiguous store kept for cache-friendly scans.",
+    "Frame and tick loops: removing dead entities, spent particles or finished projectiles from a contiguous entity store before the next update - the canonical performance and data-locality use.",
+    "Buffer cleanup before shipping or persisting: dropping invalid records from a batch, blank entries from a log buffer, or control characters from a string.",
+    "Deduplication pipelines: sort (or keep the sequence sorted) and then drop adjacent duplicates in one pass (unique + erase, Vec::dedup, uniq!).",
+    "Large arrays where a copy-out filter would double peak memory or break identity - a struct array that other components hold pointers or references into.",
+    "Log and event trimming: keeping only the recent or relevant entries while preserving order, without abandoning the existing allocation.",
+    "ECS archetype transitions: when an entity's component set changes and it must move to a different archetype storage block, the source archetype compacts around the removed component slots before the next system runs - functionally similar to erase-remove at the archetype level.",
+    "Network connection tables: pruning closed or timed-out connections from a vector of struct Connection entries while preserving the order of live handles referenced by other subsystems.",
+    "Particle system culling: in a physics or rendering loop, removing dead particles from a contiguous particle buffer in-place without invalidating indices used by particle references elsewhere in the frame.",
+    "Parser and lexer token streams: stripping whitespace, comments or error tokens from a token slice before handing it to the next compilation pass, without allocating a fresh slice.",
+    "Database row buffers: removing null or default fields from an in-memory row batch before serialisation, or dropping rows that failed constraint checks before a bulk insert.",
+    "Audio sample buffers: removing silence or clips above a threshold from a sample buffer in a DSP pipeline, preserving the relative sample order for downstream processing.",
+    "Compiler pass and IR pipelines (LLVM): llvm::erase_if in llvm/ADT/STLExtras.h is the codebase-wide compaction call for dropping resolved passes, dead instructions and consumed diagnostics from vectors of pointers - LLVM's fused spelling of the idiom predating std::erase_if.",
+    "Browser process tables and message queues (Chromium): base::Erase / base::EraseIf in base/stl_util.h implement the idiom per container so Chromium compacts vectors of pending tasks, observers and connection entries without hand-written erase(std::remove(...)) pairs at every call site."
+  ],
+  "avoid_when": [
+    "One or two elements need to go and their positions are known: a single positional erase (or swap with the last element and pop) is simpler and cheaper than a compaction pass.",
+    "The sequence is a linked list or another node-based container (std::list, std::map, a queue of tasks): erase the nodes you mean, per element - compaction is pointless there.",
+    "A new sequence is fine: build it with a filter or comprehension (Array.prototype.filter, a list comprehension, a streaming collect), which is one pass and usually clearer. Prefer the in-place form only when identity, capacity or peak memory matter.",
+    "Order does not matter and the container is a contiguous array: swap the removed element with the last one and pop, which is O(1) per removal and moves at most one element.",
+    "Membership is what you actually have - a set or hash map: remove by key (O(1) per entry) instead of scanning and compacting.",
+    "The container is immutable or shared across threads without synchronisation: producing a filtered new value (copy-on-write style) is safer than mutating a shared sequence."
+  ],
+  "language_files": {
+    "generic": "erase-remove.generic.json",
+    "c": "erase-remove.c.json",
+    "cplusplus": "erase-remove.cplusplus.json",
+    "csharp": "erase-remove.csharp.json",
+    "go": "erase-remove.go.json",
+    "java": "erase-remove.java.json",
+    "javascript": "erase-remove.javascript.json",
+    "kotlin": "erase-remove.kotlin.json",
+    "python": "erase-remove.python.json",
+    "ruby": "erase-remove.ruby.json",
+    "rust": "erase-remove.rust.json",
+    "scala": "erase-remove.scala.json",
+    "swift": "erase-remove.swift.json",
+    "typescript": "erase-remove.typescript.json"
+  },
+  "paradigm": [
+    "procedural",
+    "data-oriented"
+  ],
+  "scope": "value",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "shrink-to-fit",
+    "copy-on-write",
+    "iterator",
+    "data-locality",
+    "deforestation",
+    "transducer"
+  ],
+  "anti_patterns": [
+    "Calling the compaction algorithm alone and assuming the sequence shrank - std::remove 'removes' nothing: the elements stay in the container, the size is unchanged, and only moved-from values sit behind the new logical end.",
+    "Erase-in-a-loop: it = c.erase(it) or removeAt(i) in a loop shifts the whole tail once per removed element and turns a linear job into O(n*k), while a forward index loop that erases skips elements outright.",
+    "Feeding the algorithm's return value to the single-argument erase overload: it compiles and erases exactly one element, silently leaving the rest of the matches in place.",
+    "Building a new collection in a hot path (filter plus reassignment) and calling it erase-remove: it allocates, breaks identity and aliases, and doubles peak memory - a copy-out filter is a different decision.",
+    "Compacting a node-based container (std::list with std::remove then erase) where the container's own remove_if would unlink the nodes directly.",
+    "Treating compaction as a shrink: capacity is untouched, so code that believes the buffer was released keeps the memory it thinks it gave back."
+  ],
+  "design_principles": [
+    "Separate policy from mechanism: the predicate decides what stays; the compaction and release machinery decides how survivors move and how the tail is freed.",
+    "Respect the container's invariant: only the owning container may change the number of elements - the algorithm works on an iterator pair precisely because it does not know the storage.",
+    "Optimise without changing semantics: one pass, one tail release, stable order, destroyed elements; speed must not be bought with reordering or with leaving removed values alive.",
+    "Do not hand-roll what the standard library already provides - if the platform has a fused call, state the intent and let the library own the mechanism.",
+    "Make the cost visible in the interface: document the linear pass and the single tail release, because callers otherwise reason about 'erase' as if it were cheap per call."
+  ],
+  "best_practices": [
+    "Always pair the compaction with the release step in one statement or one helper, and prefer a fused library call (std::erase_if, List<T>.RemoveAll, MutableList.removeAll, Vec::retain, removeAll(where:), slices.DeleteFunc) where the toolchain has one.",
+    "Prefer the container's own member when it has one (std::list::remove_if, Vec::retain, List<T>.RemoveAll, MutableList.removeAll, removeAll(where:)) - it knows how to release its own storage.",
+    "Use stable compaction when order matters; when it does not, swap-with-last plus pop is cheaper.",
+    "Zero, clear or destroy the released tail explicitly in manual realizations so removed pointers cannot be reused by accident and removed values do not survive the removal.",
+    "Never erase while iterating a contiguous container; if a loop is unavoidable, iterate backwards or consume the iterator that erase returns.",
+    "Check the predicate's polarity against the API (remove-if vs retain/keep-if) and test it with a predicate that matches nothing and one that matches everything.",
+    "Decide capacity separately: after the compaction, shrink the buffer only if the memory actually matters (shrink_to_fit, TrimExcess, keepingCapacity:).",
+    "In Rust: benchmark Vec::retain against xs.into_iter().filter(...).collect() for hot paths - retain can be 4-6x slower on alternating keep/drop patterns; use extract_if only when you need to process the removed elements, and always exhaust the iterator or use retain if you mean to drop them.",
+    "In Go: use the two-pointer filter pattern (b := a[:0]; for _, x := range a { if keep(x) { b = append(b, x) } }; a = b) to filter in place without allocating; follow with clear(a[len(b):]) when element types contain pointers so the GC can reclaim the dead tail.",
+    "In JavaScript: Array.prototype.filter returns a new array (non-mutating) - for true in-place behaviour reassign the result back to the variable; be aware this still allocates a new array internally unless using a manual index-based write-and-truncate pattern.",
+    "In Java and Kotlin: prefer removeIf(pred) over iterative remove loops; on CopyOnWriteArrayList removeIf is thread-safe while removeAll with a predicate is not.",
+    "In Swift: use removeAll(where:) for in-place order-preserving removal; filter returns a new array (non-mutating) and is not equivalent.",
+    "In C#: List<T>.RemoveAll returns the count of removed elements; use it instead of manually iterating and calling RemoveAt, which is O(n) per call.",
+    "When removing a large fraction of elements (>50%): benchmark erase-remove against building a new filtered collection - the copy-out approach can be faster because it avoids the final tail-shift on erase.",
+    "For pointer-containing structs in manual two-pass implementations: explicitly zero the dead tail after compaction so that finalisers and GC do not retain unreachable objects.",
+    "With move-only types: ensure the compaction step uses std::move for survivors and the release step destroys the moved-from objects in the tail, not just drops the length."
+  ],
+  "version": "1.2",
+  "sources": [
+    "More C++ Idioms (Wikibooks), chapter 'Erase-Remove' - intent ('To eliminate elements from an STL container to reduce the size of it'), the motivation that std::remove only partitions because it works on an iterator pair while only container members can eliminate elements, the v.erase(std::remove(v.begin(), v.end(), item), v.end()) sample, and the warning that omitting v.end() compiles but removes a single item: https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Erase-Remove",
+    "Scott Meyers, Effective STL (2001), Item 32 'Follow remove-like algorithms with erase if you really want to remove elements' - cited as the idiom's reference by the Wikibooks chapter above.",
+    "cppreference, std::remove, std::remove_if - removing 'is done by partitioning the elements': the underlying sequence is not shortened, the survivors keep their relative order, and elements are shifted by move assignment since C++11: https://en.cppreference.com/w/cpp/algorithm/remove",
+    "cppreference, std::vector<T>::erase - notes that the range overload is generally used with std::remove/std::remove_if 'to minimize the number of moves of the remaining (non-removed) elements - this is the erase-remove idiom', and that std::erase_if replaces the idiom since C++20: https://en.cppreference.com/w/cpp/container/vector/erase",
+    "cppreference, std::erase, std::erase_if(std::vector) - the C++20 free functions expand to std::remove(_if) followed by c.erase(it, c.end()) and return the number of erased elements: https://en.cppreference.com/w/cpp/container/vector/erase2",
+    "bigcpp.com, 'Erase-Remove' reference - clarifies that std::remove does not move removed elements to the end; it compacts survivors to the front, leaving trailing values in an unspecified state; also covers lazy views (std::views::filter), C++20 std::erase/std::erase_if one-call form, and when rebuilding with std::copy_if outperforms erase-remove (removing >~50% of elements): https://bigcpp.com/reference/idioms/erase-remove",
+    "Victor Ciura, ACCU 2022, 'Remove This Idiom' - demonstrates that std::remove_if rewrites the entire range, that the two-step form is necessary, and catalogues the classic mistakes: passing the wrong erase overload, forgetting erase, and erasing while iterating: https://ciura.ro/presentations/2022/Conferences/Remove%20This%20Idiom%20-%20Victor%20Ciura%20-%20ACCU%202022.pdf",
+    "ISO/IEC JTC1 SC22 WG21, P1209R0 'Adopt Consistent Container Erasure from Library Fundamentals 2 for C++20' - rationale for std::erase/std::erase_if: they expand to remove+erase for sequence containers, delegate to iteration+erase for associative containers, and eliminate the most common remove-erase mistakes by fusing the two steps: https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p1209r0.html",
+    "Rico's Blog, 'C++ Erase Remove' (2023) - benchmarks showing that when a large fraction of elements are removed, std::copy_if into a new vector can outperform erase-remove due to avoiding per-element shift costs; also notes vector::resize as a truncation alternative: https://ricojia.github.io/2023/01/06/cpp-remove-erase/",
+    "Go Wiki, 'SliceTricks' - in-place filter without allocating: b := a[:0]; for _, x := range a { if keep(x) { b = append(b, x) } }; a = b; followed by clear(a[len(b):]) to allow GC of pointer fields; also covers Cut and Delete with explicit nil/zeroing to avoid memory leaks from stale references in the backing array: https://go.dev/wiki/SliceTricks",
+    "Rust issue #91497, 'Vec::retain() is significantly slower than into_iter().filter().collect()' - benchmarks showing retain can be 4-6x slower than filter+collect on alternating keep/drop patterns; root cause is retain's internal processing strategy and a const bool parameter added in PR #88060; PR #91527 attempted a fix; practical takeaway: in hot paths, benchmark retain vs filter+collect before assuming in-place is faster: https://github.com/rust-lang/rust/issues/91497",
+    "Rust std lib, Vec::extract_if source - extract_if (formerly drain_filter) yields removed elements during iteration without a separate allocation; key semantic difference from retain: elements matching the predicate are extracted (not swapped or compacted in place), and dropping the ExtractIf iterator before exhaustion leaves the remainder in the container (not removed): https://doc.rust-lang.org/stable/src/alloc/vec/extract_if.rs.html",
+    "Rust Clippy issue #11254, 'unused_extract_if' - discusses the must_use problem when extract_if's iterator is dropped before exhaustion: no elements are removed, but the code looks like it should have done something; proposes a clippy lint for this pattern: https://github.com/rust-lang/rust-clippy/issues/11254",
+    "Swift Evolution proposal 0197, 'removeAll(where:)' - adds removeAll(where:) to RangeReplaceableCollection for in-place, order-preserving predicate-based removal in a single O(n) pass; rationale includes consistency with filter (which returns a new collection) and the need for an explicit in-place form: https://github.com/swiftlang/swift-evolution/blob/master/proposals/0197-remove-where.md",
+    "Apple Developer Documentation, Swift removeAll(where:) - official reference: removes all elements satisfying the predicate in place, preserves remaining elements' order, O(n) complexity; also notes that filter returns a new array (non-mutating) vs removeAll(where:) for in-place: https://developer.apple.com/documentation/swift/array/removeall(where:)-5k61r",
+    "Baeldung, 'Removing Elements from Java Collections' - removeIf (Java 8+) is the safe, performant in-place predicate removal for all List implementations; implemented internally as a two-pass mark-then-remove on ArrayList; stream.filter+collect creates a new list (allocation, non-mutating); Collectors.partitioningBy can split into matching/non-matching groups: https://www.baeldung.com/java-collection-remove-elements",
+    "Baeldung, 'Remove All Occurrences of a Specific Value from a List' - repeated List.remove(value) is O(n²) on ArrayList because each call shifts the tail; List.removeIf(pred) is O(n) and the recommended approach; removeIf predicate polarity: returns true to remove, not to keep: https://www.baeldung.com/java-remove-value-from-list",
+    "Microsoft Docs, .NET List<T>.RemoveAll(Predicate<T>) - removes all elements matching the predicate, returns the count of removed elements, O(n) linear scan; the predicate defines the removal condition; unlike some languages, this is a single call that handles both compaction and release: https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.list-1.removeall",
+    "Stack Overflow, 'Use cases of removeAll and removeIf' - Java's removeIf on CopyOnWriteArrayList is thread-safe; removeAll with a predicate collection iterates and removes one-by-one with different semantics; Kotlin has two removeAll overloads (by collection and by predicate) which can be confused: https://stackoverflow.com/questions/51653851/use-cases-of-removeall-and-removeif",
+    "Wikipedia, 'Erase-remove idiom' - the canonical write-up of the named technique: std::remove/std::remove_if shift non-matching elements to the front in a single pass without resizing, the container's erase then drops the tail, and C++20 std::erase/std::erase_if fuse the two; also notes the idiom is inapplicable to containers whose elements are not MoveAssignable (const keys in set/map): https://en.wikipedia.org/wiki/Erase%E2%80%93remove_idiom",
+    "Herb Sutter, GotW #51 'Extending the Standard Library - Part I' - clarifies the central misconception the idiom turns on: std::remove does not erase elements or change container size, it only reorders kept elements to the front and returns the new logical end, which is why the container's erase is mandatory: http://www.gotw.ca/gotw/051.htm",
+    "ISO/IEC JTC1 SC22 WG21, N4009 'Improving std::erase and std::erase_if' (2014) - catalogue of the idiom's traps that motivated the C++20 fusion: erase-in-a-loop is quadratic on vectors, the two-step form is easy to mis-write with silent bugs, std::list should use its own remove_if (preserves iterators, works on non-MoveAssignable types), and associative containers cannot use erase-remove at all because of const keys: https://www.open-std.org/JTC1/sc22/wg21/docs/papers/2014/n4009.htm",
+    "LLVM, include/llvm/ADT/STLExtras.h - llvm::erase_if(C, P) is LLVM's codification of the idiom (C.erase(llvm::remove_if(C, P), C.end())) used throughout the compiler to compact vectors of passes, instructions and diagnostics ahead of std::erase_if availability: https://llvm.org/doxygen/STLExtras_8h_source.html",
+    "Chromium, base/stl_util.h (base::Erase, base::EraseIf) - Chromium implements the erase-remove idiom per container (vector, deque, string, list, forward_list, with IterateAndEraseIf for maps) to emulate C++20 std::erase/erase_if before it was available, then migrates call sites off hand-written erase(std::remove(...)) pairs: https://chromium.googlesource.com/chromium/src/+/a345670fda3ed1a40e7ec8ea8a2cc073548e041b/base/stl_util.h",
+    "dev/krzaq, 'An erase/remove idiom gotcha' - when remove_if matches nothing the returned iterator is end(), so feeding it to the single-argument vector::erase is undefined behaviour rather than a safe no-op; only the two-iterator range erase is always valid: https://dev.krzaq.cc/post/an-erase-remove-idiom-gotcha/",
+    "elbeno, 'A persistent myth about STL's remove (and friends)' - demonstrates that remove_if overwrites removed slots with survivors rather than moving removed elements to the end (e.g. {1,2,3,4,5} minus evens is {1,3,5,4,5} before erase), and warns that removing raw pointers with the idiom leaks the pointees unless ownership is expressed with smart pointers: https://www.elbeno.com/blog/?p=1056"
+  ],
+  "pitfalls": [
+    "Stopping after the compaction step: std::remove, std::remove_if, and their equivalents only rearrange elements - they do not shorten the container or release the tail; omitting the erase/truncate step leaves all removed elements still present with the original size unchanged.",
+    "Feeding std::remove's return to the single-argument erase overload: v.erase(std::remove(...)) compiles and erases exactly one element (the first survivor), silently leaving every matching element in the container.",
+    "Leaving stale pointers or values in the released tail: after a manual compaction, the tail contains copies of removed elements that have not been destroyed; pointers into the tail become dangling (use-after-free) or stale (readable data after logical removal), and for types with finalisers or GC-tracked fields the dead tail can cause memory leaks.",
+    "Predicate polarity confusion: APIs differ on whether the predicate returns true-to-remove (remove-if) or true-to-keep (retain/keep-if); swapping the polarity silently removes the complement of the intended set.",
+    "Dropping an extract_if/drain_filter iterator before exhaustion: in Rust's extract_if, inlining drain_filter, or similar APIs that return an iterator over removed elements, dropping the iterator early leaves all not-yet-visited elements in the container - it behaves like retain, not like remove.",
+    "Rust Vec::retain vs filter().collect() performance inversion: Vec::retain can be 4-6x slower than xs.into_iter().filter().collect() on alternating keep/drop patterns due to retain's internal processing strategy; always benchmark for hot paths.",
+    "Erase-in-a-loop on a contiguous container: calling erase(it) or removeAt(i) inside a loop shifts the entire tail after each removal, turning O(n) into O(n·k); an index-based forward loop that erases also skips the element immediately following each erased position.",
+    "Applying erase-remove to a node-based container: std::list::remove_if is O(n) and unlinks nodes directly; combining std::remove with std::list::erase is O(n²) because std::remove does a full scan and then erase does another O(n) traversal per removed element.",
+    "Believing capacity is released after shrinking: erase-remove and all its language equivalents leave the underlying buffer's capacity unchanged; shrink_to_fit / TrimExcess / keepingCapacity(false) are separate operations.",
+    "Concurrent modification of a shared container: calling mutating remove operations from multiple threads without synchronisation (on a non-thread-safe container) causes data races; even on thread-safe containers removeAll can have different atomicity semantics than removeIf.",
+    "Go: memory leak from pointer fields after slice Delete or Cut: the backing array still holds references to removed elements, preventing GC; clear() or explicit nil/zeroing of the dead tail is required after in-place slice operations on pointer-containing types.",
+    "Java: repeated List.remove(value) in a loop is O(n²) on ArrayList because each call shifts the tail; List.removeIf is O(n) but some collection implementations handle it differently - CopyOnWriteArrayList's removeIf is thread-safe but removeAll with a predicate is not.",
+    "Shallow comparison traps in predicate-based removal: when elements are compared by reference or by a custom equality that does not match the predicate's semantics, elements the programmer expected to remove survive while unexpected ones are dropped.",
+    "Wrong move: passing remove_if's returned iterator to the single-argument erase as a 'safe if nothing matched' fallback -> when the predicate matches nothing the iterator is end() and vector::erase(end()) is undefined behaviour, not a no-op -> instead always use the two-iterator range form v.erase(it, v.end()), or std::erase_if / a fused library call that handles the empty-match case.",
+    "Wrong move: applying erase-remove to an associative container (std::set, std::map) -> the elements are not MoveAssignable because keys are const, so std::remove fails with pages of confusing template diagnostics -> instead erase by key per element or use std::erase_if for associative containers (N4009), which iterates and erases.",
+    "Wrong move: erase-remove over a container of raw owning pointers and considering the elements gone -> only the pointer copies leave the container and every pointee leaks -> instead hold owning smart pointers (unique_ptr) so the release step destroys the pointees, or delete the pointees before compacting."
+  ],
+  "related_patterns_notes": {
+    "swap-and-pop": "swap-and-pop",
+    "extract-if": "extract-if",
+    "drain-filter": "drain-filter",
+    "partition": "partition",
+    "remove-if": "remove-if"
+  }
+}

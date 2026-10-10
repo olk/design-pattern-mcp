@@ -1,0 +1,211 @@
+{
+  "category": "concurrency-resilience",
+  "name": "poison-pill",
+  "aliases": [
+    "sentinel message",
+    "end-of-stream marker"
+  ],
+  "intent": "Terminate queue consumers cooperatively by sending a reserved sentinel message that each consumer recognises as \"no more work\", so consumers drain the backlog and exit without a separate control channel or forced cancellation.",
+  "problem": "A producer-consumer system must shut down, but its consumers block on an empty queue and the queue has no built-in \"no more items\" signal: callers either kill the workers mid-work and drop buffered items, or leave them blocked forever. Production has ended - how do the consumers learn that while still processing everything already queued?",
+  "context": "In-process or broker-mediated producer-consumer systems with a FIFO work queue, a fixed set of long-lived consumers (threads, coroutines, actors) that block when the queue is empty, and a shutdown requirement that work already accepted by the queue be drained before the consumers exit - typically deployment, signal handling or test teardown.",
+  "benefits": [
+    "Graceful drain: work already accepted by the queue is completed before the consumers exit, so a shutdown cannot silently drop buffered items.",
+    "No new control channel: the shutdown signal rides the work queue itself, so consumers need no extra flag, latch or out-of-band protocol.",
+    "Cooperative and race-free to reason about: each consumer decides when to exit, and FIFO ordering makes \"after the last item\" well defined.",
+    "Reuses the runtime's blocking/suspending take, so the shutdown path costs no polling and no extra wake-up machinery.",
+    "Works on any channel with FIFO semantics, including bounded queues, where the same backpressure protects the drain.",
+    "Deterministic teardown for tests: an explicit stop item makes thread-based systems deterministic to shut down, without sleeps or guessed timeouts."
+  ],
+  "tradeoffs": [
+    "One pill per consumer: the injector must know how many consumers share the queue, and the count is easy to get wrong - a lost pill leaves a worker blocked forever, an extra pill stops another worker's backlog early.",
+    "The signal is in-band: the sentinel shares the data plane with real work, needs a reserved type/tag that cannot collide with payloads, and anyone who can enqueue can stop the consumers.",
+    "Ordering is load-bearing: a pill enqueued before pending work stops the consumer early, a duplicated pill causes premature exit, and the protocol is only safe on a FIFO channel whose producers have stopped first.",
+    "No completion feedback: the pill asks consumers to stop but does not report that they did; a join/acknowledgement step and a deadline remain the caller's responsibility.",
+    "Cooperative only: a consumer stuck in a long task or blocked downstream never dequeues the pill, so a hard-stop mechanism (interrupt, cancellation token, kill) is still required as a fallback.",
+    "Does not cross process or broker boundaries: consumers you do not control never see the sentinel, so remote or third-party consumers need the transport's own close/stop facility."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 8,
+    "performance": 8,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Producer",
+      "responsibility": "Enqueues work items and, after the last item, one pill per consumer; must stop enqueuing real work before the pills so that the drain is complete."
+    },
+    {
+      "role": "Consumer",
+      "responsibility": "Loops on the queue with the runtime's blocking take; on dequeuing the pill it finishes the current item, releases resources and exits."
+    },
+    {
+      "role": "Poison Pill",
+      "responsibility": "A reserved message, value or tag distinct from every work payload, meaning \"no more work\"; the only in-band signal the consumer must recognise."
+    },
+    {
+      "role": "Channel",
+      "responsibility": "FIFO transport that delivers the pill after all preceding work and blocks consumers while it is empty."
+    },
+    {
+      "role": "Shutdown Coordinator",
+      "responsibility": "Knows the number of consumers, injects exactly that many pills once production has stopped, joins the consumers and escalates to hard cancellation if they miss the deadline."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Signal-driven shutdown of an in-process worker pool: the SIGTERM handler stops accepting work, then enqueues one pill per worker so the backlog is processed before the process exits.",
+    "Batch importers and ETL stages whose consumers block on a work queue and must finish the current batch before a run is considered complete.",
+    "Test harnesses and simulations: an explicit stop message makes thread-based systems deterministic to shut down, without sleeps or guessed timeouts.",
+    "Actor systems: a reserved stop message (for example Akka PoisonPill) terminates an actor after the messages already queued for it have been handled.",
+    "Log and event writers where the last records must reach the sink before consumers release their buffers and files.",
+    "Bounded-queue stages in a pipeline: pills travel the same backpressured channel as work, so upstream cannot keep producing after the stop decision.",
+    "Kubernetes pod shutdown: containers receive SIGTERM, workers stop pulling from the job queue, drain in-flight tasks, then exit within the terminationGracePeriodSeconds window.",
+    "Redis/Bull queue workers: a shutdown signal pushes a sentinel via BLPOP so workers exit cleanly without losing the right to process pending tasks.",
+    "Akka Streams and similar streaming frameworks: the GraphStage signals completion via onPull/downstream cancellation, which is the materialised equivalent of a poison pill.",
+    "Redis Streams consumer groups: XREADGROUP with block timeout naturally returns when the stream is empty; a special ID (e.g. \">\") polling loop plus a shared shutdown flag replaces the in-process sentinel.",
+    "Broker-level poison message isolation: in Kafka, RabbitMQ, or Azure Service Bus, a permanently failing message (deserialisation error, validation failure) blocks a partition/consumer indefinitely; DLQ-based routing (publish to dead-letter topic after N retries, then commit offset and continue) is the broker-level analogue that prevents one poison message from halting the entire pipeline.",
+    "Kubernetes preStop hooks + pill drain: a container's lifecycle preStop hook can enqueue a sentinel into an in-process work queue while the orchestrator grants terminationGracePeriodSeconds for the drain to complete, ensuring zero work-drop during rolling updates.",
+    "Azure Service Bus competing-consumers workers: when a worker receives a shutdown notification it completes its current PeekLock message, then calls Abandon on any held locks before unregistering; Azure Service Bus dead-letter queues handle the poison-message variant when a message exceeds MaxDeliveryCount and cannot be delivered.",
+    "Akka hierarchical actor trees: sending PoisonPill to a parent actor stops it after all queued messages ahead of the pill are processed, and automatically sends stop messages to all children in bottom-up order; this is the idiomatic way to orchestrate ordered multi-actor shutdown.",
+    "Non-blocking retry architectures (RabbitMQ): rather than local Thread.sleep retries that block the consumer thread, use server-side TTL queues with Dead Letter Exchange routing to implement exponential backoff, keeping the consumer responsive to new messages and to shutdown pills.",
+    "Java's JDK BlockingQueue worker pools: because BlockingQueue has no built-in close, producers can enqueue a unique end-of-stream object after all work; each consumer takes until that sentinel and then the coordinator joins workers.",
+    "Python multiprocessing worker pools: multiprocessing.Queue/JoinableQueue supports FIFO task delivery with sentinel values and join-based drain tracking; send one sentinel per worker and join them after the queue is exhausted.",
+    "Akka Classic actors: PoisonPill is enqueued in the mailbox and processed after already queued messages, while Akka Typed requires an explicit Stop/Shutdown protocol; choose the API that matches the actor model."
+  ],
+  "avoid_when": [
+    "The executor or collection already has a completion protocol - ExecutorService.shutdown()/close(), BlockingCollection.CompleteAdding(), close(ch), Thread::Queue#close, AsyncStream.finish(); use that instead of adding an in-band sentinel.",
+    "Hard termination is required (a hung consumer, a deadline): the pill is cooperative and cannot interrupt work in progress; use a cancellation token or interrupt with a hard-kill fallback.",
+    "Consumers are remote or independently deployed, or a broker topic has consumer groups you do not own: a sentinel cannot address them - use the broker's consumer-stop/close API.",
+    "There is exactly one producer and one consumer, and the consumer is awaited as a future: completing the input or dropping the sender is simpler and cannot be miscounted.",
+    "Heterogeneous consumers share one queue and must stop at different times: counting pills per consumer type is brittle - a dedicated shutdown channel or flag is clearer.",
+    "The queue is unordered or priority-based: a pill's FIFO position is meaningless; the drain guarantee does not hold."
+  ],
+  "language_files": {
+    "generic": "poison-pill.generic.json",
+    "c": "poison-pill.c.json",
+    "cplusplus": "poison-pill.cplusplus.json",
+    "csharp": "poison-pill.csharp.json",
+    "go": "poison-pill.go.json",
+    "java": "poison-pill.java.json",
+    "javascript": "poison-pill.javascript.json",
+    "kotlin": "poison-pill.kotlin.json",
+    "python": "poison-pill.python.json",
+    "ruby": "poison-pill.ruby.json",
+    "rust": "poison-pill.rust.json",
+    "scala": "poison-pill.scala.json",
+    "swift": "poison-pill.swift.json",
+    "typescript": "poison-pill.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "two-phase-termination",
+    "cancellation-token",
+    "structured-concurrency",
+    "producer-consumer",
+    "master-worker",
+    "actor",
+    "guarded-suspension",
+    "dead-letter-channel",
+    "circuit-breaker"
+  ],
+  "anti_patterns": [
+    "Confusing the shutdown sentinel with a poison message: an undeliverable or malformed message belongs to Invalid Message Channel or Dead Letter Channel handling, not to consumer shutdown - the shared \"poison\" name causes real design mistakes.",
+    "Broadcasting a single pill to a multi-consumer queue: one consumer dequeues it and exits while the rest block forever; inject one pill per consumer or close the channel instead.",
+    "Enqueuing pills before the backlog (or letting producers keep adding afterwards), so consumers stop early and queued work is dropped without a trace.",
+    "Using a magic payload value (null, -1, empty string) as the sentinel on a queue that can legitimately carry it; the consumer stops on real data.",
+    "A pill protocol with no join: shutdown looks successful while workers are still running, or hangs because nothing waits for them.",
+    "Relying on a pill to abort a consumer stuck in a long task; it is never dequeued, and graceful shutdown turns into a hang.",
+    "Enqueuing a single pill for all consumers on a shared queue: the first consumer takes it and exits, leaving the rest blocked forever.",
+    "Confusing \"poison pill message\" (a permanently failing record that blocks a partition in Kafka/RabbitMQ and requires DLQ routing) with \"poison pill sentinel\" (the cooperative shutdown signal); these are two distinct patterns that share the word \"poison\"."
+  ],
+  "design_principles": [
+    "Explicit lifecycle: a consumer's stop condition is a first-class part of the protocol, not an ambient flag or a timeout.",
+    "Ordering determines semantics: \"drain then stop\" is only well defined on a FIFO channel, so the channel's ordering guarantee is part of the pattern.",
+    "Symmetry of creation and destruction: whoever starts the consumers owns the pills (one per consumer) and joins them.",
+    "Prefer the runtime's completion primitive over an in-band sentinel when one exists (channel close, CompleteAdding, Queue#close); the sentinel is for queues that lack one.",
+    "Separate draining from aborting: a cooperative stop finishes accepted work, while abrupt termination is a different mechanism with different guarantees.",
+    "Least knowledge: producers know only the sentinel contract, consumers only the queue; neither needs the other's identity.",
+    "Poison is not the same as \"bad message\": a poison pill is a normal sentinel for cooperative shutdown; a poison message is a malformed payload requiring Dead Letter Queue handling - conflating the two causes architectural mistakes."
+  ],
+  "best_practices": [
+    "Inject exactly one pill per consumer, after the last work item, from a single close()/shutdown() helper so producers cannot forget, duplicate or reorder the pills.",
+    "Make the pill runtime-distinguishable - a dedicated type, tag field or enum - never a magic payload value, and document the sentinel contract next to the queue's declaration.",
+    "Keep the pill on the same FIFO channel as work; do not route it through a priority lane, or the drain guarantee breaks.",
+    "Join every consumer after the pills and enforce a bounded deadline; escalate to interrupt/cancel if a consumer misses it rather than reporting a clean shutdown.",
+    "Never send the sentinel across process or broker boundaries; use the transport's own consumer-stop facility there.",
+    "Test the shutdown path itself: assert that all queued work completed before exit and that a missing pill is detected (deadline) rather than hidden by daemon threads or process exit.",
+    "When the queue already offers a completion API (Close, Complete, CompleteAdding, close token), use it and keep the sentinel only for queues without one.",
+    "Combine the sentinel with a bounded deadline and a hard-cancel escalation: a missing pill should never result in a process that hangs indefinitely.",
+    "On ordered/brokered queues, consider a circuit breaker that prevents a single poison message from blocking the head of the queue; route it to a DLQ after N retries instead of retrying in place.",
+    "Distinguish poison-pill shutdown (cooperative drain) from Dead Letter Queue handling (malformed/unprocessable messages); these are two separate concerns sharing the word \"poison\".",
+    "In actor hierarchies (Akka, Erlang OTP), prefer the built-in stop/terminate signal (PoisonPill in Akka, link/exit in Erlang) over a manual queue-based pill; the runtime handles child ordering and resource cleanup.",
+    "In weakly-ordered memory models, ensure the pill is published with proper synchronisation after all preceding work items; on ARM/POWER architectures a plain write to a shared queue field may not be visible to the consumer before the pill is dequeued."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Goetz, Peierls, Bloch, Bowbeer, Holmes & Lea, Java Concurrency in Practice (2006), Chapter 7 (Cancellation and Shutdown) - poison-pill objects as a producer-consumer shutdown technique.",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html - the JDK documents end-of-stream/poison objects as the shutdown tactic for blocking queues.",
+    "https://learn.microsoft.com/en-us/dotnet/standard/collections/thread-safe/blockingcollection-overview - CompleteAdding/IsCompleted/GetConsumingEnumerable: the completion protocol that absorbs the sentinel.",
+    "https://kotlinlang.org/docs/channels.html - close described as sending a special close token that ends iteration after the buffered elements.",
+    "https://doc.akka.io/api/akka-core/current/akka/actor/PoisonPill.html - PoisonPill, a message all actors understand that terminates the actor when it is processed.",
+    "https://go.dev/blog/pipelines - Sameer Ajmani (Go team): Go Concurrency Patterns - pipelines, explicit cancellation, and closing a done channel as a broadcast signal to all goroutines.",
+    "https://go101.org/article/channel-closing.html - Go 101: channel closing principle, moderator pattern for M-receiver/N-sender graceful shutdown, and safe close strategies.",
+    "https://pymotw.com/2/multiprocessing/communication.html - Python Module of the Week: JoinableQueue with None sentinel for multiprocessing worker pool shutdown, join() for drain tracking.",
+    "https://docs.python.org/3/library/multiprocessing.html - Python multiprocessing Queue, SimpleQueue, JoinableQueue; sentinel values and task_done()/join() for coordinated drain.",
+    "https://igor.gorovyy.pro/blog/posts/2026-08-22-graceful-shutdown/ - Igor Gorovyy: graceful shutdown in Go with signal.NotifyContext, ordered component shutdown (HTTP → workers → DB), and bounded deadline under terminationGracePeriodSeconds.",
+    "https://www.java-design-patterns.com/patterns/poison-pill/ - Java Design Patterns: poison pill with Producer/Consumer code examples, when to use, and benefits/tradeoffs.",
+    "https://scalemind.dev/java/concurrency/poison-pill-shutdown-pattern-in-java/ - ScaleMind: Java poison pill decision guide, common mistakes (too few pills, enqueuing poison too early), and fit assessment.",
+    "https://depot.dev/blog/graceful-shutdown-in-go - Depot: graceful shutdown in Go with ctx.Done() polling loops, sync.WaitGroup for in-flight work, and context.Background() with timeout for drain-phase operations.",
+    "https://tokio.rs/tokio/topics/shutdown - Tokio: CancellationToken for cooperative task cancellation across multiple tasks, clone-based broadcasting, and task tracker patterns.",
+    "https://async-concurrency.com/resilience-cancellation-error-handling/graceful-shutdown-and-signals/ - async-concurrency.com: phase-ordered shutdown (LB deregistration → drain → cancel → close), bounded deadlines, signal handler placement on the event loop.",
+    "https://www.toolsku.com/en/blog/rust-tokio-graceful-shutdown-2026/ - ToolsKu: Tokio shutdown pitfalls including forgetting cancelled() in select, misusing CancellationToken as one-shot, task leaks, and timeout settings.",
+    "https://oneuptime.com/blog/post/2026-03-31-redis-poison-pill-pattern-queues/view - OneUpTime: dual Redis poison pill patterns - graceful shutdown via sentinel and DLQ handling for persistently failing messages.",
+    "https://www.boundev.com/blog/dotnet-cancellationtoken-guide-async-patterns - Boundev: .NET CancellationToken patterns including linked tokens, Register() callbacks, IHostApplicationLifetime, and common mistakes.",
+    "https://serard.dev/content/blog/distributed-task/08-resilience.html - Stéphane Erard: saga DLH patterns, compensation failure handling, and circuit-breaker-wrapped retry policies for distributed task resilience.",
+    "https://sph.sh/en/posts/dead-letter-queue-production-strategies/ - SPH: DLQ production strategies including exponential backoff with jitter, circuit-breaker DLQ routing, and content-based poison routing.",
+    "https://dev.to/rosgluk/dead-letter-queues-handling-poison-messages-in-distributed-systems-7p3 - DEV.to: distinguishing poison messages from transient failures, idempotency for DLQ redrive, DLQ retention and alerting.",
+    "https://codesprintpro.com/blog/microservices-patterns/ - Code Sprint Pro: Dead Letter Queue routing with retry/DLQ code examples, recoverable vs. permanent error classification, DLQ monitoring.",
+    "https://www.boost.org/doc/libs/1_85_0/doc/html/boost_asio/example/cpp14/executors/pipeline.cpp - Boost ASIO 1.85: queue_front::stop() as a cooperative unblocking signal, pipeline example with thread_pool and ordered shutdown.",
+    "https://stackoverflow.com/questions/9574587/how-to-properly-shutdown-instance-of-class-that-uses-asio-for-event-queuing - StackOverflow: boost::asio graceful shutdown patterns, signal_set for SIGTERM/SIGINT, and ordered io_context shutdown.",
+    "https://www.exchangetuts.com/standard-way-to-perform-a-clean-shutdown-with-boostasio-1639989916922142 - Exchangetuts: boost::asio signal_set as the standard way to perform clean shutdown with io_context::stop().",
+    "https://rodrigoaraujo.me/posts/golang-pattern-graceful-shutdown-of-concurrent-events/ - Rodrigo Araújo: Go graceful shutdown of concurrent events with jobQueue close as poison pill, ctx.Done() cancellation, and WaitGroup drain.",
+    "https://masstransit-v6.netlify.app/usage/exceptions - MassTransit: exception handling, _error queue for poison messages, dead-letter pipe for skipped messages, and fault handling configuration.",
+    "https://docs.particular.net/nservicebus/recoverability/ - Particular Software: NServiceBus recoverability with immediate/delayed retries, automatic rate-limiting circuit breaker, error queue, and custom recoverability policies.",
+    "https://floriancourouge.com/en/blog/kafka-poison-pills-patterns-resilience-consumers - Florian Courouge: five Kafka resilience patterns for poison pills - DLQ, Skip & Log, Retry with exponential backoff and circuit breaker, Quarantine Topic, and Prometheus/Grafana observability setup.",
+    "https://www.conduktor.io/blog/dead-letter-topics-handling-poison-pills - Conduktor: handling Kafka poison pills via dead letter topics, ErrorHandlingDeserializer, Spring Kafka @RetryableTopic with @DltHandler, and DLT replay after root-cause fix.",
+    "https://www.confluent.io/blog/spring-kafka-can-your-kafka-consumers-handle-a-poison-pill/ - Confluent/ING: real-world Spring Kafka poison pill incidents at ING - deserialisation failures blocking Kafka partitions, ErrorHandlingDeserializer configuration, and DeadLetterPublishingRecoverer for automated DLT routing.",
+    "https://github.com/akka/akka/blob/main/akka-actor/src/main/scala/akka/actor/Actor.scala - Akka OSS source: PoisonPill case object class definition (extends AutoReceivedMessage with PossiblyHarmful), actor lifecycle hooks (preStart, postStop, preRestart, postRestart), and aroundReceive intercept.",
+    "https://github.com/akka/akka-core/blob/v2.10.21/akka-actor/src/main/scala/akka/pattern/GracefulStopSupport.scala - Akka GracefulStopSupport: the gracefulStop(actorRef, timeout, stopMessage) Future-based API that waits for the actor to drain its mailbox and terminate before the deadline.",
+    "https://www.erlang.org/docs/25/reference_manual/processes.html - Erlang OTP official reference: bidirectional link/exit signal semantics, exit(Pid, Reason) explicit termination, monitor/2 unidirectional observation, trap_exit for converting exit signals to messages; OTP's built-in exit signal system subsumes the in-process sentinel pill pattern.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/competing-consumers - Microsoft Azure Architecture Patterns: Competing Consumers - multiple concurrent consumer instances on Service Bus/Storage queues, poison message detection via dead-letter sub-queue after MaxDeliveryCount, and transactional PeekLock read semantics.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling - Microsoft Azure Architecture Patterns: Queue-Based Load Leveling - queue as buffer between tasks and a backend service; Service Bus dead-letter sub-queue for messages that exceed MaxDeliveryCount.",
+    "https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/concurrent/BlockingQueue.html - JDK 26 documents that BlockingQueue has no built-in shutdown and that producers commonly use a sentinel/end-of-stream object.",
+    "https://docs.python.org/3/library/multiprocessing.html - Python multiprocessing docs cover FIFO queues, sentinel-based worker termination, and joining workers after shutdown.",
+    "https://doc.akka.io/libraries/akka-core/current/actors.html - Akka Classic docs: PoisonPill is enqueued like ordinary messages and processed after already-queued messages; Kill is the forceful alternative.",
+    "https://doc.akka.io/libraries/akka-core/current/typed/from-classic.html - Akka docs: PoisonPill is not supported in Akka Typed; use a protocol-specific stop message instead.",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.blockingcollection-1.completeadding?view=net-10.0 - BlockingCollection.CompleteAdding prevents new additions and lets consuming loops finish without sentinels.",
+    "https://stackoverflow.com/questions/8667870/is-it-possible-to-use-poison-pill-approach-with-bounded-queues - discussion of bounded-queue shutdown caveats when a full queue cannot accept poison pills."
+  ],
+  "related_patterns_notes": {
+    "supervisor-tree": "supervisor-tree"
+  }
+}

@@ -1,0 +1,193 @@
+{
+  "category": "concurrency-resilience",
+  "name": "guardian-object",
+  "aliases": [
+    "encapsulated lock",
+    "private lock object"
+  ],
+  "intent": "Keep a piece of shared mutable state and the lock that serialises it inside one dedicated object, so that every read and write passes through that object's guarded operations and no caller can touch the state without holding the lock.",
+  "problem": "Shared mutable state is protected by whatever lock each call site happens to take: one site forgets the lock, another locks a different object, a third reads the state after the lock was released, and the invariant that spans several fields is lost although every individual access 'looked' guarded. The recurring decision is where the serialisation point lives - distributed across call sites, which no one can review, or attached to the data itself, where forgetting it is impossible.",
+  "context": "Concurrent access to state whose invariants span more than one field or more than one operation (a balance plus a transaction count, a map plus its size hint, a session plus its last-seen stamp), reached from threads, tasks, coroutines or callbacks. It applies best where the set of legal operations is small and known and the state is not shared across processes; the caller may be any thread, but the state is only ever touched through one object. The pattern is the encapsulation-first reading of the coordination family: it is what Monitor Object and Lockable Object are replaced with when the lock must not be part of the object's public surface.",
+  "benefits": [
+    "The lock cannot be forgotten: the state is private, so the only way to reach it is through the guardian's operations, and the guard is part of every one of them.",
+    "One place owns the invariant: multi-field and multi-step updates (check-then-act) happen inside a single critical section, so the state cannot be observed half-updated by the guardian's own users.",
+    "The lock belongs to the object, not to its callers: no convention, header comment or code review is needed to know which lock protects what, and no unrelated component can take the same lock and deadlock the owner.",
+    "The synchronisation policy becomes implementation detail: switching from a plain mutex to a read-write lock, an atomic cell or an internal queue is a change inside the guardian, invisible to callers.",
+    "It composes with the platform's own incarnation of the idea (Rust's Mutex<T> owning its data, Swift's Mutex<Value> and actors, C#'s dedicated lock object), so the same design is enforced by the compiler where the language is strong and by discipline where it is not.",
+    "It makes the concurrency budget explicit: one guardian is one serialisation point, which is measurable (lock hold time, contention) instead of emerging from the sum of scattered locks."
+  ],
+  "tradeoffs": [
+    "The guardian is a serialisation point by construction: every operation on the state runs one at a time, so a coarse guardian turns unrelated reads and writes into a queue and locks in the state's partitioning - the usual path to lock striping or sharding later.",
+    "Every access becomes an indirect, guarded call, and the guarded region is inside the object where the caller cannot see it: a method that holds the lock a little too long (formatting, logging, I/O, a callback) stalls every other user without the call site showing any sign of locking.",
+    "Publishing the guarded state is a silent failure mode: returning the internal collection, a live view, an iterator or a reference lets callers read and mutate it outside the lock, so the API must copy out - a copy the caller may not expect and the guardian's author may offhandedly remove.",
+    "Deadlock ordering becomes invisible at the call site: two guarded objects used together acquire two private locks inside two opaque methods, so the acquisition order is nowhere in the caller's code (the failure C#'s lock documentation warns about for exactly this reason).",
+    "The lock is held across user code whenever a guarded operation calls back into the caller (a listener, a comparator, an overridden method), which invites re-entrancy problems: non-reentrant locks self-deadlock, reentrant ones hide the design error.",
+    "It can conceal a better structure: state that the guardian serialises may really belong to one owner thread/task (Thread Confinement, an actor, a queue) or could be immutable and shared without any lock, and a guardian that quietly becomes a contention choke point makes that rethink look like a performance problem rather than a modelling one.",
+    "In garbage-collected runtimes the guardian keeps strong references to everything it holds, so a guardian that also owns per-entity data or listeners extends their lifetime - leaks replace the manual ownership question the pattern was supposed to answer.",
+    "Testing stays partial: the guardian removes the accidental races but not the interesting ones - the tests still have to provoke contention, re-entrancy and lock-ordering, which a single-threaded test never does."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 8,
+    "simplicity": 6,
+    "performance": 6,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Guardian Object",
+      "responsibility": "Owns the lock and the guarded state, exposes the guarded operations and is the only component allowed to touch the state; it never publishes the state itself, only copies or the results of guarded computations."
+    },
+    {
+      "role": "Guarded State",
+      "responsibility": "The mutable data and its invariant (one field or a set of fields that must change together); private to the guardian and reachable only from inside its critical sections."
+    },
+    {
+      "role": "Guarded Operation",
+      "responsibility": "One public operation of the guardian that acquires the lock, reads and updates the state according to the invariant and releases the lock on every exit path; compound operations exist so that no caller needs to hold the lock across several calls."
+    },
+    {
+      "role": "Lock Primitive",
+      "responsibility": "The mutex, monitor, lock object, atomic cell or isolated executor the guardian serialises with; chosen inside the guardian (blocking or suspending, plain or recursive, exclusive or read-write) and unknown to callers."
+    },
+    {
+      "role": "Client Thread or Task",
+      "responsibility": "Calls the guarded operations and must not hold its own lock around them, must not attempt to reach the state by other means, and must assume the guardian is a serialisation point."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "In-process caches and registries: a map plus its statistics, TTL bookkeeping and eviction counters, where readers and writers arrive from many request threads and every operation must see a consistent view.",
+    "Application services holding shared mutable state - a rate-limit counter, a connection lease table, a feature-flag snapshot - that was previously protected by scattered locks or by hoping the interleaving never happens.",
+    "Objects shared between callbacks and event-loop tasks: the guardian is the single owner of the state and its operations are the only mutators, which removes read-modify-write interleaving across await points.",
+    "Device, driver and simulator state that must be driven from a control thread while being sampled from a monitoring thread, with the invariant (mode plus position plus status code) kept consistent.",
+    "Legacy shared globals being refactored: moving the flags and counters behind one guarded object turns 'which lock protects this field' questions into one reviewed API.",
+    "Cross-language boundaries where a native library is called from many threads: the guardian serialises the calls (the library need not be thread-safe) and hides the raw handle so callers cannot bypass it.",
+    "Test fixtures and simulators whose state must be mutated deterministically from several test threads while presenting a simple synchronous API.",
+    "Financial ledgers and booking systems: a balance plus a transaction count, a position plus P&L, or a quota plus a usage counter where the invariant spans multiple numeric fields that must be updated atomically under contention from many concurrent threads.",
+    "Connection pools and lease tables: a pool of network connections, database handles, or worker threads where acquire() and release() must be atomic and the pool's internal bookkeeping (size, idle count, waiters) must remain consistent across every caller.",
+    "Feature flags and dynamic configuration: a registry of feature states plus last-update timestamps that must be consulted and updated atomically so that a server process never observes a half-applied flag change during a rolling deployment.",
+    "Gaming and real-time simulation: shared game-state objects (player positions, physics body states, scores) that must be updated atomically from the game loop while being sampled from monitoring or replay threads, with invariants spanning multiple interrelated fields.",
+    "Distributed worker queues and task schedulers: a pending-work counter plus a list of pending tasks plus a drain signal, where the drain operation must atomically snapshot the list and reset the counter without a race between inspect and drain.",
+    "JDK's java.util.concurrent.LinkedBlockingQueue: the queue's linked nodes, count and notEmpty/notFull Conditions are guarded by two private ReentrantLock fields (putLock and takeLock) that no caller can reach; every public operation (put, take, poll, offer) acquires the relevant private lock internally, so the queue state is unreachable without going through a guarded operation.",
+    "Swift standard library Mutex<Value> (SE-0433): the lock owns its value outright - withLock hands the protected value to a closure as inout and releases on every exit path, which is the Guardian Object built into the platform, with the guarded state physically inside the guardian rather than beside a separate lock field.",
+    "Security-hardened Java components that execute untrusted code: per SEI CERT LCK00-J such classes replace synchronized methods (which expose 'this' as the lock) with synchronized blocks on a private final lock object, so hostile callers cannot acquire the class's lock and stall it - the guardian form chosen for the security reason, not only the maintainability reason."
+  ],
+  "avoid_when": [
+    "The state is the object's own field and the object's public methods are the API anyway - that is Monitor Object, or simply a thread-safe object; adding a separate guardian just introduces a second hop.",
+    "Collaborators must be able to serialise their own multi-call sequences against the state - that requires the lock to be visible, which is Lockable Object (client-side locking), the deliberate opposite of encapsulation.",
+    "All access already comes from one thread, task or event loop - Thread Confinement, a single-threaded executor or a queue removes the lock instead of hiding it.",
+    "The state could be immutable: replace it wholesale (copy-on-write, an immutable snapshot published through an atomic reference) and readers need no lock at all.",
+    "A single scalar is all that is shared and the platform has atomics for it - an atomic counter or a compare-and-set loop is smaller and faster than a guardian object.",
+    "The serialisation span is a whole workflow rather than an object - put the work behind a single owner (an actor, a worker with a mailbox) or in a database transaction, where the boundary is the unit of serialisation."
+  ],
+  "language_files": {
+    "generic": "guardian-object.generic.json",
+    "c": "guardian-object.c.json",
+    "cplusplus": "guardian-object.cplusplus.json",
+    "csharp": "guardian-object.csharp.json",
+    "go": "guardian-object.go.json",
+    "java": "guardian-object.java.json",
+    "javascript": "guardian-object.javascript.json",
+    "kotlin": "guardian-object.kotlin.json",
+    "python": "guardian-object.python.json",
+    "ruby": "guardian-object.ruby.json",
+    "rust": "guardian-object.rust.json",
+    "scala": "guardian-object.scala.json",
+    "swift": "guardian-object.swift.json",
+    "typescript": "guardian-object.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "monitor-object",
+    "lockable-object",
+    "thread-confinement",
+    "thread-safe-interface",
+    "scoped-locking",
+    "guarded-suspension",
+    "actor",
+    "read-write-lock",
+    "copy-on-write",
+    "producer-consumer"
+  ],
+  "anti_patterns": [
+    "The guardian that guards most things: a single lock object chosen per module (or per application) so unrelated state shares one serialisation point - the pattern degenerating into a global lock.",
+    "Leaky encapsulation: exposing the guarded map/list/record, or returning a live view or iterator, so callers mutate the state outside the lock and the invariant depends on caller discipline.",
+    "Locking on a shared or public object - `this`, a class object, an interned string, another component's monitor - which lets unrelated code take the same lock and deadlock the guardian.",
+    "Guarding with a recursive lock to make a self-deadlock 'work', hiding the fact that a guarded method calls another guarded method and that the critical section is really the whole call graph.",
+    "Guardian operations that call back into client code while holding the lock (listeners, comparators, futures completed under the lock), turning every callback into potential re-entrancy and deadlock.",
+    "Serialising everything through one guardian and calling it scalability, when the state should have been immutable, partitioned, or owned by a single worker."
+  ],
+  "design_principles": [
+    "Encapsulation as the safety mechanism: the guard is effective only because the state is unreachable without it.",
+    "Single responsibility: one object owns one invariant, and the lock exists to protect exactly that invariant.",
+    "Atomicity of invariants: a state change that must be observed as a whole happens inside one critical section, never spread over several calls.",
+    "Information hiding: callers know the operations, not the lock, the primitive or the layout of the state.",
+    "Concurrency as implementation detail: whether access is serialised by a mutex, an atomic cell, a queue or an actor is changeable behind the guardian's API."
+  ],
+  "best_practices": [
+    "Keep the synchronisation primitive private, final and dedicated to this state - never the object itself, a class object, a string or another component's lock.",
+    "Make every accessor a guarded operation that acquires and releases on every path (scoped lock, RAII guard, `with`/`defer`/`try-finally`), and copy data out instead of returning references into the state.",
+    "Keep the critical section minimal and free of callbacks, logging, I/O and acquires of other guardians; disclose what a guarded operation does if it must be longer.",
+    "Prefer the platform's own incarnation when it enforces the guarantee - a mutex that owns its data, an actor, an isolated cell - over a hand-written lock plus discipline.",
+    "Document the invariant and the lock policy with the type (which fields the guardian protects, whether operations may re-enter), and test contention explicitly rather than assuming a single-threaded test proves anything.",
+    "Measure hold time and contention before splitting a guardian; when the single serialisation point becomes the limit, partition the state (striping, per-key guardians) or move the work to a single owner instead of weakening the encapsulation.",
+    "Retire the guardian when the state becomes immutable or confined: fewer locks is better than a tidy lock.",
+    "Combine the private lock with a compile-time annotation or lockdown analysis annotation (@GuardedBy in Java, SCOPED_LOCKABLE in Clang, GUARDED_BY in Pigweed) so the policy is machine-verifiable and documented in the type signature rather than a comment.",
+    "Use RAII / scoped lock wrappers (std::lock_guard, MutexGuard, Python's 'with lock:', Java's try-with-resources on a ReentrantLock) so the critical section is always scope-bound and exception-safe — never manual lock/unlock pairs.",
+    "Apply least privilege to locking: protect the smallest possible invariant with each lock; if one logical operation spans two independent fields that no caller ever needs atomically, use two guardians rather than one coarse-grained lock.",
+    "Test the encapsulation actively: write a test that calls an accessor without going through the guardian and verify it produces incorrect results — this confirms the state is genuinely unreachable and the encapsulation holds.",
+    "When a superclass adopts the private lock idiom, subclasses must also adopt it and must never synchronise on the subclass instance or superclass lock; document the locking policy in both the superclass and subclass Javadoc or equivalent.",
+    "The lock field itself should be final (or the reference must be structurally immutable) so the lock reference cannot be replaced at runtime; the lock field does not need volatile for correctness of the lock itself, but the fields it protects must be accessed only through the guardian.",
+    "Retire the guardian when the state becomes genuinely immutable (replaceable with a final field or a copy-on-write snapshot) or when thread confinement becomes possible (single owner, queue, actor) — fewer locks are always better than a tidy one."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Lea, D., Concurrent Programming in Java: Design Principles and Patterns, 2nd ed. (Addison-Wesley, 1999) - the coordination family this pattern belongs to: state whose invariant is protected by synchronisation that lives with the object, not at the call sites.",
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (Wiley, 2000) - the contrast set that defines this pattern by opposition: Monitor Object (the object serialises its own method calls) and Lockable Object (the object publishes its own lock); Guardian Object is the encapsulation-first option where the lock stays private and the state stays unreachable.",
+    "Bloch, J., Effective Java, 3rd ed. (Addison-Wesley, 2018) - the private lock object idiom: serialise on a dedicated private instance rather than on an object that clients can also acquire.",
+    "Naming note: 'Guardian Object' is the modern label for that encapsulated-lock idiom; the classical catalogs document its neighbours (Monitor Object, Lockable Object, Guarded Suspension, Thread Confinement) rather than this name, and the per-language files cite the platform documentation that actually prescribes the dedicated-object form.",
+    "https://docs.oracle.com/javase/tutorial/essential/concurrency/locksync.html",
+    "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/lock",
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+    "https://developer.apple.com/documentation/synchronization/mutex",
+    "Goetz, B., Peierls, T., Bloch, J., Bowbeer, J., Holmes, D., & Lea, D., Java Concurrency in Practice, 2nd ed. (Addison-Wesley, 2006), Chapter 4 — 'Composing Objects'. Listings 4.3 and 4.4 demonstrate the private lock object idiom: guarding state with a dedicated private final lock versus intrinsic synchronization, and discuss composability and security benefits of the private lock.",
+    "Wilmans, J., 'p3497R0 — guarded objects', ISO WG21 C++ Standards Committee, November 2024. A modern C++ formalization proposing a 'guarded<T>' type that encapsulates both data and its mutex, making it statically impossible to access the data without acquiring the lock. Argues the mutex-data relationship must be type-enforced, not convention-only.",
+    "SEI CERT Oracle Coding Standard, rule LCK00-J — 'Use private final lock objects to synchronize classes that may interact with untrusted code'. Security-motivated: synchronizing on 'this' or another publishable object allows hostile code to cause DoS by holding the lock. The private lock object idiom prevents external code from acquiring the class's lock. Also covers inheritance considerations and subclass obligations.",
+    "CMU 17-214 Lecture 20 — Introduction to Concurrency, Part 3 (Carnegie Mellon University, 2021). Academic lecture covering the private lock pattern with a BankAccount example, @GuardedBy annotations, and the distinction between Monitor Object and Guardian Object. Recommends preferring java.util.concurrent utilities over custom wait/notify patterns.",
+    "MIT 6.031 Reading 23 — 'Mutual Exclusion', Software in 6.031 (MIT, 2021). Undergraduate-level treatment of mutual exclusion fundamentals using a BankAccount example; contrasts confinement, immutability, and mutual exclusion as complementary strategies for safe concurrent access to shared mutable data.",
+    "Herlihy, M., & Shavit, N., The Art of Multiprocessor Programming, 2nd ed. (Morgan Kaufmann, 2020). The authoritative academic text on lock-based coordination. Chapters 7–8 cover spin locks, queue locks, monitors, and blocking synchronization. Provides the formal correctness criteria (sequential consistency, linearizability) against which guardian implementations are evaluated.",
+    "Nayuki, 'Concurrent Programming with Monitors' (nayuki.io). Accessible explanation of monitors combining a mutex with condition variables, with implementations in Java and Python. Distinguishes the monitor pattern from lock-free approaches and discusses production pitfalls including missed wakeups and lock-ordering deadlocks.",
+    "Software Patterns Lexicon — 'Monitor Object Pattern for Synchronization in Concurrency'. Detailed description of Monitor Object (the pattern most frequently confused with Guardian Object). Key distinction: in Monitor Object the lock is implicit and all public methods are mutually exclusive; in Guardian Object the lock is private and the API consists of named operations with defined semantics.",
+    "Software Patterns Lexicon — 'Java Locks, Monitors, and Synchronization Trade-Offs'. Systematic comparison of Java synchronization approaches (intrinsic locks, java.util.concurrent locks, monitors). Recommends making the synchronization policy explicit in the type signature rather than in implementation comments.",
+    "Clang 3.5 Thread Safety Analysis Documentation — 'RAII Lock Classes and Private Mutexes'. Documents SCOPED_LOCKABLE, EXCLUSIVE_LOCKS_REQUIRED, and LOCK_RETURNED annotations for expressing private-lock patterns in C++ with compile-time verification. The LOCK_RETURNED workaround is relevant when a guardian must cooperate with external analysis tools.",
+    "Yong Jie, 'Java Concurrency in Practice — Private Lock Object Guardian Pattern' (blog, 2020). Developer-readable explanation of how Java Concurrency in Practice's private lock idiom works and why it differs from synchronizing on 'this'.",
+    "Rust Book, Chapter 16 — 'Shared-State Concurrency'. Documents Arc<Mutex<T>> as the canonical Rust ownership model for thread-safe shared state: Mutex provides exclusive access enforced by the type system, and Arc provides shared ownership across threads. Shows how Rust's type system makes the guardian pattern the default rather than a convention.",
+    "OpenJDK source, java.util.concurrent.LinkedBlockingQueue — a production Guardian Object: private final ReentrantLock fields (putLock, takeLock) and Conditions (notFull, notEmpty) guard the node list and count; all public operations acquire the private locks internally and the state is never published. https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/concurrent/LinkedBlockingQueue.java",
+    "SEI CERT Oracle Coding Standard, LCK00-J — 'Use private final lock objects to synchronize classes that may interact with untrusted code' (updated rule page): block synchronization on a private final Object, why synchronizing on 'this' lets hostile code cause contention/DoS, subclass obligations, and using multiple private final locks for granularity. https://cmu-sei.github.io/secure-coding-standards/sei-cert-oracle-coding-standard-for-java/rules/locking-lck/lck00-j/",
+    "SEI CERT Oracle Coding Standard, LCK01-J — 'Do not synchronize on objects that may be reused': the misuse case for the guardian's lock choice - Boolean/Integer boxed values, interned Strings and other reused or exposed objects as lock targets silently share a monitor with unrelated code. https://cmu-sei.github.io/secure-coding-standards/sei-cert-oracle-coding-standard-for-java/rules/locking-lck/lck01-j/",
+    "SEI CERT Oracle Coding Standard, LCK07-J — 'Avoid deadlock by requesting and releasing locks in the same order': the lock-ordering discipline that encapsulated locks make invisible at call sites, and the consistent-ordering remedy. https://cmu-sei.github.io/secure-coding-standards/sei-cert-oracle-coding-standard-for-java/rules/locking-lck/lck07-j/",
+    "Swift Evolution SE-0433 — 'Mutex': rationale for the standard-library Mutex<Value> that wraps a platform mutex (os_unfair_lock on Apple platforms, pthread_mutex elsewhere) around the protected value, with withLock providing exclusive inout access - the guardian as a platform primitive. https://github.com/swiftlang/swift-evolution/blob/main/proposals/0433-mutex.md",
+    "Bretl, G., 'Achieving High Concurrency in Object-Oriented Databases' (2006) - documents an earlier use of the name 'guardian objects' in concurrency control: dedicated guardian objects as a pessimistic control layer protecting groups of objects, predating and independent of the modern encapsulated-lock reading. https://www.odbms.org/wp-content/uploads/2006-03-024.01-Bretl-Achieving-High-Concurrency-in-Object-Oriented-Databases-March-2006.pdf"
+  ]
+}

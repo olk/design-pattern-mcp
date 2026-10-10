@@ -1,0 +1,18 @@
+{
+  "pattern": "secure-logger",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "custom ILogger/ILoggerProvider with a chained HMACSHA256 authenticator",
+  "implementation_notes": "Microsoft.Extensions.Logging already supplies the chokepoint: implement ILoggerProvider.CreateLogger and an ILogger whose Log<TState> canonicalises state, scopes and exception, chains an HMACSHA256 tag over the previous tag and appends to a write-only sink. Register the provider as a singleton so exactly one object owns the chain state, and put the sink behind an interface whose only write operation is append; the classic hand-written form is justified mainly when the audit stream must live outside the dependency-injection host (a tiny standalone writer owned by the process).",
+  "code_sketch": "public sealed class SecureLogger(ILogSink sink, ReadOnlyMemory<byte> key, ChainState chain) : ILogger {\n    public IDisposable? BeginScope<TState>(TState s) where TState : notnull => null;\n    public bool IsEnabled(LogLevel l) => l >= LogLevel.Information;\n    public void Log<TState>(LogLevel l, EventId id, TState state, Exception? ex, Func<TState, Exception?, string> fmt) {\n        lock (chain) {                                          // one chain, many loggers\n            var body = Canonicalise(l, id, state, ex, fmt);      // fields are data, never format\n            var tag = HMACSHA256.HashData(key.Span, [.. chain.Prev, .. chain.SeqBytes(), .. body]);\n            sink.Append(chain.Seq, tag, body);                   // append-only, fsync per policy\n            chain.Advance(tag);\n        }\n    }\n}",
+  "pitfalls": [
+    "A provider registered as transient or scoped produces one chain state per resolution; register it as a singleton (AddSingleton<ILoggerProvider, ...>) or the sequence numbers fork.",
+    "Structured state and scopes can carry secrets through message templates or exception messages - redact in the provider, because the append-only store will keep whatever reaches it.",
+    "ILogger.Log is called concurrently from thread-pool threads; guard the chain state (lock, dedicated writer channel, or a single-consumer Channel<T>) instead of relying on the sink being internally synchronised."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/custom-provider",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.hmacsha256"
+  ],
+  "version": "1.0"
+}

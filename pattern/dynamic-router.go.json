@@ -1,0 +1,56 @@
+{
+  "pattern": "dynamic-router",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "atomic.Pointer[RoutingTable] holding an immutable rule snapshot",
+  "implementation_notes": "Go's idiom for runtime-reconfigurable routing is an immutable table value swapped atomically: build a new RoutingTable, store it with atomic.Pointer[T].Store, and have each message Load the pointer once so it is routed by exactly one generation. The rules can come from anywhere - a config file watched with fsnotify, a control endpoint, a database poll - as long as the swap is atomic and the published table is never mutated afterwards; a sync.RWMutex-guarded map is the simpler fallback when in-place edits are acceptable and lock contention is not a concern.",
+  "code_sketch": "type Rule struct{ Match string; Dest Handler }\ntype RoutingTable struct { rules map[string]Handler; fallback Handler }\nvar live atomic.Pointer[RoutingTable]           // Go 1.19+\n\nfunc route(key string, m Message) {\n\tt := live.Load()                            // one snapshot per message\n\tif h, ok := t.rules[key]; ok { h.Handle(m); return }\n\tt.fallback.Handle(m)                        // unmatched goes somewhere visible\n}\nfunc publish(t *RoutingTable) { live.Store(t) } // control channel",
+  "pitfalls": [
+    "Mutating the table after Store is a data race even if readers read it only once: publish a fresh value instead.",
+    "Map iteration order is randomized, so first-match-wins rule ordering must be an ordered slice, never a range over a map.",
+    "Loading the pointer deep inside a handler can pick up a newer table mid-message; load once per message and pass the snapshot down."
+  ],
+  "sources": [
+    "https://pkg.go.dev/sync/atomic",
+    "https://pkg.go.dev/net/http"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "atomic-pointer-table",
+      "name": "Immutable routing table behind atomic.Pointer",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.19",
+      "idiom_name": "atomic.Pointer[RoutingTable] holding an immutable rule snapshot",
+      "implementation_notes": "Go's idiom for runtime-reconfigurable routing is an immutable table value swapped atomically: build a new RoutingTable, store it with atomic.Pointer[T].Store, and have each message Load the pointer once so it is routed by exactly one generation. The rules can come from anywhere - a config file watched with fsnotify, a control endpoint, a database poll - as long as the swap is atomic and the published table is never mutated afterwards; a sync.RWMutex-guarded map is the simpler fallback when in-place edits are acceptable and lock contention is not a concern.",
+      "code_sketch": "type Rule struct{ Match string; Dest Handler }\ntype RoutingTable struct { rules map[string]Handler; fallback Handler }\nvar live atomic.Pointer[RoutingTable]           // Go 1.19+\n\nfunc route(key string, m Message) {\n\tt := live.Load()                            // one snapshot per message\n\tif h, ok := t.rules[key]; ok { h.Handle(m); return }\n\tt.fallback.Handle(m)                        // unmatched goes somewhere visible\n}\nfunc publish(t *RoutingTable) { live.Store(t) } // control channel",
+      "pitfalls": [
+        "Mutating the table after Store is a data race even if readers read it only once: publish a fresh value instead.",
+        "Map iteration order is randomized, so first-match-wins rule ordering must be an ordered slice, never a range over a map.",
+        "Loading the pointer deep inside a handler can pick up a newer table mid-message; load once per message and pass the snapshot down."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync/atomic",
+        "https://pkg.go.dev/net/http"
+      ]
+    },
+    {
+      "variant_id": "servemux-registration",
+      "name": "net/http.ServeMux route registration at runtime",
+      "paradigm": "declarative",
+      "min_standard": "Go1.22",
+      "idiom_name": "http.ServeMux Handle/HandleFunc with method and wildcard patterns",
+      "implementation_notes": "Where the messages are HTTP requests, the standard library router is the realization: any goroutine can call mux.Handle/HandleFunc while the server runs, so route registration is the control channel, and Go 1.22 patterns add method matching and {wildcard} segments with a documented precedence rule (the most specific pattern wins, conflicting patterns panic at registration). Handlers read matched segments with Request.PathValue, and Request.SetPathValue exists so routers outside the standard library can publish their own parse results. Use it when routing conditions are method-and-path shaped; content-based conditions still need explicit code.",
+      "code_sketch": "mux := http.NewServeMux()\nmux.HandleFunc(\"POST /orders/{id}\", handleOrder)   // Go 1.22 pattern syntax\nmux.HandleFunc(\"GET /orders/{id}\", showOrder)\n\ngo func() {                                       // control channel\n\tfor upd := range updates { mux.HandleFunc(upd.Pattern, upd.Handler) }\n}()\n\nid := r.PathValue(\"id\")                           // matched wildcard",
+      "pitfalls": [
+        "Registering two overlapping patterns where neither is more specific panics at registration time, so a rule-push path must recover from that panic and keep serving the previous table.",
+        "ServeMux has no unregister API: a removed rule cannot be deleted, only shadowed - deletions need a fresh mux swapped behind an atomic pointer or a wrapper router.",
+        "Precedence is decided by the mux (most specific wins), not by the rule set's order, so an operator's expectation of last-wins or first-wins rule ordering does not hold."
+      ],
+      "sources": [
+        "https://go.dev/blog/routing-enhancements"
+      ]
+    }
+  ],
+  "default_variant": "atomic-pointer-table"
+}

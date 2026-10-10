@@ -1,0 +1,58 @@
+{
+  "pattern": "control-bus",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "Meter/Instrument + IHostApplicationLifetime + MapHealthChecks (ASP.NET Core)",
+  "implementation_notes": ".NET splits the control bus into two native halves. Status is instrumentation: a System.Diagnostics.Metrics Meter with counters and histograms, exported by OpenTelemetry or read live with dotnet-counters, plus DiagnosticSource/EventSource for events. Control is the host lifecycle and the admin surface: IHostApplicationLifetime (ApplicationStopping/StopApplication) and the CancellationToken handed to BackgroundService.ExecuteAsync request graceful shutdown, while commands become endpoints registered with MapHealthChecks/MapPost and protected with RequireAuthorization and RequireHost. Health-check middleware plus IHealthCheck is the standard watchdog surface, and configuration reload (IOptionsMonitor/ReloadOnChange) removes the need for many commands entirely. A message-based control bus is only justified when components cannot be addressed over HTTP or the operator already owns a broker.",
+  "code_sketch": "var meter = new Meter(\"integration.control\");\nvar processed = meter.CreateCounter<long>(\"messages.processed\");\n\nbuilder.Services.AddHealthChecks().AddCheck<QueueDepthCheck>(\"queue-depth\");\nbuilder.Services.AddSingleton<CommandHandler>();       // dispatcher shared by all command endpoints\n\nvar app = builder.Build();\napp.MapHealthChecks(\"/healthz\").RequireAuthorization();\napp.MapPost(\"/admin/routes/{id}/suspend\", (string id, CommandHandler h) => h.SuspendAsync(id))\n   .RequireAuthorization(\"ops\");\napp.MapPost(\"/admin/stop\", (IHostApplicationLifetime life) => { life.StopApplication(); return Results.Ok(); })\n   .RequireAuthorization(\"ops\");\napp.Run();",
+  "pitfalls": [
+    "StopApplication is a request, not an exit: code that assumes the process is gone immediately races the ApplicationStopping callbacks that still have to drain work.",
+    "MapHealthChecks and custom admin endpoints are a privileged control surface; without RequireAuthorization/RequireHost they are reachable from every interface the app listens on.",
+    "A BackgroundService that ignores the CancellationToken passed to ExecuteAsync keeps running after a stop command and makes the component report 'stopped' while it still consumes work."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/core/diagnostics/metrics",
+    "https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks",
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.ihostapplicationlifetime"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "diagnostics-and-health-endpoints",
+      "name": "System.Diagnostics.Metrics + host lifetime + health-check endpoints",
+      "paradigm": "oo",
+      "min_standard": "C#10",
+      "idiom_name": "Meter/Instrument + IHostApplicationLifetime + MapHealthChecks (ASP.NET Core)",
+      "implementation_notes": ".NET splits the control bus into two native halves. Status is instrumentation: a System.Diagnostics.Metrics Meter with counters and histograms, exported by OpenTelemetry or read live with dotnet-counters, plus DiagnosticSource/EventSource for events. Control is the host lifecycle and the admin surface: IHostApplicationLifetime (ApplicationStopping/StopApplication) and the CancellationToken handed to BackgroundService.ExecuteAsync request graceful shutdown, while commands become endpoints registered with MapHealthChecks/MapPost and protected with RequireAuthorization and RequireHost. Health-check middleware plus IHealthCheck is the standard watchdog surface, and configuration reload (IOptionsMonitor/ReloadOnChange) removes the need for many commands entirely. A message-based control bus is only justified when components cannot be addressed over HTTP or the operator already owns a broker.",
+      "code_sketch": "var meter = new Meter(\"integration.control\");\nvar processed = meter.CreateCounter<long>(\"messages.processed\");\n\nbuilder.Services.AddHealthChecks().AddCheck<QueueDepthCheck>(\"queue-depth\");\nbuilder.Services.AddSingleton<CommandHandler>();       // dispatcher shared by all command endpoints\n\nvar app = builder.Build();\napp.MapHealthChecks(\"/healthz\").RequireAuthorization();\napp.MapPost(\"/admin/routes/{id}/suspend\", (string id, CommandHandler h) => h.SuspendAsync(id))\n   .RequireAuthorization(\"ops\");\napp.MapPost(\"/admin/stop\", (IHostApplicationLifetime life) => { life.StopApplication(); return Results.Ok(); })\n   .RequireAuthorization(\"ops\");\napp.Run();",
+      "pitfalls": [
+        "StopApplication is a request, not an exit: code that assumes the process is gone immediately races the ApplicationStopping callbacks that still have to drain work.",
+        "MapHealthChecks and custom admin endpoints are a privileged control surface; without RequireAuthorization/RequireHost they are reachable from every interface the app listens on.",
+        "A BackgroundService that ignores the CancellationToken passed to ExecuteAsync keeps running after a stop command and makes the component report 'stopped' while it still consumes work."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/core/diagnostics/metrics",
+        "https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks",
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.hosting.ihostapplicationlifetime"
+      ]
+    },
+    {
+      "variant_id": "signalr-control-hub",
+      "name": "SignalR hub as the control channel for client-side components",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "SignalR Hub<IControlClient> with command RPCs and status callbacks",
+      "implementation_notes": "Where the managed components are web clients rather than servers (edge gateways, browser-attached services, agents behind NAT), a SignalR hub makes a natural control channel: the console calls hub methods to send commands to a client, a group or everyone, and components push status back through the strongly typed Hub<T> interface, with SignalR handling transport fallback (WebSockets, server-sent events, long polling) and connection management. The hub is a privileged surface and must live on its own path with its own authentication scheme and authorisation policy. This variant complements the diagnostics/health variant: SignalR carries the commands, System.Diagnostics.Metrics still carries the telemetry.",
+      "code_sketch": "public interface IControlClient { Task Command(ControlCommand cmd); Task Status(StatusReport s); }\n\npublic sealed class ControlHub : Hub<IControlClient> {\n    public Task Ack(string id, bool applied) => audit.RecordAsync(id, applied, Context.UserIdentifier);\n    public Task Snapshot(StatusReport s) => Clients.Group(\"console\").Status(s);\n}\n// console: await hubConnection.InvokeAsync(\"Command\", new ControlCommand(\"suspend\", \"orders\"));\n// component: await hubConnection.On<ControlCommand>(\"Command\", c => ApplyAsync(c));",
+      "pitfalls": [
+        "Hub methods are callable by any client that can reach the hub: without an authentication scheme and an authorisation policy (and a hub separate from user-facing ones) the control bus is public.",
+        "SignalR reconnects and drops connections by design and does not guarantee delivery, so lifecycle commands must be acknowledged by the client and retried, never fired once.",
+        "Status callbacks are pushed by the component, so a component that stops sending status looks healthy unless the console tracks missed heartbeats and raises an alert."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/aspnet/core/signalr/introduction"
+      ]
+    }
+  ],
+  "default_variant": "diagnostics-and-health-endpoints"
+}

@@ -1,0 +1,113 @@
+# Production Compose for systemd deployment.
+#
+# This file is a deployment variant of docker/docker-compose.yml:
+#   - No `build:` sections (images must be pre-built from the dev compose
+#     via `make docker-build-all` before enabling the service).
+#   - Absolute paths everywhere.
+#   - The systemd unit injects COMPOSE_PROJECT_NAME=dpml-systemd so this
+#     stack is distinct from the dev compose.
+#   - TEI sidecars are NOT defined here — they live in the shared
+#     `pattern-tei-infra` stack (https://github.com/olk/pattern-tei-infra).
+#     This stack joins the `pattern-tei-shared` external network to reach them.
+#
+# Every DESIGN_PATTERN_* name set here must match a `{env:...}` placeholder in
+# config/config.json. A name that does not is SILENTLY IGNORED (the server falls
+# back to its built-in default) — e.g. a bare `TRANSPORT` or `PORT` leaves the
+# server on the `transport: stdio` default and the published port dead. The
+# authoritative list is the config file itself:
+#   grep -o '{env:[A-Z_]*' config/config.json | sort -u
+#
+# Installed at: /etc/design-pattern-mcp/docker-compose.yml
+
+services:
+  design-pattern-mcp:
+    image: ${MCP_IMAGE:-design-pattern-mcp:latest}
+    container_name: "design-pattern-mcp"
+    networks: [pattern-tei-shared]
+    environment:
+      # Config path (the CLI --config flag overrides it).
+      - DESIGN_PATTERN_CONFIG_PATH=/app/config/config.json
+
+      # Generator (LLM): drives ANALYZE/GENERATE/EVALUATE — same MiniMax default
+      # as the dev stack, overridable per deployment; the key falls back to
+      # MINIMAXAI_API_KEY supplied by the unit's EnvironmentFile (.env).
+      # Without a key the server still starts and retrieval works; each LLM call
+      # fails with ERR_009 and the pipeline takes its degraded paths (E3/E4/E12).
+      # The provider prefix lives in MODEL (litellm convention): the
+      # DESIGN_PATTERN_GENERATOR_PROVIDER value only labels error messages.
+      - DESIGN_PATTERN_GENERATOR_PROVIDER=${DESIGN_PATTERN_GENERATOR_PROVIDER:-minimax}
+      - DESIGN_PATTERN_GENERATOR_MODEL=${DESIGN_PATTERN_GENERATOR_MODEL:-minimax/MiniMax-M2.7}
+      - DESIGN_PATTERN_GENERATOR_BASE_URL=${DESIGN_PATTERN_GENERATOR_BASE_URL:-https://api.minimax.io/v1}
+      - DESIGN_PATTERN_GENERATOR_API_KEY=${DESIGN_PATTERN_GENERATOR_API_KEY:-${MINIMAXAI_API_KEY:-}}
+      - DESIGN_PATTERN_GENERATOR_TEMPERATURE=${DESIGN_PATTERN_GENERATOR_TEMPERATURE:-0.1}
+      - DESIGN_PATTERN_GENERATOR_TOP_P=${DESIGN_PATTERN_GENERATOR_TOP_P:-1.0}
+      - DESIGN_PATTERN_GENERATOR_TOP_K=${DESIGN_PATTERN_GENERATOR_TOP_K:-20}
+      # Provider reliability knobs: applications per GENERATE call, the per-agent circuit
+      # breaker and the whole-run execution budget (ERR_014 on expiry). All three are
+      # independent of the per-provider-call timeout in config/config.json.
+      - DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE=${DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE:-5}
+      - DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD=${DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}
+      - DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS=${DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS:-60.0}
+
+      # Embedder: the /v1 suffix selects TEI's OpenAI-compatible route for litellm.
+      # Client batch 8 == the sidecar's ORT max_batch_requests cap for this model;
+      # a larger client batch is split into sequential sub-batches inside ONE HTTP
+      # request and then outlives the client timeout (measured 2026-09-24).
+      - DESIGN_PATTERN_EMBEDDER_BASE_URL=http://pattern-tei-embed:8080/v1
+      - DESIGN_PATTERN_EMBEDDER_BATCH_SIZE=${EMBED_CLIENT_BATCH_SIZE:-8}
+      - DESIGN_PATTERN_EMBEDDER_API_KEY=${DESIGN_PATTERN_EMBEDDER_API_KEY:-not-needed}
+
+      - DESIGN_PATTERN_RERANKER_BASE_URL=http://pattern-tei-rerank:8080
+
+      # Dense embedding cache: baked into the image at /app/data/dense-cache by
+      # `make docker-build-all`. Writing stays enabled so a model swap or catalog
+      # edit re-embeds once and is reused for the container's lifetime; set
+      # DENSE_CACHE_MODE=require to turn any cache/fingerprint mismatch into a
+      # startup refusal instead of a silent re-embed.
+      - DESIGN_PATTERN_DENSE_CACHE_PATH=/app/data/dense-cache
+      - DESIGN_PATTERN_DENSE_CACHE_MODE=${DENSE_CACHE_MODE:-auto}
+      - DESIGN_PATTERN_DENSE_CACHE_WRITE=true
+      # Declared sidecar-model identity for the cache fingerprint (empty = probe decides).
+      - DESIGN_PATTERN_EMBED_MODEL_REPO=${EMBED_MODEL_REPO:-}
+      - DESIGN_PATTERN_EMBED_ONNX_VARIANT=${EMBED_ONNX_VARIANT:-}
+
+      - DESIGN_PATTERN_PATTERN_DIRECTORY=/app/pattern
+
+      - REASONING_ENABLED=true
+      - REASONING_SPAWN_TIMEOUT_SECONDS=10
+      - REASONING_STEP_TIMEOUT_SECONDS=20
+      - REASONING_MAX_TOTAL_STEPS=8
+      - REASONING_QUIET_STDERR=true
+      - REASONING_FAIL_FAST=true
+
+      - DESIGN_PATTERN_TASKS_HEARTBEAT_ENABLED=true
+      - DESIGN_PATTERN_TASKS_HEARTBEAT_INTERVAL_SECONDS=30
+      - DESIGN_PATTERN_TASKS_DEADLINE_SECONDS=${DESIGN_PATTERN_TASKS_DEADLINE_SECONDS:-1800.0}
+      - DESIGN_PATTERN_TRANSPORT=streamable-http
+      - DESIGN_PATTERN_HOST=0.0.0.0
+      - DESIGN_PATTERN_PORT=${MCP_CONTAINER_PORT:-8062}
+      - DESIGN_PATTERN_LOGGING_LEVEL=INFO
+      - DESIGN_PATTERN_LOGGING_FORMAT=json
+
+    depends_on: []
+
+    ports:
+      - "${MCP_HOST_PORT:-8062}:${MCP_CONTAINER_PORT:-8062}"
+    volumes:
+      - /etc/design-pattern-mcp/config:/app/config
+    restart: on-failure
+    healthcheck:
+      # TCP probe on the port the server actually binds (DESIGN_PATTERN_PORT
+      # above): the server binds only AFTER warmup, so connect = fully ready.
+      # The `--health` CLI flag is deliberately NOT the probe — it exercises the
+      # OFFLINE embedder, so it reports healthy while the HTTP surface is still
+      # down (and would have reported healthy even with the transport mis-scoped).
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', ${MCP_CONTAINER_PORT:-8062}), timeout=5).close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1800s   # cold start embeds the whole catalog when no cache is baked
+
+networks:
+  pattern-tei-shared:
+    external: true

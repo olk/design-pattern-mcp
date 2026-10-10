@@ -1,0 +1,55 @@
+{
+  "pattern": "cache-aside",
+  "language": "swift",
+  "support": "library",
+  "idiom_name": "NSCache<NSString, Value> with setObject(_:forKey:cost:)",
+  "implementation_notes": "NSCache is Foundation's thread-safe cache: object(forKey:) and setObject(_:forKey:cost:) store transient objects, entries are evicted automatically under memory pressure, and the instance can be used from several threads without extra locking, which is why it replaces a hand-written dictionary plus lock. The application still owns the protocol - a miss loads from the source of truth and sets the object with a cost and, for TTL, a deadline wrapper, while a write removes the key after the store commit. NSCache is per process and may drop entries at any time, so a shared tier still needs a client such as a Redis package.",
+  "code_sketch": "private let cache = NSCache<NSString, Entity>()\n\nfunc entity(for id: String) -> Entity {\n    if let hit = cache.object(forKey: id as NSString) { return hit }   // cache hit\n    let loaded = source.load(id)                                       // source of truth\n    cache.setObject(loaded, forKey: id as NSString, cost: loaded.size)\n    return loaded\n}\n\nfunc update(_ e: Entity) { source.save(e); cache.removeObject(forKey: e.id as NSString) }",
+  "pitfalls": [
+    "NSCache has no TTL and may evict at any moment (even while a caller holds the returned object), so presence in the cache must never be treated as proof the value exists.",
+    "Keys are not copied and must be objects (KeyType: AnyObject); mutating a key after insertion makes the entry unreachable.",
+    "The cache retains its values strongly, so large or sensitive objects stay in memory until eviction - use NSDiscardableContent or do not cache them."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/foundation/nscache"
+  ],
+  "variants": [
+    {
+      "variant_id": "nscache",
+      "name": "Foundation NSCache with object(forKey:) and cost-based eviction",
+      "paradigm": "oo",
+      "min_standard": "Swift5.0",
+      "idiom_name": "NSCache<NSString, Value> with setObject(_:forKey:cost:)",
+      "implementation_notes": "NSCache is Foundation's thread-safe cache: object(forKey:) and setObject(_:forKey:cost:) store transient objects, entries are evicted automatically under memory pressure, and the instance can be used from several threads without extra locking, which is why it replaces a hand-written dictionary plus lock. The application still owns the protocol - a miss loads from the source of truth and sets the object with a cost and, for TTL, a deadline wrapper, while a write removes the key after the store commit. NSCache is per process and may drop entries at any time, so a shared tier still needs a client such as a Redis package.",
+      "code_sketch": "private let cache = NSCache<NSString, Entity>()\n\nfunc entity(for id: String) -> Entity {\n    if let hit = cache.object(forKey: id as NSString) { return hit }   // cache hit\n    let loaded = source.load(id)                                       // source of truth\n    cache.setObject(loaded, forKey: id as NSString, cost: loaded.size)\n    return loaded\n}\n\nfunc update(_ e: Entity) { source.save(e); cache.removeObject(forKey: e.id as NSString) }",
+      "pitfalls": [
+        "NSCache has no TTL and may evict at any moment (even while a caller holds the returned object), so presence in the cache must never be treated as proof the value exists.",
+        "Keys are not copied and must be objects (KeyType: AnyObject); mutating a key after insertion makes the entry unreachable.",
+        "The cache retains its values strongly, so large or sensitive objects stay in memory until eviction - use NSDiscardableContent or do not cache them."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/foundation/nscache"
+      ]
+    },
+    {
+      "variant_id": "actor-cache",
+      "name": "actor with a Task-valued in-flight map (Swift concurrency)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "idiom_name": "actor holding [Key: Task<Value, Error>] with deduplicated loads",
+      "implementation_notes": "Swift concurrency gives a lock-free structure for the same protocol: an actor serializes access to its state (Apple documents actors as running tasks on a serial executor), and storing the in-flight load as a Task rather than the value lets concurrent callers await the same source-of-truth read, which is the actor-world single-flight. Entries carry a deadline for TTL, invalidation removes the key after the store write, and the actor replaces the mutex; the cost is that no heavy or blocking work may run inside the actor.",
+      "code_sketch": "actor EntityCache {\n    private var entries: [String: Entry] = [:]        // value + deadline\n    private var inflight: [String: Task<Entity, Error>] = [:]\n\n    func entity(for id: String,\n                load: @Sendable @escaping (String) async throws -> Entity) async throws -> Entity {\n        if let e = entries[id], !e.expired { return e.value }\n        if let t = inflight[id] { return try await t.value }   // share one load\n        let task = Task { try await load(id) }\n        inflight[id] = task\n        defer { inflight[id] = nil }\n        let value = try await task.value\n        entries[id] = Entry(value: value, deadline: .now + ttl)\n        return value\n    }\n}",
+      "pitfalls": [
+        "Values that cross the actor boundary must be Sendable; storing a non-Sendable reference type compiles under leniency and races at runtime.",
+        "A failed in-flight Task must be removed from the map, or every later caller awaits the cached failure.",
+        "Long blocking loads inside the actor serialize all other cache access; run the I/O outside and keep only the bookkeeping inside."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/swift/actor",
+        "https://developer.apple.com/documentation/foundation/nscache"
+      ]
+    }
+  ],
+  "default_variant": "nscache",
+  "version": "1.0"
+}

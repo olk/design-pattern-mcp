@@ -1,0 +1,66 @@
+{
+  "pattern": "message-store",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "SQLiteCpp Database/Statement/Transaction RAII with WAL",
+  "implementation_notes": "SQLiteCpp wraps the C API in RAII types: Database opens the file, Statement prepares and binds (including a reused append statement), and Transaction commits in the happy path or rolls back in its destructor, so the message-store structure collapses into a small class holding one statement plus the RAII transaction - no hand-written cleanup, no leaked handles on early return. Payloads become std::string or serialized blobs; the tap is a std::thread consuming a bounded queue (or a lock-free ring) owned by that class, and retention is a DELETE plus incremental VACUUM executed on the same writer, never from a reader. Choose this variant when reporting needs real queries (joins over correlation ids, grouped volumes); choose the RocksDB variant when the write rate of the audit tap dominates and queries are key-range scans.",
+  "code_sketch": "SQLite::Database db(\"audit.sqlite\", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);\ndb.exec(\"PRAGMA journal_mode=WAL\");\nSQLite::Statement ins(db, \"INSERT OR IGNORE INTO msg_store VALUES (?,?,?,?)\");\nvoid tap(StoredMessage const& m) {          // delivery path: enqueue only\n    if (!queue.push(m)) drops.fetch_add(1); // bounded queue, never blocks the sender\n}\nvoid writer() {                             // single owner of the connection\n    while (auto m = queue.pop()) {\n        SQLite::Transaction tx(db);         // RAII: rollback unless commit()\n        ins.bind(1, m->id).bind(2, m->channel).bind(3, m->ts).bind(4, m->body);\n        ins.exec(); ins.reset(); tx.commit();\n    }\n}",
+  "pitfalls": [
+    "A Statement bound to a destroyed or moved Database is a dangling handle; keep lifetimes nested (Database outer, Statement inner) because SQLiteCpp does not track that for you.",
+    "SQLite::Exception must not escape the tap: catching it in the writer loop and counting drops is what keeps the audit side channel from failing the business path.",
+    "SQLITE_BUSY/SQLITE_LOCKED appear as soon as a second writer opens the same file: one writer connection plus WAL is the configuration that avoids it.",
+    "WAL is a property of the database file, not of the connection: setting PRAGMA journal_mode=WAL behind a read-only opener silently does nothing, and readers then block the writer."
+  ],
+  "sources": [
+    "https://github.com/SRombauts/SQLiteCpp",
+    "https://sqlite.org/wal.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sqlitecpp-store",
+      "name": "SQLiteCpp RAII store (relational audit table)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "sqlitecpp"
+      ],
+      "idiom_name": "SQLiteCpp Database/Statement/Transaction RAII with WAL",
+      "implementation_notes": "SQLiteCpp wraps the C API in RAII types: Database opens the file, Statement prepares and binds (including a reused append statement), and Transaction commits in the happy path or rolls back in its destructor, so the message-store structure collapses into a small class holding one statement plus the RAII transaction - no hand-written cleanup, no leaked handles on early return. Payloads become std::string or serialized blobs; the tap is a std::thread consuming a bounded queue (or a lock-free ring) owned by that class, and retention is a DELETE plus incremental VACUUM executed on the same writer, never from a reader. Choose this variant when reporting needs real queries (joins over correlation ids, grouped volumes); choose the RocksDB variant when the write rate of the audit tap dominates and queries are key-range scans.",
+      "code_sketch": "SQLite::Database db(\"audit.sqlite\", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);\ndb.exec(\"PRAGMA journal_mode=WAL\");\nSQLite::Statement ins(db, \"INSERT OR IGNORE INTO msg_store VALUES (?,?,?,?)\");\nvoid tap(StoredMessage const& m) {          // delivery path: enqueue only\n    if (!queue.push(m)) drops.fetch_add(1); // bounded queue, never blocks the sender\n}\nvoid writer() {                             // single owner of the connection\n    while (auto m = queue.pop()) {\n        SQLite::Transaction tx(db);         // RAII: rollback unless commit()\n        ins.bind(1, m->id).bind(2, m->channel).bind(3, m->ts).bind(4, m->body);\n        ins.exec(); ins.reset(); tx.commit();\n    }\n}",
+      "pitfalls": [
+        "A Statement bound to a destroyed or moved Database is a dangling handle; keep lifetimes nested (Database outer, Statement inner) because SQLiteCpp does not track that for you.",
+        "SQLite::Exception must not escape the tap: catching it in the writer loop and counting drops is what keeps the audit side channel from failing the business path.",
+        "SQLITE_BUSY/SQLITE_LOCKED appear as soon as a second writer opens the same file: one writer connection plus WAL is the configuration that avoids it.",
+        "WAL is a property of the database file, not of the connection: setting PRAGMA journal_mode=WAL behind a read-only opener silently does nothing, and readers then block the writer."
+      ],
+      "sources": [
+        "https://github.com/SRombauts/SQLiteCpp",
+        "https://sqlite.org/wal.html"
+      ]
+    },
+    {
+      "variant_id": "rocksdb-log-store",
+      "name": "RocksDB append-only audit log (LSM key-value store)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++17",
+      "requires_features": [
+        "rocksdb"
+      ],
+      "idiom_name": "rocksdb::DB::Put with WriteOptions.sync + prefix-iterated history",
+      "implementation_notes": "When the store is a high-rate log rather than a report table, an LSM key-value engine fits better than SQL: RocksDB's DB::Put appends the record under a key that leads with the channel and timestamp, so per-channel history is a prefix scan via an Iterator or a snapshot read, and rocksdb::WriteOptions.sync=true makes each put durable at the cost of a flush (the default, sync=false, leaves the tail in the OS buffer). Retention replaces SQL DELETE: DeleteRange over an obsolete time range, a TTL column family, or periodic compaction with a compaction filter. Choose this over the SQLite variant when the tap's throughput matters most and queries are key-range scans; choose SQLite when reporting needs ad-hoc joins and a query language, and note that both can be operated side by side - RocksDB for the hot log, SQLite for the report projection.",
+      "code_sketch": "rocksdb::Options opts; opts.create_if_missing = true;\nstd::unique_ptr<rocksdb::DB> db;\nrocksdb::DB::Open(opts, \"audit-log\", &db);\n\nrocksdb::WriteOptions wo;\nwo.sync = true;                                   // durable per record, at one flush each\n\nauto key = channel + \"|\" + ts_zero_padded + \"|\" + message_id;   // channel+time prefix -> range scan\ndb->Put(wo, key, payload_json);                   // the tap's whole write path\n\n// reporting: db->NewIterator(ReadOptions{}) over [channel+\"|\"+from, channel+\"|\"+to)\n// retention: db->DeleteRange(wo, cf, obsolete_lo, obsolete_hi) or a TTL column family",
+      "pitfalls": [
+        "WriteOptions.sync=false is the default and leaves the record in the OS buffer: a machine crash loses the tail of the audit log exactly when it is being investigated.",
+        "DeleteRange is not atomic with concurrent writers on the same key range; retention must be a coordinated sweep, not a background guess.",
+        "Compaction and WAL growth are operations: an unbounded audit column family eventually fills the disk, so TTL settings or compaction filters belong in the configuration from day one.",
+        "Key layout is the schema: changing the key prefix (for example putting the timestamp first) silently breaks every existing range scan and needs a migration."
+      ],
+      "sources": [
+        "https://github.com/facebook/rocksdb/wiki/WAL-Performance",
+        "https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log"
+      ]
+    }
+  ],
+  "default_variant": "sqlitecpp-store"
+}

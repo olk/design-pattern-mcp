@@ -1,0 +1,73 @@
+{
+  "pattern": "lazy-acquisition",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "std::sync::OnceLock::get_or_init",
+  "implementation_notes": "std::sync::OnceLock<T> is a thread-safe cell that can be written at most once: get() observes the not-yet-acquired state, get_or_init(f) acquires exactly once even under concurrent callers, and the returned &T is the published value. Unlike Mutex it is never poisoned by a panic, so a failing initializer simply leaves the cell empty and the next caller retries - which makes it the better holder when acquisition may fail transiently and you intend to retry. Rust also makes the release question a type-level decision: statics never run Drop, so a static OnceLock holding an OS resource is leaked at exit by design, while a per-instance holder puts the cell in the struct and implements Drop on the owner.",
+  "code_sketch": "use std::sync::OnceLock;\n\nfn config() -> &'static Config {\n    static CELL: OnceLock<Config> = OnceLock::new();\n    CELL.get_or_init(|| Config::load(\"app.toml\"))\n}",
+  "pitfalls": [
+    "Reentrant initialization deadlocks: the documentation states it is an error for the initializer to initialize the same cell again and that the current implementation deadlocks, so the closure must not reach back into the holder it is filling.",
+    "get_or_init cannot fail, so an acquisition that returns Result must be stored explicitly (OnceLock<Result<T, E>>) or the failure has to become a panic or unwrap inside the closure - decide which and keep it consistent.",
+    "Static holders never run Drop: the lazily acquired resource lives until process exit, which is usually intended for process-wide state (the std docs call it out) but is not a release policy for anything scarce.",
+    "A per-thread holder wants thread_local! plus std::cell::OnceCell instead of the sync type: OnceLock costs an atomic load on every access, which matters in a hot path."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-oncelock",
+      "name": "std::sync::OnceLock::get_or_init",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "idiom_name": "std::sync::OnceLock::get_or_init",
+      "implementation_notes": "std::sync::OnceLock<T> is a thread-safe cell that can be written at most once: get() observes the not-yet-acquired state, get_or_init(f) acquires exactly once even under concurrent callers, and the returned &T is the published value. Unlike Mutex it is never poisoned by a panic, so a failing initializer simply leaves the cell empty and the next caller retries - which makes it the better holder when acquisition may fail transiently and you intend to retry. Rust also makes the release question a type-level decision: statics never run Drop, so a static OnceLock holding an OS resource is leaked at exit by design, while a per-instance holder puts the cell in the struct and implements Drop on the owner.",
+      "code_sketch": "use std::sync::OnceLock;\n\nfn config() -> &'static Config {\n    static CELL: OnceLock<Config> = OnceLock::new();\n    CELL.get_or_init(|| Config::load(\"app.toml\"))\n}",
+      "pitfalls": [
+        "Reentrant initialization deadlocks: the documentation states it is an error for the initializer to initialize the same cell again and that the current implementation deadlocks, so the closure must not reach back into the holder it is filling.",
+        "get_or_init cannot fail, so an acquisition that returns Result must be stored explicitly (OnceLock<Result<T, E>>) or the failure has to become a panic or unwrap inside the closure - decide which and keep it consistent.",
+        "Static holders never run Drop: the lazily acquired resource lives until process exit, which is usually intended for process-wide state (the std docs call it out) but is not a release policy for anything scarce.",
+        "A per-thread holder wants thread_local! plus std::cell::OnceCell instead of the sync type: OnceLock costs an atomic load on every access, which matters in a hot path."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    },
+    {
+      "variant_id": "std-lazylock",
+      "name": "std::sync::LazyLock<T, F>",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.80",
+      "idiom_name": "std::sync::LazyLock",
+      "implementation_notes": "LazyLock stores the initializer and dereferences to the value, so call sites read like ordinary statics (`static CONF: LazyLock<Config> = LazyLock::new(load);` then `&*CONF`); initialization blocks other threads and, if the closure panics, the lock is poisoned irrecoverably - every later access panics, and the docs are explicit that this is not the recoverable Mutex poisoning. Prefer LazyLock when the initializer needs no per-call input; choose OnceLock when it does or when failure must be retryable.",
+      "code_sketch": "use std::sync::LazyLock;\n\nstatic CONF: LazyLock<Config> = LazyLock::new(|| Config::load(\"app.toml\"));\n\nfn main() { println!(\"{}\", CONF.name); }   // initialized here",
+      "pitfalls": [
+        "Poisoning is permanent and unrecoverable: one panic in the initializer makes every later dereference panic, so LazyLock is wrong around fallible acquisition that you may want to retry.",
+        "Dereferencing blocks while another thread initializes, so touching it from a hot path turns first access into a barrier.",
+        "The closure takes no captured inputs at construction: anything parameterised belongs in OnceLock::get_or_init instead."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html"
+      ]
+    },
+    {
+      "variant_id": "once-cell-crate",
+      "name": "once_cell::sync::{OnceCell, Lazy}",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.34",
+      "idiom_name": "once_cell crate",
+      "implementation_notes": "Before OnceLock (1.70) and LazyLock (1.80) were stable, once_cell was the crate the ecosystem used (with lazy_static as the older macro-based alternative): once_cell::sync::OnceCell with get_or_try_init for fallible acquisition, and once_cell::sync::Lazy for statics. The crate's own recipes cover safe global initialization, lazy global data and lazily compiled regexes, and they warn that the holder must be declared static rather than const. Choose it only when the MSRV predates the std types; otherwise std removes a dependency.",
+      "code_sketch": "use once_cell::sync::Lazy;\n\nstatic CONF: Lazy<Config> = Lazy::new(|| Config::load(\"app.toml\"));\n\nfn main() { let _ = &*CONF; }",
+      "pitfalls": [
+        "Declaring the holder as const instead of static compiles but re-creates and re-acquires the value on every use - the once_cell documentation calls this out explicitly.",
+        "once_cell::unsync types are not Sync and cannot back a shared holder; the mismatch surfaces as a trait-bound error far from the declaration.",
+        "It is an extra dependency pinned to a moving MSRV, which the std types removed - a long-lived library now carries that upgrade obligation."
+      ],
+      "sources": [
+        "https://docs.rs/once_cell/latest/once_cell/"
+      ]
+    }
+  ],
+  "default_variant": "std-oncelock",
+  "version": "1.0"
+}

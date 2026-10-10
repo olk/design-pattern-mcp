@@ -1,0 +1,78 @@
+{
+  "pattern": "virtual-proxy",
+  "language": "java",
+  "support": "manual",
+  "idiom_name": "hand-written proxy + volatile double-checked locking",
+  "implementation_notes": "Java ships no lazy value type, so the stand-in is a hand-written class implementing the same interface and guarding a private field: read the field, and if it is unset, enter a synchronized block, re-check, and construct. The field must be volatile for this to work under the Java 5+ memory model - the classic double-checked locking idiom was famously broken because the initializing writes and the field assignment could be reordered, and volatile publication plus the happens-before edge is what makes the fast path correct. Prefer a Supplier memoized with an AtomicReference (compareAndSet, build outside the lock) or the initialization-on-demand holder when the single-flight requirement dominates; the classic proxy remains justified when the stand-in must implement a multi-method interface.",
+  "code_sketch": "final class ImageProxy implements Image {\n    private final String path;\n    private volatile Image real;\n    public void draw() {\n        if (real == null) {\n            synchronized (this) {\n                if (real == null) real = Image.load(path);\n            }\n        }\n        real.draw();\n    }\n}",
+  "pitfalls": [
+    "Dropping volatile silently breaks the idiom: the compiler and the JMM may publish a reference before the object's fields are visible, so other threads observe a half-constructed subject.",
+    "Constructing inside the monitor serializes every reader behind the slow construction, and an initializer that calls back into the proxy deadlocks; build outside the lock or use an atomic compareAndSet.",
+    "Forwarding the work but not identity: the proxy's default equals/hashCode/toString and getClass expose the stand-in, which breaks sets, maps, assertions and ORM identity checks."
+  ],
+  "sources": [
+    "https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html",
+    "https://en.wikipedia.org/wiki/Initialization-on-demand_holder_idiom",
+    "https://docs.oracle.com/javase/8/docs/technotes/guides/reflection/proxy.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "volatile-dcl",
+      "name": "Volatile double-checked-locking proxy",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "hand-written proxy + volatile double-checked locking",
+      "implementation_notes": "Java ships no lazy value type, so the stand-in is a hand-written class implementing the same interface and guarding a private field: read the field, and if it is unset, enter a synchronized block, re-check, and construct. The field must be volatile for this to work under the Java 5+ memory model - the classic double-checked locking idiom was famously broken because the initializing writes and the field assignment could be reordered, and volatile publication plus the happens-before edge is what makes the fast path correct. Prefer a Supplier memoized with an AtomicReference (compareAndSet, build outside the lock) or the initialization-on-demand holder when the single-flight requirement dominates; the classic proxy remains justified when the stand-in must implement a multi-method interface.",
+      "code_sketch": "final class ImageProxy implements Image {\n    private final String path;\n    private volatile Image real;\n    public void draw() {\n        if (real == null) {\n            synchronized (this) {\n                if (real == null) real = Image.load(path);\n            }\n        }\n        real.draw();\n    }\n}",
+      "pitfalls": [
+        "Dropping volatile silently breaks the idiom: the compiler and the JMM may publish a reference before the object's fields are visible, so other threads observe a half-constructed subject.",
+        "Constructing inside the monitor serializes every reader behind the slow construction, and an initializer that calls back into the proxy deadlocks; build outside the lock or use an atomic compareAndSet.",
+        "Forwarding the work but not identity: the proxy's default equals/hashCode/toString and getClass expose the stand-in, which breaks sets, maps, assertions and ORM identity checks."
+      ],
+      "sources": [
+        "https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html",
+        "https://en.wikipedia.org/wiki/Initialization-on-demand_holder_idiom",
+        "https://docs.oracle.com/javase/8/docs/technotes/guides/reflection/proxy.html"
+      ]
+    },
+    {
+      "variant_id": "lazy-initialization-holder",
+      "name": "Initialization-on-demand holder for a static subject",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "static nested holder class initialised by the JVM",
+      "implementation_notes": "For a shared static subject, put its construction in a nested class's static initializer and expose it through a method; the JVM initializes the holder only when it is first used and guarantees that class initialization is sequential, so the fast path needs no synchronization or volatile read at all. The idiom exploits the JVM's class-loading rules rather than the memory model, which makes it the cheapest correct single-flight guard on a static subject, but it fixes the subject to one shared instance and is only safe when construction cannot fail.",
+      "code_sketch": "final class BigTable {\n    private BigTable() {}\n    private static final class Holder {\n        static final BigTable INSTANCE = new BigTable();\n    }\n    static BigTable instance() { return Holder.INSTANCE; }\n}",
+      "pitfalls": [
+        "The holder only ever produces one instance: per-instance lazy members still need a field guard (see the double-checked variant).",
+        "If the holder's initializer throws, the class is marked erroneous for that loader and every later access fails with NoClassDefFoundError - a recoverable construction belongs behind a checked lazy initializer instead.",
+        "Eager-looking code (a static field on the outer class) reintroduces the initialization the idiom exists to defer; the subject must stay inside the nested class."
+      ],
+      "sources": [
+        "https://en.wikipedia.org/wiki/Initialization-on-demand_holder_idiom",
+        "https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html"
+      ]
+    },
+    {
+      "variant_id": "reflect-orm-proxy",
+      "name": "Runtime-generated lazy proxy (reflection or persistence provider)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "java.lang.reflect.Proxy / JPA lazy proxy (Hibernate LazyInitializer)",
+      "implementation_notes": "When the interface is not known until runtime, java.lang.reflect.Proxy generates the stand-in and routes every invocation through an InvocationHandler, which is the right place to trigger construction before delegating; the same machinery is what persistence providers use for association mappings. Hibernate's LazyInitializer exposes initialize(), getImplementation(), getIdentifier() and setImplementation(), and AbstractLazyInitializer adds prepareForPossibleLoadingOutsideTransaction() so an uninitialized proxy can be detached and loaded later. Choose a generated proxy when a hand-written class per interface is impractical or when the ORM already owns the mapping; a hand-written proxy stays clearer and avoids reflection for a single fixed interface.",
+      "code_sketch": "Image image = (Image) Proxy.newProxyInstance(\n    Image.class.getClassLoader(),\n    new Class<?>[] { Image.class },\n    (proxy, method, args) -> method.invoke(real(path), args));\n// real(path) constructs the subject on the first call\n// JPA equivalent: em.getReference(Image.class, id) until a property is read",
+      "pitfalls": [
+        "The trigger becomes invisible: a plain getter, toString or equals can fire a database round trip, and unstructured traversal produces N+1 query storms.",
+        "Identity must be handled explicitly - two proxies for the same entity, hashCode/equals forwarding and getClass queries otherwise break sets, maps and ORM identity.",
+        "Serialization and detach: a generated proxy that is written out or used after its session ends fails with a lazy-initialization error unless the provider was prepared for loading outside the transaction."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/8/docs/technotes/guides/reflection/proxy.html",
+        "https://docs.oracle.com/javase/8/docs/api/java/lang/reflect/InvocationHandler.html",
+        "https://docs.hibernate.org/orm/current/javadocs/org/hibernate/proxy/LazyInitializer.html"
+      ]
+    }
+  ],
+  "default_variant": "volatile-dcl",
+  "version": "1.0"
+}

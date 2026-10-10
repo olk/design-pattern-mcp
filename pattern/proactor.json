@@ -1,0 +1,187 @@
+{
+  "category": "concurrency-resilience",
+  "name": "proactor",
+  "aliases": [
+    "proactive event dispatching"
+  ],
+  "intent": "Demultiplex and dispatch service requests triggered by the completion of asynchronous operations, so a small number of threads drive many concurrent operations without a thread per operation and without a non-blocking state machine.",
+  "problem": "I/O-heavy components must choose between one thread per operation - which blocks, needs deep thread stacks and swings between idle and saturated - and a readiness-driven event loop whose handlers may never block and must be able to resume at any point where a handle becomes ready. On platforms that execute operations asynchronously and report their completion, the component needs a structure that initiates operations, keeps their request state alive and dispatches completion notifications as ordinary handler calls.",
+  "context": "Applications on a platform or runtime that supports asynchronous operations - Windows overlapped I/O and I/O completion ports, POSIX aio, Linux io_uring, or an epoll/kqueue/IOCP-backed runtime such as Boost.Asio, tokio, asyncio or the JVM NIO.2 provider - that perform many concurrent I/O or timer operations: high-performance network servers, protocol stacks and middleware, storage and database engines, and UI or control integrations in which a shared thread must stay responsive. It fits when the concurrency strategy (single-threaded, thread pool, per-CPU threads) should vary independently of the application logic and the platform can notify on completion rather than only on readiness.",
+  "benefits": [
+    "Separation of concerns: the mechanism that demultiplexes and dispatches completion events is application-independent and reusable, while handlers contain only application-specific work.",
+    "Portability: the handler interface and the completion dispatcher are reused across the facilities that provide asynchronous operations (overlapped I/O and I/O completion ports, POSIX aio, io_uring), insulating application code from the platform call.",
+    "Threading policy is decoupled from concurrency policy: long-running operations complete in the asynchronous operation processor, so a server can run one thread per CPU while servicing far more clients than it has threads.",
+    "The completion dispatcher encapsulates the concurrency mechanism: single-threaded, dynamic-thread, call-through or thread-pool dispatch can be substituted without touching handlers.",
+    "Increased performance: only logical threads of control with work to do are activated, avoiding context switches into idle threads and the stack memory that a thread per operation would commit.",
+    "Simplification of application synchronisation: as long as handlers do not spawn extra threads, they can be written as though the environment were single-threaded.",
+    "Explicit completion semantics: partial results (short reads and writes) are delivered to the handler, which can reissue the operation while keeping the intermediate state it owns.",
+    "Function composition: asynchronous operations can be chained naturally, where a completion handler initiates the next step, enabling composed operations (e.g., read header then body) without the caller knowing the chain exists (Boost.Asio documentation).",
+    "Zero-copy potential: on io_uring, data lands directly in user-supplied buffers on completion, eliminating intermediate kernel-buffer copies for operations already served from page cache."
+  ],
+  "tradeoffs": [
+    "Hard to debug: the inverted flow of control oscillates between the dispatcher and application callbacks, so single-stepping crosses framework code the developer may not own and initiation and completion are separated in time and space.",
+    "Buffer and request-state lifetime become part of the design: every outstanding operation needs its own buffer and state that stay valid until completion, which can be delayed indefinitely, whereas a reactor needs no buffer until a handle is ready.",
+    "Execution order is not controllable: initiators cannot influence the order in which outstanding operations complete, so ordering must be reconstructed in application state and prioritisation and cancellation have to be designed into the processor.",
+    "Portability tax where the platform lacks asynchronous I/O: the operation engine must be emulated with dedicated threads or with a reactor underneath, which reintroduces context switches and the machinery the pattern was meant to remove.",
+    "Dispatcher-dependent handler concurrency: handlers are preemptive under dynamic-thread and thread-pool dispatch but not under post-reactive or call-through dispatch, so correctness assumptions silently change with the concurrency strategy.",
+    "State bookkeeping across partial completions: handlers must tie request-specific state (bytes transferred, remaining work, next stage) through the completion chain, typically with a completion token, or the operation cannot be resumed.",
+    "Program complexity: it is more difficult to develop applications using asynchronous mechanisms due to the separation in time and space between operation initiation and completion. Applications may also be harder to debug due to the inverted flow of control (Boost.Asio documentation).",
+    "Memory usage: buffer space must be committed for the duration of a read or write operation, which may continue indefinitely, and a separate buffer is required for each concurrent operation — a higher baseline commitment than the Reactor pattern."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 7,
+    "maintainability": 5,
+    "simplicity": 3,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Proactive Initiator",
+      "responsibility": "Starts an asynchronous operation and registers with it the completion handler to notify and the completion dispatcher to use; remains free to do other work while the operation runs."
+    },
+    {
+      "role": "Asynchronous Operation",
+      "responsibility": "The request executed asynchronously on behalf of the initiator (accept, connect, read, write, timer); it runs without borrowing the initiator thread and reports partial or complete results."
+    },
+    {
+      "role": "Asynchronous Operation Processor",
+      "responsibility": "Executes operations asynchronously and queues completion events; typically the operating system (I/O completion ports, POSIX aio, io_uring) or a runtime that emulates it with dedicated threads or a reactor."
+    },
+    {
+      "role": "Completion Handler",
+      "responsibility": "Application-specific callback interface whose hook methods are invoked with the results of a completed operation; a handler may initiate further asynchronous operations and carries the request state between them."
+    },
+    {
+      "role": "Completion Dispatcher",
+      "responsibility": "Dequeues completion events and calls back the completion handlers, encapsulating the concurrency strategy (single-threaded, dynamic-thread, call-through, thread pool) and the callback mechanism."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "High-performance network servers and proxies that hold thousands of connections and must not dedicate a thread per connection (the POSA2 web-server example, and modern examples such as Nginx using io_uring and .NET Kestrel using IOCP).",
+    "Storage and database engines that issue many concurrent reads and writes and want a fixed thread pool with explicit completion handling (PostgreSQL 17+ io_uring backend, ScyllaDB, RocksDB with io_uring backend).",
+    "Middleware and protocol stacks in which connection establishment uses asynchronous accept and connect and the same completion dispatcher drives the subsequent protocol processing (Envoy proxy's filter chain driven by a libevent-based event loop, though Envoy itself uses a Reactor/thread-per-worker model for connection acceptance).",
+    "GUI and control applications that keep a main or UI thread responsive while long-running I/O completes elsewhere (the Windows overlapped I/O and message-loop case).",
+    "Runtimes and language platforms that wrap the OS asynchronously and resume coroutines, tasks or virtual threads on completion (Boost.Asio, tokio, asyncio, NIO.2, .NET TPL, Go goroutines through netpoll).",
+    "Batching and streaming pipelines that overlap many transfers and need cancellable, bounded sets of outstanding operations (io_uring submission and completion rings, send/receive bundles, multishot accept).",
+    "Systems requiring unified network and file I/O through a single completion interface, where io_uring replaces the need for separate thread pools for file work (DevOpsNess case study; mixed network+disk workloads that previously needed epoll + a thread pool).",
+    "High-throughput JSON API gateways where io_uring-based proxies (Nginx 1.25+) have shown measurable latency reductions over process-per-connection models (TechForDev migration case study).",
+    "Windows overlapped-I/O servers built on I/O completion ports submit reads, writes, and accepts with OVERLAPPED state; GetQueuedCompletionStatus dequeues completion packets to a bounded worker set, making this a direct Proactor deployment.",
+    "Boost.Asio servers initiate async_read and async_write operations with completion tokens or handlers and let an associated executor dispatch results, enabling composed operations while hiding OS demultiplexing.",
+    ".NET high-throughput socket servers, including the ASP.NET Core Kestrel sockets transport, use SocketAsyncEventArgs to reuse per-operation buffers and state and invoke completion callbacks for AcceptAsync, ReceiveAsync, and SendAsync."
+  ],
+  "avoid_when": [
+    "The component holds a handful of connections or performs one long operation at a time: a blocking thread per connection or a stdlib server call is smaller and easier to debug.",
+    "All the work is CPU-bound: a work queue over a thread pool (producer-consumer) is the right structure, because there are no asynchronous completions to dispatch.",
+    "A runtime or framework already implements the pattern and exposes async APIs (Go goroutines, Node promises, .NET async/await, asyncio, tokio): use those APIs instead of rebuilding a dispatcher on top.",
+    "Strict operation ordering is required: completion order cannot be controlled, so a message queue or a single-threaded reactor that processes one request at a time fits better.",
+    "The platform offers only synchronous I/O and the workload does not justify an emulated engine: a reactor or plain threads keep the design honest.",
+    "The workload is latency-sensitive at the per-request level and dominated by application processing (serialisation, encryption, business logic): io_uring's batching model trades mean latency for throughput; tail latency may worsen without careful tuning of batch size and wait policy.",
+    "Kernel versions cannot be controlled: key io_uring features (multishot accept, ring messaging, op chaining) require Linux 5.15+; older production kernels limit the effective Proactor surface."
+  ],
+  "language_files": {
+    "generic": "proactor.generic.json",
+    "c": "proactor.c.json",
+    "cplusplus": "proactor.cplusplus.json",
+    "csharp": "proactor.csharp.json",
+    "go": "proactor.go.json",
+    "java": "proactor.java.json",
+    "javascript": "proactor.javascript.json",
+    "kotlin": "proactor.kotlin.json",
+    "python": "proactor.python.json",
+    "ruby": "proactor.ruby.json",
+    "rust": "proactor.rust.json",
+    "scala": "proactor.scala.json",
+    "swift": "proactor.swift.json",
+    "typescript": "proactor.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "reactor",
+    "acceptor-connector",
+    "asynchronous-completion-token",
+    "half-sync-half-async",
+    "future-promise",
+    "active-object",
+    "leader-followers",
+    "thread-pool",
+    "observer"
+  ],
+  "anti_patterns": [
+    "Blocking inside a completion handler (a synchronous database or file call): the dispatcher thread is captured and every other outstanding operation waits behind it.",
+    "Reusing or freeing a buffer while an operation on it is still outstanding - the classic dangling-buffer failure of completion-based I/O.",
+    "Unbounded outstanding operations without admission control, presented as scalability: memory and queue depth grow with requests, not with useful work.",
+    "Rebuilding the dispatcher on top of a runtime that already provides it (tokio, asyncio, .NET, Node, Go), duplicating machinery and breaking the runtime's scheduling.",
+    "Assuming handlers run concurrently, or that they never do, instead of deriving the contract from the chosen dispatcher.",
+    "On io_uring: naive replacement of epoll without redesigning around batching, multishot ops, and provided buffers — yields at best 1.06-1.10x improvement vs 2+ x when the architecture is redesigned for io_uring's capabilities (VLDB 2025 study).",
+    "On io_uring: relying on IOSQE_IO_LINK for ordering across independent operations — the link breaks on error and subsequent ops run unordered.",
+    "On io_uring: enabling SQPOLL without a sustained highsubmission workload — the spinning kernel thread wastes CPU when traffic is sparse.",
+    "Assuming readiness-event (Reactor) semantics on a completion-event (Proactor) API: partial completions and short reads/writes are normal in Proactor, not errors."
+  ],
+  "design_principles": [
+    "Separation of concerns: initiating an operation, executing it and dispatching its completion are three distinct responsibilities.",
+    "Inversion of control (Hollywood principle): the framework calls the handler; application code registers interest instead of polling or blocking.",
+    "Information hiding: handlers see the results and their own state, never the processor's queues or the dispatcher's event loop.",
+    "Decoupling policy from mechanism: the dispatcher encapsulates the concurrency strategy so threading policy varies independently of application logic.",
+    "Single responsibility per role: the processor runs operations, the dispatcher demultiplexes completions, the handler processes results.",
+    "Bounded resources: every outstanding operation consumes memory for its buffer and state; unbounded submissions create unbounded memory pressure — apply back-pressure explicitly."
+  ],
+  "best_practices": [
+    "Keep completion handlers short and non-blocking; long synchronous work belongs behind another asynchronous operation or a separate pool.",
+    "Make buffer and request-state ownership explicit and keep both alive until the operation completes — one buffer per outstanding operation.",
+    "Carry a completion token with every operation so a completion can be matched to its request state (the Asynchronous Completion Token pattern).",
+    "Decide and document the dispatcher's concurrency contract (single-threaded, thread pool, call-through); handler correctness depends on it.",
+    "Bound the number of outstanding operations and apply back-pressure before initiating more.",
+    "Design cancellation and prioritisation explicitly; completion order cannot be repaired after the fact.",
+    "Handle partial completions by reissuing the remainder instead of assuming one notification means the whole transfer.",
+    "Prefer batch submission of operations where the platform supports it (io_uring: submit multiple SQEs in one io_uring_enter call) to amortise syscall overhead.",
+    "Use fixed file descriptors and registered buffers for long-lived resources (listen sockets, database connections) to eliminate repeated per-operation kernel lookups.",
+    "For io_uring: design buffer pool lifecycle management so buffers are replenished to the kernel's provided-buffer ring before exhaustion; monitor CQ capacity to avoid dropping completions.",
+    "For io_uring: choose queue depth, batch size, and wait policy (SQPOLL vs ordinary submission) based on measured latency distribution, not defaults — throughput-oriented storage may accept higher queuing delay than latency-sensitive RPC.",
+    "Use multishot operations (accept, receive) where available to eliminate per-connection resubmit overhead on high-connection-rate workloads.",
+    "Profile the full application path, not microbenchmarks: syscall reduction is proven but end-to-end gains require that I/O overhead actually be a bottleneck — for CPU-bound protocols (serialisation, encryption), it may not be."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (2000) - Proactor (Event Handling chapter).",
+    "Pyarali, Harrison, Schmidt & Jordan, Proactor: An Object Behavioral Pattern for Demultiplexing and Dispatching Handlers for Asynchronous Events (PLoP 1997), https://www.dre.vanderbilt.edu/~schmidt/PDF/proactor.pdf",
+    "Schmidt et al., JAWS: Applying the Proactor Pattern to High-Performance Web Servers (1998), https://www.dre.vanderbilt.edu/JAWS/papers/proactor-jaws.pdf",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/event-patterns.html",
+    "https://www.boost.org/doc/libs/develop/doc/html/boost_asio/overview/core/async.html",
+    "https://www.boost.org/doc/libs/1_86_0/doc/html/boost_asio/overview/implementation.html",
+    "https://learn.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports",
+    "Axboe, J. (2019). Efficient IO with io_uring. https://kernel.dk/io_uring.pdf",
+    "Linux manual page: io_uring(7) - https://linuxman7.org/linux/man-pages/man7/io_uring.7.html",
+    "J. Jasny et al., \"High-Performance DBMSs with io_uring: When and How to Use It\" (VLDB 2025), https://www.vldb.org/pvldb/vol19/p2317-jasny.pdf",
+    "Kiril Urbonas, \"Linux io_uring — Async I/O Patterns We Use\" (DevOpsNess, 2026), https://www.devopsness.com/blog/linux-io-uring-async-io-patterns",
+    "Vadim Mi, \"io_uring File I/O Optimizations\" (2026), https://vadimmi.substack.com/p/io-uring-file-io-optimizations",
+    "I. G. Knaur & D. C. Schmidt, \"Comparing Two High-Performance I/O Design Patterns\" (Artima, 2005), https://www.artima.com/articles/comparing-two-high-performance-io-design-patterns",
+    "0xKiire, \"Reactor vs Proactor: Event Loops, Async I/O, and How Servers Scale\" (2026), https://0xkiire.com/reactor-vs-proactor-event-loops/",
+    "youngju.dev, \"Complete Guide to Async I/O Models 2025: epoll, io_uring, Reactor/Proactor, and async/await Internals\" (2026), https://www.youngju.dev/blog/culture/2026-04-15-async-io-models-epoll-io-uring-reactor-guide-2025.en",
+    "kindatechnical.com, \"A Guide to Software Design Patterns - Reactor and Proactor Patterns for I/O\" (2026), https://kindatechnical.com/software-design-patterns/reactor-proactor-io.html",
+    "Canonical Proactor pattern (PLoP 1997): https://www.plopcon.org/pastplops/plop97/Proceedings/pyarali.proactor.pdf",
+    "Microsoft Learn, CreateIoCompletionPort: https://learn.microsoft.com/en-us/windows/win32/fileio/createiocompletionport",
+    "Boost.Asio, Asynchronous Operations: https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/model/async_ops.html",
+    ".NET SocketAsyncEventArgs: https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.socketasynceventargs?view=net-10.0",
+    "ASP.NET Core Kestrel SocketTransportOptions: https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.server.kestrel.transport.sockets.sockettransportoptions.unsafepreferinlinescheduling?view=aspnetcore-10.0",
+    "System Overflow, Reactor vs Proactor: https://www.systemoverflow.com/learn/os-systems-fundamentals/io-models/reactor-vs-proactor-readiness-vs-completion-driven-io"
+  ]
+}

@@ -1,0 +1,188 @@
+{
+  "category": "persistence-state",
+  "name": "concrete-table-inheritance",
+  "aliases": [
+    "table per concrete class",
+    "table per concrete type",
+    "leaf table inheritance",
+    "TPCC",
+    "TPC"
+  ],
+  "intent": "Map an inheritance hierarchy to one table per concrete class - abstract classes get no table of their own - where each table repeats every column that class persists, inherited members included, so one object instance is exactly one row and a leaf-scoped read is a single-table statement with no join and no discriminator filter; hierarchy-wide reads are paid for explicitly, by UNIONing the concrete tables.",
+  "problem": "A class hierarchy must be stored relationally, and most queries ask for one concrete type rather than for the base. The three standard layouts each force a different price: one shared table makes every subclass's columns nullable for the types that never use them, so the database stops enforcing the model; one table per class joined on a shared key pays a join on every read; and one table per concrete class duplicates the base columns everywhere. The team must decide whether join-free leaf access and honest per-type constraints are worth that duplication, the loss of a shared key space, and the disappearance of a single foreign-key target for the hierarchy.",
+  "context": "Object-relational mapping of a shallow-to-medium class hierarchy where the concrete classes diverge noticeably, most queries and writes target a single concrete type, and a denormalized schema is acceptable. Typical when tables are owned per module or shard, when join-free read paths matter (reporting, bulk export, hot leaf tables), or when the ORM in use offers a table-per-concrete-class strategy (JPA TABLE_PER_CLASS, EF Core TPC, SQLAlchemy concrete inheritance, TypeORM concrete entities).",
+  "benefits": [
+    "Every read or write for one concrete type is a plain statement against one table: no joins, no discriminator filter, and all of an instance's state in a single row.",
+    "Columns stay honest: each table holds exactly the concrete type's persistent members (inherited ones included), so NOT NULL, CHECK, unique and type constraints on them are actually true instead of applying to one subclass in a shared table.",
+    "No discriminator column has to be maintained, and a new subclass cannot corrupt another type's rows by introducing an unexpected value in a shared type code.",
+    "Storage autonomy per concrete type: each table can be indexed, partitioned, archived, compressed or even moved to another schema or shard without touching its siblings.",
+    "Wide or rarely used subclasses stop polluting the other types' tables, which keeps the hot tables narrow and their indexes small.",
+    "Leaf-heavy workloads get the best shape available: EF Core's own guidance is to choose TPC when code mostly queries a single leaf type and benchmarks show an improvement over table-per-hierarchy.",
+    "Schema evolution per leaf: adding a column to one concrete type's table does not affect sibling tables, enabling independent deployment of schema changes.",
+    "Each concrete table can use provider-specific features (e.g., full-text search, spatial indexes) without forcing them onto unrelated types.",
+    "Referential integrity from other tables can point directly to the concrete table they care about, avoiding polymorphic FK problems."
+  ],
+  "tradeoffs": [
+    "The inherited columns are duplicated in every concrete table: a rename, retype or constraint change must be applied to all of them, and nothing in the schema or the compiler flags drift between engineers.name and managers.name.",
+    "There is no shared key space: keys must stay unique across the whole hierarchy while each table would generate its own, so identity has to come from one source (a shared sequence, seeded identity ranges or GUIDs) - EF Core therefore uses a shared sequence, and SQLite supports neither sequences nor identity seeds under TPC.",
+    "Polymorphic references cannot be enforced by the database: a foreign key to 'any subclass' has no single target table, so EF Core cannot create the constraint and the application must guarantee that the referenced row exists.",
+    "Reading the base type becomes a UNION ALL over all concrete tables with NULL padding for the columns that do not apply and a synthesized type tag (SQLAlchemy's polymorphic_union); such queries are brittle, defeat simple index use and make hierarchy-wide LIMIT/OFFSET pagination awkward.",
+    "Hierarchy-level invariants fragment: a unique attribute across all subclasses, or a count of every instance of the base type, needs an extra registry table because no single table holds all instances.",
+    "Hierarchy refactoring becomes a multi-table migration: moving a field up to the base or down into a subclass rewrites every concrete table, and adding a subclass adds a table plus its key-generation and union wiring.",
+    "Adding a new concrete type requires creating a new table and updating every UNION ALL query or view that reads the hierarchy — a breaking schema change in application code.",
+    "Database-level constraints that span the whole hierarchy (e.g., a CHECK that all employees have a valid email regardless of type) cannot be expressed without an additional registry table."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 5,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 5,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Concrete Class",
+      "responsibility": "An instantiable class of the hierarchy; its complete persistent state, inherited members included, is stored in its own table."
+    },
+    {
+      "role": "Concrete Table",
+      "responsibility": "One table per concrete class holding columns for every persistent member of that class, with the base class's columns duplicated; no table exists for abstract classes and no discriminator column is needed."
+    },
+    {
+      "role": "Concrete Mapper",
+      "responsibility": "A mapper that loads and saves instances of exactly one concrete class against its own table, without joins and without knowledge of its siblings."
+    },
+    {
+      "role": "Abstract Base Class",
+      "responsibility": "The domain superclass that declares shared state and behaviour but is not mapped to a table of its own; only concrete classes are persisted."
+    },
+    {
+      "role": "Polymorphic Reader",
+      "responsibility": "The union query, view or framework mechanism that reconstructs a mixed collection by concatenating the concrete tables, padding non-applicable columns with NULL and synthesizing the type tag (for example SQLAlchemy's polymorphic_union)."
+    },
+    {
+      "role": "Key Source",
+      "responsibility": "The sequence, GUID generator or seeded identity range shared by all concrete tables, because no single table can own key generation for the whole hierarchy."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Reporting or read-model schemas where each concrete type is queried on its own and join-free scans matter more than a normalized schema.",
+    "Existing or externally owned tables that already exist per leaf type and must be mapped onto a class hierarchy without introducing a shared table.",
+    "Sharded or per-module schemas where each concrete table lives in a different schema or database while the application keeps one domain hierarchy.",
+    "Frameworks that expose a table-per-concrete-class strategy and teams whose queries are leaf-scoped (JPA TABLE_PER_CLASS, EF Core TPC, SQLAlchemy concrete inheritance, TypeORM concrete entities).",
+    "Import, export and ETL code that materializes a hierarchy into one denormalized table per leaf for bulk loading and reads it back through a union.",
+    "Multi-tenant SaaS applications where each tenant's data for a concrete type can be archived, compressed, or moved independently.",
+    "Domain models with a stable hierarchy where leaf types change frequently (new product types, event types) and independent deployability of each type's schema is valued.",
+    "Legacy integration layers where external systems own tables per type and the application must map onto them without schema migration.",
+    "EF Core 7+ hierarchies switched to TPC with UseTpcMappingStrategy, where each concrete type gets its own denormalized table, keys come from one shared sequence, and Microsoft's guidance is to pick TPC once queries mostly target a single leaf type.",
+    "SQLAlchemy concrete inheritance (__mapper_args__ with concrete = True plus polymorphic_union) when each subclass table must stay independently queryable and indexed while queries on the base still return the mixed hierarchy through the union.",
+    "TypeORM entity inheritance where an abstract base class contributes its columns and relations to separate photo, question and post tables - one table per subclass, no shared table, no discriminator."
+  ],
+  "avoid_when": [
+    "Queries against the base type dominate: table-per-hierarchy or class-table inheritance serves those without unions, and EF Core's guidance is to lean to TPH when queries span many types.",
+    "The subclasses differ only slightly: single table inheritance keeps one table plus a type code and duplicates nothing (ActiveRecord and Core Data give you that by default).",
+    "Referential integrity to the hierarchy matters, because other tables point at 'any subclass': class table inheritance keeps one key space and one foreign-key target.",
+    "The hierarchy is expected to change often (fields moving up and down): every such change becomes a migration across all concrete tables.",
+    "The ORM of record does not support the strategy and the team wants the ORM to own the mapping (Django has no concrete inheritance; Rails ships single table inheritance and delegated types) - then pick the mapping the framework supports.",
+    "Integer auto-increment keys are required and the database does not support sequences or seeded identity ranges (e.g., SQLite with TPC) - switch to GUIDs or use a different mapping strategy.",
+    "The team lacks tooling to detect column drift between concrete tables: without automated schema comparison, duplicated base columns will silently diverge over time."
+  ],
+  "language_files": {
+    "generic": "concrete-table-inheritance.generic.json",
+    "c": "concrete-table-inheritance.c.json",
+    "cplusplus": "concrete-table-inheritance.cplusplus.json",
+    "csharp": "concrete-table-inheritance.csharp.json",
+    "go": "concrete-table-inheritance.go.json",
+    "java": "concrete-table-inheritance.java.json",
+    "javascript": "concrete-table-inheritance.javascript.json",
+    "kotlin": "concrete-table-inheritance.kotlin.json",
+    "python": "concrete-table-inheritance.python.json",
+    "ruby": "concrete-table-inheritance.ruby.json",
+    "rust": "concrete-table-inheritance.rust.json",
+    "scala": "concrete-table-inheritance.scala.json",
+    "swift": "concrete-table-inheritance.swift.json",
+    "typescript": "concrete-table-inheritance.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "single-table-inheritance",
+    "class-table-inheritance",
+    "inheritance-mappers",
+    "identity-field",
+    "data-mapper",
+    "metadata-mapping",
+    "foreign-key-mapping"
+  ],
+  "anti_patterns": [
+    "Choosing table per concrete class for a hierarchy that is almost always read polymorphically: every such read becomes a hand-maintained union, and the mapping is then blamed on the database.",
+    "Letting each concrete table evolve independently so the duplicated base columns drift in type, length or nullability with nothing to detect it.",
+    "Writing a foreign-key column that references 'some subclass' and assuming the database enforces it - with no single target table it cannot.",
+    "Using per-table identity or auto-increment columns and discovering key collisions the first time the tables are read together as one hierarchy.",
+    "Forgetting to update the UNION ALL view when a new concrete type is added, causing silent data loss in polymorphic queries.",
+    "Adding NOT NULL constraints to duplicated base columns without ensuring all concrete tables actually enforce the same nullability, creating contradictory schemas.",
+    "Using TPC with SQLite without client-side GUID generation: SQLite lacks sequences and identity seed/increment for TPC, causing key generation to fail at runtime."
+  ],
+  "design_principles": [
+    "One mapper per concrete class: each mapper has a single table to know about, so mapping logic stays local.",
+    "Explicit duplication over hidden coupling: the same column appears in several tables on purpose, so the duplication is the documented price of leaf-local storage and must be tested.",
+    "Keep the abstract base unmapped: abstract classes carry no table, so only concrete state is persisted.",
+    "Design the storage from the dominant query, not from the class diagram: leaf-scoped reads favour this mapping, polymorphic reads favour single table or class table inheritance.",
+    "Restore lost integrity explicitly: where the mapping removes a shared key space or a foreign-key target, add a key source and a registry table rather than assuming correctness.",
+    "Treat the UNION ALL polymorphic view as a first-class schema artifact: name it, document it, and make it the only entry point for hierarchy-wide reads.",
+    "Validate column consistency across concrete tables with automated schema tests that fail on drift in type, nullability, or constraint definition."
+  ],
+  "best_practices": [
+    "Keep the shared key source explicit: one sequence, GUID generator or seeded identity plan for all concrete tables so keys stay unique across the hierarchy.",
+    "Generate the duplicated base columns from a single definition (shared mapper base, code generation or migration template) and add a schema test that fails when they drift.",
+    "Provide exactly one polymorphic read path - a UNION ALL view in the database or the framework's union mechanism - and document that it is the only hierarchy-wide access.",
+    "Keep the abstract base class unmapped and free of persistence metadata so no table is silently created for it.",
+    "If cross-subclass uniqueness or references are needed, add a small registry or base table for identity instead of pretending the union enforces it.",
+    "Re-check the decision when the query mix changes: table per concrete class pays off only while most queries are leaf-scoped, so revisit it with benchmarks when hierarchy-wide reads appear.",
+    "Prefer GUIDs or UUIDs for key generation when the database does not support sequences, to avoid key-collision issues across concrete tables.",
+    "Version the polymorphic UNION ALL view together with the concrete tables: treat schema additions of new concrete types as coordinated migrations.",
+    "Use the ORM's native TPC support where available (EF Core UseTpcMappingStrategy, JPA TABLE_PER_CLASS, SQLAlchemy concrete inheritance) rather than hand-rolling the union, to keep the polymorphic reader in sync automatically.",
+    "When supporting multiple database providers, prefer key strategies that work universally (GUID/UUID) over provider-specific sequences."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Martin Fowler, Patterns of Enterprise Application Architecture (2002) - Concrete Table Inheritance, in the Structural Mapping Patterns chapter (Chapter 12, 'Mapping to Relational Databases').",
+    "https://martinfowler.com/eaaCatalog/concreteTableInheritance.html",
+    "https://learn.microsoft.com/en-us/ef/core/modeling/inheritance - EF Core documentation covering TPH, TPT, and TPC inheritance mapping strategies, including shared sequence key generation and foreign key constraint limitations for TPC.",
+    "https://docs.sqlalchemy.org/en/20/orm/inheritance.html - SQLAlchemy ORM inheritance documentation covering concrete inheritance, polymorphic_union, and polymorphic loading.",
+    "https://jakarta.ee/specifications/persistence/3.2/apidocs/jakarta.persistence/jakarta/persistence/inheritancetype - JPA InheritanceType enum including TABLE_PER_CLASS.",
+    "https://thorben-janssen.com - Practical guidance on JPA/Hibernate inheritance strategies including TABLE_PER_CLASS limitations and key generation.",
+    "https://typedb.com/blog/inheritance-and-polymorphism-where-the-cracks-in-sql-begin-to-show - TypeDB's analysis of Single Table, Concrete Table, and Class Table inheritance patterns in SQL, including tradeoffs, referential integrity challenges, and key allocation problems.",
+    "https://www.geeksforgeeks.org/jpa-table-per-class-strategy - JPA Table-Per-Class strategy overview with advantages and disadvantages.",
+    "https://milanjovanovic.tech - Milan Jovanovic's Entity Framework Core inheritance mapping blog covering TPC in EF Core 7+.",
+    "https://abp.io - ABP.IO documentation on Entity Framework Core inheritance strategies including TPC mapping introduced in EF Core 7.",
+    "https://jacobian.org - Django concrete inheritance gotcha: multi-table inheritance creates two tables (base + subclass) with a FK from subclass to base, which is Class Table Inheritance, not Concrete Table Inheritance.",
+    "https://www.informit.com/articles/article.aspx?p=30661&seqNum=4 - Fowler's Structural Mapping Patterns chapter of Patterns of Enterprise Application Architecture: the canonical Concrete Table Inheritance text, noting the mapping changes required when the superclass hierarchy changes.",
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.entityframeworkcore.relationalentitytypebuilderextensions.usetpcmappingstrategy?view=efcore-10.0 - EF Core UseTpcMappingStrategy API: each concrete type maps to its own database object with all of its properties as columns.",
+    "https://typeorm.io/docs/entity/entity-inheritance/ - TypeORM's official entity-inheritance documentation: an abstract base class contributes its columns to separate photo/question/post tables, one table per subclass.",
+    "https://docs.jboss.org/hibernate/orm/5.2/userguide/html_single/chapters/domain/inheritance.html - Hibernate ORM inheritance mapping: TABLE_PER_CLASS polymorphic reads as UNION ALL over the concrete tables with a synthesized clazz_ tag, and the shared-key/column-name constraints it imposes.",
+    "https://docs.oracle.com/cd/E19226-01/820-7627/bnbqu/index.html - Java EE 6 Tutorial on the Table per Concrete Class strategy: poor polymorphic-query support and the fact that not all JPA providers implement it.",
+    "https://learn.microsoft.com/en-us/archive/blogs/alexj/tip-12-how-to-choose-an-inheritance-strategy - The Entity Framework team's own guidance discouraging TPC: designer gaps and the rule that a base type cannot carry associations under TPC.",
+    "https://agiledata.org/essays/mappingobjects.html - Scott Ambler's O/R mapping essay: one table per concrete class is avoided because role changes force copying data between tables and re-keying, and adding a base attribute means altering every concrete table."
+  ],
+  "related_patterns_notes": {
+    "registry-pattern": "registry-pattern",
+    "union-view": "union-view"
+  }
+}

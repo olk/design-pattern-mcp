@@ -1,0 +1,53 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "scala",
+  "support": "idiomatic",
+  "idiom_name": "scala.collection.concurrent.TrieMap.putIfAbsent",
+  "implementation_notes": "`TrieMap.putIfAbsent(k, v)` returns Option[V]: None means this thread won the claim, Some means the key was already present - a lock-free atomic claim that replaces the classic seen-set on the JVM. It is process-local, so with several JVMs on one queue each claims independently; pair it with a durable store, or with the deduplication offered by reliable-delivery tooling, when duplicates can outlive the process.",
+  "code_sketch": "class Receiver {\n  private val seen = TrieMap.empty[String, Instant]\n\n  def claim(key: String): Boolean =\n    seen.putIfAbsent(key, Instant.now().plus(redeliveryWindow)).isEmpty // true => claimed\n\n  def onMessage(msg: Message): Unit =\n    if (!claim(msg.key)) ack(msg)            // duplicate: absorb\n    else { applyEffects(msg); ack(msg) }\n}",
+  "pitfalls": [
+    "TrieMap state is per-JVM: competing instances each claim the same key independently.",
+    "Values carry expiry but nothing enforces it; a retention sweep is still required."
+  ],
+  "sources": [
+    "https://www.scala-lang.org/api/current/scala/collection/concurrent/TrieMap.html",
+    "https://www.scala-lang.org/api/current/scala/collection/mutable/Set.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "triemap-claim",
+      "name": "Concurrent claim with TrieMap.putIfAbsent",
+      "paradigm": "concurrent",
+      "implementation_notes": "`TrieMap.putIfAbsent(k, v)` returns Option[V]: None means this thread won the claim, Some means the key was already present - a lock-free atomic claim that replaces the classic seen-set on the JVM. It is process-local, so with several JVMs on one queue each claims independently; pair it with a durable store, or with the deduplication offered by reliable-delivery tooling, when duplicates can outlive the process.",
+      "code_sketch": "class Receiver {\n  private val seen = TrieMap.empty[String, Instant]\n\n  def claim(key: String): Boolean =\n    seen.putIfAbsent(key, Instant.now().plus(redeliveryWindow)).isEmpty // true => claimed\n\n  def onMessage(msg: Message): Unit =\n    if (!claim(msg.key)) ack(msg)            // duplicate: absorb\n    else { applyEffects(msg); ack(msg) }\n}",
+      "pitfalls": [
+        "TrieMap state is per-JVM: competing instances each claim the same key independently.",
+        "Values carry expiry but nothing enforces it; a retention sweep is still required."
+      ],
+      "sources": [
+        "https://www.scala-lang.org/api/current/scala/collection/concurrent/TrieMap.html",
+        "https://www.scala-lang.org/api/current/scala/collection/mutable/Set.html"
+      ],
+      "min_standard": "Scala2.13",
+      "idiom_name": "scala.collection.concurrent.TrieMap.putIfAbsent"
+    },
+    {
+      "variant_id": "cats-effect-ref",
+      "name": "Functional claim with Cats Effect Ref.modify",
+      "paradigm": "functional",
+      "implementation_notes": "In a referentially transparent stack the seen-set is a Ref: `ref.modify(seen => (seen + key, seen.contains(key)))` returns the claim decision and the updated state in one atomic step, so no lock discipline is written by hand. Strictly it is the same process-local state as the TrieMap variant; true durability comes from composing the Ref with a unique-constraint insert (doobie/skunk) inside the consumer's transaction.",
+      "code_sketch": "def consume(ref: Ref[IO, Set[String]], msg: Message): IO[Unit] =\n  ref.modify(seen => (seen + msg.key, seen.contains(msg.key))).flatMap { duplicate =>\n    if (duplicate) ack(msg)                // duplicate: absorb\n    else applyEffects(msg) >> ack(msg)\n  }",
+      "pitfalls": [
+        "Ref is process-local: Distributed Ref syncs only in-memory between nodes, so it is not a durable claim.",
+        "Ref updates are atomic but not transactional with external effects; a crash after the claim can swallow a retry unless the claim is rolled back or reconciled."
+      ],
+      "sources": [
+        "https://typelevel.org/cats-effect/docs/std/ref"
+      ],
+      "min_standard": "Scala2.13",
+      "idiom_name": "Ref[F, Set[String]].modify"
+    }
+  ],
+  "default_variant": "triemap-claim"
+}

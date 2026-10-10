@@ -1,0 +1,56 @@
+{
+  "pattern": "caching",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "map + sync.RWMutex + wall-clock TTL, singleflight around the loader",
+  "implementation_notes": "The standard library provides the store but not the cache: a map guarded by sync.RWMutex (or sync.Map when the key set is append-mostly) holds values under comparable keys, while TTL, a size bound with an eviction sweep and invalidation on write are hand-written in a small struct with Get/Set methods. sync.Map has no eviction at all, so entries accumulate unless deletion is explicit. The idiomatic Go complement is golang.org/x/sync/singleflight around the loader, which collapses concurrent misses of one key into a single provider call; generics (Go 1.18+) let the cache be typed without interface{} conversions.",
+  "code_sketch": "type entry[V any] struct{ v V; at time.Time }\ntype Cache[K comparable, V any] struct{ mu sync.RWMutex; m map[K]entry[V]; ttl time.Duration }\nfunc (c *Cache[K, V]) Get(k K) (V, bool) {       // miss also covers expiry\n\tc.mu.RLock()\n\te, ok := c.m[k]\n\tc.mu.RUnlock()\n\tif ok && time.Since(e.at) <= c.ttl {\n\t\treturn e.v, true\n\t}\n\tvar zero V\n\treturn zero, false                           // Set: mu.Lock(); m[k] = entry{v: v, at: time.Now()}\n}",
+  "pitfalls": [
+    "sync.Map is not a cache: it never evicts, has no TTL and Range is not a consistent snapshot - using it without explicit deletion is a memory leak.",
+    "Holding RLock across the loader serializes the whole cache and can deadlock if the loader re-enters it; release the lock before the provider call and re-check (singleflight prevents duplicate work).",
+    "Caching pointers, slices or maps that callers later mutate corrupts every hit; cache immutable values or defensive copies."
+  ],
+  "sources": [
+    "https://pkg.go.dev/sync#Map",
+    "https://pkg.go.dev/golang.org/x/sync/singleflight"
+  ],
+  "variants": [
+    {
+      "variant_id": "map-rmutex-ttl",
+      "name": "Hand-rolled map + sync.RWMutex with TTL (stdlib only)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.0",
+      "idiom_name": "map + sync.RWMutex + wall-clock TTL, singleflight around the loader",
+      "implementation_notes": "The standard library provides the store but not the cache: a map guarded by sync.RWMutex (or sync.Map when the key set is append-mostly) holds values under comparable keys, while TTL, a size bound with an eviction sweep and invalidation on write are hand-written in a small struct with Get/Set methods. sync.Map has no eviction at all, so entries accumulate unless deletion is explicit. The idiomatic Go complement is golang.org/x/sync/singleflight around the loader, which collapses concurrent misses of one key into a single provider call; generics (Go 1.18+) let the cache be typed without interface{} conversions.",
+      "code_sketch": "type entry[V any] struct{ v V; at time.Time }\ntype Cache[K comparable, V any] struct{ mu sync.RWMutex; m map[K]entry[V]; ttl time.Duration }\nfunc (c *Cache[K, V]) Get(k K) (V, bool) {       // miss also covers expiry\n\tc.mu.RLock()\n\te, ok := c.m[k]\n\tc.mu.RUnlock()\n\tif ok && time.Since(e.at) <= c.ttl {\n\t\treturn e.v, true\n\t}\n\tvar zero V\n\treturn zero, false                           // Set: mu.Lock(); m[k] = entry{v: v, at: time.Now()}\n}",
+      "pitfalls": [
+        "sync.Map is not a cache: it never evicts, has no TTL and Range is not a consistent snapshot - using it without explicit deletion is a memory leak.",
+        "Holding RLock across the loader serializes the whole cache and can deadlock if the loader re-enters it; release the lock before the provider call and re-check (singleflight prevents duplicate work).",
+        "Caching pointers, slices or maps that callers later mutate corrupts every hit; cache immutable values or defensive copies."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync#Map",
+        "https://pkg.go.dev/golang.org/x/sync/singleflight"
+      ]
+    },
+    {
+      "variant_id": "golang-lru",
+      "name": "hashicorp/golang-lru v2 fixed-capacity LRU (library)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "lru.New[K,V](size) / expirable.NewLRU (TLL)",
+      "implementation_notes": "hashicorp/golang-lru/v2 is the de-facto Go LRU: lru.New[K,V](size) returns a fixed-capacity cache with automatic eviction (Add/Get/Contains/Remove/Purge, plus Peek to inspect without touching recency), and the expirable subpackage adds per-entry TTL with an eviction callback. The v2 API needs generics (Go 1.18+); v1 is type-erased. Choose it when a true LRU bound matters instead of a hand-rolled sweep, and keep singleflight around the loader for the miss path.",
+      "code_sketch": "cache, err := lru.New[string, *Doc](1024)   // capacity-bounded\nif err != nil { return err }\ncache.Add(key, doc)                        // evicts LRU when full\nif doc, ok := cache.Get(key); ok {         // Get also touches recency\n    return doc, nil\n}\n// TTL variant:\ncache = expirable.NewLRU[string, *Doc](1024, onEvict, time.Minute)",
+      "pitfalls": [
+        "Using Get where only existence matters skews eviction order (it touches recency); Peek exists for read-without-touch.",
+        "lru.New returns an error for size <= 0; ignoring it yields a nil cache that only fails later at Add/Get."
+      ],
+      "sources": [
+        "https://pkg.go.dev/github.com/hashicorp/golang-lru/v2",
+        "https://github.com/hashicorp/golang-lru"
+      ]
+    }
+  ],
+  "default_variant": "map-rmutex-ttl",
+  "version": "1.0"
+}

@@ -1,0 +1,26 @@
+{
+  "pattern": "wire-tap",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "tap goroutine relaying the source channel with a non-blocking select/default send into a bounded tap channel",
+  "implementation_notes": "The idiomatic Go tap is a relay goroutine that owns both sends: it ranges over the source channel, hands a deep-cloned copy to a bounded tap channel with a select whose default branch increments an exported atomic.Uint64 (Go's documented non-blocking send - the default case is chosen whenever the send cannot proceed, so the primary flow never waits on the analyzer), then forwards the original value downstream unchanged. Channel sends copy their operand, but the copy is shallow: slice, map, and pointer fields of a struct value still alias the primary message, so a real Clone() must deep-copy everything the analyzer can touch. Ownership follows the pipeline convention - whoever makes the tap channel closes it only after the last send, the analyzer drains it with for range (a closed channel's remaining buffered values are still received, then the range ends), and the tap is removed by cancelling the relay with a done channel or context instead of closing a channel under a live sender. Choose this hand-rolled form when the flow is an in-process chan or the messaging client exposes only a handler callback; when the transport is already a broker, prefer its fan-out - NATS documents a subscriber on the > wildcard as exactly this wire tap (at-most-once copies, a tap that can't keep up is cut off as a slow consumer) and NSQ delivers a copy of every topic message to each channel with fully independent buffering - neither touches the publisher or the primary consumer.",
+  "code_sketch": "// Tap relays src to dst unchanged, copying into a bounded analyzer\n// channel; overflow drops are counted, never applied to the flow.\nfunc Tap(src <-chan Msg, dst chan<- Msg, buf int) (<-chan Msg, *atomic.Uint64) {\n    tap := make(chan Msg, buf)\n    dropped := new(atomic.Uint64)\n    go func() {\n        defer close(tap) // close after the last send; drains end the analyzer\n        for m := range src {\n            select {\n            case tap <- m.Clone(): // deep copy; buffered, never blocks\n            default:               // documented non-blocking send\n                dropped.Add(1)     // explicit overflow policy: drop the copy\n            }\n            dst <- m // original forwarded, unmodified\n        }\n        close(dst)\n    }()\n    return tap, dropped\n}",
+  "pitfalls": [
+    "Omitting the default branch turns the copy into backpressure on the primary flow: a send on a full buffered channel waits until a receiver retrieves a value (Effective Go), and a select with no default case blocks until one of its communications can proceed (Go spec) - a slow analyzer then stalls the messages passing through the tap.",
+    "Cloning by assigning the struct value is not a copy: a slice field is only a descriptor pointing into the original array, and modifying the elements of a re-slice modifies the elements of the original slice (Go Slices blog) - the analyzer and the primary path silently mutate each other's payload through shared backing arrays, maps, and pointer fields.",
+    "close(tap) while the relay can still send panics the whole program - a send on a closed channel proceeds by causing a run-time panic (Go spec), and the pipelines article spells out the rule the tap must follow: 'Sends on a closed channel panic, so it's important to ensure all sends are done before calling close'.",
+    "A dead or never-started analyzer is a resource leak, not just lost telemetry: a goroutine blocked on a channel whose partner is gone hangs there forever - 'Goroutines are not garbage collected; they must exit on their own' (pipelines article) - so the relay's sends need a done/context branch, and the drop counter must be exported or a wedged analyzer is indistinguishable from a quiet system.",
+    "The default branch fails silently by design: if the send cannot go through immediately the default case is simply chosen (Go blog, Timing out, moving on), so without an explicit, scrapeable drop counter a tapped stream that is 90% loss looks identical to a healthy one."
+  ],
+  "sources": [
+    "https://go.dev/doc/effective_go",
+    "https://go.dev/ref/spec",
+    "https://go.dev/blog/concurrency-timeouts",
+    "https://go.dev/blog/pipelines",
+    "https://go.dev/blog/slices-intro",
+    "https://pkg.go.dev/sync/atomic",
+    "https://docs.nats.io/learn/core-nats/debugging-delivery",
+    "https://nsq.io/overview/design.html"
+  ],
+  "version": "1.1"
+}

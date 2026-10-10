@@ -1,0 +1,196 @@
+{
+  "category": "concurrency-resilience",
+  "name": "thread-local-storage",
+  "aliases": [
+    "thread-specific storage",
+    "thread-specific data"
+  ],
+  "intent": "Give every thread its own instance of a logically global access point, so per-thread state can be read and written without locks and without threading it through every call as a parameter.",
+  "problem": "A value that is conceptually one per execution context - the calling thread's error status, a per-thread scratch formatter or buffer, the request identity and trace context of the worker handling a call - must be reachable from everywhere in the call chain as if it were a global, yet each thread must see its own copy. Sharing one instance would put a lock on every access and mix unrelated threads' data; passing the value explicitly would change every signature, which is exactly what is impossible when a legacy single-threaded API has to keep working while the program becomes multithreaded.",
+  "context": "Thread-per-request, thread-per-connection or worker-thread architectures, and library or framework code that has to retrofit per-thread state into an API whose signatures cannot change. It also covers per-thread caching and scratch objects (formatters, parsers, buffers, pseudo-random generators) whose whole point is to avoid sharing. It does not apply where the runtime multiplexes many tasks onto one OS thread (goroutine schedulers, event loops, coroutine dispatchers, virtual threads): there the unit that needs its own copy is the task or the request, not the thread.",
+  "benefits": [
+    "Lock-free on the hot path: nothing is shared, so nothing needs a mutex, atomic or condition variable. POSA2 states the pattern's whole point is to retrieve thread-specific data without incurring locking overhead on each access, which matters most in inner loops where a shared counter, formatter or buffer would serialise every thread.",
+    "Transparent to callers: the access point looks like an ordinary global or static variable, so no parameter is threaded through the call chain and existing signatures, interfaces and framework callbacks stay unchanged. POSA2 lists ease of use and portability as the pattern's benefits; retrofitting a single-threaded API is the use case it was documented for.",
+    "Isolation by construction: a thread cannot see or corrupt another thread's copy, so the value needs no publication protocol and no memory-ordering reasoning - the storage location itself is what distinguishes the copies.",
+    "Per-thread initialisation and teardown have a natural home: POSIX keys carry a destructor that runs at thread exit, and the native forms (thread_local, thread_local!, _Thread_local) construct lazily per thread and destroy at thread exit, so a per-thread buffer is allocated once per thread and released without a lifetime protocol of its own.",
+    "Enables per-thread caching and scratch data that would otherwise be contended or allocated per call, which is why standard libraries ship such objects themselves: POSIX errno, java.util.concurrent.ThreadLocalRandom, the JDK's thread-local caches, and logback's MDC.",
+    "Cheap to make explicit later: because the ambient state is reached through one named accessor, converting it back into an explicit parameter is a mechanical refactor - the pattern concentrates the hidden dependency in a single place instead of scattering it across the code base."
+  ],
+  "tradeoffs": [
+    "The dependency becomes invisible: nothing in a signature says that a function reads or writes ambient state, so a far-away callee can change what the caller sees. The ScopedValue specification lists exactly this problem (a ThreadLocal does not prevent code in a faraway callee from setting a new value) as a reason to prefer immutable scoped bindings.",
+    "Lifetime is the thread's, not the work item's: pooled threads outlive tasks, so a request identity, tenant or transaction written by one task stays readable by the next task scheduled on that thread unless it is removed explicitly. The ThreadLocal javadoc notes that a thread holds its reference as long as the thread is alive, and the ScopedValue javadoc calls that lifetime unbounded.",
+    "It leaks identities across requests: when the stored value is an authenticated principal, tenant or authorisation decision, omitted cleanup turns an optimisation into a confused-deputy bug - the reason mature frameworks call remove(), Dispose() or reset() in a finally block.",
+    "Wrong unit in async and virtual-thread runtimes: many tasks share one OS thread, so a thread-local is not task-local and a value can jump between concurrent requests. JEP 506 motivates scoped values with precisely this and with the memory cost of a million virtual threads each carrying thread-locals.",
+    "It hides the structure of the system and encourages thread-safe globals: POSA2 lists both as the pattern's liabilities, and a code base in which ambient state replaces parameters becomes hard to follow; explicitly represented relationships often remove the need for the pattern altogether.",
+    "Cleanup is subtle and platform-dependent: POSIX destructors may re-associate values and the process repeats destruction up to PTHREAD_DESTRUCTOR_ITERATIONS, glibc destroys C++ thread_local objects before thread-specific data so the two must not be mixed inside destructors, Rust aborts the process when a thread-local destructor panics, and Boost documents that cleanup is not performed for threads created through the native API on some platforms.",
+    "Memory is retained for the thread's lifetime: values held by long-lived threads, pooled workers or thread-per-connection servers stay reachable until the thread dies or the value is removed, and per-thread maps and caches multiply that retention by the number of threads.",
+    "Debuggability and testability suffer: the state appears in neither stack traces nor signatures, tests running on one thread leak values into each other, and re-entrant paths that set the value twice silently corrupt each other unless the previous value is saved and restored.",
+    "Access can cost more than a plain global: dynamically initialised thread-local storage (block-scope thread_local in shared libraries, dlopen'ed modules, emulated TLS) can use the slower dynamic TLS model, so the promise of an ordinary variable access has to be verified rather than assumed.",
+    "C++ thread_local in dynamically loaded libraries incurs a measurable per-access overhead: general-dynamic TLS (the default with -fPIC) routes accesses through __tls_get_addr, which costs roughly 3-10 ns per unique access site due to Dynamic Thread Vector (DTV) generation checks; initial-exec TLS avoids this but fails when the library is dlopen'ed, and the TLS model cannot be chosen per-deployment without rebuilds.",
+    "Async-context cross-boundary changes do not propagate back to the caller: in Python contextvars and similar task-scoped facilities, modifications made inside a worker thread (asyncio.to_thread, thread pools) are not visible to the parent task after the thread returns - the propagation is one-way (copy_context at task-spawn time), which can silently break logging, authentication and DI systems that expect bidirectional visibility."
+  ],
+  "quality_attributes": {
+    "testability": 4,
+    "extensibility": 5,
+    "maintainability": 4,
+    "simplicity": 7,
+    "performance": 8,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Application Thread",
+      "responsibility": "The unit of concurrency that uses the access point; it reads and mutates its own copy of the thread-specific object and never addresses another thread's copy."
+    },
+    {
+      "role": "TS Object Proxy",
+      "responsibility": "The globally visible access point (a function, a smart-pointer object or a language construct) that hides the key and the collection from callers and returns the calling thread's instance, lazily creating it when the thread has none."
+    },
+    {
+      "role": "TS Object",
+      "responsibility": "The per-thread instance of the data - a status value, a formatter, a request context - owned by exactly one thread and reachable only through the proxy."
+    },
+    {
+      "role": "TS Object Collection",
+      "responsibility": "The per-thread container that maps keys to that thread's objects (the POSIX TSD area, the JVM's ThreadLocalMap, the CLR's thread-static block, the Foundation thread dictionary); it is what makes one key resolve to different objects in different threads."
+    },
+    {
+      "role": "Key",
+      "responsibility": "The identifier under which the proxy looks the object up in the calling thread's collection. POSIX allocates one explicitly with pthread_key_create(); native forms bind it at compile time or at declaration (a thread_local declaration, a ThreadLocal instance, a thread_local! key) - and its lifetime is per process, not per thread."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Per-thread error state: errno and the POSIX requirement that each thread sees its own completion status, the example POSA2 opens with.",
+    "Per-thread scratch objects in a hot path: date formatters, string builders, parser or serialisation buffers, compression workspaces - allocated once per thread instead of per call, with no lock around a shared instance.",
+    "Per-request context in thread-per-request servers: request id, authenticated principal, tenant, locale, transaction or logging context, set at the request edge and read by logging and persistence layers deep in the stack (Spring's RequestContextHolder, logback's MDC, thread-bound persistence sessions).",
+    "Retrofitting a legacy single-threaded API: a library that keeps per-call state in file-static variables must become thread-safe without changing its published signatures - POSA2's porting scenario, and the reason ACE_TSS-style proxies were built.",
+    "Per-thread resources owned by a worker: a connection, session or transaction bound to the worker thread that serves it, created on first use and released by the thread-exit destructor.",
+    "Tracing and observability: a span or correlation context that instrumentation points read from anywhere without an explicit parameter - realized per-thread in classic servers and per-task in async runtimes (AsyncLocalStorage, contextvars, ScopedValue, @TaskLocal).",
+    "MDC and structured logging context: logback's Mapped Diagnostic Context (MDC), Python's logging integration with contextvars, and OpenTelemetry baggage propagation all use thread-local or task-local storage to attach per-request fields (request ID, correlation ID, user ID) to the current execution context so that log lines and traces are automatically enriched without drilling parameters through every call.",
+    "Spring TaskDecorator for context propagation: Spring's TaskDecorator interface captures the current thread's state (e.g., SecurityContext, RequestAttributes) when a task is submitted to a thread pool and restores it when the task runs, providing a safe pattern for propagating thread-bound context into asynchronously executed work.",
+    "InheritableThreadLocal for thread-forked child contexts: when a new thread is explicitly forked (not pooled/reused), InheritableThreadLocal copies the parent's values to the child at creation time, useful in classic thread-per-task designs where the child needs the same logging or security context as its parent.",
+    "Porting a legacy single-threaded library to threads without touching its API: ACE's ACE_TSS<TYPE> template is the pattern's canonical C++ implementation - one global ACE_TSS instance presents a logically global variable while owning the creation, per-thread access and destruction of every thread's copy (ts_get/ts_object/ts_ptr), exactly the TS Object Proxy POSA2 describes.",
+    "Per-thread fields and ambient context in .NET: [ThreadStatic] static fields for compile-time-known per-thread state (fastest, but never auto-initialised per thread), System.Threading.ThreadLocal<T> when a per-thread value factory or lazy initialisation is needed, and AsyncLocal<T> when the same logical operation must keep its context across awaits that hop between pool threads."
+  ],
+  "avoid_when": [
+    "The value can simply be passed: an explicit parameter, a context object or a per-request struct is clearer than ambient state. Go's position is exactly that request-scoped values should travel as an explicit context.Context argument.",
+    "The runtime multiplexes tasks onto one thread: event loops, goroutine schedulers, coroutine dispatchers and virtual threads need per-task or per-context storage (AsyncLocalStorage, contextvars, ScopedValue, @TaskLocal, tokio task_local!, coroutine context elements), not per-thread storage.",
+    "The state is shared rather than per-thread: protect it with a guardian object, make it immutable and swap it atomically, or hand it to a single owner thread instead of pretending each thread has its own copy.",
+    "The value must be visible to other threads you spawn: thread-local state does not propagate (except deliberately inheritable variants, which copy at thread creation only), so pass the value or use an explicit context that propagates.",
+    "The scope is one function or one object: a local variable, a field or a parameter is simpler, testable and free of lifetime questions.",
+    "You are writing Go: there is no goroutine-local storage by design, and goroutine-id-based workarounds lose their data as soon as any handler or library spawns another goroutine - use context.Context with context.WithValue to propagate request-scoped values explicitly instead (Go's own documented pattern for this exact use case)."
+  ],
+  "language_files": {
+    "generic": "thread-local-storage.generic.json",
+    "c": "thread-local-storage.c.json",
+    "cplusplus": "thread-local-storage.cplusplus.json",
+    "csharp": "thread-local-storage.csharp.json",
+    "go": "thread-local-storage.go.json",
+    "java": "thread-local-storage.java.json",
+    "javascript": "thread-local-storage.javascript.json",
+    "kotlin": "thread-local-storage.kotlin.json",
+    "python": "thread-local-storage.python.json",
+    "ruby": "thread-local-storage.ruby.json",
+    "rust": "thread-local-storage.rust.json",
+    "scala": "thread-local-storage.scala.json",
+    "swift": "thread-local-storage.swift.json",
+    "typescript": "thread-local-storage.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "singleton",
+    "thread-confinement",
+    "active-object",
+    "thread-pool",
+    "double-checked-locking",
+    "guardian-object",
+    "monitor-object"
+  ],
+  "anti_patterns": [
+    "Using thread-local storage to avoid passing a required parameter: the callee's real dependencies disappear from its signature and the code becomes untestable and hostile to re-entrancy - the same objection the ScopedValue specification raises against a ThreadLocal that any far-away callee can overwrite.",
+    "Storing request identity, tenant or authorisation state in a thread-local and relying on the next request to overwrite it: pooled threads serve many requests, so one omitted remove(), Dispose() or reset() leaks the previous caller's identity into the next one.",
+    "Simulating goroutine-local or thread-local storage in an async runtime by keying a map on the current thread or a spawn id: tasks share threads and migrate between them, so the value is read by the wrong unit of work. Go's runtime deliberately withholds goroutine ids to prevent exactly this.",
+    "A thread-local as a hidden global for configuration or mutable business state: the pattern's own documented liabilities (it encourages thread-safe globals and hides the structure of the system) describe the resulting design.",
+    "Leaving per-thread caches and buffers to be reclaimed when the thread dies in a process with thousands of long-lived or pooled threads: memory grows with the thread count and nothing ever frees it.",
+    "Reinventing per-thread storage as a global map plus a thread-id key on a platform that already has thread-local storage: it re-adds the lock the pattern was supposed to remove.",
+    "Using threading.local in an async handler without wrapping the entire request lifecycle in a contextvars.run() or AsyncLocalStorage.run(): the thread-local value is shared with all other async tasks running concurrently on the same thread, causing context bleed between concurrent requests."
+  ],
+  "design_principles": [
+    "Separation of concerns: the access point is separated from the storage location - callers name a logical value, while the runtime resolves the physical per-thread object.",
+    "Information hiding: the key, the collection and the lookup stay behind the proxy; POSA2 notes that without the proxy, application threads would have to obtain the collections and use keys explicitly.",
+    "Avoid sharing rather than synchronise it: state that belongs to one execution context should not be shared at all, which removes the need for locking instead of making locking cheaper.",
+    "Explicit over implicit, consciously traded: adding an ambient access path is a debt, so it must be justified by API compatibility or by a genuinely cross-cutting concern, and the hidden value must be documented like a hidden parameter.",
+    "Lifecycle ownership: the storage knows when its lifetime ends (thread exit, scope exit, work-item end) and releases there, so per-thread resources are freed deterministically instead of at the next garbage collection.",
+    "Immutability by preference: where the use case allows, prefer immutable scoped bindings (ScopedValue, contextvars.ContextVar, AsyncLocalStorage stores) over mutable thread-local state - immutable bindings prevent far-callee corruption and are easier to reason about in concurrent contexts."
+  ],
+  "best_practices": [
+    "Prefer the language's declarative form over a hand-rolled registry: thread_local, ThreadLocal<T> with a factory, thread_local!, @ThreadLocal, Thread.threadDictionary, threading.local plus contextvars - the primitives already handle lazy per-thread initialisation and thread-exit cleanup.",
+    "Treat the thread-local as a hidden parameter: initialise it at one documented entry point (the request edge, the worker-loop start), name it after its scope, and keep unrelated code from writing it.",
+    "Reset before reuse: clear or dispose the value in a finally block or at the end of each work item (ThreadLocal.remove(), ThreadLocal<T>.Value = null or Dispose(), thread_variable_set(key, nil), contextvars token reset) - the single most important rule in pooled and server environments.",
+    "Pick the primitive that matches the execution unit: async-context facilities (AsyncLocalStorage, contextvars, ScopedValue, @TaskLocal, tokio task_local!, coroutine context elements) for task-scoped state, thread-local storage only where the work item really is the thread.",
+    "Keep the stored object small and self-contained: never store request objects, sessions, class loaders or anything another thread will read, and never let the value become the only reference that keeps a request graph alive.",
+    "Make the ambient dependency visible: document scope and lifetime where the field is declared, expose one narrow accessor instead of raw setters, and delete the thread-local as soon as the signature can be changed to take the value explicitly.",
+    "Verify thread-exit cleanup on the target platform before relying on it (POSIX destructor iteration, Boost's native-thread caveat, virtual-thread and pool behaviour) and test the reuse path explicitly: run two work items on one thread and assert that the second starts from a clean state.",
+    "Use ScopedValue (Java 21+) over ThreadLocal for new code targeting virtual threads: ScopedValue's immutable one-way bindings avoid the unbounded-lifetime and far-callee-overwrite problems that plague ThreadLocal, and the lexical scoping makes cleanup automatic.",
+    "In Rust, prefer const initialisation for thread_local! to use the non-lazy (eager-storage) path: thread_local! { pub static COUNTER: Cell<u32> = const { Cell::new(0) }; } avoids the per-access state machine and drop-tracking overhead of lazy TLS.",
+    "In Node.js, always use AsyncLocalStorage.run(store, fn) to establish a new context rather than enterWith(), which can silently leak context across unrelated async chains; wrap the entire request lifecycle, not just the initial middleware.",
+    "In Spring applications with @Async or TaskExecutor, use TaskDecorator to capture SecurityContext and RequestAttributes at submit-time and restore them inside the task's run() method - this is the framework-supported pattern for propagating thread-bound context into async execution.",
+    "Avoid InheritableThreadLocal in pooled thread environments: the copied value from the parent thread persists across task boundaries on the same pooled thread, causing stale or leaked context in subsequent tasks; use ScopedValue, contextvars, or explicit context propagation instead.",
+    "For C++ thread_local in shared libraries that may be dlopen'ed, be aware that general-dynamic TLS (the default under -fPIC) adds ~3-10 ns per access via __tls_get_addr; if the library is never loaded via dlopen, compile with -ftls-model=initial-exec or -ftls-model=local-dynamic to reduce this overhead."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (Wiley, 2000) - Thread-Specific Storage (Concurrency chapter); the pattern's originating catalog.",
+    "Schmidt, D. C., Thread-Specific Storage: An Object Behavioral Pattern for Accessing per-Thread State Efficiently (PLoP '97) - intent, participants (TS Object Proxy, TS Object, TS Object Collection), benefits (efficiency, ease of use, portability, reusability) and liabilities (it encourages thread-safe global variables, hides the structure of the system).",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html",
+    "https://www.cs.wm.edu/~dcschmidt/PDF/TSS-pattern.pdf",
+    "https://pubs.opengroup.org/onlinepubs/9699969799/functions/pthread_key_create.html",
+    "https://en.cppreference.com/w/cpp/language/storage_duration",
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ThreadLocal.html",
+    "https://openjdk.org/jeps/506 - JEP 506: Scoped Values (Java 21) - motivation, API, and migration guidance from ThreadLocal to immutable scope-bound scoped values.",
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ScopedValue.html",
+    "https://nodejs.org/api/async_context.html - AsyncLocalStorage documentation covering run(), enterWith(), getStore(), and async-context propagation behaviour in Node.js.",
+    "https://go.dev/blog/context - Go Concurrency Patterns: Context - official Go blog on using context.Context for per-request value propagation as the goroutine-local storage alternative.",
+    "https://go.dev/doc/faq#no_goroutine_id - Go FAQ: Why is there no goroutine ID? Explains why goroutine IDs are intentionally withheld and that context.Value is the correct mechanism.",
+    "https://docs.python.org/3/library/contextvars.html - Python contextvars documentation: ContextVar, Context, copy_context(), and native asyncio integration.",
+    "https://peps.pythonlang.net/pep-0567/ - PEP 567: Context Variables (Python 3.7) - introducing contextvars to solve per-task context propagation in async code.",
+    "https://maskray.me/blog/all-about-thread-local-storage - Detailed analysis of C++ TLS implementation: TLS models (initial-exec, local-dynamic, general-dynamic), __tls_get_addr cost, dlopen interaction, and async-signal-safety considerations.",
+    "https://yosefk.com/blog/cxx-thread-local-storage-performance.html - C++ thread_local performance: __tls_get_addr slow path, DTV generation updates, and the ~3-10 ns per-access overhead in dynamically loaded libraries.",
+    "https://www.dev-doc.rust-lang.org/nightly/std/macro.thread_local.html - Rust thread_local! macro documentation: const vs lazy initialisation paths, EagerStorage vs LazyStorage, and const { } optimisation.",
+    "https://matklad.github.io/2020/10/03/fast-thread-locals-in-rust.html - Fast Thread Locals In Rust: benchmarks showing lazy thread_local! overhead and the const { } workaround to achieve non-lazy initialisation.",
+    "https://medium.com/yapi-kredi-teknoloji/threadlocal-deep-dive-internals-pitfalls-and-best-practices-95083b2f5b43 - ThreadLocal Deep Dive: internals, Spring integration, memory leak risks with thread pools, @Async context propagation pitfalls, and TaskDecorator pattern.",
+    "https://www.baeldung.com/java-threadlocal - Introduction to Java ThreadLocal: usage patterns, custom ThreadPoolExecutor for automatic remove(), and thread pool reuse risks.",
+    "https://matthewpalma.dev/blog/nodejs-asynclocalstorage-request-context-production-apis - Node.js AsyncLocalStorage: request-scoped context without globals; run() vs enterWith(), store design, and production Express integration patterns.",
+    "https://ionutbalosin.com/2026/02/scoped-values-a-better-alternative-to-threadlocal-for-virtual-threads/ - Scoped Values vs ThreadLocal comparison: memory efficiency with virtual threads, inheritance via StructuredTaskScope, and migration guidance.",
+    "http://xunitpatterns.com/Thread-Specific%20Storage.html",
+    "https://www.dre.vanderbilt.edu/Doxygen/Stable/libace-doc/a08070.html - ACE_TSS<TYPE> class template reference (Schmidt's ACE framework): the pattern's canonical C++ implementation - per-thread copies owned by one global instance, lazy creation on first access, destruction of all thread copies when the ACE_TSS is destroyed.",
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/thread-local-storage-thread-relative-static-fields-and-data-slots - Microsoft Learn: thread-relative static fields ([ThreadStatic]) vs ThreadLocal<T> vs data slots; per-thread initialisation caveats and the AsyncLocal<T> guidance for async control flow.",
+    "https://sites.google.com/site/unclebobconsultingllc/thread-local-a-convenient-abomination - Robert C. Martin, 'Thread Local: A Convenient Abomination': argues storing unit-of-work/session state in thread-locals is an antipattern because the thread-to-work-item mapping is one-to-one only by assumption, and pooled reuse leaks stale scope."
+  ],
+  "related_patterns_notes": {
+    "scoped-value": "scoped-value",
+    "contextvars": "contextvars",
+    "async-local-storage": "async-local-storage",
+    "task-local": "task-local"
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "pattern": "server-session",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "Drogon enableSession() + req->session() (drogon::Session / SessionPtr)",
+  "implementation_notes": "Drogon is the mainstream C++ framework that ships sessions: HttpAppFramework::instance().enableSession(timeout, sameSite) turns them on (1200 s default, 0 keeps the record for the application's whole lifetime) and every request then carries a drogon::Session through req->session(), a thread-safe, typed key/value bag with insert/get/modify/find that the framework keeps on the server while only the SessionID cookie travels to the browser. That replaces the classic role structure - identifier generation, registry lookup, cookie binding - with one framework call, and the session object is available in handlers and filters alike (the documented usage pattern is a filter that rate-limits by session). The remaining decision is deployment: with the in-process store a conversation is pinned to one instance, so a farm needs a shared store or sticky routing, which the framework does not decide for you.",
+  "code_sketch": "drogon::HttpAppFramework::instance().enableSession(1200);  // same-site + timeout\n\nvoid Handler(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&cb) {\n    auto session = req->session();                 // drogon::Session, server-side\n    if (session->find(\"visits\")) {\n        session->modify<int>(\"visits\", [](int &v) { ++v; });\n    } else {\n        session->insert(\"visits\", 1);\n    }\n    cb(HttpResponse::newHttpJsonResponse({{ \"visits\", session->get<int>(\"visits\") }}));\n}",
+  "pitfalls": [
+    "Session support is off by default; enabling it also means clients without cookie support create a new record for every request, which the documentation calls out as wasted memory and compute.",
+    "The framework store is per process: an in-process session pins the conversation to one instance unless a shared store or sticky routing is added.",
+    "enableSession(0) means 'never expire', which is rarely what a production deployment wants; the timeout must be chosen deliberately."
+  ],
+  "sources": [
+    "https://github.com/drogonframework/drogon/wiki/ENG-07-Session"
+  ],
+  "variants": [
+    {
+      "variant_id": "drogon-managed-session",
+      "name": "Drogon-managed session on HttpRequest",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "Drogon enableSession() + req->session() (drogon::Session / SessionPtr)",
+      "implementation_notes": "Drogon is the mainstream C++ framework that ships sessions: HttpAppFramework::instance().enableSession(timeout, sameSite) turns them on (1200 s default, 0 keeps the record for the application's whole lifetime) and every request then carries a drogon::Session through req->session(), a thread-safe, typed key/value bag with insert/get/modify/find that the framework keeps on the server while only the SessionID cookie travels to the browser. That replaces the classic role structure - identifier generation, registry lookup, cookie binding - with one framework call, and the session object is available in handlers and filters alike (the documented usage pattern is a filter that rate-limits by session). The remaining decision is deployment: with the in-process store a conversation is pinned to one instance, so a farm needs a shared store or sticky routing, which the framework does not decide for you.",
+      "code_sketch": "drogon::HttpAppFramework::instance().enableSession(1200);  // same-site + timeout\n\nvoid Handler(const HttpRequestPtr &req, std::function<void(const HttpResponsePtr &)> &&cb) {\n    auto session = req->session();                 // drogon::Session, server-side\n    if (session->find(\"visits\")) {\n        session->modify<int>(\"visits\", [](int &v) { ++v; });\n    } else {\n        session->insert(\"visits\", 1);\n    }\n    cb(HttpResponse::newHttpJsonResponse({{ \"visits\", session->get<int>(\"visits\") }}));\n}",
+      "pitfalls": [
+        "Session support is off by default; enabling it also means clients without cookie support create a new record for every request, which the documentation calls out as wasted memory and compute.",
+        "The framework store is per process: an in-process session pins the conversation to one instance unless a shared store or sticky routing is added.",
+        "enableSession(0) means 'never expire', which is rarely what a production deployment wants; the timeout must be chosen deliberately."
+      ],
+      "sources": [
+        "https://github.com/drogonframework/drogon/wiki/ENG-07-Session"
+      ]
+    },
+    {
+      "variant_id": "beast-hand-rolled-store",
+      "name": "Boost.Beast server + hand-written session table",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::unordered_map<std::string, Session> behind std::mutex, swept on a timer",
+      "implementation_notes": "When Beast/Asio is already the HTTP layer and no session-aware framework is in the stack, the classic structure is written by hand: the handler parses the Cookie header, the table maps identifier -> session object under a std::mutex (or one shard per worker thread), and a periodic task drops idle records. Boost.Beast provides HTTP messages and connections, not a session abstraction, so identifier generation, expiry and serialization policy remain application code - this variant is justified for a small, fixed set of values and a single-instance deployment, but it reimplements what a session framework would otherwise own.",
+      "code_sketch": "std::unordered_map<std::string, Session> sessions_;\nstd::mutex mu_;\n\nSession& resolve(const std::string& sid) {\n    std::lock_guard<std::mutex> lock(mu_);          // one table, many io threads\n    return sessions_.try_emplace(sid).first->second;\n}\n// sweeper task: erase entries whose last_seen < now - idle_ttl",
+      "pitfalls": [
+        "Every thread running the io_context shares the table: unlock the mutex around user code and the race is back; hold it and blocking handlers serialize the server.",
+        "Without a sweeper the map grows without bound; and because it is process memory, a second worker or a restart silently empties every conversation.",
+        "The Cookie header is attacker-controlled text: parse it strictly (length, charset, one value per name) and never hash or index on it unchecked."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/libs/beast/doc/html/index.html",
+        "https://en.cppreference.com/cpp/thread/mutex"
+      ]
+    },
+    {
+      "variant_id": "redis-backed-shared-store",
+      "name": "Session record in Redis (hiredis), shared across instances",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "Redis hash/string per session id with TTL (hiredis client)",
+      "implementation_notes": "The deployment variant that removes affinity: keep the payload in Redis under a key derived from the session identifier, set with an expiry so the store itself forgets idle conversations, and let every instance read and write the same record; hiredis is the usual C client for that. The carrier and rotation policy do not change - only the owner of the payload - but resolving a request now depends on the network, so timeouts, pooling and a stated failure mode (fail closed for authenticated routes) become part of the realization, and concurrent writers need a version or last-write-wins rule.",
+      "code_sketch": "redisContext *r = redisConnect(host, port);\nredisReply *v = redisCommand(r, \"GET session:%s\", sid);\nif (!v || v->type == REDIS_REPLY_NIL) { create_and_store(r, sid); }\nredisCommand(r, \"SETEX session:%s %d %s\", sid, idle_ttl, encoded_state);\n/* logout: redisCommand(r, \"DEL session:%s\", sid); */",
+      "pitfalls": [
+        "A store outage is now a session outage: every request fails to resolve its conversation, so the error path must be explicit (fail closed for privileged routes, never silently anonymous).",
+        "Read-modify-write across instances races: two concurrent requests from one client can interleave GET/SET and lose an update unless the record carries a version or the conversation is single-writer.",
+        "Redis replies must be freed (redisReply) and connections pooled/shared correctly across threads; the naive 'connect per request' version both leaks and collapses under load."
+      ],
+      "sources": [
+        "https://github.com/redis/hiredis",
+        "https://github.com/drogonframework/drogon/wiki/ENG-07-Session"
+      ]
+    }
+  ],
+  "default_variant": "drogon-managed-session",
+  "version": "1.0"
+}

@@ -1,0 +1,62 @@
+{
+  "support": "library",
+  "idiom_name": "System.Threading.Channels bounded channel + Task readers (single-reader dispatch or fan-out)",
+  "implementation_notes": "The classic dispatcher collapses into System.Threading.Channels: Channel.CreateBounded<T> is the queue, ChannelReader.ReadAllAsync() is the consumer loop, and a Task.Run(async () => await foreach ...) per reader is a performer - with SingleReader/SingleWriter promising the access pattern so the implementation can drop locks. A single-reader dispatcher plus an ActionBlock (or a semaphore) is the form to choose when the selection must be central; the bounded channel's FullMode supplies back-pressure (Wait) or explicit loss (DropOldest/DropWrite). Use Channel.CreateUnbounded only when the producer is genuinely rate-limited by something else; Task/PLINQ remain the simpler tools when the performers are equivalent and uncoordinated.",
+  "code_sketch": "var channel = Channel.CreateBounded<Message>(new BoundedChannelOptions(1024)\n{\n    SingleWriter = true,          // one producer\n    SingleReader = false,         // several performers dequeue from it\n    FullMode = BoundedChannelFullMode.Wait   // writers experience back-pressure\n});\nfor (var i = 0; i < workers; i++)\n    _ = Task.Run(async () =>\n    {\n        await foreach (var msg in channel.Reader.ReadAllAsync()) await HandleAsync(msg);\n    });\nawait channel.Writer.WriteAsync(message, ct);   // never unbounded growth",
+  "pitfalls": [
+    "A channel is never finished by itself: without Writer.Complete() (or cancellation) ReadAllAsync() awaits forever and the performers never exit.",
+    "A reader loop whose handler throws kills that Task; unless the exception is observed (await/log) the performer silently disappears and the remaining readers absorb the load.",
+    "CreateUnbounded is the default in many samples but gives no back-pressure at all: overload becomes heap growth, and BoundedChannelFullMode.DropWrite/DropOldest silently discards messages unless an itemDropped callback is registered.",
+    "Declaring SingleReader = true while starting several readers is a correctness bug hidden by the option: the channel may skip synchronization the readers rely on."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/core/extensions/channels",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.actionblock-1"
+  ],
+  "variants": [
+    {
+      "variant_id": "channels-reader-loop",
+      "name": "Channels with a single-reader dispatcher or reader fan-out",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "idiom_name": "System.Threading.Channels bounded channel + Task readers (single-reader dispatch or fan-out)",
+      "implementation_notes": "The classic dispatcher collapses into System.Threading.Channels: Channel.CreateBounded<T> is the queue, ChannelReader.ReadAllAsync() is the consumer loop, and a Task.Run(async () => await foreach ...) per reader is a performer - with SingleReader/SingleWriter promising the access pattern so the implementation can drop locks. A single-reader dispatcher plus an ActionBlock (or a semaphore) is the form to choose when the selection must be central; the bounded channel's FullMode supplies back-pressure (Wait) or explicit loss (DropOldest/DropWrite). Use Channel.CreateUnbounded only when the producer is genuinely rate-limited by something else; Task/PLINQ remain the simpler tools when the performers are equivalent and uncoordinated.",
+      "code_sketch": "var channel = Channel.CreateBounded<Message>(new BoundedChannelOptions(1024)\n{\n    SingleWriter = true,          // one producer\n    SingleReader = false,         // several performers dequeue from it\n    FullMode = BoundedChannelFullMode.Wait   // writers experience back-pressure\n});\nfor (var i = 0; i < workers; i++)\n    _ = Task.Run(async () =>\n    {\n        await foreach (var msg in channel.Reader.ReadAllAsync()) await HandleAsync(msg);\n    });\nawait channel.Writer.WriteAsync(message, ct);   // never unbounded growth",
+      "pitfalls": [
+        "A channel is never finished by itself: without Writer.Complete() (or cancellation) ReadAllAsync() awaits forever and the performers never exit.",
+        "A reader loop whose handler throws kills that Task; unless the exception is observed (await/log) the performer silently disappears and the remaining readers absorb the load.",
+        "CreateUnbounded is the default in many samples but gives no back-pressure at all: overload becomes heap growth, and BoundedChannelFullMode.DropWrite/DropOldest silently discards messages unless an itemDropped callback is registered.",
+        "Declaring SingleReader = true while starting several readers is a correctness bug hidden by the option: the channel may skip synchronization the readers rely on."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/core/extensions/channels",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.actionblock-1"
+      ]
+    },
+    {
+      "variant_id": "dataflow-action-block",
+      "name": "TPL Dataflow ActionBlock with MaxDegreeOfParallelism",
+      "paradigm": "declarative",
+      "min_standard": "C#8",
+      "requires_features": [
+        "System.Threading.Tasks.Dataflow package"
+      ],
+      "idiom_name": "ActionBlock<TInput> + ExecutionDataflowBlockOptions.MaxDegreeOfParallelism",
+      "implementation_notes": "TPL Dataflow compiles the dispatcher and the performer pool into one declarative block: an ActionBlock<TInput> has an internal queue, invokes the configured delegate for every posted element and runs at most MaxDegreeOfParallelism of them at a time, so post() is the dispatch and the delegate is the performer. Complete() then Completion await drains it. It is the right form for multi-stage flows (the block links into a pipeline) and when the degree of parallelism is configuration; it is heavier than a channel when messages are simply fanned out, and the Dataflow assembly ships as a NuGet package rather than in the shared framework.",
+      "code_sketch": "var options = new ExecutionDataflowBlockOptions\n{\n    MaxDegreeOfParallelism = Environment.ProcessorCount,\n    BoundedCapacity = 1024            // back-pressure: Post() returns false when full\n};\nvar performer = new ActionBlock<Message>(async msg => await HandleAsync(msg), options);\nforeach (var msg in batch)\n    await performer.SendAsync(msg);   // dispatch = post, exactly one delegate invocation\nperformer.Complete();\nawait performer.Completion;           // drain before shutdown",
+      "pitfalls": [
+        "ActionBlock.Post() returns false and silently drops the message when BoundedCapacity is reached; use SendAsync (which awaits) or inspect the return value.",
+        "Exceptions from the delegate fault the whole block permanently: it stops accepting input and every subsequent Post/SendAsync fails until the block is replaced.",
+        "OutputCount/InputCount and Completion are the only observability hooks; without them a stalled block is indistinguishable from a slow one.",
+        "MaxDegreeOfParallelism = -1 (unbounded) plus BoundedCapacity = -1 gives no limits at all, which is the overload failure mode the pattern exists to avoid."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.actionblock-1"
+      ]
+    }
+  ],
+  "default_variant": "channels-reader-loop",
+  "pattern": "message-dispatcher",
+  "language": "csharp",
+  "version": "1.0"
+}

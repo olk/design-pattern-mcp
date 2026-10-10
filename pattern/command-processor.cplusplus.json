@@ -1,0 +1,64 @@
+{
+  "pattern": "command-processor",
+  "language": "cplusplus",
+  "idiom_name": "std::function/std::packaged_task commands + std::mutex/condition_variable + worker threads",
+  "implementation_notes": "The base C++ realization: a command is a `std::function<void()>` (type-erased closure) or a `std::packaged_task<R()>` when the submitter needs the result, the repository is a `std::queue<...>` guarded by `std::mutex` and `std::condition_variable`, and the executor is a fixed set of worker threads that pop-and-run outside the lock; `std::future` from packaged_task gives the result, cancellation-by-policy and the per-command outcome that the history layer records. Undo and macros are application-level: store a serialisable command description plus an inverse alongside the closure, or keep a separate `std::function<void()>` undo stack. Still the right choice when no third-party runtime may be added.",
+  "code_sketch": "std::queue<std::function<void()>> q;                 // command repository\nstd::mutex m; std::condition_variable cv;\nvoid worker() {                                     // executor\n    for (;;) {\n        std::function<void()> cmd;\n        { std::unique_lock lk(m); cv.wait(lk, [&]{ return !q.empty() || stop; });\n          if (q.empty() && stop) return; cmd = std::move(q.front()); q.pop(); }\n        cmd();                                       // run outside the lock\n        history.push_back(cmd);                      // logging / undo\n    }\n}",
+  "pitfalls": [
+    "Holding the mutex while executing the command serialises the pool and deadlocks on re-submission; dequeue under the lock, execute outside it.",
+    "Discarding the std::future of a std::packaged_task loses the exception it carries - the failure becomes silent.",
+    "A command capturing `this` or a reference outlives the object it refers to if it stays in the queue/history; prefer capturing values or shared ownership.",
+    "An unbounded std::queue with no backpressure policy turns overload into unbounded memory growth."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/packaged_task",
+    "https://en.cppreference.com/w/cpp/thread/condition_variable",
+    "https://en.cppreference.com/w/cpp/utility/functional/function"
+  ],
+  "support": "manual",
+  "variants": [
+    {
+      "variant_id": "std-function-thread-pool",
+      "name": "std::function command queue + condition_variable worker pool",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::function/std::packaged_task commands + std::mutex/condition_variable + worker threads",
+      "implementation_notes": "The base C++ realization: a command is a `std::function<void()>` (type-erased closure) or a `std::packaged_task<R()>` when the submitter needs the result, the repository is a `std::queue<...>` guarded by `std::mutex` and `std::condition_variable`, and the executor is a fixed set of worker threads that pop-and-run outside the lock; `std::future` from packaged_task gives the result, cancellation-by-policy and the per-command outcome that the history layer records. Undo and macros are application-level: store a serialisable command description plus an inverse alongside the closure, or keep a separate `std::function<void()>` undo stack. Still the right choice when no third-party runtime may be added.",
+      "code_sketch": "std::queue<std::function<void()>> q;                 // command repository\nstd::mutex m; std::condition_variable cv;\nvoid worker() {                                     // executor\n    for (;;) {\n        std::function<void()> cmd;\n        { std::unique_lock lk(m); cv.wait(lk, [&]{ return !q.empty() || stop; });\n          if (q.empty() && stop) return; cmd = std::move(q.front()); q.pop(); }\n        cmd();                                       // run outside the lock\n        history.push_back(cmd);                      // logging / undo\n    }\n}",
+      "pitfalls": [
+        "Holding the mutex while executing the command serialises the pool and deadlocks on re-submission; dequeue under the lock, execute outside it.",
+        "Discarding the std::future of a std::packaged_task loses the exception it carries - the failure becomes silent.",
+        "A command capturing `this` or a reference outlives the object it refers to if it stays in the queue/history; prefer capturing values or shared ownership.",
+        "An unbounded std::queue with no backpressure policy turns overload into unbounded memory growth."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/packaged_task",
+        "https://en.cppreference.com/w/cpp/thread/condition_variable",
+        "https://en.cppreference.com/w/cpp/utility/functional/function"
+      ]
+    },
+    {
+      "variant_id": "asio-post-executor",
+      "name": "Boost.Asio io_context as a ready-made executor",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "boost-asio"
+      ],
+      "idiom_name": "io_context::post / strand-serialised handlers",
+      "implementation_notes": "Boost.Asio already provides the processor's executor: `io_context::post()` enqueues a handler into io_context's own work queue and a thread or thread pool running `io_context::run()` drains it - commands are the posted handlers and scheduling policy becomes thread count plus `strand` serialisation. This removes the hand-written queue/mutex/condvar triple, and it is the pragmatic choice when the process is I/O-bound and Asio is already in the build; the command abstraction (typed commands, history, undo) is still application code, and only one participant (the executor) came from the library.",
+      "code_sketch": "boost::asio::io_context io;\nio.post([&] { place_order(order_id, qty); });       // invocation, not execution\nboost::asio::post(io, boost::asio::bind_executor(strand,\n    [&] { /* serialised command execution */ }));\nauto guard = boost::asio::make_work_guard(io);     // keep run() alive between commands\nstd::vector<std::thread> pool(4, [&]{ io.run(); });",
+      "pitfalls": [
+        "Without a work_guard, `io_context::run()` returns as soon as the queue empties and the pool stops draining commands.",
+        "Multiple threads calling run() execute handlers concurrently - wrap commands that must not interleave in a strand or raise max_concurrency to 1.",
+        "Long blocking work inside a posted handler stalls the event loop; hand it to a separate thread pool and post the completion back."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/1_86_0/doc/html/boost_asio/reference/io_context/post.html",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/io_context.html"
+      ]
+    }
+  ],
+  "default_variant": "std-function-thread-pool",
+  "version": "1.0"
+}

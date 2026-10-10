@@ -1,0 +1,79 @@
+{
+  "pattern": "monitor-object",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "class + std::mutex + std::condition_variable + unique_lock/scoped_lock",
+  "implementation_notes": "Modern C++ writes the monitor by hand from the standard library: a std::mutex member is the monitor lock and std::condition_variable the monitor condition, with std::unique_lock/std::scoped_lock providing the Scoped Locking idiom so the lock is released on every exit path. The predicate overload of condition_variable::wait replaces the hand-written loop and handles spurious wakeups; notify_one/notify_all correspond to signal/broadcast, and std::jthread with stop tokens can make an indefinite wait cancellable. Use condition_variable_any only when the lock is not a std::mutex, and split interface methods from implementation methods so intra-object calls never re-lock.",
+  "code_sketch": "class BoundedQueue {\n  std::mutex m_;\n  std::condition_variable not_full_, not_empty_;\n  std::deque<Message> q_;  std::size_t cap_;\npublic:\n  void put(Message m) {\n    std::unique_lock lk{m_};\n    not_full_.wait(lk, [&] { return q_.size() < cap_; });\n    q_.push_back(std::move(m));\n    not_empty_.notify_one();\n  }\n};",
+  "pitfalls": [
+    "std::condition_variable only works with std::unique_lock<std::mutex>; using it with another lockable type requires condition_variable_any, and a notify without holding the mutex must not precede publishing the state change.",
+    "A condition variable carries no state: notify_one before any waiter arrives is a lost wakeup unless the predicate already reflects the change, which is exactly what the predicated wait overload enforces.",
+    "Do not block, allocate heavily or call foreign code while holding the mutex, and do not paper over intra-object re-locking with std::recursive_mutex - the Thread-Safe Interface split is the fix."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-mutex-condvar",
+      "name": "std::mutex + std::condition_variable with scoped locking",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "class + std::mutex + std::condition_variable + unique_lock/scoped_lock",
+      "implementation_notes": "Modern C++ writes the monitor by hand from the standard library: a std::mutex member is the monitor lock and std::condition_variable the monitor condition, with std::unique_lock/std::scoped_lock providing the Scoped Locking idiom so the lock is released on every exit path. The predicate overload of condition_variable::wait replaces the hand-written loop and handles spurious wakeups; notify_one/notify_all correspond to signal/broadcast, and std::jthread with stop tokens can make an indefinite wait cancellable. Use condition_variable_any only when the lock is not a std::mutex, and split interface methods from implementation methods so intra-object calls never re-lock.",
+      "code_sketch": "class BoundedQueue {\n  std::mutex m_;\n  std::condition_variable not_full_, not_empty_;\n  std::deque<Message> q_;  std::size_t cap_;\npublic:\n  void put(Message m) {\n    std::unique_lock lk{m_};\n    not_full_.wait(lk, [&] { return q_.size() < cap_; });\n    q_.push_back(std::move(m));\n    not_empty_.notify_one();\n  }\n};",
+      "pitfalls": [
+        "std::condition_variable only works with std::unique_lock<std::mutex>; using it with another lockable type requires condition_variable_any, and a notify without holding the mutex must not precede publishing the state change.",
+        "A condition variable carries no state: notify_one before any waiter arrives is a lost wakeup unless the predicate already reflects the change, which is exactly what the predicated wait overload enforces.",
+        "Do not block, allocate heavily or call foreign code while holding the mutex, and do not paper over intra-object re-locking with std::recursive_mutex - the Thread-Safe Interface split is the fix."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "asio-strand",
+      "name": "Executor/strand serialisation without a lock",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "Boost.Asio",
+        "strand",
+        "io_context"
+      ],
+      "idiom_name": "strand<> + bind_executor: every handler of the object runs on one strand",
+      "implementation_notes": "Where the object is only reached from asynchronous handlers, the monitor lock is replaced by confinement to a strand: a strand is a strictly sequential invocation of handlers, so every method becomes a handler posted through boost::asio::bind_executor(strand, ...) and no two of them ever run concurrently. There is no monitor lock and no condition variable - a method that must wait for the state to change re-posts itself or resumes a continuation instead of blocking a thread, which is what makes this form usable inside an event loop. It realises the same guarantee (one method at a time inside the object) through scheduling rather than mutual exclusion; choose it when the surrounding code is already Asio-based.",
+      "code_sketch": "boost::asio::strand<io_context::executor_type> strand_{make_strand(io)};\nvoid put(msg m) {                        // serialised by the strand\n    boost::asio::post(strand_, [this, m] { put_impl(m); });\n}\n// completion handlers are bound the same way:\n// sock.async_read_some(buf, bind_executor(strand_, on_read));",
+      "pitfalls": [
+        "A strand only serialises handlers that actually go through it: a direct call, a different executor or an unbound completion handler escapes the serialisation silently.",
+        "Handlers must not block: a blocking call inside a strand stalls the io_context and every object bound to that executor, which is why waits become continuations.",
+        "The object must outlive every posted handler (shared_from_this or explicit lifetime management), and all intermediate handlers of a composed operation must use the same strand."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/core/strands.html"
+      ]
+    },
+    {
+      "variant_id": "ace-classic",
+      "name": "ACE wrapper facades (the POSA2-era C++ realisation)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "requires_features": [
+        "ACE"
+      ],
+      "idiom_name": "ACE_Thread_Mutex + ACE_Condition with Guard (Scoped Locking)",
+      "implementation_notes": "The pattern's original C++ home: POSA2 and the pattern paper document this structure with ACE wrapper facades, where a class holds a Thread_Mutex as its monitor lock and Thread_Condition objects as monitor conditions, each interface method wraps its body in Guard<Thread_Mutex>, forwards to non-synchronised implementation methods and waits in a predicate loop. ACE_Message_Queue is the production version of exactly this shape, and Strategized Locking can parameterise the synchronisation policy (MT_SYNCH versus NULL_SYNCH) over the same class template. Choose it only when ACE is already in the stack; otherwise std::mutex/std::condition_variable replace it one to one.",
+      "code_sketch": "class Message_Queue {\n  ACE_Thread_Mutex monitor_lock_;\n  ACE_Condition<ACE_Thread_Mutex> not_full_{monitor_lock_}, not_empty_{monitor_lock_};\npublic:\n  void put(const Message &msg) {\n    Guard<ACE_Thread_Mutex> guard(monitor_lock_);   // Scoped Locking\n    while (full_i()) not_full_.wait();              // predicate loop\n    put_i(msg);\n    not_empty_.signal();\n  }\n};",
+      "pitfalls": [
+        "ACE condition variables are bound to a specific mutex wrapper: mixing mutex types, or signalling from outside the guard's scope, breaks the monitor without a compiler error.",
+        "The ACE stack is C++03-era and heavyweight; without its service configuration and reactor layers the standard library gives the same structure with less machinery."
+      ],
+      "sources": [
+        "https://www.dre.vanderbilt.edu/~schmidt/ACE/book2/",
+        "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html"
+      ]
+    }
+  ],
+  "default_variant": "std-mutex-condvar",
+  "version": "1.0"
+}

@@ -1,0 +1,77 @@
+{
+  "pattern": "lazy-initialization",
+  "language": "cplusplus",
+  "support": "native",
+  "idiom_name": "function-local static with guaranteed thread-safe initialisation",
+  "implementation_notes": "The language absorbed the pattern: since C++11 a block-scope static is initialised the first time control passes through its declaration and, if several threads reach it concurrently, the initialisation occurs exactly once - cppreference states the guarantee explicitly, so the classic marker test disappears and the accessor becomes 'static Foo f; return f;'. The same mechanism gives lazily built singletons (Meyers form) and lazily created shared dependencies, with no lock on the fast path after initialisation. A throwing initialiser leaves the static uninitialised, so the initialisation is attempted again on the next traversal.",
+  "code_sketch": "const Index& index() {\n    static const Index idx = Index::load(cfg_path());  // first call builds it\n    return idx;                                        // exactly once, thread-safe\n}",
+  "pitfalls": [
+    "Thread safety applies to block-scope statics only: a namespace-scope or member static is initialised before main, which is how the static-initialisation-order fiasco (and the construct-on-first-use idiom) arise.",
+    "MSVC before 2015 did not implement magic statics, and code that wraps the static in a hand-written double-checked fast path (a raw pointer test outside the static) is still a data race on any standard library.",
+    "A recursive initialiser (the static's constructor using the accessor) is undefined/deadlocking rather than merely slow, and destroying a function-local static at exit can race with other threads' use during shutdown."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/storage_duration",
+    "https://en.cppreference.com/w/cpp/language/static"
+  ],
+  "variants": [
+    {
+      "variant_id": "function-local-static",
+      "name": "Function-local static (thread-safe since C++11)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "function-local static with guaranteed thread-safe initialisation",
+      "implementation_notes": "The language absorbed the pattern: since C++11 a block-scope static is initialised the first time control passes through its declaration and, if several threads reach it concurrently, the initialisation occurs exactly once - cppreference states the guarantee explicitly, so the classic marker test disappears and the accessor becomes 'static Foo f; return f;'. The same mechanism gives lazily built singletons (Meyers form) and lazily created shared dependencies, with no lock on the fast path after initialisation. A throwing initialiser leaves the static uninitialised, so the initialisation is attempted again on the next traversal.",
+      "code_sketch": "const Index& index() {\n    static const Index idx = Index::load(cfg_path());  // first call builds it\n    return idx;                                        // exactly once, thread-safe\n}",
+      "pitfalls": [
+        "Thread safety applies to block-scope statics only: a namespace-scope or member static is initialised before main, which is how the static-initialisation-order fiasco (and the construct-on-first-use idiom) arise.",
+        "MSVC before 2015 did not implement magic statics, and code that wraps the static in a hand-written double-checked fast path (a raw pointer test outside the static) is still a data race on any standard library.",
+        "A recursive initialiser (the static's constructor using the accessor) is undefined/deadlocking rather than merely slow, and destroying a function-local static at exit can race with other threads' use during shutdown."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/storage_duration",
+        "https://en.cppreference.com/w/cpp/language/static"
+      ]
+    },
+    {
+      "variant_id": "call-once-flag",
+      "name": "std::call_once over a std::once_flag",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::once_flag plus std::call_once",
+      "implementation_notes": "When the initialisation is not tied to one variable - registering handlers, warming a global registry, applying a one-time configuration - std::call_once(f, fn) with a std::once_flag is the library form of the same guarantee. Unlike the static-local form, a throwing callable neither completes nor poisons the flag: cppreference documents that the exception is propagated and the flag is not flipped, so the next call attempts the initialisation again - a retry-friendly, but also potentially repeated, failure policy.",
+      "code_sketch": "std::once_flag flag;\nRegistry registry;\n\nvoid ensure_registry() {\n    std::call_once(flag, [] { registry = Registry::discover(); });\n}\n// throwing callable: exception propagates, flag stays unset -> retried",
+      "pitfalls": [
+        "std::call_once blocks every concurrent caller until the callable returns, and if the callable throws, the flag is not flipped: repeated failures mean repeated blocking and repeated side effects, so the callable should be exception-safe.",
+        "once_flag is neither copyable nor movable and must outlive every caller; a once_flag in a destroyed object leaves callers with a dangling flag.",
+        "The callable returning void means success/failure must be encoded in the shared state it writes, not in its return value."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/call_once"
+      ]
+    },
+    {
+      "variant_id": "resettable-optional",
+      "name": "Resettable lazy cell (std::optional plus mutex/atomic)",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::optional"
+      ],
+      "idiom_name": "std::optional<T> cell guarded by std::mutex (or atomic publication)",
+      "implementation_notes": "When the value must be rebuildable (configuration reload, connection loss) the once-forms are the wrong tool because they can never run the initialiser a second time; the replacement is an explicit cell - std::optional<T> plus a std::mutex, or, for a hot read path, an std::atomic flag with release publication and a pointer/shared_ptr payload. It trades the language guarantee for a reset operation and a hand-written publication protocol, which is exactly why it should be the exception.",
+      "code_sketch": "class Cell {\n  std::optional<Index> value_;\n  mutable std::mutex mu_;\n public:\n  const Index& get() {\n    std::lock_guard<std::mutex> lk(mu_);\n    if (!value_) value_ = Index::load(cfg_path());\n    return *value_;\n  }\n  void reset() { std::lock_guard<std::mutex> lk(mu_); value_.reset(); }\n};",
+      "pitfalls": [
+        "The lock is now taken on every access, not only on the first, so a resettable cell is a different performance bargain than a function-local static.",
+        "Hand-rolled atomic publication must use acquire/release (or a mutex); a plain pointer test plus a non-atomic store reproduces the pre-C++11 double-checked locking bug.",
+        "Invalidation races are the point of this variant and are the responsibility of the owner: a reader may hold a reference to the old value while another thread resets the cell (use shared_ptr snapshots if that is possible)."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/call_once",
+        "https://en.cppreference.com/w/cpp/language/storage_duration"
+      ]
+    }
+  ],
+  "default_variant": "function-local-static",
+  "version": "1.0"
+}

@@ -1,0 +1,20 @@
+{
+  "pattern": "deadline-propagation",
+  "language": "c",
+  "support": "manual",
+  "implementation_notes": "C has neither a deadline nor a cancellation type in its standard library, so the pattern is hand-wired: take one absolute deadline as a struct timespec from clock_gettime(CLOCK_MONOTONIC) at ingress, thread it through the per-request context every call receives, and derive a relative timeout for each blocking wait - poll(2)/epoll_wait take milliseconds, so compute remaining and pass it instead of -1 (infinite). CLOCK_MONOTONIC is never affected by discontinuous wall-clock jumps, which is exactly what budget arithmetic needs. For cancellation, prefer an explicit done flag or an eventfd checked between stages over pthread_cancel, whose asynchronous cancellation is only safe in code that was written for it.",
+  "idiom_name": "absolute CLOCK_MONOTONIC deadline + remaining-time timeouts for poll/ppoll",
+  "code_sketch": "struct deadline { struct timespec at; };   /* CLOCK_MONOTONIC, set once at ingress */\nstatic long remaining_ms(const struct deadline *d) {\n    struct timespec now;\n    clock_gettime(CLOCK_MONOTONIC, &now);\n    return (d->at.tv_sec - now.tv_sec) * 1000L\n         + (d->at.tv_nsec - now.tv_nsec) / 1000000L;\n}\n/* each hop forwards the same deadline; every wait uses what is left */\nlong t = remaining_ms(&req->deadline);\nif (t <= 0) return DEADLINE_EXCEEDED;\nint n = poll(fds, nfds, (int)t);          /* relative ms, never a fresh full timeout */",
+  "pitfalls": [
+    "Using CLOCK_REALTIME for the deadline: an NTP step or manual clock change makes remaining time jump or go negative - use CLOCK_MONOTONIC.",
+    "ppoll(2) takes a relative struct timespec while pselect(2) takes an absolute one; mixing the idioms produces waits that ignore the deadline or fire immediately.",
+    "pthread_cancel is asynchronous and can fire inside a critical section or while a mutex is held; propagate an explicit check (or eventfd) unless all code is cancellation-safe.",
+    "The deadline value must be immutable per request; a struct shared across threads that is written by one of them races - compute remaining locally in each thread instead.",
+    "'No deadline' must not be encoded as 0: poll(0) returns immediately. Represent it explicitly (negative/infinite) or the hop silently drops the budget."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man2/clock_gettime.2.html",
+    "https://man7.org/linux/man-pages/man2/poll.2.html"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,59 @@
+{
+  "pattern": "unit-of-work",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "database/sql Tx (BeginTx/Commit/Rollback) + hand-rolled change set",
+  "implementation_notes": "database/sql gives the boundary and nothing else: DB.BeginTx returns an sql.Tx whose Exec and Query run on one connection until Commit or Rollback, and the Go documentation tells you to defer tx.Rollback, never to issue BEGIN/COMMIT through raw SQL, and never to mix non-transaction DB calls into the same work. There is no identity map and no dirty checking, so the register half is a struct you write: a map keyed by primary key holding new, dirty and removed rows plus a Commit method that walks the lists in foreign-key order. GORM adds closure and Begin/Commit helpers and wraps each write in its own transaction by default, which is convenient but not a deferred flush - it saves eagerly, so batching still requires an explicit Transaction or Session around the calls.",
+  "code_sketch": "func (u *UnitOfWork) Commit(ctx context.Context) error {\n    tx, err := u.db.BeginTx(ctx, nil)\n    if err != nil { return err }\n    defer tx.Rollback()                        // no-op after a successful Commit\n    if err := u.insertNew(ctx, tx); err != nil { return err }\n    if err := u.updateDirty(ctx, tx); err != nil { return err }\n    if err := u.deleteRemoved(ctx, tx); err != nil { return err }\n    if err := tx.Commit(); err != nil { return err }\n    u.reset()                                  // clear the change sets\n    return nil\n}",
+  "pitfalls": [
+    "One stray db.Exec (or a pool query) inside the unit of work commits immediately outside the Tx and breaks atomicity - pass the *sql.Tx everywhere.",
+    "defer tx.Rollback() after a successful Commit returns sql.ErrTxDone, which must be ignored rather than treated as a failure.",
+    "sql.Tx is not safe for concurrent use by multiple goroutines: one unit of work per request/goroutine.",
+    "GORM's default per-write transaction gives no batching benefit; use Transaction/Session deliberately, or disable it globally when the unit of work owns the boundary."
+  ],
+  "sources": [
+    "https://go.dev/doc/database/execute-transactions",
+    "https://pkg.go.dev/database/sql#Tx",
+    "https://gorm.io/docs/transactions.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "database-sql-tx",
+      "name": "database/sql Tx with a hand-written change set",
+      "paradigm": "procedural",
+      "min_standard": "Go1.8",
+      "idiom_name": "database/sql Tx (BeginTx/Commit/Rollback) + hand-rolled change set",
+      "implementation_notes": "database/sql gives the boundary and nothing else: DB.BeginTx returns an sql.Tx whose Exec and Query run on one connection until Commit or Rollback, and the Go documentation tells you to defer tx.Rollback, never to issue BEGIN/COMMIT through raw SQL, and never to mix non-transaction DB calls into the same work. There is no identity map and no dirty checking, so the register half is a struct you write: a map keyed by primary key holding new, dirty and removed rows plus a Commit method that walks the lists in foreign-key order. GORM adds closure and Begin/Commit helpers and wraps each write in its own transaction by default, which is convenient but not a deferred flush - it saves eagerly, so batching still requires an explicit Transaction or Session around the calls.",
+      "code_sketch": "func (u *UnitOfWork) Commit(ctx context.Context) error {\n    tx, err := u.db.BeginTx(ctx, nil)\n    if err != nil { return err }\n    defer tx.Rollback()                        // no-op after a successful Commit\n    if err := u.insertNew(ctx, tx); err != nil { return err }\n    if err := u.updateDirty(ctx, tx); err != nil { return err }\n    if err := u.deleteRemoved(ctx, tx); err != nil { return err }\n    if err := tx.Commit(); err != nil { return err }\n    u.reset()                                  // clear the change sets\n    return nil\n}",
+      "pitfalls": [
+        "One stray db.Exec (or a pool query) inside the unit of work commits immediately outside the Tx and breaks atomicity - pass the *sql.Tx everywhere.",
+        "defer tx.Rollback() after a successful Commit returns sql.ErrTxDone, which must be ignored rather than treated as a failure.",
+        "sql.Tx is not safe for concurrent use by multiple goroutines: one unit of work per request/goroutine.",
+        "GORM's default per-write transaction gives no batching benefit; use Transaction/Session deliberately, or disable it globally when the unit of work owns the boundary."
+      ],
+      "sources": [
+        "https://go.dev/doc/database/execute-transactions",
+        "https://pkg.go.dev/database/sql#Tx",
+        "https://gorm.io/docs/transactions.html"
+      ]
+    },
+    {
+      "variant_id": "gorm-transaction",
+      "name": "GORM Transaction closure / Begin-Commit with explicit saves",
+      "paradigm": "oo",
+      "min_standard": "Go1.18",
+      "idiom_name": "db.Transaction(func(tx *gorm.DB) error { ... }) or tx := db.Begin()",
+      "implementation_notes": "GORM's Transaction closure commits when the callback returns nil and rolls back on any error, and nested Transaction calls use savepoints (SavePoint/RollbackTo are available manually). Model writes are still eager - tx.Create/tx.Save issue SQL immediately - so the unit of work is the closure plus your own tracking of what to save, not a deferred flush. Prefer it when GORM is already the persistence layer and the transaction is one service call.",
+      "code_sketch": "err := db.Transaction(func(tx *gorm.DB) error {\n    if err := tx.Model(&order).Update(\"status\", \"paid\").Error; err != nil { return err }\n    if err := tx.Create(&Audit{OrderID: order.ID}).Error; err != nil { return err }\n    return nil            // nil commits, any error rolls back\n})",
+      "pitfalls": [
+        "Inside the callback you must use tx, never db, or the statement escapes the transaction and commits on its own.",
+        "GORM wraps every individual write in its own transaction unless SkipDefaultTransaction is set, so a sequence of writes without an outer Transaction is not atomic."
+      ],
+      "sources": [
+        "https://gorm.io/docs/transactions.html"
+      ]
+    }
+  ],
+  "default_variant": "database-sql-tx"
+}

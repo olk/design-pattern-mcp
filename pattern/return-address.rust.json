@@ -1,0 +1,60 @@
+{
+  "pattern": "return-address",
+  "language": "rust",
+  "support": "idiomatic",
+  "implementation_notes": "In Rust the reply channel is usually an owned handle inside the request value rather than a header: the requester creates a oneshot::channel(), moves the Sender into the request struct and awaits the Receiver, so the reply path is compile-time checked and needs no addressing. This is the shape of actor-style services (mailbox plus per-request oneshot) and of tower-style service calls; the broker header appears only when requests leave the process — see the lapin variant.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tokio-oneshot",
+      "name": "oneshot::Sender carried in the request struct",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "tokio"
+      ],
+      "idiom_name": "tokio::sync::oneshot::Sender inside the request value",
+      "implementation_notes": "In Rust the reply channel is usually an owned handle inside the request value rather than a header: the requester creates a oneshot::channel(), moves the Sender into the request struct and awaits the Receiver, so the reply path is compile-time checked and needs no addressing. This is the shape of actor-style services (mailbox plus per-request oneshot) and of tower-style service calls; the broker header appears only when requests leave the process — see the lapin variant.",
+      "code_sketch": "struct Request { n: u64, reply: oneshot::Sender<u64> } // return address in the value\n\nasync fn service(mut rx: mpsc::Receiver<Request>) {\n    while let Some(req) = rx.recv().await {\n        let _ = req.reply.send(fib(req.n));  // Err => requester gone\n    }\n}\n\nlet (tx, rx) = oneshot::channel();\nmailbox.send(Request { n: 10, reply: tx }).await?;\nlet answer = rx.await?;",
+      "pitfalls": [
+        "Sender::send returns Err when the Receiver was dropped: ignoring it turns 'requester left' into a silently lost reply, so map it to a cancellation path.",
+        "A oneshot is single-consume and not cloneable — fan-out or duplicate replies need an mpsc or broadcast channel instead.",
+        "Keeping the Sender alive in a longer-lived struct keeps the requester's future pending; dropping the request is the cancellation signal."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/oneshot/fn.channel.html",
+        "https://tokio.rs/tokio/tutorial/channels"
+      ]
+    },
+    {
+      "variant_id": "lapin-reply-to",
+      "name": "AMQP BasicProperties reply_to (lapin)",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "BasicProperties::default().with_reply_to(\"reply.queue\")",
+      "implementation_notes": "Over AMQP, lapin exposes the address on the message: BasicProperties is a builder whose with_reply_to sets the property, and the consumer reads delivery.properties.reply_to() and publishes the answer there, exactly as other AMQP clients do. Choose it when replies must cross process boundaries, survive a restart, or be inspectable by the broker; keep the oneshot variant for same-process services where a queue name would be pure overhead.",
+      "code_sketch": "let props = BasicProperties::default()\n    .with_reply_to(\"rpc.reply\".into())\n    .with_correlation_id(\"7f3c\".into());\nchannel.basic_publish(\"\", \"rpc_queue\", BasicPublishOptions::default(),\n                      b\"10\".to_vec(), props).await?;\n\n// service\nif let Some(q) = delivery.properties.reply_to() {\n    channel.basic_publish(\"\", q, BasicPublishOptions::default(), answer,\n        BasicProperties::default().with_correlation_id(corr)).await?;\n}",
+      "pitfalls": [
+        "The delivery must be acked or nacked; publishing the reply before acking a request that later fails produces duplicate replies.",
+        "reply_to is Option<String>: a request without it needs an explicit policy (fixed channel or dead-letter), never an unwrap.",
+        "lapin's properties are builder values, not mutable — build a fresh BasicProperties for the reply instead of reusing the request's."
+      ],
+      "sources": [
+        "https://docs.rs/lapin/latest/lapin/type.BasicProperties.html",
+        "https://www.rabbitmq.com/docs/direct-reply-to"
+      ]
+    }
+  ],
+  "default_variant": "tokio-oneshot",
+  "idiom_name": "tokio::sync::oneshot::Sender inside the request value",
+  "code_sketch": "struct Request { n: u64, reply: oneshot::Sender<u64> } // return address in the value\n\nasync fn service(mut rx: mpsc::Receiver<Request>) {\n    while let Some(req) = rx.recv().await {\n        let _ = req.reply.send(fib(req.n));  // Err => requester gone\n    }\n}\n\nlet (tx, rx) = oneshot::channel();\nmailbox.send(Request { n: 10, reply: tx }).await?;\nlet answer = rx.await?;",
+  "pitfalls": [
+    "Sender::send returns Err when the Receiver was dropped: ignoring it turns 'requester left' into a silently lost reply, so map it to a cancellation path.",
+    "A oneshot is single-consume and not cloneable — fan-out or duplicate replies need an mpsc or broadcast channel instead.",
+    "Keeping the Sender alive in a longer-lived struct keeps the requester's future pending; dropping the request is the cancellation signal."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/oneshot/fn.channel.html",
+    "https://tokio.rs/tokio/tutorial/channels"
+  ]
+}

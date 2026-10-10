@@ -1,0 +1,60 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "stream::iter(parts).map(route).buffer_unordered(n).fold(...)",
+  "implementation_notes": "futures is where the composite starts in async Rust: stream::iter(parts).map(route) builds one future per part, buffer_unordered(n) runs up to n of them concurrently and yields results as they finish (buffered(n) preserves input order), and collect()/fold() performs the aggregation - the concurrency limit is explicit, which the classic form usually lacks. Ownership is the correlation state: each future owns its part and the collected Vec is the merge input, so no shared mutable aggregator is required. Use the ordered form whenever the merge is not commutative.",
+  "code_sketch": "use futures::stream::{self, StreamExt};\n\nlet report = stream::iter(split(&msg))\n    .map(|part| route(part))\n    .buffer_unordered(8)                                  // bounded fan-out\n    .fold(Report::empty(), |acc, res| async move { acc.merge(res) })\n    .await;",
+  "pitfalls": [
+    "buffer_unordered loses input order; use buffered(n) or carry the part index when the aggregate depends on order.",
+    "Closures that borrow the composite message will not be Send for tokio::spawn - take ownership of each part or use scoped tasks, or the composite does not compile.",
+    "futures::future::join_all builds every future eagerly with no bound; for large part counts prefer buffer_unordered/for_each_concurrent."
+  ],
+  "sources": [
+    "https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "futures-buffer-unordered",
+      "name": "futures StreamExt map + buffer_unordered + fold",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "futures crate"
+      ],
+      "idiom_name": "stream::iter(parts).map(route).buffer_unordered(n).fold(...)",
+      "implementation_notes": "futures is where the composite starts in async Rust: stream::iter(parts).map(route) builds one future per part, buffer_unordered(n) runs up to n of them concurrently and yields results as they finish (buffered(n) preserves input order), and collect()/fold() performs the aggregation - the concurrency limit is explicit, which the classic form usually lacks. Ownership is the correlation state: each future owns its part and the collected Vec is the merge input, so no shared mutable aggregator is required. Use the ordered form whenever the merge is not commutative.",
+      "code_sketch": "use futures::stream::{self, StreamExt};\n\nlet report = stream::iter(split(&msg))\n    .map(|part| route(part))\n    .buffer_unordered(8)                                  // bounded fan-out\n    .fold(Report::empty(), |acc, res| async move { acc.merge(res) })\n    .await;",
+      "pitfalls": [
+        "buffer_unordered loses input order; use buffered(n) or carry the part index when the aggregate depends on order.",
+        "Closures that borrow the composite message will not be Send for tokio::spawn - take ownership of each part or use scoped tasks, or the composite does not compile.",
+        "futures::future::join_all builds every future eagerly with no bound; for large part counts prefer buffer_unordered/for_each_concurrent."
+      ],
+      "sources": [
+        "https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html"
+      ]
+    },
+    {
+      "variant_id": "rayon-par-iter",
+      "name": "Rayon parallel iterator (CPU-bound parts)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "rayon crate"
+      ],
+      "idiom_name": "par_iter().map(route).reduce(identity, combine)",
+      "implementation_notes": "Rayon turns the split into data-parallel iteration: par_iter().map(route) distributes the parts over the thread pool and reduce (or fold/collect) merges them, so the aggregation is written as a genuine divide-and-conquer reduction with an identity and an associative combine - exactly the shape the trait documents. Use it for CPU-bound parts, keep futures for async I/O, and do not block an async runtime's worker threads with rayon work.",
+      "code_sketch": "use rayon::prelude::*;\n\nlet report = split(&msg)\n    .par_iter()\n    .map(|part| route(part))\n    .reduce(|| Report::empty(), |a, b| a.merge(b));",
+      "pitfalls": [
+        "reduce requires an associative combine with a true identity (the docs state this); a non-associative merge gives non-deterministic aggregates.",
+        "Rayon's global pool is shared with the rest of the program: blocking or nested parallelism inside a part can starve it - use a scoped ThreadPool for isolation.",
+        "A panic in any part unwinds through the reduce and loses the partial aggregate; panic_fuse or catch_unwind is needed for partial results."
+      ],
+      "sources": [
+        "https://docs.rs/rayon/latest/rayon/iter/trait.ParallelIterator.html"
+      ]
+    }
+  ],
+  "default_variant": "futures-buffer-unordered",
+  "version": "1.0"
+}

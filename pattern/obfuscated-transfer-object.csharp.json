@@ -1,0 +1,55 @@
+{
+  "pattern": "obfuscated-transfer-object",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "IDataProtector.Protect/Unprotect seal a serialized protected map into a byte[] payload",
+  "implementation_notes": ".NET ships a purpose-built data protection stack: an IDataProtector obtained from IDataProtectionProvider.CreateProtector(\"ObfuscatedTO\") seals a byte[] payload with a managed key ring scoped by purpose strings, and Unprotect verifies and reverses it, so the transfer object only serializes its protected map and stores the returned bytes. The plaintext members stay ordinary properties guarded with [JsonIgnore] (or a custom JsonConverter), and ToString/DebuggerDisplay must be overridden because generated record printing includes every property. What replaces the classic structure: CreateProtector plus Protect/Unprotect replace the class's sealed map and, crucially, the key management - storage, purpose scoping and rotation of the key ring are the framework's responsibility.",
+  "code_sketch": "public sealed class ObfuscatedTO\n{\n    private readonly IDataProtector _protector;\n    [JsonIgnore] public Dictionary<string, string>? Protected { get; private set; }\n    public byte[]? Sealed { get; private set; }        // wire form carries only this\n\n    public void Seal()\n    {\n        Sealed = _protector.Protect(JsonSerializer.SerializeToUtf8Bytes(Protected!));\n        Protected = null;                              // drop the plaintext view\n    }\n    public override string ToString() => \"ObfuscatedTO\";   // record printing would leak\n}",
+  "pitfalls": [
+    "Unprotect throws CryptographicException on tampering or a key-ring mismatch - treat it as a security event, never as ordinary deserialization failure, and do not echo the payload.",
+    "The key ring defaults to local storage and must be shared (or persisted) between producer and consumer nodes; an unshared key ring is the most common production failure of this realization.",
+    "Serializers and debuggers read properties, not accessors: without [JsonIgnore]/a converter and a ToString override, a POCO or record prints the plaintext map (records synthesize ToString and equality over all properties).",
+    "ProtectedData (DPAPI) is a different mechanism: Windows-only and scoped to the current user or machine, so a payload sealed as CurrentUser cannot be opened by a service account or another host."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.dataprotection.idataprotector"
+  ],
+  "variants": [
+    {
+      "variant_id": "dataprotection",
+      "name": "ASP.NET Core Data Protection over a sealed payload property",
+      "paradigm": "oo",
+      "idiom_name": "IDataProtector.Protect/Unprotect seal a serialized protected map into a byte[] payload",
+      "implementation_notes": ".NET ships a purpose-built data protection stack: an IDataProtector obtained from IDataProtectionProvider.CreateProtector(\"ObfuscatedTO\") seals a byte[] payload with a managed key ring scoped by purpose strings, and Unprotect verifies and reverses it, so the transfer object only serializes its protected map and stores the returned bytes. The plaintext members stay ordinary properties guarded with [JsonIgnore] (or a custom JsonConverter), and ToString/DebuggerDisplay must be overridden because generated record printing includes every property. What replaces the classic structure: CreateProtector plus Protect/Unprotect replace the class's sealed map and, crucially, the key management - storage, purpose scoping and rotation of the key ring are the framework's responsibility.",
+      "code_sketch": "public sealed class ObfuscatedTO\n{\n    private readonly IDataProtector _protector;\n    [JsonIgnore] public Dictionary<string, string>? Protected { get; private set; }\n    public byte[]? Sealed { get; private set; }        // wire form carries only this\n\n    public void Seal()\n    {\n        Sealed = _protector.Protect(JsonSerializer.SerializeToUtf8Bytes(Protected!));\n        Protected = null;                              // drop the plaintext view\n    }\n    public override string ToString() => \"ObfuscatedTO\";   // record printing would leak\n}",
+      "pitfalls": [
+        "Unprotect throws CryptographicException on tampering or a key-ring mismatch - treat it as a security event, never as ordinary deserialization failure, and do not echo the payload.",
+        "The key ring defaults to local storage and must be shared (or persisted) between producer and consumer nodes; an unshared key ring is the most common production failure of this realization.",
+        "Serializers and debuggers read properties, not accessors: without [JsonIgnore]/a converter and a ToString override, a POCO or record prints the plaintext map (records synthesize ToString and equality over all properties).",
+        "ProtectedData (DPAPI) is a different mechanism: Windows-only and scoped to the current user or machine, so a payload sealed as CurrentUser cannot be opened by a service account or another host."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.dataprotection.idataprotector"
+      ]
+    },
+    {
+      "variant_id": "json-converter-aesgcm",
+      "name": "System.Text.Json converter sealing one property with AesGcm",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "JsonConverter<ProtectedMap> sealing the serialized map with System.Security.Cryptography.AesGcm",
+      "implementation_notes": "Where a Data Protection provider is not available (a class library, a worker service, a cross-platform component), the alternative is a custom JsonConverter<ProtectedMap> that seals the serialized map with AesGcm - nonce and tag travel with the ciphertext - and opens it on read, so the wire form never contains plaintext and the surrounding type stays an ordinary POCO. What replaces the classic structure: the converter becomes the object's only serialization path, which is both the strength (no default contract can transcribe the protected members) and the cost (key storage, rotation and every other serializer - XML, protobuf, manual - are yours to manage).",
+      "code_sketch": "public sealed class ProtectedMapConverter : JsonConverter<ProtectedMap>\n{\n    private readonly AesGcm _aes;                        // 32-byte key from the key store\n    public override void Write(Utf8JsonWriter w, ProtectedMap value, JsonSerializerOptions o)\n    {\n        var nonce = RandomNumberGenerator.GetBytes(12);   // unique per seal\n        var tag = new byte[16];\n        var plain = JsonSerializer.SerializeToUtf8Bytes(value);\n        var cipher = new byte[plain.Length];\n        _aes.Encrypt(nonce, plain, cipher, tag);\n        w.WriteBase64StringValue([.. nonce, .. tag, .. cipher]);   // sealed bytes on the wire\n    }\n    // Read: split nonce/tag/cipher, _aes.Decrypt, then deserialize the map.\n}",
+      "pitfalls": [
+        "AesGcm demands a unique 96-bit nonce per key; a fixed or incremented-without-persistence nonce breaks confidentiality and authenticity at once.",
+        "AesGcm throws CryptographicException when the tag check fails - a converter that catches it and returns an empty map hands the attacker a silent bypass.",
+        "Per-property converters compose poorly: the converter must own the protected property (or the whole type), otherwise the default contract still serializes the plaintext view alongside the sealed one."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.aesgcm"
+      ]
+    }
+  ],
+  "default_variant": "dataprotection",
+  "version": "1.0"
+}

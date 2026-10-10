@@ -1,0 +1,57 @@
+{
+  "pattern": "lazy-initialization",
+  "language": "ruby",
+  "support": "idiomatic",
+  "idiom_name": "@cell ||= build (or defined?(@cell) for falsy values)",
+  "implementation_notes": "Ruby's idiom is a one-liner: @summary ||= build_summary replaces the classic null-marker guard and is the standard memoisation form in Rails-era code. It is single-threaded-safe only in the weak sense that CRuby's GVL keeps the assignment itself atomic - the build can still be entered twice if it releases the GVL on I/O, and JRuby/TruffleRuby run it genuinely in parallel. Use `defined?(@summary) ? @summary : (@summary = build)` when the value may legitimately be false/nil, and a real primitive (Mutex, Concurrent::Map) when several threads can arrive first. The classic structure remains justified when the value must be reset (remove_instance_variable) or when no gem is available.",
+  "code_sketch": "class Report\n  def summary\n    @summary ||= Summary.build(rows)      # memoised on first call\n  end\n  # falsy-safe: defined?(@summary) ? @summary : (@summary = build)\n  # reset:     remove_instance_variable(:@summary) if defined?(@summary)\nend",
+  "pitfalls": [
+    "||= recomputes whenever the result is falsy: a builder returning nil/false (or an empty collection guarded by `||=`) looks like a cache miss on every call - the defined? form or a sentinel object is required.",
+    "Under a preemptive or GVL-releasing race two threads can both build; the second assignment wins and the first object is dropped (silently, since Ruby has no constructor-time uniqueness check) - use Mutex#synchronize or Concurrent::Map#compute_if_absent when that matters.",
+    "Memoised instance variables outlive the state they were derived from: after a config reload or a tenant switch the object serves stale data unless an explicit reset path exists.",
+    "Subclasses that override the builder inherit the cached value from a super call: reading `@cell` in a parent method can return a value built by different logic, so prefer an explicit cell accessor when overriding is expected."
+  ],
+  "sources": [
+    "https://docs.ruby-lang.org/en/3.3/syntax/assignment_rdoc.html",
+    "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/Map.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "memoize-ivar-guard",
+      "name": "Instance-variable memoisation with ||= (and defined? checks)",
+      "paradigm": "oo",
+      "idiom_name": "@cell ||= build (or defined?(@cell) for falsy values)",
+      "implementation_notes": "Ruby's idiom is a one-liner: @summary ||= build_summary replaces the classic null-marker guard and is the standard memoisation form in Rails-era code. It is single-threaded-safe only in the weak sense that CRuby's GVL keeps the assignment itself atomic - the build can still be entered twice if it releases the GVL on I/O, and JRuby/TruffleRuby run it genuinely in parallel. Use `defined?(@summary) ? @summary : (@summary = build)` when the value may legitimately be false/nil, and a real primitive (Mutex, Concurrent::Map) when several threads can arrive first. The classic structure remains justified when the value must be reset (remove_instance_variable) or when no gem is available.",
+      "code_sketch": "class Report\n  def summary\n    @summary ||= Summary.build(rows)      # memoised on first call\n  end\n  # falsy-safe: defined?(@summary) ? @summary : (@summary = build)\n  # reset:     remove_instance_variable(:@summary) if defined?(@summary)\nend",
+      "pitfalls": [
+        "||= recomputes whenever the result is falsy: a builder returning nil/false (or an empty collection guarded by `||=`) looks like a cache miss on every call - the defined? form or a sentinel object is required.",
+        "Under a preemptive or GVL-releasing race two threads can both build; the second assignment wins and the first object is dropped (silently, since Ruby has no constructor-time uniqueness check) - use Mutex#synchronize or Concurrent::Map#compute_if_absent when that matters.",
+        "Memoised instance variables outlive the state they were derived from: after a config reload or a tenant switch the object serves stale data unless an explicit reset path exists.",
+        "Subclasses that override the builder inherit the cached value from a super call: reading `@cell` in a parent method can return a value built by different logic, so prefer an explicit cell accessor when overriding is expected."
+      ],
+      "sources": [
+        "https://docs.ruby-lang.org/en/3.3/syntax/assignment_rdoc.html",
+        "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/Map.html"
+      ]
+    },
+    {
+      "variant_id": "concurrent-map-compute",
+      "name": "Thread-safe once-cell with Concurrent::Map / Mutex",
+      "paradigm": "concurrent",
+      "idiom_name": "Concurrent::Map#compute_if_absent or Mutex#synchronize around the build",
+      "implementation_notes": "When the value is shared across threads, the idiomatic replacement for ||= is a real once-primitive from the concurrent-ruby gem - Concurrent::Map#compute_if_absent computes per key at most once and is the standard memo table - or, for a single value, an explicit Mutex plus a double-checked read. This variant keeps the same cell shape as the ||= form but moves the guarantee into a synchronisation object, which is what the language itself does not provide. Choose it whenever the object is reachable from more than one thread (Puma, Sidekiq, any threaded server).",
+      "code_sketch": "class Registry\n  def initialize\n    @index = Concurrent::Map.new\n  end\n\n  def summary_for(key)\n    @index.compute_if_absent(key) { Summary.build(key) }   # once per key\n  end\nend",
+      "pitfalls": [
+        "compute_if_absent may run its block more than once under contention and publish one winner, so the block should be free of externally visible side effects (creating a connection twice is a leak).",
+        "Concurrent::Map is per-process: in multi-process deployments (Unicorn, clustered Puma) each worker memoises independently, so 'built once' never means 'built once globally' - and Fork-safety of an existing map or lock is a separate hazard.",
+        "A Mutex-guarded cell must be re-tested inside the lock (double-checked) or every waiter rebuilds the value, which is exactly the cost the memoisation was meant to remove."
+      ],
+      "sources": [
+        "https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/Map.html",
+        "https://docs.ruby-lang.org/en/3.3/syntax/assignment_rdoc.html"
+      ]
+    }
+  ],
+  "default_variant": "memoize-ivar-guard",
+  "version": "1.0"
+}

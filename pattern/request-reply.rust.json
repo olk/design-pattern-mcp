@@ -1,0 +1,58 @@
+{
+  "pattern": "request-reply",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "tokio::sync::oneshot + tokio::time::timeout",
+  "implementation_notes": "Tokio's oneshot channel is the reply channel: allocate (tx, rx) per request, hand tx to whatever will answer, and await rx wrapped in tokio::time::timeout. The classic correlation table is unnecessary when each request owns its channel, and the runtime's cancellation model does the rest - dropping the timeout future cancels the wait, and dropping tx without sending makes rx resolve to RecvError, the honest replier-gone signal. tower::Service + oneshot is the same mechanism one layer up, and async-nats's client.request() bundles inbox subject plus timeout when a broker is in play.",
+  "code_sketch": "async fn call(client: &Client, req: Request) -> Result<Reply, CallError> {\n    let (tx, rx) = oneshot::channel::<Reply>();\n    client.send(Envelope { id: next_id(), request: req, reply: tx }).await?;\n    match tokio::time::timeout(Duration::from_secs(5), rx).await {\n        Ok(Ok(reply)) => Ok(reply),\n        Ok(Err(_)) => Err(CallError::ReplierGone),  // tx dropped\n        Err(_) => Err(CallError::Timeout),          // deadline elapsed\n    }\n}",
+  "pitfalls": [
+    "Dropping the timed-out receive cancels the wait but not the remote work: stopping the replier needs its own cancellation channel or deadline header.",
+    "tokio::time::timeout panics when the runtime has no timer enabled (Builder::enable_time/enable_all), so a minimal test runtime fails at the first call.",
+    "oneshot::Sender cannot be cloned: for several replies use an mpsc channel plus an explicit completion rule, and drop the sender to signal failure."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html",
+    "https://docs.rs/tokio/latest/tokio/time/fn.timeout.html",
+    "https://docs.nats.io/concepts/request-reply"
+  ],
+  "variants": [
+    {
+      "variant_id": "tokio-oneshot-timeout",
+      "name": "Tokio oneshot channel wrapped in tokio::time::timeout",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "tokio::sync::oneshot + tokio::time::timeout",
+      "implementation_notes": "Tokio's oneshot channel is the reply channel: allocate (tx, rx) per request, hand tx to whatever will answer, and await rx wrapped in tokio::time::timeout. The classic correlation table is unnecessary when each request owns its channel, and the runtime's cancellation model does the rest - dropping the timeout future cancels the wait, and dropping tx without sending makes rx resolve to RecvError, the honest replier-gone signal. tower::Service + oneshot is the same mechanism one layer up, and async-nats's client.request() bundles inbox subject plus timeout when a broker is in play.",
+      "code_sketch": "async fn call(client: &Client, req: Request) -> Result<Reply, CallError> {\n    let (tx, rx) = oneshot::channel::<Reply>();\n    client.send(Envelope { id: next_id(), request: req, reply: tx }).await?;\n    match tokio::time::timeout(Duration::from_secs(5), rx).await {\n        Ok(Ok(reply)) => Ok(reply),\n        Ok(Err(_)) => Err(CallError::ReplierGone),  // tx dropped\n        Err(_) => Err(CallError::Timeout),          // deadline elapsed\n    }\n}",
+      "pitfalls": [
+        "Dropping the timed-out receive cancels the wait but not the remote work: stopping the replier needs its own cancellation channel or deadline header.",
+        "tokio::time::timeout panics when the runtime has no timer enabled (Builder::enable_time/enable_all), so a minimal test runtime fails at the first call.",
+        "oneshot::Sender cannot be cloned: for several replies use an mpsc channel plus an explicit completion rule, and drop the sender to signal failure."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html",
+        "https://docs.rs/tokio/latest/tokio/time/fn.timeout.html",
+        "https://docs.nats.io/concepts/request-reply"
+      ]
+    },
+    {
+      "variant_id": "std-mpsc-recv-timeout",
+      "name": "std::sync::mpsc with recv_timeout (no async runtime)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "std::sync::mpsc::channel + Receiver::recv_timeout",
+      "implementation_notes": "Without an async runtime, std::sync::mpsc (or crossbeam-channel) plus recv_timeout gives the blocking form: one channel per request, the worker owns the Sender, and the caller's recv_timeout is the deadline, distinguishing Timeout from Disconnected (worker gone) without any correlation bookkeeping. Use it in thread pools and FFI contexts; the trade is a parked OS thread per outstanding call, so the pool and the number of in-flight requests must be bounded.",
+      "code_sketch": "fn call(pool: &Pool, req: Request) -> Result<Reply, CallError> {\n    let (tx, rx) = std::sync::mpsc::channel::<Reply>();\n    pool.submit(Envelope { id: next_id(), request: req, reply: tx })?;\n    match rx.recv_timeout(Duration::from_secs(5)) {\n        Ok(reply) => Ok(reply),\n        Err(RecvTimeoutError::Timeout) => Err(CallError::Timeout),\n        Err(RecvTimeoutError::Disconnected) => Err(CallError::ReplierGone),\n    }\n}",
+      "pitfalls": [
+        "Each outstanding call parks a thread: without a bounded pool and request count, request-reply turns into thread exhaustion.",
+        "std mpsc is single-consumer: the caller must be the only receiver, and a worker that keeps its Sender after a timeout sends into a channel nobody reads."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html",
+        "https://doc.rust-lang.org/std/sync/mpsc/struct.RecvTimeoutError.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-oneshot-timeout",
+  "version": "1.0"
+}

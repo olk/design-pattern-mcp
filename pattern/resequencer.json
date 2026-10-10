@@ -1,0 +1,162 @@
+{
+  "category": "workflow-messaging",
+  "name": "resequencer",
+  "aliases": [
+    "message resequencer",
+    "reorder buffer"
+  ],
+  "intent": "Restore the original order of a message stream that parallel processing, routing or transport has scrambled, by buffering out-of-sequence messages and releasing them in sequence order to an order-preserving output channel, without modifying their content.",
+  "problem": "The order in which related messages must be processed has been lost: several consumers, parallel branches or partitioned transports now handle them concurrently, so the next step receives them out of sequence and in-sequence processing - referential integrity, ordered state transitions, reconciliation - fails. Something has to remember the messages that arrived ahead of their turn, wait for the missing ones and then release everything in order, or the parallelisation has to be given up.",
+  "context": "Message-flow architectures in which related messages carry a sequence number (assigned by the producer, a Splitter or a Message Sequence generator) and a later step requires per-correlation ordering: competing consumers on one channel, split-process-and-merge flows, partitioned queues whose parts are processed concurrently, and chunked batch transfers. The pattern presupposes unique sequence numbers, gaps that are bounded in time (so a timeout can be configured) and an output channel that itself preserves order.",
+  "benefits": [
+    "Downstream processing can rely on sequence instead of tolerating arbitrary order, which is what referential integrity, ordered state transitions and reconciliation need.",
+    "The upstream stages stay parallel: the cost of reordering is paid once, by one component, instead of forcing every producer and consumer to be sequential.",
+    "The ordering contract becomes explicit and inspectable in one place: sequence numbering, gap policy, duplicates policy and capacity stop being hidden assumptions spread across consumers.",
+    "Message content is untouched, so reordering stays independent of transformation, enrichment and filtering and can be inserted into an existing flow.",
+    "One structure covers both ends of the spectrum: batch semantics when the sequence size is known (collect, sort, release) and streaming semantics when it is not (gap detection with a timeout)."
+  ],
+  "tradeoffs": [
+    "Memory: the buffer holds every message that arrived ahead of its turn, so state grows with the reorder window - and with the number of correlations when the scope is too wide; an unbounded window is the pattern's standard production incident, and buffering whole payloads makes it worse.",
+    "Latency: nothing can be released before the gap in front of it is filled or declared dead, so the reorder window is added to end-to-end latency, and a message that never arrives can delay the stream indefinitely when no timeout is configured.",
+    "The gap policy is a new operational contract: when a hole is declared (timeout, capacity, sequence size reached) the component must release a partial sequence out of order, discard the messages around the hole, or reject late arrivals - each option loses information the flow has to tolerate.",
+    "Duplicates and late messages must be decided deliberately: a repeated sequence number either overwrites a message, is delivered twice or is rejected, and a message arriving after its turn was skipped is no longer in order - under retries a naive resequencer becomes silent data loss.",
+    "Durability: an in-memory window loses its reordering state on restart, so under at-least-once delivery the pending window and the release decisions have to be externalised if a restart must not lose or misorder messages.",
+    "The guarantee is only as strong as what follows: a later stage that parallelises, drops or reorders messages undoes the ordering the resequencer produced, so the constraint has to hold to the point where order is actually consumed."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 5,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Resequencer",
+      "responsibility": "Stateful filter that receives possibly out-of-sequence messages, keeps them in its buffer and releases the in-sequence ones to the output channel without changing their content."
+    },
+    {
+      "role": "Sequence Number Producer",
+      "responsibility": "Upstream component (producer, Splitter, file segmenter) that assigns a unique, monotonic sequence number per correlation and carries it in the message."
+    },
+    {
+      "role": "Pending Buffer",
+      "responsibility": "Internal state holding messages that arrived ahead of their turn, keyed by sequence number and bounded by a capacity."
+    },
+    {
+      "role": "Expected-Sequence Cursor",
+      "responsibility": "Per-correlation marker of the next message the downstream step may see; it only advances past a hole when the gap policy declares the hole dead."
+    },
+    {
+      "role": "Gap and Release Policy",
+      "responsibility": "Decides when to release despite a hole - known sequence size, batch bound, gap timeout, capacity eviction - and what happens to duplicates and messages that arrive after their turn."
+    },
+    {
+      "role": "Order-Preserving Output Channel",
+      "responsibility": "Carries the released messages to the next component in the same order (single consumer, ordered queue, ordered session)."
+    },
+    {
+      "role": "Discard Sink",
+      "responsibility": "Receives what the gap policy removes from the ordered stream: expired groups, rejected old messages, unparseable sequence numbers."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "A consumer group reads one queue and a later step must apply updates per aggregate in the producer's order, so the resequencer sits between the competing consumers and the ordered apply step.",
+    "Split-process-and-merge flows (a Composed Message Processor) where parallel branches return the pieces of one document and the reassembled output must keep the original segment order.",
+    "Partitioned transports where one key's messages can be handled by more than one worker - rebalances, retries, mixed partitions - while the downstream projection still needs per-key order.",
+    "Batch and file integration: numbered segments of a large transfer (EDI interchange, nightly export, chunked upload) are processed concurrently and reassembled in segment order, with a size bound or timeout for missing segments.",
+    "Replica and cache maintenance: an ordered change stream applied to a secondary store where referential integrity requires parents before children even though the changes arrive out of order.",
+    "Apache Camel's Resequence EIP restores message order in either batch or stream mode by comparing a sequence expression, allowing a route that parallelised work to emit ordered output.",
+    "Spring Integration's Resequencer groups messages by correlation ID and releases their unchanged payloads by SEQUENCE_NUMBER, with a message store and expiry controls for incomplete groups.",
+    "Oracle Mediator's standard resequencer buffers each group until its configured sequence IDs arrive, while its best-effort mode trades strict ordering for progress when a complete sequence is unavailable."
+  ],
+  "avoid_when": [
+    "The transport already delivers in order - a single consumer on a FIFO queue, a log partition keyed by the ordering key - so the parallelisation, not the order, is the thing to fix.",
+    "Order is available by construction: one queue or partition per ordered stream, or a serialised (single-consumer) step, is cheaper and simpler than any buffer.",
+    "The messages are independent and no downstream step requires sequence; the resequencer then adds latency, state and a gap policy for nothing.",
+    "Gaps can be long or unbounded (a sequence number may never arrive, or a producer stops mid-sequence): prefer partial release with reconciliation, or make the consumer idempotent and order-insensitive, rather than waiting.",
+    "The reorder window exceeds the latency budget: an order-sensitive step fed by a slow branch is a placement problem, not a resequencing problem."
+  ],
+  "language_files": {
+    "generic": "resequencer.generic.json",
+    "c": "resequencer.c.json",
+    "cplusplus": "resequencer.cplusplus.json",
+    "csharp": "resequencer.csharp.json",
+    "go": "resequencer.go.json",
+    "java": "resequencer.java.json",
+    "javascript": "resequencer.javascript.json",
+    "kotlin": "resequencer.kotlin.json",
+    "python": "resequencer.python.json",
+    "ruby": "resequencer.ruby.json",
+    "rust": "resequencer.rust.json",
+    "scala": "resequencer.scala.json",
+    "swift": "resequencer.swift.json",
+    "typescript": "resequencer.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "message-sequence",
+    "splitter",
+    "aggregator",
+    "competing-consumers",
+    "message-router",
+    "composed-message-processor",
+    "idempotent-receiver",
+    "guaranteed-delivery"
+  ],
+  "anti_patterns": [
+    "Resequencer with neither timeout nor capacity: one missing sequence number stalls the stream forever while everything behind the hole keeps buffering.",
+    "One global resequencer for every correlation id, so unrelated streams share a window and a cursor and the buffer grows with the total traffic instead of one key's reorder window.",
+    "Silent overwrite of duplicates (keeping the last message for a repeated sequence number), which turns a retry into undetectable data loss.",
+    "Using the resequencer to paper over broken sequence assignment - non-unique, non-monotonic or resettable numbers - instead of fixing the producer that defines order.",
+    "Blocking the only consumer thread while waiting for the missing message, so the component deadlocks against the arrival that would satisfy it.",
+    "Declaring the flow ordered while a later stage fans out again, so the ordering guarantee is measured at the wrong place."
+  ],
+  "design_principles": [
+    "Separate timing from business semantics: restoring order is a flow concern, not a domain rule, and it should not leak into the stages around it.",
+    "Make the ordering contract explicit - sequence number, uniqueness, monotonicity, reset semantics - because the pattern is only as good as the numbering it consumes.",
+    "Bound resource use by construction: capacity and time bounds are part of the pattern, not tuning added after the first incident.",
+    "Single responsibility per participant: the resequencer reorders and nothing else; transformation, aggregation and filtering belong to other components.",
+    "Fail visibly: when the gap policy fires, the decision must surface on a channel someone monitors instead of quietly changing what the flow means.",
+    "Treat ordering and idempotence together, since reordering under retries inevitably produces duplicates and late arrivals."
+  ],
+  "best_practices": [
+    "Assign the sequence number where order is defined (the producer or the Splitter) and keep it unique per correlation id.",
+    "Always bound both the buffer (capacity) and the wait (sequence size, batch bound or timeout), and decide in advance what the timeout does: advance the cursor, release the partial sequence, or discard the group.",
+    "Scope one resequencer per correlation id, and give each ordered stream its own instance instead of one global window.",
+    "Decide the duplicates and late-message policy explicitly (keep first, keep last, reject old) and route what the policy removes to a discard or dead-letter channel that is monitored.",
+    "Keep the output channel order-preserving with a single consumer, and do not interpose a parallelising stage between the resequencer and the step that needs order.",
+    "Persist the pending window when messages can be redelivered after a restart, so the reordering state survives with the same guarantees as the delivery itself.",
+    "Monitor pending size, gap-timeout rate and discard rate: they are this pattern's early-warning signals."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Resequencer (Message Routing chapter).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/Resequencer.html",
+    "https://camel.apache.org/components/latest/eips/resequence-eip.html",
+    "https://docs.spring.io/spring-integration/reference/resequencer.html",
+    "https://particular.net/blog/you-dont-need-ordered-delivery",
+    "https://camel.apache.org/components/4.22.x/eips/resequence-eip.html",
+    "https://docs.spring.io/spring-integration/reference/6.4/resequencer.html",
+    "https://docs.oracle.com/cloud/latest/soa121300/SOASE/GUID-A6C92CD4-A78D-4D12-B667-96CD1FB9828B.htm",
+    "https://issues.apache.org/jira/browse/SYNAPSE-1130"
+  ]
+}

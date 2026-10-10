@@ -1,0 +1,55 @@
+{
+  "pattern": "transactional-message-queue",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "sqlite3/libpq BEGIN IMMEDIATE + outbox row + relay",
+  "implementation_notes": "C has no transaction manager and no destructors, so the atomic unit of work is written by hand: open a database transaction (sqlite3_exec(db, \"BEGIN IMMEDIATE\", ...) or PQexec(conn, \"BEGIN\")), write the business row and the outbox row inside it, then COMMIT; a relay thread publishes committed rows and marks or deletes them only after the broker acknowledges. This is the only composition in which the state change and the announcement share one commit boundary, because librdkafka offers no XA integration with a database.",
+  "code_sketch": "sqlite3_exec(db, \"BEGIN IMMEDIATE\", 0, 0, 0);\nsqlite3_exec(db, \"INSERT INTO orders(id,total) VALUES(1,42)\", 0, 0, 0);\nsqlite3_exec(db, \"INSERT INTO outbox(topic,payload) VALUES('orders','{...}')\", 0, 0, 0);\nsqlite3_exec(db, \"COMMIT\", 0, 0, 0);   /* state change and announcement, one commit */\n/* relay thread: SELECT unsent rows -> publish -> UPDATE sent_at after ack */",
+  "pitfalls": [
+    "Every early return must roll back explicitly: without destructors or a cleanup label, a forgotten COMMIT leaves the transaction open and holding SQLite's write lock.",
+    "A relay that publishes before COMMIT emits messages whose business row may still roll back; select only committed rows and mark them sent after the broker acknowledges (at-least-once).",
+    "sqlite3 auto-commits outside BEGIN and a second connection must not write inside the transaction or it blocks on the writer lock."
+  ],
+  "sources": [
+    "https://www.sqlite.org/lang_transaction.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "sqlite-outbox",
+      "name": "Database transaction + outbox table with a relay",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "sqlite3/libpq BEGIN IMMEDIATE + outbox row + relay",
+      "implementation_notes": "C has no transaction manager and no destructors, so the atomic unit of work is written by hand: open a database transaction (sqlite3_exec(db, \"BEGIN IMMEDIATE\", ...) or PQexec(conn, \"BEGIN\")), write the business row and the outbox row inside it, then COMMIT; a relay thread publishes committed rows and marks or deletes them only after the broker acknowledges. This is the only composition in which the state change and the announcement share one commit boundary, because librdkafka offers no XA integration with a database.",
+      "code_sketch": "sqlite3_exec(db, \"BEGIN IMMEDIATE\", 0, 0, 0);\nsqlite3_exec(db, \"INSERT INTO orders(id,total) VALUES(1,42)\", 0, 0, 0);\nsqlite3_exec(db, \"INSERT INTO outbox(topic,payload) VALUES('orders','{...}')\", 0, 0, 0);\nsqlite3_exec(db, \"COMMIT\", 0, 0, 0);   /* state change and announcement, one commit */\n/* relay thread: SELECT unsent rows -> publish -> UPDATE sent_at after ack */",
+      "pitfalls": [
+        "Every early return must roll back explicitly: without destructors or a cleanup label, a forgotten COMMIT leaves the transaction open and holding SQLite's write lock.",
+        "A relay that publishes before COMMIT emits messages whose business row may still roll back; select only committed rows and mark them sent after the broker acknowledges (at-least-once).",
+        "sqlite3 auto-commits outside BEGIN and a second connection must not write inside the transaction or it blocks on the writer lock."
+      ],
+      "sources": [
+        "https://www.sqlite.org/lang_transaction.html"
+      ]
+    },
+    {
+      "variant_id": "librdkafka-transaction",
+      "name": "librdkafka transactional producer",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "rd_kafka_init_transactions / begin / commit / abort (+ send_offsets_to_transaction)",
+      "implementation_notes": "The broker-side realization: a producer with a stable transactional.id calls rd_kafka_init_transactions() once, then rd_kafka_begin_transaction(), rd_kafka_producev()/rd_kafka_produce_batch(), optionally rd_kafka_send_offsets_to_transaction() to commit consumed offsets, and finishes with rd_kafka_commit_transaction() or rd_kafka_abort_transaction(). It makes the producer's operations atomic among themselves (the transactional-client semantics) and gives exactly-once effects for consume-transform-produce, but it cannot include a database write, so a database-coupled service still pairs it with an outbox row.",
+      "code_sketch": "rd_kafka_init_transactions(rk, 10000);\nrd_kafka_begin_transaction(rk);\nrd_kafka_producev(rk, RD_KAFKA_V_TOPIC(\"orders\"),\n                  RD_KAFKA_V_VALUE(event, len), RD_KAFKA_V_END);\nif (db_commit(db) == 0) rd_kafka_commit_transaction(rk, 10000);\nelse                    rd_kafka_abort_transaction(rk, 10000);",
+      "pitfalls": [
+        "Only one transaction may be open per producer instance and the transactional producer is not thread-safe: serialise the sends or use one producer per thread.",
+        "Every transaction call must be checked and the producer's event queue served (rd_kafka_poll/rd_kafka_flush) or the commit never completes.",
+        "Transactions need Kafka 0.11+ brokers and a stable transactional.id; a random id silently disables zombie fencing."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/clients/librdkafka/html/rdkafka_8h.html",
+        "https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ],
+  "default_variant": "sqlite-outbox",
+  "version": "1.0"
+}

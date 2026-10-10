@@ -1,0 +1,164 @@
+{
+  "category": "interaction-boundary",
+  "name": "server-session",
+  "aliases": [
+    "server session state",
+    "server-side session"
+  ],
+  "intent": "Keep the conversation state of each conversation on the server - held in a store the server owns, serialized into a per-conversation record and keyed by an opaque session identifier the client carries - so that every request can resume a conversation no single request object could remember.",
+  "problem": "A conversation spans several requests and needs state (login context, shopping cart, wizard step, entitlement snapshot, flash message, correlation data), but the deployment forbids keeping it on the client: the payload is too large for a cookie, too sensitive to hand to the browser, must be revocable at logout, or must be readable by operators. The recurring decision is therefore 'the conversation state belongs on the server - where exactly, with which lifetime, and how does a request find it again?' - and the answer has to name a store, an identifier, an expiry policy and a failure story for every request that cannot find its record.",
+  "context": "Request-response or message-driven software whose client can hold and return a small opaque handle (a cookie, a header, a token) and whose server side can own a store: process memory on a single instance, a distributed cache, a session table, or the same database the application already uses. It applies when the conversation payload is larger than a carrier comfortably holds, when it holds secrets or internal identifiers, when per-conversation revocation and audit matter, and when the extra round trip to the store is cheaper than the alternative of pushing identity and state onto every request. Multi-instance deployments turn the store choice into the central design decision: without a shared store the conversation is pinned to one process or one node.",
+  "benefits": [
+    "The payload is decoupled from the carrier: the session record can be as large and structured as the conversation needs, and the wire carries only an opaque identifier - the roughly 4 KB cookie ceiling and cookie-visible plaintext stop being constraints.",
+    "Confidentiality and control stay inside the trust boundary: secrets, internal identifiers and role data never leave the server, and operators can inspect, enumerate and delete conversation records (the revocation story that a client-held token cannot offer).",
+    "Revocation is a server-side delete: logging out, suspending a user or invalidating every session of an attacker is an operation on the store, not a hope that the client discards its copy (server-side records are invalidated at logout, unlike cookie-based sessions).",
+    "A shared store makes instances interchangeable: Redis, a database or a distributed cache lets any node serve any request of a conversation, so autoscaling and rolling deploys stop logging users out and sticky routing becomes optional rather than mandatory.",
+    "The conversation can participate in ordinary transactional and domain infrastructure: the session record can live next to domain data, be read in the same request transaction, be backed up, migrated and inspected with the tools the team already runs.",
+    "Server-side lifecycle policy is explicit: idle timeout, absolute lifetime, maximum concurrent sessions and rotation rules are decisions of the server, applied uniformly, independent of what the client does with its cookie."
+  ],
+  "tradeoffs": [
+    "The store becomes shared infrastructure and a critical dependency: a node-local map breaks behind a load balancer (express-session's MemoryStore is documented as leaking memory and as not scaling past a single process; Vapor's in-memory driver does not survive restarts), while a shared store adds a network hop, an operational dependency and a failure mode in which a store outage makes every conversation unavailable.",
+    "The session identifier is a bearer credential: whoever holds it is the conversation, so theft means impersonation, entropy and cookie attributes (Secure, HttpOnly, SameSite) become security-critical, and the identifier must be rotated on login and privilege change to blunt session fixation.",
+    "Every request pays a read/serialize/deserialize/write cycle on a hot path; without dirty tracking, lazy loading or a caching layer the store round trip is paid even by requests that never touch the session (tower-sessions and Ktor both advertise deferred loading as the mitigation).",
+    "Coherent records mean last-writer-wins races: concurrent requests from one client each load, mutate and store the whole record, and the later write silently discards the earlier one (ASP.NET Core documents exactly this for its non-locking, coherent session), so state must be merge-tolerant, versioned or single-writer per conversation.",
+    "Records accumulate and expire: session tables and maps need sweeping and bounded growth - Apache's mod_session_dbd documents that expiry is not automatic (an external cron job is required), Rails' Active Record store asks for a scheduled db:sessions:trim, and containers run their own expiry frequency - and a stolen identifier stays valid until the record itself expires.",
+    "Serialization and deployment coupling: attributes must be serializable for replication, persistence or a remote store (Tomcat filters session attribute classes, Spring Session needs a serialization strategy that survives upgrades), and code that works in-memory can fail only once the record crosses a process boundary.",
+    "Without a shared store, availability and scaling are hostage to affinity: sticky routing keeps a conversation on one node, so that node's restart or eviction costs the session, and rebalancing breaks conversations unpredictably."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Client",
+      "responsibility": "Stores the session identifier it was handed (cookie jar, keychain, header) and returns it with every subsequent request of the conversation; it never sees the payload unless the server chose to leak it into the carrier."
+    },
+    {
+      "role": "Session Identifier",
+      "responsibility": "Opaque, high-entropy handle that names one conversation record and is the only session state that crosses the boundary; generated by the server (CSPRNG), rotated when privilege changes, and never reused for a different conversation."
+    },
+    {
+      "role": "Session State",
+      "responsibility": "The per-conversation payload itself - cart, wizard position, authentication context, entitlements, flash message - held server-side in serialized form and treated as the authoritative record of the conversation."
+    },
+    {
+      "role": "Session Manager (Store)",
+      "responsibility": "Owns the records: creation, lookup by identifier, update, expiry and eviction, deletion on logout, and the storage medium (process memory, cache, session table, distributed store); it also owns the cleanup policy that keeps the store bounded."
+    },
+    {
+      "role": "Session Middleware",
+      "responsibility": "Boundary code that resolves the identifier from the request before application code runs, exposes the payload as a session abstraction, persists the updated record before the response leaves, and writes the identifier back with the right attributes (HttpOnly, Secure, SameSite, Path, Max-Age)."
+    },
+    {
+      "role": "Lifecycle Policy",
+      "responsibility": "Idle timeout, absolute lifetime, rotation on authentication, maximum concurrent sessions per principal and fail-open/fail-closed behaviour when the store is unreachable; expressed as configuration and enforced by the manager and middleware together."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "persistence-unit",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Web applications and REST backends: authenticated context, CSRF tokens, shopping cart, user preferences and flash messages - the default of most web frameworks (Django sessions, ASP.NET Core session middleware, express-session, Ktor Sessions, Vapor sessions).",
+    "Conversation payloads that will not fit a cookie or must not be readable: multi-step checkouts, import/onboarding wizards, generated previews, uploaded-but-uncommitted drafts and internal identifiers that the browser must never see.",
+    "Sensitive or regulated flows (health, finance, insurance, government) that need server-side confidentiality plus an auditable record that can be deleted when the citizen logs out or withdraws consent, which a signed client-side token cannot provide.",
+    "Clusters, autoscaling groups and rolling deployments: a shared session store (Redis, SQL, distributed cache) keeps conversations alive across instance replacement and removes the need for sticky sessions.",
+    "Multi-step protocol handshakes where the server must correlate several requests: SAML/OIDC login state and nonces, one-time tokens, resume-a-cursor behaviour, and batch approval flows that span more than one round trip.",
+    "Messaging and workflow systems that resume a conversation from a message: a server-held record (or a process manager owning it) lets a request-reply or event-driven exchange continue where the last message left off.",
+    "Operator-facing requirements: sign out all devices, list and kill a user's sessions, rate-limit per session, or inspect what a support case actually did - all of which are queries against server-side records.",
+    "Making the store a deployment decision instead of a code rewrite: Django's sessions expose interchangeable SESSION_ENGINE backends - database (default), cache, file, and write-through cached_db that reads from the cache and falls back to the database on eviction - and its docs explicitly warn that the local-memory cache is not multi-process safe in production, which is exactly the deployment test this pattern asks before the first line of session code.",
+    "Java clusters that keep HttpSession code but replace the container: Spring Session registers its own springSessionRepositoryFilter ahead of anything touching HttpSession and backs it with Redis or a JDBC store (SPRING_SESSION plus SPRING_SESSION_ATTRIBUTES tables), so any node can serve any request of the conversation and sessions survive instance replacement without container-level replication.",
+    "Rails applications outgrowing the default cookie: switching from CookieStore to ActiveRecordStore (a sessions table with an indexed session_id and a marshaled data column, expirable via added timestamps and a scheduled trim) or CacheStore keeps the payload server-side with only the session id in the cookie, and the guide prescribes reset_session after login to break fixation."
+  ],
+  "avoid_when": [
+    "The deployment should stay stateless and the payload is small: keep the conversation in a signed (and if needed encrypted) cookie or token - the Client Session alternative avoids the store, the round trip and the shared dependency entirely.",
+    "Only one or two scalars are involved: a query-string parameter, hidden form field or ordinary cookie is simpler than a session record and has no lifecycle to run.",
+    "A single process serves every request and losing conversations on restart is acceptable: a plain in-memory map keyed by an identifier - or even the framework default - is enough; do not add a store you do not need.",
+    "The state is really domain data with a meaning beyond the conversation: persist it as domain records (Entity, Repository, Aggregate) and let the session hold only references to them.",
+    "Every request may hit a different process with no shared storage available (some serverless and edge runtimes): a client-carried token fits the platform better than a store that does not exist.",
+    "The 'conversation' is a long-running business process spanning days or external partners: model it explicitly as a workflow or Process Manager with durable, message-driven state instead of an ever-growing session blob."
+  ],
+  "language_files": {
+    "generic": "server-session.generic.json",
+    "c": "server-session.c.json",
+    "cplusplus": "server-session.cplusplus.json",
+    "csharp": "server-session.csharp.json",
+    "go": "server-session.go.json",
+    "java": "server-session.java.json",
+    "javascript": "server-session.javascript.json",
+    "kotlin": "server-session.kotlin.json",
+    "python": "server-session.python.json",
+    "ruby": "server-session.ruby.json",
+    "rust": "server-session.rust.json",
+    "scala": "server-session.scala.json",
+    "swift": "server-session.swift.json",
+    "typescript": "server-session.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "client-session",
+    "session-facade",
+    "secure-session-manager",
+    "repository",
+    "cache-aside",
+    "process-manager"
+  ],
+  "anti_patterns": [
+    "Node-local session map behind a load balancer: the store is process memory, so requests land on a node that never saw the conversation and users are logged out at random - express-session's MemoryStore warning is the canonical statement of this failure.",
+    "Session as a second database: stuffing whole object graphs, cached query results or duplicated domain state into the record until it becomes a drifting copy of the real store (and a serialization hazard the moment the record crosses a process boundary).",
+    "Immortal sessions: no server-side expiry, no rotation after privilege changes, no deletion on logout, with the cookie's Max-Age as the only policy - the store grows forever and a stolen identifier stays valid long after the user believes they logged out.",
+    "Sticky sessions as the only scaling answer: pinning conversations to nodes keeps the application stateful per instance, so every restart, eviction or rebalance destroys sessions and deploys must be planned around routing.",
+    "Storing unserializable or unshareable things in the session (open connections, locks, request-scoped objects, ORM entities bound to one context): works in a single process with an in-memory store and breaks the day the store becomes remote or replicated.",
+    "Bloated anonymous sessions: creating a record for every visitor and request, including clients that never return and that send no identifier (Drogon's docs warn about exactly this memory and compute waste), turning the store into a write-amplification device."
+  ],
+  "design_principles": [
+    "Separation of concerns at the boundary: resolving identity, storing the record and using the state are three responsibilities - application code should see a session abstraction, never a cookie, a store handle or a serialization format.",
+    "Single source of truth: the server-side record is the conversation; the client holds only an opaque reference, so the payload cannot diverge between two authoritative copies.",
+    "Explicit lifecycle over implicit behaviour: creation, idle timeout, absolute expiry, rotation and revocation are declared policy, not side effects of a cookie's attributes or a store's eviction chance.",
+    "Fail safely on a critical dependency: define per-route whether an unreachable store means 'log in again' (fail closed) or 'continue anonymously' (fail open), and make the store's latency and errors visible.",
+    "Small, reference-like payloads: keep the session an index of the conversation (ids, small values, flags) and leave domain data in the domain store, so the record stays cheap to move, expire and reason about."
+  ],
+  "best_practices": [
+    "Mint identifiers with a CSPRNG (at least 128 bits, unpredictable), rotate them on authentication and privilege change, and treat the identifier as a bearer credential when choosing cookie attributes and transport security.",
+    "Pick the store from the deployment: process memory for a single instance, Redis or a distributed cache for a farm, the application's database when durability and transactional access matter - and document what a store outage does.",
+    "Set both an idle timeout and an absolute maximum lifetime server-side, sweep expired records with a scheduled job or native TTL, and monitor store size and eviction rates as an operational signal.",
+    "Keep records small and serializable: identifiers and compact values rather than entities or graphs, and a version field so today's code can still read yesterday's records.",
+    "Persist once per request at the end of the cycle, and use dirty tracking or lazy loading so requests that never touch the session do not pay a store write.",
+    "Decide concurrency policy explicitly for a single conversation: single-writer per session, optimistic version checks, or merge-safe state, because coherent records otherwise resolve concurrent edits as last-writer-wins.",
+    "Test the failure paths: store unreachable, identifier unknown or expired, record from an older format, two concurrent requests on one conversation, and logout while another request is in flight.",
+    "Keep credentials, authorization decisions and large payloads out of the record where possible; store identifiers and re-derive authority from the authoritative source instead of trusting a stale snapshot."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Martin Fowler, Patterns of Enterprise Application Architecture (2003) - Server Session State (Chapter 17, Session State Patterns), the server-side sibling of Client Session State and Database Session State.",
+    "https://martinfowler.com/eaaCatalog/serverSessionState.html",
+    "https://learn.microsoft.com/en-us/aspnet/core/fundamentals/app-state",
+    "https://docs.djangoproject.com/en/5.2/topics/http/sessions/",
+    "https://docs.spring.io/spring-session/reference/index.html",
+    "https://martinfowler.com/bliki/SessionState.html - what session state is for (in-flight business-transaction data that tolerates loss on crash) and why hybrid client/server/database storage is common.",
+    "https://guides.rubyonrails.org/action_controller_overview.html - Rails session stores (CookieStore default, CacheStore, ActiveRecordStore), server-side storage with only the session id in the cookie, and reset_session after login against fixation.",
+    "https://tomcat.apache.org/tomcat-9.0-doc/config/manager.html - the container form of the pattern: Manager/PersistentManager with a Store element, saveOnRestart and Serializable-attribute requirements.",
+    "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html - session id regeneration on privilege change, strict (server-issued only) identifier acceptance, and concurrent-session policy.",
+    "https://www.loginradius.com/blog/identity/token-based-authentication-vs-session-authentication - the standard criticism: centralized mutable session state becomes a coordination point and outage dependency behind load balancers, the counterweight driving the Client Session alternative."
+  ]
+}

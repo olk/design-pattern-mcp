@@ -1,0 +1,57 @@
+{
+  "pattern": "cache-aside",
+  "language": "javascript",
+  "support": "manual",
+  "idiom_name": "module-scope Map of {value, expiresAt, inflight} plus an async loader",
+  "implementation_notes": "The JavaScript runtime ships only Map - an insertion-ordered key-value store - so the cache-aside shape is a small helper that keeps {value, expiresAt} entries, checks Date.now() on read, awaits the loader on a miss and deletes the key after the source-of-truth write; storing the in-flight promise under the same key lets concurrent misses for one key share a single load. Newer engines add Map.prototype.getOrInsert, but it covers only the synchronous read-or-insert half and cannot await a loader. For a cache shared across instances the helper wraps a client such as ioredis instead of a Map.",
+  "code_sketch": "const cache = new Map();                        // key -> { value, expiresAt, inflight }\nasync function getOrLoad(key, load) {\n  const hit = cache.get(key);\n  if (hit && hit.expiresAt > Date.now()) return hit.value;\n  if (hit?.inflight) return hit.inflight;       // share one load across concurrent misses\n  const inflight = load()\n    .then(v => { cache.set(key, { value: v, expiresAt: Date.now() + TTL }); return v; })\n    .catch(e => { cache.delete(key); throw e; });   // never cache a rejected promise\n  cache.set(key, { expiresAt: 0, inflight });\n  return inflight;\n}\n// write: await store.put(key, v); cache.delete(key);",
+  "pitfalls": [
+    "Storing the in-flight promise means a rejection must remove the entry, or the cache serves a cached failure forever.",
+    "A module-level Map is per process: behind a load balancer every instance has its own copy, so the TTL and invalidation semantics must tolerate divergence - or the cache moves to Redis.",
+    "A Map without a maximum size and a sweep leaks memory; expired entries are only removed when something overwrites or deletes them.",
+    "Cache keys must be namespaced per tenant or user: a shared Map in a server process leaks data across requests."
+  ],
+  "sources": [
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map"
+  ],
+  "variants": [
+    {
+      "variant_id": "map-ttl",
+      "name": "Map + absolute expiry timestamps with an async getOrLoad helper",
+      "paradigm": "procedural",
+      "min_standard": "ES2017",
+      "idiom_name": "module-scope Map of {value, expiresAt, inflight} plus an async loader",
+      "implementation_notes": "The JavaScript runtime ships only Map - an insertion-ordered key-value store - so the cache-aside shape is a small helper that keeps {value, expiresAt} entries, checks Date.now() on read, awaits the loader on a miss and deletes the key after the source-of-truth write; storing the in-flight promise under the same key lets concurrent misses for one key share a single load. Newer engines add Map.prototype.getOrInsert, but it covers only the synchronous read-or-insert half and cannot await a loader. For a cache shared across instances the helper wraps a client such as ioredis instead of a Map.",
+      "code_sketch": "const cache = new Map();                        // key -> { value, expiresAt, inflight }\nasync function getOrLoad(key, load) {\n  const hit = cache.get(key);\n  if (hit && hit.expiresAt > Date.now()) return hit.value;\n  if (hit?.inflight) return hit.inflight;       // share one load across concurrent misses\n  const inflight = load()\n    .then(v => { cache.set(key, { value: v, expiresAt: Date.now() + TTL }); return v; })\n    .catch(e => { cache.delete(key); throw e; });   // never cache a rejected promise\n  cache.set(key, { expiresAt: 0, inflight });\n  return inflight;\n}\n// write: await store.put(key, v); cache.delete(key);",
+      "pitfalls": [
+        "Storing the in-flight promise means a rejection must remove the entry, or the cache serves a cached failure forever.",
+        "A module-level Map is per process: behind a load balancer every instance has its own copy, so the TTL and invalidation semantics must tolerate divergence - or the cache moves to Redis.",
+        "A Map without a maximum size and a sweep leaks memory; expired entries are only removed when something overwrites or deletes them.",
+        "Cache keys must be namespaced per tenant or user: a shared Map in a server process leaks data across requests."
+      ],
+      "sources": [
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map"
+      ]
+    },
+    {
+      "variant_id": "lru-cache-fetch",
+      "name": "lru-cache fetch() with max size and TTL",
+      "paradigm": "oo",
+      "min_standard": "ES2017",
+      "idiom_name": "new LRUCache({ max, ttl }).fetch(key, loader) + delete after the store write",
+      "implementation_notes": "The lru-cache package is the widely used dependency for this shape: new LRUCache({ max, ttl }) bounds the store, and cache.fetch(key, loader) implements read-with-populate, deduplicating concurrent fetches for one key and skipping the insert when the entry was deleted, evicted or overwritten while the loader ran. delete(key) after the store commit is the invalidation step, and the library's options express the eviction and staleness policy instead of hand-written sweeping code.",
+      "code_sketch": "import { LRUCache } from 'lru-cache';\n\nconst cache = new LRUCache({ max: 5_000, ttl: 5 * 60_000 });\nconst entity = await cache.fetch(`entity:${id}`, async () => store.find(id));\n// concurrent fetch() calls for the same key share one load\n// write path: await store.save(entity); cache.delete(`entity:${id}`);",
+      "pitfalls": [
+        "fetch() does not store rejections, so a failing source is retried by every caller - add a short-lived negative entry when the source is known to be down.",
+        "ttl counts from insertion by default; do not assume a sliding window unless the staleness options are set deliberately.",
+        "An evicted or deleted entry whose fetch was still in flight is not inserted, so callers must not assume the value they just loaded ended up in the cache."
+      ],
+      "sources": [
+        "https://www.npmjs.com/package/lru-cache",
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map"
+      ]
+    }
+  ],
+  "default_variant": "map-ttl",
+  "version": "1.0"
+}

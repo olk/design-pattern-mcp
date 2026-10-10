@@ -1,0 +1,76 @@
+{
+  "pattern": "execute-around",
+  "language": "csharp",
+  "support": "native",
+  "idiom_name": "using (var r = ...) { ... } and the C# 8 using declaration",
+  "implementation_notes": "The compiler rewrites a using statement into try/finally and calls Dispose on the resource when control leaves the block, so the teardown cannot be skipped by an early return, a break or an exception; a using declaration extends the bracket to the end of the enclosing scope, and several declarators (or nested usings) dispose in reverse order. What replaces the classic wrapper is this rewrite plus the IDisposable contract. Use it as the default for any resource with a single, parameterless release; use the delegate wrapper below for protocols that are not one Dispose call - a transaction with commit and rollback, a retry, a unit of work.",
+  "code_sketch": "using (var reader = new StreamReader(\"file1.txt\"))   // setup + guaranteed teardown\n{\n    Process(reader.ReadToEnd());                       // body\n}                                                      // Dispose() runs here, also on exception",
+  "pitfalls": [
+    "The garbage collector never calls Dispose; an IDisposable that is not inside a using or try/finally keeps its unmanaged resource until finalization, if there is any at all.",
+    "A using declaration leaves the disposed object reachable in the enclosing scope; touching it after the block throws ObjectDisposedException, which is why the declaration form should be used only when nothing later needs the variable.",
+    "Dispose must be idempotent and should not throw during unwinding: an exception raised by Dispose while the body's exception propagates can hide the original failure."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/using",
+    "https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/using-objects"
+  ],
+  "variants": [
+    {
+      "variant_id": "using-statement",
+      "name": "using statement / using declaration over IDisposable",
+      "paradigm": "oo",
+      "min_standard": "C#1",
+      "idiom_name": "using (var r = ...) { ... } and the C# 8 using declaration",
+      "implementation_notes": "The compiler rewrites a using statement into try/finally and calls Dispose on the resource when control leaves the block, so the teardown cannot be skipped by an early return, a break or an exception; a using declaration extends the bracket to the end of the enclosing scope, and several declarators (or nested usings) dispose in reverse order. What replaces the classic wrapper is this rewrite plus the IDisposable contract. Use it as the default for any resource with a single, parameterless release; use the delegate wrapper below for protocols that are not one Dispose call - a transaction with commit and rollback, a retry, a unit of work.",
+      "code_sketch": "using (var reader = new StreamReader(\"file1.txt\"))   // setup + guaranteed teardown\n{\n    Process(reader.ReadToEnd());                       // body\n}                                                      // Dispose() runs here, also on exception",
+      "pitfalls": [
+        "The garbage collector never calls Dispose; an IDisposable that is not inside a using or try/finally keeps its unmanaged resource until finalization, if there is any at all.",
+        "A using declaration leaves the disposed object reachable in the enclosing scope; touching it after the block throws ObjectDisposedException, which is why the declaration form should be used only when nothing later needs the variable.",
+        "Dispose must be idempotent and should not throw during unwinding: an exception raised by Dispose while the body's exception propagates can hide the original failure."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/using",
+        "https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/using-objects"
+      ]
+    },
+    {
+      "variant_id": "lambda-wrapper",
+      "name": "generic helper taking the body as a delegate (Func/Action)",
+      "paradigm": "functional",
+      "min_standard": "C#3",
+      "idiom_name": "static TResult WithX<TResult>(..., Func<TResult> body)",
+      "implementation_notes": "For protocols that are not a single disposable object, pass the body as a delegate: the helper does the setup, calls body(), and performs teardown on both the success and the failure path. Lambdas and closures make call sites read like a language construct, and the helper is the right home for shared policy (isolation level, retry, unit-of-work scope). It also covers what using cannot express: conditional acquisition, several resources whose teardown depends on the body's outcome, and resources that deliberately hide their handle. Keep the delegate typed so the body's result and the wrapper's result stay linked.",
+      "code_sketch": "static TResult InTransaction<TResult>(Db db, Func<TResult> body)\n{\n    using var tx = db.BeginTransaction();      // setup (itself disposable)\n    try\n    {\n        var result = body();                   // body as an argument\n        tx.Commit();                           // teardown: success path\n        return result;\n    }\n    catch { tx.Rollback(); throw; }            // teardown: failure path\n}",
+      "pitfalls": [
+        "A Func<Task<TResult>> body needs an async wrapper that awaits inside the bracket; passing an async lambda to the synchronous overload commits or rolls back before the work has finished.",
+        "Lambdas that capture variables are compiled into a closure class and allocate per call; a hot path should capture nothing (the compiler caches such delegates) or pass state in explicitly.",
+        "An exception thrown by the teardown while the body's exception is propagating replaces it unless the wrapper is written to keep the original - decide which one survives and document it."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/lambda-expressions"
+      ]
+    },
+    {
+      "variant_id": "await-using",
+      "name": "await using over IAsyncDisposable",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "IAsyncDisposable"
+      ],
+      "idiom_name": "await using (var r = ...) / await using var r = ...",
+      "implementation_notes": "When releasing the resource is genuinely asynchronous - flushing a network buffer, closing a channel, committing an async transaction - await using rewrites to try/finally with await DisposeAsync() and keeps the same guarantee as the synchronous form, with the dispose phase awaited rather than blocking. Use it only for resources that implement IAsyncDisposable (or a ref struct with a public parameterless Dispose for the synchronous form); for an asynchronous body, combine it with a wrapper taking Func<Task<TResult>> so the await happens inside the bracket.",
+      "code_sketch": "await using (var connection = new SqlConnection(connectionString))\n{\n    await connection.OpenAsync();\n    await RunAsync(connection);          // body\n}                                        // await connection.DisposeAsync()",
+      "pitfalls": [
+        "await using requires an IAsyncDisposable (or the disposable pattern on a ref struct); it does not silently accept a plain IDisposable, whose disposal must stay in the synchronous using.",
+        "The async teardown can fail after the body already failed; the two exceptions have to be combined deliberately, otherwise one of them is lost.",
+        "DisposeAsync must be idempotent and cancellation-aware: a cancelled token during shutdown can leave the resource partially released if the implementation treats it as fatal."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/using"
+      ]
+    }
+  ],
+  "default_variant": "using-statement",
+  "version": "1.0"
+}

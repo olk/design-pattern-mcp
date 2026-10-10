@@ -1,0 +1,72 @@
+{
+  "pattern": "control-bus",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "app.control.broadcast + app.control.inspect (control queue) and Flower",
+  "implementation_notes": "For Celery-based Python systems the control bus already exists. Commands are broadcast on a dedicated control queue (app.control.broadcast or the celery control CLI: enable_events, pool_grow, pool_shrink, rate_limit, shutdown), queries go to the workers and their replies are collected with a timeout (inspect active|scheduled|reserved|registered|stats, --destination to narrow the set, --timeout to bound the wait, --reply for a callback queue), and Flower adds the console: a web UI and HTTP API that lists workers and tasks and issues the same control commands. Because control traffic uses the broker's control queue rather than the task queues, a task backlog does not delay management. Use this variant when Celery is the fabric; for non-Celery services the stdlib or admin-endpoint variants are the smaller answer.",
+  "code_sketch": "from celery import Celery\n\napp = Celery('proj', broker='pyamqp://guest@localhost//')\n\n@app.task(bind=True)\ndef hard_work(self):\n    ...\n\napp.control.broadcast('pool_grow', n=2)                          # command on the control queue\napp.control.rate_limit('proj.tasks.hard_work', '10/m')\nreplies = app.control.inspect(timeout=1.0).stats()               # status query, correlated replies\napp.control.broadcast('shutdown', destination=['worker1@host'])  # scoped lifecycle command",
+  "pitfalls": [
+    "Control broadcasts are fan-out and fire-and-forget: a worker that is down misses the command silently, so use --destination plus a reply/timeout when the action must be confirmed.",
+    "Inspect and control only work when the workers share the broker and the control queue has not been disabled or separated; a misrouted control queue makes a healthy cluster look unreachable.",
+    "Control commands are not authenticated: anyone who can publish to the broker can shut workers down, so the control queue must sit behind broker credentials separate from application publishing."
+  ],
+  "sources": [
+    "https://docs.celeryq.dev/en/stable/userguide/monitoring.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "celery-control-queue",
+      "name": "Celery remote control over the control queue (with Flower as console)",
+      "paradigm": "oo",
+      "min_standard": "Python3.7",
+      "idiom_name": "app.control.broadcast + app.control.inspect (control queue) and Flower",
+      "implementation_notes": "For Celery-based Python systems the control bus already exists. Commands are broadcast on a dedicated control queue (app.control.broadcast or the celery control CLI: enable_events, pool_grow, pool_shrink, rate_limit, shutdown), queries go to the workers and their replies are collected with a timeout (inspect active|scheduled|reserved|registered|stats, --destination to narrow the set, --timeout to bound the wait, --reply for a callback queue), and Flower adds the console: a web UI and HTTP API that lists workers and tasks and issues the same control commands. Because control traffic uses the broker's control queue rather than the task queues, a task backlog does not delay management. Use this variant when Celery is the fabric; for non-Celery services the stdlib or admin-endpoint variants are the smaller answer.",
+      "code_sketch": "from celery import Celery\n\napp = Celery('proj', broker='pyamqp://guest@localhost//')\n\n@app.task(bind=True)\ndef hard_work(self):\n    ...\n\napp.control.broadcast('pool_grow', n=2)                          # command on the control queue\napp.control.rate_limit('proj.tasks.hard_work', '10/m')\nreplies = app.control.inspect(timeout=1.0).stats()               # status query, correlated replies\napp.control.broadcast('shutdown', destination=['worker1@host'])  # scoped lifecycle command",
+      "pitfalls": [
+        "Control broadcasts are fan-out and fire-and-forget: a worker that is down misses the command silently, so use --destination plus a reply/timeout when the action must be confirmed.",
+        "Inspect and control only work when the workers share the broker and the control queue has not been disabled or separated; a misrouted control queue makes a healthy cluster look unreachable.",
+        "Control commands are not authenticated: anyone who can publish to the broker can shut workers down, so the control queue must sit behind broker credentials separate from application publishing."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/monitoring.html"
+      ]
+    },
+    {
+      "variant_id": "signal-and-queue-dispatcher",
+      "name": "stdlib signal handlers plus a queue-backed command dispatcher",
+      "paradigm": "procedural",
+      "min_standard": "Python3.6",
+      "idiom_name": "signal.signal(SIGHUP/SIGTERM) flags + multiprocessing.Queue dispatcher + logging.config.dictConfig reload",
+      "implementation_notes": "For a plain daemon the control bus is the operating system plus a queue: signal.signal(SIGHUP, handler) and SIGTERM/SIGUSR1 handlers set flags that the main loop checks, a dispatcher class reading a multiprocessing.Queue (or a socketpair) applies control messages to the component, and reconfiguration is logging.config.dictConfig plus a validated config reload. Signal handlers run in the main thread only and between bytecodes, so the handler must do nothing but set a flag - that constraint is exactly why the flag-plus-queue shape, rather than a real handler chain, is the standard Python answer.",
+      "code_sketch": "import logging.config, multiprocessing, queue, signal\n\nRELOAD = multiprocessing.Event()\n\ndef _on_hup(signum, frame):\n    RELOAD.set()                                     # never do real work inside a signal handler\n\nsignal.signal(signal.SIGHUP, _on_hup)\nsignal.signal(signal.SIGTERM, lambda *_: SHUTDOWN.set())\n\nwhile running:\n    if RELOAD.is_set():\n        logging.config.dictConfig(load_config())     # validate, then swap\n        RELOAD.clear()\n    try:\n        dispatch(control_q.get(timeout=0.1))         # multiprocessing.Queue of ControlCommand\n    except queue.Empty:\n        pass",
+      "pitfalls": [
+        "Signal handlers only run in the main thread of the main interpreter and must not take locks: doing real work (or acquiring a Lock) inside the handler can deadlock the process.",
+        "SIGHUP-style reload is not atomic: a handler that reads a half-written file or partially replaces the logging configuration leaves the process in a mixed state - write configs to a temp file, rename, validate, then swap.",
+        "A queue-backed dispatcher is only as reliable as its queue: commands left in a queue after a crash are replayed on restart unless the dispatcher is idempotent."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/signal.html"
+      ]
+    },
+    {
+      "variant_id": "admin-http-endpoints",
+      "name": "Admin HTTP endpoints on a separate app/port with an auth dependency",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "Flask/FastAPI admin app (own port) + authentication dependency + shared command dispatcher",
+      "implementation_notes": "When the component already serves HTTP, the control bus is a separate admin application or blueprint: status, suspend/resume, drain and reload endpoints, protected by an authentication dependency and bound to a management port (never the public API), whose handlers delegate to the same in-process dispatcher the workers use so the console and the component see one source of truth. The classic message-based form is justified only when components cannot accept inbound connections - then the console must poll a queue or broker instead.",
+      "code_sketch": "from fastapi import Depends, FastAPI\n\nadmin = FastAPI()                                       # separate app, separate port, not the public API\n\n@admin.get('/routes/{route}/status')\ndef status(route: str, _: None = Depends(require_ops_token)) -> dict:\n    return routes[route].snapshot()\n\n@admin.post('/routes/{route}/suspend')\ndef suspend(route: str, reason: str, _: None = Depends(require_ops_token)) -> dict:\n    return {'applied': routes[route].suspend(reason)}    # drain in-flight work, then report\n# uvicorn admin:admin --host 127.0.0.1 --port 9001",
+      "pitfalls": [
+        "An admin app mounted on the public API (or bound to 0.0.0.0 without an auth dependency) is a remote control surface for anyone who can reach the port; keep it on the management interface with a token or mTLS dependency.",
+        "Synchronous drain-on-request blocks a worker: start the drain in the background, return 202, and let the status endpoint report drained/idle.",
+        "The admin process must share state with the data process: with multiple WSGI/ASGI workers each has its own memory, so commands either target one worker explicitly or must be delivered through a shared channel (queue, Redis, broker)."
+      ],
+      "sources": [
+        "https://flask.palletsprojects.com/en/stable/quickstart/",
+        "https://docs.python.org/3/library/signal.html"
+      ]
+    }
+  ],
+  "default_variant": "celery-control-queue"
+}

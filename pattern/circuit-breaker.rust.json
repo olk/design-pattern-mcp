@@ -1,0 +1,57 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "CircuitBreakerLayer::builder().failure_rate_threshold().sliding_window_size()",
+  "implementation_notes": "In a Tower service stack the breaker is a layer: CircuitBreakerLayer::builder().failure_rate_threshold(0.5).sliding_window_size(100).build()? wraps any Service and rejects calls while open with CircuitBreakerError::OpenCircuit, classifies failures through failure_classifier or classify_response (the latter for services whose Error is Infallible, such as HTTP or gRPC clients that encode errors in the response), selects the trip model (sliding window by default, consecutive failures as an alternative), supports slow-call detection and minimum_number_of_calls so a cold window cannot trip, and exposes state_sync(), is_open() and metrics() for observability plus with_fallback for the degradation path. Compose it with timeout and load-shedding layers, keeping in mind that layer order decides whether queued or retried work passes through the breaker. Prefer it over a hand-rolled variant when the call is already a Service and you want the window, classification hooks and events for free.",
+  "code_sketch": "let payments = ServiceBuilder::new()\n    .layer(TimeoutLayer::new(Duration::from_secs(1)))            // bounds duration\n    .layer(CircuitBreakerLayer::builder()\n        .failure_rate_threshold(0.5)\n        .sliding_window_size(100)\n        .on_state_transition(|from, to| tracing::warn!(?from, ?to))\n        .build()?)\n    .service(PaymentsClient::new(endpoint));\n\nmatch payments.oneshot(Authorize(order)).await {\n    Err(CircuitBreakerError::OpenCircuit) => Receipt::degraded(),   // fail fast\n    other => other?,\n}",
+  "pitfalls": [
+    "A breaker layer created per request or per connection resets the statistics; wrap the client once so the window accumulates across calls.",
+    "CircuitBreakerError::Inner must be distinguished from OpenCircuit: folding the short circuit into the same retryable error class makes upstream retry policies hammer the open circuit.",
+    "The default classification counts every Err as a failure, so business errors returned as Err trip the breaker unless failure_classifier or classify_response narrows it.",
+    "Layer order changes semantics: a breaker inside a retry layer sees each attempt, a breaker outside sees only the final outcome of the retry sequence."
+  ],
+  "sources": [
+    "https://docs.rs/tower-resilience-circuitbreaker/latest/tower_resilience_circuitbreaker/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tower-resilience",
+      "name": "tower-resilience CircuitBreakerLayer for Tower services",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "CircuitBreakerLayer::builder().failure_rate_threshold().sliding_window_size()",
+      "implementation_notes": "In a Tower service stack the breaker is a layer: CircuitBreakerLayer::builder().failure_rate_threshold(0.5).sliding_window_size(100).build()? wraps any Service and rejects calls while open with CircuitBreakerError::OpenCircuit, classifies failures through failure_classifier or classify_response (the latter for services whose Error is Infallible, such as HTTP or gRPC clients that encode errors in the response), selects the trip model (sliding window by default, consecutive failures as an alternative), supports slow-call detection and minimum_number_of_calls so a cold window cannot trip, and exposes state_sync(), is_open() and metrics() for observability plus with_fallback for the degradation path. Compose it with timeout and load-shedding layers, keeping in mind that layer order decides whether queued or retried work passes through the breaker. Prefer it over a hand-rolled variant when the call is already a Service and you want the window, classification hooks and events for free.",
+      "code_sketch": "let payments = ServiceBuilder::new()\n    .layer(TimeoutLayer::new(Duration::from_secs(1)))            // bounds duration\n    .layer(CircuitBreakerLayer::builder()\n        .failure_rate_threshold(0.5)\n        .sliding_window_size(100)\n        .on_state_transition(|from, to| tracing::warn!(?from, ?to))\n        .build()?)\n    .service(PaymentsClient::new(endpoint));\n\nmatch payments.oneshot(Authorize(order)).await {\n    Err(CircuitBreakerError::OpenCircuit) => Receipt::degraded(),   // fail fast\n    other => other?,\n}",
+      "pitfalls": [
+        "A breaker layer created per request or per connection resets the statistics; wrap the client once so the window accumulates across calls.",
+        "CircuitBreakerError::Inner must be distinguished from OpenCircuit: folding the short circuit into the same retryable error class makes upstream retry policies hammer the open circuit.",
+        "The default classification counts every Err as a failure, so business errors returned as Err trip the breaker unless failure_classifier or classify_response narrows it.",
+        "Layer order changes semantics: a breaker inside a retry layer sees each attempt, a breaker outside sees only the final outcome of the retry sequence."
+      ],
+      "sources": [
+        "https://docs.rs/tower-resilience-circuitbreaker/latest/tower_resilience_circuitbreaker/"
+      ]
+    },
+    {
+      "variant_id": "std-instant-state-machine",
+      "name": "Hand-rolled breaker with std atomics and Instant",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "AtomicU8 state + AtomicU64 counters + Instant cooldown deadline",
+      "implementation_notes": "Without a crate the breaker is a small struct: an AtomicU8 state, AtomicU64 failure and total counters, and the trip instant kept as an Instant (monotonic - the standard library documents that Instant never goes backwards and that on UNIX it is clock_gettime with CLOCK_MONOTONIC, so it is the correct cooldown clock) behind a small lock or an AtomicU64 offset. Admission is a single load plus a compare-and-swap for the open-to-half-open transition, and the counted update happens after the call returns, so no lock is ever held across the dependency call; in async code the counters stay plain atomics because they need no await. Ownership does part of the work that other languages need discipline for: the breaker is Arc-shared and the protected future is owned by the caller, so no outcome can be recorded after the caller has dropped it.",
+      "code_sketch": "pub struct Breaker { st: AtomicU8, fails: AtomicU64, total: AtomicU64,\n                     tripped: Mutex<Option<Instant>> }   // monotonic trip instant\n\npub fn admit(&self) -> Result<(), OpenCircuit> {\n    if self.st.load(Ordering::Acquire) == OPEN {\n        let cooling = self.tripped.lock().unwrap().is_some_and(|t| t.elapsed() < COOLDOWN);\n        if cooling { return Err(OpenCircuit); }\n        if self.st.compare_exchange(OPEN, HALF_OPEN, AcqRel, Acquire).is_err() {\n            return Err(OpenCircuit);   // lost the half-open race: fail fast\n        }\n    }\n    Ok(())\n}",
+      "pitfalls": [
+        "Instant is opaque and not serialisable: a breaker whose state must survive a restart needs a persisted timestamp, or the remaining cooldown is unknown after a restart.",
+        "Holding the Mutex across the dependency call (rather than only around the trip instant) serialises every request, and in async code a std::sync::Mutex held across an await is a correctness hazard.",
+        "Counters must be accessed with consistent orderings; a plain static mut or shared Cell is undefined behaviour under concurrency and will not compile in safe code anyway.",
+        "A ratio computed from counters that are never reset grows stale in the closed state, so add a window or a periodic reset."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/time/struct.Instant.html"
+      ]
+    }
+  ],
+  "default_variant": "tower-resilience"
+}

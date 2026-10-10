@@ -1,0 +1,59 @@
+{
+  "pattern": "producer-consumer",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::mutex + std::condition_variable bounded queue (predicated wait)",
+  "implementation_notes": "Modern C++ ships the synchronization primitives but no bounded blocking queue, so the classic structure is a template class over std::deque (or a fixed ring) guarded by std::mutex, with two std::condition_variable instances for not_empty/not_full; push waits through the predicated overload (wait(lock, [&]{ return size < cap; })), which already loops against spurious wakeups. Waiting methods need std::unique_lock; the full-queue policy (block, wait_for with timeout, try_push returning false) is part of the interface. When a bounded queue already exists in the stack (Boost.Asio/executor queues, oneTBB concurrent_bounded_queue, moodycamel), use it instead of writing a second one.",
+  "code_sketch": "template <class T> class BlockingQueue {\n  std::deque<T> q_; std::mutex m_;\n  std::condition_variable not_empty_, not_full_; std::size_t cap_;\n public:\n  void push(T v) {\n    std::unique_lock lk(m_);\n    not_full_.wait(lk, [&] { return q_.size() < cap_; });\n    q_.push_back(std::move(v));\n    not_empty_.notify_one();\n  }\n  /* pop(): waits on not_empty_, then notifies not_full_. */\n};",
+  "pitfalls": [
+    "A bare cv.wait(lk) without the predicate reintroduces spurious-wakeup and lost-wakeup bugs; always use wait(lock, pred) or a while loop.",
+    "One condition variable for both empty and full waiters lets a consumer steal a producer's wakeup; use two condition variables (or notify_all) so each waiter class is woken for its own reason.",
+    "Notifying while holding the lock is legal but wakes a thread that immediately blocks on the mutex; unlock first (or notify at scope exit) for throughput.",
+    "std::condition_variable only works with std::unique_lock<std::mutex>; lock_guard in a waiting method does not compile, and condition_variable_any is needed for other lock types."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "mutex-condvar-queue",
+      "name": "Bounded queue with std::mutex and std::condition_variable",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::mutex + std::condition_variable bounded queue (predicated wait)",
+      "implementation_notes": "Modern C++ ships the synchronization primitives but no bounded blocking queue, so the classic structure is a template class over std::deque (or a fixed ring) guarded by std::mutex, with two std::condition_variable instances for not_empty/not_full; push waits through the predicated overload (wait(lock, [&]{ return size < cap; })), which already loops against spurious wakeups. Waiting methods need std::unique_lock; the full-queue policy (block, wait_for with timeout, try_push returning false) is part of the interface. When a bounded queue already exists in the stack (Boost.Asio/executor queues, oneTBB concurrent_bounded_queue, moodycamel), use it instead of writing a second one.",
+      "code_sketch": "template <class T> class BlockingQueue {\n  std::deque<T> q_; std::mutex m_;\n  std::condition_variable not_empty_, not_full_; std::size_t cap_;\n public:\n  void push(T v) {\n    std::unique_lock lk(m_);\n    not_full_.wait(lk, [&] { return q_.size() < cap_; });\n    q_.push_back(std::move(v));\n    not_empty_.notify_one();\n  }\n  /* pop(): waits on not_empty_, then notifies not_full_. */\n};",
+      "pitfalls": [
+        "A bare cv.wait(lk) without the predicate reintroduces spurious-wakeup and lost-wakeup bugs; always use wait(lock, pred) or a while loop.",
+        "One condition variable for both empty and full waiters lets a consumer steal a producer's wakeup; use two condition variables (or notify_all) so each waiter class is woken for its own reason.",
+        "Notifying while holding the lock is legal but wakes a thread that immediately blocks on the mutex; unlock first (or notify at scope exit) for throughput.",
+        "std::condition_variable only works with std::unique_lock<std::mutex>; lock_guard in a waiting method does not compile, and condition_variable_any is needed for other lock types."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "semaphore-ring-buffer",
+      "name": "C++20 counting semaphores over a ring buffer (Dijkstra form)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "std::counting_semaphore"
+      ],
+      "idiom_name": "std::counting_semaphore empty/full slots + atomic ring indices",
+      "implementation_notes": "C++20's std::counting_semaphore makes Dijkstra's original two-semaphore solution directly expressible: one semaphore counts empty slots (initialized to the capacity) and one counts filled slots (initialized to zero), the ring indices are atomics, and acquire()/release() replace the condition variables and the predicate loop entirely. Semaphores are not tied to threads, so acquiring in one thread and releasing in another is exactly the intended producer/consumer hand-off; try_acquire_for gives a bounded wait, and the standard warns that try_acquire can fail spuriously, so a failed try means 'not yet' and never an error. Choose it when the toolchain is C++20 and the lock-free hand-off or the simpler code path matters.",
+      "code_sketch": "template <class T> class Ring {\n  std::vector<T> buf_; std::atomic<std::size_t> head_{0}, tail_{0};\n  std::counting_semaphore<> empty_, full_{0};\n public:\n  explicit Ring(std::size_t cap) : buf_(cap), empty_(cap) {}\n  void push(T v) {\n    empty_.acquire();\n    buf_[tail_.fetch_add(1) % buf_.size()] = std::move(v);\n    full_.release();\n  }\n  /* pop(): full_.acquire(); take and advance head_; empty_.release(); */\n};",
+      "pitfalls": [
+        "try_acquire may fail spuriously by specification; a retry loop must treat that as 'not ready', not as a failure to report.",
+        "The semaphore counts must match the capacity exactly (empty_ = capacity, full_ = 0); an off-by-one silently becomes a data race or a permanent stall.",
+        "An exception or early return between acquire and release leaks a slot forever; guard the critical step so release always runs."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/counting_semaphore"
+      ]
+    }
+  ],
+  "default_variant": "mutex-condvar-queue"
+}

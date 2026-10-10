@@ -1,0 +1,68 @@
+{
+  "pattern": "command-processor",
+  "language": "rust",
+  "idiom_name": "enum/trait-object Command + mpsc::sync_channel + thread::spawn workers",
+  "implementation_notes": "With only the standard library, the repository is `mpsc::sync_channel(n)` - the bounded form, because `channel()` is unbounded and queues without limit - and the executor is one or more `thread::spawn`ed workers whose loop is `while let Ok(cmd) = rx.recv()`; recv returning `Err` *is* the shutdown protocol, since it means every sender was dropped. Commands are either a trait object (`Box<dyn Command + Send>`) or, more idiomatically, a plain enum matched in the worker, which keeps them `Send`, `Clone`-free and cheap. Ownership is why history/undo needs deliberate design: an executed command has moved into the worker, so a log stores a serialisable *description* (serde) plus an inverse rather than the command itself, and shared receiver state lives in an Arc<Mutex<_>>.",
+  "code_sketch": "enum Command { Place(OrderId, u32), Cancel(OrderId) }\nfn worker(rx: Receiver<Command>, repo: Arc<Repo>) {      // executor\n    while let Ok(cmd) = rx.recv() {                      // Err => all senders dropped\n        match cmd {\n            Command::Place(id, qty) => repo.place(id, qty),\n            Command::Cancel(id) => repo.cancel(id),\n        }\n    }\n}\nlet (tx, rx) = mpsc::sync_channel::<Command>(256);       // bounded == backpressure\ntx.send(Command::Place(id, 2)).unwrap();                 // invocation only",
+  "pitfalls": [
+    "`mpsc::channel()` is unbounded: producers never block and an overloaded system grows until the allocator fails - use sync_channel with a capacity.",
+    "Only one consumer can own the Receiver; to fan out to several workers you need a mutex-guarded shared receiver or one channel per worker (or crossbeam/tokio primitives).",
+    "Commands crossing a thread boundary must be `Send`; an enum or Arc-based command is fine, a Box<dyn FnOnce()> holding Rc/&references is not.",
+    "A panicking worker thread is invisible unless the join handle is checked; the processor should catch_unwind or log from inside the loop.",
+    "For replay, the command enum must be serialisable and versioned; an enum that only exists in memory cannot be persisted."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html",
+    "https://doc.rust-lang.org/std/thread/fn.spawn.html",
+    "https://doc.rust-lang.org/book/ch16-02-message-passing.html"
+  ],
+  "support": "manual",
+  "variants": [
+    {
+      "variant_id": "std-mpsc-thread-pool",
+      "name": "std::sync::mpsc + worker threads (trait-object or enum commands)",
+      "paradigm": "oo",
+      "min_standard": "Rust2018",
+      "idiom_name": "enum/trait-object Command + mpsc::sync_channel + thread::spawn workers",
+      "implementation_notes": "With only the standard library, the repository is `mpsc::sync_channel(n)` - the bounded form, because `channel()` is unbounded and queues without limit - and the executor is one or more `thread::spawn`ed workers whose loop is `while let Ok(cmd) = rx.recv()`; recv returning `Err` *is* the shutdown protocol, since it means every sender was dropped. Commands are either a trait object (`Box<dyn Command + Send>`) or, more idiomatically, a plain enum matched in the worker, which keeps them `Send`, `Clone`-free and cheap. Ownership is why history/undo needs deliberate design: an executed command has moved into the worker, so a log stores a serialisable *description* (serde) plus an inverse rather than the command itself, and shared receiver state lives in an Arc<Mutex<_>>.",
+      "code_sketch": "enum Command { Place(OrderId, u32), Cancel(OrderId) }\nfn worker(rx: Receiver<Command>, repo: Arc<Repo>) {      // executor\n    while let Ok(cmd) = rx.recv() {                      // Err => all senders dropped\n        match cmd {\n            Command::Place(id, qty) => repo.place(id, qty),\n            Command::Cancel(id) => repo.cancel(id),\n        }\n    }\n}\nlet (tx, rx) = mpsc::sync_channel::<Command>(256);       // bounded == backpressure\ntx.send(Command::Place(id, 2)).unwrap();                 // invocation only",
+      "pitfalls": [
+        "`mpsc::channel()` is unbounded: producers never block and an overloaded system grows until the allocator fails - use sync_channel with a capacity.",
+        "Only one consumer can own the Receiver; to fan out to several workers you need a mutex-guarded shared receiver or one channel per worker (or crossbeam/tokio primitives).",
+        "Commands crossing a thread boundary must be `Send`; an enum or Arc-based command is fine, a Box<dyn FnOnce()> holding Rc/&references is not.",
+        "A panicking worker thread is invisible unless the join handle is checked; the processor should catch_unwind or log from inside the loop.",
+        "For replay, the command enum must be serialisable and versioned; an enum that only exists in memory cannot be persisted."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html",
+        "https://doc.rust-lang.org/std/thread/fn.spawn.html",
+        "https://doc.rust-lang.org/book/ch16-02-message-passing.html"
+      ]
+    },
+    {
+      "variant_id": "tokio-mpsc-tasks",
+      "name": "tokio::sync::mpsc + spawned tasks (async runtime)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async-await",
+        "tokio"
+      ],
+      "idiom_name": "tokio::sync::mpsc::channel + tokio::spawn worker with select!",
+      "implementation_notes": "On an async runtime the same roles are played by `tokio::sync::mpsc::channel(n)` (bounded; `send().await` suspends the producer when full) and one or more `tokio::spawn`ed tasks draining it, with `tokio::select!` for graceful shutdown and prioritised streams. Commands are async closures or a serde-serialisable enum; per-command results come back through a oneshot channel, which is the async analogue of the `Future` the blocking variant records. Prefer this variant when receivers are I/O-bound and a runtime is already present; prefer std threads when commands are CPU-bound or the runtime dependency is unwanted.",
+      "code_sketch": "let (tx, mut rx) = tokio::sync::mpsc::channel::<Command>(256);   // bounded\ntokio::spawn(async move {                              // executor task\n    while let Some(cmd) = rx.recv().await {\n        match cmd {\n            Command::Place(id, qty) => repo.place(id, qty).await,\n            Command::Cancel(id) => repo.cancel(id).await,\n        }\n    }\n});\ntx.send(Command::Place(id, 2)).await.unwrap();         // suspends when full",
+      "pitfalls": [
+        "Holding a std::sync::MutexGuard across `.await` is a compile error for good reason - use tokio::sync::Mutex or scope the lock so it cannot span an await point.",
+        "spawned tasks detach: a panic inside one is swallowed unless the JoinHandle is awaited or the task is instrumented, so the processor must log failures itself.",
+        "The runtime must be shut down gracefully: dropping the runtime cancels spawned tasks mid-command, leaving state half-updated (drain with the sender dropped plus a JoinSet).",
+        "CPU-heavy commands must be moved off the async worker with spawn_blocking, or they stall the runtime's worker threads."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html",
+        "https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html"
+      ]
+    }
+  ],
+  "default_variant": "std-mpsc-thread-pool",
+  "version": "1.0"
+}

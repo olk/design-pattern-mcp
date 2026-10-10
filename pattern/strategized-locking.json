@@ -1,0 +1,160 @@
+{
+  "category": "concurrency-resilience",
+  "name": "strategized-locking",
+  "aliases": [
+    "pluggable locking strategy"
+  ],
+  "intent": "Parameterize a component's synchronization mechanism as a pluggable locking policy, so that one implementation can run unsynchronized, mutex-protected or reader/writer-protected without editing its critical sections.",
+  "problem": "A reusable component's synchronization mechanism is hard-coded, so the same algorithm is duplicated for every concurrency use-case: one copy for single-threaded hosts that need no locking, another behind a mutex, a third behind a reader/writer lock. Fixes and optimizations then have to be applied to all copies (version skew), and the decision is made by whoever writes the component rather than by the deployment that knows its contention profile.",
+  "context": "Reusable components, frameworks and libraries whose concurrency use-case differs between deployments: single-threaded versus multi-threaded hosts, read-dominated versus write-dominated access, blocking versus coroutine-based callers, or platforms whose synchronization primitives differ. It applies when the synchronization aspect can be named as one policy (or a small family of policies) wrapping the component's critical sections, and when the build (compile-time policy parameter) or the composition root (injected strategy object) can decide which policy is used.",
+  "benefits": [
+    "One implementation serves every concurrency configuration: tuning the synchronization policy no longer means writing and maintaining a component variant per use-case.",
+    "No version skew - enhancements and bug fixes land in a single implementation instead of being replicated across lock-specific copies.",
+    "Lock cost can be matched to the deployment: a no-op strategy removes synchronization completely from single-threaded builds, a reader/writer or optimistic strategy can be supplied where the workload is read-dominated.",
+    "The synchronization policy becomes explicit and reviewable at one composition point instead of being buried in every method implementation.",
+    "New strategies (spin, adaptive, semaphore, striped) are added without modifying the component, satisfying the open/closed principle on the policy axis.",
+    "Substituting instrumented strategies (counting, delaying, deliberately failing) makes lock acquisition observable and lets tests run the component deterministically single-threaded."
+  ],
+  "tradeoffs": [
+    "Obtrusive parameterization: the compile-time form leaks the strategy into the component's type and therefore into every caller's signature; the runtime form replaces that with an indirect dispatch on every critical section and an obligation that the strategy object outlives the component.",
+    "The plug point is untyped with respect to correctness: nothing expresses 'must be re-entrant here' or 'must block under contention', so swapping a recursive mutex for a non-recursive one - or a real lock for a no-op - compiles cleanly and becomes self-deadlock or a data race.",
+    "The pattern is only sound together with Scoped Locking (release on every path) and Thread-Safe Interface (public methods lock once, implementation methods assume the lock is held); applied halfway it produces double acquisition, self-deadlock, or exactly the overhead it was meant to remove.",
+    "Granularity is per component, not per operation: compound operations spanning several components, lock striping and hierarchical locking stay outside its scope, and switching the strategy per call invites inconsistent acquisition orders.",
+    "Extra types, typedefs and configuration plumbing for a decision that may never change - in a component with a single fixed deployment the strategy indirection costs more than a hard-coded lock.",
+    "A wrong strategy is invisible in dynamic languages and hard to spot in static ones: the defect appears as a race or a hang under load rather than as a compile error, and a reader of the critical section cannot see which lock is actually held."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Component (Context)",
+      "responsibility": "Holds the locking strategy - as a type parameter or an injected object - and executes its critical sections under it; per Thread-Safe Interface it locks only at its public boundary and calls unlocked implementation methods internally."
+    },
+    {
+      "role": "Locking Strategy",
+      "responsibility": "Defines the uniform synchronization interface the component uses (acquire/release, lock/unlock, or run-under-exclusion), so the component never names a concrete primitive."
+    },
+    {
+      "role": "Concrete Locking Strategy",
+      "responsibility": "A member of the policy family: thread mutex, recursive mutex, reader/writer lock, semaphore, file lock, optimistic/stamped lock, or the no-op (Null Object) strategy that makes a single-threaded configuration free."
+    },
+    {
+      "role": "Lock Adapter",
+      "responsibility": "Adapts platform or framework primitives to the strategy interface (Wrapper Facade) and, in the polymorphic realization, bridges the strategy hierarchy to a non-polymorphic handle object that a guard can hold by reference."
+    },
+    {
+      "role": "Lock Usage Guard (collaborator, Scoped Locking)",
+      "responsibility": "Acquires the strategy on entry to a critical section and releases it on every exit path including exceptions - the reason a strategy can be swapped without auditing every return statement."
+    },
+    {
+      "role": "Strategy Selection Point",
+      "responsibility": "The typedef, template argument, factory or composition-root wiring that fixes which concrete strategy a deployment gets; the single place where the component's concurrency configuration is reviewed."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Reusable library components - caches, object pools, registries, loggers - shipped to both single-threaded and multi-threaded hosts, where the single-threaded build should pay nothing for synchronization.",
+    "Read-mostly indexes and lookup structures whose deployment wants a reader/writer or optimistic-read strategy instead of an exclusive mutex.",
+    "Middleware and framework components used across different concurrency architectures (thread pool, reactor, proactor, coroutine runtime), needing one implementation with several synchronization policies.",
+    "Portable components whose underlying primitive differs per platform (POSIX, Windows, embedded RTOS), where the adaptation belongs behind a strategy interface rather than inside the algorithm.",
+    "Test and simulation harnesses that substitute instrumented strategies to observe lock ordering, force contention, or run the component deterministically single-threaded.",
+    "ACE (ADAPTIVE Communication Environment) - the framework the pattern was extracted from: ACE_Guard<ACE_LOCK> is a scoped-locking template parameterized on the lock type, whose policy family must supply the ACE locking contract (acquire/tryacquire/release/remove); ACE_Adaptive_Lock defers the concrete lock choice to run time, while ACE's own ACE_Lock reference documents that polymorphic locks cost about 20% overhead in virtual function calls - which is why ACE parameterizes by type instead of using the polymorphic base pervasively.",
+    "POCO C++ Libraries: Poco::NullMutex is documented as an empty mutex implementation that performs no locking at all, intended for policy-driven designs where the mutex type is a template parameter so a deployment switches between thread-safe (Poco::Mutex / Poco::FastMutex) and not thread-safe; components such as Poco's SingletonHolder take their synchronization policy as a template argument.",
+    "Rust lock_api crate (the foundation of parking_lot): Mutex<R, T> and RwLock<R, Data> are generic wrappers over a user-supplied raw lock type implementing RawMutex/RawRwLock, so one component body compiles against a spinlock, a parking lock or any custom backend, and extra capabilities (timeouts, fair unlock, upgradable/downgradable or recursive read locks) surface only when the plugged-in raw lock implements the matching extension trait."
+  ],
+  "avoid_when": [
+    "The component will always run with one fixed synchronization policy: use that lock directly together with a scoped guard - the strategy parameter is ceremony.",
+    "The runtime or framework already supplies the policy (actor systems, message passing, per-request single-threaded execution): use it instead of re-parameterizing locks.",
+    "The real problem is atomicity across components or across several operations: a pluggable primitive does not make a compound operation atomic; design one owner for the state (Monitor Object) or confine it to a thread instead.",
+    "The critical section is on a hot path where even an indirect call per acquisition is too expensive and the policy never varies: hard-code the lock (or use the compile-time form) instead of the runtime form.",
+    "The program is single-threaded and stays single-threaded: code with no synchronization at all is simpler than code whose no-op strategy merely documents that fact."
+  ],
+  "language_files": {
+    "generic": "strategized-locking.generic.json",
+    "c": "strategized-locking.c.json",
+    "cplusplus": "strategized-locking.cplusplus.json",
+    "csharp": "strategized-locking.csharp.json",
+    "go": "strategized-locking.go.json",
+    "java": "strategized-locking.java.json",
+    "javascript": "strategized-locking.javascript.json",
+    "kotlin": "strategized-locking.kotlin.json",
+    "python": "strategized-locking.python.json",
+    "ruby": "strategized-locking.ruby.json",
+    "rust": "strategized-locking.rust.json",
+    "scala": "strategized-locking.scala.json",
+    "swift": "strategized-locking.swift.json",
+    "typescript": "strategized-locking.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "strategy",
+    "bridge",
+    "scoped-locking",
+    "thread-safe-interface",
+    "double-checked-locking",
+    "monitor-object",
+    "policy-based-design",
+    "null-object"
+  ],
+  "anti_patterns": [
+    "Shipping a no-op strategy as the default: a published API whose default configuration is lock-free races the moment it is reused in a threaded host.",
+    "Locked interface methods calling locked implementation methods (the Thread-Safe Interface violation): with a recursive strategy the locking overhead silently doubles, with a non-recursive one the component self-deadlocks.",
+    "'Configurable locking' with exactly one strategy - an abstract lock factory, a strategy parameter and a guard that always resolve to the same type, adding indirection without variation.",
+    "Choosing a recursive mutex to make intra-component calls work instead of splitting interface and implementation methods: re-entrancy papers over a call graph that would deadlock under any non-recursive policy.",
+    "Switching the strategy per operation on one component: two strategies guarding the same state provide no mutual exclusion at all and invite lock-order inversions."
+  ],
+  "design_principles": [
+    "Separation of concerns: synchronization policy is separated from the component's computation, exactly as the parent Strategy pattern separates an algorithm from its context.",
+    "Open/closed principle: new synchronization mechanisms arrive as new strategies, without modifying the component or its critical sections.",
+    "Dependency inversion: the component depends on a lock abstraction (interface, type parameter or protocol), never on a concrete OS primitive - the Adapter/Wrapper Facade supplies the conformance.",
+    "Composition over inheritance: the runtime form composes a strategy object (Bridge) instead of subclassing the component once per concurrency use-case.",
+    "Null Object: the no-op strategy is a first-class member of the policy family, so the single-threaded configuration needs no conditional code inside the component.",
+    "Single responsibility per participant: the component computes, the strategy synchronizes, the guard releases."
+  ],
+  "best_practices": [
+    "Decide the strategy at the composition root (typedef, template argument, constructor injection) and keep the choice out of the component's methods; document which policy a production deployment uses.",
+    "Pair the pattern with Scoped Locking and with the Thread-Safe Interface split (public methods lock once, private _i methods assume the lock is held); a component designed for a non-recursive strategy is safe with every recursive one, never the reverse.",
+    "Treat a no-op strategy as a deliberate configuration for provably single-threaded hosts, never as the default of a reusable API.",
+    "Keep the strategy's lifetime strictly longer than every component that references it, and use one strategy instance per protected state - two strategies over the same state mean no exclusion.",
+    "Test with at least two strategies (a real one and an instrumented or no-op one), so that re-entrancy and release assumptions surface before production.",
+    "Measure before and after: if the policy never varies, replace the indirection with a concrete lock; if it does vary, keep the acquisition cost of the runtime form in the profile."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (2000) - Strategized Locking, Synchronization Patterns chapter; documented there as a specialization of the Strategy pattern.",
+    "Schmidt, Strategized Locking, Thread-safe Interface, and Scoped Locking: Patterns and Idioms for Simplifying Multi-threaded C++ Components, C++ Report 11(9), 1999.",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/sync-patterns.html",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/pattern-abstracts.html",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/locking-patterns.pdf",
+    "https://www.dre.vanderbilt.edu/~schmidt/patterns-ace.html",
+    "https://www.dre.vanderbilt.edu/Doxygen/7.0.11/html/libace-doc/a05902.html",
+    "https://www.dre.vanderbilt.edu/Doxygen/5.5.9/html/ace/classACE__Adaptive__Lock.html",
+    "http://www.dre.vanderbilt.edu/Doxygen/6.1.1/html/libace-doc/a00326.html",
+    "https://docs.pocoproject.org/current/Poco.NullMutex.html",
+    "https://docs.rs/lock_api/latest/lock_api/",
+    "https://stackoverflow.com/questions/31619195/why-no-inheritance-relations-between-the-c-mutex-mutexes"
+  ]
+}

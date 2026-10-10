@@ -1,0 +1,89 @@
+{
+  "pattern": "async-method-invocation",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "ExecutorService.submit + Future.get",
+  "implementation_notes": "The JDK's original realization: ExecutorService.submit(Callable<T>) starts the call on the pool and returns Future<T> at once; get() collects the result - blocking or with a timeout - and rethrows the callable's failure wrapped in ExecutionException, cancel(true) marks the Future cancelled and requests interruption but cannot stop code that ignores interruption, and isDone/state expose completion. FutureTask is the same handle written by hand (a Runnable plus a result slot) and is what an ExecutorService executes internally, which is why the pattern rarely has to be rebuilt: the standard library already owns the executor, the handle and the memory-visibility edge between the worker and the collector (actions before the computation happen-before the actions following get()). Keep this shape for plain one-shot calls and for code that must run on Java 5 or 6; modern code that needs chaining or notification uses the CompletableFuture or virtual-thread variant instead.",
+  "code_sketch": "ExecutorService pool = Executors.newFixedThreadPool(8);\nFuture<Report> pending = pool.submit(() -> fetchReport(id));   // returns now\n// caller continues ...\ntry {\n    Report r = pending.get(5, TimeUnit.SECONDS);   // collect later\n} catch (ExecutionException e) {\n    Throwable cause = e.getCause();                // the real failure\n}",
+  "pitfalls": [
+    "Future.get wraps any failure in ExecutionException; reporting the wrapper instead of the cause loses the actual error.",
+    "A Future whose value is never fetched hides the task's exception completely - every submitted task needs an owner.",
+    "Blocking inside a pool thread on a task the same bounded pool must run deadlocks it; keep .get() calls out of the pool or size the pool for the blocking factor.",
+    "cancel(true) marks the Future cancelled and requests interruption; the task must react to interruption (check Thread.interrupted()/InterruptedException), or the underlying work can keep running after the caller believes it was cancelled."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Future.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "executor-future",
+      "name": "ExecutorService.submit -> Future<T> (FutureTask)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "requires_features": [
+        "executors"
+      ],
+      "idiom_name": "ExecutorService.submit + Future.get",
+      "implementation_notes": "The JDK's original realization: ExecutorService.submit(Callable<T>) starts the call on the pool and returns Future<T> at once; get() collects the result - blocking or with a timeout - and rethrows the callable's failure wrapped in ExecutionException, cancel(true) marks the Future cancelled and requests interruption but cannot stop code that ignores interruption, and isDone/state expose completion. FutureTask is the same handle written by hand (a Runnable plus a result slot) and is what an ExecutorService executes internally, which is why the pattern rarely has to be rebuilt: the standard library already owns the executor, the handle and the memory-visibility edge between the worker and the collector (actions before the computation happen-before the actions following get()). Keep this shape for plain one-shot calls and for code that must run on Java 5 or 6; modern code that needs chaining or notification uses the CompletableFuture or virtual-thread variant instead.",
+      "code_sketch": "ExecutorService pool = Executors.newFixedThreadPool(8);\nFuture<Report> pending = pool.submit(() -> fetchReport(id));   // returns now\n// caller continues ...\ntry {\n    Report r = pending.get(5, TimeUnit.SECONDS);   // collect later\n} catch (ExecutionException e) {\n    Throwable cause = e.getCause();                // the real failure\n}",
+      "pitfalls": [
+        "Future.get wraps any failure in ExecutionException; reporting the wrapper instead of the cause loses the actual error.",
+        "A Future whose value is never fetched hides the task's exception completely - every submitted task needs an owner.",
+        "Blocking inside a pool thread on a task the same bounded pool must run deadlocks it; keep .get() calls out of the pool or size the pool for the blocking factor.",
+        "cancel(true) marks the Future cancelled and requests interruption; the task must react to interruption (check Thread.interrupted()/InterruptedException), or the underlying work can keep running after the caller believes it was cancelled."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Future.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+      ]
+    },
+    {
+      "variant_id": "completable-future",
+      "name": "CompletableFuture: composition instead of blocking collection",
+      "paradigm": "functional",
+      "min_standard": "Java8",
+      "requires_features": [
+        "completable-future",
+        "lambdas"
+      ],
+      "idiom_name": "CompletableFuture.supplyAsync + thenApply/allOf",
+      "implementation_notes": "Java 8 replaces the blocking collector with composition: CompletableFuture.supplyAsync/runAsync start the call and return a handle whose thenApply/thenCompose/thenAccept register continuations instead of waiting, exceptionally/handle are the explicit failure paths, and allOf/anyOf are the collectors for several outstanding calls. This is the modern default for chains that used to be written with the pattern's callback object: the callback is a function value, the ordering is declarative, and no thread is parked while the chain is assembled. It also composes with blocking internals: an async call that wraps a blocking I/O operation keeps the caller free, but the executor that runs it must be sized for blocking, and the failure of the wrapped operation arrives as a CompletionException that must be unwrapped.",
+      "code_sketch": "CompletableFuture<Report> pending =\n    CompletableFuture.supplyAsync(() -> fetchReport(id), pool);   // returns now\nCompletableFuture<String> rendered = pending\n        .thenApply(Report::render)                     // continuation, not a blocking get\n        .exceptionally(ex -> \"report unavailable\");     // explicit failure path\n// several calls: CompletableFuture.allOf(a, b).thenRun(...)",
+      "pitfalls": [
+        "Composition is only asynchronous if the executor suffices: thenApplyAsync without an explicit Executor uses the common pool, so blocking work there can starve other stages; non-async thenApply may run on the completing thread, so use a dedicated executor for blocking or context-sensitive work.",
+        "CompletionException (and its cause) is the failure channel of composed stages; a bare exceptionally that swallows it restores the silent-failure anti-pattern.",
+        "A handle that is never joined or composed still hides its exception: CompletableFuture does not report unobserved failures.",
+        "thenApply on the common pool can execute on the completing thread: continuations that assume any particular thread (UI, request context, thread-locals) break silently."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Future.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "Virtual-thread-per-task: keep the synchronous call shape",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor + future.get()",
+      "implementation_notes": "Java 21 makes the asynchronous twin unnecessary in most server code: Executors.newVirtualThreadPerTaskExecutor() (or Thread.ofVirtual()) runs each task on a virtual thread, the runtime unmounts it from its carrier at blocking operations, and the caller collects the result with future.get() or a plain blocking call - the thread-per-request style stays, at the scalability of the asynchronous style. The JEP is explicit that virtual threads exist to provide scale, not speed, that they must never be pooled, and that pinning (blocking inside synchronized or native frames) captures the carrier and destroys the scalability. Use this variant when the deferred work is I/O-bound, when readability matters more than the last microsecond of overhead, or when migrating an existing blocking API; keep the CompletableFuture shape where continuations are genuinely asynchronous and no thread should exist per request.",
+      "code_sketch": "try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {\n    Future<Report> a = executor.submit(() -> fetchReport(id));    // one virtual thread\n    Future<Invoice> b = executor.submit(() -> fetchInvoice(id));\n    var summary = summarize(a.get(), b.get());   // blocking code, thousands in parallel\n}   // close() waits for completion - structured ownership without a manual join",
+      "pitfalls": [
+        "Virtual threads are never pooled: wrapping them in a fixed pool or a semaphore of threads reintroduces the limit the construct removed - limit with a Semaphore or an admission queue instead.",
+        "Pinning: blocking inside synchronized or a native/foreign call captures the carrier; migrate hot locks to ReentrantLock before moving that code onto virtual threads.",
+        "Thread-locals used to cache expensive per-thread resources become per-task allocations when a thread is created per task, so caches must move out of thread-locals.",
+        "A virtual thread never preempts CPU-bound work: long computations still hold their carrier and gain nothing from the construct."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/444",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Future.html"
+      ]
+    }
+  ],
+  "default_variant": "executor-future",
+  "version": "1.1"
+}

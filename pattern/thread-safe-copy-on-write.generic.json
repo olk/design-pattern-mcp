@@ -1,0 +1,18 @@
+{
+  "pattern": "thread-safe-copy-on-write",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "protected sharing state (atomic count or published pointer) + clone-and-republish on write",
+  "implementation_notes": "Language-neutral form: keep the shared payload behind one published reference and give every reader a cheap way to hold that reference for the duration of its read - an atomically counted handle, or a load of an atomically published pointer. Copies share the payload; the first mutation after sharing clones it, applies the change and publishes the new payload in a single atomic step (a store with release semantics, or a compare-and-swap retry loop), so a reader sees either the old or the new version and never a torn one. Serialise writers around read-modify-write (mutex or CAS loop), because publication is atomic but the update is not, and decide explicitly when a replaced payload may be freed: the last owning reference drops it, an epoch/grace period passes, or the collector collects it. Never hand out a mutation path into a published payload.",
+  "code_sketch": "published = atomic_ref(body)            # readers load once, no lock\n\ndef read():\n    snapshot = published.load()         # atomic acquire\n    return snapshot.answer()            # the reader holds it for its whole read\n\ndef update(change):\n    with write_lock:                    # writers serialise\n        next_body = published.load().clone()   # copy-on-write\n        change(next_body)\n        published.store(next_body)      # single atomic publish",
+  "pitfalls": [
+    "Protecting the reference count but not the published pointer: a plain pointer read that races with a writer's swap is undefined behaviour even when the count is atomic.",
+    "Forgetting to serialise writers: two clone-and-publish writers lose one of the two updates, because publication is atomic but read-modify-write is not.",
+    "Treating a shared payload as mutable by accident: any interior reference or shallow copy leaked out of the handle voids the copy-on-write barrier for every reader.",
+    "Wrong move: making the count atomic and stopping there -> on many cores every acquire and release is an atomic read-modify-write on one cache line, the line ping-pongs between cores, and read throughput collapses -> load the snapshot once into a local handle for the whole read, or move to an RCU-style protocol where the read path performs no shared write at all.",
+    "Wrong move: caching a long-lived handle - a retained iterator, a listener field, a global - to avoid reloading -> that one pin keeps every generation it ever touched reachable, so memory grows with the number of updates instead of the number of live readers -> scope the snapshot local to the logical read and let the last owning reference (or the grace period) free replaced bodies.",
+    "Wrong move: publishing the new body with a plain store because pointer writes are 'atomic anyway' -> a reader can load the new pointer before the new body's contents are visible to its core and read a half-initialised snapshot -> publish with release ordering (rcu_assign_pointer, store with Release, the language's atomic reference type) so the body's writes happen-before the pointer becomes visible."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

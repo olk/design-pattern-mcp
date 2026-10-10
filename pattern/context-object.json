@@ -1,0 +1,181 @@
+{
+  "category": "interaction-boundary",
+  "name": "context-object",
+  "aliases": [
+    "request context",
+    "ambient context"
+  ],
+  "intent": "Carry the per-request state that many components in a flow need inside one protocol-independent object, so the state travels with the request instead of being threaded through every signature or re-derived inside each layer.",
+  "problem": "The same handful of per-request facts - authenticated user, tenant, locale, correlation id, transaction handle, negotiated media type - are needed by many components between the entry point and the data store, but the transport only exposes them in protocol-specific form (HttpServletRequest, JMS Message, gRPC ServerCall, socket buffers). Passing them as ordinary parameters ripples through every intermediate signature and still couples each layer to the transport type, while keeping a separate copy per layer scatters the state, duplicates the lookup logic and forces each layer to synchronise access to it.",
+  "context": "Request-oriented software with a layered or pipelined flow: web front controllers, filter and interceptor chains, message endpoints, RPC servers, batch jobs. It applies when several components along one request need overlapping state, when transport types must not leak into domain code, and when the state has a clearly bounded lifetime (one request, one message, one unit of work). The parameter-free (ambient) form additionally needs a runtime that can bind state to a request scope: thread-local storage, an async-local store, a coroutine/fiber context, a request-scoped DI scope, or structured concurrency ScopedValue/ContextVar.",
+  "benefits": [
+    "Protocol independence: the context exposes application-typed values, so layers that consume it never import servlet, messaging or socket types (the Core J2EE motivation).",
+    "Stable signatures: a new piece of per-request data is added to the context in one place instead of being threaded through every method between producer and consumer.",
+    "One home for cross-cutting request data - identity, tenant, locale, correlation/transaction ids - instead of re-deriving it per layer or reading it from thread-locals scattered across the code base.",
+    "Reuse across tiers: presentation, domain and persistence code all consume the same carrier, without each one knowing how or where it was populated.",
+    "Eliminates per-layer per-request state and the locking that guarded it: the context travels with the request or lives in the request scope, so layers need no shared maps keyed by request (the PLoP'05 motivation).",
+    "Testability: a context can be constructed directly in a unit test and injected, which is far easier than reproducing a transport request or a partially populated per-layer manager.",
+    "Observability integration: trace IDs, span contexts, and metric labels stored in the context flow automatically into every log line and span without explicit parameter threading, making end-to-end traces much easier to assemble."
+  ],
+  "tradeoffs": [
+    "Hidden coupling: once the context is ambient, every component can read (and often write) it, so the real dependencies of a method disappear from its signature - the coupling the pattern removes from parameters reappears as invisible coupling to a shared bag.",
+    "Lifetime discipline is load-bearing: a context bound to a pooled thread, an async-local scope or a cached object outlives the request unless it is reset, and the failure mode is one request reading another request's (or another tenant's) data.",
+    "Bloat: the context tends to become the place where 'anything anyone might need' lands, and the PLoP'05 paper records interface bloat as the pattern's own liability as functionality grows.",
+    "Per-request cost: allocation or pool bookkeeping for the carrier, plus a scope lookup (thread-local, async-local, coroutine context) on each read, and the population logic itself has to be written and kept correct at the boundary.",
+    "Testability inverts for the ambient forms: tests must enter and leave the scope around the code under test, which is more brittle than handing a fake context to a method that takes one.",
+    "Propagation is runtime-specific: values follow threads, tasks or fibers only as far as the runtime copies them, so detached tasks, thread pools and raw executors silently observe missing or stale state.",
+    "Cancellation entanglement: when the context carries a CancellationToken alongside data values, conflating request cancellation with value propagation can cause premature or surprising cancellations in nested components that do not expect the token to be the same as the outer request's token."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Context Object",
+      "responsibility": "Holds the per-request state behind typed accessors/mutators, exposing application concepts (user, tenant, locale, correlation id) rather than protocol objects. In modern runtimes may be implemented as an immutable value record, a mutable struct, or a class with typed fields."
+    },
+    {
+      "role": "Context Factory",
+      "responsibility": "Creates, populates and (optionally) recycles the context for each request, so creation policy lives in one place and the rest of the flow only reads it. In typed languages the factory is the only place that casts protocol objects into application types."
+    },
+    {
+      "role": "Request Scope Binding",
+      "responsibility": "Makes the context reachable without a parameter - the explicit reference handed down the call chain, or the runtime binding (thread-local, async-local, coroutine context element, request-scoped DI scope, ScopedValue/task-local binding) and its reset at the end. Modern runtimes offer structured bindings (ScopedValue.where().run in Java Loom, ContextVar in Python, AsyncLocal in .NET) that automatically reset when the scope exits."
+    },
+    {
+      "role": "Contextualizable Component",
+      "responsibility": "Any layer, handler or service in the flow that reads or enriches the part of the context it owns; it depends on the context abstraction, never on the transport. Well-designed components declare which context fields they read, making dependencies visible even when the context is ambient."
+    },
+    {
+      "role": "Originator",
+      "responsibility": "The entry point (front controller, filter, message listener, job runner, gRPC interceptor) that obtains transport data, delegates context creation to the factory and establishes the binding. Responsible for ensuring the binding is cleaned up before the request scope ends."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Web request pipelines: a front controller or filter chain authenticates, resolves the tenant and opens the transaction, then puts it all in one context object that controllers, views and repositories read.",
+    "Multi-tenant SaaS routing: the tenant is resolved once at the edge and read by the persistence layer to pick the connection or shard, without a tenant parameter on every method.",
+    "Distributed tracing and logging: request, trace and span IDs travel in the context so any component can log or propagate them without being instrumented with extra parameters.",
+    "Enterprise layering behind a facade: security and transaction information is populated at the boundary and consumed by domain services that must not depend on servlet, JMS or ORB types.",
+    "Batch and job processing: each unit of work gets its own context carrying input parameters, credentials and progress state, recycled between units to keep allocation off the critical path.",
+    "Message endpoints and middleware: a consumer populates a context from the message headers so the handler chain downstream contains no transport types.",
+    "Feature flag evaluation: the resolved flag set (derived from user, tenant, percentage rollout) is placed in the context so every component downstream sees the same flags without each service needing a flag client or the evaluation context re-built.",
+    "Rate limiting and quota enforcement: the resolved client identity and tier are placed in the context by the edge layer; any service along the chain can check the quota without a shared in-memory counter or a round-trip to a quota service.",
+    "Request-scoped caching: cache keys derived from the request context (user id, tenant, locale) enable a per-request cache that automatically expires when the request ends, avoiding cache stampedes and cross-request pollution.",
+    "Observability metric labels: latency percentiles, error counts and custom business metrics can tag by tenant, user role or feature flag variant automatically because those labels live in the context rather than needing to be threaded through every call site.",
+    "Rails request context: an ActiveSupport::CurrentAttributes subclass (Current.account, Current.request_id) is populated in a before_action and read by models, jobs and mailers, then reset automatically around every request.",
+    "Laravel request and job context: middleware calls Context::add with the request or trace id, the values are automatically appended to every log entry and travel with dispatched queued jobs through context dehydration/hydration.",
+    "ASP.NET Core middleware pipelines: middleware stores resolved state in HttpContext.Items so later middleware and controllers handling the same request read it without shared services or extra parameters."
+  ],
+  "avoid_when": [
+    "Only one or two values cross the boundary - pass them (or a Parameter Object) explicitly; the indirection and hidden coupling cost more than the signature noise.",
+    "The state belongs to a single component - a local variable, a struct field or an injected collaborator is simpler, testable and visible.",
+    "The pipeline is stateless and functional - ambient mutable state fights referential transparency; keep threading the data or parameterise the flow (Reader-style) instead.",
+    "The language convention mandates explicit threading (Go's ctx-first-argument rule) - follow it; hiding such a context in a struct or a global is the documented anti-pattern.",
+    "The context must survive a process boundary - use wire contracts (correlation-id header, message headers) instead of an in-process object.",
+    "The platform already provides a sufficient request-scoped carrier (ASP.NET Core HttpContext.Items, NestJS @Scope.REQUEST, Ktor call.attributes, Python's contextvars) - use it; a second parallel carrier only creates ambiguity about which context to read from.",
+    "The team cannot discipline the interface from growing - if there is no clear ownership model or API contract for what goes into the context, it will become a God object faster than the pattern's bloat liability predicts."
+  ],
+  "language_files": {
+    "generic": "context-object.generic.json",
+    "c": "context-object.c.json",
+    "cplusplus": "context-object.cplusplus.json",
+    "csharp": "context-object.csharp.json",
+    "go": "context-object.go.json",
+    "java": "context-object.java.json",
+    "javascript": "context-object.javascript.json",
+    "kotlin": "context-object.kotlin.json",
+    "python": "context-object.python.json",
+    "ruby": "context-object.ruby.json",
+    "rust": "context-object.rust.json",
+    "scala": "context-object.scala.json",
+    "swift": "context-object.swift.json",
+    "typescript": "context-object.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "plop"
+  ],
+  "related_patterns": [
+    "front-controller",
+    "intercepting-filter",
+    "application-controller",
+    "data-transfer-object",
+    "parameter-object",
+    "thread-local-storage",
+    "security-context",
+    "correlation-identifier",
+    "service-locator"
+  ],
+  "anti_patterns": [
+    "God context: the carrier grows into a kitchen-sink bag holding config, services and non-request state, so no one can tell what any component actually needs.",
+    "Static or shared mutable context instance reused across requests (a static field, a singleton, a module-level object), which turns the request carrier into a global variable.",
+    "Binding the context to a pooled thread or async scope and never resetting it, so the next request inherits the previous user, tenant or transaction.",
+    "Using the context as a service locator - pulling collaborators out of it instead of injecting dependencies - which hides wiring and defeats the DI container.",
+    "Silent parameter smuggling: an ambient context makes a component's real inputs invisible, so callers cannot tell what must be populated before calling it and failures surface as nulls deep in the flow.",
+    "Context object as a cache: storing expensive-to-compute values in the context to avoid recomputation couples the context's lifetime to computation correctness and easily returns stale data if the computation assumptions change mid-request."
+  ],
+  "design_principles": [
+    "Information hiding: the transport and its protocol types stay behind the context's accessors.",
+    "Separation of concerns: creating/populating the state (factory, boundary) is separate from consuming it (layers), and both are separate from the behaviour that uses the values.",
+    "Single responsibility: the context holds state, the factory owns its lifecycle, and each layer owns only the attributes it writes.",
+    "Dependency inversion: components depend on the context abstraction, not on the request implementation (servlet request, message, connection).",
+    "DRY: cross-cutting per-request data is resolved once at the boundary instead of re-derived in every layer.",
+    "Fail fast: an expected attribute that was never populated should raise immediately rather than degrade into a null that surfaces far away.",
+    "Interface segregation for the context: prefer many small typed getters (user, tenant, traceId) over one monolithic get(key) returning an untyped object, so that a missing key surfaces as a compile-time or immediate runtime error rather than a silent null."
+  ],
+  "best_practices": [
+    "Keep the context protocol-independent: expose application-typed accessors and never the servlet request, message or socket type.",
+    "Scope it tightly: create at the entry point, bind for the dynamic extent of the request, and destroy/reset on exit (ScopedValue.where(...).run, @TaskLocal.withValue, ContextVar.set/reset, ALS.run, thread-local set/unset).",
+    "Prefer write-once/immutable contexts, or partition into a read-only section (user, tenant, trace id) and a mutable section (transaction handle, nested span) with clear ownership; ambient mutable bags are where leak and race bugs live.",
+    "Type the keys (ContextVar, AttributeKey, ScopedValue, AsyncLocal<T>, an unexported Go key type) instead of string keys, so lookups are checked at compile time and collisions impossible.",
+    "Partition by role (or use several small contexts) rather than growing one wide context that every layer depends on. A separate TraceContext, TenantContext and AuthContext each with a clear owner scales better than a catch-all RequestContext.",
+    "Document which attributes each layer may read and write, and fail fast when a required attribute is unbound. An attribute access that throws a clear MissingContextFieldError close to the production site is far better than a null propagating to persistence.",
+    "Never let the context escape the request: copy the values you need before spawning background work. When you must propagate context to detached threads or external tasks, cherry-pick the specific values (trace ID, tenant) rather than the whole object, so that a long-running background job cannot observe stale or wrong-tenant data.",
+    "Propagate cancellation explicitly rather than through the context value field: use the platform's native cancellation mechanism (CancellationToken, Context.withCancel, signal) alongside the context object, not instead of it.",
+    "Validate and sanitise every field as it enters the context factory. The context is a trust boundary: data from the wire (headers, cookies, JWT claims) placed into an ambient context becomes trusted by every downstream component, so injection or tampering at the boundary must be caught there.",
+    "In async or concurrent code, prefer ScopedValue/ContextVar/ALS semantics where the binding is copied to child tasks at creation time rather than shared by reference, eliminating the risk of a parent scope being cleared while a child is still running."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Alur, Crupi & Malks, Core J2EE Patterns: Best Practices and Design Strategies, 2nd ed. (2003) - Context Object (Presentation Tier): \"Use a Context Object to encapsulate state in a protocol-independent way to be shared throughout your application.\"",
+    "Krishna, Schmidt & Stal, Context Object: A Design Pattern for Efficient Information Sharing across Multiple System Layers (PLoP 2005) - participants Layer1..LayerN, ContextObject and ContextObjectFactory; benefits (no per-layer per-request state, no locking, recyclable contexts) and liabilities (bloat, allocation cost).",
+    "http://corej2eepatterns.com/ContextObject.htm",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/Context-Object-Pattern.pdf",
+    "https://java-design-patterns.com/patterns/context-object",
+    "Kelly, Encapsulate Context Pattern, EuroPLoP 2003 (reference [EncapsulateContext:03] in the PLoP 2005 paper) - the sibling form that keeps existing interfaces stable by passing an opaque context container.",
+    "Go standard library context package design rationale (pkg.go.dev/context) - demonstrates the explicit-passing context idiom that the Context Object pattern's Go-specific variant follows: request-scoped values and cancellation are carried together, always passed as the first argument rather than stored in a global or struct field.",
+    "Python PEP 567 - Context Variables (2018): introduces contextvars.ContextVar, a scoped-value semantics for Python coroutines that solves the same problem as AsyncLocal in .NET but with copy-on-write semantics for child coroutines, avoiding the stale-reference problem in async code.",
+    ".NET AsyncLocal<T> documentation (Microsoft Docs): the .NET implementation of async-local storage, which propagates a copy of the value to each async continuation, and the documented pitfall that the value persists on pooled thread-pool threads if not reset, leading to cross-request data leakage in ASP.NET Core applications.",
+    "Java Project Loom ScopedValue JEP 446 (2023): introduces ScopedValue.where().run() which binds a value for the lexical extent of a block, automatically reverting when the block exits. This is the modern structured-concurrency-safe form of thread-local-like request-scoped storage that eliminates the pooled-thread leakage problem.",
+    "W3C Trace Context Specification (2022): standardises the traceparent and tracestate headers that carry distributed trace and span IDs, providing the wire format that a Context Object's trace ID field is typically populated from at the edge.",
+    "c2.com Wiki, ContextObjectsAreEvil: early community discussion cataloguing the risks of context objects growing into a horizontal dependency layer, and the observation that the coupling moved (from method signatures to invisible shared state) is still coupling.",
+    "ActiveSupport::CurrentAttributes API documentation (Rails): the canonical production implementation of the ambient Context Object - a thread-isolated per-request singleton with declared attributes, automatic reset around each request, and explicit official guidance to keep only a few global per-request attributes to avoid coupling.",
+    "Laravel Context documentation (laravel.com/docs/12.x/context): a framework-provided request context populated in middleware, automatically attached to log metadata, and dehydrated/hydrated with queued jobs - showing the pattern extended across process boundaries.",
+    "Microsoft, 'Use HttpContext in ASP.NET Core' (learn.microsoft.com): HttpContext.Items as the built-in per-request key/value carrier shared between middleware and controllers, with collision-resistant key guidance.",
+    "Farley, 'The Place for Ambient Context' (spencerfarley.com, 2021): criticism of ambient context overuse - how a universal ambient carrier couples every service to the same state and makes lower-level components non-self-sufficient; recommends confining ambient context to top-level flows."
+  ],
+  "related_patterns_notes": {
+    "async-local-storage": "async-local-storage",
+    "scoped-value": "scoped-value",
+    "reader-writer-pattern": "reader-writer-pattern",
+    "delegation-pattern": "delegation-pattern"
+  }
+}

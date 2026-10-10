@@ -1,0 +1,60 @@
+{
+  "pattern": "active-object",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "Channel<T> + single-reader consumer task + TaskCompletionSource",
+  "implementation_notes": "The BCL supplies the structure: Channel.CreateBounded<T>(capacity) is the activation queue with back-pressure, one Task running a read loop is the scheduler, and TaskCompletionSource<T> returned by the proxy is the future. Each method call becomes a command (a Func<Task> or a request object); since only the consumer loop touches the servant, no locks are needed. Handle a false TryWrite (or await WriteAsync) by completing the returned task exceptionally, and catch servant exceptions so one request cannot terminate the consumer loop. Use the bounded form by default on .NET Core 3.0+ / .NET 5 and later, and remember that the channel's single-reader guarantee is only an optimization hint unless you actually run one consumer.",
+  "code_sketch": "sealed class ActiveStore {\n    readonly Channel<Func<Task>> _q = Channel.CreateBounded<Func<Task>>(1024);\n    public ActiveStore() => _ = Task.Run(async () => {\n        await foreach (var work in _q.Reader.ReadAllAsync()) await work();  // scheduler\n    });\n    public Task PutAsync(Message m) {\n        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);\n        if (!_q.Writer.TryWrite(() => {\n            try { servant.Put(m); tcs.SetResult(true); }\n            catch (Exception ex) { tcs.SetException(ex); }\n            return Task.CompletedTask;\n        })) {\n            tcs.SetException(new InvalidOperationException());\n        }\n        return tcs.Task;                                   // the future\n    }\n}",
+  "pitfalls": [
+    "Without RunContinuationsAsynchronously the awaiting continuation can resume on the scheduler loop and re-enter the object.",
+    "Completing the writer is the shutdown signal: without it ReadAllAsync never ends, the consumer task leaks and pending writers hang.",
+    "TryWrite hides back-pressure only if its false result is ignored - a full bounded channel otherwise leaves the caller's Future unresolved; complete it exceptionally or await WriteAsync when overload must block the producer."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel-1",
+    "https://learn.microsoft.com/en-us/dotnet/core/extensions/channels",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1"
+  ],
+  "variants": [
+    {
+      "variant_id": "channel-consumer-loop",
+      "name": "System.Threading.Channels consumer loop",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "idiom_name": "Channel<T> + single-reader consumer task + TaskCompletionSource",
+      "implementation_notes": "The BCL supplies the structure: Channel.CreateBounded<T>(capacity) is the activation queue with back-pressure, one Task running a read loop is the scheduler, and TaskCompletionSource<T> returned by the proxy is the future. Each method call becomes a command (a Func<Task> or a request object); since only the consumer loop touches the servant, no locks are needed. Handle a false TryWrite (or await WriteAsync) by completing the returned task exceptionally, and catch servant exceptions so one request cannot terminate the consumer loop. Use the bounded form by default on .NET Core 3.0+ / .NET 5 and later, and remember that the channel's single-reader guarantee is only an optimization hint unless you actually run one consumer.",
+      "code_sketch": "sealed class ActiveStore {\n    readonly Channel<Func<Task>> _q = Channel.CreateBounded<Func<Task>>(1024);\n    public ActiveStore() => _ = Task.Run(async () => {\n        await foreach (var work in _q.Reader.ReadAllAsync()) await work();  // scheduler\n    });\n    public Task PutAsync(Message m) {\n        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);\n        if (!_q.Writer.TryWrite(() => {\n            try { servant.Put(m); tcs.SetResult(true); }\n            catch (Exception ex) { tcs.SetException(ex); }\n            return Task.CompletedTask;\n        })) {\n            tcs.SetException(new InvalidOperationException());\n        }\n        return tcs.Task;                                   // the future\n    }\n}",
+      "pitfalls": [
+        "Without RunContinuationsAsynchronously the awaiting continuation can resume on the scheduler loop and re-enter the object.",
+        "Completing the writer is the shutdown signal: without it ReadAllAsync never ends, the consumer task leaks and pending writers hang.",
+        "TryWrite hides back-pressure only if its false result is ignored - a full bounded channel otherwise leaves the caller's Future unresolved; complete it exceptionally or await WriteAsync when overload must block the producer."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel-1",
+        "https://learn.microsoft.com/en-us/dotnet/core/extensions/channels",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1"
+      ]
+    },
+    {
+      "variant_id": "tpl-dataflow-actionblock",
+      "name": "TPL Dataflow ActionBlock with degree 1",
+      "paradigm": "concurrent",
+      "min_standard": "NET4.5",
+      "idiom_name": "ActionBlock<T> with MaxDegreeOfParallelism = 1",
+      "implementation_notes": "An ActionBlock<T> configured with MaxDegreeOfParallelism = 1 and BoundedCapacity is an off-the-shelf activation queue plus scheduler: SendAsync is the proxy's call and the returned Task completes when the item has been processed, so no consumer loop is written at all and the servant runs one message at a time without locks. Prefer this form when the application already composes dataflow blocks; otherwise the Channel form is lighter. The System.Threading.Tasks.Dataflow namespace describes the model as actor-based in-process message passing.",
+      "code_sketch": "var block = new ActionBlock<Message>(m => servant.Put(m),\n    new ExecutionDataflowBlockOptions {\n        MaxDegreeOfParallelism = 1,      // serialize: one message at a time\n        BoundedCapacity = 1024           // back-pressure instead of growth\n    });\nawait block.SendAsync(msg);              // completes when processed\n// shutdown: block.Complete(); await block.Completion;",
+      "pitfalls": [
+        "Leaving MaxDegreeOfParallelism unbounded makes the servant concurrent and reintroduces the data races the pattern removes.",
+        "SendAsync awaits capacity only if the returned task is awaited; a producer that ignores it still grows memory.",
+        "Without Complete() plus awaiting Completion at shutdown, queued items are abandoned when the process exits."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/how-to-specify-the-degree-of-parallelism-in-a-dataflow-block",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow",
+        "https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library"
+      ]
+    }
+  ],
+  "default_variant": "channel-consumer-loop",
+  "version": "1.1"
+}

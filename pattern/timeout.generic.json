@@ -1,0 +1,23 @@
+{
+  "pattern": "timeout",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "call-level budget + timer + cancellation hand-off",
+  "implementation_notes": "Language-neutral form: derive an absolute deadline from a monotonic clock before the call starts, hand it to the call's wait primitive (blocking with a budget, an async select, or a token the callee can observe), and treat expiry as its own outcome - neither success nor a generic error. Propagate the same deadline downstream with elapsed time deducted instead of computing a fresh full budget at each hop, and make the abandoned work stoppable: if the callee can observe a cancellation signal, send it; if it cannot, ensure the operation is idempotent before any retry. Budgets belong to configuration derived from the dependency's latency distribution, not to a constant copied between call sites. Timeout, retry, bulkhead and circuit breaker must be designed together as a single policy: the timeout caps the per-attempt wait, the retry budget caps total attempts, the bulkhead caps concurrent calls, and the circuit breaker stops all calls when the dependency is clearly down. The composition order matters: CircuitBreaker(Retry(Call)) observes the logical operation; Retry(CircuitBreaker(Call)) observes each physical attempt.",
+  "code_sketch": "deadline = monotonic_now() + budget\nresult = call_with_deadline(peer, payload, deadline)   # blocking, async or token-based\nif result is TIMED_OUT:\n    cancel(handle)                  # tell the callee to stop, when the protocol allows it\n    report(Timeout(peer, budget))   # a definite failure, never a slow success",
+  "pitfalls": [
+    "Leaving the deadline out of the protocol, so the callee cannot know the caller gave up and keeps burning resources on work nobody will read.",
+    "Treating expiry as success or as an ordinary error, which makes retries blind and hides a real dependency outage behind a fallback value.",
+    "Measuring with a wall clock instead of a monotonic clock, so a clock adjustment silently shortens or extends every budget.",
+    "Setting timeouts based on healthy-system p95 latency instead of p99.9 under load, so normal variance triggers spurious failures during peaks.",
+    "Adding a timeout without also tuning retries, bulkhead and circuit-breaker thresholds, producing retry amplification that makes the overload worse.",
+    "Retrying a non-idempotent operation after a timeout without knowing whether the remote side processed it, risking duplicate side effects (e.g., double payment).",
+    "Wrong move: bounding the wait with Thread.join(timeout)/future.get(timeout) and treating expiry as done -> the blocked worker keeps running, holding the connection, lock or row it acquired, and the next timeout fires while the previous abandoned call is still executing -> instead hand the wait primitive an observable cancellation it can act on (interruptible wait, token, socket close), and only accept the leak when the callee provably self-terminates.",
+    "Wrong move: re-arming the same per-attempt budget at every retry and every hop -> three 2s attempts plus a downstream chain silently costs 6s+ while the caller's own caller already budgeted 3s, so the timeout 'never fires' at the level that mattered -> instead carry one absolute end-to-end deadline, deduct elapsed time, and skip any retry whose remaining budget cannot finish it.",
+    "Wrong move: one timeout value covering pool-queue wait, connect, TLS and read -> a saturated connection pool is logged as a backend timeout, the backend is blamed and tuned, and the real capacity limit stays hidden -> instead time each phase separately (borrow/connect/handshake/read) so a timeout names the phase that actually exceeded its budget."
+  ],
+  "sources": [
+    "AWS Well-Architected Framework REL05-BP05 — Set client timeouts: configure both connection and request timeouts explicitly; balance tight enough to release resources against loose enough to avoid retry amplification; use per-dependency values, not a global constant. https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_mitigate_interaction_failure_client_timeouts.html"
+  ],
+  "version": "1.0"
+}

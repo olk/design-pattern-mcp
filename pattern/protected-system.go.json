@@ -1,0 +1,65 @@
+{
+  "pattern": "protected-system",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "unexported struct field + checked methods in one package; os.Root for path-confined resources",
+  "implementation_notes": "Go's encapsulation is package-scoped: 'An identifier is exported if ... the first character of the identifier's name is a Unicode uppercase letter ... and the identifier is declared in the package block or it is a field name or method name. All other identifiers are not exported', so the local realization is a guard type in its own package with an unexported resource field and exported methods that consult the policy before touching the resource - code in another package cannot even name the field, and the guard can be returned as a small consumer-side interface so callers never see the concrete resource. Inside the same package there is no protection, and reflect/unsafe step around the type system ('unsafe ... contains operations that step around the type safety of Go programs'; reflect cannot set unexported fields), so the package boundary is the real enclosure and should be kept minimal. For filesystem resources the standard library now provides the owning object itself: os.Root's 'methods on Root can only access files and directories beneath a root directory', with documented TOCTOU caveats for symlink validation and Unix metadata operations.",
+  "code_sketch": "package vault                    // the only package that may name the store\n\ntype Vault struct {\n\tstore  *store.Type        // unexported: not nameable outside package vault\n\tpolicy Policy\n}\n\nfunc (v *Vault) Read(who Subject, id string) (Record, error) {\n\tif !v.policy.Allows(who, id) {\n\t\treturn Record{}, ErrDenied        // decided before the store is touched\n\t}\n\treturn v.store.Load(id)\n}\n// filesystem resources: root, _ := os.OpenRoot(dir) - confined beneath dir, race-caveated",
+  "pitfalls": [
+    "The boundary is the package, not the object: any code in the same package (including files added later) reads v.store directly, so the guard's package must stay minimal and hold no other functionality.",
+    "unsafe steps around the type system and reflection reads unexported fields (though it cannot set them); a struct value copied with = copies the resource reference, so never return the concrete guard struct when only its interface is meant to be used.",
+    "An interface is not an enclosure: embedding the resource type promotes its methods and re-exposes them, returning the resource as any (or through reflection) defeats the guard, and a broad interface handed to callers can be type-asserted back to the concrete type.",
+    "os.Root confines paths but documents races: symlink validation can be TOCTOU on some platforms and Chmod/Chown/Chtimes are 'vulnerable to a race condition' on Unix, so path confinement is not the same as descriptor ownership."
+  ],
+  "sources": [
+    "https://go.dev/ref/spec#Exported_identifiers",
+    "https://go.dev/src/os/root.go",
+    "https://go.dev/src/io/fs/fs.go",
+    "https://go.dev/src/unsafe/unsafe.go"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "package-guard",
+      "name": "Unexported field in a dedicated package (hand-written guard)",
+      "paradigm": "procedural",
+      "idiom_name": "unexported struct field + checked methods in one package; os.Root for path-confined resources",
+      "implementation_notes": "Go's encapsulation is package-scoped: 'An identifier is exported if ... the first character of the identifier's name is a Unicode uppercase letter ... and the identifier is declared in the package block or it is a field name or method name. All other identifiers are not exported', so the local realization is a guard type in its own package with an unexported resource field and exported methods that consult the policy before touching the resource - code in another package cannot even name the field, and the guard can be returned as a small consumer-side interface so callers never see the concrete resource. Inside the same package there is no protection, and reflect/unsafe step around the type system ('unsafe ... contains operations that step around the type safety of Go programs'; reflect cannot set unexported fields), so the package boundary is the real enclosure and should be kept minimal. For filesystem resources the standard library now provides the owning object itself: os.Root's 'methods on Root can only access files and directories beneath a root directory', with documented TOCTOU caveats for symlink validation and Unix metadata operations.",
+      "code_sketch": "package vault                    // the only package that may name the store\n\ntype Vault struct {\n\tstore  *store.Type        // unexported: not nameable outside package vault\n\tpolicy Policy\n}\n\nfunc (v *Vault) Read(who Subject, id string) (Record, error) {\n\tif !v.policy.Allows(who, id) {\n\t\treturn Record{}, ErrDenied        // decided before the store is touched\n\t}\n\treturn v.store.Load(id)\n}\n// filesystem resources: root, _ := os.OpenRoot(dir) - confined beneath dir, race-caveated",
+      "pitfalls": [
+        "The boundary is the package, not the object: any code in the same package (including files added later) reads v.store directly, so the guard's package must stay minimal and hold no other functionality.",
+        "unsafe steps around the type system and reflection reads unexported fields (though it cannot set them); a struct value copied with = copies the resource reference, so never return the concrete guard struct when only its interface is meant to be used.",
+        "An interface is not an enclosure: embedding the resource type promotes its methods and re-exposes them, returning the resource as any (or through reflection) defeats the guard, and a broad interface handed to callers can be type-asserted back to the concrete type.",
+        "os.Root confines paths but documents races: symlink validation can be TOCTOU on some platforms and Chmod/Chown/Chtimes are 'vulnerable to a race condition' on Unix, so path confinement is not the same as descriptor ownership."
+      ],
+      "sources": [
+        "https://go.dev/ref/spec#Exported_identifiers",
+        "https://go.dev/src/os/root.go",
+        "https://go.dev/src/io/fs/fs.go",
+        "https://go.dev/src/unsafe/unsafe.go"
+      ]
+    },
+    {
+      "variant_id": "os-root",
+      "name": "os.Root confined handle (stdlib owning object)",
+      "paradigm": "procedural",
+      "min_standard": "Go1.24",
+      "requires_features": [
+        "os.Root"
+      ],
+      "idiom_name": "os.OpenRoot + Root.OpenFile/Mkdir/Remove",
+      "implementation_notes": "For file trees the standard library supplies the owning object: 'Methods on Root can only access files and directories beneath a root directory. If any component of a file name passed to a method of Root references a location outside the root, the method returns an error.' Construct one with os.OpenRoot(dir) and hand clients the Root - they can only address paths beneath it, and the Root's own methods reject permission bits outside 0o777 and validate names like fs.FS. This is the strongest in-language realization available because the confinement lives in the runtime library rather than in package hygiene. Read the caveats before relying on it: symlink validation 'is vulnerable to TOCTOU attacks' on some targets and Unix Chmod/Chown/Chtimes are documented as racy, so for hostile filesystem races fall back to openat2-style kernel guarantees.",
+      "code_sketch": "root, err := os.OpenRoot(\"/srv/tenants/acme\")   // owns the subtree\nif err != nil { return err }\ndefer root.Close()\n\nf, err := root.OpenFile(path.Join(\"data\", name), os.O_RDONLY, 0)\n// path escaping the root (.., absolute, symlink out) is rejected by Root itself,\n// so the object - not the caller - is what enforces confinement.",
+      "pitfalls": [
+        "Root confines paths, not identity: it has no notion of which caller may read what, so it is the ownership half of the pattern and still needs a policy check (or per-tenant roots) in front of it.",
+        "Documented races remain (symlink validation TOCTOU on some platforms, Unix Chmod/Chown/Chtimes): confinement of names does not equal atomic mediation of the underlying inode.",
+        "A Root is a handle to a directory, not to a file: handing out a *os.File opened through it passes the file outside the root's future control, exactly like a leaked descriptor in C."
+      ],
+      "sources": [
+        "https://go.dev/src/os/root.go",
+        "https://go.dev/src/os/file.go"
+      ]
+    }
+  ],
+  "default_variant": "package-guard"
+}

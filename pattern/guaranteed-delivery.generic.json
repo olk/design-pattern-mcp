@@ -1,0 +1,32 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "per-hop durable store + positive acknowledgement + replay on restart",
+  "implementation_notes": "Language-neutral form: split the path into hops and accept a message at each hop only by copying it into a durable store (a file followed by fsync, a database row, a broker log entry), then hand the next hop a reference to that stored copy. The next hop acknowledges after it has stored - and at the last hop processed and committed - the message; only on that acknowledgement may the previous copy be deleted. A recovery process replays anything still stored but unacknowledged, so restart is part of normal operation rather than an exception path. Deduplicate on a stable, business-derived message id or make the handler idempotent, because every failure in this protocol surfaces as a duplicate delivery. Which technology plays the store is a deployment decision: broker log, message-store table, transactional outbox, OS-persisted work queue or a hand-written spool file.",
+  "code_sketch": "send(m):\n    store.put(m.id, m)                      # durable; the send is not complete before this\n    try: transport.write(m); wait_for_ack()  # ack means: stored at the next hop\n    except Timeout: schedule_replay(m.id)    # leave the copy in the store\n    else: store.delete(m.id)                 # only now may we forget it\nrecovery(): for m in store.unacked(): replay(m)\nreceive(m): commit_business_effect(m); dedup(m.id); ack(m)",
+  "pitfalls": [
+    "Treating a successful transport write as delivery; only the stored and acknowledged state counts.",
+    "Deleting from the store before the next hop confirmed - the window between write and ack is exactly where messages get lost.",
+    "Skipping deduplication or idempotence, so the first redelivery after a crash doubles the business effect.",
+    "RabbitMQ: enabling publisher confirms but never inspecting the result - nack-ed messages are silently lost on broker failure before persist.",
+    "Kafka: using idempotent producer without transactional.id for cross-session exactly-once - a producer restart assigns a new PID, breaking dedup across restarts.",
+    "AWS SQS: treating standard queues as exactly-once - they provide at-least-once only; use FIFO queues with content-based deduplication for exactly-once.",
+    "GCP Pub/Sub: enabling exactly-once on a push subscription - only pull subscriptions support the guarantee; push deliveries can still duplicate.",
+    "Azure Service Bus: using peek-lock but closing the receiver before settling - the lock expires and the message redelivers before the settlement call completes.",
+    "Setting visibility timeout shorter than processing time - another consumer claims the message while the original is still working, causing duplicate delivery.",
+    "Network partition during the window between processing completion and acknowledgement - the message is redelivered after the business effect already applied, with no idempotency guard.",
+    "DLQ payload containing sensitive data (PII, credentials) with no redaction - the dead-letter store becomes an unguarded data store subject to breach.",
+    "Unbounded retry without exponential backoff on a failing downstream dependency - retry storms amplify the outage and may trigger circuit breakers that slow recovery.",
+    "Kafka: setting min.insync.replicas=1 (the default in some bootstrap configs) combined with unclean.leader.election.enabled=true allows data loss during unclean leader failover — these two settings must be set together, not independently.",
+    "Misconfiguring the prefetch count (Kafka's max.poll.records, RabbitMQ's prefetch, SQS's receive batch) too high: a consumer crash loses an entire in-flight batch, causing a large duplicate burst on redelivery that can overwhelm downstream systems.",
+    "Using a TTL that expires messages while they are still in-flight for processing (visibility timeout > TTL): the message is deleted by the broker while the consumer is actively working on it, causing silent data loss with no redelivery signal.",
+    "Implementing a custom retry loop but forgetting to cap the total retry count, then hitting an unbounded exponential backoff that causes a retry storm — the downstream service becomes a victim of the retry traffic it is already struggling to handle.",
+    "Cloud provider regional outages overlapping with DLQ redrive: replaying a DLQ while the source queue's broker is still recovering can cause messages to be redelivered to consumers that have already moved on, creating ordering violations and late-delivery anomalies.",
+    "Wrong move: Treat RabbitMQ publisher confirms as proof that a message reached a consumer -> the broker confirmation covers broker acceptance or persistence, not the committed business effect -> instead retain a replayable copy until consumer processing commits and its acknowledgement is settled.",
+    "Wrong move: Enable Kafka idempotence and call it cross-session exactly-once -> idempotence alone does not atomically couple external state and is limited to its producer session -> instead use transactional.id with read_committed where appropriate and make the sink idempotent.",
+    "Wrong move: Select an Amazon SQS Standard queue when duplicates violate a business invariant -> Standard queues are at-least-once and FIFO deduplication is bounded by its window -> instead use FIFO within the documented window or persist a business-key idempotency record."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

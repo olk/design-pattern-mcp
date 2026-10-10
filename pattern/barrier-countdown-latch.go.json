@@ -1,0 +1,58 @@
+{
+  "pattern": "barrier-countdown-latch",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "sync.WaitGroup Add/Done/Wait, errgroup.Group.Wait",
+  "implementation_notes": "The standard library supplies the latch as sync.WaitGroup: Add(n) before the goroutines start, Done() on every exit path, Wait() in the collector; goroutines that can fail use golang.org/x/sync/errgroup, whose Wait() adds first-error propagation and, with WithContext, cancels the siblings. What the standard library does not ship is a reusable phase barrier - that is the channel or sync.Cond variant below. Respect the reuse rules: a WaitGroup must not be copied after first use and must not be re-armed with Add while a Wait is in flight; use one WaitGroup per round.",
+  "code_sketch": "var wg sync.WaitGroup\nfor _, shard := range shards {\n    wg.Add(1)                      // before the goroutine starts\n    go func(s Shard) {\n        defer wg.Done()            // runs even if the worker panics past recover\n        process(s)\n    }(shard)                       // explicit parameter: Go < 1.22 loop capture\n}\nwg.Wait()                          // one-shot fan-in",
+  "pitfalls": [
+    "WaitGroup reuse race: calling Add on a WaitGroup while another goroutine is inside Wait panics or races; each round needs its own WaitGroup or the barrier variant.",
+    "The loop-variable capture bug (pre-Go 1.22): `go func(){...}()` closing over the loop variable makes every worker process the last element, and the WaitGroup happily waits for the duplicated work.",
+    "Wrong move: let a worker panic without a deferred Done or error path -> failure: without deferred Done a WaitGroup waiter can block, and an unrecovered panic terminates the process even if Done runs -> instead: defer Done immediately and recover or return the error through errgroup so the group can cancel.",
+    "Copying a WaitGroup into a helper by value is a data race the race detector flags; pass a pointer or keep it in the enclosing scope."
+  ],
+  "sources": [
+    "https://pkg.go.dev/sync",
+    "https://pkg.go.dev/golang.org/x/sync/errgroup"
+  ],
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "sync-waitgroup-latch",
+      "name": "sync.WaitGroup and errgroup (one-shot fan-in)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.0",
+      "idiom_name": "sync.WaitGroup Add/Done/Wait, errgroup.Group.Wait",
+      "implementation_notes": "The standard library supplies the latch as sync.WaitGroup: Add(n) before the goroutines start, Done() on every exit path, Wait() in the collector; goroutines that can fail use golang.org/x/sync/errgroup, whose Wait() adds first-error propagation and, with WithContext, cancels the siblings. What the standard library does not ship is a reusable phase barrier - that is the channel or sync.Cond variant below. Respect the reuse rules: a WaitGroup must not be copied after first use and must not be re-armed with Add while a Wait is in flight; use one WaitGroup per round.",
+      "code_sketch": "var wg sync.WaitGroup\nfor _, shard := range shards {\n    wg.Add(1)                      // before the goroutine starts\n    go func(s Shard) {\n        defer wg.Done()            // runs even if the worker panics past recover\n        process(s)\n    }(shard)                       // explicit parameter: Go < 1.22 loop capture\n}\nwg.Wait()                          // one-shot fan-in",
+      "pitfalls": [
+        "WaitGroup reuse race: calling Add on a WaitGroup while another goroutine is inside Wait panics or races; each round needs its own WaitGroup or the barrier variant.",
+        "The loop-variable capture bug (pre-Go 1.22): `go func(){...}()` closing over the loop variable makes every worker process the last element, and the WaitGroup happily waits for the duplicated work.",
+        "Wrong move: let a worker panic without a deferred Done or error path -> failure: without deferred Done a WaitGroup waiter can block, and an unrecovered panic terminates the process even if Done runs -> instead: defer Done immediately and recover or return the error through errgroup so the group can cancel.",
+        "Copying a WaitGroup into a helper by value is a data race the race detector flags; pass a pointer or keep it in the enclosing scope."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync",
+        "https://pkg.go.dev/golang.org/x/sync/errgroup"
+      ]
+    },
+    {
+      "variant_id": "channel-rendezvous-barrier",
+      "name": "Channel-based reusable phase barrier",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.0",
+      "idiom_name": "arrival channel + per-generation release gates, or sync.Cond with a generation counter",
+      "implementation_notes": "Because the standard library has no barrier type, Go composes one: each worker sends its arrival on a shared channel, a gatekeeper goroutine consumes all n arrivals and then closes the release gate for that generation, and workers block on `<-gate`. Closing instead of sending makes the release a broadcast, gives every later reader an immediate zero-value, and keeps the generation explicit; a sync.Cond with a generation counter is the other idiomatic composition, cheaper in allocations but without select-based cancellation. Prefer channels when cancellation matters (select on ctx.Done()) and Cond when the barrier is on a hot path with a fixed party count.",
+      "code_sketch": "gates := make([]chan struct{}, steps)       // one release gate per phase\nfor i := range gates { gates[i] = make(chan struct{}) }\narrived := make(chan struct{}, n)\ngo func() {                              // gatekeeper: one generation at a time\n    for i := range gates {\n        for j := 0; j < n; j++ { <-arrived }  // wait for every party\n        close(gates[i])                        // broadcast the release\n    }\n}()\n// worker(step): compute(step); arrived <- struct{}{}; <-gates[step]",
+      "pitfalls": [
+        "A gatekeeper goroutine leaks if a worker never arrives: give the barrier a context-aware select (`select { case arrived <- struct{}{}: case <-ctx.Done(): }`) so cancellation releases the group.",
+        "Closing a channel the next generation also uses panics on a second close; allocate one gate per generation up front (or hand the new gate through a channel) instead of reusing the same channel.",
+        "The release is a memory barrier only for data that happens-before the close: publishing partial results through a shared slice without an explicit synchronization (channel or mutex) races, because closing a channel does not make unrelated writes visible by accident."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync"
+      ]
+    }
+  ],
+  "default_variant": "sync-waitgroup-latch"
+}

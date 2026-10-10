@@ -1,0 +1,19 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "Vapor Queues maxRetryCount + Job.error hook writing into a durable dead-letter store (or a DLT topic via swift-kafka-client)",
+  "implementation_notes": "Nothing in the Swift server stack provides a dead-letter channel, so it is assembled from the retry primitive and the hook that survives it: Vapor Queues (NIO-backed workers, Redis or database driver) retries a job up to maxRetryCount and then calls the job's error(_:error:_:) method, which is the only place that still owns both the payload and the thrown error when the budget is spent. The dead-letter write belongs there - a failed_jobs row in the same database (or a dead-letter topic produced through swift-server/swift-kafka-client for log-based transports) carrying the payload, the error and the attempt count, plus an operator path to retry or discard. Doing nothing in the hook, or logging only, is the Swift-shaped version of silently dropping the message.",
+  "code_sketch": "struct EmailJob: AsyncJob {\n    typealias Payload = Email\n    func dequeue(_ ctx: QueueContext, _ p: Email) async throws { try await send(p) }\n\n    func error(_ ctx: QueueContext, _ error: Error, _ p: Email) async throws {\n        try await DeadLetter(originalJob: \"EmailJob\", payload: p,\n                             reason: \"\\(error)\").save(on: ctx.application.db)  // park\n    }\n}\n// dispatch: try await req.queue.dispatch(EmailJob.self, payload, maxRetryCount: 3)",
+  "pitfalls": [
+    "error(_:error:_:) is called for every failed attempt, not only the last one: writing to the dead-letter store there without checking the attempt count parks each transient retry.",
+    "A throw inside the error hook is swallowed by the driver, so the dead-letter write must not throw on transient database errors without its own retry, and the payload must be Codable to be rebuildable later.",
+    "Retry bookkeeping lives in the driver (Redis or the database): a worker crash or a lost reservation can re-run a job whose dead-letter record already exists - dedupe on job id or a natural idempotency key.",
+    "Doing blocking work in the hook occupies an EventLoop thread and stalls other jobs on the same loop; database writes must go through the async/NIO path."
+  ],
+  "sources": [
+    "https://docs.vapor.codes/advanced/queues/",
+    "https://github.com/swift-server/swift-kafka-client"
+  ],
+  "version": "1.0"
+}

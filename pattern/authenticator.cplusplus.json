@@ -1,0 +1,59 @@
+{
+  "pattern": "authenticator",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "abstract Authenticator interface + factory registry of std::function creators (C++11)",
+  "implementation_notes": "Hand-written structure: an abstract class with a pure virtual authenticate(credentials) returning std::shared_ptr<Principal> (available in C++11) or a Result type, one concrete class per mechanism (password, X.509, JWT), and a registry mapping configured names to factories (std::unordered_map<std::string, std::function<std::unique_ptr<Authenticator>()>>). The standard library never verifies identities, so the payoff is entirely the seam: mechanism-specific cryptography (OpenSSL, libsodium, a JWT library) stays inside the concrete authenticator and callers see only the principal. On C++20 toolchains the same seam can be expressed as an awaitable interface so network-backed verification suspends instead of blocking.",
+  "code_sketch": "struct Credentials { std::string scheme; std::string blob; };\n\nstruct Authenticator {\n    virtual ~Authenticator() = default;\n    virtual std::shared_ptr<Principal> authenticate(const Credentials&) const = 0;\n};\n\nusing Factory = std::function<std::unique_ptr<Authenticator>()>;\nstd::unordered_map<std::string, Factory> make_registry(UserStore& users, Jwks& jwks, const std::string& issuer) {\n    return {\n        {\"password\", [&users] { return std::unique_ptr<Authenticator>(new PasswordAuthenticator(users)); }},\n        {\"bearer\",   [&jwks, &issuer] { return std::unique_ptr<Authenticator>(new JwtAuthenticator(jwks, issuer)); }},\n    };\n}\n// inside a service: auto registry = make_registry(users, jwks, issuer);\n// call site: auto principal = registry.at(scheme)()->authenticate(creds);",
+  "pitfalls": [
+    "A virtual destructor is mandatory; deleting a concrete authenticator through the base pointer otherwise leaks it.",
+    "Constructing an authenticator (and its crypto context or JWKS cache) per request is expensive -> a factory can discard reusable verification state -> cache immutable context or return a shared long-lived instance while keeping per-request state local.",
+    "Throwing from authenticate() erases the difference between invalid credentials and verifier failure -> callers cannot choose safe 401 versus outage handling -> return a Result type with explicit error categories and reserve exceptions for programming errors.",
+    "Certificate and key material must be owned by value (smart pointers), never referenced from a request-scoped buffer that dies first."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/utility/functional/function"
+  ],
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "abstract-class-registry",
+      "name": "Abstract Authenticator + factory registry (classic)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "abstract Authenticator interface + factory registry of std::function creators (C++11)",
+      "implementation_notes": "Hand-written structure: an abstract class with a pure virtual authenticate(credentials) returning std::shared_ptr<Principal> (available in C++11) or a Result type, one concrete class per mechanism (password, X.509, JWT), and a registry mapping configured names to factories (std::unordered_map<std::string, std::function<std::unique_ptr<Authenticator>()>>). The standard library never verifies identities, so the payoff is entirely the seam: mechanism-specific cryptography (OpenSSL, libsodium, a JWT library) stays inside the concrete authenticator and callers see only the principal. On C++20 toolchains the same seam can be expressed as an awaitable interface so network-backed verification suspends instead of blocking.",
+      "code_sketch": "struct Credentials { std::string scheme; std::string blob; };\n\nstruct Authenticator {\n    virtual ~Authenticator() = default;\n    virtual std::shared_ptr<Principal> authenticate(const Credentials&) const = 0;\n};\n\nusing Factory = std::function<std::unique_ptr<Authenticator>()>;\nstd::unordered_map<std::string, Factory> make_registry(UserStore& users, Jwks& jwks, const std::string& issuer) {\n    return {\n        {\"password\", [&users] { return std::unique_ptr<Authenticator>(new PasswordAuthenticator(users)); }},\n        {\"bearer\",   [&jwks, &issuer] { return std::unique_ptr<Authenticator>(new JwtAuthenticator(jwks, issuer)); }},\n    };\n}\n// inside a service: auto registry = make_registry(users, jwks, issuer);\n// call site: auto principal = registry.at(scheme)()->authenticate(creds);",
+      "pitfalls": [
+        "A virtual destructor is mandatory; deleting a concrete authenticator through the base pointer otherwise leaks it.",
+        "Constructing an authenticator (and its crypto context or JWKS cache) per request is expensive -> a factory can discard reusable verification state -> cache immutable context or return a shared long-lived instance while keeping per-request state local.",
+        "Throwing from authenticate() erases the difference between invalid credentials and verifier failure -> callers cannot choose safe 401 versus outage handling -> return a Result type with explicit error categories and reserve exceptions for programming errors.",
+        "Certificate and key material must be owned by value (smart pointers), never referenced from a request-scoped buffer that dies first."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/functional/function"
+      ]
+    },
+    {
+      "variant_id": "coroutine-awaitable",
+      "name": "Awaitable Authenticator on C++20 coroutines",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await authenticator.authenticate(credentials) on an event-loop executor",
+      "implementation_notes": "Network-backed mechanisms (directory bind, OIDC discovery and JWKS fetch, revocation check) block a thread in the classic shape; C++20 stackless coroutines let the same one-operation interface become awaitable, so a single event loop serves many concurrent verifications. The seam does not change - still one operation yielding a principal - but the return type becomes a task/awaitable and the implementation must keep its state alive across suspension. Choose it when verification is I/O-bound and the toolchain has C++20 coroutines.",
+      "code_sketch": "task<std::optional<Principal>> authenticate(Credentials creds) {\n  auto claims = co_await introspect(creds.blob);        // suspends, does not block the loop\n  if (!claims) co_return std::nullopt;\n  co_return Principal{claims->subject};\n}",
+      "pitfalls": [
+        "State captured in a coroutine frame must outlive every suspension; a reference to a request-scoped credential is the coroutine-era dangling-pointer bug.",
+        "Blocking calls (DNS, file I/O, synchronous crypto) inside an awaitable silently stall the whole executor.",
+        "Detached tasks that outlive the request must not touch the connection or request object they started from."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/coroutine"
+      ]
+    }
+  ],
+  "default_variant": "abstract-class-registry"
+}

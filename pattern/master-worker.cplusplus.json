@@ -1,0 +1,73 @@
+{
+  "pattern": "master-worker",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::async(std::launch::async, ...) + std::future::get aggregation",
+  "implementation_notes": "The smallest C++ realization: one std::future per subtask, aggregation by calling get() as each future becomes ready. The launch policy must be passed explicitly - the default (async | deferred) lets the implementation defer the call to the first wait, silently serialising the work on the caller's thread. std::async with launch::async is specified to run as if in a new thread, so it is a thread-per-subtask form: cap the number of live futures (a sliding window of in-flight tasks) when the subtask count is large, or move to a pool.",
+  "code_sketch": "std::vector<std::future<long>> fs;\nfor (const Part& p : parts)\n    fs.push_back(std::async(std::launch::async, partial_sum, p));\nlong total = 0;\nfor (auto& f : fs) total += f.get();   // aggregate as they complete",
+  "pitfalls": [
+    "std::async without an explicit std::launch::async may run deferred, so the fan-out quietly becomes sequential.",
+    "One thread per subtask oversubscribes when the subtask count far exceeds the core count; keep the in-flight window bounded.",
+    "A throwing subtask rethrows from f.get(); collect results per future so one failure does not discard the other partials."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/async"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-async-futures",
+      "name": "std::async + std::future fan-out (C++11)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::async(std::launch::async, ...) + std::future::get aggregation",
+      "implementation_notes": "The smallest C++ realization: one std::future per subtask, aggregation by calling get() as each future becomes ready. The launch policy must be passed explicitly - the default (async | deferred) lets the implementation defer the call to the first wait, silently serialising the work on the caller's thread. std::async with launch::async is specified to run as if in a new thread, so it is a thread-per-subtask form: cap the number of live futures (a sliding window of in-flight tasks) when the subtask count is large, or move to a pool.",
+      "code_sketch": "std::vector<std::future<long>> fs;\nfor (const Part& p : parts)\n    fs.push_back(std::async(std::launch::async, partial_sum, p));\nlong total = 0;\nfor (auto& f : fs) total += f.get();   // aggregate as they complete",
+      "pitfalls": [
+        "std::async without an explicit std::launch::async may run deferred, so the fan-out quietly becomes sequential.",
+        "One thread per subtask oversubscribes when the subtask count far exceeds the core count; keep the in-flight window bounded.",
+        "A throwing subtask rethrows from f.get(); collect results per future so one failure does not discard the other partials."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async"
+      ]
+    },
+    {
+      "variant_id": "thread-work-queue",
+      "name": "Hand-built worker pool over a mutex/condition-variable queue",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::thread pool + std::deque task queue + std::condition_variable",
+      "implementation_notes": "The classic POSA structure written directly: a fixed set of std::thread workers pops std::function tasks from a std::deque guarded by std::mutex, waiting on a std::condition_variable; a poison pill (empty function or a stop flag) terminates the loop, std::thread::join is the barrier and the master aggregates the per-task results afterwards. Choose it when dispatch policy matters - task priority, batching, per-queue affinity, or a worker count the standard library does not let you control - and remember it is not work stealing.",
+      "code_sketch": "for (unsigned i = 0; i < n; ++i)\n    workers.emplace_back([&] {\n        for (;;) {\n            std::function<void()> job;\n            { std::unique_lock lk(m); cv.wait(lk, [&] { return !q.empty(); });\n              job = std::move(q.front()); q.pop_front(); }\n            if (!job) return;            // poison pill\n            job();\n        }\n    });\n// master: push tasks; after aggregating, push n pills and join every worker",
+      "pitfalls": [
+        "wait must use the predicate overload and the queue must be re-checked after every wakeup, or workers pop an empty queue.",
+        "Destroying the pool while workers are still blocked in wait is undefined; the stop signal must be pushed and joined before members are destroyed.",
+        "A single queue serialises dispatch under the mutex; at high task rates use per-worker queues or a lock-free queue and accept reordering."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "onetbb-task-group",
+      "name": "oneTBB task_group over a work-stealing arena (C++17)",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "requires_features": [
+        "task_group"
+      ],
+      "idiom_name": "tbb::task_group::run + wait (or tbb::parallel_for)",
+      "implementation_notes": "oneTBB owns a work-stealing pool: task_group::run submits a subtask, wait() is the join and run_and_wait returns a value, while parallel_for/blocked_range covers regular data decomposition and the task_arena (or global_control) bounds the worker count. Choose it when the pool must be sized, tasks must nest (a worker spawning more work without deadlocking) or the standard library's thread-per-subtask behaviour is too expensive; the cost is an external dependency and a build-system change.",
+      "code_sketch": "tbb::task_group tg;\nfor (const Part& p : parts)\n    tg.run([&, p] { results.push_back(partial_sum(p)); });\ntg.wait();                            // master aggregates results",
+      "pitfalls": [
+        "Push into a shared container from parallel tasks needs its own synchronisation or a concurrent container.",
+        "A task must not block on another task's result: use task_group/flow-graph dependencies, because blocking a worker can deadlock the arena when it holds the work the dependency needs."
+      ],
+      "sources": [
+        "https://uxlfoundation.github.io/oneTBB/"
+      ]
+    }
+  ],
+  "default_variant": "std-async-futures"
+}

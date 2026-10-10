@@ -1,0 +1,57 @@
+{
+  "pattern": "health-check-endpoint",
+  "language": "rust",
+  "support": "library",
+  "implementation_notes": "The ecosystem answer is a route on the framework already serving traffic: Router::new().route(\"/healthz\", get(handler)) where the handler is an async fn returning something that implements IntoResponse - (StatusCode, &'static str) is enough - served by axum::serve over a tokio listener; actix-web and warp are the same shape. What remains is the check set: async functions wrapped in tokio::time::timeout for each dependency probe plus a cached aggregate behind an Arc/RwLock so the probe does not hit the database every interval. The classic registry is justified once several subsystems must be reported separately or liveness and readiness must be split; for a gRPC service the tonic variant replaces the HTTP route with the standard health protocol. Rust has no health module in the standard library, but the mainstream frameworks make the endpoint a few lines: with axum the whole route structure is Router::new().route(\"/healthz\", get(handler)) over a tokio listener, and tonic-health provides the gRPC equivalent as a protocol service (grpc.health.v1 with ServingStatus and a Watch stream) rather than an HTTP route. What is left is the check set with tokio::time::timeout around each dependency probe and a cached aggregate behind an Arc/RwLock; the classic registry is justified once liveness and readiness must be split across several subsystems. The two variants differ in protocol and client behaviour, not in taste: HTTP for orchestrators that probe paths, gRPC health for clients that must stop sending traffic on NOT_SERVING.",
+  "idiom_name": "axum Router + async handler (tokio::time::timeout per check)",
+  "code_sketch": "use axum::{routing::get, Router, http::StatusCode};\nuse std::time::Duration;\n\nasync fn ready(pool: &Pool) -> StatusCode {\n    match tokio::time::timeout(Duration::from_millis(200), pool.ping()).await {\n        Ok(Ok(())) => StatusCode::OK,\n        _ => StatusCode::SERVICE_UNAVAILABLE,\n    }\n}\n\nlet app = Router::new()\n    .route(\"/healthz/live\", get(|| async { StatusCode::OK }))\n    .route(\"/healthz/ready\", get(|| async { ready(&pool).await }))\n    .with_state(pool.clone());\n",
+  "pitfalls": [
+    "axum has no built-in per-route timeout: a handler that awaits a dependency without tokio::time::timeout keeps the task alive after the orchestrator gave up, so failures are reported as unreachable rather than unhealthy.",
+    "Sharing one connection pool between the readiness check and the traffic path makes a merely busy instance report unready; decide deliberately which pool and which budget the probe uses.",
+    "Panicking checks (unwrap on a poisoned RwLock or a failed pool checkout) answer 500 and read as a dependency failure when the actual cause is a program bug - return a status instead of unwrapping."
+  ],
+  "sources": [
+    "https://docs.rs/axum/latest/axum/",
+    "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+  ],
+  "variants": [
+    {
+      "variant_id": "axum-http-route",
+      "name": "axum Router route returning a status code",
+      "paradigm": "oo",
+      "implementation_notes": "The ecosystem answer is a route on the framework already serving traffic: Router::new().route(\"/healthz\", get(handler)) where the handler is an async fn returning something that implements IntoResponse - (StatusCode, &'static str) is enough - served by axum::serve over a tokio listener; actix-web and warp are the same shape. What remains is the check set: async functions wrapped in tokio::time::timeout for each dependency probe plus a cached aggregate behind an Arc/RwLock so the probe does not hit the database every interval. The classic registry is justified once several subsystems must be reported separately or liveness and readiness must be split; for a gRPC service the tonic variant replaces the HTTP route with the standard health protocol. Rust has no health module in the standard library, but the mainstream frameworks make the endpoint a few lines: with axum the whole route structure is Router::new().route(\"/healthz\", get(handler)) over a tokio listener, and tonic-health provides the gRPC equivalent as a protocol service (grpc.health.v1 with ServingStatus and a Watch stream) rather than an HTTP route. What is left is the check set with tokio::time::timeout around each dependency probe and a cached aggregate behind an Arc/RwLock; the classic registry is justified once liveness and readiness must be split across several subsystems. The two variants differ in protocol and client behaviour, not in taste: HTTP for orchestrators that probe paths, gRPC health for clients that must stop sending traffic on NOT_SERVING.",
+      "min_standard": "Rust2021",
+      "idiom_name": "axum Router + async handler (tokio::time::timeout per check)",
+      "code_sketch": "use axum::{routing::get, Router, http::StatusCode};\nuse std::time::Duration;\n\nasync fn ready(pool: &Pool) -> StatusCode {\n    match tokio::time::timeout(Duration::from_millis(200), pool.ping()).await {\n        Ok(Ok(())) => StatusCode::OK,\n        _ => StatusCode::SERVICE_UNAVAILABLE,\n    }\n}\n\nlet app = Router::new()\n    .route(\"/healthz/live\", get(|| async { StatusCode::OK }))\n    .route(\"/healthz/ready\", get(|| async { ready(&pool).await }))\n    .with_state(pool.clone());\n",
+      "pitfalls": [
+        "axum has no built-in per-route timeout: a handler that awaits a dependency without tokio::time::timeout keeps the task alive after the orchestrator gave up, so failures are reported as unreachable rather than unhealthy.",
+        "Sharing one connection pool between the readiness check and the traffic path makes a merely busy instance report unready; decide deliberately which pool and which budget the probe uses.",
+        "Panicking checks (unwrap on a poisoned RwLock or a failed pool checkout) answer 500 and read as a dependency failure when the actual cause is a program bug - return a status instead of unwrapping."
+      ],
+      "sources": [
+        "https://docs.rs/axum/latest/axum/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+      ]
+    },
+    {
+      "variant_id": "tonic-grpc-health",
+      "name": "tonic-health gRPC health service (grpc.health.v1)",
+      "paradigm": "concurrent",
+      "implementation_notes": "For gRPC services the health contract is the protocol rather than a route: tonic-health implements grpc.health.v1 (generated types under pb, a ServingStatus enum and server utilities) so the service can register a health service next to the application services. The unary Check RPC serves load balancers and monitoring, while the Watch RPC lets clients stop sending requests while the status is NOT_SERVING and resume when it returns - which is why the health service must be wired to the same lifecycle state that the readiness logic uses. Choose this variant when clients and load balancers already speak gRPC with health checking enabled; keep the HTTP variant when the decider only probes HTTP.",
+      "min_standard": "Rust2021",
+      "idiom_name": "tonic_health::server health reporter registered on the tonic Server",
+      "code_sketch": "let (health_reporter, health_service) = tonic_health::server::health_reporter();\nhealth_reporter.set_serving::<OrdersService>().await;\n\nServer::builder()\n    .add_service(health_service)\n    .add_service(OrdersServer::new(db))\n    .serve(addr)\n    .await?;\n",
+      "pitfalls": [
+        "A service registered as SERVING that never transitions during shutdown leaves clients sending requests into a draining process - the reporter must follow the lifecycle state.",
+        "Dropping or forgetting the reporter (or registering under the wrong service name) makes clients watching a specific service name keep a stale status instead of failing.",
+        "The Watch stream is long-lived: a client that reconnects in a tight loop after the server restarts multiplies connection churn - configure backoff (the gRPC client does by default, custom clients must)."
+      ],
+      "sources": [
+        "https://docs.rs/tonic-health/latest/tonic_health/",
+        "https://grpc.io/docs/guides/health-checking/"
+      ]
+    }
+  ],
+  "default_variant": "axum-http-route",
+  "version": "1.0"
+}

@@ -1,0 +1,77 @@
+{
+  "pattern": "bulkhead",
+  "language": "rust",
+  "support": "library",
+  "implementation_notes": "The async-Rust bulkhead is tokio::sync::Semaphore: a const-constructible permit counter per dependency, acquire().await for the bounded wait (tokio's timeout combinators bound it), try_acquire() for the fail-fast path, and a Permit whose Drop releases the slot, so ownership replaces manual release bookkeeping. Use it when the dependency call is asynchronous; for blocking clients prefer the dedicated-runtime variant, and when the call is part of a tower service stack the ConcurrencyLimit layer expresses the same bound as a composable layer.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tokio-semaphore",
+      "name": "tokio::sync::Semaphore permits",
+      "paradigm": "concurrent",
+      "implementation_notes": "The async-Rust bulkhead is tokio::sync::Semaphore: a const-constructible permit counter per dependency, acquire().await for the bounded wait (tokio's timeout combinators bound it), try_acquire() for the fail-fast path, and a Permit whose Drop releases the slot, so ownership replaces manual release bookkeeping. Use it when the dependency call is asynchronous; for blocking clients prefer the dedicated-runtime variant, and when the call is part of a tower service stack the ConcurrencyLimit layer expresses the same bound as a composable layer.",
+      "min_standard": "Rust2021",
+      "idiom_name": "tokio::sync::Semaphore with try_acquire/acquire",
+      "code_sketch": "static DB_SLOTS: Semaphore = Semaphore::const_new(8);\n\nlet _permit = DB_SLOTS.try_acquire().map_err(|_| BusyError)?;\nlet rows = db.query(sql).await?;   // permit dropped at scope end -> slot free",
+      "pitfalls": [
+        "try_acquire also returns Err when the semaphore is closed, so rejection and shutdown must be distinguished in error mapping.",
+        "tokio's Semaphore is fair and waiting acquires queue; under overload that queue is unbounded unless you use try_acquire or a timeout.",
+        "Holding a permit across unrelated awaits serialises the dependency needlessly; keep the guarded region to the dependency call.",
+        "Blocking clients called inside an async task while holding a permit stall a runtime worker; offload with spawn_blocking or a dedicated runtime."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html",
+        "https://docs.rs/tower/latest/tower/limit/struct.ConcurrencyLimit.html"
+      ]
+    },
+    {
+      "variant_id": "tower-concurrency-limit",
+      "name": "tower ConcurrencyLimit layer (service stack)",
+      "paradigm": "concurrent",
+      "implementation_notes": "When dependencies are tower services (hyper clients, gRPC, database proxies) the bulkhead is a layer: ConcurrencyLimitLayer::new(n) wraps a client so at most n in-flight requests pass downstream while callers wait on readiness; combine it with a load-shedding layer for the fail-fast rejection policy and with a timeout for the deadline. This composes with retry and rate-limit layers and keeps the bound next to the client construction; use the semaphore variant when the call is not a Service or admission must be shared across clients.",
+      "min_standard": "Rust2021",
+      "idiom_name": "tower::limit::ConcurrencyLimitLayer per dependency client",
+      "code_sketch": "let db = ServiceBuilder::new()\n    .layer(ConcurrencyLimitLayer::new(8))     // max 8 in flight per dependency\n    .layer(TimeoutLayer::new(Duration::from_secs(2)))\n    .service(DbClient::new(endpoint));\n\nlet rows = db.oneshot(Query { sql }).await?;",
+      "pitfalls": [
+        "The layer bounds in-flight requests but readiness-based callers queue; without load shedding, saturation becomes latency instead of rejection.",
+        "Layer order matters: concurrency inside versus outside the timeout changes whether queued time counts against the deadline.",
+        "Cloning the wrapped service shares the limit internally; verify that sharing matches the intended per-dependency boundary.",
+        "ConcurrencyLimit requires tower's Service contract, so adapting plain async functions adds boilerplate compared with a semaphore."
+      ],
+      "sources": [
+        "https://docs.rs/tower/latest/tower/limit/struct.ConcurrencyLimit.html"
+      ]
+    },
+    {
+      "variant_id": "dedicated-runtime",
+      "name": "dedicated tokio runtime for blocking dependencies",
+      "paradigm": "concurrent",
+      "implementation_notes": "Hard thread isolation: build a separate multi-thread runtime with a fixed worker_threads count for a blocking dependency (or a group of them) and submit its work there, so a stuck blocking client consumes only that runtime's threads and never the API runtime's workers; spawn_blocking on the main runtime (bounded by max_blocking_threads) is the lighter alternative when a dedicated runtime per dependency is too heavy. Prefer it when the dependency has no async client or when a library blocks unpredictably.",
+      "min_standard": "Rust2021",
+      "idiom_name": "Builder::new_multi_thread().worker_threads(n) per dependency",
+      "code_sketch": "let db_runtime = tokio::runtime::Builder::new_multi_thread()\n    .worker_threads(8)                 // this dependency only\n    .thread_name(\"db-runtime\")\n    .build()?;\n\ndb_runtime.spawn(async move { query(sql).await });\n// lighter: tokio::task::spawn_blocking(move || blocking_query(sql))",
+      "pitfalls": [
+        "Threads and stacks are reserved per runtime even when idle; many per-dependency runtimes multiply memory.",
+        "A runtime must not be dropped from inside itself; keep it in a struct or static and shut it down explicitly.",
+        "Results are not Send across runtimes without a channel bridge such as oneshot or mpsc.",
+        "max_blocking_threads is global (default 512), so an unconfigured blocking workload can still exhaust the main runtime's blocking pool."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-semaphore",
+  "idiom_name": "tokio::sync::Semaphore with try_acquire/acquire",
+  "code_sketch": "static DB_SLOTS: Semaphore = Semaphore::const_new(8);\n\nlet _permit = DB_SLOTS.try_acquire().map_err(|_| BusyError)?;\nlet rows = db.query(sql).await?;   // permit dropped at scope end -> slot free",
+  "pitfalls": [
+    "try_acquire also returns Err when the semaphore is closed, so rejection and shutdown must be distinguished in error mapping.",
+    "tokio's Semaphore is fair and waiting acquires queue; under overload that queue is unbounded unless you use try_acquire or a timeout.",
+    "Holding a permit across unrelated awaits serialises the dependency needlessly; keep the guarded region to the dependency call.",
+    "Blocking clients called inside an async task while holding a permit stall a runtime worker; offload with spawn_blocking or a dedicated runtime."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html",
+    "https://docs.rs/tower/latest/tower/limit/struct.ConcurrencyLimit.html"
+  ]
+}

@@ -1,0 +1,147 @@
+{
+  "category": "workflow-messaging",
+  "name": "message-dispatcher",
+  "aliases": [],
+  "intent": "Put one coordinating component in front of a channel so that it dequeues each message and hands it to exactly one performer, letting several consumers on a single channel process messages concurrently under an explicit, centrally controlled dispatch policy.",
+  "problem": "Several consumers must serve one channel, but the assignment cannot be left to the messaging infrastructure: some messages need a specialized performer, others only need a performer that is currently free, and the application wants to decide, observe, throttle or trace that choice. When the consumers also share expensive per-performer state (a connection, a warm cache, a session), handing the dequeue decision to the infrastructure makes the assignment invisible and untunable.",
+  "context": "In-process, server-side message consumption where the channel and its consumers live in the same runtime: an event-driven consumer or a dequeue loop reads a channel and the application fans the work out to a pool of workers. Applies when performer selection is a real decision (specialization, affinity, fairness, per-performer limits) and a coordinator is cheap; once the deployment uses a broker that already assigns messages to consumers (competing consumers in a consumer group, partitioned queues), the dispatch decision usually belongs to the broker and the in-process dispatcher only decides what happens inside one consumer.",
+  "benefits": [
+    "The dispatch policy lives in one place: round-robin, least-busy, affinity by key, specialist selection or per-performer rate limiting can be changed without touching a single performer.",
+    "Performers become simple and uniform - they receive a message and process it - so they can be pooled, replaced or scaled independently of the channel they serve.",
+    "Per-performer setup (connections, caches, sessions) is amortized over many messages instead of being paid per message or hidden inside the infrastructure.",
+    "Dispatch is observable and steerable: the dispatcher is the natural seam for tracing, metrics, fairness, admission control and back-pressure before work starts.",
+    "Concurrency is bounded and tunable in one place, instead of being an emergent property of how many consumer instances the infrastructure happens to start."
+  ],
+  "tradeoffs": [
+    "The dispatcher is a single point of contention and failure: every message passes through one dequeue-and-assign step, so a stalled or crashed dispatcher starves all performers, and throughput is capped by that step rather than by the number of performers.",
+    "It does not scale out the way competing consumers do: the coordinated dequeue lives in one process, so adding machines does not add dispatch capacity, and the pattern gives up the broker's built-in load balancing across instances.",
+    "Dispatching changes delivery semantics: by taking over the hand-off the application also takes over acknowledgement, retry and duplicate suppression, so at-least-once delivery and idempotency become design responsibilities that the pattern does not solve for you.",
+    "Queue bounds decide the failure mode: an unbounded queue converts overload into memory growth, while a bounded queue needs a rejection policy (block, reject, drop, caller-runs) that callers must understand.",
+    "Shared mutable state across performers, per-thread assumptions and resource ownership (who closes the connection the performer borrowed?) become visible hazards exactly because the assignment of work to worker is now application logic."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 5,
+    "security": 4,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Dispatcher",
+      "responsibility": "Consumes messages from the channel, selects exactly one performer per message and hands the message over; owns the queue bounds, the dispatch policy and the failure semantics of the hand-off."
+    },
+    {
+      "role": "Performer",
+      "responsibility": "Processes a single message handed to it by the dispatcher and delegates the rest of the work into the application; may be newly created or reused from a pool."
+    },
+    {
+      "role": "Performer Pool",
+      "responsibility": "Keeps performers alive and bounded (thread pool, worker goroutines, virtual threads, process pool), so dispatch costs neither thread creation nor per-message setup."
+    },
+    {
+      "role": "Dispatch Policy",
+      "responsibility": "Encapsulates the selection rule - round-robin, least-busy, affinity by message key, specialist by message property - so performers stay unaware of why they were chosen."
+    },
+    {
+      "role": "Message Source",
+      "responsibility": "The event-driven consumer or dequeue loop that supplies messages to the dispatcher; keeps the channel's acknowledgement, ordering and back-pressure contract."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "A JMS/AMQP listener inside one application process that must fan each incoming message out to a bounded thread pool, with a queue bound and a rejection policy chosen by the application.",
+    "A server that hosts warm per-worker state (database connections, caches, model handles) and wants messages assigned to the worker that already holds the right state instead of whichever consumer the broker picked.",
+    "A workload where some messages must be routed to a specialized performer (a slow writer, a GPU worker, a compliance-checked handler) while the rest go to a general pool - the channel stays one channel, the decision stays local.",
+    "Per-key ordering or affinity: messages from the same entity must be processed by the same performer, so a dispatcher hashes the key to a performer while still running many performers in parallel.",
+    "Fair sharing between tenants or request classes when the transport offers no priority or quota, implemented as a dispatch policy with per-performer limits and pacing.",
+    "A single-consumer transport (a file tail, a database queue table polled by one poller) that must still be processed by many workers.",
+    "Apache Camel's SEDA component is an in-process staged route: a BlockingQueue separates producers from consumers, concurrentConsumers bounds the worker side, and queue-full behavior can be made explicit for an asynchronous hand-off.",
+    "Akka Typed's Pool Router creates a fixed set of routees and forwards each message to one routee (round-robin by default), making bounded local performer selection explicit; use a Group Router when routees are discovered across a cluster.",
+    "Spring Integration's ExecutorChannel uses a UnicastingDispatcher and TaskExecutor for asynchronous point-to-point hand-off, with configurable load balancing and failover; because the sender returns before the handler, transaction and acknowledgement boundaries must be explicit."
+  ],
+  "avoid_when": [
+    "The transport already implements competing consumers (JMS message-driven-bean pools, Kafka consumer groups, SQS consumers, cloud queue triggers): the broker's dequeue assignment is the dispatcher, and rebuilding it in-process adds a hop, a bottleneck and a second failure domain.",
+    "Performers are equivalent and stateless, and the only goal is throughput: competing consumers scale across machines while a dispatcher cannot; a plain submit to a thread pool per message is simpler than a dispatcher object.",
+    "The choice of consumer depends on the message content (type, customer, region): put a Content-Based Router or Datatype Channel upstream so the routing decision is a topology fact rather than hidden application code.",
+    "Exactly-once, ordered or transactional processing is required: the pattern hands you the acknowledgement boundary without solving it; a transactional client or a broker-managed queue with the guarantees you need is the honest choice.",
+    "A single consumer already keeps up, or the work is not message-shaped: no coordination need exists, and a queue of one is just overhead."
+  ],
+  "language_files": {
+    "generic": "message-dispatcher.generic.json",
+    "c": "message-dispatcher.c.json",
+    "cplusplus": "message-dispatcher.cplusplus.json",
+    "csharp": "message-dispatcher.csharp.json",
+    "go": "message-dispatcher.go.json",
+    "java": "message-dispatcher.java.json",
+    "javascript": "message-dispatcher.javascript.json",
+    "kotlin": "message-dispatcher.kotlin.json",
+    "python": "message-dispatcher.python.json",
+    "ruby": "message-dispatcher.ruby.json",
+    "rust": "message-dispatcher.rust.json",
+    "scala": "message-dispatcher.scala.json",
+    "swift": "message-dispatcher.swift.json",
+    "typescript": "message-dispatcher.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "competing-consumers",
+    "point-to-point-channel",
+    "event-driven-consumer",
+    "message-endpoint",
+    "service-activator",
+    "thread-pool",
+    "producer-consumer",
+    "active-object"
+  ],
+  "anti_patterns": [
+    "The dispatcher that also performs the work: once the coordinator processes messages itself, the roles collapse and the dispatch step becomes the bottleneck it was meant to remove.",
+    "Creating a performer per message with no bound, so that a burst turns into unbounded thread/goroutine/task creation and the dispatch policy degenerates into \"whoever starts first\".",
+    "An unbounded submission queue advertised as elasticity: overload is absorbed as memory growth until the process dies, and no caller ever learns that the performers cannot keep up.",
+    "A dispatcher that owns business logic, transaction boundaries and retry policy at the same time, becoming a god-object that no performer can be tested or reasoned about without.",
+    "Re-implementing Message Dispatcher on top of a broker that already offers competing consumers, or on top of a framework that already dispatches (MessageListenerContainer, ActorSystem, DispatchQueue), and paying for two coordinators."
+  ],
+  "design_principles": [
+    "Separation of concerns: the decision which performer serves a message is separated from processing the message.",
+    "Single responsibility per role: the dispatcher dispatches, performers perform, the policy decides.",
+    "Open/closed principle: new dispatch policies and specialized performers plug in behind the selection seam without changing the channel or the other performers.",
+    "Explicit coupling: the hand-off point (queue, acknowledgement, failure handling) is a named, observable place rather than an implicit property of a transport.",
+    "Bounded resources: concurrency and queue depth are configuration of one component, not an emergent effect of infrastructure behaviour."
+  ],
+  "best_practices": [
+    "Keep exactly one owner of the dequeue step per channel, and let that owner only assign work - never process it.",
+    "Bound the queue and choose the at-bound behaviour deliberately (block, reject, drop, caller-runs); make the choice visible to callers.",
+    "Keep performers interchangeable: inject the message, not the channel, and avoid shared mutable state so any performer can serve any message unless the policy says otherwise.",
+    "Define the failure contract of the hand-off explicitly - acknowledgement point, retry, dead-letter destination, duplicate handling - and implement it in the dispatcher.",
+    "Reuse performers through a pool when per-performer setup is expensive, and tear the pool down deterministically on shutdown (drain, then cancel stragglers).",
+    "Instrument the dispatch step (queue depth, wait time, per-performer occupancy, rejection count) because it is the single place where the whole flow can be understood.",
+    "Prefer the transport's own competing consumers when the performers are stateless and equivalent; keep an application-level dispatcher for the decisions the transport cannot make."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe, G. & Woolf, B., Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Message Dispatcher (Messaging Endpoints chapter); Competing Consumers in the same chapter is the contrasting solution.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageDispatcher.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/CompetingConsumers.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessagingEndpointsIntro.html",
+    "https://doc.akka.io/libraries/akka-core/current/typed/routers.html",
+    "https://camel.apache.org/components/4.22.x/seda-component.html",
+    "https://docs.spring.io/spring-integration/reference/channel/configuration.html",
+    "https://www.rabbitmq.com/docs/consumer-prefetch"
+  ]
+}

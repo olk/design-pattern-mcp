@@ -1,0 +1,71 @@
+{
+  "pattern": "process-manager",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "MassTransitStateMachine<TSaga> + saga repository (EF Core)",
+  "implementation_notes": "MassTransit supplies the pattern directly: MassTransitStateMachine<TSaga> declares states, events and activities, CorrelateById maps every message onto exactly one saga instance, and the saga repository (EF Core, MongoDB, Redis) persists that instance between messages, so the process state is a row rather than a field. Timeouts are scheduled events (Schedule/ScheduleTimeout) instead of a separate timer service, and Fault<T> events drive the compensation path. Choose it when the steps already travel over a broker and more than one service is involved; a plain in-process machine is smaller when the flow never leaves one process.",
+  "code_sketch": "public class OrderSaga : MassTransitStateMachine<OrderSagaState>\n{\n    public State AwaitingPayment { get; private set; } = null!;\n    public State Compensating { get; private set; } = null!;\n    public Event<PaymentOk> PaymentOk { get; private set; } = null!;\n    public Event<PaymentTimeout> PaymentTimeout { get; private set; } = null!;\n\n    public OrderSaga()\n    {\n        InstanceState(x => x.CurrentState);\n        Event(() => PaymentOk, e => e.CorrelateById(m => m.Message.OrderId));\n        Initially(When(Submitted)\n            .TransitionTo(AwaitingPayment)\n            .Publish(c => new ReserveStock(c.Saga.OrderId))\n            .Schedule(PaymentTimeout, c => new PaymentTimeout(c.Saga.OrderId), TimeSpan.FromHours(1)));\n        During(AwaitingPayment, When(PaymentOk).TransitionTo(Done));\n        DuringAny(When(PaymentTimeout).TransitionTo(Compensating)\n            .Publish(c => new ReleaseCredit(c.Saga.OrderId)).Finalize());\n    }\n}",
+  "pitfalls": [
+    "Saga state and the outgoing messages are not atomic unless the transport is configured for it (transactional outbox, or a broker transaction); a crash between the state commit and the publish duplicates or loses the step.",
+    "Consumers must tolerate the same event twice: at-least-once delivery applies to saga events too, including events delivered again after a state transition.",
+    "Instances that never reach Finalize accumulate in the saga repository; missing completion and a missing retention policy turn it into a growing table."
+  ],
+  "sources": [
+    "https://masstransit.io/documentation/patterns/saga"
+  ],
+  "variants": [
+    {
+      "variant_id": "masstransit-saga",
+      "name": "MassTransit saga state machine",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "MassTransitStateMachine<TSaga> + saga repository (EF Core)",
+      "implementation_notes": "MassTransit supplies the pattern directly: MassTransitStateMachine<TSaga> declares states, events and activities, CorrelateById maps every message onto exactly one saga instance, and the saga repository (EF Core, MongoDB, Redis) persists that instance between messages, so the process state is a row rather than a field. Timeouts are scheduled events (Schedule/ScheduleTimeout) instead of a separate timer service, and Fault<T> events drive the compensation path. Choose it when the steps already travel over a broker and more than one service is involved; a plain in-process machine is smaller when the flow never leaves one process.",
+      "code_sketch": "public class OrderSaga : MassTransitStateMachine<OrderSagaState>\n{\n    public State AwaitingPayment { get; private set; } = null!;\n    public State Compensating { get; private set; } = null!;\n    public Event<PaymentOk> PaymentOk { get; private set; } = null!;\n    public Event<PaymentTimeout> PaymentTimeout { get; private set; } = null!;\n\n    public OrderSaga()\n    {\n        InstanceState(x => x.CurrentState);\n        Event(() => PaymentOk, e => e.CorrelateById(m => m.Message.OrderId));\n        Initially(When(Submitted)\n            .TransitionTo(AwaitingPayment)\n            .Publish(c => new ReserveStock(c.Saga.OrderId))\n            .Schedule(PaymentTimeout, c => new PaymentTimeout(c.Saga.OrderId), TimeSpan.FromHours(1)));\n        During(AwaitingPayment, When(PaymentOk).TransitionTo(Done));\n        DuringAny(When(PaymentTimeout).TransitionTo(Compensating)\n            .Publish(c => new ReleaseCredit(c.Saga.OrderId)).Finalize());\n    }\n}",
+      "pitfalls": [
+        "Saga state and the outgoing messages are not atomic unless the transport is configured for it (transactional outbox, or a broker transaction); a crash between the state commit and the publish duplicates or loses the step.",
+        "Consumers must tolerate the same event twice: at-least-once delivery applies to saga events too, including events delivered again after a state transition.",
+        "Instances that never reach Finalize accumulate in the saga repository; missing completion and a missing retention policy turn it into a growing table."
+      ],
+      "sources": [
+        "https://masstransit.io/documentation/patterns/saga"
+      ]
+    },
+    {
+      "variant_id": "durable-task-orchestrator",
+      "name": "Durable Task / Durable Functions orchestrator",
+      "paradigm": "concurrent",
+      "min_standard": "C#10",
+      "idiom_name": "orchestrator function with deterministic replay + durable timers",
+      "implementation_notes": "The orchestrator function is the process manager and the runtime owns the state: every await is checkpointed, so the flow is ordinary C# that survives process restarts and can sleep for days, while context.CreateTimer and Task.WhenAny express deadlines. The determinism contract matters more than the API - no DateTime.Now, no GUIDs, no direct I/O inside the orchestrator; side effects live in activity functions, and replay means activities must be idempotent. Choose it when the platform is available and the flow is long-running; prefer the broker-based saga when the steps are messages owned by other services, because here the flow and its steps are deployed together.",
+      "code_sketch": "[Function(nameof(OrderOrchestrator))]\npublic static async Task Run([OrchestrationTrigger] TaskOrchestrationContext ctx)\n{\n    var order = ctx.GetInput<Order>();\n    await ctx.CallActivityAsync(\"ReserveCredit\", order);\n    using var cts = new CancellationTokenSource();\n    var pay = ctx.CallActivityAsync(\"TakePayment\", order);\n    var timeout = ctx.CreateTimer(TimeSpan.FromHours(1), cts.Token);\n    if (await Task.WhenAny(pay, timeout) == timeout)\n        await ctx.CallActivityAsync(\"ReleaseCredit\", order);   // compensate\n    else\n        cts.Cancel();                                          // stop loser\n    await ctx.CallActivityAsync(\"Ship\", order);\n}",
+      "pitfalls": [
+        "Non-deterministic orchestrator code (clock, randomness, direct HTTP) breaks replay and produces non-reproducible history; the values must come from the context or from an activity.",
+        "Awaiting both branches without cancelling the loser leaves its timer or activity recorded in history and can wake a finished instance.",
+        "Activities are not transactional with the orchestration state, so replay can invoke them again; they must be idempotent or guarded by a business key."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/durable-task/durable-functions/durable-functions-overview"
+      ]
+    },
+    {
+      "variant_id": "stateless-machine",
+      "name": "Stateless in-process state machine",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "StateMachine<TState,TTrigger> with a custom persisted store",
+      "implementation_notes": "Stateless provides only the decider: states, triggers, guards and entry/exit actions configured fluently, with the machine reading and writing the state through delegates you supply. Persistence is therefore whatever repository you pass in, and timeouts remain application code (Task.Delay or a scheduler), which makes it a good fit for short flows inside one process where a broker or durable runtime would be overkill. The classic configuration is still the right shape when the flow has few states but the transitions need guards and entry actions; when the state must survive a restart it is not the machine that does it.",
+      "code_sketch": "var machine = new StateMachine<OrderState, OrderTrigger>(\n    () => order.State, s => order.State = s);\n\nmachine.Configure(OrderState.AwaitingPayment)\n       .Permit(OrderTrigger.PaymentOk, OrderState.AwaitingStock)\n       .Permit(OrderTrigger.Timeout, OrderState.Compensating)\n       .OnEntryAsync(async () => await _repo.SaveAsync(order));\n\nawait machine.FireAsync(OrderTrigger.PaymentOk);   // guard + persist",
+      "pitfalls": [
+        "The machine object is not thread-safe: one instance per process instance, never a shared static machine serving concurrent flows.",
+        "Mixing the synchronous Fire and the asynchronous FireAsync/OnEntryAsync overloads lets persistence race with the transition; await the async overloads consistently.",
+        "State durability is exactly as good as the store you inject - the library itself checkpoints nothing, so a crash can lose the last transition."
+      ],
+      "sources": [
+        "https://github.com/dotnet-state-machine/stateless"
+      ]
+    }
+  ],
+  "default_variant": "masstransit-saga",
+  "version": "1.0"
+}

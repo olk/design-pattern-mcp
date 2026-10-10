@@ -1,0 +1,58 @@
+{
+  "pattern": "singleflight",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::promise/std::shared_future in a mutex-guarded unordered_map",
+  "implementation_notes": "The standard library supplies the shareable completion handle but not the registry: std::future is move-only, while std::shared_future is copyable and its get() may be called by many threads, so the idiom is a mutex-guarded map from key to std::shared_future<T> (or to an entry owning the promise and a waiter count). The leader creates the promise and publishes the shared_future into the map before starting work, sets value or exception on the promise, and erases the key with the lock held; waiters copy the shared_future out of the map and call get() outside the lock, so the mutex is never held across the computation or across a blocking wait. Erasing at completion keeps the map an in-flight registry; keeping the entry would silently turn it into a cache.",
+  "code_sketch": "std::shared_future<Value> load(const Key& k, Loader& loader) {\n  std::shared_ptr<std::promise<Value>> p; std::shared_future<Value> f;\n  { std::lock_guard<std::mutex> lk(m_);\n    auto it = m_.find(k);\n    if (it != m_.end()) return it->second;              // join the flight\n    p = std::make_shared<std::promise<Value>>();\n    f = p->get_future().share();                        // one future, many readers\n    m_.emplace(k, f);                                   // announce before running\n  }                                                     // lock released\n  try { p->set_value(loader(k)); }                      // leader runs once\n  catch (...) { p->set_exception(std::current_exception()); }\n  { std::lock_guard<std::mutex> lk(m_); m_.erase(k); }  // forget on completion\n  return f;\n}",
+  "pitfalls": [
+    "std::future is move-only: store and hand out std::shared_future (the result of share()), or waiters cannot copy the handle out of the registry.",
+    "get() re-throws the exception stored by set_exception for every waiter - the intended shared error, but it means the leader's error is fanned out and each waiter must handle it.",
+    "Hold the registry mutex only for map access: waiting on a shared_future or running the loader with the lock held serializes every unrelated key.",
+    "Erase on completion, not on announcement: a waiter that copies the handle stays valid, but a late joiner after the erase correctly starts a second flight.",
+    "Outstanding shared_futures keep the shared state and the result alive, so a registry that never erases entries becomes an unbounded cache."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/shared_future"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "shared-future-registry",
+      "name": "Registry of std::shared_future (C++11)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::promise/std::shared_future in a mutex-guarded unordered_map",
+      "implementation_notes": "The standard library supplies the shareable completion handle but not the registry: std::future is move-only, while std::shared_future is copyable and its get() may be called by many threads, so the idiom is a mutex-guarded map from key to std::shared_future<T> (or to an entry owning the promise and a waiter count). The leader creates the promise and publishes the shared_future into the map before starting work, sets value or exception on the promise, and erases the key with the lock held; waiters copy the shared_future out of the map and call get() outside the lock, so the mutex is never held across the computation or across a blocking wait. Erasing at completion keeps the map an in-flight registry; keeping the entry would silently turn it into a cache.",
+      "code_sketch": "std::shared_future<Value> load(const Key& k, Loader& loader) {\n  std::shared_ptr<std::promise<Value>> p; std::shared_future<Value> f;\n  { std::lock_guard<std::mutex> lk(m_);\n    auto it = m_.find(k);\n    if (it != m_.end()) return it->second;              // join the flight\n    p = std::make_shared<std::promise<Value>>();\n    f = p->get_future().share();                        // one future, many readers\n    m_.emplace(k, f);                                   // announce before running\n  }                                                     // lock released\n  try { p->set_value(loader(k)); }                      // leader runs once\n  catch (...) { p->set_exception(std::current_exception()); }\n  { std::lock_guard<std::mutex> lk(m_); m_.erase(k); }  // forget on completion\n  return f;\n}",
+      "pitfalls": [
+        "std::future is move-only: store and hand out std::shared_future (the result of share()), or waiters cannot copy the handle out of the registry.",
+        "get() re-throws the exception stored by set_exception for every waiter - the intended shared error, but it means the leader's error is fanned out and each waiter must handle it.",
+        "Hold the registry mutex only for map access: waiting on a shared_future or running the loader with the lock held serializes every unrelated key.",
+        "Erase on completion, not on announcement: a waiter that copies the handle stays valid, but a late joiner after the erase correctly starts a second flight.",
+        "Outstanding shared_futures keep the shared state and the result alive, so a registry that never erases entries becomes an unbounded cache."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/shared_future"
+      ]
+    },
+    {
+      "variant_id": "folly-shared-promise",
+      "name": "Folly SharedPromise/Future (C++17)",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "idiom_name": "folly::SharedPromise<T> + folly::Future<T> registry",
+      "implementation_notes": "Folly ships both halves as first-class types: folly::SharedPromise<T> is a promise whose getFuture() may be called many times, so one in-flight computation hands out any number of futures, and a ConcurrentHashMap or mutex-guarded map keyed by the coalescing key is a thin registry on top. Future/SemiFuture continuation and timeout facilities let each waiter wait with its own deadline without touching the shared execution. Choose this form where folly is already a dependency; the standard-library form needs no third-party code.",
+      "code_sketch": "folly::ConcurrentHashMap<Key, folly::Future<Value>> m;\nfolly::Future<Value> load(const Key& k, Loader& loader) {\n  auto it = m.find(k);\n  if (it != m.end()) return it->second;             // join the flight\n  auto p = std::make_shared<folly::SharedPromise<Value>>();\n  auto ins = m.emplace(k, p->getFuture());          // many futures, one promise\n  if (!ins.second) return ins.first->second;\n  runAsync([p, k, &loader] { p->setWith([&] { return loader(k); }); })\n      .ensure([&m, k] { m.erase(k); });             // forget on completion\n  return ins.first->second;\n}",
+      "pitfalls": [
+        "SharedPromise::getFuture may be called many times, but setValue/setException only wins once; a second completion attempt is ignored or throws, so the flight must publish exactly once.",
+        "Work submitted with runAsync runs on the folly executor: keep the registry erase on an ensure/continuation rather than on a waiter's thread, or the entry leaks when no waiter is left.",
+        "A folly::Future chain keeps its shared state alive; a registry that never erases completed entries becomes an unbounded cache."
+      ],
+      "sources": [
+        "https://github.com/facebook/folly/blob/main/folly/futures/SharedPromise.h"
+      ]
+    }
+  ],
+  "default_variant": "shared-future-registry"
+}

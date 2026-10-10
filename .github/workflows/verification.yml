@@ -1,0 +1,145 @@
+name: Nightly Verification Canaries
+
+# L10 TCB canaries (docs/testing-strategies.md §3.10): the verifiers and tester
+# toolchains are part of the trusted computing base; a garden mutant that
+# survives a dependency bump BLOCKS the bump until triaged. Advisory jobs are
+# marked continue-on-error — findings are leads that must be triaged, not
+# silent green.
+#
+# Runs the full test-toolchain surface nightly: make test-unit (L1),
+# make test-oracles (L1b/L2 + trace replay + DST + gardens), and
+# make test-mutations (L3, advisory) — plus the tool-gated verifiers.
+# Schedule: 03:00 UTC daily; manual dispatch from the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly, 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# One nightly run at a time: a manual dispatch while the scheduled run is
+# still going (or a >24 h sweep) must not pile up duplicate jobs.
+concurrency:
+  group: nightly-verification
+  cancel-in-progress: false
+
+jobs:
+  unit-suite:
+    name: L1 canary — unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Unit tests (make test-unit)
+        run: make test-unit
+
+  bug-gardens:
+    name: TCB canary — bug gardens + oracle suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Executable oracles (canary, PBT, gardens)
+        run: make test-oracles
+
+      - name: Planted-bug garden kill check
+        run: uv run pytest tests/verification/test_bug_garden.py -v
+
+      - name: Property-ID ledger consistency
+        run: make verify-ledger
+
+      - name: NL-Doc cross-consistency (mechanical subset)
+        run: make verify-cross-consistency
+
+  mutmut-sweep:
+    name: TCB canary — mutmut over the mutation scope (advisory; ratcheted baseline)
+    runs-on: ubuntu-latest
+    # Mutation testing runs every mutant against its test slice in series; the
+    # cap keeps an over-grown mutant surface from burning the whole night — a
+    # timeout still emits partial results for triage. `make test-mutations`
+    # ends with scripts/mutmut_baseline.py --gate, which compares the run
+    # against the committed verify/mutmut-baseline.json (ratchet: new
+    # survivors / kill-ratio drops fail the gate step). The job stays advisory
+    # (continue-on-error) — a red here means "triage the survivor list" (kill
+    # or record equivalents, then regen-mutmut-baseline), never a silent
+    # baseline refresh.
+    timeout-minutes: 300
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: mutmut incremental sweep + baseline gate
+        run: make test-mutations
+
+  verify-fizz:
+    name: L4 — FizzBee exhaustive checks (opt-in toolchain)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: Install fizzbee
+        # Pinned to v0.5.3: the gate verdict in scripts/fizz-check.sh keys off
+        # this version's exit-code semantics (exits 0 even on invariant
+        # failure), so a floating "latest" install could silently change what
+        # the gate means. Prebuilt linux_x86 tarball ships the fizz binary at
+        # the archive root; PATH is extended via GITHUB_PATH so `FIZZ ?= fizz`
+        # (Makefile) resolves it.
+        run: |
+          curl -fsSL -o /tmp/fizzbee.tar.gz \
+            https://github.com/fizzbee-io/fizzbee/releases/download/v0.5.3/fizzbee-v0.5.3-linux_x86.tar.gz
+          mkdir -p /tmp/fizzbee
+          tar -xzf /tmp/fizzbee.tar.gz -C /tmp/fizzbee --strip-components=1
+          chmod +x /tmp/fizzbee/fizz
+          echo /tmp/fizzbee >> "$GITHUB_PATH"
+      - name: Exhaustive model checks
+        run: make verify-fizz
+
+  verify-fizz-garden:
+    name: L4 — FizzBee spec-garden revalidation (opt-in toolchain)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: Install fizzbee
+        # Same pinned install as the verify-fizz job: the garden verdicts
+        # (which assertion a flip fires, liveness semantics) are keyed to
+        # v0.5.3 behaviour; a floating install could flip a KILLED row to
+        # SURVIVED for toolchain reasons instead of spec reasons.
+        run: |
+          curl -fsSL -o /tmp/fizzbee.tar.gz \
+            https://github.com/fizzbee-io/fizzbee/releases/download/v0.5.3/fizzbee-v0.5.3-linux_x86.tar.gz
+          mkdir -p /tmp/fizzbee
+          tar -xzf /tmp/fizzbee.tar.gz -C /tmp/fizzbee --strip-components=1
+          chmod +x /tmp/fizzbee/fizz
+          echo /tmp/fizzbee >> "$GITHUB_PATH"
+      - name: Spec-garden revalidation (every FG-* mutant must behave as documented)
+        run: uv run python scripts/fizz_garden.py --specs verify/fizz --fizz-bin fizz

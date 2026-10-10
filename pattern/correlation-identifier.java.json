@@ -1,0 +1,60 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "ConcurrentHashMap<String, CompletableFuture<Reply>> + orTimeout",
+  "implementation_notes": "CompletableFuture is a Future any thread may complete, so the correlation table stores futures in a ConcurrentHashMap keyed by the id and the reply listener removes and completes the matching one. Deadline handling is in the JDK from Java 9 (orTimeout/completeOnTimeout) or via get(timeout, unit); JMS and AMQP already carry the value as JMSCorrelationID or correlation_id, and Spring AMQP's convertSendAndReceive performs this bookkeeping for you, so the hand-written table is for transports that carry no correlation of their own.",
+  "code_sketch": "private final ConcurrentHashMap<String, CompletableFuture<Reply>> pending = new ConcurrentHashMap<>();\n\npublic CompletableFuture<Reply> call(String body) {\n    var id = UUID.randomUUID().toString();\n    var future = new CompletableFuture<Reply>();\n    pending.put(id, future);                                   // register before send\n    transport.send(new Request(id, body));\n    return future.orTimeout(5, TimeUnit.SECONDS)               // Java 9+\n                 .whenComplete((r, e) -> pending.remove(id));\n}\n// reply listener:\n// var f = pending.remove(msg.correlationId()); if (f != null) f.complete(msg.payload());",
+  "pitfalls": [
+    "When two threads complete the same CompletableFuture only one succeeds, so completing a future whose entry was already removed silently drops the reply - decide explicitly whether that is the timeout path or a bug.",
+    "orTimeout fails the future with TimeoutException but does not cancel the outstanding request; the late reply then lands on a removed entry and must be discarded gracefully.",
+    "Removal and completion are not atomic by default: use remove(id) itself as the completion gate (as in the sketch) or computeIfPresent so a duplicate reply cannot be delivered twice.",
+    "Non-async CompletableFuture continuations run on whichever thread completed the future - the reply/IO thread - so heavy work or blocking I/O in a continuation must be handed to an executor."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "completable-future-map",
+      "name": "ConcurrentHashMap of CompletableFutures (Java 8+)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "ConcurrentHashMap<String, CompletableFuture<Reply>> + orTimeout",
+      "implementation_notes": "CompletableFuture is a Future any thread may complete, so the correlation table stores futures in a ConcurrentHashMap keyed by the id and the reply listener removes and completes the matching one. Deadline handling is in the JDK from Java 9 (orTimeout/completeOnTimeout) or via get(timeout, unit); JMS and AMQP already carry the value as JMSCorrelationID or correlation_id, and Spring AMQP's convertSendAndReceive performs this bookkeeping for you, so the hand-written table is for transports that carry no correlation of their own.",
+      "code_sketch": "private final ConcurrentHashMap<String, CompletableFuture<Reply>> pending = new ConcurrentHashMap<>();\n\npublic CompletableFuture<Reply> call(String body) {\n    var id = UUID.randomUUID().toString();\n    var future = new CompletableFuture<Reply>();\n    pending.put(id, future);                                   // register before send\n    transport.send(new Request(id, body));\n    return future.orTimeout(5, TimeUnit.SECONDS)               // Java 9+\n                 .whenComplete((r, e) -> pending.remove(id));\n}\n// reply listener:\n// var f = pending.remove(msg.correlationId()); if (f != null) f.complete(msg.payload());",
+      "pitfalls": [
+        "When two threads complete the same CompletableFuture only one succeeds, so completing a future whose entry was already removed silently drops the reply - decide explicitly whether that is the timeout path or a bug.",
+        "orTimeout fails the future with TimeoutException but does not cancel the outstanding request; the late reply then lands on a removed entry and must be discarded gracefully.",
+        "Removal and completion are not atomic by default: use remove(id) itself as the completion gate (as in the sketch) or computeIfPresent so a duplicate reply cannot be delivered twice.",
+        "Non-async CompletableFuture continuations run on whichever thread completed the future - the reply/IO thread - so heavy work or blocking I/O in a continuation must be handed to an executor."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-thread-blocking",
+      "name": "One virtual thread per request blocked on a hand-off queue (Java 21+)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "SynchronousQueue per request + virtual thread per call",
+      "implementation_notes": "With virtual threads (JEP 444, final in Java 21) the reason for the asynchronous future table largely disappears: give every outstanding request its own virtual thread parked on a blocking hand-off (a SynchronousQueue or a one-slot ArrayBlockingQueue) stored in the correlation map, and let the reply thread put the payload in. Blocking a virtual thread is cheap and nearly unlimited, so the code reads as an ordinary blocking call while scaling like the asynchronous style; keep the CompletableFuture variant on Java 8-17 or where the call chain is already reactive.",
+      "code_sketch": "private final ConcurrentHashMap<String, SynchronousQueue<Reply>> pending = new ConcurrentHashMap<>();\n\npublic Reply call(String body) throws InterruptedException {\n    var id = UUID.randomUUID().toString();\n    var handoff = new SynchronousQueue<Reply>();\n    pending.put(id, handoff);                                  // register before send\n    try {\n        transport.send(new Request(id, body));\n        return handoff.poll(5, TimeUnit.SECONDS);              // virtual thread parks cheaply\n    } finally { pending.remove(id); }\n}\n// reply listener: var q = pending.remove(cid); if (q != null) q.put(payload);",
+      "pitfalls": [
+        "A virtual thread blocked inside a synchronized block or method pins its carrier (JEP 444); use ReentrantLock or block outside monitors so the carrier stays available.",
+        "poll() returning null is the timeout - do not confuse it with a legitimate null payload, and prefer a sentinel or Optional for empty results.",
+        "Do not funnel hand-offs through a fixed platform-thread pool or pool the virtual threads themselves: the variant relies on a fresh, cheap virtual thread per request.",
+        "put() on a SynchronousQueue blocks until a taker arrives, so the reply thread can stall; use offer with a timeout in the listener if the transport thread must never block."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/444"
+      ]
+    }
+  ],
+  "default_variant": "completable-future-map",
+  "version": "1.0"
+}

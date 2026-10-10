@@ -1,0 +1,82 @@
+{
+  "pattern": "master-slave",
+  "language": "cplusplus",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "async-futures",
+      "name": "std::async futures fanned out over a bounded partition (C++11)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::async with std::launch::async + std::future::get aggregation",
+      "implementation_notes": "C++11's <future> gives the master two library pieces: std::async launches each sub-task and std::future::get() joins it, rethrowing whatever the sub-task threw. Because the default policy is async|deferred - the implementation may run the callable lazily in the calling thread - pass std::launch::async explicitly or you may never get parallelism. Fan out at most roughly std::thread::hardware_concurrency() tasks (one future per core-sized partition) since oversubscription costs context switches, and remember that future::wait/get on the last future is the join point while the shared state is the aggregation slot. For a long-lived worker set with a queue, a pool (oneTBB, OpenMP taskloop) is the better fit; std::async per task is convenient but not a pool.",
+      "code_sketch": "auto part = [&](int i) { return computePart(data, i); };\nconst int n = std::thread::hardware_concurrency();\nstd::vector<std::future<double>> parts;\nfor (int i = 0; i < n; ++i)                     // master partitions\n    parts.push_back(std::async(std::launch::async, part, i));\ndouble total = 0;\nfor (auto& f : parts) total += f.get();          // join + combine",
+      "pitfalls": [
+        "The default launch policy may defer execution into the calling thread; without std::launch::async the 'workers' may never run in parallel.",
+        "std::async's returned future blocks in its destructor when it came from a truly async call, so a discarded future can serialise the master at an unexpected point.",
+        "Exceptions are captured per future and rethrown at get(); the first get() that throws leaves the remaining sub-tasks running, so decide whether to discard or join them.",
+        "Shared state captured by reference must be immutable during the parallel phase - the compiler will not catch a data race, and none of the futures orders the writes."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async",
+        "https://www.openmp.org/spec-html/5.0/openmpsu47.html"
+      ]
+    },
+    {
+      "variant_id": "jthread-stop-token",
+      "name": "std::jthread worker pool with cooperative stop_token cancellation (C++20)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "stop_token",
+        "jthread"
+      ],
+      "idiom_name": "std::jthread workers + std::stop_token shutdown",
+      "implementation_notes": "std::jthread is the C++20 worker type: its destructor requests a stop and joins, so a pool of jthreads needs no explicit shutdown bookkeeping, and each worker receives a std::stop_token it polls (stop_requested() or stop_callback) inside the work loop. The master keeps the partition/dispatch/combine responsibilities and calls request_stop() to end a batch early; the join is still the destructor. Use this variant when the toolchain is C++20 and sub-tasks are long-running enough that cooperative cancellation matters; the stop_token replaces ad-hoc atomic stop flags and makes the master's cancellation lever explicit.",
+      "code_sketch": "std::vector<std::jthread> pool;\nstd::queue<Job> q; std::mutex m; std::condition_variable cv;\nfor (int i = 0; i < n; ++i)\n    pool.emplace_back([&](std::stop_token st) {         // slave\n        for (;;) {\n            Job j;\n            { std::unique_lock lk(m); cv.wait(lk, [&]{ return !q.empty() || st.stop_requested(); });\n              if (st.stop_requested()) return; j = q.front(); q.pop(); }\n            results.push_back(compute(j));              // partial\n        }\n    });\n// master: fill q, cv.notify_all(); on shutdown pool[i].request_stop()",
+      "pitfalls": [
+        "A worker that ignores its stop_token keeps running: cancellation is cooperative, so blocking calls must be interruptible (or polled) for request_stop() to take effect.",
+        "The condition variable must wait on (queue not empty || stop requested); otherwise a stop request never wakes a sleeping worker and the destructor's join hangs.",
+        "Results written by workers must be combined after the join - jthread's destructor order is the only synchronisation guarantee, not the stop signal."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    },
+    {
+      "variant_id": "openmp-taskloop",
+      "name": "OpenMP taskloop over a parallel region (toolchain-provided tasks)",
+      "paradigm": "data-oriented",
+      "min_standard": "OpenMP5.0",
+      "requires_features": [
+        "openmp"
+      ],
+      "idiom_name": "#pragma omp taskloop (or parallel for) with reduction",
+      "implementation_notes": "OpenMP moves the decomposition into the toolchain: a parallel region starts the team, taskloop partitions the associated loop into explicit tasks (creating an implicit taskgroup that joins them) and a reduction clause replaces the hand-written combine. The master is the encountering thread of the parallel region; the workers are the team. Prefer this variant when the work is a regular loop over independent iterations and you want the compiler to handle scheduling, or when a parallel for with reduction is enough - the explicit master/worker roles then exist only implicitly, which is the trade: less code, less control over dispatch and failure handling.",
+      "code_sketch": "double total = 0.0;\n#pragma omp parallel\n#pragma omp single\n{\n    #pragma omp taskloop reduction(+:total)\n    for (int i = 0; i < n; ++i)\n        total += computePart(i);          // each iteration becomes a task\n}",
+      "pitfalls": [
+        "taskloop without single executes once per team thread, duplicating every task; wrap it in single (or use parallel for).",
+        "The reduction variable's combine is associative-by-contract but floating-point summation order is unspecified, so results differ run to run unless the reduction is structured.",
+        "A stray data-sharing attribute (shared instead of firstprivate/default(none)) turns independent sub-tasks into a race."
+      ],
+      "sources": [
+        "https://www.openmp.org/spec-html/5.0/openmpsu47.html"
+      ]
+    }
+  ],
+  "default_variant": "async-futures",
+  "idiom_name": "std::async with std::launch::async + std::future::get aggregation",
+  "implementation_notes": "C++11's <future> gives the master two library pieces: std::async launches each sub-task and std::future::get() joins it, rethrowing whatever the sub-task threw. Because the default policy is async|deferred - the implementation may run the callable lazily in the calling thread - pass std::launch::async explicitly or you may never get parallelism. Fan out at most roughly std::thread::hardware_concurrency() tasks (one future per core-sized partition) since oversubscription costs context switches, and remember that future::wait/get on the last future is the join point while the shared state is the aggregation slot. For a long-lived worker set with a queue, a pool (oneTBB, OpenMP taskloop) is the better fit; std::async per task is convenient but not a pool.",
+  "code_sketch": "auto part = [&](int i) { return computePart(data, i); };\nconst int n = std::thread::hardware_concurrency();\nstd::vector<std::future<double>> parts;\nfor (int i = 0; i < n; ++i)                     // master partitions\n    parts.push_back(std::async(std::launch::async, part, i));\ndouble total = 0;\nfor (auto& f : parts) total += f.get();          // join + combine",
+  "pitfalls": [
+    "The default launch policy may defer execution into the calling thread; without std::launch::async the 'workers' may never run in parallel.",
+    "std::async's returned future blocks in its destructor when it came from a truly async call, so a discarded future can serialise the master at an unexpected point.",
+    "Exceptions are captured per future and rethrown at get(); the first get() that throws leaves the remaining sub-tasks running, so decide whether to discard or join them.",
+    "Shared state captured by reference must be immutable during the parallel phase - the compiler will not catch a data race, and none of the futures orders the writes."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/async",
+    "https://www.openmp.org/spec-html/5.0/openmpsu47.html"
+  ],
+  "version": "1.0"
+}

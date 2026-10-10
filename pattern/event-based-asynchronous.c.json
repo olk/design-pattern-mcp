@@ -1,0 +1,58 @@
+{
+  "pattern": "event-based-asynchronous",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread_create + caller-supplied completion callback (or a completion queue drained by the owner)",
+  "implementation_notes": "The start function allocates a per-call record, spawns a worker with pthread_create and returns immediately; the worker computes the result and delivers completion by invoking the stored callback - or, preferably, by posting the record to a queue or self-pipe that the owner drains, so the callback executes on the owner's thread. This is the manual realization: C has no async syntax, no future type and no dispatcher, so cancellation, progress and the exactly-once guarantee are conventions the API author documents. Prefer the queue form when the caller owns an event loop (post, then dispatch); direct invocation is acceptable when the caller is already a worker pool without an event context.",
+  "code_sketch": "struct op { void (*done)(struct op *, int); int rc; };\n\nstatic void *worker(void *arg) {\n    struct op *o = arg;\n    o->rc = do_work();            /* runs off the caller's thread */\n    o->done(o, o->rc);            /* exactly-once completion */\n    return NULL;\n}\n\npthread_t t;\npthread_create(&t, NULL, worker, op);   /* start now; caller continues */\npthread_detach(t);                      /* reap the thread */",
+  "pitfalls": [
+    "Invoking the completion on the worker thread while the caller mutates the same data is a race: either post the completion to the caller's queue/self-pipe or hand ownership of the record over explicitly.",
+    "pthread_create per operation without join or detach leaks thread resources, and pthread_cancel cannot stop work safely - give the worker a cancellation flag it polls.",
+    "The operation record must outlive the worker and be freed exactly once (on completion or cancellation), otherwise the stored callback pointer dangles."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_create.3.html",
+    "https://man7.org/linux/man-pages/man3/pthread_cond_signal.3.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "worker-thread-callback",
+      "name": "Worker thread invoking a caller-supplied completion callback",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "pthreads"
+      ],
+      "idiom_name": "pthread_create + caller-supplied completion callback (or a completion queue drained by the owner)",
+      "implementation_notes": "The start function allocates a per-call record, spawns a worker with pthread_create and returns immediately; the worker computes the result and delivers completion by invoking the stored callback - or, preferably, by posting the record to a queue or self-pipe that the owner drains, so the callback executes on the owner's thread. This is the manual realization: C has no async syntax, no future type and no dispatcher, so cancellation, progress and the exactly-once guarantee are conventions the API author documents. Prefer the queue form when the caller owns an event loop (post, then dispatch); direct invocation is acceptable when the caller is already a worker pool without an event context.",
+      "code_sketch": "struct op { void (*done)(struct op *, int); int rc; };\n\nstatic void *worker(void *arg) {\n    struct op *o = arg;\n    o->rc = do_work();            /* runs off the caller's thread */\n    o->done(o, o->rc);            /* exactly-once completion */\n    return NULL;\n}\n\npthread_t t;\npthread_create(&t, NULL, worker, op);   /* start now; caller continues */\npthread_detach(t);                      /* reap the thread */",
+      "pitfalls": [
+        "Invoking the completion on the worker thread while the caller mutates the same data is a race: either post the completion to the caller's queue/self-pipe or hand ownership of the record over explicitly.",
+        "pthread_create per operation without join or detach leaks thread resources, and pthread_cancel cannot stop work safely - give the worker a cancellation flag it polls.",
+        "The operation record must outlive the worker and be freed exactly once (on completion or cancellation), otherwise the stored callback pointer dangles."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_create.3.html",
+        "https://man7.org/linux/man-pages/man3/pthread_cond_signal.3.html"
+      ]
+    },
+    {
+      "variant_id": "posix-aio-sigevent",
+      "name": "POSIX AIO request whose sigevent announces completion",
+      "paradigm": "procedural",
+      "min_standard": "POSIX2001",
+      "idiom_name": "aio_read/aio_write + struct sigevent (SIGEV_SIGNAL or SIGEV_THREAD)",
+      "implementation_notes": "POSIX AIO is the only standardized completion-notification object C has: the request struct carries aio_sigevent, which specifies the notification that occurs when the request is complete - a signal to the process or the invocation of a function in a new thread - so aio_read/aio_write become the start method and the notification is the event. Implementations differ (glibc emulates AIO with threads, the Linux kernel path is restricted), so treat delivery as platform-specific and keep the same per-call record and cancellation discipline as the manual variant.",
+      "code_sketch": "struct aiocb cb = { .aio_fildes = fd, .aio_buf = buf,\n                    .aio_nbytes = n, .aio_offset = off };\ncb.aio_sigevent.sigev_notify = SIGEV_THREAD;   /* completion = callback */\ncb.aio_sigevent.sigev_notify_function = on_done;\naio_read(&cb);                                  /* start now, returns at once */",
+      "pitfalls": [
+        "SIGEV_THREAD callbacks may run concurrently for several requests and on implementation-created threads, so shared state touched by on_done needs its own locking.",
+        "aio_return/aio_error must be read exactly once per request, and buffer plus aiocb must stay valid until completion - a stack-allocated aiocb is the classic dangling-completion bug."
+      ],
+      "sources": [
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/aio_read.html"
+      ]
+    }
+  ],
+  "default_variant": "worker-thread-callback",
+  "version": "1.0"
+}

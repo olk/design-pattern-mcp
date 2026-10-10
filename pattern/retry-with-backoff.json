@@ -1,0 +1,172 @@
+{
+  "category": "concurrency-resilience",
+  "name": "retry-with-backoff",
+  "aliases": [
+    "exponential backoff",
+    "jittered retry"
+  ],
+  "intent": "Absorb a transient failure by retrying the operation on a delay schedule that grows multiplicatively and is capped, with per-attempt randomization (jitter) so clients that failed together do not retry together, and with an attempt/interval/time budget so the schedule can never outlive the caller's patience.",
+  "problem": "Every caller of a remote or shared dependency meets failures that are self-correcting but not instantaneous: a reset connection, a throttled API, a database that briefly refuses work, a DNS or connection race. The two naive answers both fail. Retrying immediately re-sends work to a dependency that is already saturated - the AWS simulation of contending optimistic-concurrency clients shows the work growing with the square of the client count. Retrying on a fixed interval is little better, because every client that saw the same blip comes back at the same moment, so a recovering dependency receives synchronized waves instead of a trickle. What is missing is a delay that grows while the dependency is unhealthy, stops growing so no single request hangs for minutes, and differs per client so the retry load is spread.",
+  "context": "Any call across a process or network boundary whose failures are transient and whose repetition is safe: HTTP/RPC/SDK calls, database deadlock or serialization-failure victims, message-handler invocations, connection establishment and DNS races. It applies when failures can be classified, when repeating the operation is idempotent or made so by an idempotency key, and when the dependency's capacity is finite enough that uncoordinated retries would be a load event of their own. The schedule lives in the caller, the client library or a policy layer; servers impose the same shape on the other side through protocol backoff (TCP doubles its retransmission timeout on every retransmission, up to a maximum) and through explicit pushback such as Retry-After.",
+  "benefits": [
+    "Transient faults are absorbed without a human: the request that would have failed on a blip succeeds on the second or third attempt, and the caller's success rate improves at the cost of a delay rather than a redesign.",
+    "Backoff gives the dependency room to recover: the interval grows while it is unhealthy, so retry traffic drops exactly when the dependency needs load removed - the opposite of a fixed-interval retry that keeps arriving at full rate.",
+    "Jitter removes the second wave: randomizing each delay desynchronizes clients that failed together, turning a synchronized retry storm into an approximately constant trickle; the AWS contention simulation shows jittered backoff cutting both the work done and the time to completion relative to un-jittered backoff.",
+    "The schedule is one tunable artifact: base interval, multiplier, cap, jitter mode and total budget are configuration, so the same mechanism serves a latency-sensitive interactive call and a background job with different numbers instead of different code.",
+    "Caps and budgets bound the worst case: a maximum interval plus a maximum elapsed time or attempt count means the pattern can never turn one failure into an unbounded wait, and a retry quota (token bucket) additionally makes the caller fail fast while the dependency is down instead of adding load.",
+    "Server pushback can be honoured: when the dependency answers with Retry-After (or an SDK equivalent such as x-amz-retry-after), the schedule can take the server's timing as authoritative, which is more accurate than any client-side estimate of when capacity returns."
+  ],
+  "tradeoffs": [
+    "Latency amplification: the worst case is the sum of every attempt plus every delay, so a schedule that climbs to a 30-second cap can hold a request for minutes unless a total budget bounds it; retries stretch exactly the case that is already slow.",
+    "Retries are still repeated work: if the first attempt succeeded and only the response was lost, a jittered retry duplicates the effect unless the operation is idempotent or carries an idempotency key.",
+    "Jitter buys aggregate safety at the cost of predictability: individual delays are deliberately non-deterministic, which complicates tail-latency reasoning and forces tests to inject the clock and the random source.",
+    "Masking: a dependency that degrades slowly stays hidden behind successful retries; without attempt metrics and exhaustion alerts, the first visible signal is the day the retry budget runs out.",
+    "Multiplication across layers: SDK retries, client retries and broker redelivery each carry their own schedule, and their budgets do not coordinate, so one logical failure can become dozens of calls and minutes of latency while every layer adds its own jittered delay.",
+    "Budget machinery can silently suppress retries: when a retry quota is exhausted, the SDK or proxy returns the error without attempting, so a caller that only inspects the final error cannot distinguish 'not retried because the budget is empty' from 'retried and failed'.",
+    "The pattern costs something even on the happy path: per-call attempt state, a timer and a wider configuration surface; a blocking sleep also parks a thread (and sometimes a connection) for the entire delay.",
+    "Configuration is the real cost: a base interval that is too small brings the retry storm back, a multiplier or cap that is too large pushes a single call past the caller's deadline, and the correct numbers depend on how the dependency recovers, which is rarely documented."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 3,
+    "reliability": 9,
+    "security": 4,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Retryable operation",
+      "responsibility": "The bounded, repeat-safe unit of work - a call, a transaction, a handler invocation. It must be idempotent or carry an idempotency key, and it should be a self-contained action rather than half of a larger workflow."
+    },
+    {
+      "role": "Failure classifier",
+      "responsibility": "Decides which outcomes are transient and therefore eligible for the schedule - status codes such as 408/429/5xx, exception types such as connection reset or timeout, error codes such as deadlock victim or EAGAIN - and excludes permanent failures before any delay is computed."
+    },
+    {
+      "role": "Backoff schedule",
+      "responsibility": "The pure delay function: base interval, multiplier, maximum interval, any floor, and the jitter mode (full, equal, decorrelated, proportional). It answers one question - how long to wait before attempt n - and holds no mutable per-call state."
+    },
+    {
+      "role": "Attempt executor and delay mechanism",
+      "responsibility": "Runs the operation, consults the classifier, keeps the attempt count and the elapsed budget, waits on the timer (sleep, async timer, scheduler) and re-invokes. The wait must be cancellable and its duration measured against a monotonic clock."
+    },
+    {
+      "role": "Retry budget",
+      "responsibility": "The ceiling on retry effort: maximum attempts, maximum elapsed time, and optionally a token bucket or quota that suppresses retries when failures are widespread, so a systemic outage is not amplified by every client."
+    },
+    {
+      "role": "Exhaustion handler",
+      "responsibility": "The decision after the last attempt or when the budget is spent: surface the original error, fall back to a degraded result, dead-letter the message or trip a circuit breaker - the place where 'the failure was not transient after all' becomes explicit."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "HTTP or RPC calls to an API that throttles: honour 429/503 and Retry-After with a capped exponential schedule so the client backs off for as long as the server asks and no longer.",
+    "Cloud SDK calls (object storage, queues, managed databases) where the provider documents a standard retry mode with jitter and a retry quota - the SDK executes the schedule and the application only bounds the total budget.",
+    "Database transactions chosen as deadlock or serialization-failure victims: exponential backoff with jitter replays the transaction without stampeding the same rows or pages.",
+    "Connection establishment, DNS resolution and service-discovery races, where the failure is a momentary handshake or lookup failure and the retry load should be spread across the fleet rather than repeated in phase.",
+    "Message consumers whose handler fails transiently: the growing delay keeps a transient failure from becoming a hot loop, and the attempt or time budget bounds the retries before redelivery or dead-lettering takes over.",
+    "Background jobs and pollers waiting for a resource to become ready (index availability, job completion, snapshot propagation): the growing interval keeps polling cost low while the total budget keeps the job bounded.",
+    "Amazon Web Services SDK standard retry mode: the client classifies transient and throttling errors, applies capped exponential backoff with full jitter, and spends a retry-quota token bucket so a sustained outage fails fast instead of multiplying load.",
+    "Google Cloud C++ client libraries: configure IdempotencyPolicy, RetryPolicy and BackoffPolicy independently for an RPC, combining retryable status codes with truncated exponential backoff and a finite retry window.",
+    "gRPC per-method service configuration: declare maxAttempts, initialBackoff, maxBackoff, backoffMultiplier and retryableStatusCodes so a service can bound replayed RPCs rather than letting each caller invent an uncoordinated loop."
+  ],
+  "avoid_when": [
+    "The failure is permanent or about the request itself (validation error, 404, business-rule rejection): no delay schedule helps, so fail fast and let the caller see the real error.",
+    "Repeating the operation is unsafe and cannot be made safe (a payment without an idempotency key): fix idempotency first (Idempotent Receiver / Idempotent Client) or do not retry.",
+    "The dependency is hard-down rather than blipping: a circuit breaker should stop the calls, because a backoff schedule would still spend the caller's attempt and time budget retrying into an outage.",
+    "The caller has a hard latency budget that the schedule cannot fit: propagate the remaining deadline and fail fast rather than stretching the request across several delays.",
+    "A lower layer already implements the schedule (SDK standard retry mode, gRPC retry policy, broker redelivery): configure that layer instead of adding a second, uncoordinated budget on top of it.",
+    "The failures are caused by sustained overload on your side or the dependency's: rate limiting or load levelling is the lever, and retries with any schedule only add load."
+  ],
+  "language_files": {
+    "generic": "retry-with-backoff.generic.json",
+    "c": "retry-with-backoff.c.json",
+    "cplusplus": "retry-with-backoff.cplusplus.json",
+    "csharp": "retry-with-backoff.csharp.json",
+    "go": "retry-with-backoff.go.json",
+    "java": "retry-with-backoff.java.json",
+    "javascript": "retry-with-backoff.javascript.json",
+    "kotlin": "retry-with-backoff.kotlin.json",
+    "python": "retry-with-backoff.python.json",
+    "ruby": "retry-with-backoff.ruby.json",
+    "rust": "retry-with-backoff.rust.json",
+    "scala": "retry-with-backoff.scala.json",
+    "swift": "retry-with-backoff.swift.json",
+    "typescript": "retry-with-backoff.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "declarative"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "retry",
+    "circuit-breaker",
+    "timeout",
+    "deadline-propagation",
+    "rate-limiting",
+    "bulkhead",
+    "graceful-degradation",
+    "idempotent-receiver"
+  ],
+  "anti_patterns": [
+    "Unbounded growth: an exponential schedule without a maximum interval, so the tenth delay of a one-second base already waits over eight minutes and the caller's budget is spent long before the last attempt.",
+    "Un-jittered retry storms: a deterministic schedule shared by a fleet, so every client that saw the same outage comes back in phase and the recovering dependency is hit by synchronized waves.",
+    "Cosmetic jitter: randomizing only the final delay, jittering the cap instead of each draw, or a randomization range so narrow that the retries stay effectively synchronized.",
+    "Retrying while holding critical resources - a lock, an open transaction, a pooled connection, a request thread - so the delay, not the failure, becomes the bottleneck.",
+    "Ignoring server pushback: computing a client-side schedule while the response carries Retry-After, and thereby retrying earlier (or later) than the dependency asked.",
+    "Stacking uncoordinated retries at several layers (SDK, client, handler, broker) with no shared budget, turning one logical failure into dozens of calls and minutes of delay.",
+    "Sleeping on the request path when the caller has a deadline: the schedule cannot fit the remaining latency budget, and the correct answer was to fail fast.",
+    "One global schedule for every dependency, ignoring that a throttled API, a deadlock victim and a DNS blip have different recovery times, error classes and idempotency rules."
+  ],
+  "design_principles": [
+    "Bounded growth: an interval that grows without a cap and a budget that never expires are not a schedule but a leak of the caller's time and threads.",
+    "Randomization is part of correctness: a deterministic schedule makes every client retry in phase, so jitter belongs in the delay calculation itself rather than in an optional tweak.",
+    "Separation of mechanism and policy: the attempt/deadline loop is fixed while base interval, multiplier, cap, jitter mode and budget are configuration values.",
+    "Idempotency as a precondition: repeating an operation is only safe when the operation's effect is repeat-safe, which is decided outside the retry loop.",
+    "Fail fast for the non-retryable: classification must exclude permanent errors before any delay is computed, so the cheaper rejection happens first.",
+    "The caller's deadline is the outer bound: a schedule may never outlive the operation's budget, and every wait must be cancellable."
+  ],
+  "best_practices": [
+    "Cap twice: a maximum interval so a single delay cannot exceed the caller's patience, and a maximum elapsed time or attempt count so the total wait is bounded.",
+    "Jitter every delay, and choose the family deliberately: full jitter (uniform in [0, computed]) when the dependency is capacity-limited, equal or decorrelated jitter when a minimum delay matters.",
+    "Honour server-directed timing: Retry-After (or x-amz-retry-after) beats any client estimate, so take the maximum of the server value and the computed delay when both exist.",
+    "Measure the delay and the total budget against a monotonic clock, and make the wait cancellable so shutdown and caller deadlines are respected.",
+    "Keep attempt counters and budgets per invocation; a shared mutable policy object leaks state between concurrent callers.",
+    "Log every attempt below the level of the exhausted failure with the attempt number and delay, and export attempt counts as a metric - that is how 'the dependency is flaky' becomes measurable.",
+    "Test the schedule as a pure function of the attempt number with an injected clock and random source: base, multiplier, cap, jitter range, budget and exhaustion are all observable behaviour.",
+    "Give each dependency its own policy: a throttled third-party API, a database deadlock victim and a DNS race do not deserve the same base interval, cap or budget."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Microsoft, Azure Architecture Center - Cloud Design Patterns: Retry pattern (retry after delay, increasing delays, idempotency precondition and the circuit-breaker hand-off; cloud reliability catalog, 2024 edition) - the catalog lineage behind this row.",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/retry",
+    "AWS Architecture Blog - 'Exponential Backoff And Jitter' (Amazon Web Services, 2015; updated May 2023): the contention simulation and the full/equal/decorrelated jitter family this pattern's randomization comes from.",
+    "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/",
+    "Paxson, Allman, Chu & Sargent, RFC 6298 - Computing TCP's Retransmission Timer (IETF Standards Track, June 2011), rule 5.5: the network-level ancestor where the RTO doubles on every retransmission and may be capped.",
+    "https://www.rfc-editor.org/rfc/rfc6298",
+    "Amazon Web Services SDK reference - Retry behavior (standard mode: exponential backoff with full jitter, base delays by error class, a retry quota token bucket and server-directed retry-after).",
+    "https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html",
+    "AWS Prescriptive Guidance - Retry with backoff pattern: canonical cloud pattern definition covering transient errors, increasing delays, idempotency and coordination with circuit breakers.",
+    "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/retry-backoff.html",
+    "Google Cloud C++ Client Libraries - Retry Policies: separate idempotency, retry and backoff policies with truncated exponential backoff and bounded retry duration.",
+    "https://docs.cloud.google.com/cpp/docs/retry-policies",
+    "gRPC - Retry: per-method service-config policies with max attempts, backoff parameters and retryable status codes.",
+    "https://grpc.io/docs/guides/retry/",
+    "Azure Architecture Center - Retry Storm antipattern: warning that uncontrolled retries amplify outages and guidance on limits, backoff, circuit breakers and Retry-After.",
+    "https://learn.microsoft.com/en-us/azure/architecture/antipatterns/retry-storm/"
+  ]
+}

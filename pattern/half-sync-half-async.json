@@ -1,0 +1,225 @@
+{
+  "category": "concurrency-resilience",
+  "name": "half-sync-half-async",
+  "aliases": [],
+  "intent": "Decouple asynchronous, event-driven processing from synchronous, blocking service logic by connecting the two layers through a queueing layer, so high-level logic can be written with ordinary blocking calls without giving up the efficiency of asynchronous I/O.",
+  "problem": "A system must react to many external I/O events - sockets, device interrupts, timers - and also run complex high-level logic. Driving everything asynchronously makes that logic hard to write, debug and maintain, while running everything synchronously (one thread per event, blocking reads) makes it hard to meet quality-of-service requirements and scales badly with the number of event sources.",
+  "context": "Complex concurrent systems that mix latency-critical asynchronous event handling with higher-level service processing: operating-system and protocol-stack designs, database and application servers, protocol gateways and middleware in which a small number of event sources drive a much larger body of blocking business logic. Applies when the runtime does not already own both layers and the two kinds of work genuinely need different concurrency policies.",
+  "benefits": [
+    "Simplification: high-level logic is written with blocking calls and a run-time stack instead of continuations, state machines or explicitly saved interrupt state.",
+    "Performance: latency-critical event demultiplexing stays in a layer that never blocks, so QoS-sensitive work is not delayed by long-running service logic.",
+    "Separation of concerns: each layer keeps its own synchronisation policy - low-level readiness/completion handling in one, monitors and locks in the other - and neither inherits the other's hazards.",
+    "Centralisation: all inter-layer interaction passes through one queueing layer, which is the single place for buffering, notification, prioritisation and flow control.",
+    "Resource fit: cheap event handling and expensive blocking work are sized to different execution resources (a few demultiplexer threads against a bounded worker pool), which scales better than either homogeneous design.",
+    "Reuse of blocking code: non-reentrant or legacy libraries (single-threaded libraries, blocking database drivers) can be confined to the synchronous layer while the front end stays event-driven."
+  ],
+  "tradeoffs": [
+    "Boundary-crossing penalty: every hand-off pays for queue synchronisation, data copying or marshalling and a context switch; POSA2 names this as the pattern's principal liability. The socket layer in BSD UNIX accounts for a large percentage of the overall TCP/IP networking overhead.",
+    "Higher structural complexity: two concurrency models plus a queueing layer must be designed, bounded and monitored, which is more machinery than either a pure async or a pure thread-pool design.",
+    "Unbounded or badly bounded queues shift failure from back-pressure to memory growth and latency, hiding overload until the process is already degraded.",
+    "End-to-end debugging spans layers: a fault can originate in the demultiplexer, the queue or a worker, and reproduced traces are timing-dependent.",
+    "Latency floor: work that must cross a queue and wait for a worker to be scheduled is slower than an inline handler, which can matter for short messages.",
+    "State duplication: the asynchronous layer cannot see the synchronous layer's progress, so it keeps enqueueing work that may already be stale or superseded.",
+    "Asynchronous I/O for higher-level tasks may be lacking: depending on system interface design, it may not be possible for higher-level tasks to utilise low-level async I/O devices efficiently, even when the hardware supports it.",
+    "Data copying overhead: when the queueing layer sits at the user/kernel boundary, messages must be copied across protection domains, increasing memory bandwidth load significantly for large messages."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Asynchronous Task Layer",
+      "responsibility": "Receives external events (readiness, completions, interrupts, timers) and processes them without ever blocking: demultiplexes, performs the low-level protocol work and enqueues requests for the synchronous layer. Often implemented using the Reactor or Proactor pattern."
+    },
+    {
+      "role": "Queueing Layer",
+      "responsibility": "Buffers messages between the two layers, notifies the waiting layer that work or data is available, and is the single point where flow control, prioritisation and back-pressure are applied. Implemented with semaphores, mutexes and condition variables to serialise concurrent access."
+    },
+    {
+      "role": "Synchronous Task Layer",
+      "responsibility": "Runs the high-level service logic on threads or processes with their own stacks and registers, so it may block on I/O, locks and databases; drains the queue and returns results through the queueing layer. Often implemented using the Active Object pattern."
+    },
+    {
+      "role": "External I/O Sources",
+      "responsibility": "Producers of the asynchronous events - network interfaces, disk controllers, timers, terminals - whose readiness or completion the asynchronous layer observes."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Network servers that accept many connections and then run blocking per-request logic: the event layer stays non-blocking while a bounded worker pool executes the blocking handlers.",
+    "Operating-system and protocol-stack designs where interrupt-level processing hands packets to sleeping processes or threads (the original BSD UNIX example, and the System V UNIX STREAMS framework).",
+    "Database or storage engines that demultiplex I/O completions asynchronously and run blocking query execution on a worker pool.",
+    "Event-driven middleware and protocol gateways that translate between a non-blocking network front end and blocking legacy libraries (X11, Sun RPC, JDBC).",
+    "Ingestion pipelines where an async front end (sockets, message brokers) enqueues batches for a bounded pool of CPU- and blocking-I/O workers.",
+    "Embedded and RTOS systems that must keep the high-priority interrupt context short and defer the bulk of processing to lower-priority tasks.",
+    "Boost.Asio and libuv (Node.js): the async I/O demultiplexer (epoll/kqueue/IOCP) is the async layer; completion handlers that may call blocking user code run in the synchronous layer; the internal task queue is the queueing layer.",
+    "Android Handler/Looper: the main thread's Looper message queue is the queueing layer; UI events arrive asynchronously from the system and are dispatched to the synchronous handler running on the UI thread, keeping the UI thread non-blocking for I/O but synchronous for view mutations.",
+    ".NET ThreadPool on Linux: the SocketAsyncEngine uses epoll to detect socket readiness (async layer), then dispatches I/O completion work to the CLR ThreadPool (synchronous layer), moving the I/O off the epoll thread to avoid serialising all socket I/O behind one event loop thread (dotnet/corefx PR #23115).",
+    "BSD UNIX networking: hardware interrupt handlers receive packets asynchronously; the socket layer queues them; application processes perform synchronous read()/write() calls — the canonical production example described in the original Schmidt & Cranor paper.",
+    "CORBA ORBs (MT-Orbix): a thread per socket handle reads requests synchronously; each request is enqueued; an Active Object thread in the synchronous layer dequeues and processes it via an upcall to the servant.",
+    "Motorola Iridium satellite gateway: an ASX-based application-level gateway routes messages between satellites and ground control stations using Half-Sync/Half-Async, implemented with the ACE Reactor (async layer), ACE Message_Queue (queueing layer) and ACE Task active objects (sync layer).",
+    "Choices OS Conduit framework: user processes are synchronous active objects, the Adapter Conduit serves as the queueing layer, and the Conduit micro-kernel operates asynchronously — an object-oriented embodiment of all three layers.",
+    "Windows NT I/O Completion Ports: the OS itself implements a Proactor-like async layer; I/O completions are queued to a port (the queueing layer); worker threads in the synchronous layer dequeue and process them with blocking read/write calls.",
+    "P4P peer-to-peer network servers: the Half-Sync layer applies the Pipe/Filter pattern inside the synchronous layer to receive and send data concurrently, gaining multiple levels of concurrency and flexibility (Wang & Liang, JSW 2014).",
+    "Continuous media I/O streams: polled interrupts dedicated to a kernel thread reduce context-switch overhead for high-bandwidth media, using shared memory between the async and sync layers to minimise data copying (Druschel & Peterson, SOSP 1993).",
+    "Nginx web server: the master process owns an epoll/kqueue-based event loop (async layer) that accepts connections and distributes them to a pool of pre-forked worker processes; each worker runs a synchronous request-handler loop, achieving the classic HS-HA split at the process level rather than the thread level.",
+    "PostgreSQL: the postmaster process demultiplexes client connections asynchronously; each backend worker process runs a synchronous query executor that may block on buffer reads, disk I/O or latches — the PostgreSQL architecture mirrors BSD UNIX networking scaled to a full database engine.",
+    "GUI applications (Qt, GTK, Swing): the UI thread runs an event loop (async layer) that dispatches user-input and system events to registered handlers; long-running operations are offloaded to a background thread pool (synchronous layer) and results are posted back to the UI thread via a queue, keeping the event loop responsive while allowing blocking operations in workers.",
+    "libuv (Node.js runtime substrate): the event loop is the asynchronous layer (epoll/kqueue/IOCP), the global thread pool (default 4 threads, UV_THREADPOOL_SIZE up to 1024) is the synchronous layer for filesystem operations and getaddrinfo/getnameinfo, and uv_queue_work's internal work queue is the queueing layer; the after_work_cb marshals the result back onto the loop thread, so blocking user code never runs on the event loop (libuv threadpool documentation).",
+    "Tokio (Rust async runtime): the reactor (epoll/kqueue/IOCP via mio) is the asynchronous layer; task::spawn_blocking offloads non-async or CPU-heavy closures to a dedicated blocking thread pool (the synchronous layer), queueing requests once the pool's thread limit is reached, and returns results to async code through the JoinHandle — the runtime's documented answer to 'this library only offers a blocking API'."
+  ],
+  "avoid_when": [
+    "The runtime already implements both layers (Go's network poller with goroutines, Node's event loop with the libuv thread pool, JVM virtual threads): adding an explicit queue and worker layer duplicates machinery the runtime owns.",
+    "All work is CPU-bound with no asynchronous source: a plain work queue over a thread pool (producer-consumer) is the right structure, because there is no asynchronous layer to separate.",
+    "Hand-off cost dominates the work itself: an inline handler or a pure async/await pipeline avoids the queue and the context switch and wins on latency.",
+    "The workload is small - one socket, one blocking handler, a short-lived tool: inline blocking code or a stdlib server is simpler and sufficient.",
+    "The components are already deployed as separate processes or services, so the operating system or the message broker supplies the asynchronous layer.",
+    "Ultra-low-latency requirements (e.g., high-frequency trading): the queue synchronisation and context-switch cost is too high even with lock-free queues; use the Leader/Followers pattern or lock-free data structures instead."
+  ],
+  "language_files": {
+    "generic": "half-sync-half-async.generic.json",
+    "c": "half-sync-half-async.c.json",
+    "cplusplus": "half-sync-half-async.cplusplus.json",
+    "csharp": "half-sync-half-async.csharp.json",
+    "go": "half-sync-half-async.go.json",
+    "java": "half-sync-half-async.java.json",
+    "javascript": "half-sync-half-async.javascript.json",
+    "kotlin": "half-sync-half-async.kotlin.json",
+    "python": "half-sync-half-async.python.json",
+    "ruby": "half-sync-half-async.ruby.json",
+    "rust": "half-sync-half-async.rust.json",
+    "scala": "half-sync-half-async.scala.json",
+    "swift": "half-sync-half-async.swift.json",
+    "typescript": "half-sync-half-async.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "module",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "reactor",
+    "proactor",
+    "active-object",
+    "leader-followers",
+    "producer-consumer",
+    "thread-pool",
+    "acceptor-connector",
+    "monitor-object",
+    "asynchronous-completion-token",
+    "wrapper-facade",
+    "mediator",
+    "facade"
+  ],
+  "anti_patterns": [
+    "Unbounded queue: accepting work faster than the workers drain it converts overload into memory growth and unbounded latency instead of back-pressure.",
+    "Blocking in the asynchronous layer — a blocking database or file call from the event loop — which stalls every event source and removes the pattern's QoS benefit.",
+    "A hidden second channel: workers pushing results back through shared mutable state instead of the queueing layer, reintroducing the data races the queue was meant to remove.",
+    "Unbounded worker creation behind the queue (a thread per arriving request), which turns the pattern back into thread-per-request with extra steps.",
+    "Business logic split across both layers because the queue protocol cannot express a request, leaving no layer owning the rule.",
+    "Head-of-line blocking: a slow or crashed worker holding a queue slot blocks all subsequent work behind it; use per-priority queues or request-level timeouts to contain blast radius.",
+    "Thundering-herd wake: many async events firing simultaneously wake all waiting workers, causing lock contention and cache thrash; use exponential back-off or phased wakeup to spread the load.",
+    "Payload aliasing: passing a mutable pointer into the queue and then continuing to use it in the async layer before the worker has consumed it, causing data races on the buffer.",
+    "Silent saturation: queue grows indefinitely under load without surfacing a saturation signal, so upstream clients keep sending until memory is exhausted.",
+    "Priority inversion: a low-priority worker holds a lock required by a high-priority async event, causing the async layer to block even though it is non-blocking by design; mitigate with priority inheritance on queue mutexes.",
+    "Excessive data copying: placing the queue at the user/kernel boundary and copying messages without using shared memory regions; for large payloads this can dominate performance.",
+    "Multi-level interrupt livelock: in kernel implementations, software interrupt processing at lower SPL levels can be delayed indefinitely by higher-priority processing, causing soft real-time deadline misses."
+  ],
+  "design_principles": [
+    "Separation of concerns: asynchronous event handling and synchronous service processing are different problems with different correctness rules.",
+    "Localised interaction: all data and events cross one queueing boundary, and that boundary is where synchronisation, buffering and flow control live.",
+    "Layered abstraction with an explicit protocol: each layer knows only the message contract of the other, never its internals or memory.",
+    "Bounded resources: the pool and the queue are sized deliberately, so overload surfaces as back-pressure rather than as resource exhaustion.",
+    "Match the concurrency policy to the work: latency-critical demultiplexing gets a non-blocking policy, blocking service logic gets threads with stacks.",
+    "Layer-to-layer flow control is mandatory: synchronous producers block when the queue is full; asynchronous producers must shed or discard when they produce faster than the sync layer can drain.",
+    "Minimise data copying: where the queue crosses protection domains, use shared memory buffers to reduce bus and memory overhead."
+  ],
+  "best_practices": [
+    "Bound the queue and define the overflow policy (block, drop, shed, scale) before the system meets its first overload. The queue depth should be sized to absorb expected burst asymmetry; set a high-water mark above which the async layer applies back-pressure.",
+    "Keep the asynchronous layer free of blocking calls and unbounded loops; every handler must return promptly to the demultiplexer.",
+    "Make the hand-off explicit and owned: pass messages or immutable payloads through the queueing layer, never pointers into buffers that the other layer recycles. Use zero-copy techniques (transfer ownership or immutable data) where possible to avoid the memory bandwidth cost of copying.",
+    "Size the worker pool from measured blocking time per request (Little's law: worker_count ≥ arrival_rate × service_time) and expose saturation as a signal, not as silent queue growth. Size to the narrowest downstream resource (connection pool, rate limit) rather than to CPU core count alone.",
+    "Preserve ordering only where the protocol requires it; global FIFO across a concurrent worker pool is expensive and usually unnecessary. Use per-priority queues or sequence numbers for ordering-sensitive requests.",
+    "Instrument queue depth, wait time and worker utilisation — they are the pattern's vital signs and the first place overload appears. Monitor busy_workers pinned at the worker count while max_qdepth climbs as the leading indicator of an undersized pool.",
+    "Shut down in both directions: stop the demultiplexer first, then drain or reject the queue, then join the workers. Use a poison-pill or shutdown flag to prevent new enqueues during drain.",
+    "Add circuit-breaker logic on the queue producers: when the sync layer is saturated (queue depth above high-water mark), apply back-pressure upstream rather than continuing to enqueue.",
+    "Prefer lock-free queues for the handoff when the async layer is extremely latency-sensitive; they eliminate kernel-level blocking at the cost of increased complexity. Benchmark under realistic load — lock-free queues can be slower under low contention.",
+    "Mitigate priority inversion: if the async layer runs at real-time priority and workers run at lower priority, a low-priority worker holding a queue mutex can block a high-priority async event from making forward progress. Use priority inheritance on mutexes or run workers at elevated priority.",
+    "Use eBPF or similar tracing to observe cross-boundary latency spikes in production; queue residence time (time from enqueue to dequeue) is the single most informative metric for tuning the pattern.",
+    "Minimise data copying at the queue boundary: allocate a shared memory region accessible from both layers so payloads can be transferred by pointer rather than by value copy. This is especially important for large messages such as media frames or bulk data transfers.",
+    "Implement multi-level interrupt schemes in kernel implementations: hardware-specific processing runs at high priority (SPLIMP on BSD), software protocol processing runs at lower priority (SPLNET), preventing high-overhead interrupt handling from delaying other hardware interrupts.",
+    "For latency-sensitive workloads, consider the Leader/Followers pattern instead when the queue hand-off overhead is too high — it eliminates the queue but requires more complex handle-deactivation protocols for cancellation and priority.",
+    "Use work-stealing to balance worker idle time: idle workers steal from the queue of busy workers rather than waiting on a shared queue, reducing latency under bursty workloads at the cost of additional synchronisation.",
+    "Configure queue maxsize to approximately 2–4× the worker count: large enough to keep workers fed across jitter, small enough that back-pressure engages before memory grows unbounded.",
+    "Separate thread priorities: run the asynchronous demultiplexer at elevated (real-time) priority and the synchronous worker pool at lower priority to prevent worker-bound work from delaying event handling. This requires priority-inheritance mutexes in the queueing layer to avoid priority inversion.",
+    "Pre-allocate queue entries: instead of allocating memory on enqueue, use a pre-allocated object pool or ring buffer so that the async layer never blocks on the allocator — allocation in the async layer is a blocking call in all but name.",
+    "Use exponential back-off on the async producers when the queue is saturated: rather than simply discarding events or spinning, back off with increasing delays to allow the sync layer to drain before resuming, which prevents silent message loss under sustained overload.",
+    "Profile queue residence time distribution under realistic burst loads: median and 99th-percentile queue latency tell you whether the pool is correctly sized; mean alone is misleading because it hides bimodal behavior during idle-to-busy transitions.",
+    "Keep the queueing layer single-consumer/single-producer when possible: multi-consumer queues require more complex synchronization (CAS or locks); if ordering across priorities is not required, use one queue per priority class with independent worker pools to reduce contention."
+  ],
+  "version": "1.4",
+  "sources": [
+    "Schmidt, D. C. & Cranor, C. D., 'Half-Sync/Half-Async: An Architectural Pattern for Efficient and Well-structured Concurrent I/O,' Proceedings of the 2nd Pattern Languages of Programs Conference (PLoP 1995), Monticello, Illinois, September 1995. Also in Buschmann et al. (eds.), Pattern Languages of Program Design 2, Addison-Wesley, 1996. — the original conference paper introducing the pattern.",
+    "Schmidt, D. C., Stal, M., Rohnert, H. & Buschmann, F., Pattern-Oriented Software Architecture Volume 2: Patterns for Concurrent and Networked Objects, John Wiley & Sons, 2000, Chapter 'Half-Sync/Half-Async' — the canonical POSA2 reference.",
+    "Schmidt, D. C. & Cranor, C. D., 'Half-Sync/Half-Async: An Architectural Pattern for Efficient and Well-structured Concurrent I/O,' Vanderbilt University PDF, https://www.cs.wm.edu/~dcschmidt/PDF/HS-HA.pdf — Schmidt's original 1999 POSA2 excerpt.",
+    "Vanderbilt University DOC Group, 'POSA2 Concurrency Patterns,' https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html — Patterns for Concurrent and Networked Objects chapter overview with all five concurrency patterns.",
+    "Wang, C. & Liang, Z., 'P4P Network Communication Components Based on Half-Sync/Half-Async and Pipe/Filter Patterns,' Journal of Software, Vol. 9, No. 11, November 2014, pp. 2830–2836, doi:10.4304/jsw.9.11.2830-2836 — academic application of the pattern to P2P network servers.",
+    "Huebscher, M. et al., 'Analysis of Event Processing Design Patterns and Their Performance Dependency on I/O Notification Mechanisms,' Proceedings of MASCOTS 2012 (International Conference on Measurement, Modeling, and Analysis of Computer Systems), pp. 56–65, Springer, doi:10.1007/978-3-642-31202-1_6 — empirical performance analysis of Half-Sync/Half-Async vs Leader/Followers across select, level-triggered and edge-triggered epoll notification mechanisms.",
+    "Schmidt, D. C., 'Patterns of the ACE Framework,' Vanderbilt University, https://www.dre.vanderbilt.edu/~schmidt/patterns-ace.html — original pattern papers for ACE, including Reactor, Proactor, Active Object, Half-Sync/Half-Async, and Leader/Followers.",
+    "Lea, D., 'Scalable Synchronous Queues,' Communications of the ACM, Vol. 52, No. 5, May 2009, pp. 100–111 — lock-free and wait-free synchronous queue algorithms relevant to the queueing layer implementation.",
+    "Scherer, W. N. III, Lea, D. & Scott, M. L., 'Scalable Synchronous Queues,' ACM PODI/SPAA 2005 (concurrent queue algorithms) — background on queue implementation tradeoffs applicable to the queueing layer.",
+    "Schmidt, D. C. et al., 'Leader/Followers: A Design Pattern for Efficient Multi-threaded Event Demultiplexing and Dispatching,' Proceedings of the 7th Pattern Languages of Programs Conference, August 2000 — the POSA2 companion pattern with explicit relationship to Half-Sync/Half-Async.",
+    "Schmidt, D. C. & Suda, T., 'Measuring the Performance of Parallel Message-based Process Architectures,' Proceedings of IEEE INFOCOM 1995, Boston, MA, April 1995, pp. 624–633 — performance measurement methodology for concurrent message-based architectures embodying Half-Sync/Half-Async.",
+    "Druschel, P. & Peterson, L. L., 'Fbufs: A High-Bandwidth Cross-Domain Transfer Facility,' Proceedings of the 14th ACM Symposium on Operating System Principles (SOSP), December 1993 — shared-memory buffer management technique to reduce data copying overhead between protection domains, cited in the original HS-HA paper.",
+    "Schmidt, D. C., 'ACE: an Object-Oriented Framework for Developing Distributed Applications,' Proceedings of the 6th USENIX C++ Conference, 1994 — the ACE framework implementation of Half-Sync/Half-Async using Reactor, Message_Queue and Task (Active Object).",
+    "Horn, C., 'The Orbix Architecture,' IONA Technologies, tech. rep., August 1993 — MT-Orbix's use of Half-Sync/Half-Async for concurrent CORBA remote operation dispatch.",
+    "Choices OS Project, 'The Conduit Communication Framework,' University of Illinois / Washington University — object-oriented Half-Sync/Half-Async in the Choices micro-kernel operating system (Zweig, 1990; Campbell et al., CACM 1993).",
+    "Boost.Asio Overview, 'The Proactor Design Pattern: Concurrency Without Threads,' https://www.boost.org/doc/libs/develop/doc/html/boost_asio/overview/core/async.html — modern production embodiment of the async layer combined with a synchronous thread pool.",
+    "Kumar Locham, S., 'Architecting High-Throughput Servers: The Half-Sync/Half-Async Approach,' Medium, January 2026, https://medium.com/@sachinklocham/architecting-high-throughput-servers-the-half-sync-half-async-approach-6290d02d6f97 — practitioner treatment of boundary-crossing overhead, data copying, queue management and latency trade-offs.",
+    "Let's Code Developers, 'This 1990s System Design Pattern Just Solved Our Modern Scaling Problem,' Medium, October 2025, https://medium.com/@letsCodeDevelopers/this-1990s-system-design-pattern-just-solved-our-modern-scaling-problem-164152ea5e9f — modern case study of adopting Half-Sync/Half-Async to solve bursty workloads with blocking I/O.",
+    "Android Open Source Project, 'AsyncTask Framework,' frameworks/base/core/java/android/os/AsyncTask.java — Android's concrete implementation of the pattern bridging the UI thread (sync layer) to async system events via Handler/Looper (queueing layer).",
+    "Android CS 282 Lecture Notes (Vanderbilt), 'Android Concurrency: The Half-Sync/Half-Async Pattern,' https://www.dre.vanderbilt.edu/~schmidt/cs282/PDFs/6-Concurrency-and-Synchronization-part10.pdf — academic walkthrough of Android AsyncTask as a production Half-Sync/Half-Async implementation.",
+    "dotnet/corefx PR #23115, '.NET ThreadPool Linux: SocketAsyncEngine uses epoll,' Microsoft, https://github.com/dotnet/corefx/pull/23115 — real-world .NET implementation using epoll-based async demultiplexing dispatching to the CLR ThreadPool (sync layer).",
+    "Java Design Patterns, 'Half-Sync/Half-Async Pattern in Java,' https://java-design-patterns.com/patterns/half-sync-half-async/ — practical Java implementation walkthrough with AsynchronousService and Executor.",
+    "Async-Concurrency.com, 'Concurrent Execution & Worker Patterns in Python,' https://async-concurrency.com/concurrent-execution-worker-patterns/ — practitioner guidance on bounded queues, Little's Law sizing, backpressure and hybrid asyncio/thread-pool designs.",
+    "Moments Log, 'Half-Sync/Half-Async: Mixing Synchronous and Asynchronous Layers,' https://www.momentslog.com/development/design-pattern/half-sync-half-async-mixing-synchronous-and-asynchronous-layers — practitioner overview covering nginx (async event loop + sync worker pool), PostgreSQL (async disk I/O + sync query execution), and GUI applications (event-driven UI delegating to background workers), with implementation guidance on thread-safe queues and work hand-off.",
+    "iluwatar, 'java-design-patterns / half-sync-half-async,' GitHub, https://github.com/iluwatar/java-design-patterns/tree/master/half-sync-half-async — open-source Java implementation demonstrating AsynchronousService (async layer), SyncTask (synchronous layer) and a blocking queue as the queueing layer, with full source code and unit tests.",
+    "SAP Community, 'Android Asynctask — vis-a-vis Half Sync Half Async Pattern,' https://community.sap.com/t5/technology-blog-posts-by-sap/android-asynctask-vis-a-vis-half-sync-half-async-pattern/ba-p/13267329 — Android AsyncTask dissected as a concrete HS-HA implementation where the UI thread is the synchronous layer, a cached thread pool is the asynchronous layer, and a serial executor queue is the queueing layer.",
+    "Stack Overflow, 'Implementation of Half Sync Half Async Pattern of POSA in Android Asynctask,' https://stackoverflow.com/questions/19976225/implementation-of-half-sync-half-asyncc-pattern-of-posa-in-android-asynctask — confirms SerialExecutor as an HS-HA queueing-layer implementation: tasks are wrapped so each runs to completion before the next is scheduled, preserving ordering without parallel workers.",
+    "Zwierlein, C. et al., 'Towards a Pattern Language for I/O Architectures,' Fraunhofer Institute, https://publica.fraunhofer.de/bitstreams/5fb1b451-db20-478a-b482-1527015679b5/download — contrasts HS-HA and Leader/Followers for event-driven network applications, including an empirical evaluation of throughput and latency under varying I/O notification mechanisms (select, epoll, kqueue).",
+    "libuv project, 'Thread pool work scheduling,' https://docs.libuv.org/en/v1.x/threadpool.html — official documentation of libuv's global thread pool (default 4 threads, UV_THREADPOOL_SIZE up to 1024) and uv_queue_work/after_work_cb hand-off, the canonical modern HS-HA boundary in the Node.js runtime substrate.",
+    "Tokio project, 'tokio::task::spawn_blocking,' https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html — official documentation of the dedicated blocking thread pool that forms the synchronous layer beneath Tokio's reactor, including pool-limit queueing and the guidance to keep long-lived blocking work on dedicated threads.",
+    "MonkeyPatch, 'Loom - Part 4 - Non-thread-blocking async I/O,' https://www.monkeypatch.io/blog/2020-05-08-loom-part-4-nio/ — critique of hybrid sync/async I/O designs: context-switch and cache-miss overhead persist across the boundary, recursive non-blocking reads risk stack overflow and CPU waste, and callback fragmentation hurts maintainability — the pressure that motivated virtual threads and coroutines."
+  ],
+  "related_patterns_notes": {
+    "reactor": "Reactor is the event-demultiplexing engine of the async layer in Half-Sync/Half-Async: it waits for and dispatches readiness events (epoll/kqueue/IOCP) but does not by itself define a synchronous processing layer. Where Half-Sync/Half-Async layers a queue and worker pool above the demultiplexer, Reactor stops at the event-notification boundary. Schmidt & Cranor (1995) explicitly note that the async layer 'may use the Reactor pattern to demultiplex events from multiple external I/O sources.",
+    "proactor": "Proactor completes the async side by moving from readiness notification (Reactor) to completion notification driven by the OS's own async I/O subsystem (Windows Overlapped I/O, Linux io_uring). Half-Sync/Half-Async can wrap either; Proactor is a more efficient async layer when the OS provides genuine async I/O, but degrades to Reactor semantics on platforms without it (Boost.Asio does exactly this). Windows NT I/O Completion Ports are the canonical OS-level Proactor implementation.",
+    "active-object": "The synchronous layer in Half-Sync/Half-Async often takes the form of an Active Object: each worker owns its own thread/actor, receives method calls via a queue, and executes them sequentially, making the synchronous layer itself thread-safe by design. The combination is common in protocol gateways and CORBA ORBs (MT-Orbix, ACE). POSA2 describes Active Object as the pattern '[the synchronous task layer] can use.",
+    "leader-followers": "Leader/Followers is an alternative to the queue-based worker pool for the synchronous layer. Where Half-Sync/Half-Async uses a shared queue and any worker can take any job, Leader/Followers rotates a fixed set of threads through the 'leader' role that demultiplexes events and hands them to followers. Leader/Followers eliminates the queue overhead but is harder to priority and cancel mid-request. Use Half-Sync/Half-Async when there are additional synchronisation or ordering constraints that Leader/Followers cannot address.",
+    "producer-consumer": "The queueing layer in Half-Sync/Half-Async is a special case of Producer-Consumer where the async layer is the sole producer and the worker pool are the consumers. Standard Producer-Consumer guidance (bounded buffer, poison pill, shutdown protocol) applies directly.",
+    "thread-pool": "The synchronous worker pool in Half-Sync/Half-Async is a Thread Pool; the pattern adds the async event layer and queueing layer that Thread Pool alone does not provide. When the async layer is removed (no external I/O to demultiplex), the pattern collapses to a plain Thread Pool.",
+    "acceptor-connector": "Acceptor-Connector builds on Half-Sync/Half-Async by adding a passive-acceptance layer: an acceptor thread demultiplexes incoming connections and spawns or attaches a service handler (the sync layer) per connection. It is the pattern that makes Half-Sync/Half-Async practical for connection-oriented servers like HTTP or database connectors.",
+    "monitor-object": "The Synchronous Task Layer often uses Monitor Object to co-ordinate access to shared state within each worker thread. The queueing layer itself is frequently implemented as a Monitor Object: its internal queue state is protected by mutex/condition variables and offers synchronized put/get methods.",
+    "asynchronous-completion-token": "Proactor-based async layers (Windows IOCP, Linux io_uring) use Asynchronous Completion Tokens to associate application state with the completion of async operations. ACT and Half-Sync/Half-Async compose when the sync layer processes the completed operation's result.",
+    "wrapper-facade": "The Queueing Layer often acts as a Wrapper Facade that simplifies the interface to lower-level synchronisation primitives (semaphores, futexes, condition variables), presenting a clean enqueue/dequeue API to both layers.",
+    "mediator": "The Queueing Layer is a Mediator between the Asynchronous and Synchronous layers: each layer interacts with the queue rather than directly with the other, reducing direct coupling.",
+    "facade": "The Queueing Layer provides a Facade that simplifies the interface to the Asynchronous task layer, presenting a unified buffering and notification API rather than exposing the raw queue implementation."
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "pattern": "intrusive-reference-counting",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "boost::intrusive_ptr<T> with ADL intrusive_ptr_add_ref/intrusive_ptr_release",
+  "implementation_notes": "The canonical C++ realization: the body embeds its count (a std::atomic<unsigned> once handles can cross threads) and two free functions next to the type - intrusive_ptr_add_ref and intrusive_ptr_release - implement the protocol; boost::intrusive_ptr<T> calls them unqualified through argument-dependent lookup on construction, copy and destruction, and the release function destroys the body when the count reaches zero. What replaces the classic hand-written handle: the smart-pointer template itself - no copy constructor, assignment operator or destructor is written, and the handle stays the size of a raw pointer because the count lives in the object. The Boost documentation recommends trying a shared_ptr-based design first; choose intrusive_ptr when the count must be in the object (fixed layout, foreign objects, no extra allocation) or when handles must be constructible from raw pointers.",
+  "code_sketch": "class Session {\n    mutable std::atomic<unsigned> refs_{0};          // count lives in the body\n    friend void intrusive_ptr_add_ref(const Session* s) {\n        s->refs_.fetch_add(1, std::memory_order_relaxed);\n    }\n    friend void intrusive_ptr_release(const Session* s) {\n        if (s->refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete s;\n    }\npublic:\n    static boost::intrusive_ptr<Session> create() { return {new Session}; }\n};\nboost::intrusive_ptr<Session> a = Session::create(), b = a;   // one increment, no allocation",
+  "pitfalls": [
+    "The counter is initialised to 0 here because intrusive_ptr increments on construction; initialise the field and every path that hands out a body consistently, or the first release frees an object still in use.",
+    "intrusive_ptr_release must not throw and must destroy exactly once; releasing a pointer that did not come from an intrusive handle, or releasing it twice, is undefined behaviour.",
+    "Mixing intrusive_ptr and shared_ptr on the same object gives it two counts and a double delete; keep one ownership model per body."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/1_86_0/libs/smart_ptr/doc/html/smart_ptr.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "boost-intrusive-ptr",
+      "name": "boost::intrusive_ptr over a hand-written embedded count (ADL hooks)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "atomics"
+      ],
+      "idiom_name": "boost::intrusive_ptr<T> with ADL intrusive_ptr_add_ref/intrusive_ptr_release",
+      "implementation_notes": "The canonical C++ realization: the body embeds its count (a std::atomic<unsigned> once handles can cross threads) and two free functions next to the type - intrusive_ptr_add_ref and intrusive_ptr_release - implement the protocol; boost::intrusive_ptr<T> calls them unqualified through argument-dependent lookup on construction, copy and destruction, and the release function destroys the body when the count reaches zero. What replaces the classic hand-written handle: the smart-pointer template itself - no copy constructor, assignment operator or destructor is written, and the handle stays the size of a raw pointer because the count lives in the object. The Boost documentation recommends trying a shared_ptr-based design first; choose intrusive_ptr when the count must be in the object (fixed layout, foreign objects, no extra allocation) or when handles must be constructible from raw pointers.",
+      "code_sketch": "class Session {\n    mutable std::atomic<unsigned> refs_{0};          // count lives in the body\n    friend void intrusive_ptr_add_ref(const Session* s) {\n        s->refs_.fetch_add(1, std::memory_order_relaxed);\n    }\n    friend void intrusive_ptr_release(const Session* s) {\n        if (s->refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete s;\n    }\npublic:\n    static boost::intrusive_ptr<Session> create() { return {new Session}; }\n};\nboost::intrusive_ptr<Session> a = Session::create(), b = a;   // one increment, no allocation",
+      "pitfalls": [
+        "The counter is initialised to 0 here because intrusive_ptr increments on construction; initialise the field and every path that hands out a body consistently, or the first release frees an object still in use.",
+        "intrusive_ptr_release must not throw and must destroy exactly once; releasing a pointer that did not come from an intrusive handle, or releasing it twice, is undefined behaviour.",
+        "Mixing intrusive_ptr and shared_ptr on the same object gives it two counts and a double delete; keep one ownership model per body."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/1_86_0/libs/smart_ptr/doc/html/smart_ptr.html"
+      ]
+    },
+    {
+      "variant_id": "intrusive-ref-counter",
+      "name": "boost::intrusive_ref_counter CRTP base (policy-selected counter)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "atomics"
+      ],
+      "idiom_name": "boost::intrusive_ref_counter<Derived, thread_safe_counter>",
+      "implementation_notes": "Instead of writing the hooks by hand, the body derives from boost::intrusive_ref_counter<Derived, CounterPolicy>, which provides both the count and the intrusive_ptr_add_ref/intrusive_ptr_release overloads; the policy selects the cost - thread_safe_counter (the default) for objects whose handles can cross threads, thread_unsafe_counter for thread-confined ones. The CRTP parameter is what lets the base destroy the correct most-derived object at zero. Choose this when you own the class, want the least code, and accept inheritance (and an empty base) as the price.",
+      "code_sketch": "class Buffer : public boost::intrusive_ref_counter<Buffer, boost::thread_safe_counter> {\n    std::vector<std::byte> data_;\npublic:\n    explicit Buffer(std::size_t n) : data_(n) {}\n};\n\nboost::intrusive_ptr<Buffer> make() { return new Buffer(4096); }  // no control block",
+      "pitfalls": [
+        "Destruction goes through the CRTP-typed base, so passing the wrong Derived type destroys the wrong object at zero.",
+        "thread_unsafe_counter omits the atomic operations entirely - correct only while every handle stays on one thread, so pick the policy deliberately.",
+        "The count is not directly controllable (use_count only), and branching on it reintroduces the concurrency bug the policy was meant to prevent."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/1_86_0/libs/smart_ptr/doc/html/smart_ptr.html"
+      ]
+    },
+    {
+      "variant_id": "foreign-counted-object",
+      "name": "Adopt a foreign counted object (COM, Core Foundation, GObject)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "forwarding intrusive_ptr_add_ref/release + intrusive_ptr(p, add_ref=false)",
+      "implementation_notes": "The pattern's original motivation in Boost: OS and framework objects already carry their own count (COM IUnknown has AddRef/Release; Core Foundation uses CFRetain/CFRelease; GObject uses g_object_ref/unref), and only the handle is missing. Define the two ADL functions as one-line forwarders to the foreign protocol and adopt a reference the caller already holds with intrusive_ptr(p, false) - the constructor increments only when add_ref is true - or let it increment by default when taking a new reference from a valid pointer. No count is added to the object; the handle simply speaks the foreign protocol.",
+      "code_sketch": "void intrusive_ptr_add_ref(IUnknown* p) { p->AddRef(); }\nvoid intrusive_ptr_release(IUnknown* p) { p->Release(); }\n\nboost::intrusive_ptr<IUnknown> adopt(IUnknown* owned) {\n    return boost::intrusive_ptr<IUnknown>(owned, false);  // caller's ref moves in\n}",
+      "pitfalls": [
+        "intrusive_ptr(p, false) consumes a reference: the caller must transfer ownership rather than reuse p, or the object is released while still in use.",
+        "The forwarding hooks must be found by ADL in the object's namespace (or fall back to namespace boost); a hook for the wrong type counts the wrong object.",
+        "Foreign protocols differ (COM Release returns a count, CF/GObject do not); never combine a foreign count with a C++-owned count on the same object."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/1_86_0/libs/smart_ptr/doc/html/smart_ptr.html"
+      ]
+    }
+  ],
+  "default_variant": "boost-intrusive-ptr",
+  "version": "1.0"
+}

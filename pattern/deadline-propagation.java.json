@@ -1,0 +1,59 @@
+{
+  "pattern": "deadline-propagation",
+  "language": "java",
+  "support": "library",
+  "implementation_notes": "On the JVM the carrier is a library object rather than language syntax: grpc-java's Context.withDeadline(deadline, scheduler) creates a CancellableContext that cancels itself at the deadline and cascades cancellation to descendants, while getDeadline() exposes the absolute deadline and cancellationCause() records why it fired. A hop runs its work inside the context (run/call) so outgoing RPCs inherit the deadline - grpc-java propagates it by default, which makes this the canonical realization - and cancels the context in a finally block so it can be collected. The classic per-stage Future.get(timeout) arrangement is replaced by the scoped context. Sibling variant: without an RPC framework the budget is split by hand over CompletableFuture.orTimeout/completeOnTimeout against one nanoTime-based deadline.",
+  "idiom_name": "io.grpc.Context.withDeadline / withDeadlineAfter + CancellableContext",
+  "code_sketch": "Context.CancellableContext ctx = Context.current()\n        .withDeadlineAfter(remainingMillis, TimeUnit.MILLISECONDS, scheduler);\ntry {\n    return ctx.call(() -> userStub.get(req));   // outgoing RPC inherits the deadline\n} finally {\n    ctx.cancel(null);   // release when the work finished early\n}",
+  "pitfalls": [
+    "Every attach() needs a matching detach() and every CancellableContext a cancel(); the javadoc states that breaking these rules leaks memory.",
+    "Context is scoped to the current thread: work handed to another thread must be wrapped (wrap(Runnable), currentContextExecutor) or the deadline and cancellation do not follow.",
+    "withDeadline cancels the context but cannot stop code that ignores isCancelled(); long computations must check the context at stage boundaries.",
+    "Do not compute the budget from System.currentTimeMillis(); the deadline is scheduled on the system nano clock, so treat getDeadline() as authoritative and derive remaining time consistently."
+  ],
+  "sources": [
+    "https://grpc.github.io/grpc-java/javadoc/io/grpc/Context.html",
+    "https://grpc.io/docs/guides/deadlines/"
+  ],
+  "variants": [
+    {
+      "variant_id": "grpc-context-deadline",
+      "name": "gRPC Java Context deadline (Context.withDeadline / withDeadlineAfter)",
+      "paradigm": "oo",
+      "implementation_notes": "On the JVM the carrier is a library object rather than language syntax: grpc-java's Context.withDeadline(deadline, scheduler) creates a CancellableContext that cancels itself at the deadline and cascades cancellation to descendants, while getDeadline() exposes the absolute deadline and cancellationCause() records why it fired. A hop runs its work inside the context (run/call) so outgoing RPCs inherit the deadline - grpc-java propagates it by default, which makes this the canonical realization - and cancels the context in a finally block so it can be collected. The classic per-stage Future.get(timeout) arrangement is replaced by the scoped context. Sibling variant: without an RPC framework the budget is split by hand over CompletableFuture.orTimeout/completeOnTimeout against one nanoTime-based deadline.",
+      "min_standard": "Java8",
+      "idiom_name": "io.grpc.Context.withDeadline / withDeadlineAfter + CancellableContext",
+      "code_sketch": "Context.CancellableContext ctx = Context.current()\n        .withDeadlineAfter(remainingMillis, TimeUnit.MILLISECONDS, scheduler);\ntry {\n    return ctx.call(() -> userStub.get(req));   // outgoing RPC inherits the deadline\n} finally {\n    ctx.cancel(null);   // release when the work finished early\n}",
+      "pitfalls": [
+        "Every attach() needs a matching detach() and every CancellableContext a cancel(); the javadoc states that breaking these rules leaks memory.",
+        "Context is scoped to the current thread: work handed to another thread must be wrapped (wrap(Runnable), currentContextExecutor) or the deadline and cancellation do not follow.",
+        "withDeadline cancels the context but cannot stop code that ignores isCancelled(); long computations must check the context at stage boundaries.",
+        "Do not compute the budget from System.currentTimeMillis(); the deadline is scheduled on the system nano clock, so treat getDeadline() as authoritative and derive remaining time consistently."
+      ],
+      "sources": [
+        "https://grpc.github.io/grpc-java/javadoc/io/grpc/Context.html",
+        "https://grpc.io/docs/guides/deadlines/"
+      ]
+    },
+    {
+      "variant_id": "completable-future-deadline",
+      "name": "CompletableFuture.orTimeout per stage over one shared deadline (JDK)",
+      "paradigm": "concurrent",
+      "implementation_notes": "Without an RPC framework there is no ambient context, so the budget must be split by hand: keep one absolute deadlineNanos (System.nanoTime based) and give each asynchronous stage CompletableFuture.orTimeout(remaining, unit) - exceptionally completing it with TimeoutException when the budget runs out - or completeOnTimeout for a fallback value. The class maintains a single daemon thread for delays and timeouts, so the mechanism is cheap, but it is per-future: the hop must recompute remaining at every stage and must not hand a stage a fresh full timeout. It composes naturally with allOf/anyOf fan-outs, one orTimeout per child.",
+      "min_standard": "Java9",
+      "idiom_name": "CompletableFuture.orTimeout / completeOnTimeout against one deadline",
+      "code_sketch": "long deadlineNanos = System.nanoTime() + budgetNanos;   // once, at ingress\n...\nvar f = callDownstream(req)\n        .orTimeout(remainingMillis(deadlineNanos), TimeUnit.MILLISECONDS);\ntry {\n    return f.join();\n} catch (CompletionException e) {\n    if (e.getCause() instanceof TimeoutException) throw new DeadlineExceeded(e);\n    throw e;\n}",
+      "pitfalls": [
+        "orTimeout completes the future exceptionally but does not cancel the underlying work (no thread interruption); the producer continues unless it observes cancellation itself.",
+        "Chaining orTimeout per stage with a fresh constant turns the budget into a sum again - always derive from the one deadlineNanos.",
+        "CancellationException from CompletableFuture.cancel() is not TimeoutException; if explicit cancel is used on expiry, handle both paths.",
+        "join() wraps failures in CompletionException, so unwrap the cause before mapping to a deadline error or the real cause is lost."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+      ]
+    }
+  ],
+  "default_variant": "grpc-context-deadline",
+  "version": "1.0"
+}

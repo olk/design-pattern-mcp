@@ -1,0 +1,74 @@
+{
+  "pattern": "forwarder-receiver",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "Boost.Asio async_write/async_read chain on a tcp::socket",
+  "implementation_notes": "Modern C++ default: Boost.Asio supplies the transport and the completion dispatch, so the forwarder is a small object owning a tcp::socket that serialises a typed message into a buffer and calls asio::async_write, while the receiver is an asio::async_read chain that completes one frame, decodes it and invokes the peer's handler; io_context is the receiver loop, replacing the hand-written receiver thread. Because async_read/async_write guarantee completion of the whole buffer, the framing step reduces to choosing the frame (typically a 4-byte big-endian length plus payload). The classic POSA1 structure - separate forwarder/receiver classes plus an explicit dispatcher - is still justified when the same peer must run over several mechanisms or when a non-Asio transport has to be plugged in.",
+  "code_sketch": "class Forwarder {\n  asio::ip::tcp::socket sock_;\npublic:\n  void send(const Message& m) {\n    auto buf = std::make_shared<std::string>(encode(m));   // 4-byte len + payload\n    asio::async_write(sock_, asio::buffer(*buf),\n        [buf](std::error_code ec, std::size_t) { if (ec) on_peer_gone(ec); });\n  }\n};\n// receiver: async_read(sock_, buffer(hdr,4), ...) then the body, then dispatch(msg)",
+  "pitfalls": [
+    "The buffer must outlive async_write - capture the shared_ptr (or the session object); a dangling buffer is the classic Asio bug.",
+    "A completion handler must not run blocking work when io_context is single-threaded, or every other connection starves.",
+    "Ignoring the error_code makes a dead peer indistinguishable from an idle one; close the socket and notify the peer on the first failure."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/networking/protocols.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "asio-callbacks",
+      "name": "Boost.Asio forwarder/receiver over tcp::socket (completion handlers)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Asio async_write/async_read chain on a tcp::socket",
+      "implementation_notes": "Modern C++ default: Boost.Asio supplies the transport and the completion dispatch, so the forwarder is a small object owning a tcp::socket that serialises a typed message into a buffer and calls asio::async_write, while the receiver is an asio::async_read chain that completes one frame, decodes it and invokes the peer's handler; io_context is the receiver loop, replacing the hand-written receiver thread. Because async_read/async_write guarantee completion of the whole buffer, the framing step reduces to choosing the frame (typically a 4-byte big-endian length plus payload). The classic POSA1 structure - separate forwarder/receiver classes plus an explicit dispatcher - is still justified when the same peer must run over several mechanisms or when a non-Asio transport has to be plugged in.",
+      "code_sketch": "class Forwarder {\n  asio::ip::tcp::socket sock_;\npublic:\n  void send(const Message& m) {\n    auto buf = std::make_shared<std::string>(encode(m));   // 4-byte len + payload\n    asio::async_write(sock_, asio::buffer(*buf),\n        [buf](std::error_code ec, std::size_t) { if (ec) on_peer_gone(ec); });\n  }\n};\n// receiver: async_read(sock_, buffer(hdr,4), ...) then the body, then dispatch(msg)",
+      "pitfalls": [
+        "The buffer must outlive async_write - capture the shared_ptr (or the session object); a dangling buffer is the classic Asio bug.",
+        "A completion handler must not run blocking work when io_context is single-threaded, or every other connection starves.",
+        "Ignoring the error_code makes a dead peer indistinguishable from an idle one; close the socket and notify the peer on the first failure."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/networking/protocols.html"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutines",
+      "name": "Boost.Asio with C++20 stackless coroutines",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await async_read/async_write session coroutines",
+      "implementation_notes": "On a C++20 toolchain the same two roles become linear coroutines: use_awaitable turns async_read/async_write into co_await expressions, so the receiver is a plain read header / read body / dispatch loop and the forwarder is a co_await write instead of a callback chain. The roles and the framing stay exactly as in the callback variant - what changes is control flow, which removes the nested-handler pyramid and the manual state objects it requires. Prefer this variant when the toolchain is C++20 and readability of the session code matters more than compatibility.",
+      "code_sketch": "asio::awaitable<void> receiver(tcp::socket sock) {\n  std::array<char, 4> hdr{};\n  for (;;) {\n    co_await asio::async_read(sock, asio::buffer(hdr), asio::use_awaitable);\n    std::string body(decode_length(hdr), '\\0');\n    co_await asio::async_read(sock, asio::buffer(body), asio::use_awaitable);\n    dispatch(decode(body));                            // peer method\n  }\n}\n// co_spawn(io, receiver(std::move(sock)), asio::detached);",
+      "pitfalls": [
+        "A detached co_spawn erases ownership: the session coroutine must own its socket and state, or a destroyed peer leaves a coroutine writing into freed memory.",
+        "use_awaitable reports errors as exceptions, so the coroutine body needs a try/catch at its boundary or the failure disappears into the detached frame.",
+        "Cancelling a co_await does not cancel the peer's view of the exchange; decide the disconnect policy before spawning."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html"
+      ]
+    },
+    {
+      "variant_id": "zeromq-multipart",
+      "name": "libzmq/cppzmq message sockets",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "zmq::socket_t + zmq::multipart_t (cppzmq)",
+      "implementation_notes": "Here a messaging library owns the whole mechanism: cppzmq wraps libzmq's socket_t and multipart_t, which already frame, queue and (for some socket types) reconnect messages, so the peer's forwarder becomes a push/pair socket that sends a multipart message and the receiver a loop that receives one; the marshalling role moves out of the forwarder into the codec helper (or into multipart frames). Choose this when the transparency of Forwarder-Receiver is wanted but a hand-written transport is not - especially when several peers or a later fan-out may be added - and note that the message contract, versioning and delivery semantics are still the application's responsibility.",
+      "code_sketch": "zmq::context_t ctx;\nzmq::socket_t forwarder(ctx, zmq::socket_type::push);   // peer1 -> peer2\nforwarder.connect(\"tcp://peer2:5555\");\nzmq::multipart_t msg;\nmsg.addstr(\"order.created\"); msg.addstr(encode(payload));\nmsg.send(forwarder);\n\nzmq::socket_t receiver(ctx, zmq::socket_type::pull);     // peer2 side\nreceiver.bind(\"tcp://*:5556\");\nfor (;;) { zmq::multipart_t in(receiver); dispatch(in.popstr(), decode(in.popstr())); }",
+      "pitfalls": [
+        "ZeroMQ queues instead of blocking: at the high-water mark messages are dropped (or the sender blocks, depending on socket type), so set the HWM deliberately and decide the overflow policy.",
+        "Connecting to a peer that is not up yet 'succeeds' - the send is buffered - so failures surface late; monitor and health-check the socket.",
+        "Multipart frames are ordered and framing-safe, but a PAIR socket binds two endpoints only; picking the socket type is picking the topology."
+      ],
+      "sources": [
+        "https://github.com/zeromq/cppzmq"
+      ]
+    }
+  ],
+  "default_variant": "asio-callbacks",
+  "version": "1.0"
+}

@@ -1,0 +1,55 @@
+{
+  "pattern": "application-service",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "struct with interface ports + Database.BeginTx, tx passed to every port call",
+  "implementation_notes": "The service is a struct with interface-typed ports; the use case begins the transaction with db.BeginTx, defers Rollback (a no-op after Commit) and passes the *sql.Tx - or the narrower DBTX interface that both *sql.DB and *sql.Tx satisfy, as sqlc generates - into every port method. There is no container and no declarative transaction: the composition root wires the struct and the unit of work becomes an explicit parameter. Typing the ports on a DBTX-style interface keeps database/sql out of the domain without adding a wrapper type.",
+  "code_sketch": "func (s *PlaceOrderService) Place(ctx context.Context, cmd PlaceOrder) (OrderID, error) {\n    tx, err := s.db.BeginTx(ctx, nil)\n    if err != nil { return 0, err }\n    defer tx.Rollback()                              // no-op after Commit\n    customer, err := s.customers.Get(ctx, tx, cmd.CustomerID)\n    if err != nil { return 0, err }\n    order, err := customer.PlaceOrder(cmd.Items)     // the domain decides\n    if err != nil { return 0, err }\n    if err := s.orders.Add(ctx, tx, order); err != nil { return 0, err }\n    if err := tx.Commit(); err != nil { return 0, err }\n    return order.ID, nil\n}",
+  "pitfalls": [
+    "defer tx.Rollback() must be registered immediately after BeginTx, before any early error return, or the connection keeps an open transaction.",
+    "Calling the pool's plain methods inside the use case silently runs outside the transaction; every port call must receive the tx handle.",
+    "Holding the transaction across HTTP calls to third parties is a common source of pool exhaustion and deadlocks in Go services."
+  ],
+  "sources": [
+    "https://go.dev/doc/database/execute-transactions",
+    "https://pkg.go.dev/database/sql#DB.BeginTx"
+  ],
+  "variants": [
+    {
+      "variant_id": "explicit-tx-handle",
+      "name": "Service struct with an explicit *sql.Tx handle",
+      "paradigm": "procedural",
+      "idiom_name": "struct with interface ports + Database.BeginTx, tx passed to every port call",
+      "implementation_notes": "The service is a struct with interface-typed ports; the use case begins the transaction with db.BeginTx, defers Rollback (a no-op after Commit) and passes the *sql.Tx - or the narrower DBTX interface that both *sql.DB and *sql.Tx satisfy, as sqlc generates - into every port method. There is no container and no declarative transaction: the composition root wires the struct and the unit of work becomes an explicit parameter. Typing the ports on a DBTX-style interface keeps database/sql out of the domain without adding a wrapper type.",
+      "code_sketch": "func (s *PlaceOrderService) Place(ctx context.Context, cmd PlaceOrder) (OrderID, error) {\n    tx, err := s.db.BeginTx(ctx, nil)\n    if err != nil { return 0, err }\n    defer tx.Rollback()                              // no-op after Commit\n    customer, err := s.customers.Get(ctx, tx, cmd.CustomerID)\n    if err != nil { return 0, err }\n    order, err := customer.PlaceOrder(cmd.Items)     // the domain decides\n    if err != nil { return 0, err }\n    if err := s.orders.Add(ctx, tx, order); err != nil { return 0, err }\n    if err := tx.Commit(); err != nil { return 0, err }\n    return order.ID, nil\n}",
+      "pitfalls": [
+        "defer tx.Rollback() must be registered immediately after BeginTx, before any early error return, or the connection keeps an open transaction.",
+        "Calling the pool's plain methods inside the use case silently runs outside the transaction; every port call must receive the tx handle.",
+        "Holding the transaction across HTTP calls to third parties is a common source of pool exhaustion and deadlocks in Go services."
+      ],
+      "sources": [
+        "https://go.dev/doc/database/execute-transactions",
+        "https://pkg.go.dev/database/sql#DB.BeginTx"
+      ]
+    },
+    {
+      "variant_id": "callback-transactor",
+      "name": "Callback transactor (unit-of-work port)",
+      "paradigm": "procedural",
+      "idiom_name": "uow.Execute(ctx, func(tx Store) error) - commits on nil, rolls back on error",
+      "implementation_notes": "Instead of threading *sql.Tx through every signature, the service depends on a small unit-of-work port whose Execute(ctx, fn) begins, commits or rolls back around the callback, and whose tx argument is a store interface implemented by both the pooled and the transactional store. The service layer then never imports database/sql, the same store type works inside and outside a transaction, and test doubles are trivial; the cost is one more abstraction and a callback nesting level.",
+      "code_sketch": "func (s *PlaceOrderService) Place(ctx context.Context, cmd PlaceOrder) (OrderID, error) {\n    var id OrderID\n    err := s.uow.Execute(ctx, func(tx Store) error {   // commits on nil, rolls back on error\n        customer, err := tx.Customers().Get(ctx, cmd.CustomerID)\n        if err != nil { return err }\n        order, err := customer.PlaceOrder(cmd.Items)   // the domain decides\n        if err != nil { return err }\n        if err := tx.Orders().Add(ctx, order); err != nil { return err }\n        id = order.ID\n        return nil\n    })\n    return id, err\n}",
+      "pitfalls": [
+        "A callback that swallows an error and returns nil commits the transaction; every failure path must return it.",
+        "Nested Execute calls must reuse the active transaction (through the context) or they deadlock waiting for a second connection.",
+        "The result must be captured in an outer variable, because the callback returns only an error."
+      ],
+      "sources": [
+        "https://rednafi.com/shards/2026/03/transactions-with-repository-pattern/",
+        "https://dev.to/gabrielanhaia/stop-passing-sqltx-through-your-go-service-layer-lp7"
+      ]
+    }
+  ],
+  "default_variant": "explicit-tx-handle",
+  "version": "1.0"
+}

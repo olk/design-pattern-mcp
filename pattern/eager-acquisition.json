@@ -1,0 +1,204 @@
+{
+  "category": "persistence-state",
+  "name": "eager-acquisition",
+  "aliases": [
+    "eager initialization",
+    "pre-warming"
+  ],
+  "intent": "Acquire and initialise a resource before anything needs it - at construction, at process start-up or at task activation - so every use pays a small, predictable cost and any acquisition failure surfaces before the deadline instead of inside it.",
+  "problem": "A resource whose acquisition is slow, blocking or failure-prone - a connection, a decoded model, a thread pool, a buffer, a warm cache - is first touched on a path that has a deadline: the first call pays the whole cost, the latency curve shows unexplained spikes after every cold start, and a misconfigured dependency is discovered inside a user request rather than during deployment. The recurring decision is whether to acquire the resource up front and hold it, or to keep deferring its cost to first use.",
+  "context": "Applies wherever the use-time budget is tight or contractual (real-time and control loops, latency-SLO services, media and trading paths, batch windows) and start-up is a controlled phase that may perform I/O while the hot path may not. It is a resource-lifecycle policy of the resource's owner rather than of a call site: it also applies inside an object that pre-warms its own dependencies during construction, and inside a worker that provisions everything before entering its loop.",
+  "benefits": [
+    "Use-time cost becomes predictable: no acquisition, pool growth, decoding or class loading happens on the critical path, so first-use latency stops dominating the tail after every cold start.",
+    "Failures surface where they are cheapest to handle - a dependency that is down, unreachable or misconfigured stops the start-up or fails the readiness check, instead of failing an arbitrary later request.",
+    "The contention burst at the first request disappears: pre-started workers, pre-filled pools and pre-built indexes let the system run at steady-state cost from the first unit of traffic.",
+    "Acquisition logic exists once, in one controlled initialisation path, instead of being duplicated - or accidentally omitted - at every use site.",
+    "Deadline-bearing systems become feasible at all: a hard real-time or contractual deadline can only be met when allocation, connection setup and decoding are paid outside it.",
+    "Start-up work becomes measurable and governable: the eager set is an explicit, observable budget with a readiness gate instead of an invisible tax spread over the first minutes of traffic."
+  ],
+  "tradeoffs": [
+    "The cost moves to start-up, the phase where it is often most expensive: serverless cold starts, autoscaling latency, CLI invocation time and rolling-deploy windows all get worse.",
+    "Resources acquired for code paths that are never taken sit idle while paying memory, file descriptors, connection slots or licences - an eagerly filled pool for a rarely used dependency is pure overhead.",
+    "Boot becomes dependency-coupled: an unavailable dependency can prevent the process from starting at all, and when the acquisition runs inside a once/static-initialisation construct the failure is cached for the process lifetime (a type-initialisation error on the JVM and in .NET, a panic in init() in Go), turning a partial outage into a total one.",
+    "Idle resources rot: connections and leases are reaped by NAT, firewall, load-balancer and database idle timeouts before their first use, so eager acquisition without validation converts a lazy failure into a stale one.",
+    "The eager set is a policy that must be maintained: as dependencies, traffic patterns and deployment topology change, an unmaintained eager set either over-provisions at boot or quietly recreates the cold-path problem it was meant to remove.",
+    "Tests and local development pay the full warm-up unless the acquisition seam is injectable, and the initialisation path is a second code path with its own failure policy, timeouts and observability to design."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Resource",
+      "responsibility": "The thing whose acquisition is moved earlier: a connection, session, buffer, worker thread, file handle, decoded model or warm cache entry - it has a non-trivial creation cost and a lifetime somebody has to own."
+    },
+    {
+      "role": "Resource Provider",
+      "responsibility": "Supplies and validates the resource: an allocator, pool, connection factory, runtime or loader. It may itself need preparation (pool construction, credentials, transport bootstrap) before the resource can be handed out."
+    },
+    {
+      "role": "Acquirer / Owner",
+      "responsibility": "Performs the acquisition before use and owns the resource for its lifetime - usually the component that will consume it (a service, an instance, a worker) or a dedicated lifecycle manager."
+    },
+    {
+      "role": "Acquisition Point",
+      "responsibility": "The hook that makes the acquisition early: a constructor, a static/type initializer, an init()/main bootstrap, an application factory, a host start-up callback or a readiness gate. It runs once, inside a controlled phase, and must be idempotent."
+    },
+    {
+      "role": "Consumer / Deadline Holder",
+      "responsibility": "Code whose budget must be met. It reads an already-acquired resource and pays no acquisition cost, and it depends on the Acquisition Point having completed - signalled by readiness, health or explicit sequencing."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Service bootstrap: open and pre-fill the database pool, load configuration and secrets, build TLS contexts and pre-touch hot caches before the readiness probe starts routing traffic.",
+    "Latency-critical first call: trading, telecom and media paths where a lazy model load or cache warm-up would blow the deadline - decode the model and build the lookup tables at boot.",
+    "Worker capacity: pre-start executor threads (prestartAllCoreThreads, a pre-spawned goroutine pool) so the first burst does not pay thread-creation and scheduler latency.",
+    "Real-time and embedded loops: pre-allocate buffers, DMA-capable memory and fixed-size queues during initialisation so the control loop contains no allocation or blocking call.",
+    "Batch and ETL windows: open every shard, file and index before the processing window starts, so the whole window is productive instead of paying setup.",
+    "Cold-start-sensitive deployments: provisioned concurrency, warmed container pools or an explicit warm-up endpoint after a deploy, moving JIT and first-call cost out of user traffic.",
+    "Cache warm-up in front of a hot read path: populate the entries the next minutes of traffic will ask for, so the source of truth never sees a miss storm at start-up.",
+    "HTTP client pool hardening: configure pool_max_idle_per_host and pool_idle_timeout with tcp_keepalive on long-running services to prevent silent connection rot after hours of idle time.",
+    "Database connection pool validation: validate connections on checkout (e.g., Hibernate's validate() or HikariCP's connectionTestQuery) rather than trusting the pool to be healthy after idle periods.",
+    "Microservice dependency pre-warming: eagerly resolve service mesh certificates, feature flag values and remote configuration before accepting traffic, so a cold dependency does not cascade into a request failure.",
+    "ML model serving: load and compile the inference model during the initialization phase of the serving process, keeping the handler path pure computation.",
+    "Serverless function initialization: move heavy library imports, JIT compilation and one-time setup into the init phase (Lambda's init handler, Provisioned Concurrency environments) so the handler stays lean.",
+    "Spring container boot: ApplicationContext pre-instantiates all non-lazy singleton beans at context refresh by default, so misconfiguration, missing dependencies and bad credentials fail the boot instead of the first request; @Lazy exists precisely to opt rarely used beans out of the eager set.",
+    "PostgreSQL pg_prewarm: preload relation blocks into the OS or shared buffer cache at server start; the autoprewarm worker records the cached block set and reloads it after a restart so the first queries post-restart skip cold disk reads.",
+    "Kubernetes pod bootstrap: init containers run setup work - waiting for dependencies, preloading data, fetching configuration - sequentially to completion before any app container starts, so the app container's first action already finds its resources in place."
+  ],
+  "avoid_when": [
+    "The resource may never be needed and the process is short-lived (one-shot CLI, migration script, serverless handler with long idle gaps): use lazy acquisition or lazy initialization and pay on first use.",
+    "Start-up time is the scarce resource (serverless cold start, aggressive autoscaling, fast rollbacks): keep acquisition lazy and warm up in the background rather than blocking readiness.",
+    "The resource is expensive, shared and used rarely: pool it (object-pool) or split it so only the cheap part is eager (partial-acquisition) instead of giving every owner its own eager copy.",
+    "The resource is idle-timeout-prone and cannot be validated cheaply: acquire lazily, or keep the eager pool alive with keepalive/validation, instead of holding a stale connection for hours to save milliseconds.",
+    "A non-critical dependency would take the whole process down at boot: apply graceful degradation or a fail-fast boundary and acquire eagerly only what the process genuinely cannot serve without.",
+    "An infrastructure layer already warms it (platform-managed connection pools, DI container eager singletons, pre-warmed container pools): configure that mechanism instead of writing a second acquisition path."
+  ],
+  "language_files": {
+    "generic": "eager-acquisition.generic.json",
+    "c": "eager-acquisition.c.json",
+    "cplusplus": "eager-acquisition.cplusplus.json",
+    "csharp": "eager-acquisition.csharp.json",
+    "go": "eager-acquisition.go.json",
+    "java": "eager-acquisition.java.json",
+    "javascript": "eager-acquisition.javascript.json",
+    "kotlin": "eager-acquisition.kotlin.json",
+    "python": "eager-acquisition.python.json",
+    "ruby": "eager-acquisition.ruby.json",
+    "rust": "eager-acquisition.rust.json",
+    "scala": "eager-acquisition.scala.json",
+    "swift": "eager-acquisition.swift.json",
+    "typescript": "eager-acquisition.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "module",
+  "provenance": [
+    "posa3"
+  ],
+  "related_patterns": [
+    "lazy-acquisition",
+    "partial-acquisition",
+    "object-pool",
+    "caching",
+    "lazy-initialization",
+    "resource-return",
+    "dispose",
+    "fail-fast",
+    "raii"
+  ],
+  "anti_patterns": [
+    "Acquiring everything eagerly 'just in case': boot time, memory and file descriptors balloon for resources most executions never touch - the pattern applied as a reflex instead of a measured decision.",
+    "Eager acquisition without validation: the pool is filled and the handles are open, and the first request discovers that the credentials expired or that a middlebox reaped the idle connection long ago.",
+    "Hiding a design problem behind warm-up: preloading a huge dataset or pre-computing a response because the use site was never made proportional - the cost is not removed, only moved where it is harder to see.",
+    "Performing I/O or taking locks inside a language-level once/static-initialisation construct, where the failure gets cached (or a deadlock with the initialisation lock is created) and the ordering against other initialisers is unspecified.",
+    "Eagerly provisioning more than the system can serve - hundreds of idle pool connections or worker threads at boot - so the process exhausts its own memory, its file descriptors or the dependency's connection limit before it serves anyone.",
+    "Treating eager acquisition as a substitute for a health signal: warm resources are not proven working resources, and a readiness probe that flips healthy before the acquisition has finished routes traffic straight into the cold path.",
+    "Leaving idle connections unvalidated: not configuring pool_idle_timeout or TCP keepalive on long-running HTTP clients, so connections go stale and produce silent failures (200 OK with empty body) after hours of inactivity.",
+    "Eager acquisition inside a constructor that is called from another constructor or from a parent-class constructor before the object is fully initialized, leaking a reference to a not-yet-constructed object to another thread."
+  ],
+  "migration_from": [
+    "lazy-initialization"
+  ],
+  "migration_to": [
+    "lazy-acquisition",
+    "partial-acquisition"
+  ],
+  "design_principles": [
+    "Keep the deadline-bearing path free of acquisition: move provisioning, allocation and decoding out of the hot path into a controlled phase.",
+    "Fail fast at start-up: detect dependency failure where handling is cheapest - before traffic, not inside a user request.",
+    "Explicit resource ownership and lifecycle: the owner acquires, validates and releases, so acquisition policy belongs to the owner rather than to each call site.",
+    "Make the cost visible and budgeted: start-up work is measured and bounded, and readiness depends on its completion.",
+    "Separation of concerns: provisioning is separated from use, and the acquisition point stays idempotent with no surprise side effects.",
+    "Validate before trusting: construction success is not proof of usability - prove the resource works with a canary call or health check.",
+    "Deterministic release: pair every eager acquisition with a corresponding release (RAII destructor, Dispose, context manager __exit__) so resources are not leaked on any code path including exceptions."
+  ],
+  "best_practices": [
+    "Acquire eagerly only for resources that are on the critical path or certain to be used; keep the rest lazy, and measure before turning the policy on.",
+    "Bound the eager phase: acquisition timeouts, a start-up budget and an explicit failure policy (fail the boot, degrade, or retry with backoff) - never let one dependency hang start-up indefinitely.",
+    "Validate rather than merely construct: open and ping a connection, decode the model, make a canary call; successful construction is not proof of usability.",
+    "Gate readiness - or acceptance of traffic - on completion of the eager phase, and report progress so slow start-ups stay diagnosable.",
+    "Keep idle resources fresh: pool keepalive/validation and recycle intervals shorter than the infrastructure's idle timeout, or acquire lazily where that cannot be guaranteed.",
+    "Make acquisition injectable and skippable so tests and local runs bootstrap cheaply, and idempotent so a warm-up hook can replay it after a deploy.",
+    "Pair the eager phase with deterministic release (RAII, Dispose, execute-around) and re-evaluate the eager set whenever the dependency or deployment topology changes.",
+    "Pre-start core thread pool threads (e.g., ThreadPoolExecutor.prestartAllCoreThreads()) before the first task arrives to eliminate thread-creation latency from the hot path.",
+    "Configure connection pool idle timeouts and TCP keepalive to match infrastructure limits (firewall, NAT, load-balancer) - connections left idle longer than the timeout are silently reaped, turning eager acquisition into a stale-resource problem.",
+    "In cloud/serverless environments, use provisioned concurrency or pre-warmed containers, but keep the initialization phase outside the handler and validate resources with a health probe before routing traffic.",
+    "For language-level static/once initializers (Go init(), Java static blocks, C# static constructors), move fallible I/O out of them into explicit initialization methods that return errors - cached init failures are process-lifetime failures.",
+    "Use sync.Once or equivalent in Go to replace fallible init() calls, enabling proper error propagation and test isolation."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Michael Kircher & Prashant Jain, Pattern-Oriented Software Architecture Vol. 3: Patterns for Resource Management (Wiley, 2004) - Eager Acquisition, in the volume's resource-acquisition group alongside Lazy Acquisition, Partial Acquisition and Lookup.",
+    "https://www.wiley.com/en-us/pattern-oriented-software-architecture-volume-3-patterns-for-resource-management-p-9780470845257",
+    "https://en.wikipedia.org/wiki/Pattern-Oriented_Software_Architecture",
+    "https://ci.nii.ac.jp/ncid/BA69229782",
+    "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.588.659",
+    "http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.415.3725",
+    "https://effective-rust.com/raii.html — Effective Rust Item 11: Implement the Drop trait for RAII patterns",
+    "https://google.github.io/comprehensive-rust/idiomatic/leveraging-the-type-system/raii.html — Comprehensive Rust: RAII with Drop trait",
+    "https://learn.microsoft.com/en-us/dotnet/standard/design-guidelines/dispose-pattern — Microsoft .NET Dispose Pattern (Framework Design Guidelines)",
+    "https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/implementing-dispose — Microsoft .NET: Implement a Dispose method",
+    "https://cpp-core-guidelines-docs.vercel.app/resource — C++ Core Guidelines: Resource management (RAII)",
+    "https://github.com/MicrosoftDocs/cpp-docs/blob/main/docs/cpp/object-lifetime-and-resource-management-modern-cpp.md — Microsoft C++: Object Lifetime and Resource Management",
+    "https://dev.to/gabrielanhaia/synconcefunc-vs-init-lazy-initialization-done-right-in-go-10mk — Go sync.OnceFunc vs init(): Lazy Initialization Done Right",
+    "https://leapcell.io/blog/the-init-function-in-go-orchestrating-initialization-logic — Go init() Function: Orchestrating Initialization Logic",
+    "https://docs.python.org/3/library/contextlib.html — Python contextlib: Utilities for with-statement contexts",
+    "https://stackoverflow.com/questions/73379360/idiomatically-should-python-context-managers-acquire-resources-at-initialization — Stack Overflow: Python context managers resource acquisition",
+    "https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html — AWS Lambda: Provisioned Concurrency",
+    "https://aws.amazon.com/blogs/compute/understanding-and-remediating-cold-starts-an-aws-lambda-perspective/ — AWS Compute Blog: Understanding and Remediation Cold Starts",
+    "https://www.besthub.dev/articles/understanding-java-threadpoolexecutor-implementation-details-and-business-best-practices-147ee1255bdc — Java ThreadPoolExecutor: prestartAllCoreThreads",
+    "https://raw.githubusercontent.com/wususu/effective-resourses/master/Java/Java%20Concurrency%20in%20Practice.pdf — Java Concurrency In Practice",
+    "https://devopsil.com/articles/2026-05-02-aws-lambda-cold-start-optimization-using-provisioned-concurr — AWS Lambda Cold Start Optimization Using Provisioned Concurrency and SnapStart",
+    "https://www.oreilly.com/library/view/pattern-oriented-software-architecture/9780470845257/12_c002.html — POSA Vol. 3 ch. 2 'Resource Acquisition': Eager Acquisition vs Lazy Acquisition for real-time/timing guarantees",
+    "http://www.kircher-schwanninger.de/michael/publications/LazyAcquisition.pdf — Kircher & Jain: Lazy Acquisition paper contrasting the eager counterpart",
+    "https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-lazy-init.html — Spring Framework reference: container pre-instantiates singletons at start-up by default; @Lazy opts out",
+    "https://www.postgresql.org/docs/current/pgprewarm.html — PostgreSQL pg_prewarm: preload relation data into buffer caches, autoprewarm across restarts",
+    "https://github.com/brettwooldridge/HikariCP/blob/dev/README.md — HikariCP README: minimumIdle fills the pool toward the idle target at start-up; initializationFailTimeout fails boot when the database is down",
+    "https://kubernetes.io/docs/concepts/workloads/pods/init-containers/ — Kubernetes init containers: run to completion before app containers start, gating Pod Ready",
+    "https://umatechnology.org/lazy-vs-eager-instantiation-in-java-which-is-better/ — critique of the tradeoff: eager raises start-up time and memory and wastes resources for objects never used"
+  ],
+  "related_patterns_notes": {
+    "context-manager": "context-manager",
+    "connection-pool": "connection-pool",
+    "readiness-gate": "readiness-gate"
+  }
+}

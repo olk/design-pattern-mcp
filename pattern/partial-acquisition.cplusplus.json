@@ -1,0 +1,79 @@
+{
+  "pattern": "partial-acquisition",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::async(std::launch::deferred) plus std::shared_future for the deferred shared part",
+  "implementation_notes": "The standard library supplies both halves of the pattern: std::async(std::launch::deferred, f) creates the future object immediately but only stores the callable, and the first non-timed wait evaluates it in the calling thread, so the cheap stage is the future and the expensive stage is the call. std::shared_future publishes that single result to every holder, which is the canonical way to share an expensive part without acquiring it twice, and buffered istreams plus file descriptors give the same shape for data. RAII releases the stages that were actually acquired, in reverse order of declaration, which turns the staged-release obligation into a property of the scope; reach for a hand-written stage plan only when the stages must be gated on external capacity, resumed across restarts, or shared with code that cannot hold a future.",
+  "code_sketch": "auto idx = load_index(path);            // stage 1: cheap, always needed\nstd::shared_future<Payload> part =      // future exists, callable not run yet\n    std::async(std::launch::deferred, [idx]{ return fetch(idx.first_range); });\nuse_headers(idx);                       // work with the cheap stage first\nconst Payload& p = part.get();          // stage 2 runs here, once for every holder\n// members destruct in reverse order: payload, index, file handle",
+  "pitfalls": [
+    "A future created without an explicit policy may already have acquired the expensive part: the default is std::launch::async | std::launch::deferred and which one is chosen is implementation-defined (the standard only recommends using concurrency when available), so std::launch::deferred must be passed when the deferral is the point.",
+    "A deferred future runs on the thread that waits: the expensive stage blocks whoever calls get() first, and wait_for() reports future_status::deferred immediately instead of applying a timeout, so deferred work cannot be bounded by a wait.",
+    "A future destroyed without being waited on never runs a deferred callable - the second stage is silently skipped and the partial resource is all the caller gets.",
+    "shared_future::get returns a reference but an assignment copies, so the shared expensive part can be duplicated at the joins; hold a reference or put the payload behind a shared_ptr."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/async"
+  ],
+  "variants": [
+    {
+      "variant_id": "deferred-shared-future",
+      "name": "Deferred future with shared_future for the shared part",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::async(std::launch::deferred) plus std::shared_future for the deferred shared part",
+      "implementation_notes": "The standard library supplies both halves of the pattern: std::async(std::launch::deferred, f) creates the future object immediately but only stores the callable, and the first non-timed wait evaluates it in the calling thread, so the cheap stage is the future and the expensive stage is the call. std::shared_future publishes that single result to every holder, which is the canonical way to share an expensive part without acquiring it twice, and buffered istreams plus file descriptors give the same shape for data. RAII releases the stages that were actually acquired, in reverse order of declaration, which turns the staged-release obligation into a property of the scope; reach for a hand-written stage plan only when the stages must be gated on external capacity, resumed across restarts, or shared with code that cannot hold a future.",
+      "code_sketch": "auto idx = load_index(path);            // stage 1: cheap, always needed\nstd::shared_future<Payload> part =      // future exists, callable not run yet\n    std::async(std::launch::deferred, [idx]{ return fetch(idx.first_range); });\nuse_headers(idx);                       // work with the cheap stage first\nconst Payload& p = part.get();          // stage 2 runs here, once for every holder\n// members destruct in reverse order: payload, index, file handle",
+      "pitfalls": [
+        "A future created without an explicit policy may already have acquired the expensive part: the default is std::launch::async | std::launch::deferred and which one is chosen is implementation-defined (the standard only recommends using concurrency when available), so std::launch::deferred must be passed when the deferral is the point.",
+        "A deferred future runs on the thread that waits: the expensive stage blocks whoever calls get() first, and wait_for() reports future_status::deferred immediately instead of applying a timeout, so deferred work cannot be bounded by a wait.",
+        "A future destroyed without being waited on never runs a deferred callable - the second stage is silently skipped and the partial resource is all the caller gets.",
+        "shared_future::get returns a reference but an assignment copies, so the shared expensive part can be duplicated at the joins; hold a reference or put the payload behind a shared_ptr."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async"
+      ]
+    },
+    {
+      "variant_id": "mmap-window",
+      "name": "Memory-mapped window over the expensive region",
+      "paradigm": "data-oriented",
+      "min_standard": "C++11",
+      "requires_features": [
+        "posix"
+      ],
+      "idiom_name": "mmap window behind a RAII mapping class",
+      "implementation_notes": "Map a window over the expensive part and let the page cache transfer pages on first touch: there is no copy into the heap, the OS chooses the transfer granularity, and the window can be remapped per range so only the parts the consumer reaches are ever read. Wrap the mapping and the descriptor in small RAII types so the stages are unmapped and closed in reverse order even on early return. Choose it when the expensive part is a large local file and the access pattern is sparse or seeks a lot; do not choose it when the provider is remote or can change under you, because a mapping is not a snapshot.",
+      "code_sketch": "struct Window {                          // RAII staging: map, then unmap\n    Window(int fd, off_t off, size_t len)\n        : p(mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, off)), n(len) {}\n    ~Window() { if (p != MAP_FAILED) munmap(p, n); }\n    const std::byte* p; size_t n;\n};\nWindow w(fd, ix.off + want.offset, want.len);   // only this range is mapped\nconsume(w.p, w.n);                              // pages fault in as touched",
+      "pitfalls": [
+        "Truncating or replacing the mapped file raises SIGBUS on the next touch of the lost page, so this variant needs a provider (immutable or exclusively-owned file) that cannot change while the window lives.",
+        "The mapping outlives close(fd) legally (the manual states the descriptor may be closed immediately after mmap), but not munmap: forgetting to unmap keeps address space reserved and the file counted as busy.",
+        "Page-granularity faults make the first touch of a window unpredictable work, so latency-sensitive paths should prefetch (MAP_POPULATE / madvise) rather than discover the cost inside a deadline."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/mmap.2.html"
+      ]
+    },
+    {
+      "variant_id": "coroutine-generator",
+      "name": "C++20 generator coroutine that yields parts",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_yield generator over the remaining parts",
+      "implementation_notes": "A coroutine that co_yields one part at a time is a staged acquisition with ordinary control flow: the generator is created cheaply, each iteration resumes the coroutine far enough to produce the next part, and destroying the generator destroys the coroutine state, which releases whatever the current stage held. cppreference notes that coroutines are stackless and that the feature exists precisely to support non-blocking I/O without callback chains and lazy computation of long sequences; prefer this variant when the parts are produced by logic (filtering, decoding, merging sources) rather than read from one provider, and when the toolchain is already C++20.",
+      "code_sketch": "generator<Part> parts(const Index& ix) {          // stage 1 handed in as data\n    for (const auto& range : ix.wanted) {\n        auto data = fetch(range);                  // stage 2, one part at a time\n        co_yield Part{range.id, std::move(data)};\n    }\n}\nfor (const Part& p : parts(ix)) consume(p);        // pull; early break destroys state",
+      "pitfalls": [
+        "The coroutine state is allocated dynamically unless the compiler elides it, so a per-part generator on a hot path pays an allocation per acquisition; measure before replacing a plain range with one.",
+        "Execution runs on the resuming thread and nothing happens before the first resume, so a generator that is created and dropped acquires nothing - unlike a callback-based staged API there is no completion to observe.",
+        "Destruction is the only release hook: a part held in the coroutine frame is released when the generator dies, so ownership must be inside the frame or explicitly transferred out - a dangling reference to a local part is the classic coroutine error."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/coroutines"
+      ]
+    }
+  ],
+  "default_variant": "deferred-shared-future",
+  "version": "1.0"
+}

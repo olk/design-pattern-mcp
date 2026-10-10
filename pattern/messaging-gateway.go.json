@@ -1,0 +1,19 @@
+{
+  "pattern": "messaging-gateway",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "small interface + struct over nats.go Conn.Request or amqp091-go",
+  "implementation_notes": "Go has no proxy generation, so the gateway is a plain interface (InventoryGateway with CheckStock(ctx, sku)) implemented by a struct that owns the client. On NATS the request-reply mechanics are already solved: nc.Request(subject, payload, timeout) creates a private inbox, attaches the reply subject, returns the first reply and distinguishes nats.ErrNoResponders from nats.ErrTimeout, so the gateway method becomes a thin typed wrapper that maps those errors into domain errors. On AMQP you write the mechanics yourself - declare an exclusive reply queue, publish with ReplyTo and CorrelationId, loop until the correlation id matches (the Go RPC tutorial's fibonacciRPC is exactly that hand-written gateway). Nothing in either route gives you the domain interface: that part is always yours.",
+  "code_sketch": "type InventoryGateway interface {  // contract the caller sees\n\tCheckStock(ctx context.Context, sku string) (Stock, error)\n}\ntype natsInventory struct{ conn *nats.Conn }     // owns the transport\nfunc (g *natsInventory) CheckStock(ctx context.Context, sku string) (Stock, error) {\n\tmsg, err := g.conn.Request(\"orders.inventory.check\", []byte(sku), 2*time.Second)\n\tif err != nil {  // nats.ErrNoResponders | nats.ErrTimeout\n\t\treturn Stock{}, fmt.Errorf(\"inventory: %w\", err)\n\t}\n\tvar s Stock\n\treturn s, json.Unmarshal(msg.Data, &s)\n}",
+  "pitfalls": [
+    "nats.ErrTimeout and nats.ErrNoResponders are ordinary errors, and a timeout says only that the answer did not arrive in time - the gateway must map both into domain errors instead of letting callers compare against broker sentinels.",
+    "Core NATS replies are at-most-once: a reply that is lost is gone, so a timed-out call must be treated as an unknown outcome and the remote operation made idempotent before any retry.",
+    "The AMQP client opens a connection, a channel and an exclusive reply queue per request in the tutorial - a real gateway must pool connections and serialize use of a single channel rather than repeating that per call.",
+    "Swallowing ctx.Err() from a cancelled request hides the fact that the broker-side work may still be running."
+  ],
+  "sources": [
+    "https://docs.nats.io/learn/core-nats/request-reply",
+    "https://www.rabbitmq.com/tutorials/tutorial-six-go"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,64 @@
+{
+  "pattern": "command-processor",
+  "language": "python",
+  "idiom_name": "callable/partial commands + queue.Queue(maxsize) + ThreadPoolExecutor",
+  "implementation_notes": "The command is any callable - a bound method, a lambda, or a `functools.partial` that binds a receiver and its arguments - which replaces the Command subclass hierarchy. `queue.Queue(maxsize=N)` is the repository: `put` blocks when full, so the bound is real backpressure, and `ThreadPoolExecutor` is the executor whose `submit()` returns the `Future` that the history/log layer records and that surfaces exceptions. Undo is a list of inverse callables pushed by each command. The classic class structure starts earning its keep when commands must be persisted, validated or replayed (Celery/dramatiq-style durable queues) or when the request needs attributes beyond its arguments.",
+  "code_sketch": "q: \"queue.Queue[Callable[[], None]]\" = queue.Queue(maxsize=256)   # bounded\nhistory: list[Callable[[], None]] = []\nwith concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:\n    while (cmd := q.get()) is not None:\n        fut = pool.submit(cmd)        # executor owns when/where it runs\n        fut.add_done_callback(lambda f: history.append(cmd))   # log / undo\n        q.task_done()\nq.put(partial(service.place_order, order_id, qty))          # invocation only",
+  "pitfalls": [
+    "An exception raised inside a submitted callable is stored in the Future and invisible unless it is inspected (`fut.exception()`/done_callback); the processor must record failures explicitly.",
+    "queue.Queue.join() hangs forever if any error path skips task_done(); wrap execution in try/finally.",
+    "Queue() with no maxsize is unbounded - producers never slow down and memory grows under load.",
+    "The GIL means CPU-bound commands gain nothing from more workers; use ProcessPoolExecutor (which requires picklable commands and payloads) for CPU work."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/concurrent.futures.html",
+    "https://docs.python.org/3/library/queue.html",
+    "https://docs.python.org/3/library/functools.html"
+  ],
+  "support": "idiomatic",
+  "variants": [
+    {
+      "variant_id": "thread-queue-executor",
+      "name": "queue.Queue + ThreadPoolExecutor (threads)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.2",
+      "idiom_name": "callable/partial commands + queue.Queue(maxsize) + ThreadPoolExecutor",
+      "implementation_notes": "The command is any callable - a bound method, a lambda, or a `functools.partial` that binds a receiver and its arguments - which replaces the Command subclass hierarchy. `queue.Queue(maxsize=N)` is the repository: `put` blocks when full, so the bound is real backpressure, and `ThreadPoolExecutor` is the executor whose `submit()` returns the `Future` that the history/log layer records and that surfaces exceptions. Undo is a list of inverse callables pushed by each command. The classic class structure starts earning its keep when commands must be persisted, validated or replayed (Celery/dramatiq-style durable queues) or when the request needs attributes beyond its arguments.",
+      "code_sketch": "q: \"queue.Queue[Callable[[], None]]\" = queue.Queue(maxsize=256)   # bounded\nhistory: list[Callable[[], None]] = []\nwith concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:\n    while (cmd := q.get()) is not None:\n        fut = pool.submit(cmd)        # executor owns when/where it runs\n        fut.add_done_callback(lambda f: history.append(cmd))   # log / undo\n        q.task_done()\nq.put(partial(service.place_order, order_id, qty))          # invocation only",
+      "pitfalls": [
+        "An exception raised inside a submitted callable is stored in the Future and invisible unless it is inspected (`fut.exception()`/done_callback); the processor must record failures explicitly.",
+        "queue.Queue.join() hangs forever if any error path skips task_done(); wrap execution in try/finally.",
+        "Queue() with no maxsize is unbounded - producers never slow down and memory grows under load.",
+        "The GIL means CPU-bound commands gain nothing from more workers; use ProcessPoolExecutor (which requires picklable commands and payloads) for CPU work."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/concurrent.futures.html",
+        "https://docs.python.org/3/library/queue.html",
+        "https://docs.python.org/3/library/functools.html"
+      ]
+    },
+    {
+      "variant_id": "asyncio-queue",
+      "name": "asyncio.Queue + worker task (single-threaded async)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.7",
+      "requires_features": [
+        "asyncio"
+      ],
+      "idiom_name": "async command coroutines + asyncio.Queue + create_task worker loop",
+      "implementation_notes": "In an async application the repository is `asyncio.Queue(maxsize=N)` (`await queue.put()` blocks the producer coroutine when full) and the executor is one or more `asyncio.create_task(...)` workers awaiting `queue.get()`; commands are async callables, so I/O-bound receivers run concurrently on one thread without locks, and ordering is deterministic when a single worker drains the queue. Mixed applications should keep one repository, not two: blocking callables go to `loop.run_in_executor`/a thread pool from inside the async worker via `asyncio.to_thread`, rather than a second queue.",
+      "code_sketch": "queue: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue(maxsize=256)\nasync def processor() -> None:                # one worker == deterministic order\n    while True:\n        cmd = await queue.get()\n        try:\n            history.append(cmd)               # log / undo\n            await cmd()                       # async command body\n        finally:\n            queue.task_done()\nworker = asyncio.create_task(processor())\nawait queue.put(place_order(order_id, qty))    # suspends when full == backpressure",
+      "pitfalls": [
+        "A blocking call inside the worker (requests, time.sleep, sync DB driver) freezes the whole event loop; offload it with asyncio.to_thread.",
+        "asyncio.Queue is not thread-safe: producers on other threads must use loop.call_soon_threadsafe, not queue.put_nowait.",
+        "A worker task that raises ends silently unless awaited or wrapped; the processor loop must catch per command and keep draining.",
+        "Abandoning the worker task at shutdown leaves queued commands unexecuted - cancel the task and drain the queue (or await queue.join()) explicitly."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-queue.html"
+      ]
+    }
+  ],
+  "default_variant": "thread-queue-executor",
+  "version": "1.0"
+}

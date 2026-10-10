@@ -1,0 +1,217 @@
+{
+  "category": "concurrency-resilience",
+  "name": "balking",
+  "aliases": [],
+  "intent": "Make a state-dependent operation a now-or-never attempt: atomically test whether the object is ready, perform the transition only if the guard holds, and otherwise return an explicit refusal immediately—without waiting, queueing, or mutating state.",
+  "problem": "Several threads or event sources can invoke a state-dependent operation at the same time—a second start while one is running, a read before a resource opens, a write after close, or a re-entrant retry. Blocking can stall a thread or event loop for an unknown time, while an unsynchronised check followed by an action can admit competing callers or corrupt invariants. The design must make the guard and the state transition one atomic decision, then define what the caller observes when the precondition is false.",
+  "context": "Use Balking for concurrent or re-entrant objects whose invalid invocations are cheap and intentional to refuse: lifecycle methods, duplicate event triggers, optional capacity admissions, and event-loop operations that cannot block. It provides no eventual-completion guarantee: a refused request is dropped or deferred by the caller, whereas Guarded Suspension waits and a queue retains work. The refusal must be observable, and the predicate plus transition must be synchronized even when the actual operation runs after the guard.",
+  "benefits": [
+    "No thread, lock or event-loop turn is held waiting: a refused call costs one predicate evaluation and returns, so a temporarily unavailable object cannot stall its callers.",
+    "State stays consistent by construction: the transition happens only inside the guard, so competing callers cannot interleave a check with another caller's mutation and at most one proceeds.",
+    "Callers stay simple: the alternative - check the state, decide, then call - duplicates the state logic at every call site and still races; here the object owns the predicate.",
+    "Bounded resource use: balking turns overload and re-entrancy into immediate rejection instead of an unbounded crowd of waiting work, the same admission decision that stdlib try* primitives standardise.",
+    "Composable with the platform: every mainstream runtime ships non-blocking attempt primitives (tryLock, trySend, offer, acquire(blocking=False), Atomics), so the pattern rarely needs new machinery.",
+    "Explicit state-dependence: making the guard a first-class check documents which operations are legal in which states, which is the prerequisite for replacing ad-hoc flags with a real state machine.",
+    "Non-blocking by design: balking is the only state-dependent policy that never parks a thread, making it the only safe choice in event-loop coroutines, green threads, and virtual-thread environments where blocking has structural costs."
+  ],
+  "tradeoffs": [
+    "Silent loss: a balking method that returns nothing is indistinguishable from a successful one, so refusals must be signalled (boolean, status or documented exception) or the dropped work is invisible.",
+    "Wrong tool when the work must happen eventually: choosing balking over Guarded Suspension or a queue converts back-pressure into lost requests and pushes retry policy onto callers.",
+    "It removes the wait, not the synchronization: predicate and transition must still be one atomic step under a lock or compare-and-set, so the hardest part of the concurrency code remains.",
+    "Constructed unfairness: attempt-style primitives do not queue (ReentrantLock.tryLock deliberately ignores a fair lock's ordering), so a persistent loser can starve while others balk and retry.",
+    "Retries leak to call sites: callers that cannot drop the request often busy-poll the guard, reintroducing the CPU cost the pattern avoided, and un-counted balks vanish from telemetry.",
+    "It can hide a design problem: a state that balks 'temporarily for an unknown time' argues for a queue or for making the illegal state unrepresentable - the reason some authors call balking an anti-pattern.",
+    "Per-method duplication: every guarded method repeats the predicate, so the state model has to be centralised or the guards drift apart.",
+    "Legitimate work loss: an over-strict guard that balking considers 'not ready' when readiness is imminent skips work the caller expected, creating invisible data loss (e.g., auto-save balking through a slow I/O window, silently dropping the user's last edits)."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 4,
+    "maintainability": 6,
+    "simplicity": 8,
+    "performance": 7,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Balking Object",
+      "responsibility": "Owns the guarded state and the guarded methods; every predicate read and every transition touches that one state under the same synchronization."
+    },
+    {
+      "role": "Balking (Guarded) Method",
+      "responsibility": "Evaluates the state predicate and, when it fails, returns immediately without side effects (or throws only when the invocation is a programming error); it never waits and never queues."
+    },
+    {
+      "role": "State Predicate",
+      "responsibility": "The single expression of 'may this action run right now', kept next to the state it reads so that object and callers agree on which states are legal."
+    },
+    {
+      "role": "Caller",
+      "responsibility": "The thread, task or event source that invokes the guarded method and must tolerate or inspect a refusal, typically retrying on a later event instead of polling."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Start/stop lifecycles: a service, device or machine that is 'enabled' accepts start() once and returns immediately for concurrent starts (the classic washing-machine example).",
+    "Open/closed resource handles: a reader, session or driver that must be open before use; calls while it is closed balk instead of opening implicitly.",
+    "Duplicate event suppression: double-clicked buttons, repeated alarm callbacks, re-entrant notification handlers and triggers that must act at most once per state period.",
+    "Admission under load: non-blocking sends into a bounded channel or permit acquisition where dropping a sample, metric or optional task is acceptable (try_send, offer, tryAcquire).",
+    "Single-flight work: reload, refresh or rebuild that should be skipped while another thread is already doing it - a cheap balking alternative to full single-flight deduplication.",
+    "Embedded and event-loop code where blocking is forbidden: the guard is the only way to decline work without stalling the loop.",
+    "Actor FSM state transitions: Akka/Erlang-style actors that process a message only in a specific Behaviour state; messages received in the wrong state are silently dropped (balked) rather than queued.",
+    "Reactive streams and backpressure: a processor that is at capacity signals OverflowStrategy.Backpressure via balking (drop/throw) rather than buffering indefinitely.",
+    "Distributed idempotency tokens: a microservice that receives a duplicate request with the same idempotency key returns the cached response (a form of balking on in-flight state) instead of re-executing.",
+    "Cloud-native admission control: a service instance that is still initialising refuses requests with a 503 (balk) rather than blocking the startup path or proxying to a different instance.",
+    "Leader election and primary failover: a node that is not the current leader or primary refuses to serve writes; etcd/raft primaries balk on write requests from stale followers rather than proxying or buffering.",
+    "Periodic task deduplication: a scheduled job (cron, scheduler) that should run at most once per period; concurrent triggers from multiple scheduler ticks or cluster nodes balk all but the first.",
+    "Cache stampede prevention: on a cache miss, only one goroutine/performer fetches the backend while others wait or balk and read the stale value; Go's golang.org/x/sync/singleflight is the canonical implementation.",
+    "Connection pool initialisation: a client (JDBC, Redis, HTTP/2) whose connect() must run once; concurrent calls from multiple request threads share one in-flight establishment and all others balk and reuse the established connection.",
+    "Graceful degradation under overload: a service at capacity rejects new requests with a fast 429/503 instead of queueing them behind a saturated thread pool.",
+    "Java editor save loops: a dirty-document flag lets a periodic auto-save balk when no edits exist; publish the flag safely and make check-and-clear atomic (volatile visibility alone does not make a compound transition atomic), as reflected by IntelliJ IDEA's FileDocumentManager.",
+    "Go's golang.org/x/sync/singleflight.Group coalesces same-key cache or backend calls so followers wait and share the result; it is a wait-capable request-coalescing cousin, not pure Balking when every caller must be served.",
+    "Apple Darwin's os_unfair_lock_trylock—and Swift's OSAllocatedUnfairLock.withLockIfAvailable—lets a caller run a guarded section only when the lock is immediately available; Apple explicitly says not to spin in a retry loop."
+  ],
+  "avoid_when": [
+    "The caller needs the operation to happen eventually—use Guarded Suspension with a condition variable, or a queue with backpressure, because Balking returns immediately and provides no completion guarantee.",
+    "Requests must never be silently dropped - return an explicit result so the caller can retry, or queue them with retry/dead-letter handling.",
+    "The invalid invocation is a programming error (using a closed handle, calling a duty that only one state allows from own code) - fail fast with an exception or make the illegal state unrepresentable.",
+    "A single-threaded component with no re-entrancy and no shared state - a plain early-return guard clause is all that is needed; naming it Balking adds no structure.",
+    "The condition is a capacity the caller should wait for - a Counting Semaphore or a bounded queue with a defined backlog expresses that admission policy better.",
+    "The guarded object is accessed across multiple processes or nodes - a threading.Lock or asyncio.Lock protects only intra-process state; distributed coordination requires database rows, Redis NX, or a consensus protocol.",
+    "The caller needs duplicate same-key requests to share one result rather than be rejected—use singleflight/request coalescing; followers wait for the leader, so it is not a pure Balking policy.",
+    "The problem is lazy publication or one-time initialization rather than a state-dependent operation—use the language's safe initialization or correctly volatile double-checked locking; DCL is an optimization, not a general refusal policy."
+  ],
+  "language_files": {
+    "generic": "balking.generic.json",
+    "c": "balking.c.json",
+    "cplusplus": "balking.cplusplus.json",
+    "csharp": "balking.csharp.json",
+    "go": "balking.go.json",
+    "java": "balking.java.json",
+    "javascript": "balking.javascript.json",
+    "kotlin": "balking.kotlin.json",
+    "python": "balking.python.json",
+    "ruby": "balking.ruby.json",
+    "rust": "balking.rust.json",
+    "scala": "balking.scala.json",
+    "swift": "balking.swift.json",
+    "typescript": "balking.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "guarded-suspension",
+    "monitor-object",
+    "double-checked-locking",
+    "scoped-locking",
+    "thread-safe-interface",
+    "fail-fast",
+    "state",
+    "circuit-breaker",
+    "producer-consumer",
+    "active-object",
+    "read-write-lock",
+    "timeout"
+  ],
+  "anti_patterns": [
+    "Silent no-op -> the caller assumes the action happened and data loss is invisible -> return a boolean/status or raise a documented domain error.",
+    "Check-then-act outside the guard -> a competing caller changes state between the check and transition -> use one lock/CAS or an atomic library operation.",
+    "Balking where waiting is required -> a slow dependency becomes lost requests plus caller-side polling -> use Guarded Suspension or a durable queue.",
+    "Ignoring false from tryLock, offer, or trySend -> rejected work is mistaken for success -> branch on the result and expose the refusal.",
+    "Hiding an illegal state behind Balking -> programming errors look like ordinary contention and remain undetected -> fail fast or make the state unrepresentable.",
+    "Awaiting while holding the async guard -> unrelated tasks serialize and re-entrant paths can deadlock -> release after the check-and-transition and await outside.",
+    "Using threading.Lock or asyncio.Lock across processes or pods -> non-owning workers bypass the guard -> coordinate with an inter-process store or distributed primitive.",
+    "Making the guard stricter than the data-loss contract -> legitimate edits or events are silently discarded -> use a queue, coalescing, or a durable retry when work matters."
+  ],
+  "design_principles": [
+    "Encapsulation: the object owns its state and its predicate; callers never decide legality from outside.",
+    "Atomicity: predicate evaluation and the state transition form one indivisible step, so at most one caller proceeds.",
+    "Fail-fast at the boundary of legality: refuse immediately instead of partially executing or blocking.",
+    "Separation of concerns: state management stays apart from the work the operation performs.",
+    "Honest interfaces: callers can distinguish refusal from success, so omission is never silent.",
+    "Explicit admission budget: decide and publish how many simultaneous workers are allowed; do not rely on balking alone to enforce capacity.",
+    "Now-or-never semantics: balking is explicitly a 'this instant or not at all' policy; if 'eventually' is required, the pattern is the wrong choice."
+  ],
+  "best_practices": [
+    "Evaluate the predicate and perform the transition inside the same lock or compare-and-set, and keep that region free of blocking calls.",
+    "Return an explicit outcome (boolean, Result, status) and document the balking condition; reserve exceptions for programming errors.",
+    "Count and log balks: refusals are otherwise invisible, and their rate is the signal that the state model or admission policy needs work.",
+    "Prefer stdlib attempt primitives over hand-rolled flags - tryLock/trySend/offer/acquire(blocking=False)/Atomics carry the memory-model guarantees.",
+    "Keep the guarded state small and centralised (one state field or object) so every guard reads the same source of truth.",
+    "When callers need the work done, move to the waiting counterpart (Guarded Suspension, blocking call, queue) instead of letting them poll.",
+    "Publish state changes correctly for other threads (volatile field, atomic type or lock) before relying on the guard.",
+    "In async/event-loop code: use an asyncio.Lock or async-native primitive, hold it only for the check-and-transition (never across an await), and return a typed Result so callers can branch on refusal.",
+    "Expose balking metrics (balk count, balk rate per guarded method) as structured telemetry; a spike is an early warning of state model pressure.",
+    "In distributed systems: combine balking with an idempotency key so that a balked duplicate request can be safely retried against a different instance or after state changes.",
+    "For one-time initialisation use the Latch idiom (sync.Once, pthread_once, std::call_once) which is a single-use balking guard - it balks on every call after the first instead of re-checking a predicate each time.",
+    "Prefer typed result types (Result[T, BalkError], Either, discriminated union) over void returns; the type system forces callers to handle the balking case.",
+    "Name balking methods with a 'try_' or 'maybe_' prefix by convention (tryStart, maybeSave) to signal the non-blocking, non-guaranteed semantics at the call site.",
+    "When multiple states can balking differently, model them as an explicit state enum rather than boolean flags; the compiler then forces exhaustiveness on every guard."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Lea, D., Concurrent Programming in Java: Design Principles and Patterns, 2nd ed. (Addison-Wesley, 1999), §3.2 — defines balking as throwing/returning when the precondition fails, contrasting with guarded suspension (blocking) and timeout (bounded wait); introduces 'now-or-never' semantics and the three guard policies (balking, suspension, timeouts).",
+    "Gamma, E., Helm, R., Johnson, R., Vlissides, J., Design Patterns: Elements of Reusable Object-Oriented Software (GoF, 1994) — origin of balking as a named pattern in the concurrency/lifecycle pattern space.",
+    "https://gee.cs.oswego.edu/dl/cpj/index.html — Online supplement to Lea's CPJ; contains the full State Dependence chapter (§3) with Guarded Methods taxonomy (balking, guarded suspension, timed waits, busy waits).",
+    "Goetz, B. et al., Java Concurrency in Practice (Addison-Wesley, 2006), §14 — state-dependent operations and condition queues; covers bounded buffers, balking vs blocking precondition handling, and the 'now-or-never' distinction.",
+    "https://en.wikipedia.org/wiki/Balking_pattern",
+    "https://java-design-patterns.com/patterns/balking/",
+    "https://softwarepatternslexicon.com/python/concurrency-patterns/balking-pattern/ — comprehensive modern Python coverage including asyncio balking, rate limiting, config loading, and distributed systems caveats (2024).",
+    "https://archman-dev.github.io/website/docs/design-patterns/concurrency-patterns/balking/ — archman-dev MDX: balking vs guarded suspension vs timeout table, Go/Python code sketches, time-critical and cloud-native use cases.",
+    "https://levelup.gitconnected.com/the-balking-pattern-when-doing-nothing-is-exactly-the-right-thing-to-do-984437378dee — Jitin Kayyala (2026): modern Java AtomicBoolean and ReentrantLock implementations, scheduled task deduplication, auto-save, virtual threads comparison.",
+    "https://diversedaily.com/understanding-the-balking-pattern-in-concurrency-ensuring-appropriate-action-execution/ — high-frequency request management and concurrency control.",
+    "https://swpatterns.com/pattern/balking/ — balking vs. guarded suspension comparison with slide-format summary.",
+    "https://web.cecs.pdx.edu/~antoy/Courses/Patterns/slides/Balking.html — PSU Antoy patterns course: guard condition, synchronized block, origin: Lea 1997.",
+    "https://web.cecs.pdx.edu/~antoy/Courses/Patterns/slides/GuardedSuspension.html — PSU Antoy: guarded suspension vs balking comparison, synchronized wait/notify pattern.",
+    "https://go-patterns.dev/sync/singleflight — Go singleflight pattern: deduplicates concurrent calls for the same key; callers either perform the work or wait for the result, a balking variant with a shared-wait option.",
+    "https://golang.design/under-the-hood/en/part3concurrency/ch10chan/pattern/ — Go under the hood: channel mechanics, mutex vs channel decision tree, when to use select with default (non-blocking balking).",
+    "https://rotational.io/blog/double-checked-locking/ — Rotational Labs: Go double-checked locking using sync.RWMutex; the read-lock check is a balking guard before acquiring the write lock.",
+    "https://github.com/doeia/battle-tested-patterns — DOEIA battle-tested patterns: code-level patterns from React, Linux, Go, Chromium, Akka, etcd, with verified source links and production provenance.",
+    "https://flylib.com/books/en/2.558.1/managing_state_dependence.html — Flylib excerpt from Java Concurrency in Practice: state-dependent operations, blocking vs balking on bounded buffers, condition queues.",
+    "https://medium.com/rustaceans/singleflight-scenario-implementation-based-on-tokio-notify-b70e7697d6e8 — Huailong Zhang (2024): implementing Go's singleflight in Rust using tokio::sync::Notify; one requester performs work while others wait - a wait-variant of balking.",
+    "https://jcip.net/ — official Java Concurrency in Practice site with the book contents, examples, and sample chapter.",
+    "http://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/ — official POSA2 overview of concurrent and networked object patterns, including its synchronization pattern language.",
+    "https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html — Java Memory Model guidance: pre-JDK5 double-checked locking is broken, while the correctly volatile JDK5+ form supplies safe publication.",
+    "https://pkg.go.dev/golang.org/x/sync/singleflight — Go's duplicate-call suppression API; same-key followers wait and share the leader's result.",
+    "https://developer.apple.com/documentation/os/os_unfair_lock_trylock — Apple documents immediate lock acquisition, false on contention, and warns against retry loops.",
+    "https://developer.apple.com/documentation/os/osallocatedunfairlock/withlockifavailable(_:)-3kw0o — Apple Swift API that runs a closure only when an OSAllocatedUnfairLock is immediately available and returns an optional result.",
+    "https://github.com/JetBrains/intellij-community/blob/master/platform/core-api/src/com/intellij/openapi/fileEditor/FileDocumentManager.java — IntelliJ IDEA's FileDocumentManager tracks unsaved documents and exposes save-only-dirty operations.",
+    "http://dig.cs.illinois.edu/papers/checkThenAct.pdf — empirical study showing that non-atomic CHECK-THEN-ACT compositions cause semantic and performance bugs even with thread-safe collections."
+  ],
+  "related_patterns_notes": {
+    "guarded-suspension": "waits on the guard until the operation can proceed, whereas Balking returns immediately and drops or defers the request.",
+    "monitor-object": "serializes an object's methods behind a monitor, while Balking is the immediate-refusal policy a guarded method may implement.",
+    "double-checked-locking": "optimizes lazy publication by checking twice around initialization, whereas Balking decides whether a state-dependent operation is admissible now.",
+    "scoped-locking": "acquires and releases a lock for a bounded scope, while Balking additionally defines what happens when acquisition or the state predicate fails.",
+    "thread-safe-interface": "makes public operations safe for concurrent callers, whereas Balking is one possible non-blocking outcome of those operations.",
+    "fail-fast": "rejects invalid input or impossible use as an error, while Balking can legitimately refuse a transient but valid state and report it as an ordinary result.",
+    "state": "models legal lifecycle states and transitions, while Balking is the refusal policy for a transition whose guard is false.",
+    "circuit-breaker": "refuses calls after observed downstream failures and later probes recovery, whereas Balking guards any local state predicate without requiring failure history.",
+    "producer-consumer": "transfers work through a queue and preserves it for a consumer, whereas Balking intentionally declines work when admission is unavailable.",
+    "single-flight": "coalesces duplicate same-key calls and usually makes followers wait for one result, whereas Balking refuses a competing invocation.",
+    "idempotency-token": "makes a repeated request safe by deduplicating or replaying its result, whereas Balking may reject a duplicate without retaining a replayable outcome.",
+    "active-object": "queues method requests behind an asynchronous execution boundary, whereas Balking avoids that queue and returns a refusal.",
+    "latch": "permits a one-way release after one event, while Balking can admit and refuse operations repeatedly as state changes.",
+    "read-write-lock": "coordinates concurrent readers and exclusive writers, whereas Balking declines immediately when the required lock or state is unavailable.",
+    "timeout": "waits up to a bounded duration before giving up, whereas Balking does not wait at all.",
+    "vetoable-changes": "validates and can reject a proposed state update before commit, whereas Balking guards an operation against the object's current state."
+  }
+}

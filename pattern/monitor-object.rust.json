@@ -1,0 +1,58 @@
+{
+  "pattern": "monitor-object",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "struct with Mutex<Inner> + Condvar",
+  "implementation_notes": "Rust inverts the classic arrangement: Mutex<T> owns the protected data and the only route to it is the MutexGuard returned by lock(), so a method that forgets to lock cannot even see the field - the discipline other languages enforce by convention, the compiler enforces here. Condvar is the monitor condition; wait consumes and returns the guard so the state cannot be touched without re-acquiring, and wait_while packages the predicate loop. Poisoning turns a panic inside the critical section into a visible error for later lockers, and Arc<Mutex<T>> is how the object is shared between threads. Blocking primitives are the default; async code replaces them with tokio::sync::Mutex.",
+  "code_sketch": "pub struct Queue<T> { inner: Mutex<Inner<T>>, space: Condvar, cap: usize }\nstruct Inner<T> { buf: VecDeque<T> }\nimpl<T> Queue<T> {\n    pub fn put(&self, item: T) {\n        let mut g = self.inner.lock().unwrap();\n        g = self.space.wait_while(g, |i| i.buf.len() == self.cap).unwrap();\n        g.buf.push_back(item);\n    }\n}",
+  "pitfalls": [
+    "Poisoning makes every lock() a Result: unwrapping re-panics after any panic inside the critical section, and ignoring PoisonError hides the original failure.",
+    "MutexGuard is not Send, so a std guard must not be held across an await; the compiler often rejects it, but not always, and holding it blocks a runtime worker.",
+    "Condvar::wait re-acquires the same mutex and panics if different mutexes are used over its lifetime; spurious wakeups still require a predicate loop (or wait_while)."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+    "https://doc.rust-lang.org/std/sync/struct.Condvar.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-sync",
+      "name": "std::sync::Mutex owning the data + Condvar",
+      "paradigm": "oo",
+      "min_standard": "Rust1.0",
+      "idiom_name": "struct with Mutex<Inner> + Condvar",
+      "implementation_notes": "Rust inverts the classic arrangement: Mutex<T> owns the protected data and the only route to it is the MutexGuard returned by lock(), so a method that forgets to lock cannot even see the field - the discipline other languages enforce by convention, the compiler enforces here. Condvar is the monitor condition; wait consumes and returns the guard so the state cannot be touched without re-acquiring, and wait_while packages the predicate loop. Poisoning turns a panic inside the critical section into a visible error for later lockers, and Arc<Mutex<T>> is how the object is shared between threads. Blocking primitives are the default; async code replaces them with tokio::sync::Mutex.",
+      "code_sketch": "pub struct Queue<T> { inner: Mutex<Inner<T>>, space: Condvar, cap: usize }\nstruct Inner<T> { buf: VecDeque<T> }\nimpl<T> Queue<T> {\n    pub fn put(&self, item: T) {\n        let mut g = self.inner.lock().unwrap();\n        g = self.space.wait_while(g, |i| i.buf.len() == self.cap).unwrap();\n        g.buf.push_back(item);\n    }\n}",
+      "pitfalls": [
+        "Poisoning makes every lock() a Result: unwrapping re-panics after any panic inside the critical section, and ignoring PoisonError hides the original failure.",
+        "MutexGuard is not Send, so a std guard must not be held across an await; the compiler often rejects it, but not always, and holding it blocks a runtime worker.",
+        "Condvar::wait re-acquires the same mutex and panics if different mutexes are used over its lifetime; spurious wakeups still require a predicate loop (or wait_while)."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+        "https://doc.rust-lang.org/std/sync/struct.Condvar.html"
+      ]
+    },
+    {
+      "variant_id": "tokio-async-mutex",
+      "name": "tokio::sync::Mutex (async, guard held across await)",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "tokio"
+      ],
+      "idiom_name": "tokio::sync::Mutex + Notify/channel for waiting",
+      "implementation_notes": "For async services the blocking std primitives would stall a runtime worker, so the monitor lock becomes tokio::sync::Mutex: lock is async and yields instead of blocking, the guard may be held across await points, and acquisition is FIFO. There is no condition variable - waiting for a predicate means dropping the guard and awaiting a Notify, a watch or a channel, or re-checking after each await in a loop. Tokio's own documentation still recommends the std Mutex when the guard is not held across an await, and message passing to a spawned owning task when the object guards an I/O resource, so the async mutex is the targeted choice rather than the default.",
+      "code_sketch": "struct Queue<T> { inner: Arc<Mutex<Inner<T>>>, room: Notify }\n\nimpl<T> Queue<T> {\n    async fn put(&self, item: T) {\n        loop {\n            let mut g = self.inner.lock().await;   // yields, does not block\n            if g.buf.len() < g.cap { g.buf.push_back(item); return; }\n            drop(g);                               // never hold across the wait\n            self.room.notified().await;\n        }\n    }\n}",
+      "pitfalls": [
+        "Holding the async guard across a long await serialises the object for the whole suspension; keep the critical section short and drop the guard before waiting.",
+        "tokio's Mutex does not poison on panic, so a panicking task can leave the guarded data inconsistent - validate on re-entry or encode the invariant in types.",
+        "Mixing std locks with tokio locks in inconsistent order, or awaiting while holding a std guard, is a deadlock risk that the compiler does not always catch."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html"
+      ]
+    }
+  ],
+  "default_variant": "std-sync",
+  "version": "1.0"
+}

@@ -1,0 +1,157 @@
+{
+  "category": "persistence-state",
+  "name": "weak-reference",
+  "aliases": [
+    "weak pointer",
+    "non-owning reference"
+  ],
+  "intent": "Let a holder reference a target without keeping it alive: the edge never extends the referent's lifetime, so every use must first obtain a strong reference and tolerate its absence.",
+  "problem": "A cache, a listener list or a back-reference must not keep its target alive, yet the holder still wants to reach it while it is alive. Strong references make the holder an owner by accident - listener registries pin lapsed listeners until someone remembers to unsubscribe, object caches hold their entries forever, and back-references built from strong edges keep orphaned subtrees resident - while a raw non-owning pointer cannot tell live from collected. The weak edge reverses the default: it neither extends the target's lifetime nor guarantees presence, so each access has to promote the edge to a strong reference and define what happens when the target is already gone.",
+  "context": "Applies in garbage-collected runtimes (JVM, .NET, Python, Ruby, JavaScript/TypeScript, Go 1.24+, Swift/ARC) and in reference-counted C++ and Rust, wherever the holder's lifetime is independent of the target's: identity-keyed caches and canonicalizing maps, listener and observer registries, non-owning back-references in cyclic object graphs, and side tables attached to objects owned elsewhere. It presupposes a runtime that can clear the edge when the referent dies; without a collector the strong/weak distinction does not exist and absence can only be learned through an explicit invalidation protocol.",
+  "benefits": [
+    "Breaks ownership cycles: a parent can hold children strongly while children refer back to the parent weakly, so an orphaned subtree or a self-referential structure is reclaimed instead of being kept resident by its own internal edges - the reason std::weak_ptr, Rust's Weak and Swift's weak exist.",
+    "Listener and observer registries stop requiring explicit unsubscribe: a dead subscriber disappears from the weak list, set or map instead of pinning the whole object graph behind a lapsed listener.",
+    "Caches and canonicalizing maps no longer pin their entries: a WeakValueDictionary, WeakHashMap, WeakMap, ConditionalWeakTable or weak.Pointer entry whose referent has no other users can be collected, and the entry disappears with it.",
+    "You can reference an object you do not own: side data or metadata can be attached to an object owned elsewhere (ConditionalWeakTable, WeakMap, ObjectSpace::WeakKeyMap) without changing that object's layout or extending its lifetime.",
+    "Promotion is explicit and typed: the runtime forces the caller to obtain a strong reference before use (lock(), upgrade(), TryGetTarget, get(), deref(), the weakref call), so the check-and-use discipline sits in the code instead of in a comment.",
+    "Where the runtime offers notification, structures get a maintenance hook: reference queues, Cleaner actions, FinalizationRegistry callbacks, weakref callbacks and runtime.AddCleanup let a registry sweep bookkeeping for targets that no longer exist."
+  ],
+  "tradeoffs": [
+    "Promotion race: the referent can be collected between deciding to use it and using it, so the only safe protocol is promote once, hold the strong reference for the duration of the use, then release it - a branch and a check that every call site must repeat.",
+    "No promptness and no guarantee of collection: a weakly reachable object may survive long after its last strong reference is gone, or never be reclaimed at all (Go documents that weak.Pointer.Value may never return nil; JavaScript documents that deref may never return undefined), so weak structures still need their own bounds and eviction policy.",
+    "Not resource management: a weak edge cannot close a file, socket, lock or native buffer, so deterministic release still needs dispose/RAII/scope constructs - the pattern is explicitly not a substitute for them.",
+    "Structural hygiene: the notification channel must be drained (polling or servicing a ReferenceQueue, a reaper, cleanup callbacks), and a structure that neither polls nor sweeps accumulates dead entries; a value that strongly references its weak key restores exactly the pin the pattern was meant to remove.",
+    "Runtime semantics leak into the design: identity versus equality keying (WeakHashMap compares keys with equals, WeakKeyMap with eql?), weak-referenceable types only (no weakrefs to Python ints or __slots__-only instances, no weak Swift structs, no primitive WeakMap keys), and behaviour that differs between reference counting and tracing collectors.",
+    "Hard to test and observe: collection cannot be forced deterministically in the JVM, JavaScript or Go, so the absence path must be injected or tolerated in tests, and instrumentation behaves differently per runtime."
+  ],
+  "quality_attributes": {
+    "testability": 3,
+    "extensibility": 5,
+    "maintainability": 5,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 5,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Weak Reference Holder",
+      "responsibility": "Object or structure that keeps a non-owning edge to the referent - a field, map entry, list or set slot, side table cell - and is never the reason the referent stays alive."
+    },
+    {
+      "role": "Referent",
+      "responsibility": "The target object; its lifetime is controlled entirely by its strong owners and it may become collectable at any moment after the last one lets go."
+    },
+    {
+      "role": "Strong Owner",
+      "responsibility": "The participant or scope that keeps the referent alive (owning collection, parent object, shared_ptr/Arc/Rc, local variable); when the last strong owner goes, the referent is eligible for collection."
+    },
+    {
+      "role": "Promotion Step",
+      "responsibility": "The runtime operation that attempts to convert the weak edge into a strong reference (lock(), upgrade(), TryGetTarget, deref(), get(), calling the weakref); it is atomic with respect to collection and may fail, and its result must be held for the duration of the use."
+    },
+    {
+      "role": "Weak Container",
+      "responsibility": "Collection whose keys, values or elements are held weakly (WeakValueDictionary, WeakKeyDictionary, WeakSet, WeakHashMap, WeakMap, ConditionalWeakTable, ObjectSpace::WeakKeyMap), so entries vanish with their referents instead of pinning them."
+    },
+    {
+      "role": "Notification / Reaping Mechanism",
+      "responsibility": "Optional best-effort facility that reports or acts on death - ReferenceQueue, Cleaner, FinalizationRegistry, weakref callback, weakref.finalize, runtime.AddCleanup, or a reaper thread polling a queue - used to sweep bookkeeping, never to carry program logic."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Listener, observer and event registries whose subscribers must not be kept alive by the publisher: UI frameworks and event buses holding weak listener sets or weak bound methods instead of requiring an unsubscribe call.",
+    "Back-references in cyclic object graphs: child-to-parent or node-to-owner edges that must not keep the parent - or an orphaned subtree - resident, the canonical reason to reach for weak_ptr, Weak or weak var.",
+    "Identity-keyed caches and canonicalizing maps: memoized computations keyed by object identity, interners, dedup tables and payload caches whose entries must not be the last reference to their keys or values.",
+    "Attaching side data to objects you do not own (ConditionalWeakTable, WeakMap, ObjectSpace::WeakKeyMap): per-object metadata for third-party objects without modifying them or extending their lifetime.",
+    "Registries of live objects, sessions or connections whose entries should vanish with the object while the owner still wants to be told about the death in order to sweep bookkeeping (ReferenceQueue, Cleaner, runtime.AddCleanup).",
+    "Memoizing an expensive result while its input is alive: a strong map of weak values recomputed on a miss, which keeps the cache small without changing correctness.",
+    "OpenJDK's ThreadLocal: each ThreadLocalMap.Entry extends WeakReference<ThreadLocal<?>> so a ThreadLocal key becomes a collectable stale slot once the program drops it, and the map expunges stale entries on later probes instead of pinning every ThreadLocal ever used to its thread.",
+    "WPF's weak event pattern (WeakEventManager, IWeakEventListener): event sources subscribe listeners through a weak manager so a long-lived source cannot keep a short-lived listener alive, which is the documented fix for the classic event-handler memory leak.",
+    "Guava caches via CacheBuilder.weakKeys()/weakValues(): entries wrap keys or values in WeakReference so reclaimed referents drop their entries during maintenance - with the documented cost that the weaked side switches to identity (==) comparison and size() keeps counting reclaimed entries until cleanup."
+  ],
+  "avoid_when": [
+    "The holder is supposed to keep the target alive - an ordinary strong reference is then the correct edge, and weakening it introduces spurious recomputation and state that disappears under the reader's feet.",
+    "The target owns external resources that must be released at a known moment (file descriptors, sockets, locks, native memory): weak references provide no release event and no ordering, so use dispose/RAII/with/using/defer instead.",
+    "The API already hands out a deterministic lifecycle handle - a subscription object, an unsubscribe callable, an AbortSignal, a cancellation token, a structured-concurrency scope, a Close/Dispose contract - because explicit hand-back is predictable and testable where collector behaviour is not.",
+    "The target is a value or otherwise not weak-referenceable: a Python int, str or an instance whose class defines __slots__ without __weakref__, a Swift struct, a JavaScript primitive, or a Java value class under preview; the runtime cannot give you a weak edge at all.",
+    "Correctness depends on observing exactly when the object dies (a lease, a name or a lock must be released at a known instant): death notification is best-effort, delayed and unordered, so an explicit lifecycle protocol is the honest mechanism."
+  ],
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "caching",
+    "cache-aside",
+    "observer",
+    "smart-pointer",
+    "dispose",
+    "flyweight",
+    "memoization"
+  ],
+  "anti_patterns": [
+    "Using a weak cache as if it were a durable cache and assuming entries survive: correctness then depends on collection timing, and hot paths thrash when the collector runs.",
+    "Replacing deterministic cleanup with weak references, so that closing files and freeing native memory becomes 'later, maybe' - descriptors run out while the collector is idle.",
+    "Holding a strong local reference to the weak value for the whole operation (or letting a value strongly reference its own weak key), silently restoring the very leak the weak edge was introduced to remove.",
+    "Making every edge weak to avoid deciding ownership: nobody keeps the object alive, so it dies earlier than any code expects - spurious misses, stale views and listeners that never fire.",
+    "Depending on FinalizationRegistry callbacks, weakref callbacks or finalizers for correctness, although they may be delayed, batched, reordered, or never called."
+  ],
+  "design_principles": [
+    "Separate ownership from reference: whether an edge owns or merely observes is expressed in its type, not in a comment or a convention.",
+    "Make absence explicit: the promotion step returns an optional value and the interface forces callers to handle it instead of leaving a dangling pointer.",
+    "Match determinism to the concern: memory reclamation tolerates non-deterministic collection, while scarce external resources keep a deterministic release path.",
+    "Keep the container's identity semantics consistent with the program's: weak keys compared by identity and weak keys compared by value are different features, not interchangeable ones.",
+    "Re-validate after promotion: the only safe use of a weak edge is to promote, hold the strong reference for the use, and let it go again."
+  ],
+  "best_practices": [
+    "Express non-ownership in the type (weak_ptr, Weak<T>, weak var, WeakReference<T>, weakref.ref, weak.Pointer) and never cache the promoted target across calls; promote per use.",
+    "Promote-then-use: lock/upgrade/TryGetTarget/deref/get once, keep the strong reference in a local for the whole operation, and treat failure as a defined normal path with a fallback.",
+    "Bound the structure anyway: weak collections grow between collections, so a weak cache still needs a size cap, a sweep or a recompute-on-miss policy rather than trusting the collector.",
+    "Drain the notification channel - poll or service the reference queue, use a cleaner/reaper, or accept periodic sweeps - and make sure cleanup actions do not capture the referent (or its bound methods).",
+    "Prefer the runtime's weak container over a hand-rolled registry (WeakValueDictionary, WeakHashMap, ConditionalWeakTable, WeakMap, ObjectSpace::WeakKeyMap), and read its keying and liveness caveats before choosing it.",
+    "Keep a strong reference to the weak identity itself where the runtime requires it (a reference object that becomes unreachable is never enqueued), and re-check the target after every notification, since the world may have changed."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Catalogue provenance note for this row, docs/design-patterns.md section 6 (footnote weak-reference): Oracle, Java SE java.lang.ref.WeakReference and the Python weakref module - non-owning references and safe retrieval of possibly collected targets; the concept itself comes from garbage-collection practice (Java 1.2, 1998).",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ref/WeakReference.html",
+    "https://docs.python.org/3/library/weakref.html",
+    "https://en.wikipedia.org/wiki/Weak_reference",
+    "https://github.com/swiftlang/swift/blob/main/docs/WeakReferences.md",
+    "https://go.dev/blog/cleanups-and-weak",
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Memory_management",
+    "https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/lang/ThreadLocal.java",
+    "https://guava.dev/releases/33.0.0-jre/api/docs/com/google/common/cache/CacheBuilder.html",
+    "https://learn.microsoft.com/en-us/dotnet/desktop/wpf/events/weak-event-patterns",
+    "https://www.haible.de/bruno/papers/cs/weak/WeakDatastructures-writeup.html"
+  ],
+  "language_files": {
+    "generic": "weak-reference.generic.json",
+    "c": "weak-reference.c.json",
+    "cplusplus": "weak-reference.cplusplus.json",
+    "csharp": "weak-reference.csharp.json",
+    "go": "weak-reference.go.json",
+    "java": "weak-reference.java.json",
+    "javascript": "weak-reference.javascript.json",
+    "kotlin": "weak-reference.kotlin.json",
+    "python": "weak-reference.python.json",
+    "ruby": "weak-reference.ruby.json",
+    "rust": "weak-reference.rust.json",
+    "scala": "weak-reference.scala.json",
+    "swift": "weak-reference.swift.json",
+    "typescript": "weak-reference.typescript.json"
+  }
+}

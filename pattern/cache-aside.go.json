@@ -1,0 +1,57 @@
+{
+  "pattern": "cache-aside",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "typed map guarded by sync.RWMutex plus golang.org/x/sync/singleflight",
+  "implementation_notes": "The standard library ships no cache, so the in-process form is a plain map plus sync.RWMutex (the sync package's guidance is to prefer a plain map with locking over sync.Map for general use), with entries carrying a time.Time deadline and expiry handled lazily on read plus a sweep or janitor. The miss path is collapsed with golang.org/x/sync/singleflight so a hot key's expiry does not fan out into one source-of-truth read per goroutine, and the write path commits to the source of truth and then deletes the key. Go's goroutine-per-request model makes the per-key single-flight group the idiomatic replacement for a lock held across a load.",
+  "code_sketch": "type Cache[K comparable, V any] struct {\n    mu sync.RWMutex\n    m  map[K]entry[V]\n    sf singleflight.Group\n}\n\nfunc (c *Cache[K, V]) Get(ctx context.Context, k K) (V, error) {\n    if v, ok := c.load(k); ok { return v, nil }          // cache hit\n    res, err, _ := c.sf.Do(fmt.Sprint(k), func() (any, error) {\n        if v, ok := c.load(k); ok { return v, nil }      // re-check: another goroutine filled it\n        v, err := c.source.Read(ctx, k)                  // source of truth\n        if err == nil { c.store(k, v, c.ttl) }\n        return v, err\n    })\n    if err != nil { var zero V; return zero, err }\n    return res.(V), nil\n}\n// write: c.source.Write(ctx, k, v); c.mu.Lock(); delete(c.m, k); c.mu.Unlock()",
+  "pitfalls": [
+    "sync.Map is not a drop-in for a general cache: it pays off for stable, mostly read-only key sets, while a plain map with RWMutex is simpler and faster for mixed read/write workloads.",
+    "Storing pointers or slices in the map and mutating them outside the lock is a data race the cache cannot see - store immutable values or clones.",
+    "TTL alone only hides entries: without a sweep, expired keys leak, so pair lazy expiry with a bounded size or a janitor goroutine."
+  ],
+  "sources": [
+    "https://pkg.go.dev/sync#Map",
+    "https://pkg.go.dev/golang.org/x/sync/singleflight"
+  ],
+  "variants": [
+    {
+      "variant_id": "rwmutex-map",
+      "name": "map + sync.RWMutex with per-entry deadlines",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "typed map guarded by sync.RWMutex plus golang.org/x/sync/singleflight",
+      "implementation_notes": "The standard library ships no cache, so the in-process form is a plain map plus sync.RWMutex (the sync package's guidance is to prefer a plain map with locking over sync.Map for general use), with entries carrying a time.Time deadline and expiry handled lazily on read plus a sweep or janitor. The miss path is collapsed with golang.org/x/sync/singleflight so a hot key's expiry does not fan out into one source-of-truth read per goroutine, and the write path commits to the source of truth and then deletes the key. Go's goroutine-per-request model makes the per-key single-flight group the idiomatic replacement for a lock held across a load.",
+      "code_sketch": "type Cache[K comparable, V any] struct {\n    mu sync.RWMutex\n    m  map[K]entry[V]\n    sf singleflight.Group\n}\n\nfunc (c *Cache[K, V]) Get(ctx context.Context, k K) (V, error) {\n    if v, ok := c.load(k); ok { return v, nil }          // cache hit\n    res, err, _ := c.sf.Do(fmt.Sprint(k), func() (any, error) {\n        if v, ok := c.load(k); ok { return v, nil }      // re-check: another goroutine filled it\n        v, err := c.source.Read(ctx, k)                  // source of truth\n        if err == nil { c.store(k, v, c.ttl) }\n        return v, err\n    })\n    if err != nil { var zero V; return zero, err }\n    return res.(V), nil\n}\n// write: c.source.Write(ctx, k, v); c.mu.Lock(); delete(c.m, k); c.mu.Unlock()",
+      "pitfalls": [
+        "sync.Map is not a drop-in for a general cache: it pays off for stable, mostly read-only key sets, while a plain map with RWMutex is simpler and faster for mixed read/write workloads.",
+        "Storing pointers or slices in the map and mutating them outside the lock is a data race the cache cannot see - store immutable values or clones.",
+        "TTL alone only hides entries: without a sweep, expired keys leak, so pair lazy expiry with a bounded size or a janitor goroutine."
+      ],
+      "sources": [
+        "https://pkg.go.dev/sync#Map",
+        "https://pkg.go.dev/golang.org/x/sync/singleflight"
+      ]
+    },
+    {
+      "variant_id": "redis-singleflight",
+      "name": "go-redis + singleflight over a shared Redis",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "go-redis GET/SET with TTL and DEL after the store write, guarded by singleflight",
+      "implementation_notes": "When instances must share the cache the store moves to Redis: go-redis performs GET/SET/MGET/DEL with a TTL and an encoded payload, and singleflight still guards the per-process miss path so a cold key is loaded once per instance. The ordering rule is unchanged - write the source of truth, then DEL the key, never the reverse - and a Redis error is treated as a miss so the request degrades to the store. MGET and pipelines are the Go-side answer to chatty per-key reads.",
+      "code_sketch": "func (c *Repo) Get(ctx context.Context, id string) (*Entity, error) {\n    if b, err := c.rdb.Get(ctx, key(id)).Bytes(); err == nil { return decode(b) } // hit\n    v, err, _ := c.sf.Do(key(id), func() (any, error) {\n        e, err := c.store.Find(ctx, id)              // source of truth\n        if err != nil { return nil, err }\n        c.rdb.Set(ctx, key(id), encode(e), c.ttl)    // populate with TTL\n        return e, nil\n    })\n    if err != nil { return nil, err }\n    return v.(*Entity), nil\n}\n// write: c.store.Save(ctx, e); c.rdb.Del(ctx, key(e.ID))",
+      "pitfalls": [
+        "A Redis error must be treated as a miss (or handled explicitly); propagating it turns a cache outage into a request outage.",
+        "DEL only after the store commit: deleting first leaves a window in which a reader re-caches the pre-update value.",
+        "Keys need a namespace and a version, and Redis only evicts when maxmemory-policy is configured - otherwise the cache grows until it is full."
+      ],
+      "sources": [
+        "https://pkg.go.dev/golang.org/x/sync/singleflight",
+        "https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html"
+      ]
+    }
+  ],
+  "default_variant": "rwmutex-map",
+  "version": "1.0"
+}

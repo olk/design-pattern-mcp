@@ -1,0 +1,71 @@
+{
+  "pattern": "cache-aside",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "Microsoft.Extensions.Caching.Memory IMemoryCache.GetOrCreateAsync",
+  "implementation_notes": "Microsoft.Extensions.Caching.Memory is the in-process realization: GetOrCreateAsync(key, factory) performs the read and the populate on a miss, MemoryCacheEntryOptions carries the TTL (AbsoluteExpirationRelativeToNow) and eviction hints, and the write path calls IMemoryCache.Remove after the store commit. The factory is not a single-flight guard - concurrent misses for the same key can each run it - so a hot key under load relies on the TTL plus the provider's behaviour, or moves to the distributed/hybrid variants.",
+  "code_sketch": "var entity = await cache.GetOrCreateAsync($\"MyEntity:{id}\", async entry => {\n    entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);\n    return await store.GetAsync(id);        // source of truth on a miss\n});\n\n// write path: commit to the store first, then invalidate\nawait store.UpdateAsync(entity);\ncache.Remove($\"MyEntity:{id}\");",
+  "pitfalls": [
+    "Removing the entry before the store commit lets a racing reader reload the old value into the cache - store, then invalidate.",
+    "IMemoryCache entries are evicted under memory pressure, so GetOrCreate can run again at any time; never treat the entry as state that must exist.",
+    "GetOrCreateAsync does not deduplicate the factory per key: a hot key expiring under load fans out to the store unless a lock, a distributed cache or HybridCache coalesces the misses."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.memory.memorycache"
+  ],
+  "variants": [
+    {
+      "variant_id": "memory-cache",
+      "name": "IMemoryCache with GetOrCreateAsync (in-process)",
+      "paradigm": "oo",
+      "min_standard": "NETCore2.0",
+      "idiom_name": "Microsoft.Extensions.Caching.Memory IMemoryCache.GetOrCreateAsync",
+      "implementation_notes": "Microsoft.Extensions.Caching.Memory is the in-process realization: GetOrCreateAsync(key, factory) performs the read and the populate on a miss, MemoryCacheEntryOptions carries the TTL (AbsoluteExpirationRelativeToNow) and eviction hints, and the write path calls IMemoryCache.Remove after the store commit. The factory is not a single-flight guard - concurrent misses for the same key can each run it - so a hot key under load relies on the TTL plus the provider's behaviour, or moves to the distributed/hybrid variants.",
+      "code_sketch": "var entity = await cache.GetOrCreateAsync($\"MyEntity:{id}\", async entry => {\n    entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);\n    return await store.GetAsync(id);        // source of truth on a miss\n});\n\n// write path: commit to the store first, then invalidate\nawait store.UpdateAsync(entity);\ncache.Remove($\"MyEntity:{id}\");",
+      "pitfalls": [
+        "Removing the entry before the store commit lets a racing reader reload the old value into the cache - store, then invalidate.",
+        "IMemoryCache entries are evicted under memory pressure, so GetOrCreate can run again at any time; never treat the entry as state that must exist.",
+        "GetOrCreateAsync does not deduplicate the factory per key: a hot key expiring under load fans out to the store unless a lock, a distributed cache or HybridCache coalesces the misses."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.memory.memorycache"
+      ]
+    },
+    {
+      "variant_id": "distributed-cache",
+      "name": "IDistributedCache over Redis (shared, multi-instance)",
+      "paradigm": "oo",
+      "min_standard": "NETCore2.0",
+      "idiom_name": "IDistributedCache.GetStringAsync/SetStringAsync + RemoveAsync",
+      "implementation_notes": "For several instances the store is shared: IDistributedCache backed by StackExchange.Redis exposes GetStringAsync as the read, SetStringAsync with DistributedCacheEntryOptions as the populate with TTL, and RemoveAsync as the invalidation executed after the store commit, with the value serialized because the store is out of process. The read path must degrade to the store when the provider fails, and the serialized payload becomes a schema contract that has to be versioned with the key.",
+      "code_sketch": "var json = await cache.GetStringAsync(key);\nif (json is null) {                                  // cache miss\n    var entity = await store.GetAsync(id);\n    await cache.SetStringAsync(key, JsonSerializer.Serialize(entity),\n        new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = ttl });\n    return entity;\n}\nreturn JsonSerializer.Deserialize<Entity>(json);\n// write: await store.UpdateAsync(entity); await cache.RemoveAsync(key);",
+      "pitfalls": [
+        "The serialized payload becomes a contract between deploys: version the key or the value, or a schema change will deserialize old entries into the new type.",
+        "A provider outage must degrade to the store; if cache calls are allowed to throw, a cache incident becomes an application outage.",
+        "Redis eviction can remove an entry before its TTL, so never cache a value that cannot be recomputed from the source of truth."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.memory.memorycache",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside"
+      ]
+    },
+    {
+      "variant_id": "hybrid-cache",
+      "name": "HybridCache (L1 in-memory + L2 distributed, stampede-safe)",
+      "paradigm": "concurrent",
+      "min_standard": "NET9",
+      "idiom_name": "Microsoft.Extensions.Caching.Hybrid HybridCache.GetOrCreateAsync",
+      "implementation_notes": "Microsoft.Extensions.Caching.Hybrid adds a two-level cache: an L1 in-process tier plus an optional L2 distributed tier, with GetOrCreateAsync(key, factory) and built-in protection so concurrent misses for one key share a single factory call. Entry options carry separate local and distributed expirations, the factory is the source-of-truth read, and RemoveAsync or RemoveByTagAsync drives invalidation after the store commit. Choose it when both tiers and framework-level miss coalescing are worth the dependency.",
+      "code_sketch": "var entity = await hybrid.GetOrCreateAsync($\"entity:{id}\", async ct =>\n    await store.GetAsync(id, ct),          // runs once per miss, even under load\n    new HybridCacheEntryOptions {\n        Expiration = TimeSpan.FromMinutes(5),\n        LocalCacheExpiration = TimeSpan.FromSeconds(30)\n    });\n// write: await store.UpdateAsync(entity); await hybrid.RemoveAsync($\"entity:{id}\");",
+      "pitfalls": [
+        "The two TTLs are independent: a long distributed TTL with a short local TTL is the usual shape, but a long local TTL hides other instances' invalidations until it lapses.",
+        "Tags are the only way to invalidate a group of entries; without them a bulk update needs an explicit key-tracking strategy."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.caching.hybrid.hybridcache.getorcreateasync"
+      ]
+    }
+  ],
+  "default_variant": "memory-cache",
+  "version": "1.0"
+}

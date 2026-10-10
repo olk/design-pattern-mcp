@@ -1,0 +1,177 @@
+{
+  "category": "interaction-boundary",
+  "name": "content-filter",
+  "aliases": [
+    "field projection",
+    "field mask"
+  ],
+  "intent": "Reduce a message to the data items one receiver actually needs, so that the receiver's contract, the bytes on the wire and the information it can see are bounded by an explicit projection instead of by whatever the producer happened to send.",
+  "problem": "Messages are shaped by their producer: they carry every field the producing system knows - often as deeply nested repeating groups - plus internal identifiers, notes and personal data that no single receiver uses. Receivers then store, index, log and re-serialize a superset they never need, contracts drift wider with every producer change, and fields that should not cross a trust boundary travel by default.",
+  "context": "Message-based integration across systems you do not fully control (channels, consumers, channel adapters, API edges) where one canonical or 'fat' payload feeds several receivers with different, stable data needs, and where a projection can be applied at a single, testable seam. It applies equally in-process at a module boundary when an aggregate must be handed on as a narrow view rather than as the whole object graph.",
+  "benefits": [
+    "Receiver contracts shrink to the fields that are actually used: less parsing, less storage, smaller indexes and cheaper retention for every consumer.",
+    "Bandwidth and latency drop on constrained or metered links (mobile, IoT, partner integrations) because only the needed fields are serialized.",
+    "Information exposure becomes an explicit decision: internal identifiers, notes and personal data are absent from the outgoing shape by construction rather than by oversight.",
+    "One producer message can feed several receivers, each with its own projection, without the producer having to know any receiver's needs (the producer's canonical model stays stable).",
+    "Nested and repeating structures can be flattened in the same step, so receiver-side mapping deals with a simple element list instead of the producer's normalized hierarchy.",
+    "Smaller, well-defined payloads are easier to diff and to test: the projection can be pinned as a fixture against a recorded producer message."
+  ],
+  "tradeoffs": [
+    "The projection must know both the source shape and the receiver's shape, so an upstream rename, type change or removal degrades it silently (missing keys, nulls, empty payloads) unless the seam validates against a schema - this is the pattern's dominant failure mode.",
+    "Filtering is lossy at the seam: fields removed for this receiver are gone from this copy, so audit, enrichment, deduplication or dispute investigation needs an unfiltered copy kept out of band (Message Store, Wire Tap) - and that retention decision has to be made before filtering, not after.",
+    "It is not an access-control mechanism. Hiding a field in one message does not stop a receiver from obtaining the data elsewhere, and treating the filter as authorization leaves an unmonitored bypass.",
+    "Every message pays a parse-project-serialize cycle even when little is removed, so for small payloads on fast links the filter can cost more than the bytes it saves.",
+    "One projection per receiver means N maintained mappings with nothing in the compiler tying them to the producer's model; putting the filter on the producer side instead re-couples the producer to every consumer.",
+    "Downstream diagnosis gets harder: the evidence needed to explain a bad message is often the field that was dropped, so troubleshooting has to go back to the producer's logs or Message Store.",
+    "Filtering by field name rather than by type is stringly typed - a typo or schema drift produces a quietly partial message instead of a failure."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 7,
+    "performance": 6,
+    "reliability": 6,
+    "security": 7,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Message Producer",
+      "responsibility": "Emits the full (superset) message and stays unaware of individual receivers' needs, so its model can evolve independently of the projections."
+    },
+    {
+      "role": "Content Filter",
+      "responsibility": "Applies one receiver's projection to each message: keeps the specified fields, drops the rest, and optionally reshapes (flattens) the retained structure."
+    },
+    {
+      "role": "Projection Specification",
+      "responsibility": "The whitelist, field mask, view class or narrow DTO that names the retained fields; it is the versioned artifact that must be tested against the producer's schema."
+    },
+    {
+      "role": "Target Receiver",
+      "responsibility": "Consumes the narrow message and depends only on the fields in the projection specification, so producer fields it never sees cannot break it."
+    },
+    {
+      "role": "Seam (channel, adapter, endpoint or edge)",
+      "responsibility": "The boundary where the filter is placed; deciding which side owns the projection - producer, channel or receiver endpoint - is the pattern's central placement decision."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Fat canonical events fanned out to several consumers, each receiving a narrow, versioned projection (a billing consumer sees amounts, a search indexer sees text fields).",
+    "API edge shaping: a public response carries only the fields the published client contract promises while internal fields never leave the service (view classes, DTOs, schema pick/omit).",
+    "Bandwidth-constrained telemetry (mobile, IoT, MQTT): the device fields a collector does not use are dropped before the message goes over the metered link.",
+    "Privacy and least privilege: personal data or internal identifiers are stripped before a message crosses into a partner, analytics or logging boundary.",
+    "Legacy flattening: an external system's deeply nested repeating groups are projected into the flat element list the receiver's code can actually consume.",
+    "Log and audit pipelines: filtering before storage keeps index size, retention cost and search latency bounded.",
+    "GraphQL and OData APIs: a selection set or $select query parameter specifies exactly which fields the client needs, and the server projects the response accordingly rather than returning a fixed shape.",
+    "gRPC and Protocol Buffers: a FieldMask on read or update operations tells the service which fields to return or modify, isolating clients from schema changes in the producer's proto definitions.",
+    "JSON:API sparse fieldsets: clients request specific resource types and fields, and the server omits unrequested attributes and relationships from the response, reducing payload size and exposure surface.",
+    "Apache Camel implements the Content Filter EIP as a first-class routing element: a Processor, Bean or XPath/XQuery expression replaces the inbound message body with just the selected elements (e.g. setBody().xpath(\"//foo:bar\")).",
+    "Kafka Connect single message transformations: MaskField replaces sensitive fields with type-valid nulls or a fixed replacement (SSN, IP address, phone) and ExtractField replaces a key or value with one field of a Struct or Map, so projections are declared in connector configuration rather than in connector code.",
+    "MongoDB query projection: find(filter, { field: 1, ... }) returns only the named fields of matching documents, so read models and index-sized payloads never materialize the full document."
+  ],
+  "avoid_when": [
+    "The receiver legitimately needs the whole message and there is no bandwidth or exposure pressure: send it unchanged and skip a mapping you would otherwise maintain forever.",
+    "The protocol already carries the selection - GraphQL field selection, OData $select, a protobuf FieldMask in the request, JSON:API sparse fieldsets - let the request express the projection instead of hand-writing a filter.",
+    "The payload is small and the link is fast: the parse-project-serialize round trip costs more than the bytes saved.",
+    "The real goal is to keep a client from seeing data it could otherwise request: that is authorization, plus redaction or tokenisation where the data must be transformed rather than merely hidden.",
+    "The work is a format or vocabulary change rather than a subset (different shape, units or names): that is Message Translator or Converter territory.",
+    "The filter would remove the only copy of data needed for replay, reconciliation or audit: keep the unfiltered copy (Message Store or Wire Tap) first."
+  ],
+  "language_files": {
+    "generic": "content-filter.generic.json",
+    "c": "content-filter.c.json",
+    "cplusplus": "content-filter.cplusplus.json",
+    "csharp": "content-filter.csharp.json",
+    "go": "content-filter.go.json",
+    "java": "content-filter.java.json",
+    "javascript": "content-filter.javascript.json",
+    "kotlin": "content-filter.kotlin.json",
+    "python": "content-filter.python.json",
+    "ruby": "content-filter.ruby.json",
+    "rust": "content-filter.rust.json",
+    "scala": "content-filter.scala.json",
+    "swift": "content-filter.swift.json",
+    "typescript": "content-filter.typescript.json"
+  },
+  "paradigm": [
+    "declarative",
+    "oo",
+    "functional"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "message-filter",
+    "content-enricher",
+    "claim-check",
+    "message-translator",
+    "partial-response",
+    "tolerant-reader",
+    "data-transfer-object",
+    "normalizer"
+  ],
+  "anti_patterns": [
+    "'Filter as firewall': using the projection to hide sensitive fields while the same data stays reachable through another endpoint or an unfiltered resource.",
+    "'Whitelist drift': a hand-copied field list nobody updates, so a producer rename starves the receiver silently (empty values instead of an error).",
+    "'Filter twice': projecting in the producer and again in every receiver, so nobody can say which fields the contract actually promises.",
+    "'Over-filtering': dropping correlation ids, sequence numbers or timestamps the receiver needs for deduplication and correlation, turning recoverable delivery problems into unreproducible ones.",
+    "'One projection for every consumer': a single lowest-common-denominator filtered message that satisfies no receiver and still needs per-consumer patching.",
+    "'Silent schema drift': a producer adds a field the receiver needs but the projection whitelist was never updated, so the new field is silently absent from the receiver's view."
+  ],
+  "design_principles": [
+    "Interface segregation: a consumer should depend only on the data it uses; one fat message for all consumers is the interface-bloat version of this violation.",
+    "Information hiding and least disclosure: expose the minimum a collaborator needs - the same instinct Parnas applies to modules applies to messages.",
+    "Explicit contracts over shared types: the receiver's view is a versioned artifact, not an implicit convention about which fields 'we usually send'.",
+    "Separation of concerns: the producer's canonical model and the receiver's view change for different reasons and are bridged by a declared mapping.",
+    "Single responsibility: the projection lives in one seam component (adapter, consumer, view), not scattered through business logic where it cannot be found or tested.",
+    "Fail loudly on schema mismatch: when the projection references a field that no longer exists in the producer's schema, the filter should raise an error rather than silently omit it."
+  ],
+  "best_practices": [
+    "Make the field set explicit and versioned - a view class, a narrow DTO or record, a schema, or a literal field mask - and keep it under a contract test against the producer's schema.",
+    "Prefer a typed projection over a stringly-typed key list: with a DTO or view class an upstream rename breaks the build instead of production.",
+    "Always retain the message identifier, correlation id and the minimal routing headers; a projection that drops them breaks retries, deduplication and trace correlation.",
+    "Decide the retention posture before filtering: if audit or replay may need the removed fields, keep an unfiltered copy out of band (Message Store or Wire Tap).",
+    "Project in one place - the receiver's edge or a channel adapter - rather than on both sides; two filters mean two definitions to keep in sync.",
+    "Where the schema is available, validate at the seam and fail loudly on missing or renamed source fields instead of emitting a quietly partial message.",
+    "Document the projection as the receiver's contract, including the flattening decision when the filter also reshapes the payload.",
+    "Never treat the filter as an authorization decision; pair it with access control whenever the receiver has another route to the data.",
+    "Prefer receiver-owned or channel-adapter-owned projections over producer-owned ones to keep the producer decoupled from consumer needs.",
+    "Pin projections against recorded producer messages in contract tests so that schema evolution breaks the test, not production.",
+    "When supporting multiple clients with different field needs, treat each projection as a first-class artifact with its own versioning and changelog."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (Addison-Wesley, 2003), Content Filter (Message Transformation part) - remove unimportant data items from a message, leaving only the important ones, and flatten nested groups where they are superfluous.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/ContentFilter.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageTransformationIntro.html",
+    "https://protobuf.dev/reference/protobuf/google.protobuf/#field-mask",
+    "https://netflixtechblog.com/practical-api-design-at-netflix-part-1-using-protobuf-field-mask-5109e06c3a65",
+    "https://graphql.org",
+    "https://spec.jsonapi.org/#sparse-fieldsets",
+    "https://docs.oasis-open.org/odata/odata/v4.01/odata-v4.01-part1-protocol.html#sec_SystemQueryOptionselect",
+    "https://camel.apache.org/components/next/eips/content-filter-eip.html",
+    "https://docs.confluent.io/cloud/current/connectors/transforms/maskfield.html",
+    "https://www.mongodb.com/docs/manual/tutorial/project-fields-from-query-results/",
+    "https://mi.docs.wso2.com/en/latest/learn/enterprise-integration-patterns/message-transformation/content-filter/",
+    "https://mixpeek.com/guides/payload-projection-for-agentic-vector-search",
+    "https://arxiv.org/html/2608.11730v1",
+    "https://learn.microsoft.com/en-us/odata/webapi/odata-security"
+  ],
+  "related_patterns_notes": {
+    "pipes-and-filters": "pipes-and-filters"
+  }
+}

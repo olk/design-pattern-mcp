@@ -1,0 +1,57 @@
+{
+  "pattern": "write-behind",
+  "language": "kotlin",
+  "support": "library",
+  "idiom_name": "EntityManager persistence context with FlushModeType.COMMIT (Spring @Transactional)",
+  "implementation_notes": "The JVM realization is the same persistence context Java uses: Hibernate tracks entity changes in memory and writes in a write-behind fashion at flush/commit time, and Kotlin property accessors funnel through the identical dirty checking, so no Kotlin-specific buffer exists. Keep the EntityManager request-scoped, drive the boundary with @Transactional or em.flush(), and treat nullable/data-class ergonomics as sugar over the same rules. What replaces the classic structure: the JPA persistence context.",
+  "code_sketch": "@Transactional\nfun update(id: Long, email: String) {\n    val author = em.find(Author::class.java, id)\n    author.email = email                 // staged in the context\n    author.lastSeen = Instant.now()      // coalesced into the same UPDATE\n    // single flush at commit; em.flush() before a query that must see it\n}",
+  "pitfalls": [
+    "Data-class copy() creates a detached instance: only mutations on the managed entity are tracked, so save the copy or mutate in place.",
+    "Property access outside the transaction touches a detached entity; Hibernate sessions are not thread-safe and coroutine dispatchers do not change that.",
+    "A suspend function that calls blocking JPA on the wrong dispatcher starves the pool, and @Transactional is thread-bound unless the reactive transaction manager is configured."
+  ],
+  "sources": [
+    "https://jakarta.ee/specifications/persistence/3.1/apidocs/jakarta.persistence/jakarta/persistence/flushmodetype",
+    "https://docs.hibernate.org/core/3.6/reference/en-US/html_single"
+  ],
+  "variants": [
+    {
+      "variant_id": "hibernate-jpa",
+      "name": "Hibernate/JPA persistence context on the JVM",
+      "paradigm": "oo",
+      "idiom_name": "EntityManager persistence context with FlushModeType.COMMIT (Spring @Transactional)",
+      "implementation_notes": "The JVM realization is the same persistence context Java uses: Hibernate tracks entity changes in memory and writes in a write-behind fashion at flush/commit time, and Kotlin property accessors funnel through the identical dirty checking, so no Kotlin-specific buffer exists. Keep the EntityManager request-scoped, drive the boundary with @Transactional or em.flush(), and treat nullable/data-class ergonomics as sugar over the same rules. What replaces the classic structure: the JPA persistence context.",
+      "code_sketch": "@Transactional\nfun update(id: Long, email: String) {\n    val author = em.find(Author::class.java, id)\n    author.email = email                 // staged in the context\n    author.lastSeen = Instant.now()      // coalesced into the same UPDATE\n    // single flush at commit; em.flush() before a query that must see it\n}",
+      "pitfalls": [
+        "Data-class copy() creates a detached instance: only mutations on the managed entity are tracked, so save the copy or mutate in place.",
+        "Property access outside the transaction touches a detached entity; Hibernate sessions are not thread-safe and coroutine dispatchers do not change that.",
+        "A suspend function that calls blocking JPA on the wrong dispatcher starves the pool, and @Transactional is thread-bound unless the reactive transaction manager is configured."
+      ],
+      "sources": [
+        "https://jakarta.ee/specifications/persistence/3.1/apidocs/jakarta.persistence/jakarta/persistence/flushmodetype",
+        "https://docs.hibernate.org/core/3.6/reference/en-US/html_single"
+      ]
+    },
+    {
+      "variant_id": "coroutine-flush-queue",
+      "name": "Coroutine Channel + flush worker",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "kotlinx.coroutines Channel with a drain-and-flush worker",
+      "implementation_notes": "Without a JPA context (Exposed, raw JDBC, or cross-request batching), Kotlin's Channel plus a launched worker is the idiomatic queue: a bounded Channel<Change> gives suspending back-pressure instead of a hand-written watermark, and a single consumer coroutine drains up to a batch size and executes one transaction per batch, optionally woken by delay() for the time trigger. The producer/consumer pair replaces the classic dirty-set-plus-flush-thread structure; the coroutine version is justified when the application is already structured around structured concurrency.",
+      "code_sketch": "val changes = Channel<Change>(capacity = 512,\n    onBufferOverflow = BufferOverflow.SUSPEND)\nlaunch(Dispatchers.IO) {\n    val batch = ArrayList<Change>()\n    while (isActive) {\n        batch += changes.receive()\n        while (batch.size < 100) batch += changes.tryReceive().getOrNull() ?: break\n        withContext(NonCancellable) { flushInOneTransaction(batch) }\n        batch.clear()\n    }\n}",
+      "pitfalls": [
+        "A rendezvous (capacity 0) channel suspends every stage() until the flusher is ready; choose BUFFERED, CONFLATED, or an explicit capacity deliberately.",
+        "A cancelled worker coroutine abandons the in-flight batch unless the final flush runs in NonCancellable before shutdown.",
+        "Channel.send from many producers still needs idempotent flush semantics: a crash between commit and batch.clear() replays the batch."
+      ],
+      "sources": [
+        "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.channels/-channel/"
+      ]
+    }
+  ],
+  "default_variant": "hibernate-jpa",
+  "version": "1.0"
+}

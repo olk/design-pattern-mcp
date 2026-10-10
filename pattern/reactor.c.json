@@ -1,0 +1,54 @@
+{
+  "pattern": "reactor",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "epoll_wait/select(2) loop + fd -> handler dispatch table",
+  "implementation_notes": "C supplies only the Synchronous Event Demultiplexer - select(2), poll(2), epoll(7) on Linux, kqueue on the BSDs - so the initiation dispatcher is written by hand: a table indexed by file descriptor holding the handler (a struct with a callback and per-handle state), a registration API that keeps the table and the demultiplexer's interest list in step, and a loop that blocks in the demultiplexer and calls the callback of each ready handle. epoll is the scalable primitive (an interest list plus a kernel ready list, registration independent of the handle count); the classic correctness detail is to rearm or drain, because with EPOLLONESHOT the descriptor is disabled after one event and must be re-armed with epoll_ctl(EPOLL_CTL_MOD), while with EPOLLET the handler must read until EAGAIN. Use libevent when a dependency is acceptable, and select(2)/poll(2) only for a handful of descriptors or where epoll/kqueue is unavailable.",
+  "code_sketch": "struct handler { int fd; void (*on_ready)(struct handler *self, uint32_t events); };\n\nfor (;;) {\n    int n = epoll_wait(epfd, evs, MAX_EVENTS, -1);          /* demultiplex */\n    if (n < 0) { if (errno == EINTR) continue; perror(\"epoll_wait\"); break; }\n    for (int i = 0; i < n; i++) {\n        struct handler *h = table[evs[i].data.fd];\n        rearm(epfd, h->fd);                                /* one-shot: re-arm before dispatch */\n        h->on_ready(h, evs[i].events);                     /* dispatch to the handler */\n    }\n}",
+  "pitfalls": [
+    "Level-triggered epoll reports a descriptor again on every epoll_wait while it stays ready, so a handler that reads only part of the available data turns the loop into a busy spinner; drain until EAGAIN or use EPOLLET/EPOLLONESHOT with an explicit rearm.",
+    "Closing a descriptor does not necessarily remove it from the interest list (duplicate descriptors referring to the same open file description keep it alive), so events can still be reported for an fd the application believes is gone: call epoll_ctl(EPOLL_CTL_DEL) before close(2).",
+    "select(2) mutates its descriptor sets in place and is bounded by FD_SETSIZE, while poll(2) re-scans the whole array on every call; choosing the wrong demultiplexer is a scaling trap, and both must be retried on EINTR."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man7/epoll.7.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "epoll-event-loop",
+      "name": "Hand-written epoll/poll loop with an fd-indexed handler table",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "epoll_wait/select(2) loop + fd -> handler dispatch table",
+      "implementation_notes": "C supplies only the Synchronous Event Demultiplexer - select(2), poll(2), epoll(7) on Linux, kqueue on the BSDs - so the initiation dispatcher is written by hand: a table indexed by file descriptor holding the handler (a struct with a callback and per-handle state), a registration API that keeps the table and the demultiplexer's interest list in step, and a loop that blocks in the demultiplexer and calls the callback of each ready handle. epoll is the scalable primitive (an interest list plus a kernel ready list, registration independent of the handle count); the classic correctness detail is to rearm or drain, because with EPOLLONESHOT the descriptor is disabled after one event and must be re-armed with epoll_ctl(EPOLL_CTL_MOD), while with EPOLLET the handler must read until EAGAIN. Use libevent when a dependency is acceptable, and select(2)/poll(2) only for a handful of descriptors or where epoll/kqueue is unavailable.",
+      "code_sketch": "struct handler { int fd; void (*on_ready)(struct handler *self, uint32_t events); };\n\nfor (;;) {\n    int n = epoll_wait(epfd, evs, MAX_EVENTS, -1);          /* demultiplex */\n    if (n < 0) { if (errno == EINTR) continue; perror(\"epoll_wait\"); break; }\n    for (int i = 0; i < n; i++) {\n        struct handler *h = table[evs[i].data.fd];\n        rearm(epfd, h->fd);                                /* one-shot: re-arm before dispatch */\n        h->on_ready(h, evs[i].events);                     /* dispatch to the handler */\n    }\n}",
+      "pitfalls": [
+        "Level-triggered epoll reports a descriptor again on every epoll_wait while it stays ready, so a handler that reads only part of the available data turns the loop into a busy spinner; drain until EAGAIN or use EPOLLET/EPOLLONESHOT with an explicit rearm.",
+        "Closing a descriptor does not necessarily remove it from the interest list (duplicate descriptors referring to the same open file description keep it alive), so events can still be reported for an fd the application believes is gone: call epoll_ctl(EPOLL_CTL_DEL) before close(2).",
+        "select(2) mutates its descriptor sets in place and is bounded by FD_SETSIZE, while poll(2) re-scans the whole array on every call; choosing the wrong demultiplexer is a scaling trap, and both must be retried on EINTR."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/epoll.7.html"
+      ]
+    },
+    {
+      "variant_id": "libevent-event-base",
+      "name": "libevent event_base with registered events (library realization)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "event_base_new / event_new / event_add / event_base_dispatch",
+      "implementation_notes": "libevent is the framework form of the same structure: event_base_new() allocates the base (initiation dispatcher plus backend), event_new() with event_add() registers a descriptor and its callback (the handler), and event_base_dispatch()/event_base_loop() run the demultiplexing loop with a selectable backend (epoll, kqueue, poll, select, devpoll, evport, win32) chosen as the fastest one available. Two documented details shape a reactor: a base's loop may only be run in a single thread, so multi-loop designs need one event_base per thread, and event_config_require_features(EV_FEATURE_ET) asks for an edge-triggered backend when handlers drain their descriptor instead of being re-armed.",
+      "code_sketch": "struct event_base *base = event_base_new();          /* picks the fastest backend */\nstruct event *ev = event_new(base, fd, EV_READ | EV_PERSIST, on_readable, session);\nevent_add(ev, NULL);                                  /* register handler for the handle */\nevent_base_dispatch(base);                            /* the dispatch loop */\n/* one base per thread: a base's loop may only be run in a single thread. */",
+      "pitfalls": [
+        "A base is looped by one thread only; sharing a base between threads needs cross-thread notification (event_base_once) or one base per thread, otherwise callbacks race the loop.",
+        "EV_PERSIST events stay registered and re-report readiness, so the callback must consume the descriptor; a non-persistent event must be re-added by the handler, and forgetting that silently stops servicing the handle.",
+        "Bufferevents and raw events are different layers: adding a raw event for a descriptor that is already wrapped by a bufferevent gives two handlers competing for the same readiness."
+      ],
+      "sources": [
+        "https://libevent.org/libevent-book/Ref2_eventbase.html"
+      ]
+    }
+  ],
+  "default_variant": "epoll-event-loop",
+  "version": "1.0"
+}

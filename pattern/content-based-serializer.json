@@ -1,0 +1,197 @@
+{
+  "category": "interaction-boundary",
+  "name": "content-based-serializer",
+  "aliases": [
+    "polymorphic serialization",
+    "self-describing message",
+    "tagged union serialization",
+    "discriminated union serialization",
+    "format-indicator pattern"
+  ],
+  "intent": "Let the serialized payload itself say which type or schema it is — through an application-added discriminator or through type identity the format introduces — so that a receiver holding several possible schemas can identify the concrete type and pick the right deserializer before it parses the body.",
+  "problem": "One channel, topic, cache or file carries messages of several concrete types, but the wire form is not self-identifying: the reader has no side-channel that says which schema applies, so it guesses, tries candidate deserializers in order until one succeeds, or forces a separate channel per message type — and every new type forces an edit in the receiver's dispatch code.",
+  "context": "Messaging and persistence boundaries where a heterogeneous, independently evolving population of values crosses a process, version or storage boundary: event streams with many event kinds, plugin or RPC dispatch, session caches and job queues holding interface-typed values, archives and dead-letter dumps replayed later with no context. The reader must decide which schema applies before it can parse the body, and producer and consumer are not compiled together.",
+  "benefits": [
+    "One channel, topic or store can carry a polymorphic population: the reader dispatches per message instead of demanding one channel or endpoint per concrete type.",
+    "The type hint travels with the data, so it survives store-and-forward, replay, dead-letter queues and archives where the original context is gone.",
+    "New concrete types enter through a registry entry rather than through edits to the receiver's parsing code — open/closed at the dispatch seam.",
+    "Interface- or base-typed values round-trip: what was written as an abstract value comes back as the concrete type, which is what makes object graphs, caches and session state feasible.",
+    "Format-introduced identity (writer schema, type URL, self-described tag) lets a reader with no compile-time knowledge of the schema consume the payload, which is what generic tooling, schema registries and schema evolution build on.",
+    "Content-based discrimination enables backward-compatible schema evolution: new fields are added as optional, the tag routes to the appropriate version-aware deserializer, and old consumers skip unknown fields through a tolerant reader.",
+    "The discriminator doubles as a routing key in message brokers, letting consumers subscribe to specific event kinds without deserializing the full body — improving throughput in high-volume event streams.",
+    "Stable type URLs (e.g., type.googleapis.com/mypackage.MessageV2) decouple the wire name from the language-level class name, so refactoring class packages does not break stored or in-flight payloads."
+  ],
+  "tradeoffs": [
+    "The tag vocabulary becomes a wire contract shared by producer and consumer: it must be documented and versioned, and refactoring a type name is a format change unless the tag is deliberately decoupled from it.",
+    "A payload-directed type selection is attacker-controlled input: wherever the tag resolves to an arbitrary type (Java default typing, .NET TypeNameHandling, Python pickle, Ruby json_class, native class descriptors), a crafted payload reaches gadget classes and remote code execution — an allow-list registry is mandatory, not an optimization.",
+    "Per-message tags cost bytes and parse time; for high-frequency small messages the tag can dominate the payload, and format-introduced identity (embedded schemas, class descriptors) costs far more than a short string.",
+    "Unknown tags surface as deserialization errors after the envelope has already been accepted: without a fail-closed bucket (dead-letter channel, unknown-type arm, quarantine table) one unrecognized value can abort a whole batch that a per-type channel would have isolated.",
+    "The registry must be populated and kept in sync: reflective or automatic registration is convenient but hides startup cost and defeats static analysis, while explicit registration is boilerplate whose omissions appear only at runtime under a rare tag.",
+    "Debugging shifts from what is this to why did the tag resolve to the wrong schema: stringly-typed tags drift away from class names, and structural substitutes (untagged unions, deduction by which fields are present) silently mis-bind when two shapes overlap.",
+    "Nested polymorphic types compound the problem: a list of interface-typed elements requires the tag on each element, and a recursive structure needs depth-bounded deserialization to avoid stack overflow on adversarial input.",
+    "Upcasting chains for schema evolution can grow long in event-sourced systems: each historical version needs a transform step, and maintaining many hops becomes a maintenance burden — eventually triggering a store rewrite."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 9,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 5,
+    "security": 4,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Serializer",
+      "responsibility": "Producer-side role: writes the concrete value and either introduces the discriminator itself (tag property, envelope field) or selects a format that emits type identity (writer schema, type URL, class descriptor). Also responsible for emitting the discriminator at the right position in the output — beginning of an object for formats that require it (JSON, MessagePack) or in the envelope for self-describing formats (Protobuf with Any, Avro with schema fingerprint)."
+    },
+    {
+      "role": "Type Tag",
+      "responsibility": "The in-band identifier — name, code, type URL, schema id, class descriptor or self-described format tag — that fixes which schema applies. Must be stable, documented, and versioned independently of the class name. The vocabulary is the shared contract between producer and consumer."
+    },
+    {
+      "role": "Type Registry",
+      "responsibility": "Maps a tag to the deserializer or concrete type that may decode the body; it is the allow-list that makes tag resolution safe and the extension point for new types. Must be fail-closed for unknown tags. In strongly-typed languages, it should be validated at startup by attempting to resolve every registered tag."
+    },
+    {
+      "role": "Deserializer",
+      "responsibility": "Reads the tag first (peek at the first field or read the envelope) and then parses the body with the resolved schema, producing a typed value or a classified error. Must never instantiate a type not returned by the registry lookup."
+    },
+    {
+      "role": "Unknown-Type Handler",
+      "responsibility": "Receives payloads whose tag is not in the registry — dead-letter channel, quarantine table, catch-all variant — so an unrecognized type degrades one message rather than the batch. In event-sourced systems this also serves as the audit trail for discovering schema drift."
+    },
+    {
+      "role": "Schema Registry",
+      "responsibility": "Optional participant in systems that use format-introduced identity (Avro writer schema, Protobuf Any, JSON Schema $id). Stores and distributes schemas by ID so producers and consumers need not embed the full schema on every message. Enables schema evolution by tracking compatibility relationships between versions."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Event streams where many event kinds share one topic and each consumer has to instantiate the matching event class (Kafka, SNS, EventStoreDB). The discriminator lets a consumer skip events it does not understand without failing, and replay tooling can route historical events through upcasting chains.",
+    "RPC or plugin dispatch where the request names the operation and the server resolves a handler from a registry. Extensible RPC frameworks (gRPC with protobuf-any, JSON-RPC with a kind field) use this to route requests without a shared interface definition at compile time.",
+    "Job queues, session caches and key-value stores that persist interface- or base-typed values and must restore the concrete type on read. Examples: Redis session stores with polymorphic user objects, Celery task queues with typed arguments.",
+    "Archives, replays and dead-letter dumps that are read from bytes alone, with no side-channel describing what each record is. Content-based serialization is the only viable approach for replaying heterogeneous event stores.",
+    "Serializing heterogeneous collections — a document model, an AST, a list of mixed node types — where per-element tags are the only way to reconstruct the shapes. Used in AST serialization for refactoring tools, diff engines, and IDE plugin APIs.",
+    "Wire formats with independent evolution: Avro or Protobuf payloads whose writer schema or type URL has to travel with the data so a reader built against another schema version can still resolve it. Schema Registry integration stores the writer schema by ID and lets consumers fetch the appropriate reader schema.",
+    "Content-addressed storage and deduplication: where the content hash IS the address, the type discriminator identifies the deserializer needed to interpret the stored bytes. Lore's fragment store, IPFS, and Git's object database all carry type tags alongside content.",
+    "Multi-tenant event pipelines: a single Kafka topic carries events from many services; the event type discriminator routes each event to the correct handler without topic-per-service explosion.",
+    "API gateway request routing: an envelope with a type field routes to different backend services or handlers without the gateway needing compile-time knowledge of every possible request type.",
+    "Confluent Schema Registry wire format: KafkaAvroSerializer and its JSON Schema/Protobuf siblings prefix every payload with a magic byte and a 4-byte big-endian schema ID, so a consumer fetches the exact writer schema from the registry by ID before decoding the body — the foreign-key form of the Format Indicator at industrial scale.",
+    "CloudEvents envelope: the REQUIRED type attribute (SHOULD be reverse-DNS prefixed, e.g. com.github.pull_request.opened) is the event-kind discriminator that brokers and middleware use for routing, filtering and policy without parsing the data payload.",
+    "Protobuf Any and API extensions: a packed message carries a type_url whose last path segment is the fully-qualified type name (type.googleapis.com/google.protobuf.Timestamp, rendered as @type in JSON), letting generic tooling and extensible RPC resolve the embedded type at read time with no compile-time shared schema."
+  ],
+  "avoid_when": [
+    "The endpoint is already typed end to end (one message type per method or per channel): a tag only repeats what the protocol states.",
+    "The value never leaves one process and its type is known statically at the call site — plain serialization of the concrete type is simpler.",
+    "Producers are untrusted and no allow-list can be maintained: prefer a fixed schema with no type-directed instantiation, or validate the whole payload against a schema before any object construction.",
+    "Payload size dominates (high-frequency tiny messages) and both ends can be regenerated together: agree the schema per channel and drop the per-message tag.",
+    "A canonical data model plus a single deserializer already covers every payload — a discriminator would admit shapes the canonical model deliberately forbids.",
+    "The system is an internal microservice where both producer and consumer are built, deployed and versioned together: a shared interface or code-generated bindings eliminate the need for self-describing payloads."
+  ],
+  "language_files": {
+    "generic": "content-based-serializer.generic.json",
+    "c": "content-based-serializer.c.json",
+    "cplusplus": "content-based-serializer.cplusplus.json",
+    "csharp": "content-based-serializer.csharp.json",
+    "go": "content-based-serializer.go.json",
+    "java": "content-based-serializer.java.json",
+    "javascript": "content-based-serializer.javascript.json",
+    "kotlin": "content-based-serializer.kotlin.json",
+    "python": "content-based-serializer.python.json",
+    "ruby": "content-based-serializer.ruby.json",
+    "rust": "content-based-serializer.rust.json",
+    "scala": "content-based-serializer.scala.json",
+    "swift": "content-based-serializer.swift.json",
+    "typescript": "content-based-serializer.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional",
+    "declarative"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "property-based-serializer",
+    "content-based-router",
+    "message-translator",
+    "converter",
+    "envelope-wrapper",
+    "tolerant-reader",
+    "normalizer",
+    "published-language"
+  ],
+  "anti_patterns": [
+    "Enabling payload-directed typing for untrusted input — ObjectMapper.enableDefaultTyping or activateDefaultTyping, TypeNameHandling.All, pickle.loads, JSON.load(create_additions: true), Marshal.load — which turns the tag into a gadget-chain entry point.",
+    "Trial deserialization: trying candidate decoders in order until one succeeds instead of carrying a tag; it is linear work, order-dependent, and quietly accepts the wrong shape when two variants have compatible optional fields.",
+    "Using the language-level class name (fully qualified, or a native export key) as the wire tag, so renaming, moving or nesting a class breaks every stored or in-flight payload.",
+    "Structural inference instead of a tag — untagged unions, deduction by which fields are present — which mis-binds as soon as additive evolution gives two shapes the same optional field.",
+    "A per-consumer tag vocabulary: each reader interprets the tag on its own, so the same payload means different things down the pipeline and nobody owns the contract.",
+    "Unchecked ObjectInputStream.readObject on untrusted data without ObjectInputFilter: the classic Java deserialization RCE attack surface, exploited via gadget chains in third-party libraries on the classpath.",
+    "Default typing without an explicit subtype allow-list: Jackson's default typing accepts @class hints that name arbitrary Java classes, turning a JSON endpoint into a gadget-chain primitive.",
+    "Using Id.CLASS or equivalent in polymorphic configuration: embeds the language-level class name (fully qualified) in the wire format, giving an attacker direct class-instantiation control."
+  ],
+  "design_principles": [
+    "Open/closed: new types are registry entries, not edits to the dispatcher.",
+    "Single responsibility: identifying the schema and parsing the body are separate steps — identify first, then allocate.",
+    "Explicit contract over inference: the tag is data the producer is responsible for, not a guess the consumer makes from shape.",
+    "Fail-safe defaults and least privilege: the tag-indexed registry is an allow-list and unknown tags are rejected into a bucket instead of being coerced into a nearby type.",
+    "Loose coupling through a published vocabulary rather than shared code: producer and consumer agree on tags and schemas, not on class hierarchies.",
+    "Defense in depth at deserialization boundaries: allow-list registry lookup, object graph depth limits, payload size bounds, and runtime type filtering are complementary layers — none is sufficient alone.",
+    "Stable identifiers decoupled from implementation names: the wire tag must not change when classes are renamed, moved, or their package structure is refactored."
+  ],
+  "best_practices": [
+    "Give every concrete type a stable, documented tag (a registered code or a published name) and never reuse or renumber one; decouple it from the class name so code refactoring stays free.",
+    "Keep an explicit allow-list registry from tag to deserializer, instantiate only registered types, and fail closed for everything else.",
+    "Separate identification from parsing: read the tag from the envelope or peek at the first field before allocating the target type, and bound payload size and nesting depth on the way in.",
+    "Route unknown tags to a dead-letter channel, an unknown-type arm or a quarantine table so an unrecognized type costs one message rather than the batch.",
+    "Version the discriminator together with the schema and treat the tag vocabulary as a published API with its own changelog.",
+    "Prefer format-introduced identity (generated schema ID, type URL, self-described tag) over hand-rolled string tags when both ends can be generated from the same schema, and add an application tag only for the polymorphic part the schema cannot express.",
+    "In event-sourced systems, treat the type discriminator as the event type identifier and pair it with a version field; route historical events through an upcaster chain that transforms each version to the next until the current schema is reached.",
+    "For high-volume streams, avoid per-element type tags in nested structures; instead, flatten the schema so the discriminator applies at the top-level message, or switch to a format that embeds schema identity once (Protobuf with Schema Registry, Avro with writer schema fingerprint).",
+    "Use ObjectInputFilter (Java JEP 290), pickle.Unpickler.find_class override (Python), or equivalent native deserialization allow-list filters whenever native object formats must be used on untrusted input.",
+    "In multi-tenant pipelines, scope the registry per tenant or per topic so that a malformed tag from one tenant cannot resolve to a handler in another tenant's scope.",
+    "Test deserialization with unknown, expired, and overlapping discriminator values; verify that every unknown tag reaches the dead-letter path and that overlapping shapes do not silently cross-bind.",
+    "Prefer data-only formats (JSON, Protobuf, Avro, MessagePack) over native object formats (Java serialization, Python pickle, .NET BinaryFormatter) wherever possible — they eliminate gadget-chain attack surfaces entirely."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns (2003) — Format Indicator (message construction): the message specifies what format it is using; related Canonical Data Model.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/FormatIndicator.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/Message.html",
+    "https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/polymorphism",
+    "https://github.com/FasterXML/jackson/wiki/Jackson-Polymorphic-Deserialization-CVE-Criteria",
+    "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html",
+    "https://serde.rs/enum-representations.html",
+    "https://kotlinlang.org/docs/serialization-polymorphism.html",
+    "https://github.com/Kotlin/kotlinx.serialization/blob/master/formats/json/commonMain/src/kotlinx/serialization/json/JsonContentPolymorphicSerializer.kt",
+    "https://docs.rs/typetag/latest/typetag/",
+    "https://github.com/frohoff/ysoserial — ysoserial gadget chain generator for Java unsafe deserialization",
+    "Alonge & Baino, 'An In-depth Study of Java Deserialization Remote-Code Execution Attacks,' ACM Computing Surveys 2024 — empirical analysis of gadget chains across library versions and deserialization attack surfaces.",
+    "https://yoo.be/fixing-insecure-deserialization-java-microservices-allowlists-runtime-filtering — allow-list + runtime object filtering for Java microservices",
+    "https://docs.proteanhq.com/adr/0040-schema-evolution-ladder — Schema Evolution Ladder: weak schema, versioning + upcasters, and store migration as three rungs for evolving event schemas in event-sourced systems",
+    "https://github.com/epicgames/lore — content-addressed storage with type-tagged fragments, BLAKE3 hashing, deduplication, and per-file context for stable identity across moves and modifications",
+    "https://code-maze.com/csharp-polymorphic-serialization-and-deserialization/ — custom JsonConverter for polymorphic deserialization with discriminator-based routing in System.Text.Json",
+    "https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/serdes-avro.html — Confluent wire format: magic byte + 4-byte big-endian Schema Registry ID prefixed to every Avro payload so the reader resolves the writer schema by ID",
+    "https://github.com/cloudevents/spec/blob/v1.0.1/spec.md — CloudEvents REQUIRED type attribute (reverse-DNS prefixed) as the standardized event-kind discriminator for routing and filtering",
+    "https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/any.proto — protobuf Any: type_url whose last path segment is the fully-qualified type name; explicit warning never to contact type URLs to resolve types",
+    "https://www.gustavwengel.dk/serde-untagged-enum-errors-are-bad — misuse study: untagged structural inference picks the first matching variant and yields uninformative 'did not match any variant' errors"
+  ],
+  "related_patterns_notes": {
+    "event-sourcing": "event-sourcing",
+    "cqrs": "cqrs",
+    "schema-registry": "schema-registry",
+    "upcaster": "upcaster"
+  }
+}

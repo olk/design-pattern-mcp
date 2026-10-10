@@ -1,0 +1,68 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "ServiceBusReceiver PeekLock + CompleteMessageAsync + MessageId dedup",
+  "implementation_notes": "The broker is the durable store: receive in PeekLock mode so the message stays locked and is redelivered when the lock expires, process, and settle with CompleteMessageAsync only after the business commit; AbandonMessageAsync releases the lock immediately and DeadLetterAsync parks a poison message. Exactly-once is completed on the send side by duplicate detection, which drops a second message with the same application-controlled MessageId inside the detection window - which is what makes a client retry after an unknown send outcome safe. Choose this variant for cloud workloads; MSMQ (below) is the local store when no cloud broker is allowed.",
+  "code_sketch": "var client = new ServiceBusClient(connectionString);\nvar receiver = client.CreateReceiver(\"orders\", new ServiceBusReceiverOptions {\n    ReceiveMode = ServiceBusReceiveMode.PeekLock });\nServiceBusReceivedMessage msg = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(30));\ntry {\n    await HandleAsync(msg.Body);                      // business commit first\n    await receiver.CompleteMessageAsync(msg);         // ack -> broker deletes it\n} catch (Exception) when (!msg.LockTokenExpired()) {\n    await receiver.AbandonMessageAsync(msg);          // unlock -> redelivery\n}",
+  "pitfalls": [
+    "Settling after the receiver or connection was closed: the settlement never reaches the service, the lock expires and the message is redelivered - then repeated redelivery moves it to the dead-letter queue.",
+    "A lock duration shorter than the processing time (renew with RenewMessageLockAsync or use sessions), and a MaxDeliveryCount that turns a bug into silent dead-lettering.",
+    "Duplicate detection considers only the MessageId: a fresh GUID per attempt defeats it, and the detection window (default 10 minutes) bounds how long a replay stays safe.",
+    "Non-idempotent handlers: PeekLock is at-least-once, so a lock expiry after a successful business effect duplicates that effect."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-transfers-locks-settlement",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection",
+    "https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver"
+  ],
+  "variants": [
+    {
+      "variant_id": "service-bus-peeklock",
+      "name": "Azure Service Bus PeekLock settlement with duplicate detection",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "requires_features": [
+        "azure-messaging-servicebus"
+      ],
+      "idiom_name": "ServiceBusReceiver PeekLock + CompleteMessageAsync + MessageId dedup",
+      "implementation_notes": "The broker is the durable store: receive in PeekLock mode so the message stays locked and is redelivered when the lock expires, process, and settle with CompleteMessageAsync only after the business commit; AbandonMessageAsync releases the lock immediately and DeadLetterAsync parks a poison message. Exactly-once is completed on the send side by duplicate detection, which drops a second message with the same application-controlled MessageId inside the detection window - which is what makes a client retry after an unknown send outcome safe. Choose this variant for cloud workloads; MSMQ (below) is the local store when no cloud broker is allowed.",
+      "code_sketch": "var client = new ServiceBusClient(connectionString);\nvar receiver = client.CreateReceiver(\"orders\", new ServiceBusReceiverOptions {\n    ReceiveMode = ServiceBusReceiveMode.PeekLock });\nServiceBusReceivedMessage msg = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(30));\ntry {\n    await HandleAsync(msg.Body);                      // business commit first\n    await receiver.CompleteMessageAsync(msg);         // ack -> broker deletes it\n} catch (Exception) when (!msg.LockTokenExpired()) {\n    await receiver.AbandonMessageAsync(msg);          // unlock -> redelivery\n}",
+      "pitfalls": [
+        "Settling after the receiver or connection was closed: the settlement never reaches the service, the lock expires and the message is redelivered - then repeated redelivery moves it to the dead-letter queue.",
+        "A lock duration shorter than the processing time (renew with RenewMessageLockAsync or use sessions), and a MaxDeliveryCount that turns a bug into silent dead-lettering.",
+        "Duplicate detection considers only the MessageId: a fresh GUID per attempt defeats it, and the detection window (default 10 minutes) bounds how long a replay stays safe.",
+        "Non-idempotent handlers: PeekLock is at-least-once, so a lock expiry after a successful business effect duplicates that effect."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-transfers-locks-settlement",
+        "https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection",
+        "https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver"
+      ]
+    },
+    {
+      "variant_id": "msmq-transactional",
+      "name": "MSMQ transactional queue (local store, DTC-enlisted)",
+      "paradigm": "oo",
+      "min_standard": "C#7",
+      "requires_features": [
+        "system-messaging"
+      ],
+      "idiom_name": "MessageQueue { Transactional = true } with MessageQueueTransaction",
+      "implementation_notes": "Windows-local realization with its own transactional log: a queue created with Transactional = true journals sends and receives, so a send becomes durable on commit and a receive that is not committed returns the message to the queue (the automatic redelivery the pattern needs). Enlisting the queue together with a database connection in one DTC transaction is what makes 'business write plus send' atomic without an outbox table. This is .NET Framework-era technology: the modern equivalents are a broker (Service Bus above) or a transactional outbox, and the classic form is justified mainly in on-premises Windows estates that already run MSMQ.",
+      "code_sketch": "var queue = new MessageQueue(@\".\\private$\\orders\") { Transactional = true };\nvar send = new MessageQueueTransaction();\nsend.Begin();\nqueue.Send(new Message(payload) { Recoverable = true }, \"order-\" + id);\nsend.Commit();                       // durable only at this point\nvar receive = new MessageQueueTransaction();\nreceive.Begin();\nMessage m = queue.Receive(receive, TimeSpan.FromSeconds(30));\n// a crash before receive.Commit() returns the message to the queue",
+      "pitfalls": [
+        "Recoverable = true is required for the message body to survive a reboot; a transactional queue alone only makes the operation atomic, not the payload persistent.",
+        "Distributed transactions need the DTC service, are slow, and make the send path fail whenever DTC or the database's XA support is unavailable.",
+        "System.Messaging exists only on .NET Framework/Windows (MSMQ cannot be used from .NET Core without a client library), so the variant is not portable.",
+        "A non-transactional Receive inside a transaction context silently bypasses the journal, and the message is lost when the process dies after processing but before ack."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.messagequeue",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.messagequeue.transactional"
+      ]
+    }
+  ],
+  "default_variant": "service-bus-peeklock",
+  "version": "1.0"
+}

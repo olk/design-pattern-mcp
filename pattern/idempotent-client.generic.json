@@ -1,0 +1,32 @@
+{
+  "pattern": "idempotent-client",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "client-minted operation id (idempotency key) plus a receiver-side key/outcome record, or naturally idempotent operation semantics",
+  "implementation_notes": "Language-neutral form: mint one opaque key per logical operation (a random UUID, a request id or a business idempotency key), attach it to every attempt, and persist it with the pending work so a restart resumes the same operation; on the receiver side, record key -> outcome in the same transaction as the business effect, replay the recorded outcome for a duplicate, and reject a replayed key whose parameters differ. Where a key is awkward, change the operation instead: absolute writes (upsert by business identifier, PUT of a full representation), conditional writes guarded by a version or ETag, or set-style updates instead of increments and appends. The retry policy is part of the contract - automatic replay is allowed only for operations declared idempotent (safe methods, PUT/DELETE or keyed commands) - and the key must be passed on to downstream calls, because a guarantee that stops at the first hop is not a guarantee.",
+  "code_sketch": "key = uuid4()                        # once per logical operation\nloop:\n    resp = POST /charges  Idempotency-Key: key    # same key every attempt\n    if resp is definitive: break                  # else back off and replay\n# receiver, one transaction:\nBEGIN\n  INSERT INTO keys(key, request_hash, state) VALUES (...) ON CONFLICT(key) DO NOTHING\n  if inserted:  apply_effect(); UPDATE keys SET state='done', outcome=...\n  else:         return recorded_outcome          # 409 if request_hash differs\nCOMMIT",
+  "pitfalls": [
+    "A key that is minted inside the retry loop, derived from the payload, or kept only in volatile memory changes what 'the same operation' means and silently disables the guarantee.",
+    "The deduplication marker and the business effect must commit atomically; otherwise a crash replays a partially applied operation.",
+    "Deduplication expires: retention must exceed the longest redelivery or resubmission window, including manual replays from a dead-letter queue.",
+    "Mint the key inside the retry loop: a timeout that fires between the retry call and the HTTP write means the key is generated fresh each time, silently disabling deduplication while the code still looks protected.",
+    "Parameter drift on replay: the same idempotency key reused with a different request body – the server must detect this and return 409 Conflict, otherwise a stale outcome is returned for semantically different work.",
+    "Low-entropy key collision: keys derived from counters, timestamps, or user-provided strings can collide across distinct operations, causing one logical operation to be silently collapsed into another.",
+    "Concurrent duplicate race: two simultaneous retries of the same key both pass the uniqueness check before either commits – requires an atomic conditional upsert with a unique constraint, not a check-then-insert in application code.",
+    "In-progress leak: recording a 'processing' state for a key and crashing before either completing or rolling back leaves the operation stuck permanently; requires a timeout-based reconciliation step.",
+    "Premature key expiration: keys that expire before a retry can arrive reopen the duplicate window and cannot protect that replay.",
+    "Using sensitive or personal data as idempotency keys: email addresses, user IDs, or personal identifiers in keys leak into logs, network traces, and deduplication stores, creating privacy and compliance exposure – use cryptographically random tokens instead.",
+    "Non-atomic marker and effect commit: if the deduplication marker and the business effect are written in separate transactions, a crash after the business effect commits but before the marker is recorded means a retry will re-execute the already-committed effect.",
+    "Eventual consistency in the deduplication store: a stale read of the key set can allow a duplicate request to pass the uniqueness check before the original write is visible – use strong consistency for high-stakes operations.",
+    "Unbounded auto-retry of non-idempotent methods without a key: SDKs or middleware that blindly retry POST requests on timeout without an idempotency key break the guarantee.",
+    "Single key for a batch of N items: if one item fails and the retry replays the entire batch with one shared key, all N items are re-executed – each logical item needs its own key.",
+    "Assuming the key's deduplication scope matches the retry's scope: a token scoped per availability zone, shard, tenant or table partition does not deduplicate a retry that lands in a different slice of that scope - AWS EC2 surfaces this as IdempotentParameterMismatch, while a per-shard key in an application store fails the same way invisibly.",
+    "Testing idempotency with sequential requests only: a check-then-write implementation passes every sequential test and still double-applies when two attempts overlap, because the duplicate window is a race rather than a sequence - replays must be exercised over concurrent connections.",
+    "Trusting infrastructure deduplication for effects outside its boundary: broker-level or gateway-level duplicate detection covers only writes inside that system's transaction, so a call to a third-party provider (payment, e-mail, carrier) still needs its own deterministic key and a reconciliation query - a key is a promise about one store, not about the world."
+  ],
+  "sources": [
+    "https://docs.stripe.com/api/idempotent_requests",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/idempotent-consumer"
+  ],
+  "version": "1.0"
+}

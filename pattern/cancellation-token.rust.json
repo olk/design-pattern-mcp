@@ -1,0 +1,88 @@
+{
+  "pattern": "cancellation-token",
+  "language": "rust",
+  "support": "library",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tokio-cancellation-token",
+      "name": "tokio-util CancellationToken",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "tokio",
+        "tokio-util"
+      ],
+      "idiom_name": "tokio_util::sync::CancellationToken with child_token",
+      "implementation_notes": "Rust's own notion of cancellation is dropping a future, but a request that someone else sends needs a shared token: tokio_util::sync::CancellationToken is cloneable, child_token() derives children that are cancelled with the parent, cancelled() returns a future to select on, cancel() is one-way and idempotent, and run_until_cancelled wraps an operation so it yields None when the request arrives. Pass clones down the task tree, select on token.cancelled() or check is_cancelled() at safe points, and prefer child tokens per generation so one cancelled token does not poison later work. For synchronous threads the equivalent is an Arc<AtomicBool> plus a Condvar or channel.",
+      "code_sketch": "let token = CancellationToken::new();\nlet child = token.clone();\n\ntokio::spawn(async move {\n    tokio::select! {\n        _ = child.cancelled() => return,       // safe point\n        _ = work() => {}\n    }\n});\n\ntoken.cancel();                                // children follow via child_token()",
+      "pitfalls": [
+        "select! cancels by dropping the losing future, which is only safe if that future is cancellation-safe: re-creating a non-cancellation-safe future (read_exact, write_all, Mutex::lock) in a loop loses progress or deadlocks - the tokio docs list which operations are cancel safe.",
+        "Detached tokio::spawn tasks outlive the scope that created them and are not cancelled by dropping the JoinHandle; use the token, JoinHandle::abort, or structured tools such as JoinSet/TaskTracker.",
+        "Cancellation only happens at .await points: a long synchronous block or std::thread::sleep inside async code never observes the token - move such work to spawn_blocking, which also cannot be cancelled.",
+        "A token is one-way and shared by every clone: reusing a cancelled root for new work cancels it immediately, so create a child_token per generation and drop it when the generation ends."
+      ],
+      "sources": [
+        "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html",
+        "https://docs.rs/tokio/latest/tokio/macro.select.html"
+      ]
+    },
+    {
+      "variant_id": "drop-select",
+      "name": "Drop-based cancellation with select!",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2018",
+      "requires_features": [
+        "async/await",
+        "tokio::select! or futures::select"
+      ],
+      "idiom_name": "cancellation by dropping the future (select!/timeout)",
+      "implementation_notes": "Structurally, Rust cancels by dropping: a future that is no longer polled simply stops at its next await, and tokio::select! relies on that to abandon the losing branch while timeout() uses it to bound a wait. Composed this way, the 'token' is the control flow that owns the future - the select arm, the scope, the timeout - and cancellation safety (is dropping and re-creating this future a no-op?) is the property that decides whether that is correct. Use it for local, structural cancellation (a request racing a shutdown, a deadline around a single operation) and switch to an explicit CancellationToken only when a signal must reach tasks that nobody holds a handle for.",
+      "code_sketch": "tokio::select! {\n    result = handle_connection(&mut conn) => result?,\n    _ = shutdown.recv() => {                 // dropping conn's future cancels it\n        return Ok(());\n    }\n}\n\n// deadline form: tokio::time::timeout(Duration::from_secs(2), call()).await?",
+      "pitfalls": [
+        "Dropping a future mid-await can lose partial work: any future used in a select loop must be cancel safe, and code that must complete an operation has to own it (spawn it) rather than borrow it into a losing branch.",
+        "A select that is re-created in a loop restarts its branches: reuse the same pinned futures (or a stream) or progress is lost at every iteration.",
+        "Dropping is silent - no cleanup runs unless types implement Drop - so RAII guards are the only guarantee that a cancelled operation releases its resources.",
+        "This mechanism cannot be triggered by a remote party: there is no handle to signal, so an external cancel needs the token variant."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/macro.select.html"
+      ]
+    },
+    {
+      "variant_id": "sync-atomic-flag",
+      "name": "std::sync::atomic flag for synchronous threads",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2015",
+      "requires_features": [
+        "std::sync::atomic::AtomicBool",
+        "std::sync::Condvar"
+      ],
+      "idiom_name": "Arc<AtomicBool> token + Condvar or channel wakeup",
+      "implementation_notes": "Outside an async runtime the token is built from std: an Arc<AtomicBool> (or AtomicU8 for a reason code) cloned into every thread, plus a Condvar or a channel so a waiting thread wakes and re-checks, because std::thread::sleep and Condvar::wait cannot observe the flag on their own. Store with Ordering::Release and load with Ordering::Acquire when the flag guards published data; Relaxed is enough when nothing else depends on the ordering. This is the same shape as the CancellationToken variant without the tokio dependency, and it is the right default for blocking thread pools and FFI-adjacent code.",
+      "code_sketch": "let cancelled = Arc::new(AtomicBool::new(false));\nlet flag = Arc::clone(&cancelled);\n\nlet worker = thread::spawn(move || {\n    while !flag.load(Ordering::Acquire) {        // safe point\n        if let Some(job) = queue.pop_timeout(Duration::from_millis(100)) {\n            run(job);\n        }\n    }\n});\ncancelled.store(true, Ordering::Release);        // request",
+      "pitfalls": [
+        "Waiting without a timeout (Condvar::wait, a blocking channel receive) hides the flag until the predicate changes; use wait_timeout or a channel with recv_timeout and re-check the flag.",
+        "The flag must be Arc-shared and its clones must be moved into threads; a stack flag borrowed across threads does not compile, and a leaked reference via unsafe defeats the point.",
+        "Forgetting the ordering (using Relaxed for flag plus data) creates a data race on the payload even though the flag itself is atomic; publish data before Release and read after Acquire."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/atomic/type.AtomicBool.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-cancellation-token",
+  "idiom_name": "tokio_util::sync::CancellationToken with child_token",
+  "implementation_notes": "Rust's own notion of cancellation is dropping a future, but a request that someone else sends needs a shared token: tokio_util::sync::CancellationToken is cloneable, child_token() derives children that are cancelled with the parent, cancelled() returns a future to select on, cancel() is one-way and idempotent, and run_until_cancelled wraps an operation so it yields None when the request arrives. Pass clones down the task tree, select on token.cancelled() or check is_cancelled() at safe points, and prefer child tokens per generation so one cancelled token does not poison later work. For synchronous threads the equivalent is an Arc<AtomicBool> plus a Condvar or channel.",
+  "code_sketch": "let token = CancellationToken::new();\nlet child = token.clone();\n\ntokio::spawn(async move {\n    tokio::select! {\n        _ = child.cancelled() => return,       // safe point\n        _ = work() => {}\n    }\n});\n\ntoken.cancel();                                // children follow via child_token()",
+  "pitfalls": [
+    "select! cancels by dropping the losing future, which is only safe if that future is cancellation-safe: re-creating a non-cancellation-safe future (read_exact, write_all, Mutex::lock) in a loop loses progress or deadlocks - the tokio docs list which operations are cancel safe.",
+    "Detached tokio::spawn tasks outlive the scope that created them and are not cancelled by dropping the JoinHandle; use the token, JoinHandle::abort, or structured tools such as JoinSet/TaskTracker.",
+    "Cancellation only happens at .await points: a long synchronous block or std::thread::sleep inside async code never observes the token - move such work to spawn_blocking, which also cannot be cancelled.",
+    "A token is one-way and shared by every clone: reusing a cancelled root for new work cancels it immediately, so create a child_token per generation and drop it when the generation ends."
+  ],
+  "sources": [
+    "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html",
+    "https://docs.rs/tokio/latest/tokio/macro.select.html"
+  ]
+}

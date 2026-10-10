@@ -1,0 +1,264 @@
+{
+  "category": "concurrency-resilience",
+  "name": "future-promise",
+  "aliases": [
+    "futures and promises",
+    "async/await"
+  ],
+  "intent": "Turn the outcome of an operation that has not finished yet into an ordinary, single-assignment value - a future/promise handle that the producer resolves exactly once and any consumer may await, combine, cancel or ignore - so the result can be passed around as a value instead of blocking the caller or inverting control flow into callbacks.",
+  "problem": "An operation has been started out of band (I/O, a remote call, a background computation) and its result does not exist yet, but the surrounding code must keep a usable handle to it now and continue later. Without a single-assignment placeholder every call site rebuilds the same machinery - a shared slot plus a completion flag, a lock/condition variable or channel to publish the result, a place to park the exception, a rule for who wakes the waiter - or it blocks a thread, or it scatters the continuation over callbacks that must re-derive the context they were called in.",
+  "context": "Concurrent and asynchronous programs in which results arrive later than they are requested: event loops and UI threads that must not block, servers with many requests in flight, coroutine/task runtimes, message-passing systems and distributed calls. It presupposes a runtime that can run work out of band (thread or pool, event loop, coroutine dispatcher, I/O completion) and a memory model that publishes the resolved result to whoever waits on it, or that resumes waiters on your behalf.",
+  "benefits": [
+    "A pending result becomes a first-class value: it can be stored in a field, put in a collection, returned from the function that started the work, passed on to another call or handed to several consumers, so 'not computed yet' stops being a special control-flow shape.",
+    "Single assignment removes the classic handoff races: the state is written once and read many times, so nobody has to invent double-check flags, and the runtime publishes the value to every waiter (or resumes them) exactly once.",
+    "Producer and consumer are decoupled in time and place: the resolver need not know who awaits (and vice versa), which is what allows the waiting side to be another thread, another turn of the event loop, or a different service.",
+    "Results compose: map/flatMap-style transforms, fan-in and fan-out (all/any/race/join), timeouts and cancellation are expressed as operations on handles, so pipelines are built without blocking calls and without callback pyramids.",
+    "Failure travels with the value: the outcome is a value-or-error state, so an exception cannot be dropped by forgetting to check a flag, and awaiting a failed result re-raises the original failure at the point of consumption.",
+    "Waiting costs less than a thread: a consumer that is not ready to continue suspends, or attaches a continuation, instead of parking an OS thread, so one process keeps many more operations in flight.",
+    "Uniformity and interop: one handle type lets libraries be combined, and mechanical adapters (callback-to-future, future-to-callback, continuation-to-Task) connect new code to old APIs instead of forcing a choice between them."
+  ],
+  "tradeoffs": [
+    "Contagion (function coloring): awaiting is only legal inside an asynchronous context, so a single future marks every caller and splits an ecosystem into synchronous and asynchronous halves - the reason 'colorless' designs (goroutines, virtual threads) are proposed as alternatives.",
+    "Unobserved outcomes disappear: an uncollected future swallows its value and its error (an unhandled rejection, a dropped Task, a Rust future that never runs because nothing awaited it), and the call site where the failure should have surfaced is gone.",
+    "Blocking on a pending value inside the runtime that must complete it - get()/join()/.result() on an event loop, a single-thread executor or a coroutine dispatcher - deadlocks or starves the very worker the operation needs.",
+    "Context and diagnostics leak across suspension points: thread-locals (identity, transaction, tracing, tenant), stack traces and debugger state do not follow the continuation, so code that reads sequentially executes in fragments on threads the author did not choose.",
+    "Cancellation, deadlines and backpressure are not part of the primitive: most futures are not cancellable, timeouts must be added explicitly, and one future per item moves overload from a queue into unbounded memory growth.",
+    "Cost and retention per pending value: each future carries a shared state, a state machine and its continuations until it settles, so very short operations pay more in bookkeeping than they save, and a handle that outlives its owner retains the context it captured.",
+    "Scheduler coupling: the runtime decides where the continuation runs (executor, dispatcher, synchronization context), so behaviour, ordering and reproducible tests now depend on a component the domain code never mentions."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Promise / Resolver (write end)",
+      "responsibility": "Single-assignment container for the outcome: exactly one call stores the value or the failure and makes the shared state ready; every later attempt is rejected or ignored, and only this role may settle the state."
+    },
+    {
+      "role": "Future / Awaitable (read end)",
+      "responsibility": "Read-only view of the pending outcome held by the client: test readiness, await or block for the value, attach continuations, combine it with other handles; several readers are allowed where the handle is shared (std::shared_future, one JS promise awaited in many places)."
+    },
+    {
+      "role": "Shared state / Completion slot",
+      "responsibility": "The once-only cell that holds pending|ready plus value|error and the waiters; it is the synchronisation point between resolver and readers, and its publication rules are what make the handle safe to move between threads."
+    },
+    {
+      "role": "Async operation / Producer",
+      "responsibility": "The work that computes the value or fails and then resolves the promise; it owns its failure path, because an unresolved handle parks its consumers forever."
+    },
+    {
+      "role": "Consumer / Client",
+      "responsibility": "Continues its own work after starting the operation and later collects the outcome - awaits it, chains a continuation, combines it with other handles, or abandons it deliberately; it never sees the write end."
+    },
+    {
+      "role": "Scheduler / Executor",
+      "responsibility": "Runs the operation out of band and resumes the consumers when the state becomes ready (event loop, thread pool, coroutine dispatcher, task scheduler); it owns the concurrency policy that the handle only names."
+    },
+    {
+      "role": "Combinator / Continuation adapter",
+      "responsibility": "Derives new pending values from existing ones without blocking (map/flatMap, all/any/race/join, callback-to-future bridges), so composition, timeouts and fan-in are expressed on handles instead of on stacks."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "persistence-unit",
+    "boundary"
+  ],
+  "use_cases": [
+    "UI and event-loop code: a network read, file load or animation hands back a promise/task immediately so the thread keeps rendering and reacts in a continuation when the value arrives.",
+    "Server request handlers that issue several independent downstream calls and combine them (fan-out with all/any/race, task groups, join), turning total latency into the slowest call instead of the sum of all calls.",
+    "Remote calls and RPC: the client holds a placeholder for the reply (Java Future, generated asynchronous stubs, gRPC/listenable futures), including promise pipelining, where the pending value is used as an argument to further calls.",
+    "Worker pools and batch pipelines: each unit of work is submitted and its future collected as it completes (executor futures, std::async, task pools, async gather), with results applied as they settle.",
+    "Bridging callback and event APIs into awaitable form (TaskCompletionSource, asyncio Future set_result, Swift continuations, oneshot channels) so legacy interfaces take part in composition and cancellation.",
+    "Sharing one pending result among many consumers (shared_future, a single promise awaited in several places, in-flight request coalescing) so the expensive work happens once and every reader observes the same outcome.",
+    "One-shot lazily-started computation as a value: a handle created before it is started (Rust lazy futures, C++ std::launch::deferred, a promise completed later by a scheduler or queue) can be passed around, stored and memoized, and is forced exactly once when somebody needs the result.",
+    "In-flight coalescing and asynchronous caching: the first caller starts the work and stores its handle in a registry, concurrent callers await the same handle, and the entry is evicted the moment it settles — a future doubling as the cache entry, with an explicit age bound so a stalled entry cannot become permanent.",
+    "Serialization without a thread: chaining work onto a single promise or queue so asynchronous writers cannot interleave (an async mutex or write queue built from the same primitive), used for single-writer resources, log segments and ordered uploads.",
+    "Readiness and drain latches: model started, ready and shutdown-complete as one handle per phase so many components can await readiness, and shutdown can wait for every in-flight handle to settle before the process exits.",
+    "Batching and micro-batching windows: collect per-caller handles opened inside a short window and settle them all from one underlying call (data-loader style), so N callers get N futures but the backend sees one request.",
+    "Hedged requests for tail latency: issue the same read to several replicas or endpoints and take the first answer before the deadline (race plus timeout), cancelling the losers deliberately — the pattern that turns p99 latency into the cost of a few extra calls.",
+    "Test and fixture synchronization: a handle used as a latch that the code under test resolves, so ordering assertions replace sleeps and flaky timing waits in asynchronous tests.",
+    "Retry with exponential backoff: wrap an async operation in a function that races it against a timeout and recursively re-invokes itself on failure, settling the outer promise only when a configured maximum attempt count is exhausted or a non-retryable error occurs, giving every retry its own independent cancellation token so the backing off is observable as increasing delay rather than unbounded queue growth.",
+    "Async lazy initialization: a singleton or resource holder returns a cached future on repeated calls instead of re-running the setup, so initialization races are resolved by the same handle being returned to every concurrent caller while the first completion cancels any in-flight duplicates.",
+    "Async iterator and streaming: a producer resolves a promise and immediately queues the next handle, yielding a sequence of futures (async generator, async iteration protocol, ReadableStream) so consumers pull values without the producer needing to know who awaits or when, and backpressure propagates by pausing the producer when the consumer's queue is full.",
+    "Async cache with TTL eviction: store a future in a concurrent map keyed by request parameters; on cache-hit, return the in-flight future instead of spawning a new operation; entries are evicted atomically on settle so the cache never holds a reference to settled futures and their retained contexts.",
+    "Circuit breaker via promise composition: wrap an operation in a future that tracks failure rate; when the circuit opens, subsequent calls return a pre-rejected future immediately without executing the operation, and the breaker half-closes by allowing one probe call through after the cooldown window.",
+    "Async context propagation: thread-local or scoped-value context (tenant ID, request trace, authentication token) is captured at the point where a future is created and restored inside the continuation, so async boundaries do not sever the context chain that diagnostics depend on.",
+    ".NET Task-based Asynchronous Pattern (TAP): Task and Task<T> return handles that carry an asynchronous operation's result, fault or cancellation, so callers can await or compose them without blocking.",
+    "Python asyncio: loop-created Future and Task objects represent event-loop work that can be awaited and combined, while TaskGroup provides a structured lifetime for related operations.",
+    "Java CompletableFuture: an explicitly completable Future and CompletionStage supports asynchronous suppliers, dependent stages, and allOf/anyOf fan-in under a chosen executor."
+  ],
+  "avoid_when": [
+    "The caller needs the value before it can do anything else: a plain synchronous call, or a direct await inside the same function, is simpler than storing and threading a handle.",
+    "The work is CPU-bound and consumed immediately: a data-parallel loop or bulk API over a range avoids per-item future bookkeeping and scheduler hops.",
+    "A structured scope already expresses the lifetime: awaiting the operations directly, or a task group/scope that joins its children, needs no stored handle at all.",
+    "The need is a stream or a queue: sequences, ordering and backpressure belong to channels, streams or observable pipelines, not to one future per element.",
+    "Only completion matters and there is no value: a callback, event or asynchronous completion token carries the notification with less machinery than an empty future.",
+    "Nobody will ever consume the outcome: run the work on an explicit background queue with logging and metrics instead of dropping a handle whose failures vanish.",
+    "The code runs on Project Loom virtual threads with pure blocking I/O: if every operation is a blocking call that the virtual thread runtime can efficiently multiplex, plain sequential code with try/catch may be clearer than explicit future composition — but note that virtual threads still need structured concurrency scopes to safely govern cancellation and child lifetimes."
+  ],
+  "language_files": {
+    "generic": "future-promise.generic.json",
+    "c": "future-promise.c.json",
+    "cplusplus": "future-promise.cplusplus.json",
+    "csharp": "future-promise.csharp.json",
+    "go": "future-promise.go.json",
+    "java": "future-promise.java.json",
+    "javascript": "future-promise.javascript.json",
+    "kotlin": "future-promise.kotlin.json",
+    "python": "future-promise.python.json",
+    "ruby": "future-promise.ruby.json",
+    "rust": "future-promise.rust.json",
+    "scala": "future-promise.scala.json",
+    "swift": "future-promise.swift.json",
+    "typescript": "future-promise.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo",
+    "functional"
+  ],
+  "scope": "value",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "active-object",
+    "async-method-invocation",
+    "asynchronous-completion-token",
+    "event-based-asynchronous",
+    "structured-concurrency",
+    "singleflight",
+    "cancellation-token",
+    "thread-pool",
+    "reactor",
+    "proactor",
+    "half-sync-half-async",
+    "callback",
+    "scatter-gather",
+    "timeout",
+    "deadline-propagation",
+    "memoization",
+    "counting-semaphore",
+    "barrier-countdown-latch",
+    "master-worker",
+    "fork-join",
+    "bulkhead",
+    "circuit-breaker",
+    "producer-consumer"
+  ],
+  "anti_patterns": [
+    "Fire and forget: starting a future and dropping the handle, so failures are never observed (unhandled rejection, lost Task, a future that never runs because nothing awaited it).",
+    "Blocking inside the runtime that must complete the future: get()/join()/.result()/Wait() on an event loop, a single-thread pool or a dispatcher - latency turned into deadlock or starvation.",
+    "Unbounded future-per-item fan-out with no admission control, presented as scalability while the limit merely moves from threads to queues, memory and downstream load.",
+    "Re-implementing futures over shared flags and polling or sleeping loops instead of using the runtime's await/completion mechanism - lost wake-ups and busy waits included.",
+    "Async in name only: methods that finish the work before returning the handle, or synchronous wrappers that block on an asynchronous call and re-create the problem they were meant to solve.",
+    "Simplification by swallowing: a catch that converts a rejection into a successful value, or a resolution with an error nobody reads, so the failure never reaches a consumer.",
+    "Floating promises: starting an async operation and not returning its Promise from a then callback, so the chain continues before the operation finishes and may observe incomplete state.",
+    "Async constructors or fire-and-forget class field async initializers: async work started during object construction with no stored reference to the returned Promise, so initialization failures silently disappear.",
+    "Blocking a virtual thread inside a synchronized block: virtual threads can be pinned to their carrier when inside synchronized blocks or native methods, defeating the purpose of lightweight threads — replace with Lock from java.util.concurrent."
+  ],
+  "design_principles": [
+    "Write-once, read-many: the outcome is published once and cannot change afterwards, so consumers need neither locks nor re-checks.",
+    "Separation of concerns: computing the value, publishing it, awaiting it and scheduling the continuation are four distinct responsibilities split across producer, promise, future and executor.",
+    "Make failure explicit: the outcome is a value-or-error state, so no error path can bypass the handle - failures are data, not ambient crashes.",
+    "Information hiding: the read end cannot settle the state, and only the resolver can - ownership of the result stays unambiguous.",
+    "Do not block a resource you still need: a design that waits synchronously inside the scheduler that must produce the value is self-defeating.",
+    "Composition over inversion of control: combinators over handles replace nested callbacks and make fan-in, timeouts and cancellation first-class.",
+    "Handle ownership is a first-class concern: a future whose result nobody observes is a latent failure mode; every handle must have a responsible consumer, a structured scope, or an explicit discard marker with terminal error routing.",
+    "Cancellation is a protocol, not a flag: a cancellation token must be checked at observable yield points, cancellation of the handle must propagate to the operation's I/O descriptors and child tasks, and the cancelled result must be distinguishable from a deadline exceeded or a client-gone-away failure.",
+    "Lazy vs eager is a deliberate choice: eager promises (executing at construction) are appropriate for fire-and-forget operations; lazy futures (executing only when awaited) are appropriate when the handle may outlive its consumer or the operation is conditional — mixing the two silently is the source of subtle correctness bugs."
+  ],
+  "best_practices": [
+    "Give every future an owner: await it, join it, attach a terminal error handler, or cancel/drop it deliberately - a handle nobody consumes is a failure mode, not a shortcut.",
+    "Never block inside the scheduler: use the runtime's await rather than get()/join()/.result() on event-loop, dispatcher or single-thread-executor threads.",
+    "Resolve on every exit path, including exceptions: an unresolved promise parks its consumers forever (and in C++ reports broken_promise).",
+    "Propagate cancellation, deadlines and ambient context into the operation and back out of the continuation - thread-local and ambient state does not travel with the result.",
+    "Bound concurrency at the executor (pool size, semaphore, task-group limit) and apply backpressure instead of creating one future per item.",
+    "Prefer composition primitives (all/any/race/join, map/flatMap) to hand-rolled counters and callbacks, and prefer the runtime's structured scope to detached handles where the language offers one.",
+    "Keep continuations short and non-blocking, and re-establish at their top whatever context they need (request identity, tenant, tracing span, transaction).",
+    "Make every detachment explicit and observable: mark intentional fire-and-forget at the call site with an explicit discard marker plus a terminal error handler, route failures to a supervising error sink carrying request and task identity, and count it — a dropped handle must be a decision recorded in the code, never an accident of syntax.",
+    "Choose the fan-in combinator by failure semantics and document the choice: all-or-nothing (Promise.all, Future.wait, Task.WhenAll) abandons siblings' results at the first rejection; collect-every-outcome (allSettled, gather(return_exceptions=True)) keeps each outcome but needs explicit per-item inspection; first-success (any/anyOf) and first-settled (race/select) require losers to be genuinely disposable.",
+    "Express deadlines with the runtime's deadline construct instead of a hand-rolled watchdog promise (asyncio.timeout, withTimeoutOrNull, CancellationTokenSource.CancelAfter, AbortSignal.timeout, orTimeout), and propagate the remaining budget into downstream calls rather than granting a fresh full timeout at every hop.",
+    "Place cancellation points where the operation's invariant can be restored — between units of work, never in the middle of a protocol exchange — and treat a cancelled operation as one that never completed: schedule compensating or cleanup work explicitly and give it a non-cancellable window (NonCancellable, a cancellation handler, uncancel after an intentional swallow, try/finally).",
+    "Keep cancellation distinguishable from failure and re-raise it: never convert a cancellation exception into a business error, preserve the abort reason so callers can distinguish client-gone from deadline-exceeded, and remember that Python's CancelledError is a BaseException — a bare except Exception neither catches it nor protects it.",
+    "Own the handle's lifetime: keep a strong reference to every background task or handle you start (asyncio holds only weak references to tasks; a std::async future abandoned may block at scope exit) and drop or evict it the moment it settles, so caches, registries and in-flight maps cannot accumulate settled values, exceptions and captured contexts.",
+    "Bound the number of pending handles at admission (semaphore, bulkhead, bounded queue) rather than trusting the executor, and monitor both the unresolved-handle count and the age of the oldest pending handle — an aging handle is either a stalled producer or a leak, and neither shows up in throughput metrics.",
+    "Turn the runtime's failure-detection aids on and keep them on: asyncio debug mode, Node's default throw-on-unhandled-rejection, a TaskScheduler.UnobservedTaskException listener, a floating-promise lint rule, and warnings-as-errors for never-awaited coroutines or must-use future types in the test suite.",
+    "Decide the sharing model before handing a handle out: single-consumption (move-only, first waiter takes the value) versus multi-consumer (shared_future, broadcast, a settled promise awaited in many places) — and never route several waiters through a single-consumption handle.",
+    "Anything composed inside a race/select loop must be cancellation-safe: safe to drop and restart without losing progress — if dropping the operation mid-await can lose progress or leave an item consumed, move it into a spawned task whose handle you keep, or make the operation idempotent before racing it.",
+    "Always return promises from then() callbacks or await them in async functions: failing to return the inner promise creates a floating promise whose settlement races against the outer chain, and subsequent handlers may observe incomplete state or run out of order.",
+    "Use AbortController as the canonical cancellation signal in JavaScript and TypeScript: create one per logical operation, pass its signal to every fetch or async API that supports it, and cancel outstanding work explicitly in finally or when the component unmounts — never rely on the garbage collector to clean up in-flight requests.",
+    "Apply controlled concurrency for fan-out operations: rather than creating one promise per item in an unbounded loop (which overwhelms downstream APIs and memory under load), batch items and gate them through a semaphore or a p-limit-style queue so the maximum number of concurrent operations is bounded regardless of input size.",
+    "Prefer flat promise chains over nesting: deep nesting (then inside then inside then) obscures control flow and makes error scope hard to reason about. Flat chains place all error handling at the end; nesting is only appropriate when a catch must scope which errors it handles.",
+    "Never mix .then()/catch() continuation style with await in the same function body: the two styles have different synchronous-vs-asynchronous error propagation paths; choose one style per function boundary and use async/await throughout for readability.",
+    "Use StructuredTaskScope (Java 21+) or TaskGroup (Python 3.11+) instead of detached tasks whenever the tasks' lifetime is bounded by a request or operation scope: structured scopes cancel children automatically on exit and propagate exceptions to the parent, eliminating the leak-prone pattern of submitting independent tasks and hoping cancellation works out.",
+    "When using virtual threads (Project Loom), prefer pure blocking style for I/O-bound work rather than explicit future composition — but still use StructuredTaskScope for fan-out and cancellation, and replace ThreadLocal with ScopedValue so context bindings inherit correctly across virtual thread mount/unmount boundaries.",
+    "For async iteration (streams, generators), model each yielded item as a fresh future so backpressure propagates naturally: the consumer's rate controls when the producer's next item handle is awaited, preventing unbounded buffering.",
+    "Implement async caches as a map of parameter-key to in-flight future; on key collision, return the existing future instead of spawning a duplicate; evict entries atomically on settle so the map never holds references to completed futures and their retained closures.",
+    "Audit synchronized blocks when adopting virtual threads: synchronized in Java pins the carrier thread and defeats virtual thread efficiency; replace with java.util.concurrent locks (ReentrantLock, StampedLock) or use ManagedBlocker with ForkJoinPool.",
+    "Distinguish lazy from eager futures in library APIs and document which you return: a lazy future (Rust, C++ deferred) defers work until first await while an eager promise (JS new Promise) starts immediately — callers who expect one and get the other will have subtle correctness bugs."
+  ],
+  "version": "1.4",
+  "sources": [
+    "History and semantics of futures and promises: Daniel P. Friedman and David Wise proposed the term promise (1976), Henry C. Baker Jr. and Carl Hewitt introduced the future placeholder for a value not yet computed (1977), and Barbara Liskov and Liuba Shrira invented promise pipelining (1988): https://en.wikipedia.org/wiki/Futures_and_promises",
+    "Adoption history of async/await (C# 5 in 2012, Python 3.5 in 2015, JavaScript in ES2017, Rust 1.39 with the 2018 edition, C++20, Swift 5.5) and the criticism of function coloring: https://en.wikipedia.org/wiki/Async/await",
+    "Microsoft, Task-based Asynchronous Pattern (TAP): a single method represents initiation and completion, and the returned Task carries both the result and the failure: https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/task-based-asynchronous-pattern-tap",
+    "Scala documentation, Futures and Promises: a Future is a placeholder object for a value that may not yet exist, composed with map/flatMap instead of blocking: https://docs.scala-lang.org/overviews/core/futures.html",
+    "MDN, Promise: pending/fulfilled/rejected states, thenable interop, handler scheduling, and the absence of a first-class cancellation protocol or handler unsubscription: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise",
+    "cppreference, std::promise: the write end of the promise-future pair and its shared state (make ready, release, and abandon with broken_promise): https://en.cppreference.com/w/cpp/thread/promise",
+    "Gray, Krishnamurthi, Crichton, A Design Space Exploration of Async/Await (OOPSLA 2026, PACMPL 10): formal study of straight-line asynchrony across JavaScript, C#, Swift, Python/Trio and Rust; nine design dimensions covering call guarantees, task extent, reference strengths, destruction and unhandled-exception propagation: https://arxiv.org/abs/2608.20677",
+    "Liskov and Shrira, Promises: Linguistic Support for Efficient Asynchronous Procedure Calls in Distributed Systems (PLDI 1988): promise pipelining, type-safe callee exception propagation, caller-controlled claiming, and the explicit reasoning for promises over MultiLisp-style implicit futures: https://dl.acm.org/doi/10.1145/53990.54016",
+    "Baker and Hewitt, The Incremental Garbage Collection of Processes (1977): the origin of call-by-future and the first statement of the unconsumed-future problem — the historical root of the give-every-handle-an-owner rule: https://doi.org/10.1145/872734.806932",
+    "Madsen, Lhotak and Tip, A Model for Reasoning about JavaScript Promises (OOPSLA 2017): a core calculus capturing ECMAScript 6 promises, promise graph representation, chaining and thenable adoption rules: https://doi.org/10.1145/3133910",
+    "Fernandez-Reyes et al., Godot: All the Benefits of Implicit and Explicit Futures (ECOOP 2019): taxonomy of control-flow versus data-flow futures, future-proliferation problems, and the transparency distinction between futures and hand-managed promises: https://doi.org/10.4230/LIPIcs.ECOOP.2019.2",
+    "JEP 462, Structured Concurrency (Java): the official statement that Future and CompletableFuture offer degrees of freedom counterproductive inside a structured scope; fork() stopped returning Future and the only sanctioned read is non-blocking after join: https://openjdk.org/jeps/462",
+    "SIP-14, Futures and Promises (Haller et al., Scala): canonical statement of Future as read-only placeholder and Promise as write-once half; combinator composition is non-blocking by default, and tryComplete is the nondeterministic first-wins escape hatch: https://docs.scala-lang.org/sips/futures-promises.html",
+    "Nystrom, What Color is Your Function? (2015): the canonical statement of function coloring — every function is sync or async, async colors its callers, and higher-order functions cannot be polymorphic over color: https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/",
+    "Smith, Notes on Structured Concurrency, or: Go Statement Considered Harmful (2018): control-flow argument that returning a future is a go statement, and that nurseries/scopes restore the black-box rule: https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/",
+    "Reactive Streams (JVM, spec 1.0.4): the boundary case — a potentially unbounded sequence of elements delivered asynchronously with mandatory non-blocking backpressure and request(n) demand as a first-class primitive: https://www.reactive-streams.org/",
+    "nodejs/node issue 51452, Racing immediately-resolving Promises leads to memory leak: minimal repro showing Promise.race/any over already-settled promises OOMs because handlers are kept on never-settling inputs; the handler-accumulation pitfall in concrete form: https://github.com/nodejs/node/issues/51452",
+    "Promises/A+ specification (promiseaplus.com): the definitive standard for promise then() behavior, covering states (pending/fulfilled/rejected), handler scheduling via microtasks, the [[Resolve]] algorithm for thenable assimilation, and the prohibition on calling resolve or reject more than once. The spec deliberately omits creation APIs, focusing only on the observer interface: https://promisesaplus.com/",
+    "MDN Web Docs, Using Promises: developer guide covering promise chain construction, error propagation through catch(), when to use Promise.all vs Promise.allSettled vs Promise.race vs Promise.any, floating promises and why they must be returned, and async/await as syntax sugar built on promises: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises",
+    "getify (Kyle Simpson), You-Dont-Know-JS: Async & Performance, Chapter 3 — Promises: thorough treatment of promise trust mechanics, why promises solve callback inversion-of-control problems, Promise.resolve() for unwrapping thenables, promise chains, and error handling via split callbacks (fulfillment/rejection handlers rather than error-first): https://github.com/getify/You-Dont-Know-JS/blob/6f51ed6746300f51bc6c930c080b8a7426b7629b/async%20%26%20performance/ch3.md",
+    "CheatCoders, JavaScript Async/Await: Every Pattern, Pitfall, and Performance Trick (2026): practical guide covering Promise.all vs allSettled vs race vs any semantics, error handling patterns (result pattern, try/catch), AbortController for cancellation, controlled concurrency batching, and a checklist of the top 10 async/await mistakes including await in forEach, async constructors, and floating promises: https://cheatcoders.net/javascript-async-await-patterns-pitfalls/",
+    "kindatechnical.com, A Guide to Software Design Patterns — Future, Promise, and Async/Await (2026): progressive examples from callbacks through Promises to async/await in JavaScript, Java CompletableFuture with thenApply/thenCompose/allOf/anyOf, Python asyncio coroutine model, C# TPL, and structured concurrency principles from Kotlin and Java 21: https://kindatechnical.com/software-design-patterns/future-promise-async.html",
+    "Python asyncio official documentation: asyncio.Future API, ensure_future(), create_task(), wait(), gather(), shield(), timeout() (Python 3.11+), TaskGroups (Python 3.11+), and the cooperative cancellation model via CancelledError: https://docs.python.org/3/library/asyncio-task.html",
+    "PEP 492 — Coroutines with async and await syntax: the definition of Python's native coroutines, async def, await, __aiter__ and __anext__ for async iteration, async with for context managers, and the statement that coroutines are not thread-safe by default: https://peps.python.org/pep-0492/",
+    "PEP 3156 — asyncio module design: the event loop abstraction, Transport and Protocol callbacks as the I/O model, Future and Task as the concurrency primitives, and the design decision to keep the loop single-threaded by default: https://peps.python.org/pep-3156/",
+    "DEV Community, The Async/Await Pitfalls You're Still Making in 2026 (2026): unhandled rejection catastrophes in Node.js 22+, memory leaks in long-lived async operations (WeakRef/FinalizationRegistry solutions), race conditions with AbortController, microtask queue flooding, and async mindset discipline: https://dev.to/pockit_tools/the-asyncawait-pitfalls-youre-still-making-in-2026-a-complete-javascript-debugging-guide-1eb8",
+    "StackPractices, Async Task Cancellation Runbook (2026): cross-language cancellation patterns (Python CancelledError, JS AbortSignal, Go context.Context, Java CompletableFuture.cancel()), token propagation, resource cleanup, timeout strategies, and graceful shutdown runbooks: https://stackpractices.com/docs/async-task-cancellation-runbook/",
+    "async-concurrency.com, Asyncio Cancellation Patterns: cooperative cancellation model, cancel-and-drain pattern, shield + timeout for must-run finalizers, uncancel() mechanics (Python 3.11+), and zombie task detection via asyncio.all_tasks(): https://async-concurrency.com/resilience-cancellation-error-handling/cancellation-patterns/",
+    "Oracle, Project Loom — Virtual Threads and Structured Concurrency (2025): virtual threads as lightweight threads where each thread runs a single task, enabling thread-per-request style at scale; structured concurrency via StructuredTaskScope with ShutdownOnFailure and ShutdownOnSuccess joiners; ScopedValues replacing ThreadLocal for virtual thread context propagation: https://www.jcp.org/aboutJava/communityprocess/ec-public/materials/2025-03-21/StructuredConcurrency.pdf",
+    "JEP 499: Structured Concurrency (Fourth Preview) in JDK 24 and JEP 8340343: Structured Concurrency (Fifth Preview): StructuredTaskScope API with static factory methods replacing constructors, Joiner interface for composable completion policies (allSuccessfulOrThrow, anySuccessfulResultOrThrow, allUntil), and explicit deadline support: https://openjdk.org/jeps/499",
+    "DEV Community, Modern Concurrency on the JVM: Coroutines and Loom (2026): comparison of Kotlin coroutines (compiler-transformed state machines, ~256 bytes per coroutine stack) vs virtual threads (VM-managed, ~1-2KB per virtual thread), structured concurrency via StructuredTaskScope, and Dispatchers.IO vs virtual thread dispatching in Ktor: https://dev.to/worldlinetech/modern-concurrency-approaches-on-the-jvm-coroutines-and-loom-3bd4",
+    "KotlinConf 2023, Coroutines and Loom Behind the Scenes: Kotlin coroutines vs Project Loom virtual threads — yield cost, stack copying, per-virtual-thread allocations (~2600 bytes heap), Dispatchers.IO on virtual threads, and the synergy of coroutines on virtual thread carriers for blocking IO: https://resources.jetbrains.com/storage/products/kotlinconf-2023/Coroutines%20and%20Loom%20Behind%20The%20Scenes.pdf",
+    "Fluture-js (Github): Fantasy Land-compliant monadic alternative to Promises with lazy evaluation (futures execute only when forked, unlike eager promises), stack-safe composition, built-in cancellation, resource management via hook, and ConcurrentFuture for parallel Applicative semantics: https://github.com/fluture-js/Fluture/",
+    "kindatechnical.com, Monads in Practice: Promises, Streams, and Parsers (2026): Promises as monads (Promise.then as flatMap), async/await as do-notation for Promises, RxJS Observable as a stream monad with mergeMap/concatMap/switchMap as bind variants, and the table of everyday constructs as monads: https://kindatechnical.com/functional-programming/monads-in-practice-promises-streams-and-parsers.html",
+    "michthemaker/futures (Github): a pull-based, poll-driven async runtime for TypeScript inspired by Rust's Future trait — zero Promises under the hood, fully lazy, Future.run() as the only execution trigger, Result-based error handling, and cancellation propagation to leaf futures: https://github.com/michthemaker/futures",
+    "Arunodaya Chatterjee, Futures: A Mechanism for Concurrency Among Objects (1989): futures in the ES-Kit distributed object system, first-class futures passed as arguments to remote method calls, automatic claim via type conversion operators (vs Argus's explicit claim()), and integration with object migration: https://doi.org/10.1145/76263.76326",
+    "Software Patterns Lexicon, Functors and Monads in JavaScript (2024): Promises as monads with then/flatMap as bind, Option/Result monads for null handling, and why monad laws guarantee safe refactoring: https://softwarepatternslexicon.com/js/functional-programming-in-javascript/functors-and-monads-in-javascript/",
+    "C2 Wiki, Promise Pipelining: Ward's description of promise pipelining as the mechanism enabling a sender to make a sequence of calls on a stream without waiting for replies, with the callee processing them in order while the caller continues: https://wiki.c2.com/",
+    "Python 3.14 asyncio Future documentation: Future objects represent eventual asynchronous results, are awaitable, and should generally be created by the event loop rather than exposed directly by application APIs: https://docs.python.org/3/library/asyncio-future.html",
+    "Oracle Java SE 21 CompletableFuture API: CompletableFuture is an explicitly completable Future and CompletionStage with dependent actions, asynchronous suppliers, and allOf/anyOf composition: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+    "Rust std::future::Future documentation: a Future represents an asynchronous value, progresses through non-blocking poll and Waker notifications, and remains inert until driven by an executor: https://doc.rust-lang.org/std/future/trait.Future.html",
+    "Luke OCodes, The Tradeoffs Async/Await Hides From You: criticism covering function coloring, hidden scheduling points and unhandled rejections as concrete misuse risks: https://lukeocodes.dev/async-await-tradeoffs"
+  ],
+  "related_patterns_notes": {
+    "async-iterator": "async-iterator",
+    "observable": "observable",
+    "reactive-streams": "reactive-streams",
+    "virtual-threads": "virtual-threads"
+  }
+}

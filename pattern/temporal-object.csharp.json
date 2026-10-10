@@ -1,0 +1,64 @@
+{
+  "pattern": "temporal-object",
+  "language": "csharp",
+  "support": "idiomatic",
+  "idiom_name": "record version chain (readonly record + with expression) over an ordered history list",
+  "implementation_notes": "C# records cover the Version role: positional records are init-only and a with expression performs the non-destructive mutation, so publishing a version is Current with { Fee = 12.5m } appended together with its DateTimeOffset effective date - no hand-written copy method. The continuity is an ordinary class owning the ordered history; as-of reads use FindLastIndex for short histories or List.BinarySearch over a maintained date list when history is long. The classic two-class structure survives only where a version must be a mutable entity for the ORM; when the model is persisted, EF Core's SQL Server temporal tables (second variant) let the database own the history instead.",
+  "code_sketch": "public sealed record ContractVersion(decimal Fee, string Terms);      // immutable version\npublic sealed class Contract {                                        // continuity\n    private readonly List<(DateTimeOffset From, ContractVersion V)> _history = new();\n    public ContractVersion Current => _history[^1].V;\n    public ContractVersion? AsOf(DateTimeOffset on) =>\n        _history.FindLastIndex(h => h.From <= on) is var i && i >= 0 ? _history[i].V : null;\n    public void Amend(DateTimeOffset effective, ContractVersion working) {  // working = Current with {..}\n        var at = _history.FindIndex(h => h.From > effective);   // insertion point\n        _history.Insert(at < 0 ? _history.Count : at, (effective, working));\n    }\n}",
+  "pitfalls": [
+    "A with expression copies references: a record member that is a List or Dictionary is shared with the previous version, so one in-place edit rewrites history - copy nested collections or make the members immutable.",
+    "DateTimeOffset comparisons are instants while DateTime comparisons depend on Kind (Unspecified compares as local time); mixing them, or persisting local time into a UTC temporal column, shifts effective dates.",
+    "List<T>.BinarySearch requires the list to be sorted by the searched key or the result is simply incorrect; use a date-only comparer over a maintained sorted list, or FindLastIndex.",
+    "An ORM entity used as the version type acquires identity and change tracking, so a tracked 'old' version can be saved over the current one - keep versions immutable records and never let SaveChanges see them as modified."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record",
+    "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/with-expression"
+  ],
+  "variants": [
+    {
+      "variant_id": "record-snapshots",
+      "name": "Immutable record versions with with-expression publishing (in memory)",
+      "paradigm": "functional",
+      "min_standard": "C#9",
+      "idiom_name": "record version chain (readonly record + with expression) over an ordered history list",
+      "implementation_notes": "C# records cover the Version role: positional records are init-only and a with expression performs the non-destructive mutation, so publishing a version is Current with { Fee = 12.5m } appended together with its DateTimeOffset effective date - no hand-written copy method. The continuity is an ordinary class owning the ordered history; as-of reads use FindLastIndex for short histories or List.BinarySearch over a maintained date list when history is long. The classic two-class structure survives only where a version must be a mutable entity for the ORM; when the model is persisted, EF Core's SQL Server temporal tables (second variant) let the database own the history instead.",
+      "code_sketch": "public sealed record ContractVersion(decimal Fee, string Terms);      // immutable version\npublic sealed class Contract {                                        // continuity\n    private readonly List<(DateTimeOffset From, ContractVersion V)> _history = new();\n    public ContractVersion Current => _history[^1].V;\n    public ContractVersion? AsOf(DateTimeOffset on) =>\n        _history.FindLastIndex(h => h.From <= on) is var i && i >= 0 ? _history[i].V : null;\n    public void Amend(DateTimeOffset effective, ContractVersion working) {  // working = Current with {..}\n        var at = _history.FindIndex(h => h.From > effective);   // insertion point\n        _history.Insert(at < 0 ? _history.Count : at, (effective, working));\n    }\n}",
+      "pitfalls": [
+        "A with expression copies references: a record member that is a List or Dictionary is shared with the previous version, so one in-place edit rewrites history - copy nested collections or make the members immutable.",
+        "DateTimeOffset comparisons are instants while DateTime comparisons depend on Kind (Unspecified compares as local time); mixing them, or persisting local time into a UTC temporal column, shifts effective dates.",
+        "List<T>.BinarySearch requires the list to be sorted by the searched key or the result is simply incorrect; use a date-only comparer over a maintained sorted list, or FindLastIndex.",
+        "An ORM entity used as the version type acquires identity and change tracking, so a tracked 'old' version can be saved over the current one - keep versions immutable records and never let SaveChanges see them as modified."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record",
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/with-expression"
+      ]
+    },
+    {
+      "variant_id": "efcore-temporal-tables",
+      "name": "SQL Server system-versioned temporal tables through EF Core",
+      "paradigm": "declarative",
+      "min_standard": "NET6.0",
+      "requires_features": [
+        "ef-core-6.0",
+        "sql-server-temporal-tables"
+      ],
+      "idiom_name": "EF Core TemporalAsOf / TemporalAll over system-versioned tables",
+      "implementation_notes": "With EF Core on SQL Server the version role moves into the database: the entity maps to a temporal table (period columns ValidFrom/ValidTo plus a history table) and the continuity is the entity key, while the query operators TemporalAsOf, TemporalAll, TemporalFromTo, TemporalBetween and TemporalContainedIn translate to FOR SYSTEM_TIME ... AS OF - so 'the contract as of 1 March' is a LINQ call instead of a hand-maintained version list. Historical queries are always no-tracking and read the history table, and system versioning records record time (what the row looked like at each commit), which is not the same as a business effective date: a retroactive amendment still needs its own effective-date column. Keep the as-of method in the domain so callers never see the persistence detail.",
+      "code_sketch": "var asOfMarch = await db.Contracts\n    .TemporalAsOf(new DateTime(2024, 3, 1, 0, 0, 0, DateTimeKind.Utc))\n    .SingleAsync(c => c.Number == \"C-17\");\nvar timeline = await db.Contracts.TemporalAll()\n    .Where(c => c.Number == \"C-17\")\n    .OrderBy(c => EF.Property<DateTime>(c, \"ValidFrom\"))\n    .Select(c => new { c.Fee, From = EF.Property<DateTime>(c, \"ValidFrom\"),\n                       To = EF.Property<DateTime>(c, \"ValidTo\") })\n    .ToListAsync();",
+      "pitfalls": [
+        "System versioning is record time, not effective time: an amendment committed today appears as of today, so effective-date semantics still need their own version rows or columns.",
+        "Temporal queries are always no-tracking and return detached copies, so change tracking, lazy loading and updates against them behave differently from ordinary queries.",
+        "The history table grows with every update and is part of the schema; retention, period-column hiding and indexes on ValidFrom/ValidTo must be planned.",
+        "Arguments are interpreted as UTC: passing local DateTime values to TemporalAsOf gives unexpected results near midnight and across zones."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/ef/core/providers/sql-server/temporal-tables",
+        "https://learn.microsoft.com/en-us/dotnet/api/microsoft.entityframeworkcore.sqlserverdbsetextensions.temporalasof?view=efcore-10.0"
+      ]
+    }
+  ],
+  "default_variant": "record-snapshots",
+  "version": "1.0"
+}

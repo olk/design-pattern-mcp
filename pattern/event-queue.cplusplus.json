@@ -1,0 +1,58 @@
+{
+  "pattern": "event-queue",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::queue/std::deque + std::mutex + std::condition_variable",
+  "implementation_notes": "The default modern-C++ realization composes the queue from standard parts: a std::deque (or std::queue on top of it) protected by std::mutex, with the drain thread parked in cv.wait(lock, predicate) and the producer doing lock + push + notify_one. What replaces the classic structure is the lock/predicate protocol itself - it supplies the blocking semantics an event queue needs without any queue class. Reach for this form when multiple producers, blocking consumers and simple reasoning matter more than the last nanosecond.",
+  "code_sketch": "std::mutex m;\nstd::condition_variable cv;\nstd::deque<Event> q;\n\nvoid post(Event e) {\n  { std::lock_guard<std::mutex> lk(m); q.push_back(std::move(e)); }\n  cv.notify_one();\n}\nEvent poll() {\n  std::unique_lock<std::mutex> lk(m);\n  cv.wait(lk, [&] { return !q.empty() || stop; });\n  Event e = std::move(q.front()); q.pop_front();\n  return e;\n}",
+  "pitfalls": [
+    "Use the predicated wait: a bare cv.wait(lock) wakes spuriously and misses a notification that lands between unlocking and waiting.",
+    "Payload writes must happen under the mutex (or with explicit release/acquire pairs) - publishing through a non-atomic queue while the consumer reads is a data race even if the pointer swap looks atomic.",
+    "Shutdown needs notify_all plus a stop flag, otherwise the parked drain thread never wakes and joins forever."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable"
+  ],
+  "variants": [
+    {
+      "variant_id": "cpp11-mutex-condvar",
+      "name": "std::deque guarded by mutex + condition variable (C++11)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::queue/std::deque + std::mutex + std::condition_variable",
+      "implementation_notes": "The default modern-C++ realization composes the queue from standard parts: a std::deque (or std::queue on top of it) protected by std::mutex, with the drain thread parked in cv.wait(lock, predicate) and the producer doing lock + push + notify_one. What replaces the classic structure is the lock/predicate protocol itself - it supplies the blocking semantics an event queue needs without any queue class. Reach for this form when multiple producers, blocking consumers and simple reasoning matter more than the last nanosecond.",
+      "code_sketch": "std::mutex m;\nstd::condition_variable cv;\nstd::deque<Event> q;\n\nvoid post(Event e) {\n  { std::lock_guard<std::mutex> lk(m); q.push_back(std::move(e)); }\n  cv.notify_one();\n}\nEvent poll() {\n  std::unique_lock<std::mutex> lk(m);\n  cv.wait(lk, [&] { return !q.empty() || stop; });\n  Event e = std::move(q.front()); q.pop_front();\n  return e;\n}",
+      "pitfalls": [
+        "Use the predicated wait: a bare cv.wait(lock) wakes spuriously and misses a notification that lands between unlocking and waiting.",
+        "Payload writes must happen under the mutex (or with explicit release/acquire pairs) - publishing through a non-atomic queue while the consumer reads is a data race even if the pointer swap looks atomic.",
+        "Shutdown needs notify_all plus a stop flag, otherwise the parked drain thread never wakes and joins forever."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    },
+    {
+      "variant_id": "cpp20-atomic-ring",
+      "name": "Lock-free SPSC ring buffer with C++20 atomic wait/notify",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "atomic_wait",
+        "atomic_notify_one"
+      ],
+      "idiom_name": "fixed ring buffer + std::atomic head/tail + wait/notify_one",
+      "implementation_notes": "Since C++20 std::atomic::wait/notify_one let the drain thread block directly on an index, so the queue becomes the Nystrom ring buffer: a fixed array plus head/tail indices advanced modulo capacity, published with release stores and read with acquire loads, and no allocation or mutex on the enqueue path. Choose it for hot paths, bounded pending windows and single-producer/single-consumer hand-offs; keep the mutex form when several producers must block or when the payload is large and copying is expensive.",
+      "code_sketch": "static constexpr size_t N = 64;\nstd::atomic<size_t> head{0}, tail{0};\nEvent buf[N];\n\nbool post(const Event& e) {              /* single producer */\n  auto t = tail.load(std::memory_order_relaxed);\n  if ((t + 1) % N == head.load(std::memory_order_acquire)) return false;  /* full */\n  buf[t] = e;\n  tail.store((t + 1) % N, std::memory_order_release);\n  tail.notify_one();\n  return true;\n}",
+      "pitfalls": [
+        "wait() compares value representations: full-size indices are fine, but a wrapped narrow index can return immediately because the ABA problem hides the change.",
+        "The single-producer/single-consumer ring is unsafe with several producers - add a CAS loop on the tail or fall back to the mutex form.",
+        "Memory orders must pair release/acquire around the index; relaxed on both sides reorders payload writes after the publish."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic_wait"
+      ]
+    }
+  ],
+  "default_variant": "cpp11-mutex-condvar",
+  "version": "1.0"
+}

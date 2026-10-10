@@ -1,0 +1,56 @@
+{
+  "pattern": "cache-aside",
+  "language": "kotlin",
+  "support": "library",
+  "idiom_name": "Caffeine Cache.get(id) { key -> load(key) } + invalidate in the write path",
+  "implementation_notes": "On the JVM Kotlin uses the same caches as Java: Caffeine's get(key) { key -> load(key) } (or a LoadingCache) performs the read and the populate, Kotlin's trailing-lambda syntax makes the loader read naturally, expireAfterWrite/maximumSize carry the policy, and invalidate(key) runs after the store commit. Spring's @Cacheable works identically from Kotlin with the proxy caveats of the JVM. The Kotlin standard library contains no cache, so the realization is a thin wrapper around a Java cache rather than a Kotlin-specific construct.",
+  "code_sketch": "private val cache: Cache<String, Entity> = Caffeine.newBuilder()\n    .expireAfterWrite(5, TimeUnit.MINUTES)\n    .maximumSize(100_000)\n    .build()\n\nfun read(id: String): Entity = cache.get(id) { key -> store.find(key) }   // populate on miss\nfun update(entity: Entity) { store.save(entity); cache.invalidate(entity.id) }  // store first",
+  "pitfalls": [
+    "Kotlin's non-null types do not survive the Java API: getIfPresent returns a platform type, so a miss is null and the compiler will not force the check.",
+    "A suspend function cannot be called from Caffeine's mapping lambda; use AsyncCache with a future-returning loader or the coroutine variant instead of runBlocking inside the loader.",
+    "Spring's annotation proxies and Kotlin's final-by-default classes interact: @Cacheable on a final or self-invoked method is not intercepted."
+  ],
+  "sources": [
+    "https://github.com/ben-manes/caffeine/wiki/Population",
+    "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/"
+  ],
+  "variants": [
+    {
+      "variant_id": "caffeine",
+      "name": "Caffeine Cache through JVM interop",
+      "paradigm": "oo",
+      "min_standard": "Kotlin1.5",
+      "idiom_name": "Caffeine Cache.get(id) { key -> load(key) } + invalidate in the write path",
+      "implementation_notes": "On the JVM Kotlin uses the same caches as Java: Caffeine's get(key) { key -> load(key) } (or a LoadingCache) performs the read and the populate, Kotlin's trailing-lambda syntax makes the loader read naturally, expireAfterWrite/maximumSize carry the policy, and invalidate(key) runs after the store commit. Spring's @Cacheable works identically from Kotlin with the proxy caveats of the JVM. The Kotlin standard library contains no cache, so the realization is a thin wrapper around a Java cache rather than a Kotlin-specific construct.",
+      "code_sketch": "private val cache: Cache<String, Entity> = Caffeine.newBuilder()\n    .expireAfterWrite(5, TimeUnit.MINUTES)\n    .maximumSize(100_000)\n    .build()\n\nfun read(id: String): Entity = cache.get(id) { key -> store.find(key) }   // populate on miss\nfun update(entity: Entity) { store.save(entity); cache.invalidate(entity.id) }  // store first",
+      "pitfalls": [
+        "Kotlin's non-null types do not survive the Java API: getIfPresent returns a platform type, so a miss is null and the compiler will not force the check.",
+        "A suspend function cannot be called from Caffeine's mapping lambda; use AsyncCache with a future-returning loader or the coroutine variant instead of runBlocking inside the loader.",
+        "Spring's annotation proxies and Kotlin's final-by-default classes interact: @Cacheable on a final or self-invoked method is not intercepted."
+      ],
+      "sources": [
+        "https://github.com/ben-manes/caffeine/wiki/Population",
+        "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/"
+      ]
+    },
+    {
+      "variant_id": "coroutine-mutex",
+      "name": "ConcurrentHashMap + kotlinx Mutex with shared in-flight loads",
+      "paradigm": "concurrent",
+      "min_standard": "Kotlin1.5",
+      "idiom_name": "suspend cache with kotlinx.coroutines Mutex.withLock over a ConcurrentHashMap",
+      "implementation_notes": "For suspend-function code the concurrency primitives are Kotlin's: a ConcurrentHashMap holds the entries and a kotlinx.coroutines Mutex (withLock) or an atomic putIfAbsent of a Deferred serializes the load so concurrent callers await the same in-flight value - the coroutine analogue of single-flight. Mutex is non-reentrant and suspends, so it must never wrap a block that re-enters the cache or stalls the dispatcher; expiry, eviction and invalidation remain application code as in the dependency-free JVM form.",
+      "code_sketch": "private val entries = ConcurrentHashMap<String, Entry>()\nprivate val mutex = Mutex()\n\nsuspend fun read(id: String): Entity {\n    entries[id]?.takeIf { !it.isExpired }?.let { return it.value }\n    return mutex.withLock {                              // one loader at a time\n        entries[id]?.takeIf { !it.isExpired }?.let { return it.value }\n        val value = store.find(id)                       // source of truth on a miss\n        entries[id] = Entry(value, deadline())\n        value\n    }\n}\n// write: store.save(e); entries.remove(e.id)",
+      "pitfalls": [
+        "kotlinx Mutex is non-reentrant and suspends: never lock a region that calls read() again, and never use it from blocking code where runBlocking would deadlock the dispatcher.",
+        "Holding the mutex across the source-of-truth suspend call serializes every miss; scope the lock per key or share a Deferred when throughput matters.",
+        "A plain MutableMap shared between coroutines is a data race - use ConcurrentHashMap or confine the map to a single dispatcher."
+      ],
+      "sources": [
+        "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.sync/-mutex/"
+      ]
+    }
+  ],
+  "default_variant": "caffeine",
+  "version": "1.0"
+}

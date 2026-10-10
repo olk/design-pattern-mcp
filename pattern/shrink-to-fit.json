@@ -1,0 +1,148 @@
+{
+  "category": "concurrency-resilience",
+  "name": "shrink-to-fit",
+  "aliases": [
+    "swap-to-fit"
+  ],
+  "intent": "Return a container's over-allocated storage to the amount its current elements actually need, so the memory reserved for a past peak is released once the container has shrunk.",
+  "problem": "A growable container sizes its storage for the largest element count it ever held: after a bulk load, a burst or a fan-in, removing elements lowers the size but not the allocation, so a long-lived list, buffer or map keeps holding peak-shaped memory that nothing uses. The container looks small to every reader of its size while its footprint stays at the peak, and enough such containers turn a memory budget that was sized for live data into one that dies at the peak.",
+  "context": "Containers whose storage is amortized and observable - dynamic arrays, strings and builders, array-backed maps - that stay alive after their shrink phase: caches and registries after eviction, buffers after a spiky ingest, parsed documents after filtering, per-connection or per-tenant structures after churn. Most relevant when memory is the binding resource (long-running services, embedded budgets, many containers per process) and when the container has a visible size/capacity split; least relevant when a pool, arena or garbage collector owns the storage instead.",
+  "benefits": [
+    "Releases storage that was sized for a peak that no longer exists: steady-state memory follows live data instead of high-water marks.",
+    "Restores the invariant capacity ~ size, which makes per-container memory accounting and sizing estimates meaningful again.",
+    "Stops one oversized buffer from pinning a whole allocation class, page or arena segment in the allocators and collectors that reclaim at block granularity.",
+    "Cheap and local: one call, one swap or one realloc in the container's own module - no interface, protocol or ownership change.",
+    "Fits an explicit lifecycle boundary (after load, filter, eviction or publish), where the cost is paid once and can be measured, instead of being paid implicitly at an unpredictable peak."
+  ],
+  "tradeoffs": [
+    "The guarantee is usually non-binding or implementation-defined - C++: 'It depends on the implementation whether the request is fulfilled'; C# does nothing once the list is above ~90% of capacity; Rust: 'the resulting vector might still have some excess capacity' - so a hard memory budget cannot be built on it.",
+    "Reallocation invalidates iterators, pointers, references and views into the container, so a local-looking call is an API-visible event: concurrent readers, cached pointers and stored slices must be quiesced or re-derived.",
+    "Copy-based realizations (swap with a temporary, rebuild, realloc that cannot contract in place) need a second allocation the size of the live range at exactly the moment memory is tightest, and in C the realloc can fail there.",
+    "It destroys the growth slack that made appends amortized O(1): trimming inside a mutation loop turns appends into repeated O(n) copies, so the pattern is a pessimization wherever the container is about to grow again.",
+    "Reclamation is not release: the allocator, the garbage collector, or a surviving subslice, view or buffer export decides whether bytes actually return, so RSS may not move even when the capacity number does.",
+    "Rebuild-based realizations replace the object rather than shrinking it: every other holder keeps the peak allocation alive, and writers on the two references diverge silently.",
+    "In runtimes where capacity is invisible or ignored (plain JavaScript arrays, Kotlin/JS) the operation is unobservable, so defensive trims accumulate as cargo cult with nothing to measure."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 4,
+    "maintainability": 7,
+    "simplicity": 8,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Container",
+      "responsibility": "Owns the element sequence and the allocated storage; its size is data while its capacity is slack, and it is the only thing that can turn unused capacity into free storage."
+    },
+    {
+      "role": "Owner (caller)",
+      "responsibility": "Knows that the growth phase has ended, chooses the quiescent point for the trim, and is responsible for dropping or re-acquiring every iterator, pointer, view and live copy of the container before and after it."
+    },
+    {
+      "role": "Allocator / Runtime",
+      "responsibility": "Carries out the reallocation or declines to: realloc, the container's trim call, the garbage collector that collects a rebuilt array. The actual guarantee lives here, not in the pattern."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "A per-connection or per-session receive/send buffer that absorbed one large burst and then must sit idle for hours; the idle footprint should not be the burst size.",
+    "A cache or registry that evicted most of its entries after a churn phase but keeps its array-backed storage at the peak entry count.",
+    "A batch import: build a large collection from an input file, filter it down to the survivors, and keep the result for the process lifetime.",
+    "Serialization: build a response payload in memory, then hold it while a slow consumer drains it - trimming to size lowers steady-state memory across thousands of in-flight responses.",
+    "Multi-tenant services where each tenant's peak must not become its permanent footprint, and per-tenant accounting would otherwise show phantom usage.",
+    "Embedded, edge or console targets with a fixed memory budget where a peak-phase container must hand its storage back before the next phase starts.",
+    "Rust std makes the pattern an explicit API: std::vec::Vec never auto-shrinks (to avoid unnecessary allocations/deallocations), so long-lived buffers call Vec::shrink_to_fit once a load or drain phase ends, and owners that want storage exactly the size of the data convert with into_boxed_slice - its documented property is that len == capacity makes the Vec <-> Box<[T]> round trip reallocation-free.",
+    "The JDK ships the canonical form as java.util.ArrayList.trimToSize(): the javadoc's stated purpose is to minimize memory usage by trimming the internal array to the list's current size once the ArrayList is known not to grow - the standard closing move for startup-built lookup lists, static tables and caches.",
+    ".NET collections expose the operation as TrimExcess (List<T>, Queue<T>, SortedList<TKey,TValue>): Microsoft's documented guidance is to call it when no more elements will be added, with a built-in cost guard - the trim is skipped entirely once the collection is more than 90% full."
+  ],
+  "avoid_when": [
+    "The container will grow again immediately (next batch, next request, next level): the slack is the optimization - reserve up front or reuse the container instead of trimming between phases.",
+    "You need a guaranteed bound: the operation is usually a request the runtime may decline, so size the storage up front (reserve/with_capacity/ensureCapacity) or use an allocator or pool with explicit accounting.",
+    "The storage is not the container's: arena, pool or slab-allocated buffers return to their owner, and trimming inside a pooled object either does nothing or fights the pool's own lifecycle.",
+    "The runtime already manages the storage and capacity is not observable or not honored (plain JavaScript arrays, Kotlin/JS, garbage-collected runtimes that reclaim whole segments): a copy to shrink is just a copy.",
+    "The trim would run on a hot path or under memory pressure: the copy-based forms cost a second allocation of the same magnitude exactly when that is most dangerous."
+  ],
+  "language_files": {
+    "generic": "shrink-to-fit.generic.json",
+    "c": "shrink-to-fit.c.json",
+    "cplusplus": "shrink-to-fit.cplusplus.json",
+    "csharp": "shrink-to-fit.csharp.json",
+    "go": "shrink-to-fit.go.json",
+    "java": "shrink-to-fit.java.json",
+    "javascript": "shrink-to-fit.javascript.json",
+    "kotlin": "shrink-to-fit.kotlin.json",
+    "python": "shrink-to-fit.python.json",
+    "ruby": "shrink-to-fit.ruby.json",
+    "rust": "shrink-to-fit.rust.json",
+    "scala": "shrink-to-fit.scala.json",
+    "swift": "shrink-to-fit.swift.json",
+    "typescript": "shrink-to-fit.typescript.json"
+  },
+  "paradigm": [
+    "procedural",
+    "data-oriented"
+  ],
+  "scope": "value",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "erase-remove",
+    "small-object-optimization",
+    "copy-on-write",
+    "object-pool",
+    "resource-return",
+    "lazy-collection"
+  ],
+  "anti_patterns": [
+    "Shrinking after every removal or append: the container reallocates on each mutation, so a benign O(n) fill becomes quadratic and latency spikes at the worst moment.",
+    "Deciding a memory budget on the assumption that the trim worked: most realizations are non-binding requests or heuristics (C# skips the reallocation above 90% of capacity), and the capacity may stay at the peak.",
+    "Holding raw pointers, iterators, String views or memoryviews across the trim and dereferencing them afterwards - the classic use-after-free/undefined-behaviour form of 'we only wanted to save memory'.",
+    "Copying to shrink while another reference still points at the old container or its buffer: nothing is released, and the two now-divergent views are the next bug.",
+    "Shrinking the view instead of the owner (Go subslice cap, JS subarray, ArraySlice-style views): the small handle keeps the whole peak allocation alive, which is the opposite of the intent.",
+    "Trimming on a request path where the copy is paid by the user (p99 latency) rather than once at a lifecycle boundary."
+  ],
+  "design_principles": [
+    "Separate what a container can hold from how much it actually holds: size and capacity are different facts, and only one of them is the live data.",
+    "Release resources at the end of the phase that needed them - tie storage to the lifecycle of the peak, not to the identity of the object.",
+    "Make the cost explicit and local: convert an invisible slow leak into a measured, deliberate one-off operation at a quiescent point.",
+    "Single responsibility: the container owns storage, the owner decides when growth has ended, and the allocator decides what reclamation means - do not blur these roles."
+  ],
+  "best_practices": [
+    "Trim at quiescent boundaries - after a load, filter, eviction or publish phase, or immediately before handing the structure to a long-lived owner - never inside a mutation loop.",
+    "Quiesce first: no iterator, pointer, view, span or buffer export into the container may survive the call; re-acquire after it and document the invalidation for callers.",
+    "Verify the effect where the language exposes it (capacity(), Count/Capacity, len/cap, sys.getsizeof) and know where it cannot be verified (JS, Kotlin/JS, non-binding requests) so the intent is not mistaken for a guarantee.",
+    "Reclaim for real: drop subslices, views and second references to the old storage, and clear the old object - a trimmed header, a linked buffer or another holder keeps the peak alive and makes the trim cosmetic.",
+    "Prefer right-sizing up front for repeated phases (reserve/with_capacity/ensureCapacity, sized constructors) and pooling of containers over repeated shrink-then-grow cycles.",
+    "Do not schedule the trim when memory is tightest: the copy-based forms hold both buffers at once, so run them while there is headroom or use a variant that keeps a floor instead of trimming to the bone.",
+    "Trim is not erase: freed storage may still contain the old values, so overwrite or zero sensitive buffers before letting them go."
+  ],
+  "version": "1.1",
+  "sources": [
+    "More C++ Idioms (Wikibooks), chapter 'Shrink-to-fit' - intent 'Minimize the capacity of a container just enough to hold existing range'; also known as 'Swap-To-Fit', introduced by Scott Meyers in Effective STL; motivation: containers allocate more memory than the elements they hold, and the leftover capacity after a container shrinks 'can be unnecessary wastage of memory resources'; the pre-C++11 sample std::vector<int>(v).swap(v) with the more reliable range-constructor form, and the C++11 note that vector, deque and basic_string declare shrink_to_fit() as a non-binding request: https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Shrink-to-fit",
+    "cppreference, std::vector<T,Allocator>::shrink_to_fit - 'Requests the removal of unused capacity. It is a non-binding request to reduce capacity() to size(). It depends on the implementation whether the request is fulfilled'; if reallocation occurs all iterators and references (including end()) are invalidated; complexity at most linear; also documents that shrink_to_fit() is not available in libstdc++ C++98 mode: https://en.cppreference.com/w/cpp/container/vector/shrink_to_fit",
+    "Scott Meyers, Effective STL (2001) - source of the 'swap-to-fit' alias per the Wikibooks chapter above (the chapter's footnote links the book's errata page, which discusses the string(s.begin(), s.end()).swap(s) form: http://www.aristeia.com/BookErrata/estl1e-errata.html)",
+    "std::vec::Vec - Rust standard library documentation - Vec does not auto-shrink 'to avoid unnecessary allocations/deallocations'; shrink_to_fit may shrink in place or reallocate and 'the resulting vector might still have some excess capacity' depending on the allocator; when len == capacity the Vec <-> Box<[T]> conversion does not reallocate, which into_boxed_slice leverages: https://doc.rust-lang.org/std/vec/struct.Vec.html",
+    "java.util.ArrayList - Oracle Java SE 24 API documentation - trimToSize(): 'Trims the capacity of this ArrayList instance to be the list's current size'; the documented way for an application to minimize storage once the list is known not to grow: https://docs.oracle.com/en/java/javase/24/docs/api/java.base/java/util/ArrayList.html",
+    "Microsoft Learn, Queue<T>.TrimExcess Method - reduces capacity to the element count only if Count is less than 90% of Capacity, otherwise the call does nothing; O(n); documented to be called when no more elements will be added - the same TrimExcess/90%-threshold design applies across the collection family (List<T>, SortedList<TKey,TValue>): https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.queue-1.trimexcess?view=net-10.0",
+    "The Go Blog, 'Go Slices: usage and internals' - a slice is a pointer/length/capacity descriptor; reslicing without copying may leave the whole (larger) backing array in memory holding more data than the active portion, and copying the subset to a new slice is the documented way to release the unused capacity: https://go.dev/blog/slices-intro",
+    "Go Wiki, SliceTricks - the canonical catalog of copy-based slice operations (extend, copy, filter), including the append(make([]T, 0, n), a...) form used to move elements onto right-sized storage: https://go.dev/wiki/SliceTricks",
+    "WG21 LWG Issue 755, 'std::vector and std::string lack explicit shrink-to-fit operations' - the standardization origin of shrink_to_fit: before it, shrink-to-fit existed only as idioms (swap with a copy; string::reserve(0)), and the adopted member was deliberately specified as a non-binding request: https://wg21.cmeerw.net/lwg/issue755",
+    "P0966R0, 'basic_string::reserve Should Not Shrink' - WG21 paper behind the C++17 change that made reserve(0) no longer shrink-to-fit, an explicit rejection of reserve-as-trim: https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p0966r0.html",
+    "B. Vorbrodt, 'shrink_to_fit that doesn't suck' (2019) - misuse analysis: naive or aggressive shrinking can worsen performance and memory (allocator granularity floors, page faults, repeated copies for sub-granularity savings); the non-binding wording exists so the allocator can decline, and shrinking inside repeated-resize code is the classic anti-pattern: https://vorbrodt.blog/2019/01/27/shrink_to_fit-that-doesnt-suck/"
+  ]
+}

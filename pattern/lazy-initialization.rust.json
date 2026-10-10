@@ -1,0 +1,78 @@
+{
+  "pattern": "lazy-initialization",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "OnceLock::new() plus get_or_init(|| build())",
+  "implementation_notes": "The standard library owns the pattern: a static OnceLock<T> starts empty, get_or_init builds the value on first call with the synchronisation and memory ordering handled by std, and every caller then receives an immutable &T - so the classic marker/flag structure plus the partially-published-object hazard disappear together, because the borrow checker only hands out references to a fully initialised value. get() returns None while the cell is empty or being initialised (it never blocks) and wait() (1.86) blocks until initialisation finishes, so a correct accessor is built from get_or_init or wait, never from a get()-then-set sequence. A panic inside the initialiser does not poison the cell - unlike Mutex, OnceLock simply stays empty and a later access retries the initialiser.",
+  "code_sketch": "use std::sync::OnceLock;\n\nfn config() -> &'static Config {\n    static CONFIG: OnceLock<Config> = OnceLock::new();\n    CONFIG.get_or_init(|| Config::load())   // once, on first call\n}",
+  "pitfalls": [
+    "A check-then-initialise accessor built on get() is a race: get() returns None while another thread is initialising, so two callers can both run the builder (and speculatively built values are dropped, which is not free for resources).",
+    "OnceLock cannot be reset: take() requires &mut self, so configuration reloads need a RwLock<Option<T>> or an ArcSwap instead, and a stale cell is otherwise permanent for the process lifetime.",
+    "The cell hands out &T only, so mutability after initialisation must live inside the value (Mutex/RwLock/atomic); types that need interior mutability with a cheap read pay for a lock on every access.",
+    "Failed initialisation has no channel: either the builder returns T and panics/fails fast, or the cell type itself must be a Result/Option so callers can handle the failure."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+    "https://rust-lang.github.io/rfcs/2788-standard-lazy-types.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-once-lock",
+      "name": "std::sync::OnceLock with get_or_init",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "idiom_name": "OnceLock::new() plus get_or_init(|| build())",
+      "implementation_notes": "The standard library owns the pattern: a static OnceLock<T> starts empty, get_or_init builds the value on first call with the synchronisation and memory ordering handled by std, and every caller then receives an immutable &T - so the classic marker/flag structure plus the partially-published-object hazard disappear together, because the borrow checker only hands out references to a fully initialised value. get() returns None while the cell is empty or being initialised (it never blocks) and wait() (1.86) blocks until initialisation finishes, so a correct accessor is built from get_or_init or wait, never from a get()-then-set sequence. A panic inside the initialiser does not poison the cell - unlike Mutex, OnceLock simply stays empty and a later access retries the initialiser.",
+      "code_sketch": "use std::sync::OnceLock;\n\nfn config() -> &'static Config {\n    static CONFIG: OnceLock<Config> = OnceLock::new();\n    CONFIG.get_or_init(|| Config::load())   // once, on first call\n}",
+      "pitfalls": [
+        "A check-then-initialise accessor built on get() is a race: get() returns None while another thread is initialising, so two callers can both run the builder (and speculatively built values are dropped, which is not free for resources).",
+        "OnceLock cannot be reset: take() requires &mut self, so configuration reloads need a RwLock<Option<T>> or an ArcSwap instead, and a stale cell is otherwise permanent for the process lifetime.",
+        "The cell hands out &T only, so mutability after initialisation must live inside the value (Mutex/RwLock/atomic); types that need interior mutability with a cheap read pay for a lock on every access.",
+        "Failed initialisation has no channel: either the builder returns T and panics/fails fast, or the cell type itself must be a Result/Option so callers can handle the failure."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html",
+        "https://rust-lang.github.io/rfcs/2788-standard-lazy-types.html"
+      ]
+    },
+    {
+      "variant_id": "std-lazy-lock",
+      "name": "std::sync::LazyLock (Rust 1.80+)",
+      "paradigm": "declarative",
+      "min_standard": "Rust1.80",
+      "idiom_name": "static X: LazyLock<T> = LazyLock::new(build)",
+      "implementation_notes": "LazyLock (1.80) packages the cell and the initialiser into one declaration: a static LazyLock<T> derefs to &T, so the value is initialised on first deref and used exactly like a plain static, with no accessor function and no Option/Result in the signature. It replaces OnceLock plus get_or_init for the common case of a process-wide value; keep OnceLock when the initialisation needs extra inputs (LazyLock fixes the builder at creation) or when you must observe whether the cell is initialised. LazyLock is also usable in non-static positions (thread-safe lazily computed fields).",
+      "code_sketch": "use std::sync::LazyLock;\n\nstatic CONFIG: LazyLock<Config> = LazyLock::new(Config::load);\n\nfn main() {\n    let c: &Config = &CONFIG;   // built here, first use\n}",
+      "pitfalls": [
+        "LazyLock::new takes the builder once: a value that depends on runtime arguments cannot use it (the builder has no parameters), so parameterised laziness needs OnceLock or an explicit map keyed by the arguments.",
+        "Every deref goes through the lazy cell's fast path, which is cheaper than a lock but not free: for ultra-hot data prefer initialising in main and passing a plain reference.",
+        "A panic during initialisation leaves the cell uninitialised (no poisoning), so an accessor could keep retrying a builder that always panics - the failure surfaces as a repeated panic rather than an initialisation error."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html",
+        "https://rust-lang.github.io/rfcs/2788-standard-lazy-types.html"
+      ]
+    },
+    {
+      "variant_id": "once-cell-crate",
+      "name": "once_cell crate (pre-stabilisation / older MSRV)",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "once_cell crate"
+      ],
+      "idiom_name": "once_cell::sync::Lazy / OnceCell",
+      "implementation_notes": "Before LazyLock stabilised, once_cell provided the same API (OnceCell/OnceLock, Lazy) and it is still the practical choice when the project's MSRV is below 1.70, or when the crate's extra APIs are needed (the std types were derived from it). Cargo editions and MSRV pinning are Rust's way of stating the floor: use once_cell when the pinned toolchain predates the std versions and migrate to std once the MSRV allows it - the two APIs are nearly drop-in.",
+      "code_sketch": "use once_cell::sync::Lazy;\n\nstatic CONFIG: Lazy<Config> = Lazy::new(Config::load);\n\n// or: use once_cell::sync::OnceCell;\n// static CELL: OnceCell<Config> = OnceCell::new();\n// let c = CELL.get_or_init(Config::load);",
+      "pitfalls": [
+        "Keeping both once_cell and std lazy types in one crate splits the ecosystem (two Lazy traits, two OnceCell types) and forces conversion through references at the boundary - pick one and migrate on a single MSRV bump.",
+        "Lazy/OnceCell in a static initialiser cannot fail either: a panicking builder aborts or retries exactly as with the std types, and the crate adds no error channel.",
+        "Older once_cell versions marked their cells with type parameters that can no longer be omitted, so a dependency upgrade may require code changes in a variant that looks like a drop-in."
+      ],
+      "sources": [
+        "https://docs.rs/once_cell"
+      ]
+    }
+  ],
+  "default_variant": "std-once-lock",
+  "version": "1.0"
+}

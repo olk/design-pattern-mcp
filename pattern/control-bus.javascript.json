@@ -1,0 +1,58 @@
+{
+  "pattern": "control-bus",
+  "language": "javascript",
+  "support": "library",
+  "idiom_name": "node:diagnostics_channel named channels + process.on('message')/cluster IPC + signal handlers",
+  "implementation_notes": "Node carries a control channel inside the process: node:diagnostics_channel (stable since v19) creates named channels with publish/subscribe semantics, so a component publishes state and telemetry under a namespaced channel name while a console or exporter subscribes, and hasSubscribers() lets the component skip expensive payload construction when nobody listens. Across processes, cluster/child_process IPC (worker.send / process.on('message')) carries commands to workers, and process signal handlers (process.on('SIGTERM'|'SIGHUP')) provide lifecycle control and configuration reload; the process 'exit' event is the last chance to flush. The classic broker form is only needed when the fleet spans hosts and a broker already exists.",
+  "code_sketch": "import diagnostics_channel from 'node:diagnostics_channel';\nimport cluster from 'node:cluster';\n\nconst commands = diagnostics_channel.channel('integration:orders-adapter:cmd');\nconst status = diagnostics_channel.channel('integration:orders-adapter:status');\n\ndiagnostics_channel.subscribe('integration:orders-adapter:cmd', ({ id, op }) => {\n  const applied = apply(op);                                  // 'pause' | 'resume' | 'flush-stats'\n  status.publish({ id, op, applied, at: Date.now() });        // correlated ack + status\n});\n\nprocess.on('SIGTERM', () => { drain().finally(() => process.exit(0)); });\nif (cluster.isPrimary) for (const id in cluster.workers) cluster.workers[id].send({ op: 'flush-stats' });",
+  "pitfalls": [
+    "diagnostics_channel subscribers run synchronously inside publish(), so a heavy subscriber slows the publishing code path and a throwing subscriber surfaces as an uncaughtException unless it is guarded.",
+    "Channel existence is not delivery: publish() with no subscriber is a silent no-op and cluster IPC drops messages to workers that have already exited, so lifecycle commands still need an acknowledgement.",
+    "Replacing the default SIGTERM handler means the process only exits when the handler does: a drain that never resolves leaves a container that ignores its termination signal."
+  ],
+  "sources": [
+    "https://nodejs.org/api/diagnostics_channel.html",
+    "https://nodejs.org/api/cluster.html",
+    "https://nodejs.org/api/process.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "node-diagnostics-channel",
+      "name": "node:diagnostics_channel plus cluster/worker IPC and process signals",
+      "paradigm": "oo",
+      "min_standard": "ES2021",
+      "idiom_name": "node:diagnostics_channel named channels + process.on('message')/cluster IPC + signal handlers",
+      "implementation_notes": "Node carries a control channel inside the process: node:diagnostics_channel (stable since v19) creates named channels with publish/subscribe semantics, so a component publishes state and telemetry under a namespaced channel name while a console or exporter subscribes, and hasSubscribers() lets the component skip expensive payload construction when nobody listens. Across processes, cluster/child_process IPC (worker.send / process.on('message')) carries commands to workers, and process signal handlers (process.on('SIGTERM'|'SIGHUP')) provide lifecycle control and configuration reload; the process 'exit' event is the last chance to flush. The classic broker form is only needed when the fleet spans hosts and a broker already exists.",
+      "code_sketch": "import diagnostics_channel from 'node:diagnostics_channel';\nimport cluster from 'node:cluster';\n\nconst commands = diagnostics_channel.channel('integration:orders-adapter:cmd');\nconst status = diagnostics_channel.channel('integration:orders-adapter:status');\n\ndiagnostics_channel.subscribe('integration:orders-adapter:cmd', ({ id, op }) => {\n  const applied = apply(op);                                  // 'pause' | 'resume' | 'flush-stats'\n  status.publish({ id, op, applied, at: Date.now() });        // correlated ack + status\n});\n\nprocess.on('SIGTERM', () => { drain().finally(() => process.exit(0)); });\nif (cluster.isPrimary) for (const id in cluster.workers) cluster.workers[id].send({ op: 'flush-stats' });",
+      "pitfalls": [
+        "diagnostics_channel subscribers run synchronously inside publish(), so a heavy subscriber slows the publishing code path and a throwing subscriber surfaces as an uncaughtException unless it is guarded.",
+        "Channel existence is not delivery: publish() with no subscriber is a silent no-op and cluster IPC drops messages to workers that have already exited, so lifecycle commands still need an acknowledgement.",
+        "Replacing the default SIGTERM handler means the process only exits when the handler does: a drain that never resolves leaves a container that ignores its termination signal."
+      ],
+      "sources": [
+        "https://nodejs.org/api/diagnostics_channel.html",
+        "https://nodejs.org/api/cluster.html",
+        "https://nodejs.org/api/process.html"
+      ]
+    },
+    {
+      "variant_id": "broker-control-subject",
+      "name": "Broker control subjects (NATS) with request/reply acknowledgement",
+      "paradigm": "oo",
+      "min_standard": "ES2021",
+      "idiom_name": "NATS control.<component>.cmd/.status subjects + request/reply inbox",
+      "implementation_notes": "When Node services already talk to a broker, the control bus becomes a subject namespace: components subscribe to control.<component>.cmd, publish heartbeats and status to control.<component>.status, and the console addresses one component or the whole fleet through wildcards (control.*.cmd); request/reply gives the acknowledgement that in-process channels cannot provide across hosts. Use this variant for long-lived services spread over many machines; inside one process or one host the stdlib diagnostics_channel/IPC variant is cheaper and has no infrastructure dependency.",
+      "code_sketch": "const nc = await connect({ servers: 'nats://nats.internal:4222' });\n\nconst sub = nc.subscribe('control.orders-adapter.cmd', { callback: async (err, msg) => {\n  if (err) return;\n  const cmd = JSON.parse(sc.decode(msg.data));\n  const applied = await apply(cmd.op);                       // idempotent command handler\n  msg.respond(sc.encode(JSON.stringify({ id: cmd.id, applied, status: snapshot() })));\n}});\n\nawait nc.publish('control.*.cmd', sc.encode(JSON.stringify({ op: 'flush-stats' })));  // fan-out\nsetInterval(() => nc.publish('control.orders-adapter.status', sc.encode(JSON.stringify(snapshot()))), 5000);",
+      "pitfalls": [
+        "Core NATS is at-most-once: a command published while the component restarts is lost, so destructive operations must use request/reply (or JetStream) and report a timeout instead of assuming success.",
+        "Wildcard fan-out (control.*.cmd) reaches every component: maintenance scripts must target explicit subjects for anything destructive.",
+        "Status heartbeats are the only liveness signal in this design, so a component that dies without unsubscribing looks alive until the console tracks missed heartbeats."
+      ],
+      "sources": [
+        "https://docs.nats.io/nats-concepts/subjects"
+      ]
+    }
+  ],
+  "default_variant": "node-diagnostics-channel"
+}

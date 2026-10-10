@@ -1,0 +1,83 @@
+{
+  "pattern": "load-leveller",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "asyncio.Queue(maxsize=N) + N worker tasks",
+  "implementation_notes": "asyncio.Queue(maxsize=N) is the event-loop load leveller: await put() suspends while the queue holds N items and await get() suspends while it is empty, so the bound paces producers without blocking the loop; the queue is explicitly not thread-safe and belongs to one loop. Workers are tasks, task_done()/join() track completion, and since 3.13 shutdown() unblocks waiters cleanly at shutdown. The classic threads-plus-queue structure is replaced by one queue and a handful of tasks; threads are only needed for blocking libraries, which must then run in an executor.",
+  "code_sketch": "queue = asyncio.Queue(maxsize=1000)          # await put() suspends when full\nasync def worker():\n    while True:\n        job = await queue.get()              # waits while empty\n        try:\n            await process(job)\n        finally:\n            queue.task_done()\nworkers = [asyncio.create_task(worker()) for _ in range(8)]\nawait queue.put(job)                         # paced, never dropped",
+  "pitfalls": [
+    "asyncio.Queue(maxsize=0) is unbounded - the default - and silently removes the bound.",
+    "A blocking call inside a worker (requests, time.sleep, sync DB driver) stalls the whole loop, so the queue stops draining; offload with loop.run_in_executor or asyncio.to_thread.",
+    "Forgetting task_done() leaves queue.join() blocked forever, which hangs graceful shutdown.",
+    "put_nowait() raising QueueFull is the explicit shed path; catching it and dropping silently loses work without a trace."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-queue.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "asyncio-queue",
+      "name": "asyncio.Queue(maxsize) with worker tasks",
+      "paradigm": "concurrent",
+      "implementation_notes": "asyncio.Queue(maxsize=N) is the event-loop load leveller: await put() suspends while the queue holds N items and await get() suspends while it is empty, so the bound paces producers without blocking the loop; the queue is explicitly not thread-safe and belongs to one loop. Workers are tasks, task_done()/join() track completion, and since 3.13 shutdown() unblocks waiters cleanly at shutdown. The classic threads-plus-queue structure is replaced by one queue and a handful of tasks; threads are only needed for blocking libraries, which must then run in an executor.",
+      "min_standard": "Python3.4",
+      "requires_features": [
+        "asyncio"
+      ],
+      "idiom_name": "asyncio.Queue(maxsize=N) + N worker tasks",
+      "code_sketch": "queue = asyncio.Queue(maxsize=1000)          # await put() suspends when full\nasync def worker():\n    while True:\n        job = await queue.get()              # waits while empty\n        try:\n            await process(job)\n        finally:\n            queue.task_done()\nworkers = [asyncio.create_task(worker()) for _ in range(8)]\nawait queue.put(job)                         # paced, never dropped",
+      "pitfalls": [
+        "asyncio.Queue(maxsize=0) is unbounded - the default - and silently removes the bound.",
+        "A blocking call inside a worker (requests, time.sleep, sync DB driver) stalls the whole loop, so the queue stops draining; offload with loop.run_in_executor or asyncio.to_thread.",
+        "Forgetting task_done() leaves queue.join() blocked forever, which hangs graceful shutdown.",
+        "put_nowait() raising QueueFull is the explicit shed path; catching it and dropping silently loses work without a trace."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-queue.html"
+      ]
+    },
+    {
+      "variant_id": "threading-queue",
+      "name": "queue.Queue(maxsize) with worker threads",
+      "paradigm": "concurrent",
+      "implementation_notes": "The standard library's queue module implements multi-producer, multi-consumer queues with all the locking included: Queue(maxsize=N) blocks put() once the queue is full and get() while it is empty, put_nowait() raises Full as the shed path, and task_done()/join() report when the work is actually processed. Threads are the right consumer here when the processing is synchronous or I/O-bound via blocking libraries; because of the GIL they do not deliver CPU parallelism, so CPU-bound stages need processes (multiprocessing.Queue) or a broker. The classic hand-written lock-and-condition-variable queue is exactly what this class already is.",
+      "min_standard": "Python3.0",
+      "requires_features": [
+        "threading"
+      ],
+      "idiom_name": "queue.Queue(maxsize=N) + threading.Thread workers",
+      "code_sketch": "q = queue.Queue(maxsize=1000)                  # insertion blocks once full\ndef worker():\n    while True:\n        job = q.get()                            # blocks while empty\n        try:\n            process(job)\n        finally:\n            q.task_done()\nthreading.Thread(target=worker, daemon=True).start()\nq.put(job)                                       # paced, not dropped\nq.join()",
+      "pitfalls": [
+        "ThreadPoolExecutor.submit() queues without limit, so max_workers bounds threads but not the backlog; a bounded queue must sit in front.",
+        "Daemon workers die silently at exit, possibly mid-item; shutdown needs a sentinel plus join().",
+        "The GIL means threads bound memory and latency but not CPU: queue a process pool or a broker for CPU-bound work.",
+        "maxsize<=0 (the constructor default) is unbounded - the failure mode the pattern prevents."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/queue.html"
+      ]
+    },
+    {
+      "variant_id": "celery-broker",
+      "name": "Celery workers over a broker (Redis/RabbitMQ)",
+      "paradigm": "concurrent",
+      "implementation_notes": "When the queue must outlive the process or feed several machines, Celery moves the buffer to a broker: task.delay() enqueues into Redis/RabbitMQ and worker processes drain it, with --concurrency setting the workers per node, prefetch controlling how much each worker reserves, acks_late deciding when a task is acknowledged, and the worker shutting down warm or cold on TERM/QUIT. The pattern's leveling is now the broker backlog and the consumer count, and retries plus the reserved/failed sets cover the retry and dead-letter parts. In-process asyncio or threading queues remain the lighter choice when durability is not required.",
+      "requires_features": [
+        "celery"
+      ],
+      "idiom_name": "Celery app.task + worker --concurrency over Redis/RabbitMQ",
+      "code_sketch": "@app.task(bind=True, max_retries=5, acks_late=True)\ndef process(self, payload):\n    do_work(payload)\n\nprocess.delay(payload)         # accepted durably; the worker drains at its own rate\n# celery -A proj worker --concurrency=8      # scale consumers on the backlog",
+      "pitfalls": [
+        "Prefetch multiplies the effective queue: a worker reserves several tasks ahead, so work sits unprocessed while the backlog looks healthy.",
+        "acks_late (needed for crash safety) makes redelivery common, so tasks must be idempotent.",
+        "Broker persistence and visibility-timeout settings decide whether accepted work survives a restart or a long task.",
+        "Blocking Celery calls inside an asyncio service need run_in_executor or the loop stalls."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/workers.html"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-queue",
+  "version": "1.0"
+}

@@ -1,0 +1,62 @@
+{
+  "pattern": "data-locality",
+  "language": "java",
+  "support": "manual",
+  "idiom_name": "float[]/int[] columns with int index handles, walked by counted loops",
+  "implementation_notes": "Java's object model fights the pattern - every instance carries a header, is reached by reference, and generic collections box primitives - so the classic structure is written by hand: parallel primitive arrays (float[] x, y, vx, vy) traversed by index, which replaces an array of Particle objects with one contiguous buffer per field. Handles are plain ints; the active count keeps the prefix packed and swap-with-last removal keeps it that way. The JIT rewards this shape: monomorphic call sites, counted loops over primitive arrays and devirtualized calls are what it optimizes best, and the layout also removes the GC pressure of many small objects. Choose it whenever the arrays fit comfortably in heap; the FFM variant takes over when the data must leave the heap or exceed it.",
+  "code_sketch": "static final int MAX = 1 << 20;\nfloat[] x = new float[MAX], y = new float[MAX];\nfloat[] vx = new float[MAX], vy = new float[MAX];\nint active = 0;\nstatic void step(float[] x, float[] y, float[] vx, float[] vy, int active, float dt) {\n    for (int i = 0; i < active; i++) {        // no header, no chase, no boxing\n        x[i] += vx[i] * dt;\n        y[i] += vy[i] * dt;\n    }\n}\n// deactivate(i): x[i] = x[--active]; y[i] = y[active]; ... (every column in lockstep)",
+  "pitfalls": [
+    "Generic collections box: List<Float>, Map<Long, ...> and records of primitives put an object (or an object array) behind every element - use primitive arrays or a primitive-collection library in hot paths.",
+    "Columns must stay in lockstep: any insert/remove/reorder has to touch every array, and a forgotten column is silent data corruption rather than a compile error.",
+    "HotSpot's optimizations are profile-driven: a loop exercised only in rare paths (or behind an obvious branch) is not optimized; keep the kernel simple and let it run.",
+    "Reference-held records defeat the layout: mixing arrays of objects with the columnar arrays reintroduces headers and indirection for those elements."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javase/tutorial/java/data/autoboxing.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "arrays-index-handles",
+      "name": "Parallel primitive arrays with index handles (Java 8)",
+      "paradigm": "data-oriented",
+      "min_standard": "Java8",
+      "idiom_name": "float[]/int[] columns with int index handles, walked by counted loops",
+      "implementation_notes": "Java's object model fights the pattern - every instance carries a header, is reached by reference, and generic collections box primitives - so the classic structure is written by hand: parallel primitive arrays (float[] x, y, vx, vy) traversed by index, which replaces an array of Particle objects with one contiguous buffer per field. Handles are plain ints; the active count keeps the prefix packed and swap-with-last removal keeps it that way. The JIT rewards this shape: monomorphic call sites, counted loops over primitive arrays and devirtualized calls are what it optimizes best, and the layout also removes the GC pressure of many small objects. Choose it whenever the arrays fit comfortably in heap; the FFM variant takes over when the data must leave the heap or exceed it.",
+      "code_sketch": "static final int MAX = 1 << 20;\nfloat[] x = new float[MAX], y = new float[MAX];\nfloat[] vx = new float[MAX], vy = new float[MAX];\nint active = 0;\nstatic void step(float[] x, float[] y, float[] vx, float[] vy, int active, float dt) {\n    for (int i = 0; i < active; i++) {        // no header, no chase, no boxing\n        x[i] += vx[i] * dt;\n        y[i] += vy[i] * dt;\n    }\n}\n// deactivate(i): x[i] = x[--active]; y[i] = y[active]; ... (every column in lockstep)",
+      "pitfalls": [
+        "Generic collections box: List<Float>, Map<Long, ...> and records of primitives put an object (or an object array) behind every element - use primitive arrays or a primitive-collection library in hot paths.",
+        "Columns must stay in lockstep: any insert/remove/reorder has to touch every array, and a forgotten column is silent data corruption rather than a compile error.",
+        "HotSpot's optimizations are profile-driven: a loop exercised only in rare paths (or behind an obvious branch) is not optimized; keep the kernel simple and let it run.",
+        "Reference-held records defeat the layout: mixing arrays of objects with the columnar arrays reintroduces headers and indirection for those elements."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/java/data/autoboxing.html"
+      ]
+    },
+    {
+      "variant_id": "java22-ffm-offheap",
+      "name": "Off-heap packed layout with the FFM API (Java 22)",
+      "paradigm": "data-oriented",
+      "min_standard": "Java22",
+      "requires_features": [
+        "java.lang.foreign",
+        "VarHandle",
+        "MemoryLayout sequence/struct layouts"
+      ],
+      "idiom_name": "Arena-allocated MemorySegment with MemoryLayout struct/sequence layouts and VarHandle accessors",
+      "implementation_notes": "JEP 454 (final in JDK 22) makes foreign memory a supported API: a MemorySegment is 'an abstraction backed by a contiguous region of memory' allocated from an Arena, and a SequenceLayout of StructLayouts describes a packed array of records whose members are read and written through VarHandles - exactly the manual layout the pattern needs, without Unsafe and without the object model. What replaces the classic structure: the packed record array lives off-heap (or in an on-heap array/buffer segment), the GC never moves or traces it, and lifetimes are explicit (confined, shared, automatic or global arenas). Choose it for large or long-lived data sets, off-heap buffers shared with native code, or when GC pause and locality both matter; keep the on-heap primitive-array variant for ordinary sizes because the arena has its own overhead.",
+      "code_sketch": "try (Arena arena = Arena.ofConfined()) {\n    SequenceLayout particles = MemoryLayout.sequenceLayout(n,\n        MemoryLayout.structLayout(ValueLayout.JAVA_FLOAT.withName(\"x\"),\n                                  ValueLayout.JAVA_FLOAT.withName(\"vx\")));\n    MemorySegment seg = arena.allocate(particles);\n    VarHandle x = particles.varHandle(PathElement.sequenceElement(), PathElement.groupElement(\"x\"));\n    for (int i = 0; i < active; i++) x.set(seg, 0L, (long) i, x.get(seg, 0L, (long) i) + dt);\n}   // closing the arena invalidates and frees every segment it allocated",
+      "pitfalls": [
+        "A segment is invalid once its arena closes (and a confined arena may only be accessed from its owning thread); using it after close fails with IllegalStateException at runtime, not at compile time.",
+        "FFM is Java 22+; on Java 21 it is a preview API (JEP 442) that requires --enable-preview, and some methods are restricted and need --enable-native-access.",
+        "Hand-computed offsets drift from the MemoryLayout: derive all VarHandles from the layout instead of mixing arithmetic offsets with layout-based access.",
+        "Off-heap memory is invisible to the GC's accounting (use Arena.ofAuto or explicit limits) and is not zeroed: initialize every field before reading."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/454"
+      ]
+    }
+  ],
+  "default_variant": "arrays-index-handles"
+}

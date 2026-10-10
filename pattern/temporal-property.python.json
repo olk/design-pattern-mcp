@@ -1,0 +1,59 @@
+{
+  "pattern": "temporal-property",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "django-simple-history HistoricalRecords + HistoryManager.as_of",
+  "implementation_notes": "In a Django model, history = HistoricalRecords() creates a historical table and one row per save, and the HistoryManager answers the pattern's question: Model.history.as_of(datetime) returns the instances as they were at that time (on an instance's manager it returns the object or raises DoesNotExist), which is the shorthand for filter(history_date__lte=t).latest_of_each().as_instances(); history_type='-' marks deletions and instance.is_historic tells a rehydrated instance from a live one. What replaces the classic structure: the historical model plus the as_of queryset; the domain class keeps ordinary attributes. Keep a hand-written collection outside Django, or when the index is a business effective date rather than the save timestamp - a list of frozen (effective, value) pairs with bisect_right is the whole realization, and django-simple-history's own docs note that as_of queries lean on the history_date index.",
+  "code_sketch": "class Employee(models.Model):\n    name = models.CharField(max_length=100)\n    salary = models.DecimalField(max_digits=10, decimal_places=2)\n    history = HistoricalRecords()\n\n# as of a past date, and the change history of one property\nEmployee.history.as_of(datetime(2024, 4, 1, tzinfo=timezone.utc)).get(pk=1)\nEmployee.history.filter(pk=1).order_by(\"history_date\").values(\"history_date\", \"salary\")",
+  "pitfalls": [
+    "as_of returns real model instances (with a _history attribute and is_historic) rather than copies: saving one writes over the live row, so a 'read the past' call must not be followed by an innocent save().",
+    "history_date is the save time (transaction time), not a business effective date; a retroactively effective change needs an explicit effective-date field plus a custom manager, or the history will answer the wrong question.",
+    "Each tracked model gets a full historical table with one row per save, and as_of needs the history_date index (SIMPLE_HISTORY_DATE_INDEX, optionally 'Composite' with the primary key) - otherwise point-in-time queries degrade to scans.",
+    "Updates that bypass save() - queryset.update(), bulk_update(), loaddata - do not create history rows unless the bulk_*_with_history helpers are used, so the history silently develops holes."
+  ],
+  "sources": [
+    "https://django-simple-history.readthedocs.io/en/stable/querying_history.html",
+    "https://django-simple-history.readthedocs.io/en/latest/historical_model.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "django-simple-history",
+      "name": "django-simple-history as_of queries",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "django-simple-history HistoricalRecords + HistoryManager.as_of",
+      "implementation_notes": "In a Django model, history = HistoricalRecords() creates a historical table and one row per save, and the HistoryManager answers the pattern's question: Model.history.as_of(datetime) returns the instances as they were at that time (on an instance's manager it returns the object or raises DoesNotExist), which is the shorthand for filter(history_date__lte=t).latest_of_each().as_instances(); history_type='-' marks deletions and instance.is_historic tells a rehydrated instance from a live one. What replaces the classic structure: the historical model plus the as_of queryset; the domain class keeps ordinary attributes. Keep a hand-written collection outside Django, or when the index is a business effective date rather than the save timestamp - a list of frozen (effective, value) pairs with bisect_right is the whole realization, and django-simple-history's own docs note that as_of queries lean on the history_date index.",
+      "code_sketch": "class Employee(models.Model):\n    name = models.CharField(max_length=100)\n    salary = models.DecimalField(max_digits=10, decimal_places=2)\n    history = HistoricalRecords()\n\n# as of a past date, and the change history of one property\nEmployee.history.as_of(datetime(2024, 4, 1, tzinfo=timezone.utc)).get(pk=1)\nEmployee.history.filter(pk=1).order_by(\"history_date\").values(\"history_date\", \"salary\")",
+      "pitfalls": [
+        "as_of returns real model instances (with a _history attribute and is_historic) rather than copies: saving one writes over the live row, so a 'read the past' call must not be followed by an innocent save().",
+        "history_date is the save time (transaction time), not a business effective date; a retroactively effective change needs an explicit effective-date field plus a custom manager, or the history will answer the wrong question.",
+        "Each tracked model gets a full historical table with one row per save, and as_of needs the history_date index (SIMPLE_HISTORY_DATE_INDEX, optionally 'Composite' with the primary key) - otherwise point-in-time queries degrade to scans.",
+        "Updates that bypass save() - queryset.update(), bulk_update(), loaddata - do not create history rows unless the bulk_*_with_history helpers are used, so the history silently develops holes."
+      ],
+      "sources": [
+        "https://django-simple-history.readthedocs.io/en/stable/querying_history.html",
+        "https://django-simple-history.readthedocs.io/en/latest/historical_model.html"
+      ]
+    },
+    {
+      "variant_id": "stdlib-bisect",
+      "name": "stdlib milestone list with bisect",
+      "paradigm": "data-oriented",
+      "idiom_name": "list of frozen (effective, value) pairs + bisect_right",
+      "implementation_notes": "Outside Django, or when the index is a domain effective date, the whole collection is a list sorted by effective date and one pure function: bisect_right(keys, when) - 1 picks the version in force, put() inserts at bisect_left(keys, when) so a repeated effective date supersedes the earlier version, and at() takes an explicit 'today' (or a clock callable) for the default form. Values should be frozen (tuples or frozen dataclasses) so a stored version cannot be mutated in place, and the keys list should be maintained alongside the values instead of rebuilt per read. Choose this variant when the history is small, must be read without a database, or must answer business-validity rather than save-time questions.",
+      "code_sketch": "from bisect import bisect_left, bisect_right\n\nclass TemporalProperty(list):        # holds (effective_date, value), sorted by date\n    def at(self, when: date) -> Money:\n        i = bisect_right([d for d, _ in self], when) - 1      # latest start <= when\n        if i < 0:\n            raise LookupError(f\"no value effective on {when}\")\n        return self[i][1]\n\n    def put(self, when: date, value: Money) -> None:\n        self.insert(bisect_left([d for d, _ in self], when), (when, value))",
+      "pitfalls": [
+        "date and datetime keys are not orderable against each other in Python 3 (TypeError), and naive datetimes cannot be compared with aware ones: pick one type and one zone for the keys.",
+        "list.insert is O(n) and a put() inside an existing range does not express 'this version ends here' - a milestone list cannot represent gaps or overlapping validity, so explicit (from, to) ranges are needed for those.",
+        "Rebuilding the keys list on every read makes each lookup O(n) plus allocation; keep a parallel sorted keys list (or store keys only and fetch values separately) when the history is long.",
+        "list subclasses expose every mutating method (append, remove, slice assignment), so callers can break the sort order that the binary search depends on - prefer composition with a private list and a read-only view."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/bisect.html",
+        "https://docs.python.org/3/library/datetime.html"
+      ]
+    }
+  ],
+  "default_variant": "django-simple-history",
+  "version": "1.0"
+}

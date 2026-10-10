@@ -1,0 +1,80 @@
+{
+  "pattern": "memoization",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "Memoize[K comparable, V any](f func(K) V) func(K) V",
+  "implementation_notes": "Go has no memoize function; the idiom is a closure over a plain map plus its own lock, and with generics (Go 1.18) one helper serves every comparable key type. Two details carry the correctness: the lookup must use the two-value form because indexing a missing key yields the zero value, and the lock must not be held while calling f, since a memoized function that recurses through the same cache would deadlock. Computing outside the lock deliberately tolerates duplicate computation on a concurrent miss - the same trade Python's functools and C#'s GetOrAdd document - which keeps the helper short and recursion-safe. Before generics each memoized function needed its own struct with a method, which is the form to keep when the cache needs a visible API (size, clear, stats).",
+  "code_sketch": "func Memoize[K comparable, V any](f func(K) V) func(K) V {\n    var mu sync.Mutex\n    cache := map[K]V{}\n    return func(k K) V {\n        if v, ok := cache[k]; ok {      // two-value lookup: a stored zero value is a hit\n            return v\n        }\n        v := f(k)                       // compute outside the lock: recursion stays safe\n        mu.Lock(); cache[k] = v; mu.Unlock()\n        return v\n    }\n}",
+  "pitfalls": [
+    "Maps are not safe for concurrent use (go.dev/blog/maps): an unsynchronised memo shared by goroutines is a data race and can abort the program with a concurrent map write.",
+    "Go map keys must be comparable - slices, maps and functions cannot be keys, so argument tuples containing them must be canonicalised to a string, struct or hash first.",
+    "Reading a map without the two-value form returns the zero value for a miss, so caching a legitimate zero or nil result makes hits and misses indistinguishable.",
+    "Holding the mutex across the computation serializes all misses and deadlocks the moment the memoized function recurses through the same cache."
+  ],
+  "sources": [
+    "https://go.dev/blog/maps",
+    "https://raw.githubusercontent.com/golang/go/go1.24.0/src/sync/map.go"
+  ],
+  "variants": [
+    {
+      "variant_id": "mutex-map-closure",
+      "name": "Memoizing closure over a map guarded by a mutex",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "requires_features": [
+        "generics"
+      ],
+      "idiom_name": "Memoize[K comparable, V any](f func(K) V) func(K) V",
+      "implementation_notes": "Go has no memoize function; the idiom is a closure over a plain map plus its own lock, and with generics (Go 1.18) one helper serves every comparable key type. Two details carry the correctness: the lookup must use the two-value form because indexing a missing key yields the zero value, and the lock must not be held while calling f, since a memoized function that recurses through the same cache would deadlock. Computing outside the lock deliberately tolerates duplicate computation on a concurrent miss - the same trade Python's functools and C#'s GetOrAdd document - which keeps the helper short and recursion-safe. Before generics each memoized function needed its own struct with a method, which is the form to keep when the cache needs a visible API (size, clear, stats).",
+      "code_sketch": "func Memoize[K comparable, V any](f func(K) V) func(K) V {\n    var mu sync.Mutex\n    cache := map[K]V{}\n    return func(k K) V {\n        if v, ok := cache[k]; ok {      // two-value lookup: a stored zero value is a hit\n            return v\n        }\n        v := f(k)                       // compute outside the lock: recursion stays safe\n        mu.Lock(); cache[k] = v; mu.Unlock()\n        return v\n    }\n}",
+      "pitfalls": [
+        "Maps are not safe for concurrent use (go.dev/blog/maps): an unsynchronised memo shared by goroutines is a data race and can abort the program with a concurrent map write.",
+        "Go map keys must be comparable - slices, maps and functions cannot be keys, so argument tuples containing them must be canonicalised to a string, struct or hash first.",
+        "Reading a map without the two-value form returns the zero value for a miss, so caching a legitimate zero or nil result makes hits and misses indistinguishable.",
+        "Holding the mutex across the computation serializes all misses and deadlocks the moment the memoized function recurses through the same cache."
+      ],
+      "sources": [
+        "https://go.dev/blog/maps",
+        "https://raw.githubusercontent.com/golang/go/go1.24.0/src/sync/map.go"
+      ]
+    },
+    {
+      "variant_id": "sync-map-loadorstore",
+      "name": "sync.Map with LoadOrStore for a cache that only grows",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.9",
+      "idiom_name": "sync.Map Load / LoadOrStore",
+      "implementation_notes": "sync.Map is documented as a specialised container whose two intended use cases are exactly memoization: entries written once and read many times, as in caches that only grow, and disjoint key sets written by several goroutines; the same doc says most code should prefer a plain map with separate locking for the type safety and invariants. Load first and only then LoadOrStore, because LoadOrStore evaluates its value argument eagerly and would otherwise compute on every call. It is the store to reach for when hits dominate, misses are rare and the value is already cheap to address; the mutex closure above is the better default when writes are common or the type needs to be generic.",
+      "code_sketch": "var cache sync.Map\n\nfunc Report(key Key) *Report {\n    if v, ok := cache.Load(key); ok {            // fast path: no allocation, no compute\n        return v.(*Report)\n    }\n    v, _ := cache.LoadOrStore(key, build(key))   // build runs even when another goroutine won\n    return v.(*Report)\n}",
+      "pitfalls": [
+        "LoadOrStore computes its argument before the call, so the miss path pays the computation even when another goroutine stored the value first - always Load before LoadOrStore.",
+        "Values are stored as any, so every read pays a type assertion and the compiler cannot check the pair of key and value types.",
+        "A Map must not be copied after first use, and it retains entries forever: there is no eviction, so unbounded key sets grow the process.",
+        "It buys nothing for small or write-heavy caches, where a plain map with a mutex is faster and clearer."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/golang/go/go1.24.0/src/sync/map.go"
+      ]
+    },
+    {
+      "variant_id": "once-single-value",
+      "name": "sync.Once for a nullary memo",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.0",
+      "idiom_name": "sync.Once.Do around a package-level value",
+      "implementation_notes": "When the memo has no key at all - a lazily built index, a compiled matcher, a loaded dictionary - the whole structure collapses into a package-level variable plus sync.Once: Do runs the initializer exactly once no matter how many goroutines call it, and every caller then reads the same value, so no lock is needed on the read path. It is the Go shape of a lazy val or Lazy<T>, and it is strictly simpler than any map: no key, no hashing, no eviction. The classical memo wrapper is the right form only when the result actually varies with arguments; for a single value, Once is the whole pattern.",
+      "code_sketch": "var (\n    once  sync.Once\n    index *Index\n)\n\nfunc Index() *Index {\n    once.Do(func() { index = buildIndex() })   // runs once, even under concurrent calls\n    return index\n}",
+      "pitfalls": [
+        "Once remembers only that the initializer ran, not that it succeeded: a panic inside Do leaves the value unset but Once consumed, so the caller keeps seeing a zero value.",
+        "The initializer must not call back into the same Once (self-deadlock), and the value it publishes must be safe for concurrent readers.",
+        "There is no invalidation: refreshing the value later needs a second Once, a mutex and a pointer swap, or an atomic.Pointer holding an immutable value.",
+        "A package-level Once keeps its value for the process lifetime, which is the point - but it is also a retention point for whatever the value references."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/golang/go/go1.24.0/src/sync/once.go"
+      ]
+    }
+  ],
+  "default_variant": "mutex-map-closure",
+  "version": "1.0"
+}

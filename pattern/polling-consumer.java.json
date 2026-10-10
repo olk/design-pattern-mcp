@@ -1,0 +1,72 @@
+{
+  "pattern": "polling-consumer",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "KafkaConsumer.poll(Duration) batch loop (max.poll.records, manual commit)",
+  "implementation_notes": "The Kafka client is a polling consumer by design: poll(Duration) returns a bounded batch (max.poll.records), returns an empty batch when nothing arrives within the timeout, and doubles as the group heartbeat, so the poll interval is a liveness parameter (max.poll.interval.ms) as much as a throughput one. Acknowledgement is the offset commit and belongs after processing - enable.auto.commit acknowledges at poll time and loses messages when the process dies between the poll and the work.",
+  "code_sketch": "try (var consumer = new KafkaConsumer<String, String>(props)) {\n    consumer.subscribe(List.of(\"jobs\"));\n    while (running) {\n        ConsumerRecords<String, String> batch = consumer.poll(Duration.ofMillis(500));\n        for (var record : batch) handle(record);\n        if (!batch.isEmpty()) consumer.commitSync();   // ack after handling\n    }\n}",
+  "pitfalls": [
+    "poll(Duration) is also the liveness heartbeat: a batch that takes longer than max.poll.interval.ms to process evicts the consumer from its group, and the next commit fails with CommitFailedException.",
+    "Auto-commit acknowledges records as poll() returns them, so a crash before the work silently loses them; disabling it and committing after processing makes the receiver at-least-once and requires idempotent handlers.",
+    "KafkaConsumer is not thread-safe: keep one poll loop per consumer and use wakeup() for shutdown instead of sharing the consumer across threads."
+  ],
+  "sources": [
+    "https://kafka.apache.org/38/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "kafka-poll-loop",
+      "name": "Kafka poll loop with bounded batches and explicit offset commit",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "KafkaConsumer.poll(Duration) batch loop (max.poll.records, manual commit)",
+      "implementation_notes": "The Kafka client is a polling consumer by design: poll(Duration) returns a bounded batch (max.poll.records), returns an empty batch when nothing arrives within the timeout, and doubles as the group heartbeat, so the poll interval is a liveness parameter (max.poll.interval.ms) as much as a throughput one. Acknowledgement is the offset commit and belongs after processing - enable.auto.commit acknowledges at poll time and loses messages when the process dies between the poll and the work.",
+      "code_sketch": "try (var consumer = new KafkaConsumer<String, String>(props)) {\n    consumer.subscribe(List.of(\"jobs\"));\n    while (running) {\n        ConsumerRecords<String, String> batch = consumer.poll(Duration.ofMillis(500));\n        for (var record : batch) handle(record);\n        if (!batch.isEmpty()) consumer.commitSync();   // ack after handling\n    }\n}",
+      "pitfalls": [
+        "poll(Duration) is also the liveness heartbeat: a batch that takes longer than max.poll.interval.ms to process evicts the consumer from its group, and the next commit fails with CommitFailedException.",
+        "Auto-commit acknowledges records as poll() returns them, so a crash before the work silently loses them; disabling it and committing after processing makes the receiver at-least-once and requires idempotent handlers.",
+        "KafkaConsumer is not thread-safe: keep one poll loop per consumer and use wakeup() for shutdown instead of sharing the consumer across threads."
+      ],
+      "sources": [
+        "https://kafka.apache.org/38/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html"
+      ]
+    },
+    {
+      "variant_id": "jms-blocking-receive",
+      "name": "JMS synchronous receiver (receive/receiveNoWait)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "MessageConsumer.receive(timeout) / receiveNoWait()",
+      "implementation_notes": "The EIP-era realization: the consumer calls MessageConsumer.receive(timeout), which blocks at most timeout milliseconds and returns null when it expires, or receiveNoWait() for the immediate variant - exactly the receive/receiveNoWait pair the pattern describes. Acknowledgement is the JMS acknowledgement mode or the transaction: in a transacted session the message is retained until commit, so a crash rolls it back to the queue, whereas a non-transacted AUTO_ACKNOWLEDGE session acknowledges on delivery, that is, before the work happens.",
+      "code_sketch": "MessageConsumer consumer = session.createConsumer(queue);\nwhile (running) {\n    Message msg = consumer.receive(500);      // null = idle tick\n    if (msg == null) { backoff(); continue; }\n    handle(msg);\n    if (transacted) session.commit();         // ack after handling\n}",
+      "pitfalls": [
+        "receive(0) means 'block indefinitely' rather than 'return immediately'; the immediate answer is receiveNoWait(), and a zero timeout in a poll loop hangs the consumer instead of polling it.",
+        "AUTO_ACKNOWLEDGE acknowledges on delivery, so a failure during handling loses the message; a transacted session or CLIENT_ACKNOWLEDGE is required when the acknowledgement point must follow processing."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/api/javax/jms/MessageConsumer.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "Virtual-thread consumer with blocking receive (Loom)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "Thread.ofVirtual() / Executors.newVirtualThreadPerTaskExecutor() with blocking receive",
+      "implementation_notes": "With virtual threads the polling consumer returns to its simplest form: one virtual thread per consumer runs an ordinary blocking receive with a timeout, and because a blocked virtual thread unmounts from its carrier the thread-per-consumer cost that motivated batching and callback plumbing largely disappears. The pattern's responsibilities do not move - timeout, idle policy, acknowledgement and shutdown are still the consumer's - but the code can be written as a plain loop, which makes this variant preferable on Java 21+ for many low-to-moderate-volume channels.",
+      "code_sketch": "try (var exec = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (Queue q : queues)\n        exec.submit(() -> {\n            while (running) {\n                Message m = q.receive(idleMs);           // unmounts while blocked\n                if (m == null) backoff(); else handleAndAck(m);\n            }\n        });\n}",
+      "pitfalls": [
+        "Virtual threads do not make polling cheaper on the wire: one thread per channel still issues one idle fetch per interval, so the fan-out limit is the channel's capacity, not the thread's cost.",
+        "A blocked thread that pins its carrier (inside a synchronized block or a native frame) behaves like a platform thread under load and loses the scalability this variant was chosen for."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html"
+      ]
+    }
+  ],
+  "default_variant": "kafka-poll-loop",
+  "version": "1.0"
+}

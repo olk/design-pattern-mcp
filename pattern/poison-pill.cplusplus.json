@@ -1,0 +1,61 @@
+{
+  "pattern": "poison-pill",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::queue<T> + std::mutex + std::condition_variable sentinel",
+  "implementation_notes": "C++11 composes the pattern from the standard library: the producer pushes a reserved value (or a tagged std::variant/optional) onto a std::queue protected by std::mutex and signals std::condition_variable, while the consumer waits with cv.wait(lock, [&]{ return !q.empty(); }) before checking for the sentinel. One reserved value is posted per consumer; the wait predicate covers spurious wake-ups. On C++20 the sentinel can be dropped entirely - std::jthread supplies a std::stop_token and condition_variable_any::wait(lock, stop_token, pred) wakes on request_stop() - so no value has to share the data plane (see the jthread-stop-token variant).",
+  "code_sketch": "std::queue<Job> q; std::mutex m; std::condition_variable cv;\n\n// producer, after the last item:\n{ std::lock_guard lk(m); q.push(Job::stop()); }\ncv.notify_one();\n\n// consumer:\nfor (;;) {\n    Job job;\n    { std::unique_lock lk(m); cv.wait(lk, [&]{ return !q.empty(); }); job = std::move(q.front()); q.pop(); }\n    if (job.is_stop()) break;        // drain finished\n    process(job);\n}",
+  "pitfalls": [
+    "A reserved T value collides when T can legitimately carry it (a default-constructed Job); use std::optional, a variant or an explicit tag instead.",
+    "One sentinel stops one consumer: pushing N pills for N threads (or a shared done flag plus notify_all) is the injector's contract.",
+    "Dropping the wait predicate makes the consumer wake on spurious notifications and observe an empty queue.",
+    "A std::thread left joinable - or one still waiting for a pill that never comes - terminates the process; prefer std::jthread, whose destructor requests stop and joins."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable",
+    "https://en.cppreference.com/w/cpp/thread/jthread"
+  ],
+  "variants": [
+    {
+      "variant_id": "sentinel-condvar",
+      "name": "Reserved sentinel value on a mutex/condition-variable queue (classic)",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::queue<T> + std::mutex + std::condition_variable sentinel",
+      "implementation_notes": "C++11 composes the pattern from the standard library: the producer pushes a reserved value (or a tagged std::variant/optional) onto a std::queue protected by std::mutex and signals std::condition_variable, while the consumer waits with cv.wait(lock, [&]{ return !q.empty(); }) before checking for the sentinel. One reserved value is posted per consumer; the wait predicate covers spurious wake-ups. On C++20 the sentinel can be dropped entirely - std::jthread supplies a std::stop_token and condition_variable_any::wait(lock, stop_token, pred) wakes on request_stop() - so no value has to share the data plane (see the jthread-stop-token variant).",
+      "code_sketch": "std::queue<Job> q; std::mutex m; std::condition_variable cv;\n\n// producer, after the last item:\n{ std::lock_guard lk(m); q.push(Job::stop()); }\ncv.notify_one();\n\n// consumer:\nfor (;;) {\n    Job job;\n    { std::unique_lock lk(m); cv.wait(lk, [&]{ return !q.empty(); }); job = std::move(q.front()); q.pop(); }\n    if (job.is_stop()) break;        // drain finished\n    process(job);\n}",
+      "pitfalls": [
+        "A reserved T value collides when T can legitimately carry it (a default-constructed Job); use std::optional, a variant or an explicit tag instead.",
+        "One sentinel stops one consumer: pushing N pills for N threads (or a shared done flag plus notify_all) is the injector's contract.",
+        "Dropping the wait predicate makes the consumer wake on spurious notifications and observe an empty queue.",
+        "A std::thread left joinable - or one still waiting for a pill that never comes - terminates the process; prefer std::jthread, whose destructor requests stop and joins."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/condition_variable",
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    },
+    {
+      "variant_id": "jthread-stop-token",
+      "name": "std::jthread + std::stop_token cooperative stop (C++20)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "stop_token"
+      ],
+      "idiom_name": "std::jthread + std::stop_token with std::condition_variable_any::wait",
+      "implementation_notes": "C++20 replaces the in-band sentinel with cooperative cancellation state: the worker runs as a std::jthread, waits with condition_variable_any::wait(lock, stop_token, pred) (which wakes when stop is requested or work is available), and exits once stop is requested and the queue is drained; the jthread destructor requests stop and joins, so no value shares the data plane and no per-consumer pill bookkeeping is needed. Choose it when the whole toolchain is C++20 and the stop signal should not be confusable with payloads; keep the sentinel when consumers are plain std::threads, non-C++20 targets, or when the stop must travel through the queue itself (for example to a consumer in another component).",
+      "code_sketch": "std::queue<Job> q; std::mutex m; std::condition_variable_any cv;\n\nstd::jthread worker([&](std::stop_token st) {\n    std::unique_lock lk(m);\n    while (cv.wait(lk, st, [&]{ return !q.empty(); })) {\n        Job job = std::move(q.front()); q.pop();\n        lk.unlock(); process(job); lk.lock();\n    }\n});\n// producer: { std::lock_guard lk(m); q.push(job); } cv.notify_one();\n// shutdown: worker.request_stop(); cv.notify_all();",
+      "pitfalls": [
+        "The stop_token overloads live on std::condition_variable_any, not std::condition_variable - the latter does not compile with a stop token.",
+        "request_stop() alone wakes a waiting worker only through the stop callback that condition_variable_any::wait registers; plain wait() needs an extra notify_all().",
+        "The jthread destructor requests stop and joins, so a worker that ignores stop blocks the destructor; the loop must return on stop once drained."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/jthread"
+      ]
+    }
+  ],
+  "default_variant": "sentinel-condvar",
+  "version": "1.0"
+}

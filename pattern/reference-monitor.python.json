@@ -1,0 +1,63 @@
+{
+  "pattern": "reference-monitor",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "one module as the monitor: __all__ as the enumerated surface, private module state, fail-closed decision",
+  "implementation_notes": "Python enforces no privacy, so the realization is a discipline expressed through module structure: the monitor is one module whose only public names are the mediated operations, listed in __all__, whose decision state lives in leading-underscore module globals, and which depends on nothing but the policy interface and a single _check function that returns False whenever it cannot decide. Name mangling (__name inside a class becomes _Class__name) is not privacy either - it only prevents accidental collisions - so it belongs nowhere in the trust argument. The value of the single module is verifiability: the whole trusted core is one file whose public surface is the __all__ list, and the test suite iterates that same list, so adding a mediated operation changes both in the same commit.",
+  "code_sketch": "# monitor.py - the whole trusted core; __all__ is the enumeration of mediated operations\n__all__ = [\"read_record\", \"write_record\"]\n_POLICY: PolicyStore | None = None          # module-private, set once, never handed out\ndef _check(subject, action, obj_id) -> bool:\n    if subject is None or subject.principal is None or _POLICY is None:\n        return False                        # fail closed: no identity or no policy\n    return _POLICY.allows(subject.principal, action, obj_id)\n\ndef read_record(subject, obj_id):\n    if not _check(subject, \"read\", obj_id):\n        raise PermissionError(\"denied\")\n    return copy.deepcopy(_STORE[obj_id])    # never return the live object",
+  "pitfalls": [
+    "Leading underscores and __all__ are conventions read by humans: any imported module can call monitor._check or rebind monitor._POLICY, and name mangling only rewrites the attribute name, so in-process enforcement in Python is advisory.",
+    "Monkey patching is the normal way Python is extended: a plugin that replaces _check, a sitecustomize module, or a wrapper that swaps the module in sys.modules disables the monitor without editing a line of it.",
+    "Returning the stored object, or a shallow copy that shares mutable sub-objects, hands the caller a reference that mutates state the monitor believes it controls; return deep copies or immutable views.",
+    "Import order is part of the trust boundary: if the policy is imported lazily, a decision can run before it exists - which is exactly the state that must fail closed instead of defaulting open."
+  ],
+  "sources": [
+    "https://docs.python.org/3/tutorial/modules.html",
+    "https://docs.python.org/3/tutorial/classes.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "module-monitor",
+      "name": "Module as the monitor (single exported entry point)",
+      "paradigm": "oo",
+      "min_standard": "Python3.0",
+      "idiom_name": "one module as the monitor: __all__ as the enumerated surface, private module state, fail-closed decision",
+      "implementation_notes": "Python enforces no privacy, so the realization is a discipline expressed through module structure: the monitor is one module whose only public names are the mediated operations, listed in __all__, whose decision state lives in leading-underscore module globals, and which depends on nothing but the policy interface and a single _check function that returns False whenever it cannot decide. Name mangling (__name inside a class becomes _Class__name) is not privacy either - it only prevents accidental collisions - so it belongs nowhere in the trust argument. The value of the single module is verifiability: the whole trusted core is one file whose public surface is the __all__ list, and the test suite iterates that same list, so adding a mediated operation changes both in the same commit.",
+      "code_sketch": "# monitor.py - the whole trusted core; __all__ is the enumeration of mediated operations\n__all__ = [\"read_record\", \"write_record\"]\n_POLICY: PolicyStore | None = None          # module-private, set once, never handed out\ndef _check(subject, action, obj_id) -> bool:\n    if subject is None or subject.principal is None or _POLICY is None:\n        return False                        # fail closed: no identity or no policy\n    return _POLICY.allows(subject.principal, action, obj_id)\n\ndef read_record(subject, obj_id):\n    if not _check(subject, \"read\", obj_id):\n        raise PermissionError(\"denied\")\n    return copy.deepcopy(_STORE[obj_id])    # never return the live object",
+      "pitfalls": [
+        "Leading underscores and __all__ are conventions read by humans: any imported module can call monitor._check or rebind monitor._POLICY, and name mangling only rewrites the attribute name, so in-process enforcement in Python is advisory.",
+        "Monkey patching is the normal way Python is extended: a plugin that replaces _check, a sitecustomize module, or a wrapper that swaps the module in sys.modules disables the monitor without editing a line of it.",
+        "Returning the stored object, or a shallow copy that shares mutable sub-objects, hands the caller a reference that mutates state the monitor believes it controls; return deep copies or immutable views.",
+        "Import order is part of the trust boundary: if the policy is imported lazily, a decision can run before it exists - which is exactly the state that must fail closed instead of defaulting open."
+      ],
+      "sources": [
+        "https://docs.python.org/3/tutorial/modules.html",
+        "https://docs.python.org/3/tutorial/classes.html"
+      ]
+    },
+    {
+      "variant_id": "audit-hook",
+      "name": "Runtime audit hook mediation (sys.addaudithook)",
+      "paradigm": "procedural",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "audit-hooks"
+      ],
+      "idiom_name": "sys.addaudithook() mediating runtime events (cannot be removed once installed)",
+      "implementation_notes": "PEP 578 gives the runtime its own mediation surface: sys.addaudithook() installs a hook that CPython calls for events raised throughout the interpreter and standard library - open, socket.connect, subprocess.Popen, ctypes.dlopen, compile, import, sys._getframe and the rest of the audit events table - and hooks cannot be removed or replaced once added; a hook that raises aborts the operation. Hooks added from C are global, hooks added from Python belong to the current interpreter, so an embedder can install the monitor before any application code runs. What it is not: the PEP says explicitly that this is not a sandbox. The hook sees runtime events rather than object-level intent, a denial is an exception (or process termination), and anything below the interpreter - a C extension, a build with auditing disabled - can act without raising the events. Use it to mediate resource acquisition (files, sockets, processes, native code) and the module monitor for object-level decisions.",
+      "code_sketch": "import sys\n\ndef _hook(event: str, args: tuple) -> None:          # installed once, removed never\n    if event == \"open\":\n        path, mode = args[0], args[1]\n        if not _check(_CURRENT, mode, path):\n            raise PermissionError(f\"audited deny: {path}\")\n    elif event in (\"socket.connect\", \"subprocess.Popen\", \"ctypes.dlopen\"):\n        if not _check(_CURRENT, event, args):\n            raise PermissionError(f\"audited deny: {event}\")\n\nsys.addaudithook(_hook)   # no API removes it; a raising hook cancels the operation",
+      "pitfalls": [
+        "An installed hook is permanent for the process: a slow or wrong hook can only be fixed by restarting, so keep it allocation-light and never raise for events outside the policy.",
+        "Hooks run with the GIL held on the thread that raised the event, so doing I/O, taking locks or logging to a slow sink inside the hook stalls the program and can deadlock against a lock the audited operation needs.",
+        "Coverage is a runtime property, not a language guarantee: builds with auditing disabled, C extensions that bypass the audited path and events added in later Python versions all move the surface - pin the version and test the event list you rely on.",
+        "Denial semantics are blunt: the exception aborts the operation for every caller at once, and a denial cannot be attributed to a decision id unless the monitor records it."
+      ],
+      "sources": [
+        "https://peps.python.org/pep-0578/",
+        "https://docs.python.org/3/library/audit_events.html"
+      ]
+    }
+  ],
+  "default_variant": "module-monitor"
+}

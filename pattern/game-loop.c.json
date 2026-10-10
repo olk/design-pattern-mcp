@@ -1,0 +1,57 @@
+{
+  "pattern": "game-loop",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-written fixed-step loop over clock_gettime(CLOCK_MONOTONIC) and nanosleep",
+  "implementation_notes": "C provides a monotonic clock and an interruptible sleep, and nothing else. clock_gettime(CLOCK_MONOTONIC) reads a clock that cannot be set, so 'time intervals measured with this clock will not be affected by calls to clock_settime()', and nanosleep suspends the thread 'until either the time interval specified by the rqtp argument has elapsed or a signal is delivered', returning the remaining time through rmtp when interrupted (EINTR). What replaces the classic structure: nothing - the driver loop, the lag accumulator and the pacing sleep are written by hand over those two calls, and the roles become plain functions. The pattern then lives in the discipline of re-reading the clock after every sleep instead of trusting the requested interval, because POSIX warns the suspension 'may be longer than requested because the argument value is rounded up to an integer multiple of the sleep resolution or because of the scheduling of other activity'. Keep the sleep shorter than one step, re-measure, and yield the CPU deliberately: a C loop that never sleeps burns a core.",
+  "code_sketch": "double prev = now_seconds();          /* clock_gettime(CLOCK_MONOTONIC) */\nconst double dt = 1.0 / 60.0;\ndouble lag = 0.0;\nfor (;;) {\n    double cur = now_seconds();\n    lag += cur - prev; prev = cur;\n    if (lag > 0.25) lag = 0.25;       /* clamp: no spiral of death */\n    drain_input();\n    while (lag >= dt) { step(dt); lag -= dt; }\n    render(lag / dt);                 /* interpolate previous -> current */\n    nanosleep_ms(dt * 1000.0 * 0.5);  /* coarse; the loop re-reads the clock */\n}",
+  "pitfalls": [
+    "CLOCK_REALTIME is adjustable, so intervals measured with it jump when the system clock is set; use CLOCK_MONOTONIC (or CLOCK_MONOTONIC_RAW) for the loop and keep CLOCK_REALTIME for calendar needs.",
+    "nanosleep returns early on a signal (EINTR) with the remaining time in rmtp; ignoring the return value either wakes early or, when the caller retries the whole interval, oversleeps past the target.",
+    "Sleep resolution is coarse and the actual suspension can exceed the request: derive dt from clock deltas, never from the iteration count or the requested sleep.",
+    "A free-running C loop with no sleep or event wait spins a core at 100% and lets the OS scheduler decide the frame rate; pace with nanosleep, timerfd or an event wait."
+  ],
+  "sources": [
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/clock_gettime.html",
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/nanosleep.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "posix-fixed-step",
+      "name": "POSIX fixed-step loop with clock_gettime and nanosleep",
+      "paradigm": "procedural",
+      "implementation_notes": "C provides a monotonic clock and an interruptible sleep, and nothing else. clock_gettime(CLOCK_MONOTONIC) reads a clock that cannot be set, so 'time intervals measured with this clock will not be affected by calls to clock_settime()', and nanosleep suspends the thread 'until either the time interval specified by the rqtp argument has elapsed or a signal is delivered', returning the remaining time through rmtp when interrupted (EINTR). What replaces the classic structure: nothing - the driver loop, the lag accumulator and the pacing sleep are written by hand over those two calls, and the roles become plain functions. The pattern then lives in the discipline of re-reading the clock after every sleep instead of trusting the requested interval, because POSIX warns the suspension 'may be longer than requested because the argument value is rounded up to an integer multiple of the sleep resolution or because of the scheduling of other activity'. Keep the sleep shorter than one step, re-measure, and yield the CPU deliberately: a C loop that never sleeps burns a core.",
+      "min_standard": "C99",
+      "idiom_name": "hand-written fixed-step loop over clock_gettime(CLOCK_MONOTONIC) and nanosleep",
+      "code_sketch": "double prev = now_seconds();          /* clock_gettime(CLOCK_MONOTONIC) */\nconst double dt = 1.0 / 60.0;\ndouble lag = 0.0;\nfor (;;) {\n    double cur = now_seconds();\n    lag += cur - prev; prev = cur;\n    if (lag > 0.25) lag = 0.25;       /* clamp: no spiral of death */\n    drain_input();\n    while (lag >= dt) { step(dt); lag -= dt; }\n    render(lag / dt);                 /* interpolate previous -> current */\n    nanosleep_ms(dt * 1000.0 * 0.5);  /* coarse; the loop re-reads the clock */\n}",
+      "pitfalls": [
+        "CLOCK_REALTIME is adjustable, so intervals measured with it jump when the system clock is set; use CLOCK_MONOTONIC (or CLOCK_MONOTONIC_RAW) for the loop and keep CLOCK_REALTIME for calendar needs.",
+        "nanosleep returns early on a signal (EINTR) with the remaining time in rmtp; ignoring the return value either wakes early or, when the caller retries the whole interval, oversleeps past the target.",
+        "Sleep resolution is coarse and the actual suspension can exceed the request: derive dt from clock deltas, never from the iteration count or the requested sleep.",
+        "A free-running C loop with no sleep or event wait spins a core at 100% and lets the OS scheduler decide the frame rate; pace with nanosleep, timerfd or an event wait."
+      ],
+      "sources": [
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/clock_gettime.html",
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/nanosleep.html"
+      ]
+    },
+    {
+      "variant_id": "sdl3-main-callbacks",
+      "name": "SDL3 main-callbacks loop (platform-owned)",
+      "paradigm": "procedural",
+      "implementation_notes": "SDL3 can own the loop: with SDL_MAIN_USE_CALLBACKS the application defines SDL_AppInit, SDL_AppEvent, SDL_AppIterate and SDL_AppQuit, and SDL_AppIterate is 'called over and over, possibly at the refresh rate of the display or some other metric that the platform dictates'. The documented reason is that iOS and Emscripten 'would rather be in charge of that while loop', and Wayland can notify the app when to draw to save power. What replaces the classic structure: the platform's driver replaces yours and the same roles survive inside SDL_AppIterate, while event pumping moves to SDL_AppEvent so the frame body never calls SDL_PollEvent. Choose it for portable builds where the OS insists on frame callbacks; keep the hand-written POSIX loop where you need control over pacing, such as dedicated servers and fixed-rate simulation without a display.",
+      "idiom_name": "SDL_AppInit / SDL_AppEvent / SDL_AppIterate callbacks",
+      "code_sketch": "#define SDL_MAIN_USE_CALLBACKS\n#include <SDL3/SDL_main.h>\nSDL_AppResult SDL_AppInit(void **state, int argc, char **argv) {\n    *state = world_new();\n    return SDL_APP_CONTINUE;                 /* one-time setup only */\n}\nSDL_AppResult SDL_AppEvent(void *state, SDL_Event *e) {\n    return e->type == SDL_EVENT_QUIT ? SDL_APP_SUCCESS : SDL_APP_CONTINUE;\n}\nSDL_AppResult SDL_AppIterate(void *state) {  /* SDL calls this at SDL's cadence */\n    step(dt_from_clock());                   /* never sleep or loop here */\n    render();\n    return SDL_APP_CONTINUE;\n}",
+      "pitfalls": [
+        "Do not call SDL_PollEvent or SDL_PumpEvents inside SDL_AppIterate: SDL manages event pumping and delivers events through SDL_AppEvent, and polling fights the platform.",
+        "SDL_AppIterate may run more or less often than the display refresh (and slower in the background), so drive the simulation from measured time - a callback count is not a time step.",
+        "Never block or run an inner forever loop in SDL_AppIterate: the application's lifetime belongs to SDL, and returning is how control goes back."
+      ],
+      "sources": [
+        "https://wiki.libsdl.org/SDL3/README-main-functions"
+      ]
+    }
+  ],
+  "default_variant": "posix-fixed-step"
+}

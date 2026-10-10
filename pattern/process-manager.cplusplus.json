@@ -1,0 +1,55 @@
+{
+  "pattern": "process-manager",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::variant + std::visit decider with a persisted state row",
+  "implementation_notes": "Modern C++ has no standard workflow runtime, so the idiomatic realization is a state modelled as std::variant (or a plain enum plus a context struct) with a decider function visited by std::visit that maps (state, event) to the next state and the outgoing command; the instance row is written and the command enqueued in one database transaction. Deadlines come from a steady clock plus a boost::asio::steady_timer or a periodic sweep of due rows, and compensations are ordinary functions kept in reverse order. The virtual-handle() State pattern is still justified when each state carries substantial behaviour, but for a flow that is mostly data the variant decider keeps the whole definition in one testable function.",
+  "code_sketch": "using State = std::variant<AwaitingPayment, AwaitingStock, Compensating, Done>;\n\nState step(const State& s, const Reply& r, Store& db) {\n  return std::visit(overloaded{\n    [&](const AwaitingPayment&) -> State {\n      if (!r.ok) return Compensating{r.cid, r.error};\n      db.save(AwaitingStock{r.cid});            // same tx as the command\n      return AwaitingStock{r.cid};\n    },\n    [&](const AwaitingStock&) -> State { return Done{}; },\n    [&](const auto&) -> State { return s; },     // stale reply\n  }, s);\n}",
+  "pitfalls": [
+    "Putting all collected data inside the variant turns the instance into one god value; keep a separate context and let states carry only what the decider needs.",
+    "A boost::asio deadline_timer must outlive its callback and be cancelled explicitly - a timer captured by reference into a destroyed handler is the classic use-after-free.",
+    "Storing deadlines as wall-clock values breaks across NTP steps; store monotonic instants for in-process timers and absolute UTC instants for persisted due dates, never mix them."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/utility/variant"
+  ],
+  "variants": [
+    {
+      "variant_id": "variant-decider",
+      "name": "Hand-rolled decider over a std::variant state",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "std::variant + std::visit decider with a persisted state row",
+      "implementation_notes": "Modern C++ has no standard workflow runtime, so the idiomatic realization is a state modelled as std::variant (or a plain enum plus a context struct) with a decider function visited by std::visit that maps (state, event) to the next state and the outgoing command; the instance row is written and the command enqueued in one database transaction. Deadlines come from a steady clock plus a boost::asio::steady_timer or a periodic sweep of due rows, and compensations are ordinary functions kept in reverse order. The virtual-handle() State pattern is still justified when each state carries substantial behaviour, but for a flow that is mostly data the variant decider keeps the whole definition in one testable function.",
+      "code_sketch": "using State = std::variant<AwaitingPayment, AwaitingStock, Compensating, Done>;\n\nState step(const State& s, const Reply& r, Store& db) {\n  return std::visit(overloaded{\n    [&](const AwaitingPayment&) -> State {\n      if (!r.ok) return Compensating{r.cid, r.error};\n      db.save(AwaitingStock{r.cid});            // same tx as the command\n      return AwaitingStock{r.cid};\n    },\n    [&](const AwaitingStock&) -> State { return Done{}; },\n    [&](const auto&) -> State { return s; },     // stale reply\n  }, s);\n}",
+      "pitfalls": [
+        "Putting all collected data inside the variant turns the instance into one god value; keep a separate context and let states carry only what the decider needs.",
+        "A boost::asio deadline_timer must outlive its callback and be cancelled explicitly - a timer captured by reference into a destroyed handler is the classic use-after-free.",
+        "Storing deadlines as wall-clock values breaks across NTP steps; store monotonic instants for in-process timers and absolute UTC instants for persisted due dates, never mix them."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/variant"
+      ]
+    },
+    {
+      "variant_id": "boost-msm",
+      "name": "Boost.MSM table-driven state machine",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "Boost.MetaStateMachine transition table + serialization",
+      "implementation_notes": "Boost.MSM compiles a UML2 state machine from a transition table into highly optimized code, so the classic state-object structure disappears into the front-end syntax (Row<> entries, guards, entry/exit actions) and its serialization support can persist and restore the machine state. Its documented compiler tests go back to g++ 4.2/4.3 and VC9, i.e. pre-C++11 toolchains, which is why the floor is stated as C++03. Choose MSM when the flow is genuinely statechart-shaped (composite or orthogonal states, deferred events, guards with priorities) and the team accepts template diagnostics and long build times; a plain switch stays cheaper for short linear flows.",
+      "code_sketch": "struct OrderFsm : msm::front::state_machine_def<OrderFsm> {\n  struct AwaitingPayment : msm::front::state<> {\n    template <class Ev, class Fsm, class Any>\n    void on_entry(Ev const&, Fsm& f, Any&) { f.arm_deadline(); }\n  };\n  typedef AwaitingPayment initial_state;\n  struct transition_table : boost::mpl::vector<\n    //  Start            Event        Next           Action\n    Row<AwaitingPayment, PaymentOk,   AwaitingStock, ReserveStock>,\n    Row<AwaitingPayment, Timeout,     Compensating,  ReleaseCredit>,\n    Row<AwaitingStock,   ReserveOk,   Done,          Ship> > {};\n};",
+      "pitfalls": [
+        "Template compile errors are hard to read and long to rebuild: one malformed row can cost minutes on a large transition table.",
+        "MSM keeps its own event queue; calling process_event from inside an action or from an external broker thread without a queue policy leads to nested or unsynchronised dispatch.",
+        "Serialization requires every state and its data to be serializable; a hand-rolled enum state makes that requirement visible instead of implicit."
+      ],
+      "sources": [
+        "https://www.boost.org/libs/msm",
+        "https://www.boost.org/doc/libs/1_82_0/libs/msm/doc/HTML/ch04.html"
+      ]
+    }
+  ],
+  "default_variant": "variant-decider",
+  "version": "1.0"
+}

@@ -1,0 +1,84 @@
+{
+  "pattern": "dirty-flag",
+  "language": "java",
+  "support": "idiomatic",
+  "idiom_name": "volatile cache field plus synchronized rebuild",
+  "implementation_notes": "The canonical JVM realization: keep the cached derived value in a volatile field, test the flag (or the field itself) outside the lock, and rebuild inside a synchronized block that re-checks; from Java 5 the JMM's volatile semantics make the unsynchronised fast path correct, which is exactly why the identical code was broken before. The order matters: assign the cache first, then clear the flag, both inside the lock. If the derived value itself is immutable and cheap to allocate, an all-or-nothing publish of a fresh object keeps readers lock-free. java.util.concurrent adds the lock-free and version-stamp alternatives below, but the volatile double-checked accessor remains the form you will meet in existing code.",
+  "code_sketch": "private volatile Cache cache;\nprivate volatile boolean dirty = true;\n\npublic Cache derived() {\n    if (!dirty) return cache;                       // fast path, no lock\n    synchronized (this) {\n        if (dirty) { cache = buildCache(); dirty = false; }   // publish, then clear\n        return cache;\n    }\n}",
+  "pitfalls": [
+    "Removing volatile makes the fast path observe stale flags or a partially constructed cache; both the flag and the cache need it (or both must be read under the lock).",
+    "Clearing the flag before assigning the cache exposes a clean-but-stale state; assigning outside the lock republishes without the happens-before edge.",
+    "The secondary check inside the synchronized block is mandatory, otherwise two threads rebuild (double side effects) and the second result overwrites the first.",
+    "Synchronizing on `this` lets external code contend for the same monitor; lock on a private final object, or use one of the java.util.concurrent forms."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "volatile-double-checked",
+      "name": "volatile double-checked accessor",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "requires_features": [
+        "volatile"
+      ],
+      "idiom_name": "volatile cache field plus synchronized rebuild",
+      "implementation_notes": "The canonical JVM realization: keep the cached derived value in a volatile field, test the flag (or the field itself) outside the lock, and rebuild inside a synchronized block that re-checks; from Java 5 the JMM's volatile semantics make the unsynchronised fast path correct, which is exactly why the identical code was broken before. The order matters: assign the cache first, then clear the flag, both inside the lock. If the derived value itself is immutable and cheap to allocate, an all-or-nothing publish of a fresh object keeps readers lock-free. java.util.concurrent adds the lock-free and version-stamp alternatives below, but the volatile double-checked accessor remains the form you will meet in existing code.",
+      "code_sketch": "private volatile Cache cache;\nprivate volatile boolean dirty = true;\n\npublic Cache derived() {\n    if (!dirty) return cache;                       // fast path, no lock\n    synchronized (this) {\n        if (dirty) { cache = buildCache(); dirty = false; }   // publish, then clear\n        return cache;\n    }\n}",
+      "pitfalls": [
+        "Removing volatile makes the fast path observe stale flags or a partially constructed cache; both the flag and the cache need it (or both must be read under the lock).",
+        "Clearing the flag before assigning the cache exposes a clean-but-stale state; assigning outside the lock republishes without the happens-before edge.",
+        "The secondary check inside the synchronized block is mandatory, otherwise two threads rebuild (double side effects) and the second result overwrites the first.",
+        "Synchronizing on `this` lets external code contend for the same monitor; lock on a private final object, or use one of the java.util.concurrent forms."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-reference-cas",
+      "name": "AtomicReference CAS republication (lock-free)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "requires_features": [
+        "java.util.concurrent.atomic"
+      ],
+      "idiom_name": "AtomicReference with updateAndGet / compareAndSet",
+      "implementation_notes": "AtomicReference replaces the lock with a CAS loop: readers get the current cache with one volatile read, and a missing or invalidated cache is rebuilt with updateAndGet (or a compareAndSet retry). Invalidation is a plain set(null) or a swap to a sentinel, so the dirty state is the reference value itself and no separate flag is needed. The dominant caveat is that the update function may run more than once when another thread wins the CAS, so it must be side-effect-free apart from creating the value; and the published object must be safely published (final fields or an immutable type) because the CAS provides the reference's visibility, not its fields'.",
+      "code_sketch": "private final AtomicReference<Cache> cache = new AtomicReference<>();\n\npublic Cache derived() {\n    Cache c = cache.get();\n    if (c != null) return c;                        // lock-free read\n    return cache.updateAndGet(prev -> prev != null ? prev : buildCache());\n}\n\n// invalidation: cache.set(null)",
+      "pitfalls": [
+        "The update function can run multiple times (CAS retries): rebuilding a resource, logging or incrementing inside it duplicates side effects.",
+        "null is the dirty state, so a legitimately null derived value needs a sentinel wrapper; otherwise the cache misses forever.",
+        "CAS publishes the reference but not the object's fields - the cached value must be immutable or built with final fields, or readers can see a partially constructed object.",
+        "Under heavy contention the CAS loop spins and rebuilds can pile up; for long recomputations a lock or StampedLock is the calmer choice."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+      ]
+    },
+    {
+      "variant_id": "stamped-optimistic-read",
+      "name": "StampedLock optimistic read with a version stamp",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "requires_features": [
+        "StampedLock"
+      ],
+      "idiom_name": "tryOptimisticRead + validate as the dirty check",
+      "implementation_notes": "StampedLock tracks a version alongside its mode, so its optimistic read is a built-in dirty check: tryOptimisticRead returns a stamp, the reader reads the cached value and any supporting fields into locals, and validate(stamp) reports whether a write (a mutation that invalidated the cache) happened since the stamp was taken. If validation fails the reader upgrades to a real lock and rebuilds; mutators take the write lock, change the primary data and clear the cache, which bumps the version. This form is for short, side-effect-free read sections of thread-safe components - the JDK documentation stresses that unvalidated optimistic reads may see wildly inconsistent state, that the lock is not reentrant and not owned by a thread, and that stamps are finite (they may recycle after long uptimes).",
+      "code_sketch": "private final StampedLock lock = new StampedLock();\nprivate Cache cache = buildCache();                 // published at construction\n\npublic Cache derived() {\n    long stamp = lock.tryOptimisticRead();\n    Cache c = cache;\n    if (!lock.validate(stamp)) {                    // a mutation invalidated it\n        stamp = lock.writeLock();\n        try { c = cache = buildCache(); } finally { lock.unlockWrite(stamp); }\n    }\n    return c;\n}",
+      "pitfalls": [
+        "Fields read optimistically must be held in locals and validated before use; calling methods on values read before validate can act on inconsistent state.",
+        "StampedLock is not reentrant: a locked body that calls another method taking the same lock deadlocks, and read-lock bodies must be side-effect-free.",
+        "Stamps are finite and may recycle after a year of continuous operation, and they are not cryptographically secure - never confuse validate with a security check.",
+        "A serialized StampedLock always deserialises unlocked; the cache must be rebuilt (or the flag set) after any round-trip."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html"
+      ]
+    }
+  ],
+  "default_variant": "volatile-double-checked"
+}

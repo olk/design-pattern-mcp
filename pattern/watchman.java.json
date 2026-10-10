@@ -1,0 +1,66 @@
+{
+  "pattern": "watchman",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "ScheduledExecutorService.scheduleWithFixedDelay over an AtomicLong System.nanoTime() stamp (Java 21: one virtual thread per watched flow)",
+  "implementation_notes": "java.util.concurrent supplies the timing and dispatch: a single ScheduledExecutorService evaluates each subject on a fixed delay, while arrivals stamp System.nanoTime() into an AtomicLong, so what replaces the classic structure is the executor plus a monotonic stamp - the per-subject expectation, the alert state machine and the escalation stay application code. Use scheduleWithFixedDelay rather than scheduleAtFixedRate so a slow check cannot overlap itself, catch Throwable inside the task because an escaping exception silently cancels all future runs, and in production publish the silence as a Micrometer counter/gauge consumed by an alerting rule engine instead of paging from the watcher thread. On Java 21+ one virtual thread per watched subject blocking on a timed poll gives the same semantics with linear, interruptible code.",
+  "code_sketch": "AtomicLong lastSeen = new AtomicLong(System.nanoTime());   // arrivals: lastSeen.set(System.nanoTime());\nScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor(r -> {\n    Thread t = new Thread(r, \"flow-watchman\"); t.setDaemon(true); return t; });\nmonitor.scheduleWithFixedDelay(() -> {\n    try {\n        Duration silent = Duration.ofNanos(System.nanoTime() - lastSeen.get());\n        if (silent.compareTo(grace) > 0) publish(subject, silent);   // metric/alert sink + state machine\n    } catch (Throwable t) { log.error(\"watchman tick failed\", t); }   // never let the task die\n}, 0, 5, TimeUnit.SECONDS);",
+  "pitfalls": [
+    "An unchecked exception escaping a periodic task cancels that task permanently and silently: the flow then looks healthy forever - wrap the body in try/catch(Throwable) and make the catch itself alert.",
+    "scheduleAtFixedRate catches up after a stall and can run checks back to back; scheduleWithFixedDelay is the correct shape for a monitor.",
+    "Executors.newSingleThreadScheduledExecutor creates a non-daemon thread that keeps the JVM alive during shutdown unless a daemon thread factory or explicit shutdown is used.",
+    "System.currentTimeMillis() is wall-clock and can step backwards with NTP, producing last-seen timestamps in the future; use System.nanoTime(), whose origin is monotonic.",
+    "A thrown Error (OutOfMemoryError in a check) or a blocked alert sink stalls the single monitor thread for every subject - keep the alert dispatch off the evaluation thread.",
+    "Sharing one executor across many subjects couples their liveness: a blocked check delays every other subject's evaluation."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledExecutorService.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/System.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "java-scheduled-executor",
+      "name": "Classic scheduled executor with a monotonic stamp",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "ScheduledExecutorService.scheduleWithFixedDelay over an AtomicLong System.nanoTime() stamp (Java 21: one virtual thread per watched flow)",
+      "implementation_notes": "java.util.concurrent supplies the timing and dispatch: a single ScheduledExecutorService evaluates each subject on a fixed delay, while arrivals stamp System.nanoTime() into an AtomicLong, so what replaces the classic structure is the executor plus a monotonic stamp - the per-subject expectation, the alert state machine and the escalation stay application code. Use scheduleWithFixedDelay rather than scheduleAtFixedRate so a slow check cannot overlap itself, catch Throwable inside the task because an escaping exception silently cancels all future runs, and in production publish the silence as a Micrometer counter/gauge consumed by an alerting rule engine instead of paging from the watcher thread. On Java 21+ one virtual thread per watched subject blocking on a timed poll gives the same semantics with linear, interruptible code.",
+      "code_sketch": "AtomicLong lastSeen = new AtomicLong(System.nanoTime());   // arrivals: lastSeen.set(System.nanoTime());\nScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor(r -> {\n    Thread t = new Thread(r, \"flow-watchman\"); t.setDaemon(true); return t; });\nmonitor.scheduleWithFixedDelay(() -> {\n    try {\n        Duration silent = Duration.ofNanos(System.nanoTime() - lastSeen.get());\n        if (silent.compareTo(grace) > 0) publish(subject, silent);   // metric/alert sink + state machine\n    } catch (Throwable t) { log.error(\"watchman tick failed\", t); }   // never let the task die\n}, 0, 5, TimeUnit.SECONDS);",
+      "pitfalls": [
+        "An unchecked exception escaping a periodic task cancels that task permanently and silently: the flow then looks healthy forever - wrap the body in try/catch(Throwable) and make the catch itself alert.",
+        "scheduleAtFixedRate catches up after a stall and can run checks back to back; scheduleWithFixedDelay is the correct shape for a monitor.",
+        "Executors.newSingleThreadScheduledExecutor creates a non-daemon thread that keeps the JVM alive during shutdown unless a daemon thread factory or explicit shutdown is used.",
+        "System.currentTimeMillis() is wall-clock and can step backwards with NTP, producing last-seen timestamps in the future; use System.nanoTime(), whose origin is monotonic.",
+        "A thrown Error (OutOfMemoryError in a check) or a blocked alert sink stalls the single monitor thread for every subject - keep the alert dispatch off the evaluation thread.",
+        "Sharing one executor across many subjects couples their liveness: a blocked check delays every other subject's evaluation."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledExecutorService.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/System.html"
+      ]
+    },
+    {
+      "variant_id": "java-virtual-threads",
+      "name": "Java 21 virtual thread per watched flow with a timed poll",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual threads"
+      ],
+      "idiom_name": "Thread.ofVirtual() + BlockingQueue.poll(timeout, unit) per subject",
+      "implementation_notes": "On Java 21+ the monitor becomes linear and per-subject: a virtual thread loops on queue.poll(budget) and treats a null result as silence, so the pending poll is the last-seen state and no scheduled sweep is needed. Virtual threads make thousands of such watchers cheap, and interrupting them on shutdown is ordinary thread interruption rather than executor teardown.",
+      "code_sketch": "Thread.ofVirtual().name(\"watchman-\" + subject).start(() -> {\n    while (!Thread.currentThread().isInterrupted()) {\n        try { if (queue.poll(budget, MILLISECONDS) == null) publish(subject, budget); }\n        catch (InterruptedException e) { return; }\n    }\n});",
+      "pitfalls": [
+        "poll(timeout) returning null is normal control flow, not an error - but a null element (if the queue allows them) would silently read as silence.",
+        "Virtual threads are still unmounted only at blocking points: a CPU-bound check inside the loop pins the carrier thread and hides the stall."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledExecutorService.html"
+      ]
+    }
+  ],
+  "default_variant": "java-scheduled-executor",
+  "version": "1.0"
+}

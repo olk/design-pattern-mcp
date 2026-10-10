@@ -1,0 +1,64 @@
+{
+  "pattern": "temporal-object",
+  "language": "java",
+  "support": "manual",
+  "idiom_name": "continuity class + NavigableMap<LocalDate, Version> (TreeMap) with floorEntry as-of lookup",
+  "implementation_notes": "Fowler's temporal collection is exactly a NavigableMap: the continuity owns a TreeMap keyed by the effective java.time.LocalDate, current() is lastEntry() and asOf(date) is floorEntry(date), so no search code is hand-written - only the two roles are. Versions should be immutable (the record shown here needs Java 16+; on Java 8 use final fields with no setters): an amendment copies the version in force, changes the copy and puts it at its effective date, which keeps published states frozen. The persisted form of the same model is a version table keyed by (identity, effective_date) with no separate continuity row, which is what JPA maps to; Hibernate Envers supplies that store together with an as-of query API (second variant).",
+  "code_sketch": "public final class Contract {                                    // continuity\n    public record Version(LocalDate effective, BigDecimal fee, String terms) {}\n    private final NavigableMap<LocalDate, Version> history = new TreeMap<>();\n    public Version current() { return history.lastEntry().getValue(); }\n    public Optional<Version> asOf(LocalDate on) {\n        Map.Entry<LocalDate, Version> e = history.floorEntry(on);    // null = Missing Version\n        return Optional.ofNullable(e == null ? null : e.getValue());\n    }\n    public void amend(LocalDate effective, Version working) { history.put(effective, working); }\n}",
+  "pitfalls": [
+    "floorEntry returns the greatest key <= date while lowerEntry/higherEntry shift by one version - the boundary rule must live in one method, especially when the query date equals an effective date.",
+    "Sharing a mutable Version instance between the map and callers lets a later edit rewrite history; use a record or final fields and defensive copies of collections.",
+    "TreeMap needs a consistent comparator and LocalDate carries no time zone: switching keys to Instant/LocalDateTime or mixing calendar systems breaks the assumption that one key is one resolvable day.",
+    "JPA entity identity: a version class annotated as an @Entity gets its own id and lifecycle, so the continuity/version split must survive proxies, equals/hashCode and lazy loading - never let the ORM merge a published version over the current one."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/TreeMap.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/LocalDate.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "navigable-map-history",
+      "name": "Continuity entity + NavigableMap history with record versions (in memory)",
+      "paradigm": "oo",
+      "min_standard": "Java16",
+      "idiom_name": "continuity class + NavigableMap<LocalDate, Version> (TreeMap) with floorEntry as-of lookup",
+      "implementation_notes": "Fowler's temporal collection is exactly a NavigableMap: the continuity owns a TreeMap keyed by the effective java.time.LocalDate, current() is lastEntry() and asOf(date) is floorEntry(date), so no search code is hand-written - only the two roles are. Versions should be immutable (the record shown here needs Java 16+; on Java 8 use final fields with no setters): an amendment copies the version in force, changes the copy and puts it at its effective date, which keeps published states frozen. The persisted form of the same model is a version table keyed by (identity, effective_date) with no separate continuity row, which is what JPA maps to; Hibernate Envers supplies that store together with an as-of query API (second variant).",
+      "code_sketch": "public final class Contract {                                    // continuity\n    public record Version(LocalDate effective, BigDecimal fee, String terms) {}\n    private final NavigableMap<LocalDate, Version> history = new TreeMap<>();\n    public Version current() { return history.lastEntry().getValue(); }\n    public Optional<Version> asOf(LocalDate on) {\n        Map.Entry<LocalDate, Version> e = history.floorEntry(on);    // null = Missing Version\n        return Optional.ofNullable(e == null ? null : e.getValue());\n    }\n    public void amend(LocalDate effective, Version working) { history.put(effective, working); }\n}",
+      "pitfalls": [
+        "floorEntry returns the greatest key <= date while lowerEntry/higherEntry shift by one version - the boundary rule must live in one method, especially when the query date equals an effective date.",
+        "Sharing a mutable Version instance between the map and callers lets a later edit rewrite history; use a record or final fields and defensive copies of collections.",
+        "TreeMap needs a consistent comparator and LocalDate carries no time zone: switching keys to Instant/LocalDateTime or mixing calendar systems breaks the assumption that one key is one resolvable day.",
+        "JPA entity identity: a version class annotated as an @Entity gets its own id and lifecycle, so the continuity/version split must survive proxies, equals/hashCode and lazy loading - never let the ORM merge a published version over the current one."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/TreeMap.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/LocalDate.html"
+      ]
+    },
+    {
+      "variant_id": "jpa-envers-audit",
+      "name": "Hibernate Envers audited entity with AuditReader as-of queries",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "jpa",
+        "hibernate-envers"
+      ],
+      "idiom_name": "@Audited entity + AuditReader.find(Class, id, date)",
+      "implementation_notes": "Envers is the framework realization: annotate the entity with @Audited and Hibernate maintains audit tables plus a revision entity, one revision per transaction; AuditReader.find(Contract.class, id, date) returns the entity state current at a date and getRevisionNumberForDate(date) maps a date to its revision, with getRevisions listing when an entity changed. That is record-time versioning (what the row was at each commit), so it satisfies audit and 'as we knew it then' reads, while effective-date amendments still need their own column and query. Choose it when the stack is already Hibernate/JPA and the requirement is history of entity state rather than a business-named amendment object.",
+      "code_sketch": "@Entity\n@Audited                                        // every transaction becomes a revision\npublic class Contract { @Id Long id; BigDecimal fee; String terms; }\n\ntry (EntityManager em = emf.createEntityManager()) {\n    AuditReader reader = AuditReaderFactory.get(em);\n    Contract inMarch = reader.find(Contract.class, 17L, LocalDate.of(2024, 3, 1));\n    Number revision = reader.getRevisionNumberForDate(LocalDate.of(2024, 3, 1));\n    List<Number> revisions = reader.getRevisions(Contract.class, 17L);\n}",
+      "pitfalls": [
+        "Audit rows accumulate for every audited entity and transaction; the audit tables need their own retention, indexing and purge policy.",
+        "find returns null for states where the entity did not exist yet and deleted entities are excluded unless includeDeletions is requested, so as-of reads must handle absence explicitly.",
+        "Enabling @Audited later does not backfill history - revisions start when auditing is switched on, so the first revision has no predecessor.",
+        "Audited relations resolve to the current target when the target is not audited (targetAuditMode), which silently mixes times inside an otherwise historical read."
+      ],
+      "sources": [
+        "https://hibernate.org/orm/envers/",
+        "https://docs.hibernate.org/stable/orm/javadocs/org/hibernate/envers/AuditReader.html"
+      ]
+    }
+  ],
+  "default_variant": "navigable-map-history",
+  "version": "1.0"
+}

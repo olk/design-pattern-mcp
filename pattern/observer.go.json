@@ -1,0 +1,56 @@
+{
+  "pattern": "observer",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "map[int]func(Event) with id-based unsubscribe closures",
+  "implementation_notes": "Go has neither an event keyword nor an observer type, so the local idiom is a struct holding func values (a slice, or a map keyed by event name or by subscription id) protected by sync.RWMutex, with Subscribe returning an unsubscribe closure and Notify copying the handlers under RLock before calling them. This replaces the Observer interface entirely: any func is an observer, and an interface is only needed when observers must carry state and be comparable. Channels are the alternative realization when consumers should pull rather than be pushed (see the fan-out variant).",
+  "code_sketch": "type Subject struct {\n    mu   sync.RWMutex\n    subs []func(Event)\n}\nfunc (s *Subject) Subscribe(fn func(Event)) func() {\n    s.mu.Lock(); i := len(s.subs); s.subs = append(s.subs, fn); s.mu.Unlock()\n    return func() { s.mu.Lock(); s.subs[i] = nil; s.mu.Unlock() }   // tombstone\n}\nfunc (s *Subject) Notify(e Event) {\n    s.mu.RLock(); fns := append([]func(Event)(nil), s.subs...); s.mu.RUnlock()\n    for _, fn := range fns { if fn != nil { fn(e) } }   // no lock held here\n}",
+  "pitfalls": [
+    "Handlers run with the lock released but can still call Notify again: a handler that notifies re-enters the loop and recurses until the stack or the user gives up.",
+    "Notification is synchronous, so a blocking handler delays every later handler; moving work onto a goroutine restores throughput but loses ordering and backpressure.",
+    "Unsubscribing during Notify only takes effect for the next round because the handler set was copied, and index-based subscriptions with nil tombstones keep the slice growing until it is compacted - both semantics must be documented, not discovered.",
+    "The closure keeps its captured object alive: an observer that forgets to call cancel leaks through the registry, and a cancelled subscription must not be called again."
+  ],
+  "sources": [
+    "https://go.dev/blog/share-memory-by-communicating"
+  ],
+  "variants": [
+    {
+      "variant_id": "callback-slice",
+      "name": "func values guarded by sync.RWMutex",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "map[int]func(Event) with id-based unsubscribe closures",
+      "implementation_notes": "Go has neither an event keyword nor an observer type, so the local idiom is a struct holding func values (a slice, or a map keyed by event name or by subscription id) protected by sync.RWMutex, with Subscribe returning an unsubscribe closure and Notify copying the handlers under RLock before calling them. This replaces the Observer interface entirely: any func is an observer, and an interface is only needed when observers must carry state and be comparable. Channels are the alternative realization when consumers should pull rather than be pushed (see the fan-out variant).",
+      "code_sketch": "type Subject struct {\n    mu   sync.RWMutex\n    subs []func(Event)\n}\nfunc (s *Subject) Subscribe(fn func(Event)) func() {\n    s.mu.Lock(); i := len(s.subs); s.subs = append(s.subs, fn); s.mu.Unlock()\n    return func() { s.mu.Lock(); s.subs[i] = nil; s.mu.Unlock() }   // tombstone\n}\nfunc (s *Subject) Notify(e Event) {\n    s.mu.RLock(); fns := append([]func(Event)(nil), s.subs...); s.mu.RUnlock()\n    for _, fn := range fns { if fn != nil { fn(e) } }   // no lock held here\n}",
+      "pitfalls": [
+        "Handlers run with the lock released but can still call Notify again: a handler that notifies re-enters the loop and recurses until the stack or the user gives up.",
+        "Notification is synchronous, so a blocking handler delays every later handler; moving work onto a goroutine restores throughput but loses ordering and backpressure.",
+        "Unsubscribing during Notify only takes effect for the next round because the handler set was copied, and index-based subscriptions with nil tombstones keep the slice growing until it is compacted - both semantics must be documented, not discovered.",
+        "The closure keeps its captured object alive: an observer that forgets to call cancel leaks through the registry, and a cancelled subscription must not be called again."
+      ],
+      "sources": [
+        "https://go.dev/blog/share-memory-by-communicating"
+      ]
+    },
+    {
+      "variant_id": "channel-fanout",
+      "name": "per-subscriber channels (pull instead of push)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.18",
+      "idiom_name": "[]chan Event with non-blocking send and a done channel per subscription",
+      "implementation_notes": "The second Go realization replaces the callback call with a send: the subject keeps one channel per subscriber, creates them in Subscribe (with the buffer the subscriber asks for) and drops or blocks on a full channel according to an explicit policy, typically a non-blocking select with a default branch. Subscribers pull with for e := range ch or select on their own done channel, which is the share-memory-by-communicating style the language documentation recommends, and ownership of the event travels with the value instead of being shared.",
+      "code_sketch": "type Subject struct { mu sync.Mutex; subs []chan Event }\nfunc (s *Subject) Subscribe(buf int) (<-chan Event, func()) {\n    ch := make(chan Event, buf)\n    s.mu.Lock(); s.subs = append(s.subs, ch); s.mu.Unlock()\n    return ch, func() { /* remove ch under lock, then close(ch) */ }\n}\nfunc (s *Subject) Notify(e Event) {\n    s.mu.Lock(); subs := append([]chan Event(nil), s.subs...); s.mu.Unlock()\n    for _, ch := range subs {\n        select { case ch <- e: default: }   // drop on a full channel\n    }\n}",
+      "pitfalls": [
+        "A full or unbuffered channel hits the default branch and the event is silently lost: pick dropping, blocking or disconnecting, and make the choice observable (counter, log).",
+        "Consumers must select on a done channel, otherwise the consuming goroutine blocks forever after unsubscribe and leaks.",
+        "Sending pointers puts shared mutable state on several goroutines at once: send values, or document that receivers must not retain and mutate them."
+      ],
+      "sources": [
+        "https://go.dev/blog/share-memory-by-communicating"
+      ]
+    }
+  ],
+  "default_variant": "callback-slice",
+  "version": "1.0"
+}

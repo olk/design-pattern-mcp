@@ -1,0 +1,218 @@
+{
+  "category": "workflow-messaging",
+  "name": "asynchronous-completion-token",
+  "aliases": [
+    "active demultiplexing",
+    "completion token",
+    "magic cookie"
+  ],
+  "intent": "Let a client create a unique application-defined token for each asynchronous operation, pass it with the request, and require the service to echo it unchanged on completion, so the client can dispatch directly to the owning state and action instead of searching by request identity; the service treats the token as opaque.",
+  "problem": "When many operations are in flight across services or a multiplexed connection, completions can arrive out of order, on another thread or process, or in batches. The client must recover the action and state for each response without scanning a request table or parsing payload fields, while the service cannot know that client context. One blocked thread per operation preserves stack-local state but spends a thread, stack, context switches and synchronization per outstanding request; the design needs a cheap, explicit demultiplexing association.",
+  "context": "Event-driven and proactor-style systems: asynchronous I/O (POSIX AIO, kernel AIO, overlapped I/O with completion ports), request demultiplexing inside middleware and object request brokers, distributed event-notification registrations, actor/coroutine request-reply, and messaging gateways that multiplex many in-flight requests over few connections. It applies whenever completions arrive out of order, on another thread or process, or in batches, and the client must recover per-request state cheaply and predictably.",
+  "benefits": [
+    "Demultiplexing is constant time: the returned token leads straight to the completion state and action, with no search keyed on request identity and no re-parsing of the reply.",
+    "Client bookkeeping collapses: no thread (and no run-time stack) per outstanding operation, and no structures whose only job is to correlate responses with requests.",
+    "The client, not the service, decides what completion state is needed, so the service stays ignorant of client context and can be shared by heterogeneous clients.",
+    "Wire overhead stays minimal: a pointer-sized token, object reference or index travels with the request and is echoed back, which matters on constrained links and keeps the service stateless with respect to client identity.",
+    "The concurrency policy remains free: the same token and completion actions work with callbacks pushed by the service or with a completion queue the client pulls from, single-threaded or multi-threaded.",
+    "New completion behaviours arrive as new tokens and handlers; the service interface and the dispatch path do not change.",
+    "The token decouples the async execution engine from the completion logic, allowing the same operation to be awaited, polled, or handled via callback without changing the service interface."
+  ],
+  "tradeoffs": [
+    "Token lifetime becomes a client responsibility: if a service never returns the token (crash, lost message, abandoned operation), the state it identifies is never released and pointer-based tokens leak.",
+    "Pointer tokens are fragile across address-space changes; persistent or restartable clients must switch to index-based tokens, which reinstates the client-side table the pattern was meant to make unnecessary.",
+    "A returned token is untrusted input: a confused or hostile peer can return an arbitrary value, so the client may have to validate or authenticate it before dispatching.",
+    "Control flow becomes indirect - the code that processes a completion is reached through the token rather than called at the call site - so tracing and debugging require knowing the wiring.",
+    "With low concurrency, or when the language's await/future syntax already carries the completion, a hand-built token registry is ceremony that duplicates what the runtime does better.",
+    "The multiplicity semantics must be fixed and documented: a token returned once per request, a token reused for repeated notifications, and a token re-created per hop in a chain of services demand different ownership and cleanup rules.",
+    "Tokens are not always opaque in practice - some transports and kernels write into the token structure (the classic non-opaque case) - so the representation must either tolerate mutation or reserve space for it.",
+    "Coroutine-based async/await can mask the demultiplexing cost: code that looks sequential may actually serialize what could run concurrently, obscuring the performance implications of the token dispatch model."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Client",
+      "responsibility": "Creates the token before invoking the asynchronous operation, passes it with the request, keeps whatever the token identifies reachable until the completion arrives, dispatches the returned token to the right completion action, and then releases or recycles it."
+    },
+    {
+      "role": "Asynchronous Completion Token (ACT)",
+      "responsibility": "A value that identifies the actions and state needed to process the completion of one asynchronous operation: meaningful to the client, opaque to the service. Typically a pointer or reference to client state, an object reference, or an index into a client-side table - and either single-use (one request, one completion) or reusable (one registration, many notifications)."
+    },
+    {
+      "role": "Service",
+      "responsibility": "Executes the operation asynchronously with respect to the client, holds the token for the duration of the operation (outside its run-time stack when it serves many requests concurrently), and returns it unchanged in the completion response; a chain of services may forward the token or map it to one of its own."
+    },
+    {
+      "role": "Completion Handler (demultiplexer)",
+      "responsibility": "The client-side role that the returned token selects - the callback invoked with it, or the completion-queue consumer that pulls it - and applies the application-specific completion actions to the state the token identifies."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Distributed event monitoring: a management application registers for many event types with many agents and uses the token echoed with each notification to update exactly the display and logger that registered for it.",
+    "Asynchronous I/O: POSIX AIO carries the token in sigevent.sigev_value, Linux kernel AIO returns it as io_event.data, and Win32 overlapped I/O queues OVERLAPPED structures at an I/O completion port - each completion reaches the request state without a lookup.",
+    "Request demultiplexing in middleware: a client tags every request over a multiplexed connection with an opaque sequence number so the reply can be routed to the waiting thread or continuation, while the server indexes object-adapter tables directly through the token it sent.",
+    "Coroutine and actor request-reply: an ask-style request registers a promise or a one-shot reply channel as its token and completes it when the response arrives.",
+    "Durability across restarts: index-based tokens (record identifiers, offsets into a mapped file) let a client that restarts still demultiplex completions of long-running external operations.",
+    "Messaging gateways: an outbound request carries a correlation value or return address so the asynchronous reply reaches the originating caller's completion path.",
+    "HTTP/2 and gRPC streaming: each in-flight RPC carries a call token that multiplexes responses onto the correct async continuation, enabling thousands of concurrent streams over a single connection.",
+    "Distributed tracing and correlation: a trace ID or span ID travels as a token with every service call, echoed in the response to route the completion to the correct trace context without parsing payload content.",
+    "Database driver request routing: each pending query carries a prepared-statement handle or connection slot token so that async result completions dispatch to the correct caller without searching connection pools.",
+    "WebSocket and Server-Sent Events multiplexing: a client opening multiple logical streams over a single transport attaches a stream-ID token with each frame so the server's response demultiplexes to the correct stream handler.",
+    "Bridging callback APIs to async/await: wrapping a callback-based SDK in an asyncio Future where the callback closes over the Future (the ACT), so `await` resumes the coroutine when the callback resolves the Future — the pattern most Python developers use daily without naming it.",
+    "TAO CORBA ORB: a multiplexed client assigns each request a sequence-number ACT that indexes its connection table, and the server echoes it so the right waiting client thread is awakened without scanning requests.",
+    "Windows NT overlapped I/O and I/O completion ports: ReadFile/WriteFile carry an OVERLAPPED structure that the kernel places in the completion port, letting the consumer recover operation state from the returned structure.",
+    "Boost.Asio: the initiating function's final completion token selects a bound handler, future, awaitable or stackful coroutine; this is a library realization of the same completion-carrier idea without changing the operation."
+  ],
+  "avoid_when": [
+    "Only one operation is outstanding at a time, or the flow is simply sequential: awaiting the call and keeping state on the stack is simpler than a token plus dispatch.",
+    "The runtime already performs the demultiplexing - completion ports, proactor implementations, coroutine executors, HTTP/2 and gRPC client libraries, actor runtimes: pass the runtime's own completion object instead of rebuilding a token table.",
+    "The reply already carries a natural, unique and cheaply validated correlation key and the completion path is not hot: a correlation-identifier lookup is enough.",
+    "Completions cannot be relied upon to arrive at all (fire-and-forget, unreliable transports): use explicit expiry/timeout handling rather than state-bearing tokens that leak when nothing comes back.",
+    "Concurrency is bounded and thread-per-request is genuinely affordable: then the thread's own stack is the completion state and the indirection buys nothing.",
+    "The async operation is one-shot and the language's native Future/Promise already carries the completion context: manually constructing a token table re-implements what the runtime already provides.",
+    "The required artifact is only the eventual value or error: use Future/Promise (or the language's awaitable) when it already owns one-shot completion and continuation storage; an ACT adds no value unless an external service must echo client state.",
+    "The caller needs an abort signal rather than a completion destination: use a cancellation token for cooperative cancellation; an ACT identifies where completion is handled and does not stop work by itself.",
+    "The operation should be a packaged request whose result is consumed later: use Async Method Invocation when request, future/result and scheduling are the abstraction; an ACT is only the per-invocation completion association."
+  ],
+  "language_files": {
+    "generic": "asynchronous-completion-token.generic.json",
+    "c": "asynchronous-completion-token.c.json",
+    "cplusplus": "asynchronous-completion-token.cplusplus.json",
+    "csharp": "asynchronous-completion-token.csharp.json",
+    "go": "asynchronous-completion-token.go.json",
+    "java": "asynchronous-completion-token.java.json",
+    "javascript": "asynchronous-completion-token.javascript.json",
+    "kotlin": "asynchronous-completion-token.kotlin.json",
+    "python": "asynchronous-completion-token.python.json",
+    "ruby": "asynchronous-completion-token.ruby.json",
+    "rust": "asynchronous-completion-token.rust.json",
+    "scala": "asynchronous-completion-token.scala.json",
+    "swift": "asynchronous-completion-token.swift.json",
+    "typescript": "asynchronous-completion-token.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "proactor",
+    "reactor",
+    "memento",
+    "callback",
+    "future-promise",
+    "async-method-invocation",
+    "correlation-identifier",
+    "return-address",
+    "acceptor-connector",
+    "observer",
+    "publisher-subscriber",
+    "half-sync-half-async",
+    "leader-followers",
+    "active-object",
+    "interceptor",
+    "extension-interface"
+  ],
+  "anti_patterns": [
+    "Raw unchecked pointer token crossing a trust or process boundary — unlike an opaque handle, it becomes a forgery or arbitrary-reference primitive; validate/authenticate or use a bounded generation-checked index.",
+    "Unreclaimed token — unlike a cancellation-aware registration, it retains state forever when the service never replies; add a deadline or cancellation path and remove the entry.",
+    "Global unbounded table or one completion lock — unlike direct token dispatch, it serializes the hot path; shard ownership or use the runtime's completion carrier.",
+    "Assuming token opacity on a mutating transport — unlike an explicitly wrapped OVERLAPPED-style token, overwritten fields corrupt dispatch; reserve fields or wrap the transport object.",
+    "Reusing one token across incompatible multiplicity — unlike a documented one-shot or reusable registration, it causes duplicate or missing cleanup; choose and enforce one lifecycle.",
+    "Thread-per-request disguised as a token — unlike ACT's event-driven state, it keeps a stack and context switch per operation; use a completion queue or handler.",
+    "Unstructured fire-and-forget operation — unlike a scoped completion owner, it outlives its parent, swallows errors and leaks state; retain, join or cancel the task.",
+    "Sequential await loop for independent work — unlike concurrent ACT dispatch, it serializes operations and hides available parallelism; start them together and collect completions.",
+    "Double resolution — unlike exactly-once completion, a second set_result or set_exception races or corrupts state; make the winner atomic and make loser handling explicit."
+  ],
+  "design_principles": [
+    "Separation of concerns: the client decides completion actions and state; the service only executes the operation and echoes the token.",
+    "Information hiding: the token is opaque to the service, so client internals never enter the service contract.",
+    "Open/closed: new completion behaviours enter through new tokens and handlers without modifying the service.",
+    "Single responsibility per role: token creation and dispatch, operation execution, and completion processing are distinct responsibilities.",
+    "Locality of identity: the identity needed for dispatch travels with the operation instead of being reconstructed or searched for when the completion arrives.",
+    "Explicit ownership transfer: the token's lifecycle (allocation, passing, storage, resolution, release) must be documented and enforced, especially for multi-use tokens in actor systems."
+  ],
+  "best_practices": [
+    "Choose the token representation deliberately: pointer or reference for homogeneous in-process clients, object reference or opaque handle for distributed middleware, index into a client-side table whenever tokens must survive address re-mapping, restart or persistence.",
+    "State ownership explicitly: who allocates the token, who owns the state it identifies, who frees it, and whether the operation may return it more than once.",
+    "Provide reclamation: a token registry, per-token deadline or cancellation so operations that never complete do not retain their state.",
+    "Validate a returned token before dispatch: bounds-check indices, check generation counters on recycled slots, authenticate when the peer is not trusted.",
+    "Choose the delivery model up front - callbacks when completions must be handled promptly, completion queues when the client should control its own scheduling and pacing.",
+    "Keep the token small and free of secrets; the service and anything observing the request sees it.",
+    "Prefer the language's own completion carrier (awaitable, future, completion token, continuation) when it exists, and reserve hand-built token registries for the places it does not: interop with callback APIs, external completion queues, pooled hot paths.",
+    "Bridge callback-based libraries to async/await using a single Future as the ACT: create the Future with loop.create_future(), register the library's callback to resolve it, and await it — this is the most common Python ACT usage pattern in production code.",
+    "Always guard Future resolution with an idempotency check: if fut.done() or fut.cancelled() before calling set_result/set_exception to prevent InvalidStateError from double resolution.",
+    "Wrap every awaited Future with asyncio.timeout() or a deadline to catch missing resolutions before they become silent hangs; export outstanding-Future gauges to detect callback APIs that stop firing.",
+    "Keep done-callback bodies microseconds: offload CPU-heavy work to run_in_executor(); never do blocking I/O or long computation in a callback that holds the event loop thread.",
+    "Use loop.call_soon_threadsafe() for all cross-thread completions; asyncio Futures are not thread-safe and touching them from the wrong thread causes RuntimeError or state corruption.",
+    "Remove stale done-callbacks with remove_done_callback() when the handler is no longer relevant; otherwise large objects captured in the callback closure are pinned for the Future's lifetime.",
+    "For multi-use tokens (actor mailboxes, repeated notifications), document the concurrency contract explicitly: whether the handler must be re-entrant, whether concurrent dispatches can overlap, and what cancellation means for the token's validity.",
+    "In Python, prefer asyncio.Task over raw asyncio.Future when the operation is already a coroutine; Tasks add cancellation, parent-task chaining, and structured concurrency via TaskGroup.",
+    "Distinguish cancellation (operation aborted, cleanup desired) from failure (operation errored): cancellation should propagate CancelledError which is catchable for cleanup, not silently swallowed.",
+    "When composing multiple async operations with the same token (fan-out, barrier, racing), ensure the token's multiplicity semantics are respected: a one-shot token resolved multiple times is a bug, not a feature.",
+    "Instrument the hot path: monitor inflight request counts, callback latencies via loop.slow_callback_duration, and unresolved-Future gauges to catch token lifecycle bugs before they cause production incidents."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Volume 2: Patterns for Concurrent and Networked Objects (Wiley, 2000) - Asynchronous Completion Token, Event Handling patterns chapter.",
+    "Schmidt, 'Asynchronous Completion Token' (POSA2 pattern paper, PLoP 1996): https://www.dre.vanderbilt.edu/~schmidt/PDF/ACT.pdf",
+    "POSA2 Event Handling patterns chapter overview (Reactor, Proactor, Asynchronous Completion Token, Acceptor-Connector): https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/event-patterns.html",
+    "Harrison, Schmidt & Pyarali, 'Asynchronous Completion Token - An Object Behavioral Pattern for Efficient Asynchronous Event Handling' (Pattern Languages of Program Design 3, 1997): https://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.41.1032",
+    "ISO/IEC N3855, 'Library Foundations for Asynchronous Operations' (C++ Standards Committee, 2014) - introduces the completion token concept as a generalizable mechanism in Boost.Asio, decoupling asynchronous operation initiation from continuation attachment: https://isocpp.org/files/papers/n4045.pdf",
+    "Suleiman, 'Patterns for Distributed Real-time and Embedded Systems' - ACT applications in DRE systems: http://www.dre.vanderbilt.edu/~schmidt/patterns-ace.html",
+    "O'Reilly, Pattern-Oriented Software Architecture Volume 2 excerpt on Asynchronous Completion Token: https://www.oreilly.com/library/view/pattern-oriented-software-architecture/9781118725177/OEBPS/c03a.htm",
+    "Python Software Foundation, 'asyncio — Asynchronous I/O' (Futures, Tasks, event loop): https://docs.python.org/3/library/asyncio-future.html",
+    "Python Software Foundation, 'asyncio — Coroutines and Tasks': https://docs.python.org/3/library/asyncio-task.html",
+    "async-concurrency.com, 'Future Objects & Callbacks in Python Asyncio' - practical bridging of callback APIs to async/await with Future-as-ACT pattern: https://async-concurrency.com/asyncio-fundamentals-event-loop-architecture/future-objects-callbacks/",
+    "async-concurrency.com, 'Bridging Callback APIs to async with Futures' - step-by-step guide using asyncio.Future as an ACT wrapper: https://async-concurrency.com/asyncio-fundamentals-event-loop-architecture/future-objects-callbacks/bridging-callback-apis-to-async-with-futures/",
+    "Kindatechnical.com, 'A Guide to Software Design Patterns - Future, Promise, and Async/Await Patterns' (2026) - progression from callbacks to futures to async/await and associated pitfalls: https://kindatechnical.com/software-design-patterns/future-promise-async.html",
+    "Brown et al., 'A Design Space Exploration of Async/Await' (arXiv:2608.20677, 2026) - comprehensive taxonomy of async/await semantics across Python, Rust, JavaScript, C#, Swift; cancellation, suspension, and coroutine patterns: https://arxiv.org/html/2608.20677",
+    "Causality Blog, 'What Async Promised and What it Delivered' - historical analysis of callbacks, promises, and async/await waves with associated tradeoffs and new bug categories introduced at each level: https://causality.blog/essays/what-async-promised/",
+    "Microsoft Learn, 'Task.GetAwaiter Method' - the awaiter is the compiler-facing continuation carrier used to await a Task: https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.getawaiter?view=net-10.0",
+    "Microsoft Learn, 'TaskAwaiter Struct' - OnCompleted and UnsafeOnCompleted register the continuation that runs when the Task completes: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.taskawaiter?view=net-10.0",
+    "Oracle Java SE 21, 'CompletionStage' - thenAccept attaches a consumer to normal completion, while stage dependencies do not guarantee a particular ordering: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletionStage.html",
+    "Oracle Java SE 21, 'CompletableFuture' - a future can be explicitly completed and supports dependent actions, with non-async actions allowed to run on the completing thread: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+    "MDN, 'await' - awaits a Promise or thenable and resumes the suspended async function through a later microtask rather than blocking the main thread: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/await",
+    "MDN, 'Promise.resolve()' - adopts thenables and explains that resolving is not the same as immediate fulfillment: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/resolve",
+    "Boost C++ Libraries, 'Completion Tokens' - the final initiating-function argument selects callback, future, awaitable or stackful-coroutine completion delivery: https://www.boost.org/latest/doc/html/boost_asio/overview/model/completion_tokens.html",
+    "Go Blog, 'Go Concurrency Patterns: Pipelines and cancellation' - abandoning a receiver can block upstream senders and leak goroutines, so cancellation must propagate upstream: https://go.dev/blog/pipelines"
+  ],
+  "related_patterns_notes": {
+    "proactor": "the operation processor and proactor dispatch completions, while ACT is the client-owned value that lets the client recover state in O(1).",
+    "reactor": "demultiplexes readiness or indication events, whereas ACT demultiplexes completion responses from operations already initiated.",
+    "memento": "captures and restores object state, whereas ACT identifies completion state and action; it is not a snapshot.",
+    "callback": "supplies the delivery hook, while ACT is the per-operation state/action identity that may be passed to that hook.",
+    "future-promise": "carries a one-shot result and continuation, whereas ACT can be an echoed opaque token for callback or queued completions and may be reusable.",
+    "async-method-invocation": "packages a request for later execution and result retrieval, whereas ACT only associates an invocation's completion with client state.",
+    "correlation-identifier": "requires a lookup by an application-visible key, whereas ACT is designed to point directly at completion state; choose correlation when the receiver must interpret the key.",
+    "return-address": "identifies where a reply should go, whereas ACT identifies what client state/action handles the completion after it arrives.",
+    "acceptor-connector": "decouples connection establishment from service processing, whereas ACT demultiplexes completions after a connection exists.",
+    "observer": "delivers repeated subject notifications to subscribers, whereas ACT binds a completion to the state for one request or an explicitly reusable registration.",
+    "publisher-subscriber": "distributes events to many subscribers, whereas ACT routes a completion to the client state associated with its originating operation.",
+    "half-sync-half-async": "separates synchronous and asynchronous layers, whereas ACT supplies the per-operation identity crossing that boundary.",
+    "leader-followers": "coordinates which thread handles an event, whereas ACT identifies the operation state that the selected thread must process.",
+    "active-object": "serializes requests behind an object's queue, whereas ACT lets many service completions dispatch directly to client-owned state.",
+    "interceptor": "wraps or alters an invocation in the call path, whereas ACT is carried with the operation and returned to select completion handling.",
+    "extension-interface": "adds optional operations to an interface, whereas ACT adds completion context without changing the service's operation semantics."
+  }
+}

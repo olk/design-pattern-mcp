@@ -1,0 +1,80 @@
+{
+  "pattern": "lazy-initialization",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "System.Lazy<T> with LazyThreadSafetyMode.ExecutionAndPublication",
+  "implementation_notes": "The BCL supplies the whole structure: a readonly Lazy<T> field constructed with a factory computes once under ExecutionAndPublication (the default mode) and returns the same value to all threads; LazyThreadSafetyMode.PublicationOnly lets racing threads compute and publishes the first winner, and None disables thread safety entirely. The classic null-marker plus lock structure is replaced by the type; it is still justified only in pre-.NET-4 code or when even one Lazy<T> allocation per instance is too much. Exception behaviour is part of the mode: with a factory, a thrown exception is cached and rethrown on every later Value access.",
+  "code_sketch": "public sealed class ReportCache\n{\n    private readonly Lazy<Report> _report =\n        new(() => Report.Build(Config.Default), LazyThreadSafetyMode.ExecutionAndPublication);\n\n    public Report Report => _report.Value;   // built on first read, exactly once\n}",
+  "pitfalls": [
+    "Exceptions from the factory are cached and rethrown on every subsequent Value access (the same exception instance, so its original stack trace no longer points at the retry) - if the failure may be transient, do not wrap a flaky factory in Lazy<T>.",
+    "Recursive access to Value from inside the initialisation method throws InvalidOperationException instead of blocking, so an initialiser that reaches the same property (directly or through a callback) fails at runtime rather than deadlocking.",
+    "LazyThreadSafetyMode.None is a real footgun in server code: it silently removes all publication guarantees, and PublicationOnly can run the factory several times, discarding the losers.",
+    "IsValueCreated is for diagnostics only; using it as an access guard reintroduces the race Lazy<T> was chosen to remove."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/framework/performance/lazy-initialization",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.lazythreadsafetymode"
+  ],
+  "variants": [
+    {
+      "variant_id": "lazy-t",
+      "name": "System.Lazy<T> (thread-safe by default)",
+      "paradigm": "oo",
+      "min_standard": "C#4",
+      "idiom_name": "System.Lazy<T> with LazyThreadSafetyMode.ExecutionAndPublication",
+      "implementation_notes": "The BCL supplies the whole structure: a readonly Lazy<T> field constructed with a factory computes once under ExecutionAndPublication (the default mode) and returns the same value to all threads; LazyThreadSafetyMode.PublicationOnly lets racing threads compute and publishes the first winner, and None disables thread safety entirely. The classic null-marker plus lock structure is replaced by the type; it is still justified only in pre-.NET-4 code or when even one Lazy<T> allocation per instance is too much. Exception behaviour is part of the mode: with a factory, a thrown exception is cached and rethrown on every later Value access.",
+      "code_sketch": "public sealed class ReportCache\n{\n    private readonly Lazy<Report> _report =\n        new(() => Report.Build(Config.Default), LazyThreadSafetyMode.ExecutionAndPublication);\n\n    public Report Report => _report.Value;   // built on first read, exactly once\n}",
+      "pitfalls": [
+        "Exceptions from the factory are cached and rethrown on every subsequent Value access (the same exception instance, so its original stack trace no longer points at the retry) - if the failure may be transient, do not wrap a flaky factory in Lazy<T>.",
+        "Recursive access to Value from inside the initialisation method throws InvalidOperationException instead of blocking, so an initialiser that reaches the same property (directly or through a callback) fails at runtime rather than deadlocking.",
+        "LazyThreadSafetyMode.None is a real footgun in server code: it silently removes all publication guarantees, and PublicationOnly can run the factory several times, discarding the losers.",
+        "IsValueCreated is for diagnostics only; using it as an access guard reintroduces the race Lazy<T> was chosen to remove."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/framework/performance/lazy-initialization",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.lazythreadsafetymode"
+      ]
+    },
+    {
+      "variant_id": "lazy-initializer",
+      "name": "LazyInitializer.EnsureInitialized (allocation-free)",
+      "paradigm": "oo",
+      "min_standard": "C#4",
+      "idiom_name": "LazyInitializer.EnsureInitialized(ref field, factory)",
+      "implementation_notes": "For struct fields, arrays of cells, or hot types where a Lazy<T> object per field is unacceptable, LazyInitializer.EnsureInitialized(ref target, factory) gives the same once-only semantics without allocating a wrapper; the field itself is the cell and the initialisation uses the runtime's thread-safe publication step. This replaces the Lazy<T> wrapper, not the pattern - it is still a real once-primitive, not a hand-written flag test.",
+      "code_sketch": "private Index? _index;\n\npublic Index Index =>\n    LazyInitializer.EnsureInitialized(ref _index, () => Index.Build(Config.Default));\n\n// struct/array form:\n// LazyInitializer.EnsureInitialized(ref cells[i], () => Cell.Create(i));",
+      "pitfalls": [
+        "EnsureInitialized operates on the field by reference: on a struct property (a copy) it initialises the copy and the value is lost - pass the actual field, not a property or a copied value.",
+        "It offers no thread-safety mode and no exception-caching policy parameter: do not assume Lazy<T> semantics (mode selection, cached factory exceptions) when switching an existing field to EnsureInitialized.",
+        "Because it is a per-field API there is no shared accessor abstraction: initialising the same value from two call sites recreates the double-build the pattern removes, and each cell needs its own review."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.lazyinitializer.ensureinitialized"
+      ]
+    },
+    {
+      "variant_id": "manual-volatile-dcl",
+      "name": "Hand-written double-checked locking on a volatile field",
+      "paradigm": "concurrent",
+      "min_standard": "C#1",
+      "requires_features": [
+        "volatile"
+      ],
+      "idiom_name": "volatile field plus lock in the slow path",
+      "implementation_notes": "Before .NET 4 and in the rare hot path where an extra wrapper allocation hurts, the classic form is still written by hand: a volatile field tested outside the lock, the initialisation inside the lock and a second test inside it. The volatile (or Volatile.Read/Interlocked) part is what makes the unsynchronised fast path legal in the .NET memory model; without it the pattern publishes partially constructed objects. Prefer Lazy<T>/LazyInitializer in all new code.",
+      "code_sketch": "private volatile Index? _index;\nprivate readonly object _gate = new();\n\npublic Index Index\n{\n    get\n    {\n        var i = _index;\n        if (i is null)\n            lock (_gate)\n                _index = i = _index ?? Index.Build(Config.Default);\n        return i;\n    }\n}",
+      "pitfalls": [
+        "Dropping volatile (or the equivalent barrier) makes the fast path a cache-coherency bug that appears only on weak memory models - the single most common defect of this variant.",
+        "The lock is per-gate: a second lock protects nothing, and lock(this)/lock(typeof(T)) invite external contention or deadlock.",
+        "The field must be re-read before returning, otherwise the local read outside the lock can hand back null after another thread initialised it."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/framework/performance/lazy-initialization"
+      ]
+    }
+  ],
+  "default_variant": "lazy-t",
+  "version": "1.0"
+}

@@ -1,0 +1,223 @@
+{
+  "category": "security-verification",
+  "name": "deferred-validation",
+  "aliases": [
+    "lazy validation",
+    "validate on use"
+  ],
+  "intent": "Postpone validating an object until an action actually needs its contents, so that work in progress can exist incomplete and every check is sized to the use that triggers it.",
+  "problem": "Validation is placed at ingestion - constructor, setter, deserialiser - so that an invalid object cannot exist; but real systems must carry drafts, historical records and partially filled forms, and different actions need different guarantees: saving a draft needs presence checks, publishing needs cross-field and cross-aggregate consistency, and reading legacy data must not fail because a field nobody uses is absent. Eager validation either rejects legitimate data or makes every use site pay for the strictest check.",
+  "context": "Domain models and boundary payloads that are assembled over time (multi-step forms, imports, ORM materialisation, PATCH requests), where one object is used by several actions with different trust levels and where the cost or reach of a check depends on the action requested. Applies whenever an object can be valid for one use and invalid for another.",
+  "benefits": [
+    "Incomplete work becomes representable: a draft, an imported record or a partially bound payload travels through the program without sentinel values or exception-driven control flow.",
+    "Checks are sized to the action: a save runs the cheap subset, publication runs presence, type, cross-field and cross-aggregate checks in ordered passes, so expensive rules are not paid on paths that never need them.",
+    "Validation rules move out of setters into use-named operations and rule objects, which removes the context-free invariant enforcement that makes entities unloadable from legacy data.",
+    "Errors can be reported in the shape the consumer needs: one deferred pass fills a violation set, a Result or field-level messages, instead of throwing on the first problem from inside a setter.",
+    "Failure surfaces where it can still be handled - at the action boundary, with the operation and the principal in scope - rather than deep inside a constructor or a deserialisation callback."
+  ],
+  "tradeoffs": [
+    "Invalid state exists inside the program between ingestion and use: every consumer must pass the gate, and a forgotten call silently defeats the pattern with no compile-time help.",
+    "Feedback is late by construction: the user learns about a defect when the action runs, so the pattern usually needs companion machinery (echo back, visible implications, previews) to keep the loop short.",
+    "A validator placed outside the object must see otherwise-hidden state, so encapsulation is weakened; keeping the check in a use-named operation on the object is the usual repair.",
+    "The per-action check sets drift: the save-time and publish-time rules live in different places and quietly disagree until the day the missing check matters.",
+    "Verdicts must be either recomputed (cost) or memoised (staleness): a cached valid result survives a later mutation unless it is invalidated by a mutation epoch, and re-checking on every access can dominate the use itself.",
+    "Late is not free: the gate must run before the first irreversible effect, or the deferral only postpones the damage to a published message, an external call or a committed transaction.",
+    "In large object graphs (e.g., ORM materialisation), cascading deferred validation can trigger N+1-style traversal and expensive cycle detection on each gate invocation, especially with Bean Validation's cascading validation across related entities.",
+    "The pattern trades compile-time safety for runtime flexibility: unlike type-level 'parse, don't validate' approaches that make illegal states unrepresentable, deferred validation defers correctness to runtime checks that can still be bypassed."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 5,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Domain Object (candidate)",
+      "responsibility": "Holds possibly incomplete state and exposes use-named validation operations; it does not enforce invariants at assignment or construction time."
+    },
+    {
+      "role": "Use / Action",
+      "responsibility": "The requested operation (save, compute, publish) that decides when validation runs and how much is required; it is the trigger, not the data."
+    },
+    {
+      "role": "Validation Operation",
+      "responsibility": "Encodes the anticipated use (validateForSave, validateForPublication) and delegates to simpler operations in ordered passes, so a stricter use includes all weaker checks."
+    },
+    {
+      "role": "Rule / Check",
+      "responsibility": "One validation rule and its composition (rule objects, constraint annotations, validator functions) that reads the candidate and reports violations."
+    },
+    {
+      "role": "Notification / Error Collector",
+      "responsibility": "Accumulates violations so one pass reports every problem, most specific first, and lets the caller decide how to present them."
+    },
+    {
+      "role": "Gatekeeper (use site)",
+      "responsibility": "The action boundary that invokes the gate before the irreversible step: persist, publish, send, or hand data to another trust zone."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Multi-step forms and wizards: each step saves a draft with presence checks only, and the submit action runs the full rule set.",
+    "Loading legacy or migrated data into a domain model: entities materialise with missing or unknown fields and are validated when an operation actually acts on them.",
+    "ORM and serializer materialisation: an object is built field by field without running setters, and the deferred gate runs before flush or commit.",
+    "PATCH and partial-update APIs: the payload is checked against the fields the operation will consume, not against the entity's full invariant set.",
+    "Import and batch pipelines: records are parsed cheaply and only the rows selected for publication are checked, with violations collected into a report instead of aborting the batch.",
+    "Anti-corruption layers: unknown or not-yet-mapped fields are carried through translation and rejected only when the domain operation that needs them runs.",
+    "CQRS command validation: commands arriving at an aggregate are validated only when the aggregate processes them, supporting command-level draft states and post-dispatch validation in the domain layer rather than at the boundary.",
+    "Event sourcing reconstruction: aggregates are rehydrated from an event stream where early events may reflect schema that no longer applies; validation is deferred until the aggregate receives its next command.",
+    "Type-first parse-don't-validate gateway: raw input is parsed into an intermediate representation (possibly with unknown/missing fields) that carries through the system; the type-level guarantee is established at construction rather than by validating at the boundary.",
+    "Bean Validation (JSR-303/JSR-380) group sequencing: validation groups define ordered passes (e.g., Default → Extended → Premium) where each group represents a use case's required checks, and group conversion sequences the gates without re-running cheap checks.",
+    "Django ORM and Django REST Framework: model.save() deliberately does not call full_clean() - clean_fields, clean, validate_unique and validate_constraints are an explicit gate the caller invokes, with every error collected into message_dict - and DRF requires serializer.is_valid() before save(), accumulating field-level errors in serializer.errors or converting them to HTTP 400 via raise_exception=True.",
+    "Rails Active Record: validations run at save time rather than at assignment, are scoped per use by validation context (on: :create / :update or custom contexts like :account_setup via valid?(context)), and save(validate: false) is the documented per-action bypass.",
+    "Hibernate ORM Bean Validation integration: entities are validated on the pre-insert and pre-update lifecycle events just before flush, and the check set per event is selected by group (javax.persistence.validation.group.pre-persist/-update/-remove), so the persistence action itself names the gate and its rule subset."
+  ],
+  "avoid_when": [
+    "The value must always be valid and is cheap to check (identifiers, money, quantities): construct it validated and let the type carry the guarantee.",
+    "Exactly one action consumes the object and the rule is a simple precondition: a guard clause at that single entry point is smaller and just as safe.",
+    "The data is untrusted and crosses a security boundary: validate at the boundary (intercepting validator, reference monitor), because deferral widens the window in which hostile bytes travel through the program.",
+    "A late failure is unacceptable (hard real-time, safety-relevant, irreversible external effects) and the check is affordable up front: validate eagerly and fail fast.",
+    "The system uses type-first design where algebraic data types can make illegal states unrepresentable: in languages with rich sum-type support (Rust, Haskell, F#, TypeScript discriminated unions), parsing raw input into domain types at the boundary eliminates the need for deferred runtime checks.",
+    "Validation groups would need to proliferate beyond manageability: when every action requires a distinct group and composition rules become complex, a simpler single-pass validation or specification-based approach scales better."
+  ],
+  "language_files": {
+    "generic": "deferred-validation.generic.json",
+    "c": "deferred-validation.c.json",
+    "cplusplus": "deferred-validation.cplusplus.json",
+    "csharp": "deferred-validation.csharp.json",
+    "go": "deferred-validation.go.json",
+    "java": "deferred-validation.java.json",
+    "javascript": "deferred-validation.javascript.json",
+    "kotlin": "deferred-validation.kotlin.json",
+    "python": "deferred-validation.python.json",
+    "ruby": "deferred-validation.ruby.json",
+    "rust": "deferred-validation.rust.json",
+    "scala": "deferred-validation.scala.json",
+    "swift": "deferred-validation.swift.json",
+    "typescript": "deferred-validation.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "declarative"
+  ],
+  "scope": "object",
+  "provenance": [
+    "plop",
+    "ddd"
+  ],
+  "related_patterns": [
+    "guard-clause",
+    "fail-fast",
+    "notification",
+    "specification",
+    "result",
+    "either",
+    "option-maybe",
+    "lazy-initialization",
+    "make-illegal-states-unrepresentable",
+    "anti-corruption-layer"
+  ],
+  "anti_patterns": [
+    "Validation by convention only: every gate is optional and at least one action skips it, so invalid records reach publication or storage - deferred validation without a mandatory gate is missing validation.",
+    "Eager entity: setters throw on invalid assignment, so historical loads, imports and drafts fail, and the wording of error messages ends up owned by the entity.",
+    "One global validator that reaches into every object's fields, duplicating rules and turning the domain model into a property bag that exists only to be inspected.",
+    "Cached verdict without an epoch: a memoised is-valid flag survives later mutation and reports stale validity to the next action.",
+    "Deferring past the side effect: the record is validated after the message was published or the transaction committed, which is when the check stops being useful.",
+    "Validation inside setters as a substitute for domain logic: setters that throw on every invalid assignment make entities unloadable from legacy data and push business rules into data-access code.",
+    "Type proliferation from parse-don't-validate taken too far: creating a new type per validation context (DraftOrder, SubmittedOrder, PaidOrder) without clear lifecycle boundaries creates an unmanageable type graph.",
+    "Duplicate validation across layers: boundary validation (DTO/command), application-layer validation, and domain-layer validation each re-implement the same rules, so changes to business rules require updates in N places."
+  ],
+  "design_principles": [
+    "Separate what is valid from when it is checked: validity is a property of the data, timing is a policy of the use.",
+    "Fail at the last responsible moment: no irreversible effect before the gate for that action.",
+    "Single responsibility for rules: rules live in rule objects or validators, not in setters and not in the callers.",
+    "Complete mediation on the exit path: whatever leaves the component passes the check for that exit.",
+    "Explicit over implicit: name validation operations after the use they validate, so the required checks can be read from the call graph.",
+    "Parse once, validate at boundaries; trust types through the core: raw external data is parsed into domain types at system entry, after which internal code relies on type guarantees rather than re-validating.",
+    "Layer validation by concern: input/shape validation at the boundary, domain invariants in the aggregate, cross-aggregate rules in sagas or domain services - not all in one place."
+  ],
+  "best_practices": [
+    "Name validation operations after the use (validateForSave, validateForPublication) and have them delegate to simpler ones, so stricter actions include the weaker checks instead of re-implementing them.",
+    "Run the gate before the irreversible step - flush, publish, send, external call - never after.",
+    "Collect violations instead of throwing on the first: check in passes, with required quantities present before their consistency, and report the most specific problems first.",
+    "Cache a verdict only with a mutation epoch or version, otherwise recompute the cheap checks on each use.",
+    "Make the gate unavoidable at the action boundary: one entry point per action calls the matching validation operation, so the pattern does not depend on every caller remembering.",
+    "Keep incompleteness explicit - absent values as Option/Optional/Null variants or a labelled exceptional value - rather than sentinel strings that a later check cannot distinguish from real data.",
+    "Report through the layer that owns the wording: the domain returns violations or a Result, message text belongs to the presentation or API layer.",
+    "Use validation groups (Bean Validation JSR-380 Default, GroupSequence) to sequence passes without re-running cheap checks: order groups so cheaper checks run first and fail-fast mode exits on the first violation in high-stakes paths.",
+    "Combine with the Notification pattern: accumulate all violations in a collector so callers receive complete feedback rather than a single first error.",
+    "For large object graphs, configure fail-fast mode or restrict cascading validation (@Valid) to only the fields the action actually consumes to avoid expensive cycle detection on each gate.",
+    "In CQRS/event-sourced systems, validate commands at two layers: basic input shape at the boundary, full invariants inside the aggregate on command dispatch - this separates cheap shape checks from expensive domain logic.",
+    "Consider parse-don't-validate for high-value fields: at the boundary, parse raw input into domain types (e.g., NonEmptyString, PositiveInt) that make illegal values unrepresentable, then trust those types through the core and reserve deferred validation for context-dependent rules only.",
+    "Document the per-action rule sets in a central registry or validation matrix so drift between save-time and publish-time rules is visible and auditable."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Ward Cunningham, The CHECKS Pattern Language of Information Integrity (PLoP '94; in Pattern Languages of Program Design), pattern 6 'Deferred Validation' - delay detailed validation of a domain model until an action is requested and tailor the extent of the validation to that action.",
+    "https://c2.com/ppr/checks.html",
+    "https://c2.com/ppr/checks2.html",
+    "Vaughn Vernon, Implementing Domain-Driven Design (2013) - validation discussed with deferred validation as an alternative to always-valid entities (as cited by the Microsoft architecture guide below).",
+    "Microsoft, .NET Microservices Architecture for Containerized .NET Applications - 'Designing validations in the domain model layer', section 'Use deferred validation in the domain'.",
+    "https://learn.microsoft.com/en-us/dotnet/architecture/microservices/microservice-ddd-cqrs-patterns/domain-model-layer-validations",
+    "Jeffrey Palermo, The fallacy of the always-valid entity (2009) - validation belongs outside the entity and runs when the operation does.",
+    "https://jeffreypalermo.com/2009/05/the-fallacy-of-the-always-valid-entity/",
+    "Kamil Grzybek, Domain Model Validation (2019) - compares the validation-object, deferred-validation and always-valid strategies and names the encapsulation cost of deferred validation.",
+    "https://www.kamilgrzybek.com/blog/posts/domain-model-validation",
+    "Martin Fowler, Notification Pattern (2004) - accumulates multiple validation errors during an operation to avoid stopping at the first failure, aligned with deferred validation's violation collector.",
+    "https://martinfowler.com/dslCatalog/notification.html",
+    "https://martinfowler.com/eaaDev/Notification.html",
+    "Martin Fowler, Replacing Throwing Exceptions with Notification in Validations (2011) - refactoring from fail-fast exceptions to a Notification collector that enables callers to inspect all errors.",
+    "https://martinfowler.com/articles/replaceThrowWithNotification.html",
+    "Eric Evans, Domain-Driven Design (2004) - aggregate invariant enforcement and the role of specification pattern in expressing validation rules; deferred validation relates to specification as the expression of contextual validation criteria.",
+    "Martin Fowler with ribs, Specification Pattern Paper (1998) - separates 'how to match' from the candidate, enabling use in selection, validation, and build-to-order; composite specification enables deferred validation's composable rule sets.",
+    "https://martinfowler.com/apsupp/spec.pdf",
+    "Alexis King (lexi-lambda), Parse, Don't Validate (2019) - contrasts parsing (which returns a refined type preserving knowledge) with validation (which discards it); argues for making illegal states unrepresentable through type construction rather than runtime checks.",
+    "https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/",
+    "Yaron Minsky / Functional Software Architecture, Make Illegal States Unrepresentable - design data models so illegal states cannot be represented by the type system; uses parse-don't-validate to centralize validation at boundaries.",
+    "https://functional-architecture.org/make_illegal_states_unrepresentable/",
+    "Steve Smith, Parse, Don't Validate – DevIQ (2023) - practical application of parse-don't-validate: parse at boundaries into domain types, then trust types through the core eliminating repeated re-validation.",
+    "https://deviq.com/principles/parse-dont-validate/",
+    "Vladimir Khorikov, Specification pattern in the DDD trilemma (2021) - specification pattern as a way to encode domain validation that trades domain model purity for encapsulation and reusability.",
+    "https://khorikov.org/posts/2021-08-02-purity-specification-pattern/",
+    "Jay Freestone, You might not need the always-valid entity (2024) - critiques always-valid entity in DDD; argues validity is contextual and core invariants should be guarded inside the entity while broader contextual rules belong in specifications.",
+    "https://www.jayfreestone.com/writing/you-might-not-need-the-always-valid-entity/",
+    "Vladimir Khorikov, Validation and DDD (2017) - four validation approaches for DDD aggregates: self-validating entity, validation object, deferred validation, and invariant shields.",
+    "https://enterprisecraftsmanship.com/posts/validation-and-ddd/",
+    "Jimmy Bogard, Validation in a DDD world (2009) - true validation is context-driven and operation-centric, not an IsValid check on entities; validation depends on the operation being performed.",
+    "https://lostechies.com/jimmybogard/2009/02/15/validation-in-a-ddd-world/",
+    "Enterprise Craftsmanship, When to validate commands in CQRS? (2022) - validates commands after dispatch in command handlers and domain layer rather than at the boundary, aligning with deferred validation's domain-layer gate.",
+    "https://enterprisecraftsmanship.com/posts/validate-commands-cqrs/",
+    "Hibernate Validator 9.x Reference Guide (2025) - Jakarta Bean Validation (JSR-380) validation groups, group sequencing, fail-fast mode, and performance considerations for cascading validation in large object graphs.",
+    "https://docs.hibernate.org/validator/9.0/reference/en-US/html_single/",
+    "In Relation To Blog, Faster Than Ever: A Look at Hibernate Validator 9.1's Performance (2025) - performance improvements in cascading validation through stack-based bean tracking, reducing memory allocations and cycle detection overhead.",
+    "https://in.relation.to/2025-09-29/hibernate-validator-benchmark/",
+    "Django documentation, Model instance reference - full_clean() runs clean_fields(), clean(), validate_unique() and validate_constraints() in order and collects every error into ValidationError.message_dict, but model.save() deliberately does not call it: model-level validation is an explicit gate the caller must invoke.",
+    "https://docs.djangoproject.com/en/5.2/ref/models/instances/",
+    "Django REST Framework, Serializer API guide - is_valid() must be called before save() or access to validated_data; errors accumulate in serializer.errors and raise_exception=True turns them into an HTTP 400 at the API boundary.",
+    "https://www.django-rest-framework.org/api-guide/serializers/",
+    "Ruby on Rails Guides, Active Record Validations - validations run on save rather than on assignment, are scoped by validation context (on: :create/:update, custom contexts, valid?(context)), and save(validate: false) skips the gate.",
+    "https://guides.rubyonrails.org/active_record_validations.html",
+    "Hibernate ORM documentation, Additional modules / Bean Validation integration - the BeanValidationEventListener validates entities on pre-insert and pre-update before changes reach the database, with per-event validation groups configurable via javax.persistence.validation.group.pre-persist/-update/-remove and violations surfacing as ConstraintViolationException (RollbackException at commit).",
+    "https://docs.hibernate.org/orm/5.0/manual/en-US/html/ch22.html",
+    "https://docs.hibernate.org/stable/entitymanager/javadoc/org/hibernate/cfg/beanvalidation/BeanValidationEventListener.html",
+    "Piotr Solnica (dry-rb creator), Invalid Object Is An Anti-Pattern (criticism, 2023) - the opposing view: objects carried in invalid states crash consumers and defeat type safety; boundary-parsed constrained types should shrink the window in which partial data travels, confining deferred validation to genuinely contextual rules.",
+    "https://solnic.dev/invalid-object-is-an-anti-pattern/"
+  ],
+  "related_patterns_notes": {
+    "parse-don": "parse-don't-validate",
+    "validation-groups": "validation-groups"
+  }
+}

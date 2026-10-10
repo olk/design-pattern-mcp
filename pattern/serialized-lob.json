@@ -1,0 +1,151 @@
+{
+  "category": "persistence-state",
+  "name": "serialized-lob",
+  "aliases": [
+    "serialized large object",
+    "serialized blob"
+  ],
+  "intent": "Store a whole graph of objects as a single serialized value in one database column, so the graph can be persisted, loaded and versioned as a unit instead of being decomposed into tables, rows and foreign keys.",
+  "problem": "An object model contains a dense graph of small objects - compositions, hierarchies, nested value objects - whose relational decomposition needs a table per node type plus parent keys, so reading or writing the graph becomes many joins, recursive queries and constant schema churn. When the graph is only ever read and written as a whole, that relational structure buys nothing and costs mapping code, tables and DDL migrations.",
+  "context": "Applies when a persistent unit is a whole object graph that the application loads and saves as a unit - document-like structures, user-defined configurations, computed results, checkpoints, plugin payloads - whose internal shape changes with the application version, and when the database is used as a store rather than as a query engine over the graph's internals. Typical on relational databases with BLOB/CLOB/JSON/BYTEA columns, but the decision is about the mapping, not the store.",
+  "benefits": [
+    "The internal structure of the graph changes freely: adding, renaming or removing nested fields needs no DDL, no new tables and no mapping code, because the column stays one column.",
+    "The graph stays whole: one row read reconstructs it and one row write persists it, so there are no joins, no recursive queries and no partially persisted graph states to reconcile.",
+    "Structures that resist relational modelling - heterogeneous or cyclic nodes, deeply nested shapes, plugin- or tenant-defined payloads - are stored without a table per node type.",
+    "Persistence collapses into one round trip (serialize the graph and bind the value; read the value and deserialize the graph), which is minimal mapping effort and testable as a pure function.",
+    "The serialized payload is a natural snapshot unit for revision history and audit: an old value can be kept next to the current one and read back later if the format is versioned.",
+    "Identity and access stay relational: ordinary columns (id, owner, kind, timestamps) can be indexed, locked and audited while the graph itself remains opaque."
+  ],
+  "tradeoffs": [
+    "The database cannot see inside the LOB: predicates, joins, aggregates, uniqueness, check constraints, foreign keys and indexes on nested data are all unavailable, so filtering, reporting and integrity checks move into application code.",
+    "Schema evolution becomes the application's job: every class or property change can invalidate stored payloads, requiring an embedded format version plus upcasting on read (or a batch re-serialization), because DDL cannot protect the shape of the payload.",
+    "Update granularity is the whole blob: changing one nested field rewrites the entire value, which amplifies writes and WAL/binlog volume, and two writers that serialize the same graph concurrently silently overwrite each other unless a Version Number or row lock is added.",
+    "Format coupling and portability: language-native formats (Java serialization, pickle, Marshal, gob) bind payloads to exact class names, module paths and runtime versions, so renaming a class or moving code breaks reads and no other language or service can consume the data.",
+    "Deserialization is a security boundary: formats that instantiate arbitrary classes on read (Java serialization, pickle, Marshal, BinaryFormatter) turn a stored payload into remote code execution if the data is ever untrusted or tampered with.",
+    "Operational cost: opaque payloads are invisible to SQL tooling, cannot be partially read or streamed by all drivers, and large LOBs inflate backups, replication and caches while hitting row-size or packet limits."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 5,
+    "simplicity": 8,
+    "performance": 5,
+    "reliability": 5,
+    "security": 4,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Object Graph",
+      "responsibility": "The cluster of domain objects (the persistent unit) that must be stored and restored as a unit; it owns its invariants and stays ignorant of how it is stored."
+    },
+    {
+      "role": "Serializer",
+      "responsibility": "Converts the graph into one self-contained byte or character stream and back, using a chosen format and an embedded format version; it is the only participant that knows the payload layout."
+    },
+    {
+      "role": "LOB Column",
+      "responsibility": "The single database field (BLOB, CLOB, BYTEA, TEXT, JSON) that holds the serialized value, alongside the ordinary columns that make the row findable, lockable and auditable without deserializing it."
+    },
+    {
+      "role": "Mapper",
+      "responsibility": "Owns the round trip: reads the row, hands the stored value to the serializer and returns a detached graph, then serializes the graph and binds the value on save; domain objects never touch the column."
+    },
+    {
+      "role": "Reader / Upgrader",
+      "responsibility": "Validates stored payloads, recognises older format versions and upgrades them to the current in-memory shape (or rejects them), so format evolution does not leak into the domain model."
+    }
+  ],
+  "suitable_scopes": [
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Storing an edited document - diagram, tree, report layout, CAD figure, mind map - whose node types follow the application version rather than a fixed relational schema.",
+    "Persisting an administrator-defined configuration or rule set (workflow definition, form layout, pricing rules) that is always loaded as a whole.",
+    "Keeping computed results or simulation checkpoints (analysis output, game state, feature snapshots) that exist only to be restored later.",
+    "Storing plugin- or tenant-provided payloads whose shape the host application deliberately does not model relationally.",
+    "Archiving audit-ready snapshots of an aggregate: current state lives in normal tables while each historical snapshot is serialized whole.",
+    "Persisting long-lived session-like state that must outlive a process but is never queried internally (server-side session state in one column).",
+    "Quartz JDBCJobStore keeps each job's JobDataMap - an arbitrary graph of serializable config and state objects - serialized in one BLOB column (JOB_DATA), opaque to SQL; the docs recommend restricting it to String properties when class-versioning of serialized payloads becomes a burden.",
+    "Rails ActiveRecord serialize/store persists a Hash, Array or Ruby-object structure in a single text column via a YAML or JSON coder, the standard way to keep application-defined nested state on a record without migrations.",
+    "Django's default database-backed sessions serialize the whole session dict into one session_data column of the django_session table - the shipped PickleSerializer is deprecated precisely because deserializing tampered payloads means remote code execution, and JSONSerializer is the documented safe default."
+  ],
+  "avoid_when": [
+    "The database must query, filter, join, aggregate or constrain the graph's inner fields: map them (Embedded Value, Class Table Inheritance) or use the store's real JSON/document capabilities with indexes.",
+    "Parts of the graph are referenced from elsewhere or updated by other transactions: give them their own rows and keys (Identity Field, Foreign Key Mapping) and serialize only a genuinely private subtree.",
+    "The payload must be read by other languages, services or long-lived external consumers: use an explicitly versioned interchange schema (protobuf, a documented JSON contract) instead of a language-native serializer.",
+    "The data is large media (images, video, attachments): keep it in a file or object store and persist a reference, or the LOB inflates backups, replicas and caches.",
+    "Concurrent writers routinely edit different parts of the same graph: whole-blob rewrites make one writer's changes vanish unless you add a Version Number or lock the row.",
+    "The values are small and stable: ordinary columns with Embedded Value constrain, query and evolve them better than an opaque blob."
+  ],
+  "language_files": {
+    "generic": "serialized-lob.generic.json",
+    "c": "serialized-lob.c.json",
+    "cplusplus": "serialized-lob.cplusplus.json",
+    "csharp": "serialized-lob.csharp.json",
+    "go": "serialized-lob.go.json",
+    "java": "serialized-lob.java.json",
+    "javascript": "serialized-lob.javascript.json",
+    "kotlin": "serialized-lob.kotlin.json",
+    "python": "serialized-lob.python.json",
+    "ruby": "serialized-lob.ruby.json",
+    "rust": "serialized-lob.rust.json",
+    "scala": "serialized-lob.scala.json",
+    "swift": "serialized-lob.swift.json",
+    "typescript": "serialized-lob.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "serialized-entity",
+    "embedded-value",
+    "data-mapper",
+    "memento",
+    "dependent-mapping",
+    "class-table-inheritance",
+    "unit-of-work"
+  ],
+  "anti_patterns": [
+    "Serializing a whole aggregate that other tables reference with foreign keys: the LOB becomes a shadow schema whose joins, constraints and cascades must be re-implemented in application code.",
+    "Using a language's native object serialization (Java serialization, pickle, Marshal, gob, BinaryFormatter) as the persistence format and then deserializing whatever is in the column without trust boundaries.",
+    "Rewriting the whole payload for every small field change while several writers hold the same row, producing silent lost updates that get blamed on the ORM.",
+    "Dumping large media into the LOB column and discovering the cost in backups, replication lag and memory.",
+    "Spreading serialization logic across the domain classes (each object knowing its persistence layout) instead of confining it to one mapper and one serializer.",
+    "Shipping schema changes with no migration or dual-read path, so production reads start failing on blobs written by the previous release."
+  ],
+  "design_principles": [
+    "Separation of concerns: the domain graph stays ignorant of persistence while the mapper and serializer own the round trip.",
+    "Encapsulation and information hiding: only the serializer knows the payload layout, so the graph's internals stay private.",
+    "Treat the storage boundary as a contract with the future: a persisted payload carries a version and a documented shape.",
+    "Choose the simplest mechanism that satisfies the requirement: if the database must reason about the data, model it relationally or with a document/JSON column - the LOB is for data the database only stores.",
+    "Fail fast at the boundary: validate and version-check payloads when reading them, not after a half-built graph has entered the domain."
+  ],
+  "best_practices": [
+    "Keep identity and lookup data outside the payload (id, owner, kind, updated_at, a format-version column) so rows can be found, locked, expired and audited without deserializing.",
+    "Embed a format version in the payload and write the reader as an upgrader: accept old versions, migrate them, and keep a test that deserializes archived samples.",
+    "Confine serialization to one mapper or gateway; keep domain classes free of persistence annotations wherever the language allows it.",
+    "Prefer a language-neutral, non-executable format (JSON, CBOR, protobuf) unless the payload is strictly private to one process and one version; never let deserialization construct arbitrary classes from untrusted input.",
+    "Dirty-check at the aggregate level and write the payload only when the graph actually changed, so no-op reads and updates do not rewrite large values.",
+    "Bound the payload: watch row/blob and packet limits, off-row storage (PostgreSQL TOAST, MySQL max_allowed_packet, SQLITE_MAX_LENGTH), stream where the driver supports it, and consider compression or an object store for big graphs.",
+    "Add a Version Number or a row lock when concurrent writers can touch the same row, and expose a read model when reports need fields from inside the payload."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (2003) - Serialized LOB, ch. 12 'Object-Relational Structural Patterns'; the catalog page notes that the Serialized LOB 'then becomes a form of memento'.",
+    "https://martinfowler.com/eaaCatalog/serializedLOB.html",
+    "https://java-design-patterns.com/patterns/serialized-lob/",
+    "https://www.quartz-scheduler.org/documentation/quartz-2.4.x/configuration/ConfigJobStoreTX.html",
+    "https://api.rubyonrails.org/classes/ActiveRecord/AttributeMethods/Serialization/ClassMethods.html",
+    "https://docs.djangoproject.com/en/5.1/topics/http/sessions/",
+    "https://docs.python.org/3/library/pickle.html"
+  ]
+}

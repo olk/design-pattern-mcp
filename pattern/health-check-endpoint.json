@@ -1,0 +1,178 @@
+{
+  "category": "concurrency-resilience",
+  "name": "health-check-endpoint",
+  "aliases": [
+    "health endpoint monitoring",
+    "health check",
+    "status endpoint",
+    "ping endpoint",
+    "liveness/readiness probe"
+  ],
+  "intent": "Expose one or more endpoints inside a service that run bounded internal functional checks and return a status code, so external probers - orchestrators, load balancers, uptime monitors - can decide whether to restart, drain or alert on the instance without knowing anything about its internals.",
+  "problem": "Whether a process should be restarted, kept in the load-balancer pool, or paged is a decision made outside the process, but the only facts an external orchestrator can observe - the port accepts connections, the last RPC succeeded - stay true while the application is wedged, half-initialized or cut off from the dependency it cannot serve without. The monitoring tool must not have to know the application's internals, yet a generic TCP or static-200 check cannot tell the difference between alive, ready and degraded. The recurring decision is which checks the application itself evaluates behind an endpoint, and which response each external prober is allowed to turn into which action.",
+  "context": "Continuously operated network services - containers under Kubernetes-style orchestration, instances behind cloud load balancers and traffic managers, deployments watched by uptime monitors - where remediation (restart, drain, reroute, page a human) is automated from a polled signal. The pattern applies wherever a prober can be pointed at an HTTP (or gRPC) endpoint and a small number of internal checks can answer faster than the prober's timeout. It does not apply to single processes without an external remediation actor, to libraries with no process of their own, or where an alert would do the work a probe cannot.",
+  "benefits": [
+    "Health semantics live where they are known: the application translates its own state - boot phase, dependency reachability, queue depth, disk headroom - into a code a generic prober can act on, so the orchestrator needs no application-specific logic.",
+    "Automated remediation becomes safe to enable: restart on liveness, drain on readiness, alert on deep checks, each action driven by the signal whose failure mode it actually fixes (Azure's self-healing designs require every service to expose such an endpoint).",
+    "Degradation is detected before users notice: a check that sees the database or cache drifting gives operators a head start the request error rate only provides after the outage has begun.",
+    "One mechanism serves every prober: kubelet probes, load-balancer and traffic-manager routing, uptime monitors and dashboards all consume the same endpoints, so health reporting is standardized across a fleet instead of re-invented per environment.",
+    "Deploys and autoscaling gain a gate: a readiness endpoint lets new instances join service only when warmed, so rolling updates proceed instance by instance on an observable signal.",
+    "Triage is cheaper: a status document naming which check failed turns 'the pod restarts randomly' into 'the redis check has timed out since 03:12'."
+  ],
+  "tradeoffs": [
+    "Check depth trades directly against blast radius: dependency-aware checks evaluated at the restart or routing layer turn one shared-dependency blip into a fleet-wide synchronized failure - every instance fails the same probe, restarts or drains together, and the reconnection storm of the recovering fleet deepens the original fault.",
+    "A shallow 200 can be a comfortable lie: an endpoint that only proves the HTTP stack answers says nothing about the traffic the instance is meant to serve, and the prober happily keeps routing to a useless instance.",
+    "The prober's budget is now a hard contract: every check must complete inside the probe timeout, so a health endpoint inherits the tail-latency risk of whatever it checks and must bound each check with its own deadline.",
+    "Polling multiplies load and couples failures: probe period times fleet size is background traffic, and a health endpoint sharing the request path of real traffic means saturation reports itself as ill health.",
+    "Status detail is an information leak: documents naming components, failure text and versions are reconnaissance material unless detail views are authenticated or restricted to an internal port.",
+    "Three signals cost three endpoints plus configuration: splitting liveness, readiness and startup is the safe design but multiplies the surface to build, secure, document and keep aligned with the prober's thresholds."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 7,
+    "performance": 6,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Health endpoint (route handler)",
+      "responsibility": "Expose a stable URL on a known port, run the checks registered for that endpoint under a hard total deadline, and map the aggregate result to a status code (200 healthy, 503 or 500 unhealthy) plus an optional status document."
+    },
+    {
+      "role": "Health check / indicator (one per dependency or invariant)",
+      "responsibility": "A small, read-only, individually time-boxed test - can the app reach the database, is the cache warmed, is the event loop responsive - returning its own status and details without side effects."
+    },
+    {
+      "role": "Aggregator / status document",
+      "responsibility": "Combine indicator results into the overall status (worst-status-wins, or a tagged subset per probe), serialize component detail, and expose named groups so liveness, readiness and ad-hoc deep checks answer from separate endpoints."
+    },
+    {
+      "role": "External prober",
+      "responsibility": "Poll the endpoint on a fixed period with a timeout and failure threshold - kubelet liveness/readiness/startup probes, load-balancer or traffic-manager health probes, uptime monitors - and own the remediation action the failing signal authorizes."
+    },
+    {
+      "role": "Remediation consumer",
+      "responsibility": "Act on the reported signal: restart the container (liveness), remove it from service endpoints (readiness), reroute to another instance (load balancer), or open an incident (deep checks feeding alerting). Which signal drives which action is the pattern's central contract."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "A container runtime deciding whether to restart a wedged process: Kubernetes GETs the liveness endpoint (or runs an exec/TCP/gRPC probe) every periodSeconds and restarts the container after failureThreshold consecutive failures, with a startup probe shielding slow-starting apps until its first success.",
+    "Gating traffic during rollouts: the Kubernetes readiness probe keeps a pod out of Service endpoints until it passes, so a rolling update sends traffic only to warmed instances and a drained pod rejoins when its checks pass again.",
+    "Spring Boot services exposing /actuator/health with auto-configured indicators (datasource, disk space, brokers) and the /actuator/health/liveness and /actuator/health/readiness groups that Spring maps from ApplicationAvailability onto Kubernetes probes.",
+    "ASP.NET Core applications registering IHealthCheck instances with AddHealthChecks and exposing them through MapHealthChecks as tagged groups, so the load balancer probes a shallow endpoint while an internal tagged group runs the deep dependency checks.",
+    "Rails 7.1+ apps shipping Rails::HealthController at GET /up - 200 when the app boots without exceptions, 500 otherwise - which uptime monitors and deploy proxies such as Kamal probe before routing traffic.",
+    "gRPC servers implementing the standard Health Checking Protocol (grpc.health.v1): Check answers SERVING/NOT_SERVING for a named service or the whole server, Watch streams status changes, client-side load balancers withhold and resume requests accordingly, and kubelet consumes the same service for gRPC liveness probes.",
+    "Global traffic management: Azure Traffic Manager and Azure Monitor ping the health endpoint at fixed intervals, treat 200 as available and any other code as offline, and reroute to a healthy region when an instance's endpoint misses its response window.",
+    "Uptime monitoring of a deployment that owns no orchestrator: an external monitor polls the health endpoint and pages when consecutive checks fail - the original Health Endpoint Monitoring scenario for cloud-hosted web roles.",
+    "Feeding dashboards and alerting from a deep endpoint (database latency, queue lag, certificate expiry) that no prober is allowed to route or restart on - the truth about degradation kept separate from the signals that drive automated action."
+  ],
+  "avoid_when": [
+    "No external actor will act on the answer: without an orchestrator, balancer or monitor that polls the endpoint and a remediation it is authorized to take, the endpoint is a dashboard widget - fine to have, but the pattern's payoff is absent.",
+    "A single process owns both halves: a library or CLI with no deployment to operate should keep liveness state in-process, not expose an HTTP endpoint.",
+    "The check would have to modify state to be meaningful: health checks must be read-only; if verifying a dependency requires consuming a message or writing a row, use an external synthetic-transaction prober instead.",
+    "You are tempted to make restarts the universal fix: if no failure mode is one a restart actually repairs, skip the liveness probe and keep readiness plus alerting - a mis-set liveness probe is the classic source of self-inflicted outages."
+  ],
+  "language_files": {
+    "generic": "health-check-endpoint.generic.json",
+    "c": "health-check-endpoint.c.json",
+    "cplusplus": "health-check-endpoint.cplusplus.json",
+    "csharp": "health-check-endpoint.csharp.json",
+    "go": "health-check-endpoint.go.json",
+    "java": "health-check-endpoint.java.json",
+    "javascript": "health-check-endpoint.javascript.json",
+    "kotlin": "health-check-endpoint.kotlin.json",
+    "python": "health-check-endpoint.python.json",
+    "ruby": "health-check-endpoint.ruby.json",
+    "rust": "health-check-endpoint.rust.json",
+    "scala": "health-check-endpoint.scala.json",
+    "swift": "health-check-endpoint.swift.json",
+    "typescript": "health-check-endpoint.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "circuit-breaker",
+    "bulkhead",
+    "fail-fast",
+    "graceful-degradation",
+    "retry",
+    "timeout",
+    "balking",
+    "healthy-object",
+    "observer",
+    "gateway"
+  ],
+  "anti_patterns": [
+    "The universal /health: one dependency-heavy endpoint wired to both restart and routing, so a shared-dependency blip becomes a synchronized fleet restart - the distributed suicide pact the operational literature names it for.",
+    "The static 200: a handler that returns OK unconditionally, so the prober's decision is driven by a signal that cannot fail and ill health is certified as health.",
+    "Liveness as cure-all: restarts wired to conditions a restart cannot fix (dependency down, traffic overload, disk full), converting degradation into flapping and thundering-herd reconnects.",
+    "Unbounded checks: dependency probes without individual deadlines, where the hang itself becomes the failure the prober misreads as a dead process.",
+    "Side-effectful checks: health polls that consume messages, write rows or migrate schema, so monitoring traffic mutates production state on a fixed schedule.",
+    "Detail without a lock: rich status documents exposed to unauthenticated callers because the prober's endpoint and the detail endpoint were never separated.",
+    "Thresholds as design: probing tuned (period, timeout, failureThreshold) until the symptoms hide, leaving the check-depth-versus-routing mismatch in place underneath."
+  ],
+  "design_principles": [
+    "Information hiding: the prober receives one status code; everything application-specific stays behind the endpoint.",
+    "Separation of signals: alive (restart), ready (drain) and degraded (alert) are three questions with three different remediations - one endpoint per signal, never one answer for all three.",
+    "Remediation fitness: a check belongs on a probe only if its failure implies the action that probe is wired to take; a restart must repair what a liveness failure detected.",
+    "Fail-open for routing, fail-loud for alerting: when a check times out, prefer the action that keeps capacity (keep serving, stay in the pool) over the one that removes instances.",
+    "Read-only observation: monitoring traffic must not change production state; checks read, never write.",
+    "Bounded latency: the endpoint's contract is the prober's timeout, so every dependency it touches gets a deadline and the aggregate gets a budget.",
+    "Least exposure: the status code answers the prober; the detail document serves only humans and machines authorized to receive it.",
+    "Health knowledge lives in the application: only the service can translate its internals into 'can this instance serve traffic', so the translation belongs in the service, not in the monitor.",
+    "Detection budget is a design quantity: mean time to detect equals probe period times failure threshold, so period, timeout and threshold are reliability parameters reviewed like code."
+  ],
+  "best_practices": [
+    "Ship at least two endpoints - a local-only liveness (200/503, no external I/O) and a readiness that may consider dependencies - plus, on Kubernetes, a startup probe or startup gate for apps whose boot exceeds the liveness defaults.",
+    "Give every check its own timeout, run checks in parallel, and guarantee the endpoint answers inside the prober's timeoutSeconds even when a dependency hangs.",
+    "Map results to the prober's contract explicitly: 200 healthy, 503 (or 500) unhealthy; keep the response body optional and put dependency names and detail behind detail-visibility controls.",
+    "Keep checks read-only and idempotent - the poll runs forever, so any side effect is repeated forever at probe frequency.",
+    "Run deep dependency checks (databases, queues, certificate expiry, downstream APIs) on a separate endpoint that feeds dashboards and alerts, never the routing or restart decision.",
+    "Serve health on a path that survives load: a management port or lightweight handler with dedicated resources, so a saturated app can still report 'busy' instead of failing its own probe.",
+    "Size probe thresholds from measured behavior: startup allowance above p99 boot time, timeout above GC/pause tails, and a preStop drain plus SIGTERM handling so removed instances finish in-flight work.",
+    "Tag or group checks (liveness group vs readiness group vs all) so adding a dependency check never silently widens what is allowed to restart or drain an instance.",
+    "Test each indicator as a plain function with a deadline - exercised against reachable and unreachable dependencies - and document which prober consumes which endpoint and what action it is authorized to take.",
+    "Prefer no liveness probe over a wrong one: add liveness only for failure modes a restart demonstrably repairs (deadlock, wedged loop), and rely on readiness plus alerting for everything else."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Nygard, M. - Release It! Design and Deploy Production-Ready Software (Pragmatic Bookshelf, 2007; 2nd ed. 2018), Stability Patterns: Health Check - the originating stability-pattern statement: expose an endpoint the monitoring acts on, and automate the action that recovers.",
+    "Microsoft Azure Architecture Center, Cloud Design Patterns: 'Health Endpoint Monitoring Pattern' - functional checks exposed as endpoints external tools query at regular intervals; 200 means available and any other code offline; Traffic Manager pings endpoints to reroute to healthy instances; checks must respond inside the probe window. https://learn.microsoft.com/en-us/azure/architecture/patterns/health-endpoint-monitoring",
+    "Microsoft Azure Architecture Center, 'Design for Self-Healing' - every service exposes a health endpoint reporting its own health and its dependencies' status so external monitors can automate remediation. https://learn.microsoft.com/en-us/azure/architecture/guide/design-principles/self-healing",
+    "Kubernetes official docs, 'Configure Liveness, Readiness and Startup Probes' - probe types (HTTP GET, exec, TCP, gRPC), periodSeconds/timeoutSeconds/failureThreshold semantics, and the restart-vs-drain-vs-startup-gate division of the three probes. https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+    "Kubernetes official docs, 'Liveness, Readiness, and Startup Probes' - liveness failures restart the container, readiness failures remove traffic and rejoin on pass, startup success unlocks the other two; align the startup probe with the liveness endpoint to avoid startup deadlocks. https://kubernetes.io/docs/concepts/workloads/pods/probes/",
+    "Spring Boot reference, 'Actuator Endpoints' - /actuator/health with auto-configured indicators and the liveness/readiness health groups (/actuator/health/liveness, /actuator/health/readiness) wired to ApplicationAvailability for Kubernetes probes. https://docs.spring.io/spring-boot/reference/actuator/endpoints.html",
+    "Microsoft, 'Health checks in ASP.NET Core' - AddHealthChecks/MapHealthChecks, IHealthCheck registration and tagged health-check groups exposed as separate endpoints for load balancers and orchestrators. https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks?view=aspnetcore-8.0",
+    "Ruby on Rails API docs, Rails::HealthController - the default GET /up returns 200 when the app boots without exceptions and 500 otherwise; documented as a boot check that intentionally does not verify dependencies, which apps extend with their own checks. https://api.rubyonrails.org/classes/Rails/HealthController.html",
+    "Rails pull request #46936, 'Add a default health controller' - the design discussion fixing the endpoint's role: minimal and fast, process readiness rather than deep dependency health, remappable via routes. https://github.com/rails/rails/pull/46936",
+    "gRPC official docs, 'Health Checking' - the grpc.health.v1 protocol: unary Check and streaming Watch, SERVING/NOT_SERVING/SERVICE_UNKNOWN statuses, empty service name for overall server health, and client-side load balancing withholding requests from unhealthy targets. https://grpc.io/docs/guides/health-checking/",
+    "gRPC specification, doc/health-checking.md - the Health service definition and client/server obligations (deadlines on Check, UNIMPLEMENTED handling, server-side status registration). https://github.com/grpc/grpc/blob/master/doc/health-checking.md",
+    "Aaron Gorka, 'How Not to Do Healthchecks' - the misuse treatment: liveness checks that verify downstream connectivity cause endless restart cascades; restart should fire only on conditions a restart repairs. https://aarongorka.com/blog/how-not-to-do-healthchecks/",
+    "The HLD Handbook, 'Health Checks and Readiness: Telling the Truth About Whether You're Up' - the three-signal model, shallow external checks versus deep local checks, fail-open load balancers, and why dependency checks at the routing layer cause mass outages. https://hld.handbook.academy/curriculum/reliability-and-operations/health-checks-readiness/",
+    "Code With Karani, 'The Shared /health Endpoint That Kills Healthy Kubernetes Pods' - one dependency-checking endpoint wired to both probes is a 'distributed suicide pact': pods fail and restart in lockstep and overwhelm the dependency with a reconnection storm; separate the endpoints. https://www.codewithkarani.com/blog/kubernetes-liveness-readiness-shared-health-endpoint",
+    "Alexandre Vazquez, 'Kubernetes Liveness Probe Anti-Patterns That Cause Cascading Failures' - liveness as cure-all, transient-failure restart storms and self-reinforcing load/restart cascades; add liveness only for restart-repairable failure modes. https://alexandre-vazquez.com/kubernetes-liveness-probe-anti-patterns/",
+    "Microsoft Azure Well-Architected, 'Architecture design patterns that support reliability' - health endpoint monitoring as the standardized health signal feeding alerting, dashboards and self-healing remediation across a workload. https://learn.microsoft.com/en-us/azure/well-architected/reliability/design-patterns"
+  ],
+  "related_patterns_notes": {
+    "leader-election": "leader-election"
+  }
+}

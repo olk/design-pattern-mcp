@@ -1,0 +1,75 @@
+{
+  "pattern": "content-based-serializer",
+  "language": "cplusplus",
+  "support": "library",
+  "implementation_notes": "protobuf's Any carries a type_url (type.googleapis.com/pkg.Message) as the in-band discriminator plus the serialized message as bytes; the receiver resolves the URL against the descriptor pool it was generated with and unpacks, which fails when the type is unknown to that binary. This is the messaging form of the pattern in C++: the schema generates encoder and decoder, so no reflection and no registration macro are needed, and an unrecognized Any can be forwarded intact because the original bytes are preserved. Use the manual tag-plus-factory path when the payload is not protobuf, and Boost export keys when the cargo is a native object graph.",
+  "variants": [
+    {
+      "variant_id": "proto-any",
+      "name": "google.protobuf.Any (type_url + generated schema)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "protobuf"
+      ],
+      "idiom_name": "google::protobuf::Any type_url resolved against the generated descriptor pool",
+      "implementation_notes": "protobuf's Any carries a type_url (type.googleapis.com/pkg.Message) as the in-band discriminator plus the serialized message as bytes; the receiver resolves the URL against the descriptor pool it was generated with and unpacks, which fails when the type is unknown to that binary. This is the messaging form of the pattern in C++: the schema generates encoder and decoder, so no reflection and no registration macro are needed, and an unrecognized Any can be forwarded intact because the original bytes are preserved. Use the manual tag-plus-factory path when the payload is not protobuf, and Boost export keys when the cargo is a native object graph.",
+      "code_sketch": "google::protobuf::Any any = incoming.any();   // type_url + payload bytes\nif (any.Is<OrderCreated>()) {                  // registry = the generated pool\n    OrderCreated order;\n    if (!any.UnpackTo(&order)) return data_error(any);\n    handle(order);\n} else {\n    dead_letter(any);                          // keep bytes, fail closed\n}",
+      "pitfalls": [
+        "Is<T>/UnpackTo only cover types this binary was generated with; a type_url from a newer producer is a data error, not a routing failure, so decide explicitly whether to forward the untouched Any or dead-letter it.",
+        "The type URL embeds the proto package and message path, so renaming or moving a message is a wire break for every stored Any - pin the full name and treat it as public API."
+      ],
+      "sources": [
+        "https://protobuf.dev/reference/protobuf/google.protobuf",
+        "https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/any.proto"
+      ]
+    },
+    {
+      "variant_id": "boost-class-export",
+      "name": "Boost.Serialization export keys over a base pointer",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "boost-serialization"
+      ],
+      "idiom_name": "BOOST_CLASS_EXPORT / BOOST_CLASS_EXPORT_GUID archive class keys",
+      "implementation_notes": "Boost.Serialization writes a class identifier into the archive whenever a polymorphic pointer is saved through a base pointer, and the loader constructs the registered derived class from that key - the type-identity half of the pattern produced by the library rather than by hand. BOOST_CLASS_EXPORT (or, better, BOOST_CLASS_EXPORT_GUID with a fixed string) has to appear in a translation unit that also includes the archive headers so the serialization code is instantiated for those archives; putting it in a dedicated linked TU keeps that explicit. Choose it for native object graphs (caches, persistence, RPC over C++ types); prefer a schema-driven format when other languages or versions must read the same bytes.",
+      "code_sketch": "class Event { public: virtual ~Event() = default; };\n\nBOOST_CLASS_EXPORT_GUID(OrderCreated,   \"order.created\")   // stable wire key\nBOOST_CLASS_EXPORT_GUID(OrderCancelled, \"order.cancelled\")\n\n// round trip through the base type:\nstd::shared_ptr<Event> event;\nar << event;   // writes the registered key next to the payload\nar >> event;   // the key selects the registered class to construct",
+      "pitfalls": [
+        "Export keys default to the class name, so use BOOST_CLASS_EXPORT_GUID with a fixed string: otherwise a rename or namespace move invalidates every archive already written.",
+        "The export macro must be in a TU that includes the archive headers or the serialization code is never instantiated, and a registry built by static initializers can be dropped by the linker when nothing references that TU."
+      ],
+      "sources": [
+        "http://www.boost.org/doc/libs/latest/libs/serialization/doc/special.html"
+      ]
+    },
+    {
+      "variant_id": "manual-tag-factory",
+      "name": "Hand-written tag plus factory registry over a codec",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::unordered_map<std::string, factory> allow-list over a JSON/CBOR codec",
+      "implementation_notes": "With neither protobuf nor Boost in the stack, write the discriminator yourself: a type member in the payload plus an unordered_map from tag to a factory function, consulted before any object is constructed. This keeps the tag vocabulary in one reviewable place and makes the allow-list property obvious, at the cost of per-type boilerplate and no schema tooling. Build the table as a function-local static rather than a namespace-scope global so initialization order across translation units cannot leave it half-populated.",
+      "code_sketch": "using Factory = std::function<std::unique_ptr<Event>(const json&)>;\n\nconst std::unordered_map<std::string, Factory>& registry() {\n    static const std::unordered_map<std::string, Factory> table = {   // allow-list\n        {\"order.created\",   [](const json& j) { return std::make_unique<OrderCreated>(from_json(j)); }},\n        {\"order.cancelled\", [](const json& j) { return std::make_unique<OrderCancelled>(from_json(j)); }},\n    };\n    return table;\n}\n\nauto it = registry().find(doc.at(\"type\").get<std::string>());\nif (it == registry().end()) return dead_letter(doc);   // fail closed\nstd::unique_ptr<Event> event = it->second(doc);",
+      "pitfalls": [
+        "A namespace-scope registry has undefined initialization order across translation units; use a function-local static (thread-safe initialization since C++11) so dispatch cannot run against an empty table.",
+        "std::function on the hot path allocates and blocks inlining for what is usually a switch: keep the rare types in the map and the frequent ones in a direct branch when throughput matters."
+      ],
+      "sources": [
+        "https://en.cppreference.com/cpp/container/unordered_map"
+      ]
+    }
+  ],
+  "default_variant": "proto-any",
+  "idiom_name": "google::protobuf::Any type_url resolved against the generated descriptor pool",
+  "code_sketch": "google::protobuf::Any any = incoming.any();   // type_url + payload bytes\nif (any.Is<OrderCreated>()) {                  // registry = the generated pool\n    OrderCreated order;\n    if (!any.UnpackTo(&order)) return data_error(any);\n    handle(order);\n} else {\n    dead_letter(any);                          // keep bytes, fail closed\n}",
+  "pitfalls": [
+    "Is<T>/UnpackTo only cover types this binary was generated with; a type_url from a newer producer is a data error, not a routing failure, so decide explicitly whether to forward the untouched Any or dead-letter it.",
+    "The type URL embeds the proto package and message path, so renaming or moving a message is a wire break for every stored Any - pin the full name and treat it as public API."
+  ],
+  "sources": [
+    "https://protobuf.dev/reference/protobuf/google.protobuf",
+    "https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/any.proto"
+  ],
+  "version": "1.0"
+}

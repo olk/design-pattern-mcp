@@ -1,0 +1,88 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "JMSContext SESSION_TRANSACTED with DeliveryMode.PERSISTENT",
+  "implementation_notes": "JMS is the pattern's classic host: the provider owns a store, DeliveryMode.PERSISTENT is the default delivery mode and 'the most reliable way to produce a message is to send a PERSISTENT message, and to do so within a transaction'. In JMS 2.0 (Java EE 7 and later) that is a JMSContext created with JMSContext.SESSION_TRANSACTED plus context.commit(); the acknowledgement of consumed messages happens at commit of a transacted session or on message.acknowledge() in CLIENT_ACKNOWLEDGE mode, so the ack can be placed after the business commit. The classic session/consumer structure is still justified whenever the provider is the durability mechanism; it is what the language's ecosystem provides rather than something a simpler idiom replaces.",
+  "code_sketch": "try (JMSContext ctx = cf.createContext(JMSContext.SESSION_TRANSACTED)) {\n    JMSProducer p = ctx.createProducer().setDeliveryMode(DeliveryMode.PERSISTENT);\n    p.send(orderQueue, order);\n    ctx.commit();                       // ack: the provider now owns the message\n}\n// receive side: ack only after the business commit\ntry (JMSContext ctx = cf.createContext(JMSContext.CLIENT_ACKNOWLEDGE)) {\n    Message m = ctx.createConsumer(orderQueue).receive();\n    placeOrder(m);                      // business effect first\n    m.acknowledge();                    // then the delivery ack\n}",
+  "pitfalls": [
+    "acknowledge() (or a session commit) before the database commit converts a crash into silent loss; rollbacks redeliver everything consumed since the last commit, so the handler must tolerate duplicates.",
+    "Explicitly setting NON_PERSISTENT - or using a provider whose 'persistent' store is only a local file without replication - silently downgrades the guarantee.",
+    "Transacted and non-transacted contexts must not be mixed for the same destination, and a context is not thread-safe; share it per thread or per unit of work.",
+    "A transacted session holds consumed messages until commit, so long processing inside one transaction grows the provider's store and can trip its limits."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javaee/7/tutorial/jms-concepts004.htm",
+    "https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1"
+  ],
+  "variants": [
+    {
+      "variant_id": "jms-persistent-local-tx",
+      "name": "JMS PERSISTENT delivery inside a transacted session",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "jms"
+      ],
+      "idiom_name": "JMSContext SESSION_TRANSACTED with DeliveryMode.PERSISTENT",
+      "implementation_notes": "JMS is the pattern's classic host: the provider owns a store, DeliveryMode.PERSISTENT is the default delivery mode and 'the most reliable way to produce a message is to send a PERSISTENT message, and to do so within a transaction'. In JMS 2.0 (Java EE 7 and later) that is a JMSContext created with JMSContext.SESSION_TRANSACTED plus context.commit(); the acknowledgement of consumed messages happens at commit of a transacted session or on message.acknowledge() in CLIENT_ACKNOWLEDGE mode, so the ack can be placed after the business commit. The classic session/consumer structure is still justified whenever the provider is the durability mechanism; it is what the language's ecosystem provides rather than something a simpler idiom replaces.",
+      "code_sketch": "try (JMSContext ctx = cf.createContext(JMSContext.SESSION_TRANSACTED)) {\n    JMSProducer p = ctx.createProducer().setDeliveryMode(DeliveryMode.PERSISTENT);\n    p.send(orderQueue, order);\n    ctx.commit();                       // ack: the provider now owns the message\n}\n// receive side: ack only after the business commit\ntry (JMSContext ctx = cf.createContext(JMSContext.CLIENT_ACKNOWLEDGE)) {\n    Message m = ctx.createConsumer(orderQueue).receive();\n    placeOrder(m);                      // business effect first\n    m.acknowledge();                    // then the delivery ack\n}",
+      "pitfalls": [
+        "acknowledge() (or a session commit) before the database commit converts a crash into silent loss; rollbacks redeliver everything consumed since the last commit, so the handler must tolerate duplicates.",
+        "Explicitly setting NON_PERSISTENT - or using a provider whose 'persistent' store is only a local file without replication - silently downgrades the guarantee.",
+        "Transacted and non-transacted contexts must not be mixed for the same destination, and a context is not thread-safe; share it per thread or per unit of work.",
+        "A transacted session holds consumed messages until commit, so long processing inside one transaction grows the provider's store and can trip its limits."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/tutorial/jms-concepts004.htm",
+        "https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1"
+      ]
+    },
+    {
+      "variant_id": "jta-xa-transaction",
+      "name": "Container-managed XA/JTA transaction over DB and JMS",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "requires_features": [
+        "jta",
+        "xa"
+      ],
+      "idiom_name": "@TransactionAttribute(REQUIRED) with an XA ConnectionFactory",
+      "implementation_notes": "One two-phase-commit transaction spanning the database and the JMS resource makes 'business write plus send' atomic, which is as close to exactly-once as the JVM platform gets without an outbox. Annotate the service method with a REQUIRED transaction attribute and inject an XA connection factory; the container commits both resources or neither, and the provider's recovery (XAResource.recover) settles in-doubt branches after a crash. Use it when the participating resources are few and stable; where XA is unavailable or too slow, prefer the transactional-outbox shape that the JMS/JDBC combination can express with one ordinary transaction.",
+      "code_sketch": "@Resource(lookup = \"java:/JmsXA\") ConnectionFactory xaCf;\n@Resource MessageDrivenContext ctx;\n\n@TransactionAttribute(TransactionAttributeType.REQUIRED)\npublic void placeOrder(Order o) {\n    em.persist(o);                       // same XA transaction\n    try (JMSContext c = xaCf.createContext(JMSContext.SESSION_TRANSACTED)) {\n        c.createProducer().send(orderQueue, o.asMessage());\n    }                                    // container commit: both, or neither\n}",
+      "pitfalls": [
+        "Two-phase commit is slow and can end in a heuristic outcome that only a human can resolve; long-running XA transactions amplify it.",
+        "Not every database/JMS-provider pair implements XA correctly (or at all) - verify the resource's recover() behaviour before relying on it.",
+        "The XA transaction must contain only the business work: HTTP calls, file I/O or user interaction inside it hold locks and connections.",
+        "A missing transaction manager recovery configuration leaves in-doubt branches after a crash, which is exactly the failure the variant was chosen to remove."
+      ],
+      "sources": [
+        "https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1",
+        "https://docs.oracle.com/javaee/7/tutorial/jms-concepts004.htm"
+      ]
+    },
+    {
+      "variant_id": "kafka-transactions",
+      "name": "Kafka transactional producer (offset and output commit together)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "requires_features": [
+        "kafka-transactions"
+      ],
+      "idiom_name": "KafkaProducer initTransactions/beginTransaction/sendOffsetsToTransaction",
+      "implementation_notes": "Kafka's log is the store and its transactional producer is the acknowledgement protocol: enable.idempotence=true (the default since Kafka 3.0) removes duplicates per partition, and initTransactions/beginTransaction/commitTransaction with sendOffsetsToTransaction make 'process the input record, produce the outputs, commit the consumer offset' one atomic unit, so a crash in between produces either both or neither. Choose it for stream/consume-transform-produce workloads where the input offset is the acknowledgement; consumers must read with isolation.level=read_committed, otherwise they observe records from aborted transactions.",
+      "code_sketch": "Properties props = new Properties();\nprops.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);\nprops.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, \"orders-tx-1\");\nprops.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, \"true\");\ntry (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {\n    producer.initTransactions();\n    producer.beginTransaction();\n    producer.send(new ProducerRecord<>(\"orders.out\", key, value));\n    producer.sendOffsetsToTransaction(offsets, groupMetadata);   // ack = offset\n    producer.commitTransaction();                               // then visible\n}",
+      "pitfalls": [
+        "A stable transactional.id is required for fencing; two instances sharing one id (or a random id per restart) either fight or lose the zombie protection.",
+        "initTransactions must run once per producer instance before any beginTransaction, and an uncommitted transaction blocks other producers on the same id until transaction.timeout.ms elapses.",
+        "Consumers that do not set read_committed see records that were later aborted, which breaks the promise the transaction was supposed to give.",
+        "Producing inside a transaction without sendOffsetsToTransaction re-reads the input after a crash and re-produces the output - the duplicate this variant exists to prevent."
+      ],
+      "sources": [
+        "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html"
+      ]
+    }
+  ],
+  "default_variant": "jms-persistent-local-tx",
+  "version": "1.0"
+}

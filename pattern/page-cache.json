@@ -1,0 +1,168 @@
+{
+  "category": "interaction-boundary",
+  "name": "page-cache",
+  "aliases": [
+    "full-page cache",
+    "output cache"
+  ],
+  "intent": "Serve a page whose response is identical for every request from output that was generated once and stored, so the dominant hits skip request handling, data access and rendering entirely.",
+  "problem": "A page costs a controller invocation, several queries and a full template render on every request even though its bytes are the same for everyone who asks. The recurring decision is whether the request path keeps recomputing that page - or whether the finished response is captured once and served from memory, from disk, from a shared cache, or from a cache in front of the application, accepting staleness and invalidation as the price.",
+  "context": "Server-side web presentation of anonymous, read-mostly pages: documentation and marketing pages, public catalogues, CMS articles, reports for a fixed parameter set, public GET/HEAD API representations. The store may be process memory, a shared cache (Redis, memcached), files behind the web server, or a CDN/edge cache fed by Cache-Control; the pattern sits downstream of whatever produces the page (Page Controller, Front Controller, Template View, Two-Step View) and upstream of the client, and it only applies while the response is a pure function of the request key. It is a web-presentation pattern of the enterprise-application family rather than an eaaCatalog entry: the documented realizations are framework output/page caching (ASP.NET Core output caching, Rails page caching) and the HTTP shared cache of RFC 9111.",
+  "benefits": [
+    "Hit latency collapses to a lookup plus a write of bytes that already exist - controller logic, domain calls, queries and template rendering are not executed at all, so both p99 and CPU drop together.",
+    "Origin load scales with misses instead of traffic: the database and downstream services stop being the bottleneck for read-mostly pages, which is what lets a modest stack survive a flash crowd.",
+    "It makes a dynamic site behave like a static one without a build step - no generator, no publish pipeline, no duplicated templates.",
+    "The storage substrate is a deployment decision, not a code change: process memory, Redis/memcached, files under the web root, or an edge cache fed by Cache-Control and Vary.",
+    "Cached pages are text (or bytes) that can be inspected, diffed, replayed and warmed deliberately, unlike a compiled query plan or an opaque buffer pool.",
+    "Freshness is an explicit operational lever: TTL, a purge API, a cache-busting key or stale-while-revalidate let the team trade staleness against load without touching page code."
+  ],
+  "tradeoffs": [
+    "Staleness becomes a product decision: the cache serves content that may no longer match the database, so every invalidation bug is user-visible, and 'how fresh must this be' has to be answered before the cache goes in.",
+    "Correctness cost moves into plumbing: invalidation must be wired into every write path, and with a shared or edge cache that means purge APIs, key versioning or short TTLs - logic that lives far from the pages it protects.",
+    "The key is a correctness boundary, not a performance detail: a key that omits any axis that changes the bytes (Vary, locale, encoding, session or authorisation state) serves one user's page to another, which is a security defect rather than a performance bug.",
+    "Key-space and memory growth: query strings, slugs and Vary axes multiply entries, so an unbounded or wildly varying cache evicts the hot set and consumes memory the application itself needs.",
+    "Expiry creates a recompute spike: when a popular entry lapses, every concurrent request recomputes it unless the implementation locks the key, serves stale-while-revalidate, or warms the entry after deploy.",
+    "Observability and debuggability degrade: most requests no longer reach the application, so bugs hide behind cached bytes, log trails break at the cache boundary, and a defect can be impossible to reproduce locally without the cache.",
+    "The cached response becomes a deployed artifact: releases must purge or version entries, so the release process and the TTL policy have to be reconciled or users see the previous build."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 6,
+    "maintainability": 4,
+    "simplicity": 5,
+    "performance": 9,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Cache key",
+      "responsibility": "Identity of one stored representation: derived from method, target and every request axis the response varies on (Accept-Encoding, locale, and where required cookie or authorisation state)."
+    },
+    {
+      "role": "Store",
+      "responsibility": "Holds the rendered bytes with their metadata - expiry, ETag, Vary and response headers - in process memory, a shared cache, files, or an edge cache."
+    },
+    {
+      "role": "Lookup layer",
+      "responsibility": "Interposes before request handling: derives the key, returns the stored representation on a hit, and on a miss passes the request on and captures what the origin produced (middleware, filter, proxy or web-server rule)."
+    },
+    {
+      "role": "Origin handler",
+      "responsibility": "Produces the response on a miss and must be deterministic for the key; it is the only participant that touches domain logic, queries and templates."
+    },
+    {
+      "role": "Freshness policy",
+      "responsibility": "Decides when an entry may be served: TTL, revalidation, stale-while-revalidate, entry tags and who owns the staleness budget."
+    },
+    {
+      "role": "Invalidation rule",
+      "responsibility": "Maps writes to purges - which model change or publish event deletes or versions which keys - including deploy-time purging."
+    },
+    {
+      "role": "Bypass rule",
+      "responsibility": "Decides when a request must not be served from or stored in the cache: non-safe methods, authenticated or personalised requests, cookie-setting or error responses."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "message-flow",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Documentation, marketing and landing pages that are identical for every anonymous visitor and change only when content is published.",
+    "A public catalogue or product listing whose data changes hourly: cached for minutes, purged on import instead of queried per request.",
+    "CMS-rendered articles served as files from the web server or CDN, so a traffic spike never reaches the application at all.",
+    "A report or dashboard page for a fixed parameter set (period, region) that many users request and nobody personalises.",
+    "Public, read-only API representations (GET collections, reference data) that are expensive to compute and safe to reuse across clients.",
+    "ASP.NET Core OutputCache middleware can cache public GET/HEAD controller, Razor Page and minimal-API responses under explicit policies while excluding authenticated or cookie-bearing responses.",
+    "Varnish can sit before an origin backend and serve a deterministic public page from its cache, using VCL routing and grace mode to keep serving stale content while the backend is unavailable.",
+    "Cloudflare Cache Rules and Origin Cache Control can deliver public HTML at the edge according to origin Cache-Control directives, with purge controls kept separate from personalised routes."
+  ],
+  "avoid_when": [
+    "The page contains per-request or per-user data (session, cart, CSRF token, prices for the caller): cache nothing, or cache only the shared fragments and assemble per request.",
+    "The content changes on every request (live feeds, dashboards with live numbers): use short-lived client caching, ETag revalidation or streaming instead of a stored page.",
+    "The invalidation graph cannot be stated - many writers, long transactions, publish through several paths - because a cache you cannot invalidate correctly is a correctness regression; fix the write paths or use cache-aside at the data layer instead.",
+    "Rendering is not actually the cost (a slow downstream dominates): caching will freeze that downstream's data, so address the dependency first, or pre-generate to files at deploy time if the page is truly static."
+  ],
+  "language_files": {
+    "generic": "page-cache.generic.json",
+    "c": "page-cache.c.json",
+    "cplusplus": "page-cache.cplusplus.json",
+    "csharp": "page-cache.csharp.json",
+    "go": "page-cache.go.json",
+    "java": "page-cache.java.json",
+    "javascript": "page-cache.javascript.json",
+    "kotlin": "page-cache.kotlin.json",
+    "python": "page-cache.python.json",
+    "ruby": "page-cache.ruby.json",
+    "rust": "page-cache.rust.json",
+    "scala": "page-cache.scala.json",
+    "swift": "page-cache.swift.json",
+    "typescript": "page-cache.typescript.json"
+  },
+  "paradigm": [
+    "declarative",
+    "oo"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "page-controller",
+    "front-controller",
+    "intercepting-filter",
+    "template-view",
+    "two-step-view",
+    "cache-aside",
+    "memoization"
+  ],
+  "anti_patterns": [
+    "Caching under a key that ignores a varying axis - most often the logged-in user, a cookie or Accept-Language - so a private page is served to strangers from a shared cache.",
+    "Enabling caching with no expiry and no purge path, so the site fossilises: the stale copy becomes the product and nobody can say when it will change.",
+    "Caching error or half-rendered responses (5xx, empty result sets, templates that failed midway), turning a transient fault into a persistent one until the TTL lapses.",
+    "Blanket cache-everything middleware mounted over the whole application, including POST and authenticated routes, because the pattern is then applied where its own bypass rules forbid it.",
+    "Using the page cache to avoid fixing a slow page: the queries stay slow on every miss, and the dashboards now hide them."
+  ],
+  "design_principles": [
+    "Determinism: a page may only be cached if it is a pure function of its key, so the cache demands the same discipline a compiler demands of a constant-folding candidate - and exposes every hidden dependency.",
+    "Single responsibility: rendering, key derivation, freshness policy and invalidation wiring are separate concerns and belong in separate places, even when they live in one class.",
+    "Fail-open correctness: a miss must always be able to produce a correct response, so the cache never becomes load-bearing storage and can be disabled without changing behaviour.",
+    "Least surprise for clients: cacheability is declared in the response (Cache-Control, Vary, ETag) so intermediaries and users see the same contract the origin implements.",
+    "Private by default: anything that depends on who is asking is uncacheable unless the key explicitly contains that identity."
+  ],
+  "best_practices": [
+    "Derive the key from the same axis list as Vary and test it: two requests that differ on any axis in Vary must produce different keys, and requests that differ on none must produce the same one.",
+    "Cache only safe methods and successful, complete responses; never store a response that sets cookies, carries authorisation-dependent content, or represents an error.",
+    "Give every entry an expiry and a size bound, and prefer stale-while-revalidate or a single-flight lock so an expiring popular entry does not stampede the origin.",
+    "Wire invalidation into the write paths and the release process (purge by key/tag on publish, purge or version on deploy) and test it like any other behaviour.",
+    "Watch cache-specific signals - hit ratio, evictions, stale serves, purge events, entry count - and warm the hot entries after a deploy or restart.",
+    "Disable or shorten the cache in development and tests so failures reproduce against the origin; a cache that is always on hides its own bugs."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Rails, actionpack-page_caching - 'Page caching is an approach to caching in which response bodies are stored in files that the web server can serve directly' (page caching extracted from Rails core in 4.0, 2013).",
+    "Microsoft, Output caching middleware in ASP.NET Core (.NET 7+) - the framework realization of the same pattern for UI routes, with policies, invalidation and stampede protection.",
+    "Fielding, Nottingham & Reschke, RFC 9111: HTTP Caching (2022) - shared-cache freshness (s-maxage), revalidation and invalidation rules any page cache must obey.",
+    "Fowler, Patterns of Enterprise Application Architecture (2002), Chapter 14 - Page Controller, Front Controller and Two-Step View produce the pages this pattern caches; Page Cache itself is not an eaaCatalog entry.",
+    "https://github.com/rails/actionpack-page_caching",
+    "https://learn.microsoft.com/en-us/aspnet/core/performance/caching/output",
+    "https://www.rfc-editor.org/info/rfc9111",
+    "https://guides.rubyonrails.org/caching_with_rails.html",
+    "https://nginx.org/en/docs/http/ngx_http_proxy_module.html",
+    "https://learn.microsoft.com/en-us/aspnet/core/performance/caching/output?view=aspnetcore-10.0",
+    "Varnish Cache documentation - backend origin servers and grace mode can serve cached content while backends are unavailable.",
+    "https://www.varnish-cache.org/docs/8.0/users-guide/vcl-backends.html",
+    "Cloudflare, Origin Cache Control - edge cache behavior driven by origin Cache-Control directives and cache rules.",
+    "https://developers.cloudflare.com/cache/concepts/cache-control/",
+    "Cloudflare, Avoid Web Cache Poisoning - unkeyed inputs and user-controlled headers must not influence cached responses.",
+    "https://developers.cloudflare.com/cache/cache-security/avoid-web-poisoning/",
+    "https://www.rfc-editor.org/rfc/rfc9111.html"
+  ]
+}

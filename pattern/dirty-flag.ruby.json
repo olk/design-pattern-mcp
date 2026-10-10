@@ -1,0 +1,60 @@
+{
+  "pattern": "dirty-flag",
+  "language": "ruby",
+  "support": "idiomatic",
+  "idiom_name": "defined?(@derived) guard plus remove_instance_variable as invalidation",
+  "implementation_notes": "The community memoization idiom carries the pattern: `@derived = compute unless defined?(@derived)` recomputes only when the instance variable is absent, and invalidation removes the variable with remove_instance_variable (which also returns the old value), so the flag is the variable's existence rather than a bool. This is the correct form for values that may legitimately be nil or false, where `@derived ||= compute` would recompute on every read. Ruby's attribute writers do not intercept assignment, so the invalidation call must live in a method the class owns; attr_accessor on the primary data bypasses the pattern entirely.",
+  "code_sketch": "class Node\n  def move(dx)\n    @x += dx\n    remove_instance_variable(:@world) if defined?(@world)   # mark dirty\n  end\n\n  def world\n    @world = compute_world(@x) unless defined?(@world)      # recompute once\n    @world\n  end\nend",
+  "pitfalls": [
+    "`||=` treats false and nil as 'not cached', so a legitimate nil/false result recomputes on every read - use defined? for the guard.",
+    "attr_writer/attr_accessor on the primary data bypasses invalidation completely; hide writers behind methods that also drop the cache.",
+    "Frozen objects cannot memoise: writing an instance variable on a frozen object raises FrozenError (Ractor-shareable objects are frozen), so lazy caches must be built before freezing.",
+    "remove_instance_variable is not atomic with the read: two threads can both rebuild, and MRI's GVL is released during blocking work, so shared instances need a Mutex."
+  ],
+  "sources": [
+    "https://ruby-doc.org/core-3.1.2/Object.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "defined-guard",
+      "name": "defined?(@cache) guard with remove_instance_variable",
+      "paradigm": "oo",
+      "min_standard": "Ruby3.0",
+      "idiom_name": "defined?(@derived) guard plus remove_instance_variable as invalidation",
+      "implementation_notes": "The community memoization idiom carries the pattern: `@derived = compute unless defined?(@derived)` recomputes only when the instance variable is absent, and invalidation removes the variable with remove_instance_variable (which also returns the old value), so the flag is the variable's existence rather than a bool. This is the correct form for values that may legitimately be nil or false, where `@derived ||= compute` would recompute on every read. Ruby's attribute writers do not intercept assignment, so the invalidation call must live in a method the class owns; attr_accessor on the primary data bypasses the pattern entirely.",
+      "code_sketch": "class Node\n  def move(dx)\n    @x += dx\n    remove_instance_variable(:@world) if defined?(@world)   # mark dirty\n  end\n\n  def world\n    @world = compute_world(@x) unless defined?(@world)      # recompute once\n    @world\n  end\nend",
+      "pitfalls": [
+        "`||=` treats false and nil as 'not cached', so a legitimate nil/false result recomputes on every read - use defined? for the guard.",
+        "attr_writer/attr_accessor on the primary data bypasses invalidation completely; hide writers behind methods that also drop the cache.",
+        "Frozen objects cannot memoise: writing an instance variable on a frozen object raises FrozenError (Ractor-shareable objects are frozen), so lazy caches must be built before freezing.",
+        "remove_instance_variable is not atomic with the read: two threads can both rebuild, and MRI's GVL is released during blocking work, so shared instances need a Mutex."
+      ],
+      "sources": [
+        "https://ruby-doc.org/core-3.1.2/Object.html"
+      ]
+    },
+    {
+      "variant_id": "mutex-synchronized",
+      "name": "Mutex-synchronized recomputation",
+      "paradigm": "concurrent",
+      "min_standard": "Ruby3.0",
+      "requires_features": [
+        "Thread::Mutex"
+      ],
+      "idiom_name": "Thread::Mutex around the defined?-guard rebuild",
+      "implementation_notes": "Ruby threads share memory, and the GVL does not make a multi-step check-and-rebuild atomic, so a shared instance wraps the recomputation in a Thread::Mutex#synchronize block and re-checks the guard inside the lock - the same double-checked shape as in other languages, with the cache published before the accessor returns. The mutex is the stdlib primitive for coordinating access to shared data across threads; the guard keeps repeated reads lock-free only if reads of an already-computed value avoid the mutex, which means accepting that the published value is effectively immutable. For true parallelism without a shared heap, Ractors (with frozen/shareable state) or processes are the alternative.",
+      "code_sketch": "class Node\n  def initialize\n    @x = 0.0\n    @lock = Mutex.new\n  end\n\n  def world\n    @lock.synchronize do\n      @world = compute_world(@x) unless defined?(@world)   # re-checked under the lock\n      @world\n    end\n  end\nend",
+      "pitfalls": [
+        "Mutex#synchronize is reentrant-safe only per instance as documented (it raises ThreadError on recursive lock attempts by the same thread); a rebuild that calls back into the same object deadlocks or raises.",
+        "The mutex must not be re-created per call, and the cached value must not be replaced by a fresh mutex during Marshal.load or dup - the lock has to be re-established explicitly.",
+        "Holding the mutex during a long recomputation serialises all readers; publish an immutable value and let subsequent reads skip the lock if that matters.",
+        "Mutual exclusion fixes visibility only inside synchronize: a fast path that reads @world without the lock can see a stale value, so it must read after the lock was last released or not at all."
+      ],
+      "sources": [
+        "https://ruby-doc.org/core-3.1.2/Thread/Mutex.html"
+      ]
+    }
+  ],
+  "default_variant": "defined-guard"
+}

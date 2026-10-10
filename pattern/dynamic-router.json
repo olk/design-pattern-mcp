@@ -1,0 +1,180 @@
+{
+  "category": "workflow-messaging",
+  "name": "dynamic-router",
+  "aliases": [
+    "dynamic routing",
+    "rules-based routing"
+  ],
+  "intent": "Route each message to a destination chosen from a rule base that can be changed while the system runs, so the router never depends on - or is redeployed for - the set of destinations it serves.",
+  "problem": "Routing logic hard-coded into the router (switch chains, static filter tables, deployment-time route configuration) couples it to every destination: adding, moving, throttling or retiring a destination needs a code change, a review and a restart, and each topology change forces the router back through the release process instead of being an operational edit.",
+  "context": "Message-based integration where the destination set or the routing policy changes faster than the router's release cycle: rules are owned by operations, destinations announce themselves, scale out, or go down for maintenance, or one router instance serves several tenants or environments. Applies when the route can be expressed as rules over message content, headers or context evaluated per message, and the platform offers a usable control channel (config watch, control bus, admin endpoint, hot-reloadable table) to publish rule changes.",
+  "benefits": [
+    "Routing topology decouples from routing code: destinations can be added, moved, throttled or retired without rebuilding and redeploying the router.",
+    "The rules live in one inspectable, maintainable place (table, configuration, rule base) that operations can own, instead of being spread over conditionals.",
+    "Destinations can announce the conditions under which they can serve, so the router does not need a compiled-in list of every endpoint.",
+    "One router instance can serve several environments or tenants by loading a different rule set, and traffic can be shifted (canary, blue/green, drain) by editing a rule.",
+    "Rule changes can be staged and swapped atomically, so a bad rule set is rolled back without a release.",
+    "Failover becomes a routing decision: redirect traffic to a standby destination by republishing rules while the primary is drained."
+  ],
+  "tradeoffs": [
+    "A second configuration surface: the rule base is production state that must be versioned, reviewed, validated, audited and rolled back, and it can drift out of agreement with the code that is supposed to own routing policy.",
+    "Runtime changes escape code review and CI: a wrong rule can silently divert live traffic - Spring Integration documents exactly this footgun for its channel-key fallback, where an untrusted message can address an unexpected channel.",
+    "The effective routing table is runtime state: tests and incident analysis must reconstruct which rules were in force, and an unmatched message needs an explicit, monitored default instead of a silent drop.",
+    "Per-message rule evaluation and lookup cost more than a compiled branch, and a shared rule structure needs a lock-free read path or it becomes a contention point at high throughput.",
+    "During a rollout replicas can hold different rule generations, so identical messages route differently until the new rule set has propagated everywhere.",
+    "The control channel is a security surface: whoever can publish rule updates can redirect traffic, so it needs authentication, authorization and an audit trail separate from the data path.",
+    "Debugging spans two systems: a routing fault may originate in the message, in a rule, in rule distribution, or in the router's unmatched-message handling."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 9,
+    "maintainability": 7,
+    "simplicity": 4,
+    "performance": 6,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Dynamic Router",
+      "responsibility": "Evaluates the rule base for every message, forwards to the destination whose conditions match, and owns no compiled-in list of destinations."
+    },
+    {
+      "role": "Rule Base",
+      "responsibility": "The runtime-updatable set of routing rules (table, configuration, database or rules engine) mapping message conditions to destinations; the only place routing policy lives."
+    },
+    {
+      "role": "Control Channel",
+      "responsibility": "Out-of-band path on which rule updates and destination announcements arrive; only writers on this channel may change routing, which makes it the security boundary of the pattern."
+    },
+    {
+      "role": "Destination",
+      "responsibility": "Endpoint that announces the conditions under which it can handle messages and receives the messages routed to it; it knows nothing about the router's other destinations."
+    },
+    {
+      "role": "Unroutable Destination",
+      "responsibility": "Explicit default or dead-letter target for messages no rule matched, so routing misses are observable rather than dropped."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Multi-tenant integration hub: each tenant has its own routing table, loaded and swapped per tenant instead of one deployed router per tenant.",
+    "Event distribution where downstream teams add or retire consumers by publishing routing conditions rather than requesting a router release.",
+    "Canary and blue/green rollouts: send a slice of traffic to a new destination by editing a rule, and roll back by restoring the previous rule set.",
+    "Maintenance windows: reroute a destination's traffic to a standby, drain the destination, then restore the rule when it returns.",
+    "Regional or sharded routing where the region-to-destination mapping is maintained by operations and changes with capacity, not with code.",
+    "Rule-driven enterprise integration in the classic EIP sense, where a rule base is consulted per message and recipients announce themselves on a control channel.",
+    "Kubernetes Gateway API traffic splitting: use HTTPRoute weighted backends to shift a configurable percentage of traffic between versions without redeploying the router.",
+    "Service mesh canary deployments: an Istio VirtualService or Linkerd ServiceProfile acts as the rule base; routing rules are edited at runtime to steer canary traffic, then promoted or rolled back.",
+    "Multi-tenant SaaS routing: Spring Cloud Gateway or Envoy.DynamicRouter loads per-tenant routing rules from a registry, injecting tenant-specific headers or rewrites so one router instance serves hundreds of isolated tenants.",
+    "API version routing and A/B testing: route by Accept header, API version path prefix, or experimentCohort header to different backend versions, controlled by rules updated without a release.",
+    "Database or cache sharding: route a tenant or user ID hash to the correct shard's endpoint via a rule table that is repointed during resharding without touching application code.",
+    "BGP route-server testing: use a chaos-testing framework against a route server to validate that policy changes converge correctly and do not produce route leaks before production deployment.",
+    "Traefik dynamic configuration: Traefik builds its routing table at runtime from providers (Docker labels, Kubernetes IngressRoute, Consul/etcd KV stores), so services announce their own routes and rule changes hot-swap without restarting the proxy.",
+    "HAProxy Runtime API: add server and set server state/weight over the runtime socket repoint and drain backends without a reload; the Data Plane API layers persistence and validation on top of these runtime changes.",
+    "Kong Gateway admin API: Routes - including the expressions DSL when router_flavor is set to expressions - are created and updated at runtime via POST /routes and take effect on the next matching request, with priority-ordered rule evaluation replacing a redeployed config."
+  ],
+  "avoid_when": [
+    "The routing rules are small and stable: a Content-Based Router with a static table, or a plain dispatch switch, is simpler and reviewable in code.",
+    "The platform cannot reload configuration safely (no control channel, no atomic swap): then a release-time route table with a staged deploy is the honest choice.",
+    "The route belongs to the message: use Routing Slip when each message carries its own itinerary instead of consulting a shared rule base.",
+    "The broker or service mesh already performs content-based routing declaratively (Kafka topic routing, Envoy route configuration, RabbitMQ exchange bindings) - do not rebuild the router in application code.",
+    "A single destination with a fixed assignment: the extra rule base and control channel cost more than they return.",
+    "Latency or audit requirements forbid per-message rule evaluation and runtime policy changes."
+  ],
+  "language_files": {
+    "generic": "dynamic-router.generic.json",
+    "c": "dynamic-router.c.json",
+    "cplusplus": "dynamic-router.cplusplus.json",
+    "csharp": "dynamic-router.csharp.json",
+    "go": "dynamic-router.go.json",
+    "java": "dynamic-router.java.json",
+    "javascript": "dynamic-router.javascript.json",
+    "kotlin": "dynamic-router.kotlin.json",
+    "python": "dynamic-router.python.json",
+    "ruby": "dynamic-router.ruby.json",
+    "rust": "dynamic-router.rust.json",
+    "scala": "dynamic-router.scala.json",
+    "swift": "dynamic-router.swift.json",
+    "typescript": "dynamic-router.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "declarative"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "message-router",
+    "content-based-router",
+    "recipient-list",
+    "routing-slip",
+    "control-bus",
+    "detour",
+    "process-manager",
+    "rule-engine"
+  ],
+  "anti_patterns": [
+    "A \"dynamic\" router whose rules are read once at startup: it is a static content-based router with extra indirection.",
+    "Rules that point at destinations the router cannot validate, so a typo or a retired endpoint silently becomes a black hole.",
+    "Storing routing rules in the same mutable state the router uses for in-flight bookkeeping, so unrelated updates interfere with routing.",
+    "A rule base writable by anyone who can publish a message: the control channel becomes a traffic-hijack vector.",
+    "Two routers with two rule bases for the same message type, which diverge exactly when the rules differ - that is, while they are being changed.",
+    "Unbounded per-message rule evaluation (a linear scan of thousands of rules, or a chain that keeps growing) presented as flexibility."
+  ],
+  "design_principles": [
+    "Separation of policy from mechanism: the rules are data, the router is the evaluator.",
+    "Open/closed principle: new destinations join by adding rules, not by modifying the router.",
+    "Single source of truth: one rule base per routing domain, updated atomically.",
+    "Fail-safe with explicit defaults: an unroutable message is a first-class, observable outcome.",
+    "Information hiding: destinations announce their conditions; the router is not compiled against them."
+  ],
+  "best_practices": [
+    "Publish immutable, pre-validated rule snapshots and swap them atomically (atomic pointer, options reload, replaceChannelMappings, ApplyConfiguration) instead of editing a live table.",
+    "Version and review rule sets like code, and drive updates through an audited control channel rather than ad-hoc edits.",
+    "Validate a rule set before it takes effect (schema plus destination reachability) and reject the whole snapshot if any rule is invalid.",
+    "Always configure an explicit default or unroutable destination, and alert on its traffic.",
+    "Keep the read path lock-free: one immutable snapshot per message, with the old generation retired only after in-flight messages finish.",
+    "Log the matched rule id (and carry it in a header or context) so routing decisions can be reconstructed after the fact.",
+    "Protect the control channel with authentication and authorization separate from the data channel.",
+    "Test routing rules against a route table checker (e.g. Envoy router_check tool) in CI before deploying a rule snapshot to production, verifying that every known input maps to the intended destination.",
+    "Run chaos engineering against the router itself: inject destination failures, network partitions, and rule-publish latency spikes to verify backpressure behaviour, graceful degradation, and recovery SLAs (e.g. P95 recovery < 30 s).",
+    "Diff rule snapshots before applying them: a human-readable diff of the old versus new rule set surfaces removed catch-all rules, broadened destination lists, and priority inversions that a schema-valid only check would miss.",
+    "Carry the matched rule identifier in the trace context ( baggage or span attributes) so distributed traces can reconstruct exactly which rule routed each request, not just the final destination.",
+    "Circuit-break on destination health: when a destination fails consecutive health checks, the router should stop sending traffic even if a rule still matches, and alert until the destination recovers or the rule is withdrawn.",
+    "Validate destination reachability before a rule set goes live: at least a TCP connect or HTTP HEAD check against every named endpoint, failing the snapshot if any destination is unreachable."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Dynamic Router (Message Routing chapter).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/DynamicRouter.html",
+    "https://camel.apache.org/components/latest/eips/dynamicRouter-eip.html",
+    "https://camel.apache.org/components/latest/dynamic-router-component.html",
+    "https://docs.spring.io/spring-integration/reference/router/dynamic-routers.html",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/gateway-routing",
+    "https://aws.amazon.com/blogs/compute/dynamically-routing-requests-with-amazon-api-gateway-routing-rules/",
+    "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/operations/dynamic_configuration",
+    "https://dataintegrationmastery.com/patterns/routing-patterns/dynamic-router.html — Dynamic Router Testing Strategy: rule validation, chaos engineering, canary/A-B testing, observability.",
+    "https://stella-ops.org/docs/operations/router-chaos-testing-runbook/ — Router Chaos Testing Runbook: backpressure verification, graceful degradation under dependency failure, and P95/P99 recovery SLA validation.",
+    "https://blog.cloudflare.com/route-leak-incident-january-22-2026/ — Cloudflare BGP route leak postmortem: overly permissive automation policy exported internal routes externally; 25-minute incident, ~12 Gbps dropped.",
+    "https://johal.in/postmortem-istio-122-config-error-dropped-30-traffic — Istio 1.22/Envoy 1.28 regex routing rule silently dropped 30% of traffic in production; regex engine v2→v3 migration gap.",
+    "https://windowsnews.ai/article/azure-front-door-edge-routing-failure-causes-global-blackout — Azure Front Door global outage from a misconfigured routing rule change that caused incorrect routing decisions across all edge nodes.",
+    "https://dev.to/techlogstack/600-calls-13-hours-4-dead-inside-the-optus-emergency-routing-collapse-1f19 — Optus emergency routing failure: a single misconfigured routing rule severed 600 emergency calls for 13 hours; no automated failover existed.",
+    "https://doc.traefik.io/traefik/reference/routing-configuration/dynamic-configuration-methods/ — Traefik official docs: dynamic (routing) configuration supplied at runtime by providers (file, Docker labels, Kubernetes, KV stores).",
+    "https://www.haproxy.com/documentation/haproxy-runtime-api/ — HAProxy Runtime API official docs: in-memory routing/server state changes without reload; changes do not persist across restarts.",
+    "https://developer.konghq.com/gateway/routing/expressions — Kong Gateway official docs: expressions-router Routes managed via the Admin API with priority-ordered runtime rule evaluation.",
+    "https://github.com/spring-cloud/spring-cloud-gateway/issues/600 — Spring Cloud Gateway: a runtime-added invalid Route Definition breaks all routes on refresh; discussion of pre-validation and last-known-good caching.",
+    "https://blog.cloudflare.com/18-november-2025-outage/ — Cloudflare postmortem: an oversized propagated configuration file exceeded a runtime limit and caused global 500s across proxy modules including routing."
+  ]
+}

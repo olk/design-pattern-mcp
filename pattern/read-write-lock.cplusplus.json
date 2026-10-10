@@ -1,0 +1,79 @@
+{
+  "pattern": "read-write-lock",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "std::shared_mutex + std::shared_lock (read) / std::unique_lock (write)",
+  "implementation_notes": "std::shared_mutex is the default: lock_shared/try_lock_shared/unlock_shared for readers and lock/try_lock for writers, wrapped in std::shared_lock and std::unique_lock so release happens on every exit path; C++14 codebases use std::shared_timed_mutex, which the same guards accept. Choose it where reads dominate and sections are long enough that serialising readers shows up; for short sections a plain std::mutex with std::lock_guard is usually faster, because shared_mutex is larger and its shared path is not free.",
+  "code_sketch": "std::shared_mutex table_mutex;\nstd::map<std::string, int> table;\n\nint lookup(const std::string& key) {\n    std::shared_lock read_lock(table_mutex);   // many readers\n    return table.at(key);\n}\n\nvoid refresh() {\n    std::unique_lock write_lock(table_mutex);  // one writer\n    table = load_table();\n}",
+  "pitfalls": [
+    "std::shared_mutex allows only one lock (shared or exclusive) per thread at a time; taking a shared_lock and then a unique_lock on the same mutex in one thread deadlocks.",
+    "Do not use the raw lock()/unlock() pairs without a guard: an exception between them leaves the mutex locked for good.",
+    "Fairness is not guaranteed; writer starvation is implementation-defined, so a reader-dominated loop can postpone a refresh indefinitely.",
+    "shared_mutex/shared_timed_mutex are larger and can be slower than std::mutex for short sections - measure before replacing a plain mutex."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/shared_mutex"
+  ],
+  "variants": [
+    {
+      "variant_id": "std-shared-mutex",
+      "name": "std::shared_mutex with std::shared_lock (C++17)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "std::shared_mutex + std::shared_lock (read) / std::unique_lock (write)",
+      "implementation_notes": "std::shared_mutex is the default: lock_shared/try_lock_shared/unlock_shared for readers and lock/try_lock for writers, wrapped in std::shared_lock and std::unique_lock so release happens on every exit path; C++14 codebases use std::shared_timed_mutex, which the same guards accept. Choose it where reads dominate and sections are long enough that serialising readers shows up; for short sections a plain std::mutex with std::lock_guard is usually faster, because shared_mutex is larger and its shared path is not free.",
+      "code_sketch": "std::shared_mutex table_mutex;\nstd::map<std::string, int> table;\n\nint lookup(const std::string& key) {\n    std::shared_lock read_lock(table_mutex);   // many readers\n    return table.at(key);\n}\n\nvoid refresh() {\n    std::unique_lock write_lock(table_mutex);  // one writer\n    table = load_table();\n}",
+      "pitfalls": [
+        "std::shared_mutex allows only one lock (shared or exclusive) per thread at a time; taking a shared_lock and then a unique_lock on the same mutex in one thread deadlocks.",
+        "Do not use the raw lock()/unlock() pairs without a guard: an exception between them leaves the mutex locked for good.",
+        "Fairness is not guaranteed; writer starvation is implementation-defined, so a reader-dominated loop can postpone a refresh indefinitely.",
+        "shared_mutex/shared_timed_mutex are larger and can be slower than std::mutex for short sections - measure before replacing a plain mutex."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/shared_mutex"
+      ]
+    },
+    {
+      "variant_id": "boost-shared-mutex",
+      "name": "Boost.Thread shared_mutex (pre-C++17, portable)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "Boost.Thread"
+      ],
+      "idiom_name": "boost::shared_mutex + boost::shared_lock / boost::upgrade_mutex",
+      "implementation_notes": "Boost.Thread mirrors the std API on C++11 toolchains and adds upgrade_mutex with upgrade_lock, which allows a held read lock to be upgraded to a write lock without releasing it - the feature the standard never adopted. Choose it for portability or when a genuine upgrade path is required; with C++17 available the std type is the better default.",
+      "code_sketch": "boost::shared_mutex m;\n{\n    boost::shared_lock<boost::shared_mutex> read(m);  // readers\n    read_cache();\n}\nboost::upgrade_mutex um;\nboost::upgrade_lock<boost::upgrade_mutex> up(um);     // upgradeable read\nboost::upgrade_to_unique_lock<boost::upgrade_mutex> w(up);  // now exclusive",
+      "pitfalls": [
+        "boost::shared_mutex has no upgrade support; upgrade is a property of the separate boost::upgrade_mutex type.",
+        "Only one upgrade lock may exist per boost::upgrade_mutex, and upgrading while other readers hold the lock blocks until they leave.",
+        "Boost.Thread must be linked (the locking types are not header-only in modern Boost)."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/thread/synchronization.html#thread.synchronization.mutex_types.shared_mutex"
+      ]
+    },
+    {
+      "variant_id": "posix-rwlock",
+      "name": "POSIX pthread_rwlock_t behind a C++ RAII guard",
+      "paradigm": "procedural",
+      "min_standard": "C++03",
+      "requires_features": [
+        "POSIX threads"
+      ],
+      "idiom_name": "pthread_rwlock_t + ReadGuard/WriteGuard",
+      "implementation_notes": "Wrap the C primitive in two small guards when the toolchain has neither C++17 nor Boost, or when the lock must be shared with a C core: pthread_rwlock_rdlock/wrlock/unlock behind constructors and destructors restores the RAII discipline the C API lacks. This is also the only realisation that can be placed in shared memory (PTHREAD_PROCESS_SHARED).",
+      "code_sketch": "pthread_rwlock_t rw = PTHREAD_RWLOCK_INITIALIZER;\n\nstruct ReadGuard {\n    ReadGuard()  { pthread_rwlock_rdlock(&rw); }\n    ~ReadGuard() { pthread_rwlock_unlock(&rw); }\n};\n\nstruct WriteGuard {\n    WriteGuard()  { pthread_rwlock_wrlock(&rw); }\n    ~WriteGuard() { pthread_rwlock_unlock(&rw); }\n};",
+      "pitfalls": [
+        "No upgrade support: release the read lock before taking the write lock.",
+        "The default glibc policy is read-preferring; set PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP when writers must not starve (and accept that recursive read locking then deadlocks).",
+        "The rwlock must be destroyed before its memory is reused, and guards must not outlive it."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_rwlock_rdlock.3p.html"
+      ]
+    }
+  ],
+  "default_variant": "std-shared-mutex",
+  "version": "1.0"
+}

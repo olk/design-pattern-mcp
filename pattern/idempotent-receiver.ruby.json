@@ -1,0 +1,56 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "ruby",
+  "support": "idiomatic",
+  "idiom_name": "ActiveRecord find_or_create_by! + unique index",
+  "implementation_notes": "Rails receivers can let the database arbitrate: a unique index on the idempotency key plus `find_or_create_by!` (or a plain INSERT) inside the same transaction as the business writes makes ActiveRecord::RecordNotUnique the duplicate signal. `find_or_create_by` alone is check-then-act unless the unique index backs it - the index, not the finder, is the claim. Outside Rails the same shape is a UNIQUE column and an INSERT OR IGNORE whose zero-change result is the duplicate.",
+  "code_sketch": "begin\n  Order.transaction do\n    SeenKey.find_or_create_by!(key: msg.idempotency_key)  # UNIQUE index backs this\n    Order.create_from(msg)                                # same transaction\n  end\nrescue ActiveRecord::RecordNotUnique\n  ack(msg)                                                # duplicate: absorb\nend",
+  "pitfalls": [
+    "find_or_create_by without a unique index is a check-then-act race under concurrent consumers; the index is what makes it correct.",
+    "Rescuing RecordNotUnique around the whole transaction also swallows a uniqueness collision from business tables - keep the rescue scoped to the claim.",
+    "SeenKey rows must be pruned by age; Rails gives no automatic retention."
+  ],
+  "sources": [
+    "https://api.rubyonrails.org/classes/ActiveRecord/Relation.html",
+    "https://www.postgresql.org/docs/current/sql-insert.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "unique-index-claim",
+      "name": "Durable claim with a unique index (Rails/ActiveRecord)",
+      "paradigm": "oo",
+      "implementation_notes": "Rails receivers can let the database arbitrate: a unique index on the idempotency key plus `find_or_create_by!` (or a plain INSERT) inside the same transaction as the business writes makes ActiveRecord::RecordNotUnique the duplicate signal. `find_or_create_by` alone is check-then-act unless the unique index backs it - the index, not the finder, is the claim. Outside Rails the same shape is a UNIQUE column and an INSERT OR IGNORE whose zero-change result is the duplicate.",
+      "code_sketch": "begin\n  Order.transaction do\n    SeenKey.find_or_create_by!(key: msg.idempotency_key)  # UNIQUE index backs this\n    Order.create_from(msg)                                # same transaction\n  end\nrescue ActiveRecord::RecordNotUnique\n  ack(msg)                                                # duplicate: absorb\nend",
+      "pitfalls": [
+        "find_or_create_by without a unique index is a check-then-act race under concurrent consumers; the index is what makes it correct.",
+        "Rescuing RecordNotUnique around the whole transaction also swallows a uniqueness collision from business tables - keep the rescue scoped to the claim.",
+        "SeenKey rows must be pruned by age; Rails gives no automatic retention."
+      ],
+      "sources": [
+        "https://api.rubyonrails.org/classes/ActiveRecord/Relation.html",
+        "https://www.postgresql.org/docs/current/sql-insert.html"
+      ],
+      "min_standard": "Ruby3.0",
+      "idiom_name": "ActiveRecord find_or_create_by! + unique index"
+    },
+    {
+      "variant_id": "in-process-set-guard",
+      "name": "In-process Set#add? guard (single process)",
+      "paradigm": "oo",
+      "implementation_notes": "`Set#add?` returns self when the element was added and nil when it was already present, which makes the check-and-claim a single call - but MRI's GVL only makes it atomic within one process, and Rails deployments normally run several workers or threads. Use it as a fast pre-filter at most; the durable claim is the unique-index variant. Redis `SET ... NX` via redis-rb gives the same one-call claim across processes.",
+      "code_sketch": "require 'set'\nSEEN = Set.new\n\ndef claim(key)\n  !SEEN.add?(key).nil?   # nil => already claimed\nend",
+      "pitfalls": [
+        "The set is per-process: Puma workers, background job processes and restarts each start with an empty guard.",
+        "Set#add? is atomic only because of the GVL; a future without it (or JRuby/TruffleRuby) changes the guarantee."
+      ],
+      "sources": [
+        "https://ruby-doc.org/stdlib-3.1.2/libdoc/set/rdoc/Set.html",
+        "https://redis.io/docs/latest/commands/set/"
+      ],
+      "min_standard": "Ruby2.0",
+      "idiom_name": "Set#add?"
+    }
+  ],
+  "default_variant": "unique-index-claim"
+}

@@ -1,0 +1,76 @@
+{
+  "pattern": "double-checked-locking",
+  "language": "cplusplus",
+  "support": "native",
+  "idiom_name": "static T& instance() { static T t; return t; }",
+  "implementation_notes": "The C++11 language guarantee absorbed the pattern: initialisation of a block-scope static happens exactly once and is thread-safe, and implementations use variants of double-checked locking internally so an already-initialised static costs a single non-atomic flag comparison. Use it for a constructible, non-rebuildable cell; the classic hand-written double check is a regression here, not an optimisation.",
+  "code_sketch": "Config& config() {                       // one thread-safe initialisation\n    static Config cfg = Config::load();  // C++11 guarantees it once\n    return cfg;                          // then a single flag test\n}",
+  "pitfalls": [
+    "The guarantee covers construction only: at exit the destructor runs in an unspecified order relative to other statics and other threads, so a lazily built global destroyed during shutdown can still be read by a running thread.",
+    "If the initialiser throws, the exception propagates to the caller and the static is re-attempted on the next call (the standard's retry rule), so a partially constructed resource must never be published by the initialiser.",
+    "A function-local static is per function call site, not per object: per-instance laziness needs a member and therefore a different mechanism.",
+    "Recursive initialisation of the same static is undefined behaviour or a deadlock (the guard is non-reentrant), so the initialiser must not call the accessor again."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/storage_duration"
+  ],
+  "variants": [
+    {
+      "variant_id": "function-local-static",
+      "name": "function-local static (magic statics)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "static T& instance() { static T t; return t; }",
+      "implementation_notes": "The C++11 language guarantee absorbed the pattern: initialisation of a block-scope static happens exactly once and is thread-safe, and implementations use variants of double-checked locking internally so an already-initialised static costs a single non-atomic flag comparison. Use it for a constructible, non-rebuildable cell; the classic hand-written double check is a regression here, not an optimisation.",
+      "code_sketch": "Config& config() {                       // one thread-safe initialisation\n    static Config cfg = Config::load();  // C++11 guarantees it once\n    return cfg;                          // then a single flag test\n}",
+      "pitfalls": [
+        "The guarantee covers construction only: at exit the destructor runs in an unspecified order relative to other statics and other threads, so a lazily built global destroyed during shutdown can still be read by a running thread.",
+        "If the initialiser throws, the exception propagates to the caller and the static is re-attempted on the next call (the standard's retry rule), so a partially constructed resource must never be published by the initialiser.",
+        "A function-local static is per function call site, not per object: per-instance laziness needs a member and therefore a different mechanism.",
+        "Recursive initialisation of the same static is undefined behaviour or a deadlock (the guard is non-reentrant), so the initialiser must not call the accessor again."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/storage_duration"
+      ]
+    },
+    {
+      "variant_id": "call-once",
+      "name": "std::call_once with std::once_flag",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::call_once(flag, factory) for cells that cannot be block-scope statics",
+      "implementation_notes": "The standard library's once primitive: std::call_once runs the callable exactly once and blocks concurrent callers until it has finished, which is the right tool when the cell is a member, must be built with arguments, or must stay resettable through a wrapper. It replaces the flag-and-check structure with a named object and, unlike a magic static, lets the accessor decide what a failed build means.",
+      "code_sketch": "std::once_flag once;                     // per cell, never reset\nstd::atomic<Config*> cfg{nullptr};\n\nConfig& config() {\n    Config* c = cfg.load(std::memory_order_acquire);\n    if (!c) {\n        std::call_once(once, [] {\n            cfg.store(Config::load(), std::memory_order_release);\n        });\n        c = cfg.load(std::memory_order_acquire);\n    }\n    return *c;\n}",
+      "pitfalls": [
+        "std::once_flag is one-shot by definition: there is no reset, so re-initialisation needs a mutex plus an atomic snapshot rather than a second call_once.",
+        "Recursively calling call_once on the same flag deadlocks, and an exception thrown by the callable is rethrown to every caller while the flag stays unset (the call may run again).",
+        "The atomic fast path in front of call_once is optional: without it the accessor still pays a once-flag test, which is usually the honest choice unless profiling says otherwise."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/call_once"
+      ]
+    },
+    {
+      "variant_id": "atomic-acquire-release",
+      "name": "hand-written double check over std::atomic<T*>",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::atomic<Cell*> with release store and acquire load plus a mutex for the slow path",
+      "implementation_notes": "The manual transformed form for cases where a block-scope static is impossible (the value lives in an object pool, must be rebuilt, or the code predates C++11): one atomic pointer carries both the reference and the ordering, so the fast path is a single acquire load and the slow path a mutex with a re-test. Keep it only when the platform's primitives cannot express the lifetime, and never with a plain pointer.",
+      "code_sketch": "std::atomic<Config*> cfg{nullptr};\nstd::mutex init_mutex;\n\nConfig& config() {\n    Config* c = cfg.load(std::memory_order_acquire);      // fast path\n    if (!c) {\n        std::lock_guard<std::mutex> guard(init_mutex);\n        c = cfg.load(std::memory_order_relaxed);          // lock orders it\n        if (!c) { c = Config::load(); cfg.store(c, std::memory_order_release); }\n    }\n    return *c;\n}",
+      "pitfalls": [
+        "Relaxed loads on the fast path, or a plain pointer, remove the acquire and let readers observe the pointer before the object's contents - the exact failure the pattern is supposed to prevent.",
+        "Rebuilding after publication needs a lifetime strategy (hazard pointers, reference counting); swapping the pointer while readers hold it is a use-after-free, not a locking problem.",
+        "Holding the mutex while running an arbitrary initialiser invites re-entrancy deadlock if the constructor calls back into the accessor."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/memory_order"
+      ],
+      "requires_features": [
+        "atomics"
+      ]
+    }
+  ],
+  "default_variant": "function-local-static",
+  "version": "1.0"
+}

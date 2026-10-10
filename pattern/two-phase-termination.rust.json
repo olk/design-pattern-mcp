@@ -1,0 +1,69 @@
+{
+  "pattern": "two-phase-termination",
+  "language": "rust",
+  "support": "library",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "tokio-cancellation-token",
+      "name": "tokio CancellationToken + task handles (async)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "tokio",
+        "tokio-util"
+      ],
+      "idiom_name": "CancellationToken + JoinSet/TaskTracker await",
+      "implementation_notes": "In async Rust the two phases are a token and a join: CancellationToken::cancel() is phase 1 (one-way, wakes every waiter; cancelled() is a future to select on, child_token() scopes it), and awaiting the JoinHandle/JoinSet/TaskTracker is phase 2 - tokio's shutdown guide puts the cleanup (flush data, send a final message) inside the task before it returns, then waits for the tasks to finish. The classic structure (an atomic flag plus join) survives in synchronous code, where std::thread gives you join but no stop primitive at all.",
+      "code_sketch": "let token = CancellationToken::new();\nlet mut set = JoinSet::new();\nset.spawn({\n    let t = token.clone();\n    async move {\n        tokio::select! {\n            _ = t.cancelled() => {}          // phase 1 reached\n            _ = run() => {}\n        }\n        flush_and_release().await;           // phase 2 cleanup\n    }\n});\n\ntoken.cancel();                              // request\nwhile set.join_next().await.is_some() {}     // completion",
+      "pitfalls": [
+        "A token is one-way and shared by its clones: reusing a cancelled token for new work cancels it immediately, so derive a child_token per generation.",
+        "Dropping a JoinSet aborts its tasks (the docs say so), and JoinSet::shutdown()/abort_all deliberately skip cleanup: keep the handles and await them, and put anything that must survive in a Drop guard or a shutdown path that runs before the next await.",
+        "Cancellation is observed only at await points: a long synchronous block or a std::thread::sleep inside a task ignores the token entirely (move such work to spawn_blocking and give it its own stop signal).",
+        "A panic in the task skips the rest of its body, including a hand-written flush; cleanup that must run regardless belongs in Drop."
+      ],
+      "sources": [
+        "https://tokio.rs/tokio/topics/shutdown",
+        "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html"
+      ]
+    },
+    {
+      "variant_id": "std-atomic-join",
+      "name": "std threads: Arc<AtomicBool> + join",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2015",
+      "requires_features": [
+        "std::thread",
+        "std::sync::atomic",
+        "std::sync::mpsc or Condvar"
+      ],
+      "idiom_name": "Arc<AtomicBool> flag + channel/Condvar wake-up + JoinHandle::join",
+      "implementation_notes": "Rust's standard library has no cancellation: std::thread gives you a handle and join, so the pattern is rebuilt from an Arc<AtomicBool> latch (store with Release, load with Acquire when the flag guards published data), a channel receive with timeout or a Condvar so the worker wakes and re-checks, and JoinHandle::join() as the completion step (its Result also surfaces a panic as phase 2's failure). Cleanup runs after the loop because a dropped closure cannot run async code; if the worker owns resources that must be released even on panic, wrap them in Drop guards.",
+      "code_sketch": "let stop = Arc::new(AtomicBool::new(false));\nlet flag = Arc::clone(&stop);\nlet (tx, rx) = mpsc::channel::<Job>();\n\nlet worker = thread::spawn(move || {\n    while !flag.load(Ordering::Acquire) {        // safe point\n        if let Ok(job) = rx.recv_timeout(Duration::from_millis(100)) { run(job); }\n    }\n    flush_and_release();                         // phase 2 cleanup\n});\n\nstop.store(true, Ordering::Release);             // phase 1: request\nworker.join().unwrap();                          // phase 2: completion",
+      "pitfalls": [
+        "Detaching (dropping the JoinHandle) removes the only way to know the thread finished - Rust programmes have no other completion signal, so keep the handle and join with a bound.",
+        "A blocking recv() without timeout hides the flag; use recv_timeout, a self-pipe, or a Condvar with a predicate so the request is actually observed.",
+        "Relaxed ordering is only safe when nothing else depends on the flag; publishing data before a Release store and reading after an Acquire load is what makes the cleanup visible to the joiner.",
+        "A panicking worker unwinds without running explicit cleanup code: RAII drops still run, but a hand-written flush at the end of the loop does not."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/atomic/type.AtomicBool.html",
+        "https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html"
+      ]
+    }
+  ],
+  "default_variant": "tokio-cancellation-token",
+  "idiom_name": "CancellationToken + JoinSet/TaskTracker await",
+  "implementation_notes": "In async Rust the two phases are a token and a join: CancellationToken::cancel() is phase 1 (one-way, wakes every waiter; cancelled() is a future to select on, child_token() scopes it), and awaiting the JoinHandle/JoinSet/TaskTracker is phase 2 - tokio's shutdown guide puts the cleanup (flush data, send a final message) inside the task before it returns, then waits for the tasks to finish. The classic structure (an atomic flag plus join) survives in synchronous code, where std::thread gives you join but no stop primitive at all.",
+  "code_sketch": "let token = CancellationToken::new();\nlet mut set = JoinSet::new();\nset.spawn({\n    let t = token.clone();\n    async move {\n        tokio::select! {\n            _ = t.cancelled() => {}          // phase 1 reached\n            _ = run() => {}\n        }\n        flush_and_release().await;           // phase 2 cleanup\n    }\n});\n\ntoken.cancel();                              // request\nwhile set.join_next().await.is_some() {}     // completion",
+  "pitfalls": [
+    "A token is one-way and shared by its clones: reusing a cancelled token for new work cancels it immediately, so derive a child_token per generation.",
+    "Dropping a JoinSet aborts its tasks (the docs say so), and JoinSet::shutdown()/abort_all deliberately skip cleanup: keep the handles and await them, and put anything that must survive in a Drop guard or a shutdown path that runs before the next await.",
+    "Cancellation is observed only at await points: a long synchronous block or a std::thread::sleep inside a task ignores the token entirely (move such work to spawn_blocking and give it its own stop signal).",
+    "A panic in the task skips the rest of its body, including a hand-written flush; cleanup that must run regardless belongs in Drop."
+  ],
+  "sources": [
+    "https://tokio.rs/tokio/topics/shutdown",
+    "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html"
+  ]
+}

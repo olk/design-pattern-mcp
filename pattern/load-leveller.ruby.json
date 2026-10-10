@@ -1,0 +1,59 @@
+{
+  "pattern": "load-leveller",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "Thread::SizedQueue(max) with push/pop worker threads",
+  "implementation_notes": "Ruby ships the bounded queue in core: Thread::SizedQueue.new(n) blocks push/enq once it holds n elements and blocks pop/deq while it is empty, so the buffer both stores the burst and paces the producer; Thread::Queue is the unbounded sibling. Workers are plain threads looping on pop, and the queue's own lock replaces any hand-written mutex/condition-variable structure. Because the GVL prevents CPU parallelism, this realization levels I/O-bound or blocking work best; for durable, cross-process work the same shape is served by a Redis-backed framework such as Sidekiq.",
+  "code_sketch": "queue = Thread::SizedQueue.new(1000)          # push blocks once full\n\nworkers = 8.times.map do\n  Thread.new do\n    while (job = queue.pop)                # pop blocks while empty\n      process(job)\n    end\n  end\nend\nqueue.push(job)                              # paced, not dropped",
+  "pitfalls": [
+    "Thread::Queue (unbounded) is the constructor people reach for by habit; only SizedQueue enforces the bound.",
+    "A worker that raises dies silently and the item is lost; the loop needs rescue/retry around process, not around pop.",
+    "The GVL caps CPU-bound throughput regardless of worker count, and threads share process memory - one leak is everyone's leak.",
+    "push on a SizedQueue blocks the calling thread (often a web request); if the request path must not block, use push(timeout) or a non-blocking check plus an explicit shed response."
+  ],
+  "sources": [
+    "https://ruby-doc.org/core-3.1.2/Thread/SizedQueue.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "sized-queue",
+      "name": "Thread::SizedQueue with worker threads",
+      "paradigm": "concurrent",
+      "implementation_notes": "Ruby ships the bounded queue in core: Thread::SizedQueue.new(n) blocks push/enq once it holds n elements and blocks pop/deq while it is empty, so the buffer both stores the burst and paces the producer; Thread::Queue is the unbounded sibling. Workers are plain threads looping on pop, and the queue's own lock replaces any hand-written mutex/condition-variable structure. Because the GVL prevents CPU parallelism, this realization levels I/O-bound or blocking work best; for durable, cross-process work the same shape is served by a Redis-backed framework such as Sidekiq.",
+      "min_standard": "Ruby2.0",
+      "requires_features": [
+        "threads"
+      ],
+      "idiom_name": "Thread::SizedQueue(max) with push/pop worker threads",
+      "code_sketch": "queue = Thread::SizedQueue.new(1000)          # push blocks once full\n\nworkers = 8.times.map do\n  Thread.new do\n    while (job = queue.pop)                # pop blocks while empty\n      process(job)\n    end\n  end\nend\nqueue.push(job)                              # paced, not dropped",
+      "pitfalls": [
+        "Thread::Queue (unbounded) is the constructor people reach for by habit; only SizedQueue enforces the bound.",
+        "A worker that raises dies silently and the item is lost; the loop needs rescue/retry around process, not around pop.",
+        "The GVL caps CPU-bound throughput regardless of worker count, and threads share process memory - one leak is everyone's leak.",
+        "push on a SizedQueue blocks the calling thread (often a web request); if the request path must not block, use push(timeout) or a non-blocking check plus an explicit shed response."
+      ],
+      "sources": [
+        "https://ruby-doc.org/core-3.1.2/Thread/SizedQueue.html"
+      ]
+    },
+    {
+      "variant_id": "sidekiq-workers",
+      "name": "Sidekiq jobs over Redis with a concurrency-limited worker process",
+      "paradigm": "concurrent",
+      "implementation_notes": "For durable background work, Sidekiq is the Ruby idiom: jobs are pushed to Redis and a worker process pulls them and executes each in its own thread (the README notes Sidekiq uses threads to handle many jobs at once in one process, and that real deployments rarely need concurrency above 10). The Redis list is the buffer, the worker's -c concurrency is the drain rate, and retries plus the dead set replace hand-rolled dead-lettering. Because Redis holds the queue, accepted work survives deploys and can be drained by several machines; the in-process SizedQueue remains lighter when durability is not needed.",
+      "idiom_name": "Sidekiq::Job perform_async + sidekiq -c N workers",
+      "code_sketch": "class ProcessJob\n  include Sidekiq::Job\n  sidekiq_options queue: 'jobs', retry: 5\n\n  def perform(payload)\n    do_work(payload)\n  end\nend\n\nProcessJob.perform_async(payload)   # durable in Redis; workers drain at their own rate",
+      "pitfalls": [
+        "Sidekiq is at-least-once: a job interrupted mid-flight is retried, so perform must be idempotent.",
+        "Job arguments are serialized to JSON: pass ids and primitives, never rich objects or symbols.",
+        "Concurrency is per worker process and bounded by memory and the database connection pool - raising it without raising the pool starves jobs.",
+        "Redis persistence/eviction settings decide whether the backlog survives a restart."
+      ],
+      "sources": [
+        "https://github.com/sidekiq/sidekiq"
+      ]
+    }
+  ],
+  "default_variant": "sized-queue",
+  "version": "1.0"
+}

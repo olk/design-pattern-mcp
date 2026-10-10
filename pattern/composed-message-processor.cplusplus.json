@@ -1,0 +1,56 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::async per part + std::vector<std::future<T>> + fold",
+  "implementation_notes": "C++11 supplies the dispatch primitive but not the composite: launch one std::async(std::launch::async, ...) per part, keep the futures in a vector ordered by part index (that vector is the correlation state), then get() each future and merge as results become available - or in index order when the merge is not commutative. The routing decision is a registry or function-pointer lookup in the split loop; the aggregation is a fold over the resolved values. Bound the fan-out with your own task queue once part counts grow, since one thread per part stops paying off quickly; the flow-graph variant is the next step up.",
+  "code_sketch": "std::vector<std::future<PartResult>> fs;\nfor (auto& part : split(msg))\n    fs.push_back(std::async(std::launch::async,\n                            [this, p = part] { return route_and_process(p); }));\nReport report;\nfor (auto& f : fs) report.merge(f.get());      // aggregation, index order\nreturn report;",
+  "pitfalls": [
+    "std::async's default policy is std::launch::async | std::launch::deferred: omitting std::launch::async lets the runtime defer parts to the caller thread and silently serialises the pipeline.",
+    "Destroying an unfinished std::future from std::async blocks in the shared state's destructor; dropping the vector without get() turns the aggregate barrier into a hidden join.",
+    "One thread per part does not scale: for hundreds of parts the spawn cost dominates the element-processing time."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/async"
+  ],
+  "variants": [
+    {
+      "variant_id": "async-futures",
+      "name": "std::async futures + merge over resolved values",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "std::async per part + std::vector<std::future<T>> + fold",
+      "implementation_notes": "C++11 supplies the dispatch primitive but not the composite: launch one std::async(std::launch::async, ...) per part, keep the futures in a vector ordered by part index (that vector is the correlation state), then get() each future and merge as results become available - or in index order when the merge is not commutative. The routing decision is a registry or function-pointer lookup in the split loop; the aggregation is a fold over the resolved values. Bound the fan-out with your own task queue once part counts grow, since one thread per part stops paying off quickly; the flow-graph variant is the next step up.",
+      "code_sketch": "std::vector<std::future<PartResult>> fs;\nfor (auto& part : split(msg))\n    fs.push_back(std::async(std::launch::async,\n                            [this, p = part] { return route_and_process(p); }));\nReport report;\nfor (auto& f : fs) report.merge(f.get());      // aggregation, index order\nreturn report;",
+      "pitfalls": [
+        "std::async's default policy is std::launch::async | std::launch::deferred: omitting std::launch::async lets the runtime defer parts to the caller thread and silently serialises the pipeline.",
+        "Destroying an unfinished std::future from std::async blocks in the shared state's destructor; dropping the vector without get() turns the aggregate barrier into a hidden join.",
+        "One thread per part does not scale: for hundreds of parts the spawn cost dominates the element-processing time."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async"
+      ]
+    },
+    {
+      "variant_id": "tbb-flow-graph",
+      "name": "oneTBB flow graph (fan-out nodes, join/aggregation sink)",
+      "paradigm": "concurrent",
+      "min_standard": "C++17",
+      "requires_features": [
+        "oneTBB flow graph"
+      ],
+      "idiom_name": "tbb::flow::graph with function_node per part kind + join/limiter nodes",
+      "implementation_notes": "oneTBB's flow graph is the library-grade form: the splitter is a broadcast_node (or a function_node emitting many messages), each part kind gets a function_node with its own concurrency, the graph edges encode the routing table, and a join_node or an aggregation sink with graph::wait_for_all() performs the completion barrier. Choose it when routing really is a graph - per-kind concurrency limits, continuous part streams, back-pressure via limiter_node - rather than one batch that is folded once.",
+      "code_sketch": "tbb::flow::graph g;\ntbb::flow::function_node<Part, Result> inventory(g, tbb::flow::unlimited,\n    [](const Part& p) { return check_inventory(p); });\ntbb::flow::function_node<Part, Result> payment(g, 2,\n    [](const Part& p) { return charge(p); });\n// splitter: broadcast_node<Part> src(g);\n//   make_edge(src, inventory); make_edge(src, payment);\n// aggregator: a sink collecting Results, then:\ng.wait_for_all();                       // completion barrier",
+      "pitfalls": [
+        "A node without a limiter_node, buffer_node or explicit concurrency argument accepts unbounded parallel work; bound it or one large composite saturates the arena.",
+        "Nodes and edges must be destroyed in the documented order and after wait_for_all(); deleting nodes while messages are in flight is undefined."
+      ],
+      "sources": [
+        "https://uxlfoundation.github.io/oneTBB/main/tbb_userguide/Flow_Graph.html"
+      ]
+    }
+  ],
+  "default_variant": "async-futures",
+  "version": "1.0"
+}

@@ -1,0 +1,56 @@
+{
+  "pattern": "competing-consumers",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "Thread::Queue + N worker threads (in-process)",
+  "implementation_notes": "Ruby's stdlib Thread::Queue#pop is thread-safe and hands each element to exactly one of several popping threads, so a fixed set of worker threads over one queue competes correctly inside a process; closing the queue makes blocked pops return nil and the workers exit. Threads buy concurrency for I/O-bound jobs but MRI's GVL denies CPU parallelism, which is why production Ruby scales the pattern with processes instead.",
+  "code_sketch": "queue = Thread::Queue.new\nworkers = n.times.map do\n  Thread.new do\n    while (job = queue.pop)     # each element goes to exactly one thread\n      process(job)              # ack after success for broker-backed work\n    end\n  end\nend\njobs.each { |j| queue << j }\nqueue.close\nworkers.each(&:join)",
+  "pitfalls": [
+    "The GVL serialises CPU-bound work: threads do not use multiple cores, so CPU-heavy jobs need processes (Sidekiq/Resque) rather than more threads.",
+    "Thread::Queue#pop blocks forever on an open, empty queue - close it on shutdown or workers never finish.",
+    "An exception in a worker thread can vanish into Thread.abort_on_exception=false; supervise threads and requeue or record the failure explicitly."
+  ],
+  "sources": [
+    "https://docs.ruby-lang.org/en/3.3/Thread/Queue.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "thread-queue",
+      "name": "Thread::Queue + N worker threads (in-process)",
+      "paradigm": "concurrent",
+      "idiom_name": "Thread::Queue + N worker threads (in-process)",
+      "implementation_notes": "Ruby's stdlib Thread::Queue#pop is thread-safe and hands each element to exactly one of several popping threads, so a fixed set of worker threads over one queue competes correctly inside a process; closing the queue makes blocked pops return nil and the workers exit. Threads buy concurrency for I/O-bound jobs but MRI's GVL denies CPU parallelism, which is why production Ruby scales the pattern with processes instead.",
+      "code_sketch": "queue = Thread::Queue.new\nworkers = n.times.map do\n  Thread.new do\n    while (job = queue.pop)     # each element goes to exactly one thread\n      process(job)              # ack after success for broker-backed work\n    end\n  end\nend\njobs.each { |j| queue << j }\nqueue.close\nworkers.each(&:join)",
+      "pitfalls": [
+        "The GVL serialises CPU-bound work: threads do not use multiple cores, so CPU-heavy jobs need processes (Sidekiq/Resque) rather than more threads.",
+        "Thread::Queue#pop blocks forever on an open, empty queue - close it on shutdown or workers never finish.",
+        "An exception in a worker thread can vanish into Thread.abort_on_exception=false; supervise threads and requeue or record the failure explicitly."
+      ],
+      "sources": [
+        "https://docs.ruby-lang.org/en/3.3/Thread/Queue.html"
+      ]
+    },
+    {
+      "variant_id": "sidekiq-workers",
+      "name": "Sidekiq processes on one Redis queue (production form)",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "Sidekiq"
+      ],
+      "idiom_name": "Sidekiq processes on one Redis queue (production form)",
+      "implementation_notes": "The production realization: several Sidekiq worker processes subscribe to the same Redis-backed queue(s) and each process runs its threads concurrently, so competition spans processes and hosts; Resque is the process-per-job variant, and Bunny/karafka consumers the broker equivalents. The pattern code is the job class, and the queue - with retries, scheduled sets and dead sets - is the library's responsibility, which is exactly what makes this the default choice over hand-rolled Thread::Queue pools.",
+      "code_sketch": "class SendEmailJob\n  include Sidekiq::Job\n  sidekiq_options queue: 'emails', retry: 5\n\n  def perform(user_id)\n    return if already_sent?(user_id)   # redelivery is normal: stay idempotent\n    send_email(user_id)\n  end\nend\n# scale: run more `bundle exec sidekiq -q emails` processes / more pods",
+      "pitfalls": [
+        "Sidekiq retries failed jobs by default: a job that dies after its side effect runs again, so idempotency or a dedupe key is mandatory.",
+        "Retry exhaustion moves the job to the dead set - without monitoring and a replay path that is a silent black hole.",
+        "Per-process concurrency multiplies Redis connections and database pool pressure; raising worker count without raising the DB pool causes checkout timeouts."
+      ],
+      "sources": [
+        "https://github.com/sidekiq/sidekiq/wiki/Best-Practices",
+        "https://sidekiq.org/"
+      ]
+    }
+  ],
+  "default_variant": "thread-queue"
+}

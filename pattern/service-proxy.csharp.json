@@ -1,0 +1,68 @@
+{
+  "pattern": "service-proxy",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "DispatchProxy.Create<T, TProxy>() + Invoke(MethodInfo, object?[])",
+  "implementation_notes": "The runtime materialises the classic structure for any interface: DispatchProxy.Create<IServiceApi, ServiceProxy>() returns an object implementing IServiceApi whose every call lands in the proxy's Invoke(MethodInfo, object?[]), so forwarding is written once and cannot miss a member. The real service is invoked reflectively from that single dispatch point, which is where metrics, tracing, retries and error mapping live; hand-written wrappers remain justified where per-call reflection is too costly or where IDE/refactoring visibility matters, and source-generated proxies (Roslyn or Castle.DynamicProxy) remove both concerns.",
+  "code_sketch": "// var api = DispatchProxy.Create<IServiceApi, ServiceProxy>();\nsealed class ServiceProxy : DispatchProxy      // implements IServiceApi at runtime\n{\n    private IServiceApi _real = default!;\n\n    protected override object? Invoke(MethodInfo method, object?[]? args)\n    {\n        using var span = Tracer.Start(method.Name);  // policy: tracing\n        try { return method.Invoke(_real, args); }   // delegate, same interface\n        catch (TargetInvocationException e) { throw e.InnerException!; }\n    }\n}",
+  "pitfalls": [
+    "Invoke returns object? and reflection wraps failures in TargetInvocationException: unwrap the inner exception or the proxy silently changes the service's error contract.",
+    "DispatchProxy generates interface proxies only and cannot express every signature (generic methods, ref/out parameters) - verify the interface before relying on it.",
+    "Per-call reflection costs several times a direct call; on hot paths prefer a source-generated proxy or a hand-written decorator."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.reflection.dispatchproxy"
+  ],
+  "variants": [
+    {
+      "variant_id": "dispatch-proxy",
+      "name": "Runtime interface proxy via System.Reflection.DispatchProxy",
+      "paradigm": "oo",
+      "idiom_name": "DispatchProxy.Create<T, TProxy>() + Invoke(MethodInfo, object?[])",
+      "implementation_notes": "The runtime materialises the classic structure for any interface: DispatchProxy.Create<IServiceApi, ServiceProxy>() returns an object implementing IServiceApi whose every call lands in the proxy's Invoke(MethodInfo, object?[]), so forwarding is written once and cannot miss a member. The real service is invoked reflectively from that single dispatch point, which is where metrics, tracing, retries and error mapping live; hand-written wrappers remain justified where per-call reflection is too costly or where IDE/refactoring visibility matters, and source-generated proxies (Roslyn or Castle.DynamicProxy) remove both concerns.",
+      "code_sketch": "// var api = DispatchProxy.Create<IServiceApi, ServiceProxy>();\nsealed class ServiceProxy : DispatchProxy      // implements IServiceApi at runtime\n{\n    private IServiceApi _real = default!;\n\n    protected override object? Invoke(MethodInfo method, object?[]? args)\n    {\n        using var span = Tracer.Start(method.Name);  // policy: tracing\n        try { return method.Invoke(_real, args); }   // delegate, same interface\n        catch (TargetInvocationException e) { throw e.InnerException!; }\n    }\n}",
+      "pitfalls": [
+        "Invoke returns object? and reflection wraps failures in TargetInvocationException: unwrap the inner exception or the proxy silently changes the service's error contract.",
+        "DispatchProxy generates interface proxies only and cannot express every signature (generic methods, ref/out parameters) - verify the interface before relying on it.",
+        "Per-call reflection costs several times a direct call; on hot paths prefer a source-generated proxy or a hand-written decorator."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.reflection.dispatchproxy"
+      ]
+    },
+    {
+      "variant_id": "grpc-interceptor",
+      "name": "ASP.NET Core gRPC interceptor in front of the service",
+      "paradigm": "oo",
+      "idiom_name": "Grpc.Core.Interceptors.Interceptor registered with AddGrpc",
+      "implementation_notes": "For a gRPC service the equivalent interface is the generated base class and the interception point is an interceptor registered once (services.AddGrpc(o => o.Interceptors.Add<PolicyInterceptor>())), so authentication, deadlines, tracing and error mapping wrap every unary and streaming call without touching the service. Interceptors compose in registration order, which is how the policy chain is built; the same API is available client-side for outgoing calls.",
+      "code_sketch": "public sealed class PolicyInterceptor : Interceptor\n{\n    public override async Task<TResponse> UnaryServerHandler<TRequest, TResponse>(\n        TRequest request, ServerCallContext context,\n        UnaryServerMethod<TRequest, TResponse> continuation)\n    {\n        using var span = Tracer.Start(context.Method);        // policy\n        return await continuation(request, context);          // delegate\n    }\n}\n// services.AddGrpc(o => o.Interceptors.Add<PolicyInterceptor>());",
+      "pitfalls": [
+        "Unary and streaming calls need different overrides; overriding only UnaryServerHandler leaves streaming RPCs uncontrolled while looking protected.",
+        "An interceptor that swallows or rewraps RpcException changes the status the client observes - rethrow the original or map it explicitly.",
+        "Interceptors run on the server's dispatcher for every call: blocking work there slows down all RPCs on that server."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/aspnet/core/grpc/interceptors"
+      ]
+    },
+    {
+      "variant_id": "http-delegating-handler",
+      "name": "HttpClient DelegatingHandler chain for HTTP services",
+      "paradigm": "oo",
+      "idiom_name": "DelegatingHandler.SendAsync in the HttpClient pipeline",
+      "implementation_notes": "When the fronted service is HTTP, the proxy is a message handler: derive from DelegatingHandler, apply policy in SendAsync and pass the request to base.SendAsync, which continues down the chain to the real transport. Correlation headers, token attachment, retries (Polly), logging and metrics belong there, and every client built from the configured factory inherits the chain - a language-level equivalent of the sidecar for outgoing traffic.",
+      "code_sketch": "sealed class PolicyHandler : DelegatingHandler\n{\n    protected override async Task<HttpResponseMessage> SendAsync(\n        HttpRequestMessage request, CancellationToken ct)\n    {\n        request.Headers.Add(\"x-correlation-id\", Correlation.Current);  // policy\n        var response = await base.SendAsync(request, ct);              // delegate\n        Metrics.Observe(request.RequestUri, response.StatusCode);\n        return response;\n    }\n}\n// services.AddHttpClient<IServiceApi, ServiceApi>().AddHttpMessageHandler<PolicyHandler>();",
+      "pitfalls": [
+        "Retries inside a handler must not replay an already consumed request body, and non-idempotent verbs must not be retried blindly - the policy has to be idempotency-aware.",
+        "Reading the content stream to inspect it breaks streaming responses; inspect only what the policy needs.",
+        "Handler order is interception order: logging registered after the retry handler counts attempts, registered before it counts logical calls once."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.net.http.delegatinghandler"
+      ]
+    }
+  ],
+  "default_variant": "dispatch-proxy",
+  "version": "1.0"
+}

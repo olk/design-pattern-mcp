@@ -1,0 +1,92 @@
+{
+  "pattern": "cancellation-token",
+  "language": "python",
+  "support": "library",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "asyncio-task-cancel",
+      "name": "asyncio task cancellation",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "asyncio",
+        "CancelledError",
+        "asyncio.timeout (3.11+)"
+      ],
+      "idiom_name": "Task.cancel + CancelledError propagation (edge cancellation)",
+      "implementation_notes": "In asyncio the task is the token: Task.cancel() schedules a CancelledError at the task's next await, the coroutine must let it propagate (or clean up and re-raise), and asyncio.shield protects a nested awaitable that must finish. Deadlines derive cancellation - asyncio.timeout()/asyncio.wait_for cancel the current task and translate the result into TimeoutError - and TaskGroup/gather propagate a cancel between siblings according to their documented rules. Cancellation is edge-based: it is delivered once at a suspension point and the task may even suppress it, which is why the re-raise rule matters. For synchronous code the stdlib has no equivalent and a threading.Event flag is the fallback.",
+      "code_sketch": "task = asyncio.create_task(worker(item))\n...\ntask.cancel()                            # request\n\ntry:\n    await task                           # raises CancelledError when it stops\nexcept asyncio.CancelledError:\n    log.info(\"cancelled\")\n    raise                                # never swallow cancellation",
+      "pitfalls": [
+        "Swallowing CancelledError (or catching Exception around awaits and continuing) leaves the task running in a cancelled state; since Python 3.8 CancelledError derives from BaseException, so bare except Exception no longer catches it, but an explicit catch-and-continue still breaks the contract.",
+        "Cancellation is delivered only at await points: a CPU-bound block between awaits ignores it, so offload heavy work or check asyncio.current_task().cancelling() explicitly.",
+        "asyncio.shield protects the inner awaitable but the awaiting coroutine still receives CancelledError, and a wait_for timeout cancels the shielded caller while the shielded work continues - a common source of orphaned tasks.",
+        "Task.cancel() is a request: the task may finish normally or ignore it, so code that must be sure of the outcome has to await the task (and a task reference must be kept, since the loop only holds weak references)."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://anyio.readthedocs.io/en/stable/cancellation.html"
+      ]
+    },
+    {
+      "variant_id": "anyio-cancel-scope",
+      "name": "anyio/trio cancel scopes (level cancellation)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "anyio (or trio)",
+        "CancelScope",
+        "task groups"
+      ],
+      "idiom_name": "CancelScope.cancel / move_on_after / fail_after",
+      "implementation_notes": "The structured-concurrency frameworks model cancellation as a scope rather than a single delivery: a CancelScope is a context manager that can be cancelled as a unit, every task inside an effectively cancelled scope is cancelled at each yield point (level cancellation), and a task group owns its own scope so cancelling the group cancels all its tasks. move_on_after/fail_after turn timeouts into cancel scopes with a deadline, shield=True carves out a region that must finish (shutdown/cleanup), and CancelScope.cancel(reason) records why. This is strictly stronger than asyncio's edge cancellation because a suppressed exception does not escape the scope, and the re-raise rule still applies to cancellation exceptions.",
+      "code_sketch": "async with anyio.create_task_group() as tg:\n    with anyio.move_on_after(2) as scope:        # deadline becomes cancellation\n        tg.start_soon(step, item)\n    if scope.cancelled_caught:\n        log.info(\"budget exhausted\")\n\ntg.cancel_scope.cancel()                         # cancel the whole group",
+      "pitfalls": [
+        "Cancel scopes must be entered and exited in LIFO order per task: yielding from inside a scope (async generators, manual __enter__) corrupts the stack and produces hard-to-diagnose behaviour.",
+        "Catching the framework's cancellation exception requires get_cancelled_exc_class(), since the class differs per backend; catching Exception instead is wrong in both directions and any caught cancellation must be re-raised.",
+        "Cleanup that awaits inside an already cancelled scope is cancelled immediately: wrap it in a shielded scope (or CancelScope(shield=True)) or the resource never closes.",
+        "Cancelling a scope from a task that does not own it, or cancelling a fail_after scope directly, produces misleading TimeoutErrors - cancel the task group's scope instead."
+      ],
+      "sources": [
+        "https://anyio.readthedocs.io/en/stable/cancellation.html"
+      ]
+    },
+    {
+      "variant_id": "threading-event-flag",
+      "name": "threading.Event flag for synchronous threads",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.2",
+      "requires_features": [
+        "threading.Event",
+        "timeout-capable waits"
+      ],
+      "idiom_name": "shared threading.Event checked in the loop, with Event.wait(timeout) as the interruptible wait",
+      "implementation_notes": "Synchronous Python has no way to stop a thread: the threading documentation is explicit that threads cannot be destroyed, stopped, suspended or interrupted, so the token is a hand-written threading.Event (or a bounded queue) that the worker checks each iteration and a timed wait that lets a blocked worker wake and re-check. Blocking calls must be bounded - Event.wait(timeout), Queue.get(timeout=...), socket timeouts, executor futures with timeouts - because an unbounded call never reaches a safe point. The pattern still works, but the payload of checking is on the library author rather than the runtime.",
+      "code_sketch": "stop = threading.Event()\n\ndef worker(queue):\n    while not stop.is_set():                    # safe point\n        try:\n            item = queue.get(timeout=0.1)       # bounded wait, then re-check\n        except queue.Empty:\n            continue\n        process(item)\n\nstop.set()                                      # request; thread decides when to stop",
+      "pitfalls": [
+        "An unbounded blocking call (queue.get() without timeout, socket without timeout, lock.acquire() without timeout) makes the flag invisible and the worker unresponsive - bound every wait.",
+        "Set the event before joining and keep the flag per operation tree: a module-level event cancels every worker that shares it, including unrelated pools.",
+        "The GIL does not make compound checks atomic: reading a plain boolean set by another thread is a race in principle and Event/Lock is the supported primitive.",
+        "Threads that are already blocked in uninterruptible native code cannot be rescued by any flag; such work must be isolated in a process or moved to a library with timeouts and cancellation."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/threading.html",
+        "https://docs.python.org/3/library/asyncio-task.html"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-task-cancel",
+  "idiom_name": "Task.cancel + CancelledError propagation (edge cancellation)",
+  "implementation_notes": "In asyncio the task is the token: Task.cancel() schedules a CancelledError at the task's next await, the coroutine must let it propagate (or clean up and re-raise), and asyncio.shield protects a nested awaitable that must finish. Deadlines derive cancellation - asyncio.timeout()/asyncio.wait_for cancel the current task and translate the result into TimeoutError - and TaskGroup/gather propagate a cancel between siblings according to their documented rules. Cancellation is edge-based: it is delivered once at a suspension point and the task may even suppress it, which is why the re-raise rule matters. For synchronous code the stdlib has no equivalent and a threading.Event flag is the fallback.",
+  "code_sketch": "task = asyncio.create_task(worker(item))\n...\ntask.cancel()                            # request\n\ntry:\n    await task                           # raises CancelledError when it stops\nexcept asyncio.CancelledError:\n    log.info(\"cancelled\")\n    raise                                # never swallow cancellation",
+  "pitfalls": [
+    "Swallowing CancelledError (or catching Exception around awaits and continuing) leaves the task running in a cancelled state; since Python 3.8 CancelledError derives from BaseException, so bare except Exception no longer catches it, but an explicit catch-and-continue still breaks the contract.",
+    "Cancellation is delivered only at await points: a CPU-bound block between awaits ignores it, so offload heavy work or check asyncio.current_task().cancelling() explicitly.",
+    "asyncio.shield protects the inner awaitable but the awaiting coroutine still receives CancelledError, and a wait_for timeout cancels the shielded caller while the shielded work continues - a common source of orphaned tasks.",
+    "Task.cancel() is a request: the task may finish normally or ignore it, so code that must be sure of the outcome has to await the task (and a task reference must be kept, since the loop only holds weak references)."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://anyio.readthedocs.io/en/stable/cancellation.html"
+  ]
+}

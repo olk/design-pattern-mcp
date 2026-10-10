@@ -1,0 +1,64 @@
+{
+  "pattern": "partial-acquisition",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "lazy Iterator adapters over a staged source (File plus BufReader); Stream for the async form",
+  "implementation_notes": "Rust's iterator adapters are lazy by contract - the standard library documentation states that creating an iterator does not do much and that nothing really happens until next() is called - so a chain of map/filter/take over a source is exactly a staged acquisition whose parts are fetched one at a time, and ownership plus Drop make the release of every stage that was acquired automatic and reverse-ordered (the file closes at the end of the block whether or not the iterator was exhausted). LazyLock/OnceLock supplies the shared expensive stage when several holders must see one acquisition, and the async twin of Iterator is futures::Stream, where parts arrive through poll_next with back-pressure instead of blocking. A hand-written plan is still justified when the resource is not an iterator at all (a resumable range-based transfer) or when stages need explicit checkpoints.",
+  "code_sketch": "let mut f = File::open(\"pack.bin\")?;        // stage 1: descriptor only\nlet index = Index::read_from(&mut f)?;      // cheap: offsets, lengths, checksums\nlet first = index.parts.first().ok_or(Error::Empty)?;\nf.seek(SeekFrom::Start(first.offset))?;     // stage 2: touch only this region\nlet mut buf = vec![0u8; first.len];\nf.read_exact(&mut buf)?;                    // f is dropped here: release follows acquisition",
+  "pitfalls": [
+    "Iterator chains execute only when consumed: a staged resource that is built but never driven by next()/for/collect acquires nothing, and a chain re-runs from scratch on every new traversal because iterators are not reusable.",
+    "BufReader reads ahead past the record that was asked for, so bytes fetched and bytes consumed diverge; against a metered or shared provider the stage boundary is the buffer, not the call site.",
+    "Async streams are inert until polled and generally need pinning: constructing one acquires nothing, dropping it before the first poll silently skips the expensive stage, and a stream that is polled but never completed can keep the provider side open.",
+    "Blocking reads inside an async stream stall the executor, so staged file access in async code belongs in spawn_blocking or in a runtime-aware file type."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/iter/index.html",
+    "https://doc.rust-lang.org/std/sync/struct.LazyLock.html",
+    "https://docs.rs/futures/latest/futures/stream/index.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "iterator-chain",
+      "name": "Lazy Iterator adapters over a staged source",
+      "paradigm": "functional",
+      "min_standard": "Rust1.0",
+      "idiom_name": "lazy Iterator adapters over a staged source (File plus BufReader); Stream for the async form",
+      "implementation_notes": "Rust's iterator adapters are lazy by contract - the standard library documentation states that creating an iterator does not do much and that nothing really happens until next() is called - so a chain of map/filter/take over a source is exactly a staged acquisition whose parts are fetched one at a time, and ownership plus Drop make the release of every stage that was acquired automatic and reverse-ordered (the file closes at the end of the block whether or not the iterator was exhausted). LazyLock/OnceLock supplies the shared expensive stage when several holders must see one acquisition, and the async twin of Iterator is futures::Stream, where parts arrive through poll_next with back-pressure instead of blocking. A hand-written plan is still justified when the resource is not an iterator at all (a resumable range-based transfer) or when stages need explicit checkpoints.",
+      "code_sketch": "let mut f = File::open(\"pack.bin\")?;        // stage 1: descriptor only\nlet index = Index::read_from(&mut f)?;      // cheap: offsets, lengths, checksums\nlet first = index.parts.first().ok_or(Error::Empty)?;\nf.seek(SeekFrom::Start(first.offset))?;     // stage 2: touch only this region\nlet mut buf = vec![0u8; first.len];\nf.read_exact(&mut buf)?;                    // f is dropped here: release follows acquisition",
+      "pitfalls": [
+        "Iterator chains execute only when consumed: a staged resource that is built but never driven by next()/for/collect acquires nothing, and a chain re-runs from scratch on every new traversal because iterators are not reusable.",
+        "BufReader reads ahead past the record that was asked for, so bytes fetched and bytes consumed diverge; against a metered or shared provider the stage boundary is the buffer, not the call site.",
+        "Async streams are inert until polled and generally need pinning: constructing one acquires nothing, dropping it before the first poll silently skips the expensive stage, and a stream that is polled but never completed can keep the provider side open.",
+        "Blocking reads inside an async stream stall the executor, so staged file access in async code belongs in spawn_blocking or in a runtime-aware file type."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/iter/index.html",
+        "https://doc.rust-lang.org/std/sync/struct.LazyLock.html",
+        "https://docs.rs/futures/latest/futures/stream/index.html"
+      ]
+    },
+    {
+      "variant_id": "async-stream",
+      "name": "futures::Stream with asynchronous part production",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.39",
+      "requires_features": [
+        "async",
+        "futures"
+      ],
+      "idiom_name": "futures::Stream plus StreamExt adapters",
+      "implementation_notes": "The asynchronous variant of an iterator: Stream produces parts over time, adapters such as buffered, chunks and then compose the stages, and none of the work happens until the stream is polled, which lets the consumer control how many parts are in flight. The futures documentation groups Stream with StreamExt and TryStreamExt exactly as Iterator is grouped with its adapters, so the staged shape is preserved; use it when the deferred parts arrive over the network or from another task, and pair it with an explicit bound (take, chunks, timeout) so the stream cannot run unbounded.",
+      "code_sketch": "let mut parts = fetch_stream(index.ranges)   // nothing fetched until polled\n    .map(|raw| decode(raw))\n    .buffered(4)                             // bounded parts in flight\n    .boxed();\nwhile let Some(part) = parts.next().await? { // stage 2: one part per poll\n    consume(part);\n}",
+      "pitfalls": [
+        "Streams must be pinned to be polled; forgetting the pin or dropping the stream before the first poll means the expensive stage never runs while the code believes it started.",
+        "buffered/buffer_unordered multiplies in-flight parts, which is exactly the shared expensive stage being duplicated - bound it explicitly and account for the memory of concurrent parts.",
+        "Errors are carried in the item type (TryStream) and must be propagated per part, or a failure mid-stream is silently dropped and the consumer keeps a partially acquired resource."
+      ],
+      "sources": [
+        "https://docs.rs/futures/latest/futures/stream/index.html"
+      ]
+    }
+  ],
+  "default_variant": "iterator-chain",
+  "version": "1.0"
+}

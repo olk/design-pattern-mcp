@@ -1,0 +1,56 @@
+{
+  "pattern": "pessimistic-offline-lock",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "LockModeType.PESSIMISTIC_WRITE, EntityManager.lock/find or Spring Data @Lock",
+  "implementation_notes": "The default Java realization asks the persistence provider for a database row lock: EntityManager.find(entity, LockModeType.PESSIMISTIC_WRITE), Query.setLockMode, or Spring Data's @Lock(PESSIMISTIC_WRITE) on a repository method. The lock belongs to the surrounding system transaction, so it is the claiming primitive and not the offline lease: the lock record's owner and timeout columns are what keep the claim alive between requests, and JPA's PessimisticLockException (transaction rollback) versus LockTimeoutException (statement-level) must both be handled where the lock is taken.",
+  "code_sketch": "interface LockRecordRepository extends JpaRepository<LockRecord, Long> {\n    @Lock(LockModeType.PESSIMISTIC_WRITE)\n    @Query(\"select l from LockRecord l where l.lockable = :key\")\n    Optional<LockRecord> lockByKey(@Param(\"key\") String key);\n}\n// claim: repo.lockByKey(key).orElseGet(() -> repo.save(new LockRecord(key, sessionId)));",
+  "pitfalls": [
+    "PESSIMISTIC_WRITE lives and dies with the transaction: using it during user think time means an open transaction per editing user, which the persistence provider and the connection pool will punish.",
+    "PESSIMISTIC_WRITE locks every row a query returns, so filtering is a locking decision - a broad query can lock far more than the aggregate being edited.",
+    "PessimisticLockException forces a transaction rollback while LockTimeoutException may roll back only the statement; callers that treat them alike leave silent lock records or half-done work."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javaee/7/api/javax/persistence/LockModeType.html",
+    "https://docs.spring.io/spring-data/jpa/reference/jpa/locking.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "jpa-pessimistic-write",
+      "name": "JPA / Spring Data pessimistic write lock",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "LockModeType.PESSIMISTIC_WRITE, EntityManager.lock/find or Spring Data @Lock",
+      "implementation_notes": "The default Java realization asks the persistence provider for a database row lock: EntityManager.find(entity, LockModeType.PESSIMISTIC_WRITE), Query.setLockMode, or Spring Data's @Lock(PESSIMISTIC_WRITE) on a repository method. The lock belongs to the surrounding system transaction, so it is the claiming primitive and not the offline lease: the lock record's owner and timeout columns are what keep the claim alive between requests, and JPA's PessimisticLockException (transaction rollback) versus LockTimeoutException (statement-level) must both be handled where the lock is taken.",
+      "code_sketch": "interface LockRecordRepository extends JpaRepository<LockRecord, Long> {\n    @Lock(LockModeType.PESSIMISTIC_WRITE)\n    @Query(\"select l from LockRecord l where l.lockable = :key\")\n    Optional<LockRecord> lockByKey(@Param(\"key\") String key);\n}\n// claim: repo.lockByKey(key).orElseGet(() -> repo.save(new LockRecord(key, sessionId)));",
+      "pitfalls": [
+        "PESSIMISTIC_WRITE lives and dies with the transaction: using it during user think time means an open transaction per editing user, which the persistence provider and the connection pool will punish.",
+        "PESSIMISTIC_WRITE locks every row a query returns, so filtering is a locking decision - a broad query can lock far more than the aggregate being edited.",
+        "PessimisticLockException forces a transaction rollback while LockTimeoutException may roll back only the statement; callers that treat them alike leave silent lock records or half-done work."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/api/javax/persistence/LockModeType.html",
+        "https://docs.spring.io/spring-data/jpa/reference/jpa/locking.html"
+      ]
+    },
+    {
+      "variant_id": "jdbc-lock-table",
+      "name": "Explicit lock table claimed with SELECT ... FOR UPDATE",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "JDBC/JdbcTemplate lock record row, transaction closed right after the claim",
+      "implementation_notes": "Fowler's original shape without an ORM in the picture: one row per lockable in a lock table, claimed inside one short JDBC transaction that commits immediately after the claim, with owner and acquired_at persisted in the row. The FOR UPDATE must be applied to the lock record (never to the business data row), because the transaction that takes it is about to end; this variant is chosen when the lock manager should be plain SQL and testable without a persistence provider.",
+      "code_sketch": "try (Connection con = ds.getConnection()) {\n    con.setAutoCommit(false);\n    try (PreparedStatement ps = con.prepareStatement(\n            \"select owner from lock_record where lockable = ? for update\")) {\n        ps.setString(1, key);\n        ResultSet rs = ps.executeQuery();      // locks the lock row (or its gap)\n        // insert when absent / update owner + acquired_at when free\n    }\n    con.commit();                              // lock record outlives the tx\n}",
+      "pitfalls": [
+        "SELECT ... FOR UPDATE on a row that does not exist yet takes no lock in READ COMMITTED, so two sessions can both read 'free': use a unique constraint plus INSERT ... ON CONFLICT, or insert first and lock after.",
+        "Commit immediately after the claim; a connection held open while the user thinks exhausts the pool and contradicts the offline premise.",
+        "The lock table becomes hot under contention: index the lockable key and keep the lock row narrow."
+      ],
+      "sources": [
+        "https://www.postgresql.org/docs/current/explicit-locking.html"
+      ]
+    }
+  ],
+  "default_variant": "jpa-pessimistic-write"
+}

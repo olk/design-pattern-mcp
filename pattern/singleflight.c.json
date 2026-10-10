@@ -1,0 +1,19 @@
+{
+  "pattern": "singleflight",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread mutex + per-key entry with a condition variable (broadcast on completion)",
+  "implementation_notes": "POSIX threads provide no future, so the classic structure is written by hand: one mutex guards a registry (hash table) that maps key to a flight entry, and each entry carries its own condition variable, a done flag, the status/result slots and a waiter count. The first thread to register an entry becomes the leader: it unlocks the mutex, computes, then re-locks, publishes the value or status, removes the key and calls pthread_cond_broadcast; every other thread waits on the entry's condition until done is set. Condition variables only support this hand-off - there is no shareable result object - so what replaces the classic completion handle is the entry plus its predicate, and the entry must outlive the last waiter (a reference count or an equivalent reclaim protocol), because waiting threads hold a pointer to it. pthread_once only covers a fixed, compile-time known set of one-shot initialisations; per-key coalescing needs the registry above.",
+  "code_sketch": "pthread_mutex_lock(&g->mu);\nf = map_get(&g, key);\nif (f) {                                      /* waiter: join the flight */\n    f->waiters++; while (!f->done) pthread_cond_wait(&f->cv, &g->mu);\n    copy_out(f, out); f->waiters--;\n} else {                                      /* leader: register, then run */\n    f = flight_new(); map_put(&g, key, f);\n    pthread_mutex_unlock(&g->mu);\n    flight_run(f, load, key);                 /* exactly one execution */\n    pthread_mutex_lock(&g->mu);\n    map_del(&g, key); f->done = 1; pthread_cond_broadcast(&f->cv); /* forget */\n}\npthread_mutex_unlock(&g->mu);                 /* reclaim f when waiters == 0 */",
+  "pitfalls": [
+    "The predicate (done, result, status) and the condition variable must be changed under the same mutex that guards pthread_cond_wait; signalling outside it is a lost-wakeup race.",
+    "The entry must outlive every waiter: freeing it as soon as the leader completes is a use-after-free - reclaim it only after the last waiter has copied the result.",
+    "pthread_cond_signal restarts exactly one unspecified waiter; with several waiters you need pthread_cond_broadcast (or one channel per waiter).",
+    "A leader that never completes (blocked call, cancelled thread) leaves waiters blocked forever; waiting needs pthread_cond_timedwait with a deadline and a documented policy.",
+    "Handing all waiters a pointer into the leader's frame or a buffer the leader frees corrupts the shared answer - copy the result into caller-owned storage."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html"
+  ],
+  "version": "1.0"
+}

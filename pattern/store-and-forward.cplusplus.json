@@ -1,0 +1,65 @@
+{
+  "pattern": "store-and-forward",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "SQLite spool table (journal_mode=WAL, synchronous=FULL) + drain thread",
+  "implementation_notes": "Use SQLite as the embedded local store: PRAGMA journal_mode=WAL switches to the write-ahead log and PRAGMA synchronous=FULL makes each commit sync the WAL, so a committed INSERT is the accept point (with the usual WAL setting NORMAL, committed transactions survive process crashes but not power loss). A worker thread - std::jthread, or a loop parked on a std::condition_variable - reads the oldest rows, delivers them and deletes a row only after the peer acknowledged; the sender and the drainer share one connection behind a std::mutex or use separate connections, in which case SQLITE_BUSY/SQLITE_LOCKED must be handled as backpressure rather than as a fatal error. A file-based spool using std::filesystem::rename is the alternative when SQLite must not be linked; the hand-written structure is justified whenever the payload must survive the process and no messaging runtime is available.",
+  "code_sketch": "sqlite3_exec(db, \"PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;\", nullptr, nullptr, nullptr);\nsqlite3_exec(db, \"INSERT INTO spool(payload) VALUES (?);\", ...);   // accept point\n// drain thread, started at boot as well:\nwhile (!stop) {\n  // SELECT rowid, payload FROM spool ORDER BY rowid LIMIT 1\n  // deliver(); on ack -> DELETE FROM spool WHERE rowid = ?; else backoff(multiplier * 2)\n}",
+  "pitfalls": [
+    "synchronous=NORMAL (the usual WAL recommendation) commits without syncing the WAL, so a power loss rolls back messages the sender already accepted.",
+    "SQLITE_BUSY / SQLITE_LOCKED from a second writer connection must be retried with a delay instead of failing the accept path.",
+    "Deleting the row before the acknowledgement, or deleting by payload instead of by primary key, drops messages the peer never processed.",
+    "The drain thread must be joined before the sqlite3 handle is closed; a detached thread touching a closed handle crashes the process."
+  ],
+  "sources": [
+    "https://www.sqlite.org/wal.html",
+    "https://en.cppreference.com/w/cpp/filesystem/rename"
+  ],
+  "variants": [
+    {
+      "variant_id": "sqlite-wal-spool",
+      "name": "SQLite WAL spool table drained by a worker thread",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "requires_features": [
+        "SQLite"
+      ],
+      "idiom_name": "SQLite spool table (journal_mode=WAL, synchronous=FULL) + drain thread",
+      "implementation_notes": "Use SQLite as the embedded local store: PRAGMA journal_mode=WAL switches to the write-ahead log and PRAGMA synchronous=FULL makes each commit sync the WAL, so a committed INSERT is the accept point (with the usual WAL setting NORMAL, committed transactions survive process crashes but not power loss). A worker thread - std::jthread, or a loop parked on a std::condition_variable - reads the oldest rows, delivers them and deletes a row only after the peer acknowledged; the sender and the drainer share one connection behind a std::mutex or use separate connections, in which case SQLITE_BUSY/SQLITE_LOCKED must be handled as backpressure rather than as a fatal error. A file-based spool using std::filesystem::rename is the alternative when SQLite must not be linked; the hand-written structure is justified whenever the payload must survive the process and no messaging runtime is available.",
+      "code_sketch": "sqlite3_exec(db, \"PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;\", nullptr, nullptr, nullptr);\nsqlite3_exec(db, \"INSERT INTO spool(payload) VALUES (?);\", ...);   // accept point\n// drain thread, started at boot as well:\nwhile (!stop) {\n  // SELECT rowid, payload FROM spool ORDER BY rowid LIMIT 1\n  // deliver(); on ack -> DELETE FROM spool WHERE rowid = ?; else backoff(multiplier * 2)\n}",
+      "pitfalls": [
+        "synchronous=NORMAL (the usual WAL recommendation) commits without syncing the WAL, so a power loss rolls back messages the sender already accepted.",
+        "SQLITE_BUSY / SQLITE_LOCKED from a second writer connection must be retried with a delay instead of failing the accept path.",
+        "Deleting the row before the acknowledgement, or deleting by payload instead of by primary key, drops messages the peer never processed.",
+        "The drain thread must be joined before the sqlite3 handle is closed; a detached thread touching a closed handle crashes the process."
+      ],
+      "sources": [
+        "https://www.sqlite.org/wal.html",
+        "https://en.cppreference.com/w/cpp/filesystem/rename"
+      ]
+    },
+    {
+      "variant_id": "asio-file-spool",
+      "name": "Boost.Asio forwarder with a file spool and timer-driven backoff",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "Boost.Asio"
+      ],
+      "idiom_name": "io_context steady_timer retry chain over a spool directory",
+      "implementation_notes": "When no embedded database is available the forwarder becomes an Asio completion chain: after each delivery attempt a steady_timer re-arms with exponential backoff while the peer is unreachable, and the same io_context can carry the delivery socket, so no dedicated drain thread is needed. The spool itself stays one file per message written with fsync + rename; the timer handler owns the retry state, which makes the backoff policy explicit instead of a sleep inside a loop. Choose it in embedded or dependency-averse builds, or where the sender already runs an Asio-based network stack.",
+      "code_sketch": "void schedule(steady_timer& t, std::chrono::milliseconds d) {\n  t.expires_after(d);\n  t.async_wait([&](error_code ec) { if (!ec) drain_once(&schedule); });\n}\n// drain_once delivers the oldest spool file; on failure it re-arms with d * 2,\n// on success it removes the file and immediately schedules the next pass.",
+      "pitfalls": [
+        "The timer must outlive async_wait; a local steady_timer that goes out of scope cancels the retry chain silently.",
+        "Blocking file I/O or a blocking send inside an io_context handler stalls the whole executor - post it to a thread pool instead.",
+        "Unbounded doubling of the delay can strand messages forever once the peer returns; cap the backoff and add a TTL or an external replay trigger."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio.html",
+        "https://man7.org/linux/man-pages/man2/fsync.2.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlite-wal-spool",
+  "version": "1.0"
+}

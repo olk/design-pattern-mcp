@@ -1,0 +1,76 @@
+{
+  "pattern": "producer-consumer",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "sync_channel(bound) with SyncSender::send and Receiver::recv/iter",
+  "implementation_notes": "The standard library's bounded channel is the pattern: let (tx, rx) = sync_channel(bound) makes SyncSender::send block while the buffer is full (try_send returns TrySendError::Full or ::Disconnected instead) and Receiver::recv block while empty, with recv_timeout for a bounded wait and rx.iter() draining until disconnect; a bound of 0 is a rendezvous channel. Dropping all senders disconnects the channel, so recv returns Err(RecvError) and iteration ends - the idiomatic termination signal needs no sentinel. std::sync::mpsc has exactly one Receiver, so several consumer threads must share it behind a Mutex (or use crossbeam-channel for true multi-consumer); send moves items into the queue, so ownership and borrow checking handle the hand-off the way other languages need discipline for.",
+  "code_sketch": "let (tx, rx) = sync_channel::<Job>(1024);\n\nlet producer = thread::spawn(move || {\n    for job in source() {\n        tx.send(job).unwrap();       // blocks while full\n    }\n});\n\nfor job in rx {                      // ends when all senders drop\n    handle(job);\n}\nproducer.join().unwrap();",
+  "pitfalls": [
+    "std's mpsc supports only one Receiver; multiple consumers must serialize on a Mutex<Receiver> (the lock becomes the bottleneck) or use crossbeam-channel instead.",
+    "send() blocks the calling OS thread: inside an async runtime that starves the executor - use a runtime-native channel there, or spawn_blocking.",
+    "channel() (unbounded) removes backpressure entirely; choosing sync_channel is choosing the bound.",
+    "Drop order is observable: if the receiver goes first, sends fail with Disconnected and the producer must treat that as an expected shutdown, not a panic."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-mpsc-sync",
+      "name": "std::sync::mpsc::sync_channel (bounded, blocking)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.0",
+      "idiom_name": "sync_channel(bound) with SyncSender::send and Receiver::recv/iter",
+      "implementation_notes": "The standard library's bounded channel is the pattern: let (tx, rx) = sync_channel(bound) makes SyncSender::send block while the buffer is full (try_send returns TrySendError::Full or ::Disconnected instead) and Receiver::recv block while empty, with recv_timeout for a bounded wait and rx.iter() draining until disconnect; a bound of 0 is a rendezvous channel. Dropping all senders disconnects the channel, so recv returns Err(RecvError) and iteration ends - the idiomatic termination signal needs no sentinel. std::sync::mpsc has exactly one Receiver, so several consumer threads must share it behind a Mutex (or use crossbeam-channel for true multi-consumer); send moves items into the queue, so ownership and borrow checking handle the hand-off the way other languages need discipline for.",
+      "code_sketch": "let (tx, rx) = sync_channel::<Job>(1024);\n\nlet producer = thread::spawn(move || {\n    for job in source() {\n        tx.send(job).unwrap();       // blocks while full\n    }\n});\n\nfor job in rx {                      // ends when all senders drop\n    handle(job);\n}\nproducer.join().unwrap();",
+      "pitfalls": [
+        "std's mpsc supports only one Receiver; multiple consumers must serialize on a Mutex<Receiver> (the lock becomes the bottleneck) or use crossbeam-channel instead.",
+        "send() blocks the calling OS thread: inside an async runtime that starves the executor - use a runtime-native channel there, or spawn_blocking.",
+        "channel() (unbounded) removes backpressure entirely; choosing sync_channel is choosing the bound.",
+        "Drop order is observable: if the receiver goes first, sends fail with Disconnected and the producer must treat that as an expected shutdown, not a panic."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html"
+      ]
+    },
+    {
+      "variant_id": "crossbeam-mpmc",
+      "name": "crossbeam-channel (MPMC with select! and timeouts)",
+      "paradigm": "concurrent",
+      "idiom_name": "crossbeam_channel::bounded(cap) with cloned Sender/Receiver and select!",
+      "implementation_notes": "crossbeam-channel is the multi-producer multi-consumer replacement for std's mpsc: bounded(cap) creates a bounded channel whose send blocks while full, Senders and Receivers clone freely so any number of threads can produce and consume the same queue, try_send/recv_timeout give non-blocking and bounded waits, and select! lets one consumer wait on several channels or a shutdown signal at once. Disconnection semantics match std's - when all senders or all receivers are dropped, operations return errors instead of blocking - which supplies the shutdown path. Reach for it when a single Receiver or all-or-nothing blocking is the limitation and an async runtime is not wanted.",
+      "code_sketch": "let (tx, rx) = crossbeam_channel::bounded::<Job>(1024);\n\nfor _ in 0..4 {\n    let rx = rx.clone();               // multi-consumer\n    thread::spawn(move || { for job in rx { handle(job); } });\n}\nselect! {\n    send(tx, job) -> res => res.unwrap(),\n    default(Duration::from_millis(50)) => { /* full-queue policy */ }\n}",
+      "pitfalls": [
+        "recv() blocks with no timeout; use recv_timeout when the consumer must also observe a shutdown flag.",
+        "select! picks randomly among ready operations, so dispatch order is not deterministic.",
+        "Dropping all receivers disconnects the channel: send then returns Err(SendError) and the producer must treat that as shutdown."
+      ],
+      "sources": [
+        "https://docs.rs/crossbeam-channel/latest/crossbeam_channel/"
+      ]
+    },
+    {
+      "variant_id": "tokio-mpsc",
+      "name": "tokio::sync::mpsc (async, bounded)",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async",
+        "tokio"
+      ],
+      "idiom_name": "tokio::sync::mpsc::channel(capacity) with send().await / recv().await and close()",
+      "implementation_notes": "In async Rust the runtime provides the queue: tokio::sync::mpsc::channel(capacity) is bounded, Sender::send awaits while the buffer is full (backpressure without blocking a thread), try_send is the non-blocking form, and the single Receiver::recv awaits an item or None once all senders are dropped and the buffer drains. reserve() hands out a permit so a producer can hold a slot while preparing a value, blocking_send/blocking_recv bridge synchronous code (outside the runtime), and Receiver::close() starts a clean shutdown that lets already-buffered messages drain. Because it is single-consumer, spreading work across tasks needs a mutex around the receiver (which serializes it) or one channel per consumer.",
+      "code_sketch": "let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(1024);\n\ntokio::spawn(async move {\n    for job in source().await {\n        tx.send(job).await.unwrap();   // awaits while full\n    }\n});\n\nwhile let Some(job) = rx.recv().await {    // None = closed\n    handle(job).await;\n}",
+      "pitfalls": [
+        "The receiver is single-consumer; sharing it behind a Mutex serializes consumption and can stall the runtime if the lock is held across await.",
+        "A task that cannot make progress while holding a send permit can deadlock a cyclic pipeline - keep the stage graph acyclic and drain downstream.",
+        "Dropping the receiver makes sends fail; dropping all senders is the clean end-of-stream signal (recv returns None after the buffer drains)."
+      ],
+      "sources": [
+        "https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html"
+      ]
+    }
+  ],
+  "default_variant": "std-mpsc-sync"
+}

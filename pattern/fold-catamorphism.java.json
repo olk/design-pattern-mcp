@@ -1,0 +1,80 @@
+{
+  "pattern": "fold-catamorphism",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "Stream.reduce, Collectors.reducing, IntStream.sum",
+  "implementation_notes": "The JDK's fold is the reduction: Stream.reduce has three shapes - reduce(BinaryOperator) returning Optional (empty stream gives an empty Optional), reduce(identity, BinaryOperator) returning the identity for an empty stream, and reduce(identity, accumulator, combiner) whose combiner merges partial results - and all of them require an associative accumulation function that the API documents and never checks. Collectors.reducing and the primitive specializations (IntStream.sum, IntStream.max, Collectors.joining) are the monoid cases and are preferable where they exist, and collect(Supplier, BiConsumer, BiConsumer) is the mutable-reduction counterpart for carriers that are mutated rather than rebuilt. Reach for reduce when the stream is a pipeline whose stages already produce the elements; for a recursive object graph the sibling switch-pattern variant is the Java 21 answer.",
+  "code_sketch": "int total = orders.stream().reduce(0, (sum, o) -> sum + o.amount);      // identity fold\n\nOptional<Integer> max = counts.stream().reduce(Integer::max);           // empty-safe fold\n\nString joined = names.stream().collect(Collectors.joining(\", \"));       // monoid specialization",
+  "pitfalls": [
+    "A mutable object is not a valid identity: reduce(new ArrayList<>(), ...) appends into one shared container (and into several partial ones under parallelism), which is what collect(Supplier, BiConsumer, BiConsumer) or a Collector exists for.",
+    "reduce(BinaryOperator) returns Optional precisely because the empty case has no value: calling get() without handling emptiness turns an empty stream into a NoSuchElementException.",
+    "reduce(identity, op) with a non-associative op is accepted and silently produces left-fold semantics for sequential streams, so the same code changes its answer the day someone makes the stream parallel."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "stream-reduce",
+      "name": "Stream reduction: reduce(BinaryOperator) / reduce(identity, accumulator)",
+      "paradigm": "declarative",
+      "min_standard": "Java8",
+      "idiom_name": "Stream.reduce, Collectors.reducing, IntStream.sum",
+      "implementation_notes": "The JDK's fold is the reduction: Stream.reduce has three shapes - reduce(BinaryOperator) returning Optional (empty stream gives an empty Optional), reduce(identity, BinaryOperator) returning the identity for an empty stream, and reduce(identity, accumulator, combiner) whose combiner merges partial results - and all of them require an associative accumulation function that the API documents and never checks. Collectors.reducing and the primitive specializations (IntStream.sum, IntStream.max, Collectors.joining) are the monoid cases and are preferable where they exist, and collect(Supplier, BiConsumer, BiConsumer) is the mutable-reduction counterpart for carriers that are mutated rather than rebuilt. Reach for reduce when the stream is a pipeline whose stages already produce the elements; for a recursive object graph the sibling switch-pattern variant is the Java 21 answer.",
+      "code_sketch": "int total = orders.stream().reduce(0, (sum, o) -> sum + o.amount);      // identity fold\n\nOptional<Integer> max = counts.stream().reduce(Integer::max);           // empty-safe fold\n\nString joined = names.stream().collect(Collectors.joining(\", \"));       // monoid specialization",
+      "pitfalls": [
+        "A mutable object is not a valid identity: reduce(new ArrayList<>(), ...) appends into one shared container (and into several partial ones under parallelism), which is what collect(Supplier, BiConsumer, BiConsumer) or a Collector exists for.",
+        "reduce(BinaryOperator) returns Optional precisely because the empty case has no value: calling get() without handling emptiness turns an empty stream into a NoSuchElementException.",
+        "reduce(identity, op) with a non-associative op is accepted and silently produces left-fold semantics for sequential streams, so the same code changes its answer the day someone makes the stream parallel."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html"
+      ]
+    },
+    {
+      "variant_id": "sealed-switch-cata",
+      "name": "Structural fold over a sealed hierarchy with record-pattern switch",
+      "paradigm": "functional",
+      "min_standard": "Java21",
+      "requires_features": [
+        "sealed interfaces",
+        "record patterns",
+        "pattern matching for switch"
+      ],
+      "idiom_name": "sealed interface + record cases + exhaustive switch expression",
+      "implementation_notes": "Java 21 makes the hand-written catamorphism type-safe: declare the cases as records implementing a sealed interface, write the algebra as one switch expression that matches record patterns and recurses into the components, and rely on the compiler's exhaustiveness analysis - JEP 441 derives coverage from the permits clause, so no default label is needed and a missing case is a compile error, and JEP 440's record patterns nest arbitrarily, which is exactly what folding a recursive type requires. The JEP is explicit that an exhaustive switch without a match-all clause is better than one with a default, because only then does the compiler report forgotten cases. Use it when the cases are data whose operations should stay outside the type; keep a classic Visitor when operations multiply faster than cases.",
+      "code_sketch": "sealed interface Expr permits Lit, Add, Mul {}\nrecord Lit(int v) implements Expr {}\nrecord Add(Expr l, Expr r) implements Expr {}\nrecord Mul(Expr l, Expr r) implements Expr {}\n\nstatic int eval(Expr e) {\n    return switch (e) {                       // exhaustive: no default needed\n        case Lit(int v)          -> v;\n        case Add(Expr l, Expr r) -> eval(l) + eval(r);\n        case Mul(Expr l, Expr r) -> eval(l) * eval(r);\n    };\n}",
+      "pitfalls": [
+        "Exhaustiveness is a compile-time approximation: when the switch and the sealed type are compiled separately, the compiler inserts a synthetic default that throws MatchException at run time for a case that appears after the switch was compiled.",
+        "A record-pattern fold is still ordinary recursion on the JVM stack - no tail-call elimination - so deeply nested input overflows the thread stack and needs an explicit worklist.",
+        "The switch expression must produce a value on every path, so a stateful traversal forces its state into the carrier or into locals: when the traversal is genuinely stateful, a Visitor or an iterative descent states that more honestly."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/441",
+        "https://openjdk.org/jeps/440"
+      ]
+    },
+    {
+      "variant_id": "parallel-reduce-combiner",
+      "name": "Parallel reduction with an explicit combiner",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "requires_features": [
+        "parallel streams"
+      ],
+      "idiom_name": "stream.parallel().reduce(identity, accumulator, combiner)",
+      "implementation_notes": "The three-argument reduce exists for parallel execution: the stream is split, each chunk folds identity and elements with the accumulator, and the combiner merges the partial results, so the combine must be associative and the identity a true identity or the result depends on the split. Use it for large, cheap-to-split, associative folds (sums, counts, extrema, bitwise combination); for mutable accumulation use collect with a concurrent collector, and for small streams stay serial because splitting costs more than the fold saves. The JDK documents the requirement rather than enforcing it: correctness under parallelism is the caller's algebraic obligation, which is worth a test that runs the same fold serially and in parallel and compares.",
+      "code_sketch": "long total = orders.parallelStream()\n    .reduce(0L,\n            (sum, o) -> sum + o.amount,        // accumulator: one partial per chunk\n            Long::sum);                        // combiner: merges partial results",
+      "pitfalls": [
+        "Associativity cannot be checked by the compiler: with subtraction, concatenation or averaging the parallel result differs from the serial one and nothing fails - the fold is simply wrong.",
+        "A three-argument reduce that ignores its combiner is correct only while the stream is sequential; the day it is parallelized, the partial results are merged by the degenerate combiner and the fold loses elements.",
+        "Parallel streams execute in the shared common ForkJoinPool: a blocking or I/O-bound accumulator starves unrelated tasks, and mutating shared state from the accumulator races instead of accumulating."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html"
+      ]
+    }
+  ],
+  "default_variant": "stream-reduce",
+  "version": "1.0"
+}

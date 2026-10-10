@@ -1,0 +1,160 @@
+{
+  "category": "concurrency-resilience",
+  "name": "singleflight",
+  "aliases": [
+    "request coalescing",
+    "request collapsing"
+  ],
+  "intent": "Collapse concurrent, equivalent requests for the same key into a single in-flight execution whose result or error is handed to every waiter, so a burst of identical calls cannot multiply the work done by the slow dependency behind them.",
+  "problem": "A hot key expires, a cold cache is hit, or a slow dependency is simply expensive: N concurrent callers ask for the same thing at the same moment and every one of them starts its own copy of the same computation. No individual caller can see the duplication - the damage is collective: the database, upstream service or object store receives N identical requests, their threads or connections are consumed, and the cache-populating write races itself. The cache that was supposed to protect the dependency now triggers periodic load spikes (the cache stampede / thundering herd), and the decision - coalesce this key or let every caller run - has to be made per key at the point where the expensive call is made, not per caller.",
+  "context": "Concurrent servers, workers and UI layers where equivalent requests can overlap in time - request handlers reading through a cache, service methods fetching the same resource, loaders resolving the same ids within one tick or frame - and where the computation behind a key is expensive, free of per-caller side effects and safe to run once on behalf of several callers. It applies when callers can accept the leader's result and timing, when the runtime offers a shareable completion handle (future, promise, task, channel, condition variable), and when every input that changes the result can be captured in the key, tenant and authorisation scope included.",
+  "benefits": [
+    "Duplicate work collapses at the source: N concurrent callers for one key produce exactly one execution, so the slow dependency sees one request instead of a burst - the cache-stampede / thundering-herd fix.",
+    "Waiters get the leader's latency instead of the serialized sum: latecomers join the running flight rather than starting behind it, and a cold key warms exactly once under load.",
+    "Downstream resources stay bounded: connection pools, thread pools and query budgets are no longer multiplied by the number of callers that happen to arrive together.",
+    "One consistent answer for the whole flight: every waiter observes the same value or the same error, so equivalent requests cannot return divergent results because of interleaved partial states.",
+    "A small, local wrapper: it can be applied around one expensive call (typically the cache-miss loader) without changing callers' signatures, the transport or the surrounding architecture.",
+    "It composes with caching instead of replacing it: the miss path is coalesced while the cache keeps results for later callers - the classic cache-aside + singleflight pairing."
+  ],
+  "tradeoffs": [
+    "Shared latency: every waiter is as slow as the leader plus the join, and there is no way for a waiter to get the answer sooner; a slow flight also holds a growing set of waiters.",
+    "Shared failure: the leader's error is delivered to all waiters, so one failure becomes N observed failures, attribution points at the leader's stack rather than each caller's context, and a caller that would have retried has to do so on its own.",
+    "Single-process scope: the registry is in-process, so N replicas still perform N executions; cross-instance deduplication needs a distributed lock, a shared cache or request routing, each with its own cost and failure modes.",
+    "Key correctness is a correctness and security burden: a key that omits a result-affecting input (tenant, authorisation scope, locale, configuration version, a parameter) coalesces different requests and can hand one principal another's result - the pattern's safety is exactly as good as its key.",
+    "Waiter lifetime must be separated from flight lifetime: a waiter that times out or is cancelled has to stop waiting without cancelling the shared work, so the implementation needs both a way to join and a way to leave, owned by something longer-lived than any single caller.",
+    "Not a cache - every later caller pays again: the entry is forgotten when the flight completes, so combining coalescing with reuse needs two deliberate lifetimes (the in-flight entry and the cached result), and mixing them silently turns the registry into an unbounded cache.",
+    "Observability shifts: duplicate calls become one execution, so per-caller request counts, traces and dashboards no longer line up unless the coalescer reports flights, waiters and duplicates suppressed."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 7,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Caller (leader or waiter)",
+      "responsibility": "Requests the work for a key; the first caller becomes the leader and runs the computation, later callers become waiters that join the existing flight and receive its outcome."
+    },
+    {
+      "role": "Coalescing Key",
+      "responsibility": "Names the work: every input that can change the result - operation, parameters, tenant and authorisation scope, configuration version - derived in one place next to the coalescer, never improvised at call sites."
+    },
+    {
+      "role": "In-Flight Registry",
+      "responsibility": "Concurrent map from key to flight entry with an atomic compute-if-absent step, so exactly one leader is registered per key while a computation is running."
+    },
+    {
+      "role": "Shared Flight",
+      "responsibility": "The single execution plus the shareable completion handle (future, promise, task, channel, condition variable) through which the leader publishes value or error and any number of waiters observe it."
+    },
+    {
+      "role": "Completion Hand-off and Forget",
+      "responsibility": "Publishes the outcome to waiters that arrived after the call too, then removes the entry so the next caller after completion starts a fresh execution (with a way to drop a key early when a flight must be replaced)."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Cache-aside miss path: the first request after expiry loads the value while concurrent requests for the same key wait and share it, so the database or upstream API sees one read per key per expiry.",
+    "Expensive read-through service methods: a user profile, product catalogue, permission set or exchange rate requested by many handlers for the same id in the same moment.",
+    "Metadata and key-material refresh: JWKS/certificate, token-endpoint or configuration fetches triggered simultaneously by many in-flight requests.",
+    "Loader-style data access within a request or tick: a per-request loader that resolves each id once and hands the shared result to every field resolution that asked for it (the DataLoader shape).",
+    "Fan-in from a batch or crawl: workers processing a message batch in which the same key recurs, deduplicated so the shared backend is hit once per batch.",
+    "Protecting a fragile downstream while it warms up: coalescing the stampede of identical refreshes after a dependency restart or a deploy that flushed its caches.",
+    "Proxy cache request collapsing: nginx's proxy_cache_lock lets exactly one request populate a cache element per proxy_cache_key while the rest wait, and Varnish queues concurrent requests for the same object on a waiting list behind the single backend fetch - the pattern implemented inside cache infrastructure itself, in C, decades before the Go package.",
+    "Client data layers deduplicate by key: TanStack Query (React Query) fires one network request per identical queryKey and resolves every subscribing component from the same in-flight promise, with no post-completion dedup window - coalescing and caching kept as the two separate lifetimes the pattern prescribes.",
+    "Coalescing long non-request work: kubelet coalesces concurrent EnsureImageExists calls for the same image so a fleet of pods referencing one hot image performs a single registry pull (kubernetes#125164, PR#139591) - and deliberately excludes PullAlways, a live demonstration that the key and the equivalence policy decide correctness."
+  ],
+  "avoid_when": [
+    "Results should be reused over time - that is memoization or cache-aside; singleflight forgets the flight when it completes, so it saves nothing for later callers.",
+    "The requests are not equivalent: calls that differ in tenant, user, authorisation scope, locale or parameters must not be collapsed, and if the key cannot capture the difference, do not coalesce.",
+    "The operation has per-caller side effects - writes, audit records, billing, notifications - where each caller's execution is itself required; deduplicating would silently drop someone's effect.",
+    "Concurrent duplicates simply do not occur (a single caller, a serialized path): the registry, the join and the entry lifecycle are pure overhead - a plain call is simpler.",
+    "Cross-process deduplication is required: the pattern is in-process, so use a distributed lock, a shared cache or request-scoped routing instead.",
+    "Callers need individual cancellation, progress or timeout semantics that would change the shared computation: run per caller and protect the dependency with a bulkhead, a rate limiter or a circuit breaker instead."
+  ],
+  "language_files": {
+    "generic": "singleflight.generic.json",
+    "c": "singleflight.c.json",
+    "cplusplus": "singleflight.cplusplus.json",
+    "csharp": "singleflight.csharp.json",
+    "go": "singleflight.go.json",
+    "java": "singleflight.java.json",
+    "javascript": "singleflight.javascript.json",
+    "kotlin": "singleflight.kotlin.json",
+    "python": "singleflight.python.json",
+    "ruby": "singleflight.ruby.json",
+    "rust": "singleflight.rust.json",
+    "scala": "singleflight.scala.json",
+    "swift": "singleflight.swift.json",
+    "typescript": "singleflight.typescript.json"
+  },
+  "paradigm": [
+    "concurrent"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "language-idiom",
+    "modern"
+  ],
+  "related_patterns": [
+    "memoization",
+    "cache-aside",
+    "future-promise",
+    "async-method-invocation",
+    "thread-pool",
+    "lazy-initialization"
+  ],
+  "anti_patterns": [
+    "Using the in-flight registry as a cache: keeping the entry (and its result) after the flight completes, so the coalescer silently becomes an unbounded, never-invalidated result store.",
+    "Coalescing on a key that omits tenant or authorisation scope, so two principals' concurrent requests collapse into one and one of them receives the other's result.",
+    "Letting the first caller's timeout or cancellation abort the shared computation for everyone.",
+    "Never forgetting entries on error, so a failed flight is joined forever and the key can never be retried.",
+    "Suppressing duplicates of side-effecting operations (writes, POSTs, payments) so that N callers believe their action ran while only one execution happened.",
+    "Sharing a mutable result object across waiters and letting one caller mutate it, corrupting the shared answer for the rest."
+  ],
+  "design_principles": [
+    "Identify work by its result-affecting inputs: the key is the contract that makes coalescing correct (and tenant-safe).",
+    "One execution in flight per key: concurrency control is per key, not global, so unrelated keys still proceed in parallel.",
+    "Separation of concerns: the registry owns membership and lifetime, the flight owns the computation, the completion handle owns publication to waiters.",
+    "Explicit lifetime policy: in-flight membership ends when the flight completes; result retention is a different decision with a different owner.",
+    "Failure is part of the shared result: errors propagate to every waiter unchanged rather than being invented per caller or swallowed."
+  ],
+  "best_practices": [
+    "Derive the key centrally from every result-affecting input and include tenant, user/authorisation scope and configuration version deliberately; never let call sites improvise keys.",
+    "Remove the entry when the flight completes, including on failure, so the registry holds only genuinely in-flight work.",
+    "Keep the flight's lifetime independent of any single waiter: waiters may give up (timeout, cancellation) while the computation continues for the others, and a stuck flight can be dropped explicitly.",
+    "Give waiters a way to leave as well as to join (a channel plus select, a non-blocking variant, per-waiter timeouts) and never hand out the shared handle in a way that lets one caller cancel it for everyone.",
+    "Bound the registry and the flight duration; on exhaustion, fail fast or bypass (fail open to a direct call) rather than queueing unbounded waiters behind one key.",
+    "Combine with caching as two explicit layers: coalesce the miss loader, then store the result - and re-check the cache inside the flight so a just-finished sibling flight is not repeated.",
+    "Instrument flights, waiters and duplicates suppressed, and surface the shared-vs-leader indication so latency dashboards and traces remain interpretable."
+  ],
+  "version": "1.1",
+  "sources": [
+    "docs/design-patterns.md §7 'Task lifetimes and asynchronous work' - Singleflight / In-Flight Request Coalescing row; originating citation: Go authors, singleflight documentation and implementation (golang.org/x/sync/singleflight, a fork of groupcache's singleflight).",
+    "https://pkg.go.dev/golang.org/x/sync/singleflight",
+    "https://github.com/golang/sync/blob/master/singleflight/singleflight.go",
+    "https://go-patterns.dev/sync/singleflight",
+    "https://en.wikipedia.org/wiki/Cache_stampede",
+    "https://www.fastly.com/documentation/guides/concepts/cache/request-collapsing",
+    "https://github.com/graphql/dataloader",
+    "https://nginx.org/en/docs/http/ngx_http_proxy_module.html",
+    "https://docs.varnish-software.com/book/http/varnish-built-in-vcl-behavior/",
+    "https://tanstack.com/query/v3/docs/framework/react/overview",
+    "https://github.com/kubernetes/kubernetes/issues/125164",
+    "https://github.com/kubernetes/kubernetes/pull/139591",
+    "https://github.com/golang/go/issues/74880",
+    "https://nejc.blog/2024-11-06/nginx-proxy-cache-lock-request-coalescing/"
+  ]
+}

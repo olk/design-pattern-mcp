@@ -1,0 +1,215 @@
+{
+  "category": "interaction-boundary",
+  "name": "cursor-pagination",
+  "aliases": [
+    "keyset pagination",
+    "cursor-based pagination"
+  ],
+  "intent": "Bound what a read boundary returns for a large or changing ordered collection by sending one page plus an opaque continuation token that pins the filter and ordering, so clients advance deterministically without offsets and without watching rows move under them.",
+  "problem": "A boundary must expose a collection that is too large to return at once and keeps changing while clients read it. Offset or page-number requests make the store count or scan everything up to the requested page, and concurrent inserts or deletes shift rows across page boundaries so consumers see duplicates or miss items; the server has no way to state where the sequence should resume.",
+  "context": "Any read boundary - an HTTP or gRPC list operation, a GraphQL connection, a database-backed feed, a batch export job - over an ordered collection that is large, growing, or read under concurrent writes, where the server can identify a unique, immutable ordering key and wants to cap both response size and per-request query cost while letting clients iterate the whole sequence.",
+  "benefits": [
+    "Bounded responses and bounded work: the page size caps payload, memory and query cost, and each page costs one index seek instead of a growing OFFSET scan.",
+    "Stable pages under concurrent writes: the position is a row key rather than a count, so new rows at the head of the collection do not push unseen rows across a page boundary.",
+    "Scales to collections whose size and read load make offset pagination unusable, without server-side cursors in the client's way.",
+    "The opaque token hides the internal position representation, so ordering and storage details can change without changing the wire contract - provided the token is truly opaque and versioned.",
+    "Pinning filter and ordering makes the iteration a deterministic sequence, which enables resumable consumers: export jobs, reindexing, backups and sync pipelines can stop and continue.",
+    "Keyset seek is O(log n) at any depth; page 500 costs the same as page 1, with no OFFSET scan overhead.",
+    "Resumable across node failures: the token encodes position, so a server restart does not lose pagination state."
+  ],
+  "tradeoffs": [
+    "No random access and typically no exact total: clients cannot jump to page N or show 'page 5 of 120'; a total count must be computed separately and is usually approximated or omitted.",
+    "The token becomes a long-lived compatibility surface: it must stay opaque, be versioned, remain decodable across deploys, and carry (or be validated against) the pinned filter and ordering.",
+    "Correctness depends on the ordering key being unique, immutable, non-null and indexed (often a composite with the primary key); mutable or float sort columns make pages skip or repeat rows, and schema or index changes can silently invalidate outstanding tokens.",
+    "If the anchor row is deleted or its ordering key changes between pages, the sequence around it is undefined - the next page can skip a row or repeat one; only an immutable key limits the damage.",
+    "Stateless (encoded) tokens cannot be revoked, and stored tokens need persistence, lookup latency and an expiry sweep; base64 encoding alone is explicitly not sufficient obfuscation, so signing or encryption and key management become part of the pattern.",
+    "The contract is easy for clients to violate: the token must be sent with all other parameters unchanged, which forces an explicit rejection path (INVALID_ARGUMENT) and a documented expiry/recovery story, and operators lose the ability to eyeball or deep-link a page position.",
+    "Backward (prev/before) pagination requires encoding both directions and reversing the sort, which significantly increases complexity; unless backward navigation is a genuine product requirement, forward-only cursor pagination is strongly preferred.",
+    "Returning total_count on every response negates the performance advantage: it requires a COUNT(*) on a large table. Provide it only via a separately cached endpoint when genuinely needed."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 9,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Client (cursor consumer)",
+      "responsibility": "Sends a bounded page request with the continuation token from the previous page, keeps the filter and ordering parameters unchanged, and stops when the response carries no next token."
+    },
+    {
+      "role": "List Endpoint",
+      "responsibility": "Validates page size (default, maximum, negative values) and the token, verifies that the pinned filter/order still match the request, assembles the page envelope and maps token failures to a defined error."
+    },
+    {
+      "role": "Cursor Codec",
+      "responsibility": "Encodes and decodes the opaque, URL-safe, versioned token (signed or encrypted, never carrying authorization); rejects malformed, tampered, foreign or expired tokens."
+    },
+    {
+      "role": "Keyset Query",
+      "responsibility": "Turns the decoded position into a strictly-after predicate over the pinned total order, uses the matching index, and fetches page_size + 1 rows to reveal whether another page exists."
+    },
+    {
+      "role": "Page Assembler",
+      "responsibility": "Trims the rows to page size, derives the next token from the last returned row's ordering keys, and emits no token only when the collection is exhausted."
+    },
+    {
+      "role": "Token Store and Expiry Policy",
+      "responsibility": "Holds server-side token state when tokens are not self-contained: pins filter/order, enforces expiry, enables revocation and sweeps dead tokens; its absence forces stateless, non-revocable tokens."
+    }
+  ],
+  "suitable_scopes": [
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Public REST or gRPC list endpoints over unbounded, growing tables - messages, orders, audit events - where deep offsets are slow and responses must stay small.",
+    "Infinite-scroll or load-more feeds that keep returning newer items while a user scrolls, with the already-seen pages stable against inserts.",
+    "Whole-collection sync and export jobs (warehouse loads, backups, search reindexing) that must iterate every row exactly once while writers continue.",
+    "GraphQL Relay connections where first/after, edges and pageInfo carry the continuation contract in the schema instead of the URL.",
+    "Consumers of third-party list APIs (Stripe-style starting_after/has_more, Google page_token iterators) that keep parameters fixed across auto-paginated calls.",
+    "Administrative and operational tooling that streams very large tables for verification or cleanup with bounded memory and predictable server load.",
+    "Audit log and event stream retrieval where events are append-only and chronological, and clients stream continuously without needing to revisit earlier pages.",
+    "Real-time activity feeds (social media timelines, notification streams) where inserts at the head must not disturb pages the user has already loaded.",
+    "Database replication and change-data-capture (CDC) pipelines that must consume a changelog exactly once across restarts and failures.",
+    "Paginating over search results from a vector database or full-text index where OFFSET at depth is expensive and results may change between queries.",
+    "Bi-directional data synchronization (CDC pipelines, replica lag-catching) where a consumer must iterate forward and occasionally needs to resume from a previous position or re-sweep a window — requiring stable forward cursors plus a defined backward-resumption path.",
+    "Paginating a partitioned or sharded database table where each partition is queried independently and cursors carry both the partition hint and the per-partition keyset position.",
+    "Slack Web API collection methods (users.list, conversations.history) where response_metadata.next_cursor drives the loop, page limits are clamped per method, and expired or malformed tokens surface as invalid_cursor so the client restarts from the first page.",
+    "GitHub GraphQL-style cursor connections where first/last (bounded 1-100) and pageInfo.startCursor/endCursor carry the continuation position for after/before traversal.",
+    "Timeline-style feeds served by Django REST framework's CursorPagination, whose default -created ordering gives a consistent view that does not repeat items as new rows are inserted."
+  ],
+  "avoid_when": [
+    "Users need page numbers, jump-to-page navigation and exact totals over a small stable dataset: offset or page-number pagination is simpler and supports random access.",
+    "The collection is bounded (a few hundred rows) or already cached, so a single response - optionally with a simple limit - is enough.",
+    "No unique, immutable, non-null, indexed ordering key exists and none can be added (sorting by a mutable score, nullable columns or floats): keyset pages will skip or repeat rows.",
+    "Consumers require a consistent point-in-time view of the whole collection while rows are deleted: materialize a snapshot or query as-of a version instead of paging a live sequence.",
+    "The data is a live event stream rather than a finite collection: a subscription or message channel is the right contract, not pages of a query result.",
+    "The primary sort key is a random UUID (v4) with no timestamp tiebreaker: random UUID ordering is unpredictable and page boundaries will be non-deterministic under concurrent writes."
+  ],
+  "language_files": {
+    "generic": "cursor-pagination.generic.json",
+    "c": "cursor-pagination.c.json",
+    "cplusplus": "cursor-pagination.cplusplus.json",
+    "csharp": "cursor-pagination.csharp.json",
+    "go": "cursor-pagination.go.json",
+    "java": "cursor-pagination.java.json",
+    "javascript": "cursor-pagination.javascript.json",
+    "kotlin": "cursor-pagination.kotlin.json",
+    "python": "cursor-pagination.python.json",
+    "ruby": "cursor-pagination.ruby.json",
+    "rust": "cursor-pagination.rust.json",
+    "scala": "cursor-pagination.scala.json",
+    "swift": "cursor-pagination.swift.json",
+    "typescript": "cursor-pagination.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "procedural"
+  ],
+  "scope": "boundary",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "gateway",
+    "data-transfer-object",
+    "record-set",
+    "partial-response",
+    "message-expiration",
+    "polling-consumer",
+    "iterator",
+    "memento"
+  ],
+  "anti_patterns": [
+    "Offset in disguise: base64-encoding a page number or offset and calling it an opaque cursor - deep pages still scan and concurrent writes still shift rows.",
+    "Unsigned or parseable tokens exposing internal ids or filter state; base64 encoding on its own is explicitly not sufficient obfuscation.",
+    "Using the page token as a credential or storing authorization inside it instead of checking authorization on every request.",
+    "Ordering by a mutable, nullable or non-unique column with no tiebreaker, so rows are skipped or duplicated under writes.",
+    "Accepting a token while ignoring changed filter or ordering parameters, so clients silently receive pages of a different sequence.",
+    "Unbounded or 'all' page sizes, and server-side token stores that are never expired or swept.",
+    "Using random UUIDv4 as the sole ordering column without a timestamp tiebreaker: random UUID ordering is unpredictable, making page boundaries non-deterministic under concurrent inserts.",
+    "Opaque-looking but plaintext cursors: base64-encoding a JSON object containing column names and values exposes the schema and lets clients construct cursors for arbitrary positions.",
+    "Returning a different response envelope shape across different endpoints in the same API, forcing clients to write per-endpoint parsing logic.",
+    "Implementing backward pagination without encoding the sort direction in the token, so clients that reverse the query mid-traversal receive pages in the wrong order."
+  ],
+  "design_principles": [
+    "Information hiding: the continuation token is opaque and server-owned, so clients cannot depend on the internal position representation.",
+    "Separation of concerns: token codec, seek-predicate construction and page assembly are distinct responsibilities inside one boundary component.",
+    "Least privilege: a page token conveys position only and never authorizes access; authorization is enforced per request as usual.",
+    "Backward compatibility: paginate from the outset and version the token, because adding pagination to an existing operation is behaviourally breaking.",
+    "Bounded work per request: the query and the response are capped, so no single request scales with the collection.",
+    "Fail fast on contract violations: reject mismatched filter/order parameters with a defined error code rather than silently returning incoherent pages.",
+    "Self-validating tokens: embed a filter or sort hash in the token payload so that tampered or mismatched requests are rejected at decode time, not at query time.",
+    "Forward-only by default: implement backward pagination only when the product genuinely requires it; the added complexity of dual-cursor encoding and result reversal is rarely justified."
+  ],
+  "best_practices": [
+    "Order by a unique, immutable, non-null, indexed key - append the primary key when the natural sort is not unique - and align the index with the full sort order and direction (ASC/DESC).",
+    "Fetch page_size + 1 rows to detect the next page instead of counting, and derive the next token from the last returned row; only the extra row or the absence of a token signals end-of-collection.",
+    "Keep the token opaque and URL-safe (sign with HMAC or use authenticated encryption; base64 alone is not opacity or tamper resistance), version the token format, and let only an empty or absent token mean end-of-collection.",
+    "Use base64url encoding (RFC 4648 §5) instead of standard base64: replace +/= with -_ to avoid percent-encoding issues in query strings.",
+    "Pin the filter and ordering in the token or validate them on every request, and reject mismatches with INVALID_ARGUMENT (HTTP 400) rather than returning incoherent pages.",
+    "Document and enforce a default and maximum page size, and treat zero-result or short pages as legal responses.",
+    "Define token expiry up front (AIP-158 suggests roughly three days), sweep stored tokens, and specify the client recovery path for expired or invalid tokens.",
+    "Run EXPLAIN ANALYZE on the keyset query against production-scale data to verify the planner uses an index seek, not a sequential scan; a missing or mismatched composite index silently reverts to full-table scan.",
+    "Make cursors self-validating by embedding a hash of the pinned filter and sort parameters; this catches mismatches at decode time rather than returning wrong results.",
+    "Provide has_next_page (or has_more) as the primary exhaustion signal; reserve total_count for a separately cached endpoint to avoid the O(n) cost of COUNT(*) on large tables.",
+    "Validate all request parameters server-side: reject negative page_size with 400, clamp oversized page_size to the maximum rather than honouring it.",
+    "Document whether the traversal contract is live (reflects changes), snapshot (one logical version), or best-effort (duplicates acceptable); clients need this to know how to deduplicate.",
+    "Test the pagination contract under concurrent mutation: insert at the head, delete from within the traversal window, update sort columns, and retry the same cursor.",
+    "Use time-ordered identifiers (UUIDv7, ULID) for primary keys instead of random UUIDv4 when the sort is chronological, to keep keyset seeks efficient.",
+    "For databases with poor row-value comparison optimization (MySQL < 8.0.33), use explicit compound WHERE clauses rather than tuple comparison (a, b) < (x, y).",
+    "Sign cursor payloads with HMAC-SHA256 (or use authenticated encryption) so that any client-side tampering is detected at decode time rather than producing wrong query results; embed a version byte so the codec can rotate keys without breaking outstanding tokens.",
+    "Include a hash of the pinned filter and sort parameters inside the token (or validate them against a store entry) so that a client changing parameters mid-iteration is rejected before any query runs, not after.",
+    "Use time-ordered identifiers — ULID (48-bit timestamp + 80-bit randomness, lexicographically sortable) or UUIDv7 (RFC draft, 48-bit timestamp + version + variant + 54-bit random, byte-wise sortable) — instead of random UUIDv4 when the primary sort is chronological; random UUID ordering is unpredictable and makes page boundaries non-deterministic under concurrent inserts.",
+    "Align composite indexes exactly with the full keyset column list and sort direction (ASC/DESC); a descending column in the keyset requires a DESC index in PostgreSQL — the planner cannot reverse direction mid-scan.",
+    "For mission-critical Postgres pagination, capture a cursor boundary (SELECT updated_at, id FROM table ORDER BY updated_at DESC, id DESC LIMIT 1) before starting traversal, then paginate only up to that boundary to avoid seeing recently committed out-of-order sequence values as duplicate rows.",
+    "On DynamoDB: a non-empty LastEvaluatedKey only signals the 1 MB read limit was hit — NOT that more matching items exist; when a FilterExpression is present, DynamoDB applies the 1 MB cap BEFORE filtering, so a page can return zero results yet still carry a non-empty LastEvaluatedKey; only an absent LastEvaluatedKey means end-of-collection.",
+    "When the natural sort column is not unique, append the primary key as the final tiebreaker in both the keyset and the ORDER BY clause; omitting the tiebreaker causes non-deterministic page boundaries under concurrent writes.",
+    "Prefer forward-only pagination; backward pagination requires encoding the sort direction in the token and reversing the query's ORDER BY, which doubles the surface area for bugs and is rarely needed."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Google API Improvement Proposals, AIP-158: Pagination (Google LLC; AIP project, changelog 2019-2025) - bounded pages, opaque and URL-safe page tokens, next_page_token progression, optional expiry with a three-day rule of thumb.",
+    "https://google.aip.dev/158",
+    "https://github.com/aip-dev/aip.dev/blob/main/aip/general/0158/aip.md - AIP-158 source with detailed page token interface including lastId, indexData, createTime fields and encryption guidance",
+    "https://relay.dev/graphql/connections.htm - GraphQL Relay Cursor Connections specification",
+    "https://docs.stripe.com/api/pagination - Stripe's cursor pagination pattern (starting_after, has_more)",
+    "https://jsonic.io/guides/json-pagination-guide (2026) - comprehensive comparison of offset, cursor, keyset and seek pagination with base64url encoding guidance and production edge cases",
+    "https://blog.openreplay.com/api-pagination-patterns/ (2026) - cursor vs keyset distinction, composite index alignment, has_more derivation from limit+1, and API design guidance",
+    "https://adhdecode.com/api-architecture/rest-api-design/cursor-based-pagination-deep-dive/ (2026) - deep dive on cursor mechanics, the seek-vs-scan difference, and why the cursor looks like 'gibberish' by design",
+    "https://www.compilemymind.com/posts/rest-graphql-pagination-offset-cursor-link-strategies/ (2026) - REST vs GraphQL pagination, link headers (RFC 8288), cursor contract testing, and mutation-aware test scenarios",
+    "https://knowledgelib.io/software/patterns/rest-pagination/2026 (2026) - decision tree for choosing pagination type, PostgreSQL row-value comparisons, composite index design, and common implementation pitfalls",
+    "https://letsbuildsolutions.com/blog/web-engineering/pagination-patterns-for-apis-offset-cursor-and-keyset-compared/ (2026) - keyset vs cursor distinction, UUID sort order pitfalls, bidirectional traversal complexity, and index include clause optimization",
+    "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Query.Pagination.html - AWS DynamoDB Developer Guide: LastEvaluatedKey is the cursor; non-empty means 1 MB page boundary was hit, NOT that more results exist; when FilterExpression is used, DynamoDB applies the 1 MB cap BEFORE filtering so a page can return zero results with a non-empty LastEvaluatedKey; only absent LastEvaluatedKey means end-of-collection.",
+    "https://relay.dev/graphql/connections.htm - GraphQL Relay Cursor Connections Specification: Connection carries edges+pageInfo, Edge carries node+cursor, PageInfo carries hasPreviousPage/hasNextPage/startCursor/endCursor (all non-null). Cursors must be opaque strings; edge ordering must be identical for first/after and last/before — NOT reversed; using both first and last simultaneously is discouraged.",
+    "https://www.stacksync.com/blog/keyset-cursors-postgres-pagination-fast-accurate-scalable - Stacksync keyset vs offset comparison: OFFSET page 50,000 costs ~87 ms vs keyset sub-millisecond at any depth. Composite cursor syntax: WHERE (updated_at, id) > (last_timestamp, last_id). Always include all keyset columns in both WHERE and ORDER BY. Postgres sequences can commit out-of-order at the tail — capture a cursor boundary before iterating.",
+    "https://mfaani.com - Systems design pagination: HMAC-SHA256 cursor signing detects client tampering at decode time; stable sort requires immutable columns; UUIDv4 without timestamp tiebreaker gives non-deterministic ordering under concurrent inserts.",
+    "https://sph.sh - DynamoDB signed cursors: cursor pagination over live data is best-effort by construction with or without expiry; expiry does not solve the instability problem on live data — new inserts and updates can still shift rows across existing page boundaries.",
+    "https://use-the-index-luke.com/no-offset - Use The Index Luke 'seek method' guide: keyset pagination maps to B-tree range scan starting after cursor's indexed values, not full-index scan with OFFSET; composite index WHERE clause must include all key columns in same order and direction as the index definition.",
+    "https://blog.jooq.org/faster-sql-paging-with-jooq-using-the-seek-method/ - Lukas Eder (jOOQ blog): the original 'Seek Method' formulation of keyset pagination, defining paging as a seek to the last-seen key instead of counting and skipping rows.",
+    "https://docs.slack.dev/apis/web-api/pagination - Slack Developer Docs (official): most Web API methods return response_metadata.next_cursor; omit the cursor for the first page, an empty next_cursor means end-of-collection, cursors expire and must not be persisted long-term, and a gibberish or too-old cursor returns invalid_cursor.",
+    "https://slack.engineering/evolving-api-pagination-at-slack/ - Slack Engineering: rationale for replacing offset pagination with opaque cursors as API collections grew from hundreds to hundreds of thousands of records.",
+    "https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api - GitHub GraphQL API (official): first/last arguments bounded 1-100 with pageInfo startCursor/endCursor driving after/before continuation.",
+    "https://www.django-rest-framework.org/api-guide/pagination/ - Django REST framework (official): CursorPagination provides forward/backward paging with an opaque cursor, requires a unique unchanging ordering field (default -created), stays consistent under concurrent inserts, and explicitly does not support arbitrary position indexing.",
+    "https://vladmihalcea.com/sql-seek-keyset-pagination/ - Vlad Mihalcea: TOP-N/Next-N seek queries anchored on the last (created_on, id) pair, deterministic tiebreaker in ORDER BY, and a composite index matching the seek direction.",
+    "https://blog.paulserban.eu/post/pagination-patterns-explained-offset-vs-cursor-vs-keyset-with-real-world-tradeoffs/ - misuse survey: raw-ID cursors leak internals and insertion rates, mutating sort keys move records across pages between requests, and requiring clients to decode cursors defeats opacity — encode a version field so the format can evolve."
+  ],
+  "related_patterns_notes": {
+    "optimistic-concurrency-control": "optimistic-concurrency-control",
+    "change-data-capture": "change-data-capture",
+    "checkpoint": "checkpoint",
+    "keyset-pagination": "keyset-pagination",
+    "bidirectional-pagination": "bidirectional-pagination",
+    "seek-method": "seek-method"
+  }
+}

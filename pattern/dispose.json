@@ -1,0 +1,180 @@
+{
+  "category": "persistence-state",
+  "name": "dispose",
+  "aliases": [
+    "deterministic release",
+    "dispose pattern",
+    "context manager protocol"
+  ],
+  "intent": "Give a garbage-collected object an explicit, idempotent release operation behind a named protocol (IDisposable, AutoCloseable, Disposable / [Symbol.dispose], __exit__) so that the scarce external resources it owns - and the resources those own, transitively - are freed at a caller-chosen moment instead of whenever the collector happens to run.",
+  "problem": "The collector reclaims only heap memory, so an object holding file and socket handles, native buffers, locks, subscriptions or pooled connections releases them late, in arbitrary order and at most once when it relies on finalization; and without an explicit release contract callers cannot tell whether closing an object cascades to the resources layered on top of it, stops at its own fields, or silently closes a handle borrowed from the caller.",
+  "context": "Applies to garbage-collected runtimes whenever an object's lifetime outlives a single lexical scope while its resources have an external lifetime: sessions and connections held across operations, wrappers around native memory, locks expressed as objects, and cached open resources. The pattern is the runtime-boundary answer for languages without destructors (JVM, .NET, JavaScript), whereas scope-bound languages realize the same contract through destructors or scope-exit constructs. Python's `with` statement (PEP 343), Java's `try-with-resources` (Java 7+), and C#'s `using`/`using` declaration are the canonical syntactic forms that guarantee the release call on every exit path.",
+  "benefits": [
+    "Deterministic release: handles, locks and connections are freed at a point the programmer chooses, so scarce resources are not held until the next collection cycle and are not exhausted by a slow or postponed GC run.",
+    "Idempotent contract: disposing twice is a no-op, which makes defensive cleanup in both an operation's finally/ensure path and the owner's teardown safe instead of a double-free.",
+    "Ownership-aware cascade: a disposer releases exactly what it owns and recurses into owned sub-resources, so borrowed resources (a stream or connection handed in by the caller) are not closed behind their owner's back.",
+    "Failure visibility: a release that can fail reports it to the caller at a known point, unlike a finalizer whose exception is swallowed or fatal, and exceptions from layered releases can be aggregated instead of lost.",
+    "Ordering and shutdown control: release order is programmer-defined (reverse acquisition order), so layered resources unwind in a valid sequence rather than the arbitrary order in which the collector finalizes objects.",
+    "Enables pooling and explicit handover: the release call is also the instant a resource can be returned to a pool or transferred to another owner, which non-deterministic collection cannot express.",
+    "Composable cleanup: ExitStack (Python), suppressed-exception aggregation (Java), and using-statement nesting allow dynamic composition of cleanup across heterogeneous resource types."
+  ],
+  "tradeoffs": [
+    "Manual discipline: every exit path must actually call the disposer; exceptions, early returns and cancellation are exactly where the call is forgotten, so the pattern moves the failure from the collector into the owner's code.",
+    "Disposed-state bookkeeping: implementations must track a disposed flag (often atomically) and decide which calls after disposal fail fast and with which error - a new failure mode for every method of the type.",
+    "Ownership ambiguity: the same handle can sit in two objects' fields, and without a documented ownership convention plus a non-owning wrapper for borrowed resources the cascade either double-closes or leaks it.",
+    "Finalizer/cleaner interaction: keeping a finalizer as a safety net costs an extra collection cycle, forces the Dispose(bool)/cleaning-action split, and makes every instance of the type more expensive to allocate; forgetting to suppress finalization after an explicit release re-runs cleanup.",
+    "Indirection and lifetime coupling: callers must know who owns which resource and when release is legal, so the object's API gains a lifecycle protocol that the language's own scope construct would otherwise hide.",
+    "Ordering hazards: an incorrect cascade order (dependents released before their dependencies, or vice versa where the release path needs the dependency) produces failures that only appear under error paths, which is where testing is weakest.",
+    "Exception masking: when both the operation body and Dispose/close throw, the original exception can be lost (C# using) or suppressed and attached to the primary exception (Java try-with-resources with getSuppressed()). Developers must know which behavior their language provides."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 8,
+    "security": 7,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Disposable Owner",
+      "responsibility": "Object that acquired one or more resources; exposes the canonical idempotent release operation (Dispose/Close/release) and guarantees that its own state is released on it."
+    },
+    {
+      "role": "Owned Resource",
+      "responsibility": "Handle, buffer, connection or lock the owner created or accepted ownership of; is itself usually disposable so the owner's release cascades into it."
+    },
+    {
+      "role": "Client / Caller",
+      "responsibility": "Uses the object within a logical operation and triggers release at the end, typically through the language's scope construct (using, with, try-with-resources, defer, RAII) so every exit path is covered."
+    },
+    {
+      "role": "Release Scope Mechanism",
+      "responsibility": "Language or library construct that binds release to a scope or ownership edge: using statement/declaration, context manager, try-with-resources, Using, defer, destructor, or a DisposableStack-style helper."
+    },
+    {
+      "role": "Borrowed Resource",
+      "responsibility": "Resource the object uses but does not own; must be skipped by the cascade, which is what keeps a decorator or session from closing its caller's handle."
+    },
+    {
+      "role": "Finalizer / Cleaner (optional)",
+      "responsibility": "Non-deterministic backstop that releases unmanaged state if the client forgot to dispose; must not touch managed collaborators, must be suppressed after an explicit release, and is never the primary mechanism."
+    },
+    {
+      "role": "Resource Pool / Lifetime Manager",
+      "responsibility": "External coordinator (connection pool, object pool) that receives resources back on Dispose and is responsible for their reuse or permanent teardown."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Session or connection objects held across several operations in a server (database session, message-channel session, SSH session) that must be closed at a known point.",
+    "Wrappers around native or unmanaged memory (interop buffers, mapped files, GPU handles) whose release cannot wait for a collection.",
+    "Locks expressed as objects, where closing releases the lock and the cascade guarantees nested acquisitions unwind in order.",
+    "Pools and lifecycle managers that reclaim instances - release hands the resource back rather than destroying it, and each instance must be returned exactly once.",
+    "Long-lived caches of open resources (one open socket or file per backend) where disposing a cache entry must cascade to the connection it owns.",
+    "Libraries exposing streams over other streams (buffered/compressing/encrypting decorators) that must document whether disposal cascades to the wrapped stream.",
+    "Database transaction scopes where a transaction is committed on success and rolled back on failure - the scope's Dispose chooses the path based on whether an exception is pending.",
+    "Async I/O with IAsyncDisposable/DisposeAsync where flush or network-shutdown is asynchronous and must be awaited (e.g., StreamWriter, network sockets).",
+    "Python ExitStack for dynamically registered cleanup callbacks and heterogeneous context managers combined in one scope.",
+    "Reentrant lock objects (RLock in Python, ReentrantLock in Java) where the dispose must track acquisition count and only release on the outermost exit.",
+    "VS Code extension API: every registration (commands, providers, event listeners) returns a Disposable that the extension pushes onto ExtensionContext.subscriptions, and the host calls dispose() on deactivation to unregister everything at a known point.",
+    "JavaScript Explicit Resource Management (TC39 Stage 3): handles, streams and Wasm resources implement [Symbol.dispose] so `using` declarations and DisposableStack release them deterministically at block exit.",
+    "Java's java.lang.ref.Cleaner as the finalizer replacement: direct byte buffers and MemorySegment arenas register a cleaning action that runs at most once when the owner becomes phantom-reachable, with close() as the deterministic path."
+  ],
+  "avoid_when": [
+    "The resource's lifetime is exactly one lexical scope: the scope construct alone (using, with, try-with-resources, Using, defer, RAII) is simpler and cannot leak on that path, no owning object is needed.",
+    "The object holds only GC-managed values or references (strings, collections, immutable data) with no external handle - there is nothing the collector cannot reclaim.",
+    "A framework already owns the lifetime for you (dependency-injection container with scoped services, connection pool, ORM session scope); adding your own Dispose duplicates or fights its teardown.",
+    "The resource is a process-wide singleton that is intentionally never released (a logger, a global cache) and shutting it down is process shutdown - an exit hook expresses that better than Dispose."
+  ],
+  "language_files": {
+    "generic": "dispose.generic.json",
+    "c": "dispose.c.json",
+    "cplusplus": "dispose.cplusplus.json",
+    "csharp": "dispose.csharp.json",
+    "go": "dispose.go.json",
+    "java": "dispose.java.json",
+    "javascript": "dispose.javascript.json",
+    "kotlin": "dispose.kotlin.json",
+    "python": "dispose.python.json",
+    "ruby": "dispose.ruby.json",
+    "rust": "dispose.rust.json",
+    "scala": "dispose.scala.json",
+    "swift": "dispose.swift.json",
+    "typescript": "dispose.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "raii",
+    "scope-guard",
+    "smart-pointer",
+    "resource-return",
+    "weak-reference",
+    "object-pool",
+    "execute-around"
+  ],
+  "anti_patterns": [
+    "Closing borrowed resources: a decorator or session whose Dispose closes a stream/connection that was passed in, so the caller's handle dies with it (double close).",
+    "Finalizer-only cleanup: relying on a finalizer/cleaner for the real release work and leaving Dispose or Close empty, so resources are freed whenever the collector runs.",
+    "Silent use-after-dispose: the flag is set but every other method keeps working on the released handle, returning garbage instead of failing fast.",
+    "Non-idempotent Close that throws or corrupts on the second call, turning defensive cleanup (finally block plus owner teardown) into a new failure path.",
+    "Finalizer on every type 'just in case', making all allocations finalizable and paying the collection overhead without any unmanaged resource to justify it.",
+    "Swallowing the original exception in Dispose/close: returning true from __exit__ for unknown exception types in Python, or catching and not re-raising in a finally block, hides the real failure.",
+    "Throwing from Dispose in C# channel/WCF proxies: Dispose is called in a faulted state and throws, masking the original operation exception that caused the fault."
+  ],
+  "design_principles": [
+    "Separation of concerns: acquisition, use and release form an explicit lifecycle protocol instead of being an implied side effect of garbage collection.",
+    "Single responsibility: each owner releases exactly its own resources; borrowers never release, which keeps ownership edges unambiguous.",
+    "Fail fast: calls after disposal raise a dedicated error rather than operating on a released handle.",
+    "Liskov/robustness of the release contract: the release operation is idempotent and safe to call from every exit path, so callers can be defensive.",
+    "Encapsulate what varies: the release sequence is the owner's private decision, exposed as one operation (possibly split into a throwing Close() and a no-throw destructor path).",
+    "Fail-safe in destructor path: never throw from a finalizer or any code path called by it; in .NET, an exception escaping a finalizer terminates the process.",
+    "Ownership transfer is explicit: a resource handed to another owner must be explicitly transferred; borrowing does not transfer ownership."
+  ],
+  "best_practices": [
+    "Define one canonical release operation (Dispose/Close) and make it idempotent; document that a second call is a no-op and what happens to later use.",
+    "Centralize cleanup in one method (Dispose(bool)/cleaning state object/close()) that both the explicit path and any finalizer path call, so the two can never diverge.",
+    "Cascade only to resources the type owns; model borrowed resources as references, a flag or a non-owning wrapper, and document the ownership edge.",
+    "Release in reverse acquisition order, and never throw from a finalizer/cleaner path; report release errors through the explicit Close path only.",
+    "Use the language's scope construct at every call site (using/using declaration, with, try-with-resources, Using, defer) instead of relying on callers to remember the call.",
+    "Where the runtime offers it, suppress finalization after an explicit release, and prefer a SafeHandle/Cleaner wrapper over a hand-written finalizer for unmanaged handles.",
+    "In Python, prefer @contextlib.contextmanager for generator-based single-scope managers; use contextlib.ExitStack for dynamic composition of heterogeneous cleanup.",
+    "In Java, use try-with-resources over manual try/finally; leverage getSuppressed() on the primary exception to inspect any suppressed close exceptions.",
+    "In C#, prefer using declarations (C# 8+ `using var`) over using statements for clearer scope binding; implement IAsyncDisposable for async cleanup paths.",
+    "For async I/O (network streams, async file I/O), implement IAsyncDisposable (C#) or __aexit__ (Python) and await the async close to flush buffers before releasing."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Cwalina & Abrams, Framework Design Guidelines: Conventions, Idioms, and Patterns for Reusable .NET Libraries (Addison-Wesley; 2nd ed. 2008, 3rd ed. 2020) - Dispose Pattern chapter.",
+    "https://learn.microsoft.com/en-us/dotnet/standard/design-guidelines/dispose-pattern",
+    "https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/implementing-dispose",
+    "https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/using-objects",
+    "https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/unmanaged",
+    "PEP 343 – The 'with' Statement (Python), https://peps.python.org/pep-0343/",
+    "contextlib — Utilities for with-statement contexts, https://docs.python.org/3/library/contextlib.html",
+    "The try-with-resources Statement, Java SE Tutorial, https://docs.oracle.com/javase/tutorial/essential/exceptions/tryResourceClose.html",
+    "Better Resource Management with Java SE 7, Oracle Technical Article, https://www.oracle.com/technetwork/articles/java/trywithresources-401775.html",
+    "IDisposable, Finalizers, and the Dispose Pattern — The Complete Guide for .NET Developers, DEV Community (2026), https://dev.to/libintombaby/idisposable-finalizers-and-the-dispose-pattern-the-complete-guide-for-net-developers-4600",
+    "Tanmay Sarkar, Dispose Pattern, https://tanmaysarkar.com/dispose-pattern/",
+    "VS Code Extension API reference - Disposable and ExtensionContext.subscriptions, https://code.visualstudio.com/api/references/vscode-api",
+    "TC39 Explicit Resource Management proposal (using, await using, DisposableStack, Symbol.dispose), https://github.com/tc39/proposal-explicit-resource-management",
+    "V8: Explicit Resource Management shipped, https://v8.dev/features/explicit-resource-management",
+    "java.lang.ref.Cleaner (JDK API), https://docs.oracle.com/en/java/javase/20/docs/api/java.base/java/lang/ref/Cleaner.html",
+    "Jimmy Bogard, Abusing using statements (IDisposable overgeneralization critique), https://lostechies.com/jimmybogard/2008/01/16/abusing-using-statements/",
+    "Ben Tsai, IDisposable: The Contentious Dispose Pattern, https://bentsai.org/posts/idisposable-the-contentious-dispose-pattern"
+  ]
+}

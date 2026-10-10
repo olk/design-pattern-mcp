@@ -1,0 +1,59 @@
+{
+  "pattern": "retry",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "for-try loop with try await Task.sleep(for:) and a transient-error classifier",
+  "implementation_notes": "With structured concurrency the pattern is written out: a loop over the attempt budget calls the async operation, classifies the thrown error and waits with try await Task.sleep(nanoseconds:) or Task.sleep(for: .seconds(n)), which suspends the task without blocking a thread and throws CancellationError if the surrounding task is cancelled - so the loop must let that error propagate rather than catch it. The standard library supplies the delay and the cancellation semantics, not the policy: attempt counts, backoff and the retryable-error decision stay with the caller, and the usual shape is a generic withRetry helper over an async closure. Combine's retry operator (the second variant) covers publisher-shaped work but has no delay or classification, so the async loop is the general answer on modern Swift.",
+  "code_sketch": "func withRetry<T>(_ attempts: Int, _ op: () async throws -> T) async throws -> T {\n    var last: Error?\n    for attempt in 1...attempts {\n        do { return try await op() }\n        catch is CancellationError { throw CancellationError() }   // never retry\n        catch let e where isTransient(e) {\n            last = e\n            if attempt < attempts { try await Task.sleep(for: .milliseconds(200 * attempt)) }\n        }\n        catch { throw error }                                     // permanent: fail fast\n    }\n    throw last!\n}",
+  "pitfalls": [
+    "Task.sleep throws CancellationError when the task is cancelled; swallowing it turns cancellation into an endless retry loop and breaks structured concurrency.",
+    "Task.sleep guarantees only that the task resumes at or after the instant (system sleep can stretch it), so a total-time budget must be measured with ContinuousClock rather than by summing delays.",
+    "Retrying an actor-isolated operation re-enters the actor on every attempt, so state mutated before the failure is replayed - the retried body must be idempotent and reentrancy-safe.",
+    "Errors are untyped by default: classification needs a typed error enum or protocol, because a generic catch cannot tell a 503 from a decoding bug."
+  ],
+  "sources": [
+    "https://raw.githubusercontent.com/swiftlang/swift/main/stdlib/public/Concurrency/TaskSleepDuration.swift",
+    "https://raw.githubusercontent.com/swiftlang/swift/main/stdlib/public/Concurrency/TaskSleep.swift"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "async-await-loop",
+      "name": "Explicit async attempt loop with Task.sleep and typed errors",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.9",
+      "idiom_name": "for-try loop with try await Task.sleep(for:) and a transient-error classifier",
+      "implementation_notes": "With structured concurrency the pattern is written out: a loop over the attempt budget calls the async operation, classifies the thrown error and waits with try await Task.sleep(nanoseconds:) or Task.sleep(for: .seconds(n)), which suspends the task without blocking a thread and throws CancellationError if the surrounding task is cancelled - so the loop must let that error propagate rather than catch it. The standard library supplies the delay and the cancellation semantics, not the policy: attempt counts, backoff and the retryable-error decision stay with the caller, and the usual shape is a generic withRetry helper over an async closure. Combine's retry operator (the second variant) covers publisher-shaped work but has no delay or classification, so the async loop is the general answer on modern Swift.",
+      "code_sketch": "func withRetry<T>(_ attempts: Int, _ op: () async throws -> T) async throws -> T {\n    var last: Error?\n    for attempt in 1...attempts {\n        do { return try await op() }\n        catch is CancellationError { throw CancellationError() }   // never retry\n        catch let e where isTransient(e) {\n            last = e\n            if attempt < attempts { try await Task.sleep(for: .milliseconds(200 * attempt)) }\n        }\n        catch { throw error }                                     // permanent: fail fast\n    }\n    throw last!\n}",
+      "pitfalls": [
+        "Task.sleep throws CancellationError when the task is cancelled; swallowing it turns cancellation into an endless retry loop and breaks structured concurrency.",
+        "Task.sleep guarantees only that the task resumes at or after the instant (system sleep can stretch it), so a total-time budget must be measured with ContinuousClock rather than by summing delays.",
+        "Retrying an actor-isolated operation re-enters the actor on every attempt, so state mutated before the failure is replayed - the retried body must be idempotent and reentrancy-safe.",
+        "Errors are untyped by default: classification needs a typed error enum or protocol, because a generic catch cannot tell a 503 from a decoding bug."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/swiftlang/swift/main/stdlib/public/Concurrency/TaskSleepDuration.swift",
+        "https://raw.githubusercontent.com/swiftlang/swift/main/stdlib/public/Concurrency/TaskSleep.swift"
+      ]
+    },
+    {
+      "variant_id": "combine-retry-operator",
+      "name": "Combine Publisher.retry(_:) operator in a pipeline",
+      "paradigm": "declarative",
+      "min_standard": "Swift5.9",
+      "idiom_name": "publisher.retry(n) with delay/catch operators for pacing and fallback",
+      "implementation_notes": "For Combine pipelines the operator is the mechanism: publisher.retry(3) recreates the subscription to the upstream publisher when it fails and passes the failure downstream after the last attempt, so the policy is expressed in the pipeline rather than in a loop. Because the operator takes only a count, delay and classification come from the surrounding operators - delay(for:scheduler:) or a custom retryWhen-style operator for pacing, catch for the terminal fallback - and the failure path stays visible in the chain, which is the reason to use it for URLSession data tasks and other publisher-based I/O. For plain async/await code the explicit loop remains the alternative, since the operator cannot express a deadline or a retryable-error predicate by itself.",
+      "code_sketch": "cancellable = URLSession.shared.dataTaskPublisher(for: url)\n    .retry(3)                                  // recreate the subscription up to 3 times\n    .map(\\.data)\n    .catch { _ in Just(Data()) }               // terminal fallback after the last attempt\n    .sink(receiveCompletion: { print($0) }, receiveValue: { print($0.count) })",
+      "pitfalls": [
+        "retry(_:) has no delay and no classification: a pipeline that fails permanently (a 404) repeats the same request immediately, so pacing and a predicate must be added around it.",
+        "The operator recreates the upstream subscription, so upstream side effects and per-subscription setup happen again on every attempt.",
+        "Retrying on the main scheduler floods it; use a background scheduler and add a timeout operator for the per-attempt budget.",
+        "Cancelling the AnyCancellable stops retries, but a sink that ignores completion makes exhaustion invisible - handle receiveCompletion."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/combine/publisher/retry(_:)"
+      ]
+    }
+  ],
+  "default_variant": "async-await-loop"
+}

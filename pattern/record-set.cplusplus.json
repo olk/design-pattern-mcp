@@ -1,0 +1,72 @@
+{
+  "pattern": "record-set",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "libpqxx pqxx::result (container of rows and fields with column metadata)",
+  "implementation_notes": "pqxx::result is the closest literal realisation in C++: a container of rows, each row a container of fields, iterable with begin()/end() and carrying column metadata (column_name(), column_type()) so name access comes free. What replaces a hand-rolled record set is this library value; copy cells into std::string (or convert to your own std::vector<Row>) when you need a value independent of libpqxx or a stable ABI. Where libpqxx is unavailable, iterate sqlite3_step()/sqlite3_column_*() or libpq's PGresult and copy into caller-owned storage - the classic hand-written struct stays justified when the set must cross a shared-library boundary or be cached as a plain value.",
+  "code_sketch": "pqxx::result r = tx.exec(\"SELECT id, email FROM customer WHERE active = $1\", active);\nstd::vector<std::string> cols = r.columns();   // metadata travels with the set\nfor (auto const& row : r) {\n    handle(row[\"id\"].as<long>(), row[\"email\"].as<std::string>());\n}",
+  "pitfalls": [
+    "pqxx::result is a snapshot owned by libpqxx: it copies cheaply (handle semantics) but row/field objects point into it - holding them past the result's lifetime dangles.",
+    "std::vector<std::string> rows lose SQL NULL: model it explicitly (std::optional<std::string>) or an empty string becomes indistinguishable from a NULL cell.",
+    "Name-based lookup walks the header on every access; precompute a name-to-index map when the set is read in a hot loop."
+  ],
+  "sources": [
+    "https://pqxx.org/libpqxx",
+    "https://sqlite.org/cintro.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pqxx-result",
+      "name": "libpqxx pqxx::result container",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "libpqxx pqxx::result (container of rows and fields with column metadata)",
+      "implementation_notes": "pqxx::result is the closest literal realisation in C++: a container of rows, each row a container of fields, iterable with begin()/end() and carrying column metadata (column_name(), column_type()) so name access comes free. What replaces a hand-rolled record set is this library value; copy cells into std::string (or convert to your own std::vector<Row>) when you need a value independent of libpqxx or a stable ABI. Where libpqxx is unavailable, iterate sqlite3_step()/sqlite3_column_*() or libpq's PGresult and copy into caller-owned storage - the classic hand-written struct stays justified when the set must cross a shared-library boundary or be cached as a plain value.",
+      "code_sketch": "pqxx::result r = tx.exec(\"SELECT id, email FROM customer WHERE active = $1\", active);\nstd::vector<std::string> cols = r.columns();   // metadata travels with the set\nfor (auto const& row : r) {\n    handle(row[\"id\"].as<long>(), row[\"email\"].as<std::string>());\n}",
+      "pitfalls": [
+        "pqxx::result is a snapshot owned by libpqxx: it copies cheaply (handle semantics) but row/field objects point into it - holding them past the result's lifetime dangles.",
+        "std::vector<std::string> rows lose SQL NULL: model it explicitly (std::optional<std::string>) or an empty string becomes indistinguishable from a NULL cell.",
+        "Name-based lookup walks the header on every access; precompute a name-to-index map when the set is read in a hot loop."
+      ],
+      "sources": [
+        "https://pqxx.org/libpqxx",
+        "https://sqlite.org/cintro.html"
+      ]
+    },
+    {
+      "variant_id": "manual-row-vector",
+      "name": "Hand-rolled std::vector<Row> record set with a name index",
+      "paradigm": "data-oriented",
+      "min_standard": "C++03",
+      "idiom_name": "std::vector<Row> + header vector + name-to-index map",
+      "implementation_notes": "When the data does not come from a library that already returns a container (CSV, an in-memory computation, or a driver API limited to stepping), build the set yourself: a row type of std::vector<std::optional<std::string>> (or a small cell struct) in a std::vector, a std::vector<std::string> header, and an unordered_map for name lookup. What replaces the classic RecordSet class is this pair of plain containers; the header plus the index map are what preserve the pattern's metadata discipline. This is the variant to reach for when the set must be copied freely, cached, or kept independent of any database library.",
+      "code_sketch": "struct RecordSet {\n  std::vector<std::string> columns;\n  std::vector<std::vector<std::optional<std::string>>> rows;\n  std::unordered_map<std::string, std::size_t> index;\n};\nRecordSet rs{cols, rows, index_of(cols)};\nauto& cell = rs.rows[i][rs.index.at(\"email\")];",
+      "pitfalls": [
+        "std::optional<std::string> per cell multiplies allocations; for wide sets prefer a cell value type with a null flag or offsets into one arena.",
+        "Building the name index per set is O(columns) - share a header object when the same projection is produced repeatedly."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/optional",
+        "https://en.cppreference.com/w/cpp/container/vector"
+      ]
+    },
+    {
+      "variant_id": "sqlite-step-scan",
+      "name": "sqlite3 prepared-statement scan materialised into caller storage",
+      "paradigm": "procedural",
+      "min_standard": "C++11",
+      "idiom_name": "sqlite3_step + sqlite3_column_* into std::vector<std::string>",
+      "implementation_notes": "SQLite's C API deliberately avoids materialising: sqlite3_step() advances to the next row and the sqlite3_column_*() family reads that row, so the record set only exists once you copy the cells into caller-owned strings; the header is read separately via sqlite3_column_count()/sqlite3_column_name()/sqlite3_column_type(). This variant is right when the result is large (bounded memory) or consumed exactly once; the price is that detachment - the copying loop - is explicitly yours, and the header must be captured before the statement is reset.",
+      "code_sketch": "sqlite3_stmt* st;\nsqlite3_prepare_v2(db, \"SELECT id, email FROM customer\", -1, &st, nullptr);\nstd::vector<std::string> cols = column_names(st);   // sqlite3_column_name(i)\nstd::vector<std::vector<std::string>> rows;\nwhile (sqlite3_step(st) == SQLITE_ROW)\n    rows.push_back({text_of(st, 0), text_of(st, 1)});  // copy before the next step\nsqlite3_finalize(st);",
+      "pitfalls": [
+        "Column text pointers are invalidated by the next sqlite3_step()/sqlite3_reset(): copy before advancing or the rows alias freed memory.",
+        "sqlite3_column_text() returns NULL for SQL NULL - distinguish it from an empty string before wrapping into std::string."
+      ],
+      "sources": [
+        "https://sqlite.org/cintro.html"
+      ]
+    }
+  ],
+  "default_variant": "pqxx-result",
+  "version": "1.0"
+}

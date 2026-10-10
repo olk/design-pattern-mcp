@@ -1,0 +1,18 @@
+{
+  "pattern": "write-behind",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "dirty HashMap + tokio interval flush task over sqlx transactions",
+  "implementation_notes": "Neither sqlx nor diesel provides a persistence context, so Rust makes you own the accumulator: a HashMap keyed by identity (coalescing by construction) drained by an async task that wakes on tokio::time::interval or a batch-size trigger and executes the batch through sqlx's Transaction, where commit() is explicit. The borrow checker forces explicit ownership of staged rows, which removes the accidental-sharing bugs the classic pattern invites; what replaces the classic structure is only the async runtime's timer and channels, so the roles remain hand-written. Honestly justified when write throughput matters; otherwise write through per change.",
+  "code_sketch": "let (tx, mut rx) = mpsc::channel::<Change>(1024);\n// producers: tx.send(change).await?;\nlet mut tick = tokio::time::interval(Duration::from_millis(200));\nloop {\n    tokio::select! {\n        _ = tick.tick() => {}\n        Some(c) = rx.recv() => { dirty.insert(c.key, c.row); }\n    }\n    if dirty.is_empty() { continue; }\n    let batch = std::mem::take(&mut dirty);   // one row per key\n    let mut tx = pool.begin().await?;\n    for (k, r) in batch { query(UPSERT).bind(r).bind(k).execute(&mut *tx).await?; }\n    tx.commit().await?;\n}",
+  "pitfalls": [
+    "Never hold a std::sync::Mutex guard across .await: either keep the map lock-free between awaits or use tokio::sync::Mutex deliberately.",
+    "A panic in the flush task stops every write silently unless the task is supervised and restarted.",
+    "Staging the final value, not a delta, keeps coalescing bounded: appending every change to a Vec per key grows without limit under pressure."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/time/fn.interval.html",
+    "https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html"
+  ],
+  "version": "1.0"
+}

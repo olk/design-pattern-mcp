@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "HashMap<u64, tokio::sync::oneshot::Sender<Reply>> + tokio::time::timeout",
+  "implementation_notes": "tokio's oneshot channel is the idiomatic waiter for this pattern: the requestor stores the Sender in a map keyed by the correlation id and awaits the Receiver, wrapping the await in tokio::time::timeout for the deadline; the read loop removes the Sender by id and sends the payload, and dropping the Sender (timeout, connection loss, shutdown) makes the receiver fail with RecvError, which is the usable no-reply signal. Since the map is shared across tasks, either guard it with a Mutex/DashMap or let one actor task own it and carry the Sender inside the request - the tokio tutorial's message-passing shape, which is the same pattern with the reply channel travelling in the request instead of an id table. There is no stdlib future-completion primitive, so the executor supplies the mechanism.",
+  "code_sketch": "async fn call(\n    id: u64,\n    body: Vec<u8>,\n    pending: &Mutex<HashMap<u64, oneshot::Sender<Reply>>>,\n    tx: &mpsc::Sender<Frame>,\n) -> Result<Reply, Error> {\n    let (resp_tx, resp_rx) = oneshot::channel();\n    pending.lock().await.insert(id, resp_tx);          // register BEFORE send\n    tx.send(Frame { id, body }).await?;\n    match timeout(Duration::from_secs(5), resp_rx).await {\n        Ok(Ok(reply)) => Ok(reply),                    // read loop matched the id\n        Ok(Err(_)) => Err(Error::NoReply),             // Sender dropped: entry removed\n        Err(_) => Err(Error::Timeout),                 // late reply dropped on remove\n    }\n}\n// read loop: if let Some(tx) = pending.lock().await.remove(&frame.id) { let _ = tx.send(payload); }",
+  "pitfalls": [
+    "Never hold a std::sync::MutexGuard across an .await: the future stops being Send and the guard can outlive its poll - use tokio::sync::Mutex or scope the lock so it is dropped before awaiting.",
+    "A oneshot Receiver dropped before the Sender sends makes send() return Err; that is the timeout/shutdown path, so ignore the result deliberately rather than treating it as a failure to deliver.",
+    "Entries left in the map after a timeout keep the Sender alive, so the caller's Receiver never observes the no-reply signal and the map grows: remove the entry on every exit path.",
+    "A per-connection counter restarts at zero after a reconnect, so replies that outlive the connection can match a fresh request - seed the counter with a random base or use UUIDs."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html",
+    "https://tokio.rs/tokio/tutorial/channels"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,19 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "ConcurrentDictionary.TryAdd plus a transactional inbox / framework deduplication",
+  "implementation_notes": "In-process, ConcurrentDictionary<TKey,TValue>.TryAdd is the atomic claim: it returns false when another thread already claimed the key, so it replaces the contains-then-add pair. For durability, let the business write itself be the claim - a unique index on the idempotency key, catching the resulting DbUpdateException - or keep an inbox table written inside the same DbContext transaction. The dominant frameworks ship the whole pattern: NServiceBus implements built-in message deduplication in its outbox, and MassTransit's consumer outbox tracks received message ids for exactly-once consumer behaviour; prefer those over hand-rolling the store when the stack is already there.",
+  "code_sketch": "private readonly ConcurrentDictionary<string, byte> _seen = new();\n\npublic async Task HandleAsync(OrderMessage msg, CancellationToken ct)\n{\n    if (!_seen.TryAdd(msg.IdempotencyKey, 0)) return;   // duplicate: absorb\n    await using var tx = await _db.Database.BeginTransactionAsync(ct);\n    _db.Inbox.Add(new InboxEntry(msg.IdempotencyKey));  // durable claim, UNIQUE index\n    ApplyEffects(msg);                                  // same transaction\n    await _db.SaveChangesAsync(ct);\n    await tx.CommitAsync(ct);\n}",
+  "pitfalls": [
+    "TryAdd on a process-local dictionary gives no protection across scaled-out instances or restarts; pair it with a durable claim when duplicates can outlive the process.",
+    "The unique-constraint violation is the durable claim, so catch DbUpdateException narrowly around the inbox insert - a broad catch around the handler hides real failures.",
+    "Inbox row and business rows must share one DbContext transaction, otherwise a crash between the two reopens the duplicate window."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2.tryadd",
+    "https://docs.particular.net/architecture/consistency",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/idempotent-consumer"
+  ],
+  "version": "1.0"
+}

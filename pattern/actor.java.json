@@ -1,0 +1,74 @@
+{
+  "pattern": "actor",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "BlockingQueue mailbox + consumer thread",
+  "implementation_notes": "The JVM's mailbox primitive is java.util.concurrent.BlockingQueue: an ArrayBlockingQueue or LinkedBlockingQueue provides put/take with the four failure modes the javadoc documents (throw, special value, block, time out), and the actor is a plain class whose state is touched only by the consumer loop that drains take(). The javadoc itself points out that BlockingQueue has no close operation and that the common shutdown tactic is a poison (end-of-stream) object. A dedicated thread or a single-thread ExecutorService runs the loop. Choose this for in-process actors; Akka or Pekko when references, supervision and remoting are needed, virtual threads when the actor count must be very large.",
+  "code_sketch": "final class Counter implements Runnable {\n    private static final Object STOP = new Object();\n    private final BlockingQueue<Object> mailbox = new ArrayBlockingQueue<>(1_000);\n    private int count;                              // touched only by run()\n    void tell(int delta) throws InterruptedException { mailbox.put(delta); }\n    void stop() throws InterruptedException { mailbox.put(STOP); }\n    public void run() {\n        try { while (true) { Object msg = mailbox.take(); if (msg == STOP) return; count += (Integer) msg; } }\n        catch (InterruptedException e) { Thread.currentThread().interrupt(); }\n    }\n}",
+  "pitfalls": [
+    "BlockingQueue has no close operation, so shutdown needs a poison sentinel or an interrupt; forgetting it leaves the consumer thread parked forever.",
+    "InterruptedException must restore the interrupt flag; swallowing it makes the actor unstoppable.",
+    "An unbounded LinkedBlockingQueue removes backpressure: producers never block and a slow actor becomes heap pressure.",
+    "Publishing mutable message objects across threads instead of immutable ones reintroduces the data race the pattern removes."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html"
+  ],
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "juc-mailbox",
+      "name": "java.util.concurrent mailbox + dedicated consumer",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "BlockingQueue mailbox + consumer thread",
+      "implementation_notes": "The JVM's mailbox primitive is java.util.concurrent.BlockingQueue: an ArrayBlockingQueue or LinkedBlockingQueue provides put/take with the four failure modes the javadoc documents (throw, special value, block, time out), and the actor is a plain class whose state is touched only by the consumer loop that drains take(). The javadoc itself points out that BlockingQueue has no close operation and that the common shutdown tactic is a poison (end-of-stream) object. A dedicated thread or a single-thread ExecutorService runs the loop. Choose this for in-process actors; Akka or Pekko when references, supervision and remoting are needed, virtual threads when the actor count must be very large.",
+      "code_sketch": "final class Counter implements Runnable {\n    private static final Object STOP = new Object();\n    private final BlockingQueue<Object> mailbox = new ArrayBlockingQueue<>(1_000);\n    private int count;                              // touched only by run()\n    void tell(int delta) throws InterruptedException { mailbox.put(delta); }\n    void stop() throws InterruptedException { mailbox.put(STOP); }\n    public void run() {\n        try { while (true) { Object msg = mailbox.take(); if (msg == STOP) return; count += (Integer) msg; } }\n        catch (InterruptedException e) { Thread.currentThread().interrupt(); }\n    }\n}",
+      "pitfalls": [
+        "BlockingQueue has no close operation, so shutdown needs a poison sentinel or an interrupt; forgetting it leaves the consumer thread parked forever.",
+        "InterruptedException must restore the interrupt flag; swallowing it makes the actor unstoppable.",
+        "An unbounded LinkedBlockingQueue removes backpressure: producers never block and a slow actor becomes heap pressure.",
+        "Publishing mutable message objects across threads instead of immutable ones reintroduces the data race the pattern removes."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html"
+      ]
+    },
+    {
+      "variant_id": "akka-typed-actors",
+      "name": "Akka Typed Actors (Behavior + ActorRef)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "Akka typed actor protocol",
+      "implementation_notes": "Akka's typed API is the reference JVM actor system: the message set is the actor's compile-checked protocol, an ActorRef is the only address that escapes, and mailbox plus dispatcher are runtime-managed. State is updated by returning a new behavior in the Scala DSL or by mutating fields of an AbstractBehavior in the Java DSL - either way one message at a time, so no synchronized or AtomicInteger is needed, as the Akka documentation states explicitly; Behaviors.supervise declares restart policy. Choose it when actors must be supervised, configured, clustered or remoted; a single in-process mailbox does not need it.",
+      "code_sketch": "public class Counter extends AbstractBehavior<Counter.Add> {\n    public record Add(int n) {}\n    private int count;\n    public Receive<Add> createReceive() {\n        return newReceiveBuilder().onMessage(Add.class, this::onAdd).build();\n    }\n    private Behavior<Add> onAdd(Add m) { count += m.n(); return this; }  // no locks needed\n    public static Behavior<Add> create() { return Behaviors.setup(Counter::new); }\n}",
+      "pitfalls": [
+        "ActorRef is the only shareable handle: passing this or the behavior object out of the actor breaks isolation.",
+        "Blocking operations inside a dispatcher starve the other actors scheduled on it; run blocking work on a dedicated dispatcher.",
+        "Classic and typed APIs must not be mixed inside one actor system; only the typed API gives compile-checked message protocols."
+      ],
+      "sources": [
+        "https://doc.akka.io/libraries/akka-core/current/typed/actors.html",
+        "https://doc.akka.io/libraries/akka-core/current/typed/mailboxes.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-thread-mailbox",
+      "name": "Virtual-thread actor (Java 21)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "idiom_name": "one virtual thread per actor + BlockingQueue",
+      "implementation_notes": "JEP 444 makes the classic blocking actor cheap: one virtual thread per actor with a BlockingQueue mailbox scales to very large actor counts because BlockingQueue.take() unmounts the virtual thread from its carrier instead of blocking an OS thread. The structure is identical to the JUC variant and only the concurrency unit changes. Virtual threads must never be pooled, CPU-bound handlers gain nothing from them, and blocking inside synchronized or native frames pins the carrier, so JEP 444 recommends ReentrantLock around potentially long I/O.",
+      "code_sketch": "var mailbox = new ArrayBlockingQueue<Msg>(1_000);   // bounded mailbox\nThread.ofVirtual().name(\"counter\").start(() -> {\n    try { while (true) { Msg m = mailbox.take(); handle(m); } }  // take() unmounts\n    catch (InterruptedException e) { Thread.currentThread().interrupt(); }\n});\nmailbox.put(new Add(1));                            // from any carrier thread",
+      "pitfalls": [
+        "Virtual threads are daemon threads: an actor whose mailbox still holds work can be discarded when the JVM exits.",
+        "Pinning - blocking inside synchronized or native frames - keeps the carrier blocked, so guard I/O with ReentrantLock as JEP 444 advises.",
+        "Do not pool virtual threads to bound concurrency; use semaphores for that, as the JEP explicitly notes."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/444"
+      ]
+    }
+  ],
+  "default_variant": "juc-mailbox"
+}

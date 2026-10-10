@@ -1,0 +1,60 @@
+{
+  "pattern": "backpressure",
+  "language": "c",
+  "support": "manual",
+  "variants": [
+    {
+      "variant_id": "blocking-fd",
+      "name": "Blocking write(2) on a pipe/socket (kernel-bounded)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "blocking write(2) + kernel pipe/socket buffer (or pthread mutex+condvar ring buffer in-process)",
+      "implementation_notes": "C has no flow-control abstraction, so the bounded hand-off is the kernel's own per-fd buffer: a blocking write(2) to a full pipe or socket simply blocks the writer until the reader drains, and that is the whole mechanism - correct for a producer that owns its thread. A pipe holds a fixed, non-negotiable capacity (16 pages by default on Linux, adjustable via fcntl(F_SETPIPE_SZ)), and a TCP socket is paced by the peer's receive window, so the bound exists but is not yours to size; never rely on a particular pipe capacity. For in-process stages there is no stdlib queue at all: the classic mutex + condition variable + bounded ring buffer (pthread_cond_wait/pthread_cond_signal) is hand-written, and it stays justified because the pattern really is a bound plus a blocking wait plus a full policy.",
+      "code_sketch": "/* the kernel's pipe/socket buffer is the bound */\nsize_t off = 0;\nwhile (off < len) {\n    ssize_t n = write(fd, buf + off, len - off); /* blocks while the reader is behind */\n    if (n > 0) { off += (size_t)n; continue; }\n    if (n < 0 && errno == EINTR) continue;\n    if (n < 0 && errno == EPIPE) return 0;\n    return -1;\n}\n\n/* in-process stage: hand-written bound + blocking wait */\npthread_mutex_lock(&q->m);\nwhile (q->count == q->cap)                /* full: wait for the consumer */\n    pthread_cond_wait(&q->not_full, &q->m);\nq->items[q->tail] = item; q->tail = (q->tail + 1) % q->cap; q->count++;\npthread_cond_signal(&q->not_empty);\npthread_mutex_unlock(&q->m);",
+      "pitfalls": [
+        "A blocking write in an event-loop thread stalls every other fd it is responsible for; either give the producer its own thread or move to the non-blocking form.",
+        "A write(2) to a pipe whose reader died raises SIGPIPE, which kills the process by default; ignore SIGPIPE or use send(MSG_NOSIGNAL) on sockets.",
+        "Blocking writes have no timeout: if the consumer never drains, the producer hangs forever, so pair the bound with a cancellation path (poll with a timeout, or a shutdown flag checked in the wait loop).",
+        "forgetting the not_full wait predicate (or using if instead of while) loses the bound under spurious wakeups and multiple producers."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/pipe.7.html",
+        "https://man7.org/linux/man-pages/man2/poll.2.html"
+      ]
+    },
+    {
+      "variant_id": "nonblocking-poll",
+      "name": "Non-blocking fd + EAGAIN + poll(POLLOUT)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "O_NONBLOCK + EAGAIN + poll(POLLOUT) readiness handshake",
+      "implementation_notes": "When the producer must not block (single-threaded reactor, many fds, one thread), switch the fd to O_NONBLOCK, treat EAGAIN/EWOULDBLOCK as 'the buffer is full', and wait for POLLOUT via poll(2) or epoll before retrying - this is the POSIX-level equivalent of the demand signal, and the readiness loop replaces the blocking write. POLLOUT only promises that *some* space is available, so a partial write must be handled: the application keeps the unsent tail in its own bounded outbound buffer and re-registers for POLLOUT, which is exactly the classic structure the reactor-style code buys back. With multiple producers, POLLOUT can be level-triggered noisy; register interest only while the outbound queue is empty of unsent data.",
+      "code_sketch": "fcntl(fd, F_SETFL, O_NONBLOCK);          /* EAGAIN now means \"full\" */\n\nssize_t n = write(fd, out->buf + out->off, out->len - out->off);\nif (n > 0) out->off += (size_t)n;\nif (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;\nif (out->off < out->len) {\n    pfd.events = POLLOUT;                  /* wait for space or retry after a partial write */\n} else {\n    pfd.events = 0;                        /* nothing pending: stop listening */\n}",
+      "pitfalls": [
+        "POLLOUT readiness does not mean the whole buffer fits - loop the write and buffer the remainder, or bytes are silently lost.",
+        "Treating EAGAIN as an I/O error instead of the full signal turns backpressure into a crash.",
+        "epoll() with edge-triggered mode plus a partial write needs an explicit retry until EAGAIN, otherwise the fd never fires again.",
+        "Keeping POLLOUT registered while the outbound queue is empty busy-spins the loop."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/poll.2.html",
+        "https://man7.org/linux/man-pages/man7/pipe.7.html"
+      ]
+    }
+  ],
+  "default_variant": "blocking-fd",
+  "idiom_name": "blocking write(2) + kernel pipe/socket buffer (or pthread mutex+condvar ring buffer in-process)",
+  "implementation_notes": "C has no flow-control abstraction, so the bounded hand-off is the kernel's own per-fd buffer: a blocking write(2) to a full pipe or socket simply blocks the writer until the reader drains, and that is the whole mechanism - correct for a producer that owns its thread. A pipe holds a fixed, non-negotiable capacity (16 pages by default on Linux, adjustable via fcntl(F_SETPIPE_SZ)), and a TCP socket is paced by the peer's receive window, so the bound exists but is not yours to size; never rely on a particular pipe capacity. For in-process stages there is no stdlib queue at all: the classic mutex + condition variable + bounded ring buffer (pthread_cond_wait/pthread_cond_signal) is hand-written, and it stays justified because the pattern really is a bound plus a blocking wait plus a full policy.",
+  "code_sketch": "/* the kernel's pipe/socket buffer is the bound */\nsize_t off = 0;\nwhile (off < len) {\n    ssize_t n = write(fd, buf + off, len - off); /* blocks while the reader is behind */\n    if (n > 0) { off += (size_t)n; continue; }\n    if (n < 0 && errno == EINTR) continue;\n    if (n < 0 && errno == EPIPE) return 0;\n    return -1;\n}\n\n/* in-process stage: hand-written bound + blocking wait */\npthread_mutex_lock(&q->m);\nwhile (q->count == q->cap)                /* full: wait for the consumer */\n    pthread_cond_wait(&q->not_full, &q->m);\nq->items[q->tail] = item; q->tail = (q->tail + 1) % q->cap; q->count++;\npthread_cond_signal(&q->not_empty);\npthread_mutex_unlock(&q->m);",
+  "pitfalls": [
+    "A blocking write in an event-loop thread stalls every other fd it is responsible for; either give the producer its own thread or move to the non-blocking form.",
+    "A write(2) to a pipe whose reader died raises SIGPIPE, which kills the process by default; ignore SIGPIPE or use send(MSG_NOSIGNAL) on sockets.",
+    "Blocking writes have no timeout: if the consumer never drains, the producer hangs forever, so pair the bound with a cancellation path (poll with a timeout, or a shutdown flag checked in the wait loop).",
+    "forgetting the not_full wait predicate (or using if instead of while) loses the bound under spurious wakeups and multiple producers."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man7/pipe.7.html",
+    "https://man7.org/linux/man-pages/man2/poll.2.html"
+  ],
+  "version": "1.1"
+}

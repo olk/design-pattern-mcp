@@ -1,0 +1,83 @@
+{
+  "pattern": "memoization",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "struct holding HashMap plus a &mut self method",
+  "implementation_notes": "Rust has no memoize wrapper in the standard library, so the honest form is a struct that owns the cache: a HashMap field and a method that takes &mut self, checks get(), computes on a miss and inserts the result. Recursion then goes through the method itself, which is why the struct is not just a style choice - a closure cannot capture itself, so recursive memoization is unwritable as a closure and the explicit cache parameter (or struct) is the pattern's justified classic form. For interior mutability in a shared context, wrap the map in Mutex/RwLock (or RefCell for single-threaded code); the compiler enforces the choice, since RefCell is not Sync and a closure holding one cannot cross threads.",
+  "code_sketch": "use std::collections::HashMap;\n\nstruct Memo { cache: HashMap<u64, u64> }\n\nimpl Memo {\n    fn fib(&mut self, n: u64) -> u64 {\n        if let Some(&v) = self.cache.get(&n) { return v; }\n        let v = if n < 2 { n } else { self.fib(n - 1) + self.fib(n - 2) };\n        self.cache.insert(n, v);\n        v\n    }\n}",
+  "pitfalls": [
+    "The method needs &mut self, so a Memo cannot be called through a shared reference; sharing it across threads requires Mutex<HashMap> and an explicit lock, not a bigger struct.",
+    "RefCell is not Sync, so a RefCell-backed cache in a closure cannot be sent across threads - the compiler error is the design check, not an obstacle to work around.",
+    "Recursive memoization as a self-referential closure does not compile in safe Rust; restructure to the struct or pass the cache as a parameter.",
+    "An unbounded HashMap retains every key and value for the owner's lifetime; bound the domain or add an LRU store for long-running processes."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+    "https://docs.rs/cached/latest/cached/"
+  ],
+  "variants": [
+    {
+      "variant_id": "hashmap-struct-method",
+      "name": "Explicit memo struct with a HashMap",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "idiom_name": "struct holding HashMap plus a &mut self method",
+      "implementation_notes": "Rust has no memoize wrapper in the standard library, so the honest form is a struct that owns the cache: a HashMap field and a method that takes &mut self, checks get(), computes on a miss and inserts the result. Recursion then goes through the method itself, which is why the struct is not just a style choice - a closure cannot capture itself, so recursive memoization is unwritable as a closure and the explicit cache parameter (or struct) is the pattern's justified classic form. For interior mutability in a shared context, wrap the map in Mutex/RwLock (or RefCell for single-threaded code); the compiler enforces the choice, since RefCell is not Sync and a closure holding one cannot cross threads.",
+      "code_sketch": "use std::collections::HashMap;\n\nstruct Memo { cache: HashMap<u64, u64> }\n\nimpl Memo {\n    fn fib(&mut self, n: u64) -> u64 {\n        if let Some(&v) = self.cache.get(&n) { return v; }\n        let v = if n < 2 { n } else { self.fib(n - 1) + self.fib(n - 2) };\n        self.cache.insert(n, v);\n        v\n    }\n}",
+      "pitfalls": [
+        "The method needs &mut self, so a Memo cannot be called through a shared reference; sharing it across threads requires Mutex<HashMap> and an explicit lock, not a bigger struct.",
+        "RefCell is not Sync, so a RefCell-backed cache in a closure cannot be sent across threads - the compiler error is the design check, not an obstacle to work around.",
+        "Recursive memoization as a self-referential closure does not compile in safe Rust; restructure to the struct or pass the cache as a parameter.",
+        "An unbounded HashMap retains every key and value for the owner's lifetime; bound the domain or add an LRU store for long-running processes."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/collections/struct.HashMap.html",
+        "https://docs.rs/cached/latest/cached/"
+      ]
+    },
+    {
+      "variant_id": "std-once-lazy",
+      "name": "OnceLock / LazyLock for a single value",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.70",
+      "requires_features": [
+        "OnceLock"
+      ],
+      "idiom_name": "static OnceLock<T> with get_or_init",
+      "implementation_notes": "For the nullary case the standard library does provide the facility: OnceLock (stable since 1.70) is a thread-safe cell written once, and get_or_init guarantees that many threads may call it concurrently yet only one initializer runs, which is exactly the memo guarantee for a value that has no arguments; LazyLock is the same idea with the initializer attached and derefs like &T. The documented trap is re-entrancy - it is an error to initialise the cell from inside its own initializer, and the current implementation deadlocks while the outcome is explicitly unspecified - so the initializer must not call back into the same cell. Single-threaded code can use std::cell::OnceCell instead, and anything keyed by arguments still needs a map plus a lock or a cache crate.",
+      "code_sketch": "use std::sync::OnceLock;\n\nstatic INDEX: OnceLock<Index> = OnceLock::new();\n\nfn index() -> &'static Index {\n    INDEX.get_or_init(build_index)   // one initializer run, even under concurrency\n}",
+      "pitfalls": [
+        "Reentrant initialisation deadlocks (documented as unspecified behaviour with the current implementation); never touch the cell from its own initializer.",
+        "A panic inside the initializer leaves the cell uninitialized and propagates, so the next caller retries a failing computation.",
+        "OnceLock covers only the zero-argument case: turning it into an argument-keyed memo means a map inside the cell and a lock around it.",
+        "A static cell holds its value for the program's lifetime, including everything the value references."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.OnceLock.html"
+      ]
+    },
+    {
+      "variant_id": "cached-crate-macro",
+      "name": "#[cached] attribute macro (cached crate)",
+      "paradigm": "declarative",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "cached"
+      ],
+      "idiom_name": "#[cached] / #[cached(max_size = N, ttl_secs = ...)]",
+      "implementation_notes": "The practical route for argument-keyed memoization is the cached crate's attribute macro: #[cached] wraps the function body with a store keyed on the arguments, #[cached(max_size = N)] adds an LRU bound, ttl_secs adds expiry, and #[once] covers the nullary case. The crate's documentation is explicit about the concurrency default - #[cached] has no write synchronization, so concurrent uncached calls for the same key may each compute independently and overwrite each other, matching the stdlib decorators of other languages - while sync_writes = by_key deduplicates them at the price of per-key locks that must not be used on recursive or re-entrant functions. That makes the crate the right default for a service-shaped memo and the wrong one for a deeply recursive function, where the explicit struct below stays clearer.",
+      "code_sketch": "use cached::proc_macro::cached;\n\n#[cached]                      // global store; concurrent misses may compute twice\nfn fib(n: u64) -> u64 {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n\n// #[cached(max_size = 1_000, ttl_secs = 60)] for a bounded, expiring memo",
+      "pitfalls": [
+        "The default has no write synchronization (documented), so identical concurrent misses can duplicate the computation; sync_writes = by_key deduplicates but must not annotate recursive functions (deadlock).",
+        "Arguments must be Clone and Hash, and the macro stores the key, so large argument structs become part of the retained footprint.",
+        "Option and Result returns are treated specially (None/Err are not cached by default), which is usually desirable and occasionally surprising.",
+        "The store lives for the program's lifetime unless a bound is configured, so a TTL or max_size belongs on every unbounded key domain."
+      ],
+      "sources": [
+        "https://docs.rs/cached/latest/cached/"
+      ]
+    }
+  ],
+  "default_variant": "hashmap-struct-method",
+  "version": "1.0"
+}

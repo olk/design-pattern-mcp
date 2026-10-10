@@ -1,0 +1,20 @@
+{
+  "pattern": "process-manager",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "enum state + exhaustive match decider + serde-persisted row + tokio timeout",
+  "implementation_notes": "Rust makes the decider cheap and honest: states are enum variants, transitions an exhaustive match, and a forgotten variant does not compile; the instance is a serialised struct (serde) in a database row and tokio::time::timeout bounds in-process waits. What the language does not supply is durability or correlation - the outbox write, the deadline sweep and the compensating steps are hand-written - so a hand-rolled enum machine is the usual shape until a durable-execution runtime is adopted. The classic state-object form is still justified when each state carries substantial behaviour and per-state modules read better than one growing match arm.",
+  "code_sketch": "#[derive(Serialize, Deserialize, Clone)]\n#[serde(tag = \"state\", rename_all = \"snake_case\")]\nenum OrderState {\n    AwaitingPayment,\n    AwaitingStock { cid: String },\n    Compensating { reason: String },\n    Done,\n}\n\nfn decide(state: &OrderState, ev: &Event) -> (OrderState, Vec<Command>) {\n    match (state, ev) {\n        (OrderState::AwaitingPayment, Event::PaymentOk { cid }) =>\n            (OrderState::AwaitingStock { cid: cid.clone() }, vec![Command::ReserveStock(cid.clone())]),\n        (OrderState::AwaitingPayment, Event::PaymentTimeout { cid }) =>\n            (OrderState::Compensating { reason: \"timeout\".into() }, vec![Command::ReleaseCredit(cid.clone())]),\n        _ => (state.clone(), vec![]),        // stale or duplicate reply\n    }\n}\n\nlet reply = tokio::time::timeout(Duration::from_secs(3600), rx.recv()).await;",
+  "pitfalls": [
+    "A serde representation that is not explicitly tagged and versioned breaks every running instance when a variant gains a field; derive with a stable tag and keep a version marker in the row.",
+    "tokio::time::timeout cancels the future but not the side effect already triggered on the remote side, so activities still need idempotency keys.",
+    "Holding a tokio Mutex across an await while another message for the same instance arrives serialises the wrong thing and can deadlock; serialise per instance (actor task or row lock) instead of relying on one global lock.",
+    "Recovering an instance by deserialising into the current enum silently loses states that were deleted - keep old variants until no instance uses them."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/book/ch06-01-defining-an-enum.html",
+    "https://docs.rs/tokio/latest/tokio/time/fn.timeout.html",
+    "https://serde.rs/derive.html"
+  ],
+  "version": "1.0"
+}

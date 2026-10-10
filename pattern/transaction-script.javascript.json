@@ -1,0 +1,18 @@
+{
+  "pattern": "transaction-script",
+  "language": "javascript",
+  "support": "idiomatic",
+  "idiom_name": "async route handler + explicit BEGIN/COMMIT on one checked-out node-postgres client",
+  "implementation_notes": "Node has no class-per-script convention: the script is an async handler function registered with Express (or a queue-worker callback), and the transaction is managed by hand because drivers such as node-postgres are deliberately low-level and provide no transaction abstraction. Check out one client from the pool, run BEGIN, execute every statement through that same client, then COMMIT on the happy path and ROLLBACK in the catch, with client.release() in finally (or hide the dance in a small withTransaction helper). Using the pool helper for one of the statements is wrong - it takes a different connection and commits outside the transaction. ORMs keep the same one-handler-per-request shape but replace the explicit SQL with a managed transaction callback (trx).",
+  "code_sketch": "app.post('/orders', async (req, res, next) => {\n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    const { rows } = await client.query('SELECT available FROM stock WHERE id = $1 FOR UPDATE', [req.body.productId]);\n    if (rows[0].available < req.body.qty) throw new Error('insufficient stock');\n    await client.query('UPDATE stock SET available = available - $1 WHERE id = $2', [req.body.qty, req.body.productId]);\n    const order = await client.query('INSERT INTO orders (product_id, qty) VALUES ($1, $2) RETURNING id', [req.body.productId, req.body.qty]);\n    await client.query('COMMIT');\n    res.status(201).json({ id: order.rows[0].id });\n  } catch (err) { await client.query('ROLLBACK'); next(err); }\n  finally { client.release(); }\n});",
+  "pitfalls": [
+    "Using pool.query for one of the statements: it checks out a different connection and commits outside the transaction.",
+    "Forgetting client.release() on the error path leaks pool slots until the process restarts.",
+    "A missing await inside the handler leaves an open transaction and an unanswered request - the async idiom fails silently here."
+  ],
+  "sources": [
+    "https://node-postgres.com/features/transactions",
+    "https://expressjs.com/en/guide/routing.html"
+  ],
+  "version": "1.0"
+}

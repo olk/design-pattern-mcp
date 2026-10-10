@@ -1,0 +1,70 @@
+{
+  "pattern": "plugin",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "plugin.Open + (*Plugin).Lookup",
+  "implementation_notes": "Go's own mechanism: build the plugin with -buildmode=plugin (a main package with exported functions and variables), then Open it and Lookup the exported symbols, which come back as untyped Symbol values that must be asserted to function or variable types. It is the highest-performance in-process option because host and plugin share data structures directly, but the stdlib documentation lists the price in the same page: Linux/FreeBSD/macOS only, poor race-detector support, cgo required, no way to close or reload a plugin, and runtime crashes unless host and plugins are built with exactly the same toolchain, build tags, flags and dependency sources.",
+  "code_sketch": "p, err := plugin.Open(\"./plugins/csv.so\")\nif err != nil { return err }\nsym, err := p.Lookup(\"NewFormatter\")   // exported symbol of the plugin main package\nif err != nil { return err }\nnewFormatter := sym.(func() Formatter) // wrong assertion panics here\nfmt.Println(newFormatter().Format(doc))",
+  "pitfalls": [
+    "A version or build-flag skew between host and plugin crashes the process without a useful error; treating host and plugin as one build unit is the only supported configuration.",
+    "plugin.Open is not available on Windows and cross-compiled hosts report \"plugin: not implemented\", so the feature must be behind a build tag or replaced for portable products.",
+    "The plugin is initialized once and can never be closed, so configuration changes for plugins require a process restart, and init functions of the plugin run at Open time."
+  ],
+  "sources": [
+    "https://pkg.go.dev/plugin"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "std-plugin-package",
+      "name": "stdlib plugin package (buildmode=plugin)",
+      "paradigm": "oo",
+      "implementation_notes": "Go's own mechanism: build the plugin with -buildmode=plugin (a main package with exported functions and variables), then Open it and Lookup the exported symbols, which come back as untyped Symbol values that must be asserted to function or variable types. It is the highest-performance in-process option because host and plugin share data structures directly, but the stdlib documentation lists the price in the same page: Linux/FreeBSD/macOS only, poor race-detector support, cgo required, no way to close or reload a plugin, and runtime crashes unless host and plugins are built with exactly the same toolchain, build tags, flags and dependency sources.",
+      "code_sketch": "p, err := plugin.Open(\"./plugins/csv.so\")\nif err != nil { return err }\nsym, err := p.Lookup(\"NewFormatter\")   // exported symbol of the plugin main package\nif err != nil { return err }\nnewFormatter := sym.(func() Formatter) // wrong assertion panics here\nfmt.Println(newFormatter().Format(doc))",
+      "pitfalls": [
+        "A version or build-flag skew between host and plugin crashes the process without a useful error; treating host and plugin as one build unit is the only supported configuration.",
+        "plugin.Open is not available on Windows and cross-compiled hosts report \"plugin: not implemented\", so the feature must be behind a build tag or replaced for portable products.",
+        "The plugin is initialized once and can never be closed, so configuration changes for plugins require a process restart, and init functions of the plugin run at Open time."
+      ],
+      "sources": [
+        "https://pkg.go.dev/plugin"
+      ],
+      "idiom_name": "plugin.Open + (*Plugin).Lookup",
+      "min_standard": "Go1.8"
+    },
+    {
+      "variant_id": "hashicorp-out-of-process",
+      "name": "hashicorp/go-plugin over gRPC (subprocess plugins)",
+      "paradigm": "concurrent",
+      "implementation_notes": "The pragmatic realization for products that cannot demand an identical toolchain: the host launches each plugin as a subprocess and talks to it over gRPC or net/rpc on a loopback connection, with a handshake that negotiates protocol version and (optionally) mTLS, and the stdlib of the host owns the lifecycle by terminating the child. Terraform, Vault, Nomad and Boundary use this shape; it makes plugins language-agnostic and crash-contained, at the cost of serialization, a process per plugin and no direct sharing of Go values.",
+      "code_sketch": "type FormatterPlugin struct{ plugin.NetRPCUnsupportedPlugin }\nfunc (p *FormatterPlugin) Server(*plugin.MuxBroker) (interface{}, error) {\n    return &formatterRPCServer{}, nil\n}\n// host side:\nclient := plugin.NewClient(&plugin.ClientConfig{\n    HandshakeConfig: handshake, Plugins: map[string]plugin.Plugin{\"formatter\": &FormatterPlugin{}},\n    Cmd: exec.Command(\"./csv-plugin\"),\n})\nrpcClient, _ := client.Client()",
+      "pitfalls": [
+        "The library is documented as designed for a local reliable network only; exposing the plugin connection over a real network leads to unpredictable behaviour.",
+        "Every call pays process-boundary serialization, so chatty extension points (per-item callbacks) become the bottleneck and the interface has to be designed in coarse requests.",
+        "The host must own child-process lifecycle and stderr handling; leaking subprocesses on host restart is the common operational failure."
+      ],
+      "sources": [
+        "https://github.com/hashicorp/go-plugin"
+      ],
+      "idiom_name": "plugin.Client/plugin.Serve over gRPC",
+      "min_standard": "Go1.16"
+    },
+    {
+      "variant_id": "compile-time-registration",
+      "name": "Blank-import registration (compile-time extension set)",
+      "paradigm": "procedural",
+      "implementation_notes": "The stdlib docs themselves point at this when the plugin package's constraints are unacceptable: each plugin package registers itself in init(), the host blank-imports the packages it wants and compiles a static executable, so the extension set is fixed at build time and no dynamic loading is involved. The registry, contract and lifecycle stay, but adding a plugin means rebuilding the host - list it when extensions are a build-time choice (release flavours, per-customer builds) rather than an operational one.",
+      "code_sketch": "// csv/csv.go\nfunc init() { formatter.Register(\"csv\", func() formatter.Formatter { return csvFormatter{} }) }\n\n// cmd/host/main.go\nimport (\n    _ \"example.com/host/plugins/csv\"\n    _ \"example.com/host/plugins/json\"\n)",
+      "pitfalls": [
+        "Registration order follows import initialization order, so plugins that depend on one another at init time produce order-dependent behaviour.",
+        "Because everything is in one binary, a plugin's dependencies become the host's - version conflicts are resolved by the build, and a single bad plugin can break the whole build."
+      ],
+      "sources": [
+        "https://pkg.go.dev/plugin"
+      ],
+      "idiom_name": "package init() registration + blank imports",
+      "min_standard": "Go1.0"
+    }
+  ],
+  "default_variant": "std-plugin-package"
+}

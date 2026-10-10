@@ -1,0 +1,54 @@
+{
+  "pattern": "messaging-gateway",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "FibonacciRpcClient-style class (callback queue + correlation_id)",
+  "implementation_notes": "Exactly the class from the RabbitMQ Python tutorial: declare an exclusive callback queue, publish with reply_to/correlation_id, and have the shared on_response callback complete the pending call, exposing a plain call(n)/check_stock(sku) method to the application. What replaces the classic gateway class here is nothing - it is the classic class; the pika client only supplies the transport, and the correlation table, the error mapping and the timeout remain hand-written.",
+  "code_sketch": "class InventoryGateway:                       # only this class knows the broker\n    def check_stock(self, sku: str) -> int:   # a method call, not messaging\n        corr_id = str(uuid.uuid4())\n        slot = queue.Queue(maxsize=1)\n        self._pending[corr_id] = slot\n        self._channel.basic_publish(\n            \"\", \"inventory.check\", body=sku,\n            properties=pika.BasicProperties(reply_to=self._callback_queue,\n                                            correlation_id=corr_id))\n        return self._await(slot, timeout=5.0)  # timeout -> domain error",
+  "pitfalls": [
+    "One BlockingConnection cannot serve concurrent calls: the tutorial's call() blocks in the client's own I/O loop, so a gateway must use one connection (or thread) per outstanding call, or the asynchronous adapter.",
+    "A worker that crashed between answering and acking will answer the same request again - unknown correlation ids must be discarded and the caller side kept idempotent.",
+    "The reply body is opaque bytes: there is no fault channel unless the payload defines one, so remote errors arrive as parse failures unless the wire contract carries them explicitly."
+  ],
+  "sources": [
+    "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+  ],
+  "variants": [
+    {
+      "variant_id": "pika-rpc-gateway",
+      "name": "Hand-written class over pika with an exclusive reply queue",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "FibonacciRpcClient-style class (callback queue + correlation_id)",
+      "implementation_notes": "Exactly the class from the RabbitMQ Python tutorial: declare an exclusive callback queue, publish with reply_to/correlation_id, and have the shared on_response callback complete the pending call, exposing a plain call(n)/check_stock(sku) method to the application. What replaces the classic gateway class here is nothing - it is the classic class; the pika client only supplies the transport, and the correlation table, the error mapping and the timeout remain hand-written.",
+      "code_sketch": "class InventoryGateway:                       # only this class knows the broker\n    def check_stock(self, sku: str) -> int:   # a method call, not messaging\n        corr_id = str(uuid.uuid4())\n        slot = queue.Queue(maxsize=1)\n        self._pending[corr_id] = slot\n        self._channel.basic_publish(\n            \"\", \"inventory.check\", body=sku,\n            properties=pika.BasicProperties(reply_to=self._callback_queue,\n                                            correlation_id=corr_id))\n        return self._await(slot, timeout=5.0)  # timeout -> domain error",
+      "pitfalls": [
+        "One BlockingConnection cannot serve concurrent calls: the tutorial's call() blocks in the client's own I/O loop, so a gateway must use one connection (or thread) per outstanding call, or the asynchronous adapter.",
+        "A worker that crashed between answering and acking will answer the same request again - unknown correlation ids must be discarded and the caller side kept idempotent.",
+        "The reply body is opaque bytes: there is no fault channel unless the payload defines one, so remote errors arrive as parse failures unless the wire contract carries them explicitly."
+      ],
+      "sources": [
+        "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+      ]
+    },
+    {
+      "variant_id": "celery-task-gateway",
+      "name": "Celery task signatures as the gateway",
+      "paradigm": "declarative",
+      "min_standard": "Python3.8",
+      "idiom_name": "task.delay()/apply_async() behind an @app.task declaration",
+      "implementation_notes": "Where the interaction is fire-and-forget, Celery supplies the gateway shape: declare the operation once with @app.task and call it as check_stock.delay(\"SKU-42\") - the docs describe delay() as convenient because it looks like calling a regular function - while Celery hides the broker, retries the publish on connection failure (task_publish_retry) and returns an AsyncResult for the eventual value. The 'interface' is the set of task signatures and the arguments are serialized by the task protocol; results come from a result backend via get(), which is a second system to operate and a blocking call rather than a correlated reply.",
+      "code_sketch": "@app.task(name=\"inventory.check_stock\")\ndef check_stock(sku: str) -> int:\n    return client.check(sku)                   # runs in a worker process\n\n# caller - looks like a function call, hides the broker:\nr = check_stock.delay(\"SKU-42\")                # AsyncResult\nstock = r.get(timeout=5)                       # result backend, not a reply queue",
+      "pitfalls": [
+        "eta/countdown tasks are fetched by the worker immediately and held in memory until due (the docs warn about RAM), so a gateway must not use them for far-future scheduling.",
+        "No reply channel exists in the task protocol: results require a configured result backend and get() blocks (or polls), reintroducing the blocking-call illusion with one more component to run.",
+        "A task is addressed by name, not by type - renaming a task or its arguments silently breaks callers that only share the task name string."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/calling.html"
+      ]
+    }
+  ],
+  "default_variant": "pika-rpc-gateway",
+  "version": "1.0"
+}

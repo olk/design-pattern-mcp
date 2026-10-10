@@ -1,0 +1,68 @@
+{
+  "pattern": "async-method-invocation",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread_create + request struct (mutex/cond result slot)",
+  "implementation_notes": "The pattern's manual form in C: a request struct owns the arguments, the result slot, an error/status field and a mutex/condition pair; the asynchronous entry point fills it, calls pthread_create and returns immediately with a handle (the pthread_t plus the struct). The worker performs the operation, writes value or status under the same mutex that guards the completion predicate, and signals; the caller's collect step waits on the condition, reads the result and then joins the thread to reclaim its resources. Callback style is the same structure with the callback invoked from the worker after the signal - and the callback then runs on the worker thread, so it must not touch caller state that may already be gone.",
+  "code_sketch": "struct ami { pthread_mutex_t m; pthread_cond_t cv; int done; long result; };\nstatic void *run(void *arg) {\n    struct ami *a = arg;\n    long v = do_long_work();                      /* the deferred call */\n    pthread_mutex_lock(&a->m); a->result = v; a->done = 1;\n    pthread_cond_broadcast(&a->cv); pthread_mutex_unlock(&a->m);\n    return NULL;\n}\nstruct ami a = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };\npthread_t th; pthread_create(&th, NULL, run, &a);      /* returns immediately */\n/* later: */ pthread_mutex_lock(&a.m);\nwhile (!a.done) pthread_cond_wait(&a.cv, &a.m);\nlong v = a.result; pthread_mutex_unlock(&a.m); pthread_join(th, NULL);",
+  "pitfalls": [
+    "The worker must not touch the request struct after the caller has freed it; the join (or an explicit hand-off of ownership) is the only safe reclamation point.",
+    "Reading or writing the completion flag outside the mutex that guards pthread_cond_wait is a lost-wakeup race: predicate and lock must be changed together.",
+    "Returning a pointer to worker-local storage as the result is a use-after-return; results must be copied into the caller-owned slot or heap-allocated with documented ownership.",
+    "A detached thread cannot be joined, so its exit status is unreachable - fire-and-forget still needs a place to record failures.",
+    "pthread_create failure must be handled explicitly (it returns an error number, not an errno): a failed start otherwise leaves the caller waiting on a handle that will never complete."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_create.3.html",
+    "https://man7.org/linux/man-pages/man7/aio.7.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pthread-handoff",
+      "name": "Hand-rolled pthread task with a guarded result slot",
+      "paradigm": "concurrent",
+      "min_standard": "C99",
+      "requires_features": [
+        "pthreads"
+      ],
+      "idiom_name": "pthread_create + request struct (mutex/cond result slot)",
+      "implementation_notes": "The pattern's manual form in C: a request struct owns the arguments, the result slot, an error/status field and a mutex/condition pair; the asynchronous entry point fills it, calls pthread_create and returns immediately with a handle (the pthread_t plus the struct). The worker performs the operation, writes value or status under the same mutex that guards the completion predicate, and signals; the caller's collect step waits on the condition, reads the result and then joins the thread to reclaim its resources. Callback style is the same structure with the callback invoked from the worker after the signal - and the callback then runs on the worker thread, so it must not touch caller state that may already be gone.",
+      "code_sketch": "struct ami { pthread_mutex_t m; pthread_cond_t cv; int done; long result; };\nstatic void *run(void *arg) {\n    struct ami *a = arg;\n    long v = do_long_work();                      /* the deferred call */\n    pthread_mutex_lock(&a->m); a->result = v; a->done = 1;\n    pthread_cond_broadcast(&a->cv); pthread_mutex_unlock(&a->m);\n    return NULL;\n}\nstruct ami a = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 };\npthread_t th; pthread_create(&th, NULL, run, &a);      /* returns immediately */\n/* later: */ pthread_mutex_lock(&a.m);\nwhile (!a.done) pthread_cond_wait(&a.cv, &a.m);\nlong v = a.result; pthread_mutex_unlock(&a.m); pthread_join(th, NULL);",
+      "pitfalls": [
+        "The worker must not touch the request struct after the caller has freed it; the join (or an explicit hand-off of ownership) is the only safe reclamation point.",
+        "Reading or writing the completion flag outside the mutex that guards pthread_cond_wait is a lost-wakeup race: predicate and lock must be changed together.",
+        "Returning a pointer to worker-local storage as the result is a use-after-return; results must be copied into the caller-owned slot or heap-allocated with documented ownership.",
+        "A detached thread cannot be joined, so its exit status is unreachable - fire-and-forget still needs a place to record failures.",
+        "pthread_create failure must be handled explicitly (it returns an error number, not an errno): a failed start otherwise leaves the caller waiting on a handle that will never complete."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_create.3.html",
+        "https://man7.org/linux/man-pages/man7/aio.7.html"
+      ]
+    },
+    {
+      "variant_id": "posix-aio",
+      "name": "POSIX asynchronous I/O with completion notification",
+      "paradigm": "concurrent",
+      "min_standard": "C99",
+      "requires_features": [
+        "posix-aio"
+      ],
+      "idiom_name": "aio_read + aio_error/aio_return (sigevent notification)",
+      "implementation_notes": "For file and network style I/O the platform already offers the pattern's shape: aio_read/aio_write enqueue the operation against an aiocb control block and return immediately, aio_error reports whether the request is still in progress, aio_return collects the byte count once it completed, and aio_suspend or the sigevent/signal notification replaces the completion callback. Choose it when the deferred operation is an I/O request and the platform's AIO is adequate; keep the pthread form for arbitrary computations, and remember that POSIX AIO implementations such as glibc's may use helper threads, so benchmark them against a bounded worker pool or a kernel-backed facility when scale matters.",
+      "code_sketch": "static struct aiocb cb;\nmemset(&cb, 0, sizeof cb);\ncb.aio_fildes = fd; cb.aio_buf = buf; cb.aio_nbytes = sizeof buf;\ncb.aio_sigevent.sigev_notify = SIGEV_SIGNAL;   /* or SIGEV_THREAD */\nif (aio_read(&cb) == -1) { /* handle immediate submission failure */ }\n/* later, or from the completion signal: */\nconst struct aiocb *list[] = { &cb };\nwhile (aio_error(&cb) == EINPROGRESS) aio_suspend(list, 1, NULL);\nssize_t n = aio_return(&cb);                   /* collect the result */",
+      "pitfalls": [
+        "The aiocb and its buffer must stay alive and untouched until the request completes; a stack-allocated control block that goes out of scope is undefined behaviour.",
+        "aio_return must be called exactly once per request, and only after aio_error reports completion - calling it early or twice is an error.",
+        "The completion notification differs by sigevent mode: a signal handler may call only async-signal-safe functions, while a SIGEV_THREAD callback runs in a new thread and still needs ordinary thread-safety; keep the aiocb and buffer alive until collection.",
+        "glibc's POSIX AIO implementation may use helper threads internally, so high request counts can still consume substantial thread resources; benchmark it against a bounded worker pool or a kernel-backed facility when scale matters."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/aio.7.html",
+        "https://man7.org/linux/man-pages/man3/pthread_create.3.html"
+      ]
+    }
+  ],
+  "default_variant": "pthread-handoff",
+  "version": "1.1"
+}

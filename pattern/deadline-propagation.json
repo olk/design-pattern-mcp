@@ -1,0 +1,191 @@
+{
+  "category": "concurrency-resilience",
+  "name": "deadline-propagation",
+  "aliases": [
+    "timeout propagation"
+  ],
+  "intent": "Bound the total time and work of a logical request by carrying one deadline through its whole call tree: every hop forwards the remaining budget and the cancellation signal instead of inventing a fresh timeout, so work that can no longer succeed is abandoned at every level.",
+  "problem": "A request fans out into a chain or tree of downstream calls and each hop applies its own timeout: the end-to-end latency budget becomes the sum of N independent timeouts, servers keep working after the originating client has given up, and cancellation never reaches the deeper work - resources are consumed producing answers nobody will read.",
+  "context": "Networked request handling with multi-hop calls: RPC and HTTP chains, service meshes, gateways, fan-out and hedged requests. It applies when one latency budget is meaningful for the whole logical request (an SLO or a user-facing timeout), when the hops are under your control and can carry request-scoped state (context, token, signal, call option or header), and when downstream work is cancellable or can be interrupted at checkpoints.",
+  "benefits": [
+    "Work stops when the budget is gone: no hop keeps computing or waiting for a response the originating client will discard, so wasted capacity is bounded by the remaining time rather than by a per-hop timeout.",
+    "End-to-end latency is bounded by one budget instead of the sum of N independent timeouts; a deep call tree cannot multiply the delay a user experiences.",
+    "Cancellation travels with the deadline and releases threads, connections, queries and locks that a fan-out or a hedged request no longer needs.",
+    "Overload protection: during degradation, doomed requests exit early instead of queueing behind work they will never wait for - the retry/deadline collapse that turns local slowness into a cascading failure is avoided.",
+    "The budget becomes one explicit, tunable number set at the edge, so SLOs and capacity planning reference a single deadline instead of a stack of unrelated per-call constants.",
+    "Each hop can make better admission decisions: when the remaining time is smaller than the expected cost of a stage, it fails or degrades immediately instead of starting unusable work."
+  ],
+  "tradeoffs": [
+    "Plumbing tax: the deadline must be threaded through every API boundary (a context, token, signal or equivalent parameter), and any hop or library that does not accept the carrier silently breaks the chain.",
+    "Cancellation is cooperative: nothing is preempted, so each blocking primitive must take the remaining time itself; a missing checkpoint or an uninterruptible call lets the operation run past the budget anyway.",
+    "Choosing the budget is an art: too tight and legitimately slow requests fail consistently, too loose and doomed work holds resources for a long time; mean latency hides the bimodal cases that matter.",
+    "Clock skew: an absolute instant cannot be forwarded safely between machines, so the wire format must carry remaining time and each hop re-derives it - a protocol-specific encoding that is easy to get wrong.",
+    "Attribution is harder: DEADLINE_EXCEEDED surfaces at arbitrary depth, so telling client cancellation, upstream expiry and a local timeout apart requires carrying a cancellation cause through every layer.",
+    "Retry interaction: retrying inside one global budget consumes it quickly, and per-attempt timeouts must be derived from what remains, otherwise retries either never fire or overshoot the budget.",
+    "Observability burden: without logging the remaining budget and the cancellation reason per hop, tuning the budget is guesswork and regressions are invisible."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Budget Setter",
+      "responsibility": "The edge or frontend component that chooses the end-to-end latency budget for the logical request and converts it into one absolute deadline handed to the first hop as request-scoped state."
+    },
+    {
+      "role": "Deadline Carrier",
+      "responsibility": "The request-scoped object that holds the deadline and the cancellation signal and is passed across every call boundary (context, token, signal, call options) - immutable, so hops can only derive shortened copies."
+    },
+    {
+      "role": "Hop (Propagator)",
+      "responsibility": "An intermediate server that reads the inbound deadline, computes the remaining budget on a monotonic clock, checks it before each stage, and forwards the budget (as remaining time) with every outgoing call; a hop may only shorten, never renew it."
+    },
+    {
+      "role": "Monotonic Clock",
+      "responsibility": "The time source used for all budget arithmetic and expiry scheduling - it never jumps backwards when the wall clock is adjusted (gRPC and SRE both derive the remaining budget against it)."
+    },
+    {
+      "role": "Cancellation Sink",
+      "responsibility": "The in-flight waits and blocking primitives that are aborted when the budget expires or the caller cancels (select/race against the signal, interruptible waits, cancellable queries)."
+    },
+    {
+      "role": "Wire Encoder",
+      "responsibility": "The protocol element that serializes the budget across the network as a remaining-time value (for example the grpc-timeout metadata) and re-establishes it on the receiving side as a local deadline, shielding the chain from clock skew."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "boundary",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Microservice request chains (gateway -> frontend service -> several backends) under one user-facing latency SLO, where each hop converts the inbound deadline into its own outgoing calls.",
+    "gRPC services whose clients set a deadline and whose servers propagate it as a remaining timeout to downstream calls while cancelling server-side work once the deadline passes.",
+    "Fan-out and aggregation endpoints calling several backends in parallel: every sub-call shares the parent budget, and sub-calls still running when it expires are cancelled instead of awaited.",
+    "Hedged requests: the first replica to answer wins, and the duplicate requests are cancelled through the same carrier so their downstream work is stopped too.",
+    "Streaming and long-poll endpoints that must stop processing when the client disconnects or the connection times out, propagating that stop to services and storage.",
+    "Batch or pipeline steps with a per-request time budget that must check the remaining time before each stage and abandon a request that can no longer be finished in time.",
+    "ROS 2 / DDS-based robotics pipelines: autonomous vehicle perception pipelines where sensor data must traverse a chain of processing nodes (detect -> classify -> plan -> act) and missed deadlines invalidate downstream results entirely.",
+    "Distributed real-time databases with multi-hop queries (gateway -> shard router -> storage node -> index node) where each hop's latency budget is derived from a user-facing SLA.",
+    "Service mesh sidecar configurations (Istio/Linkerd/Envoy) where per-route timeout policies propagate deadline context to application code via headers like grpc-timeout or custom X-Request-Deadline headers.",
+    "Industrial IoT and edge computing pipelines (edge gateway -> fieldbus bridge -> PLC -> sensor) where end-to-end control loop deadlines must be enforced across heterogeneous network boundaries.",
+    "GraphQL federation: a federated query hitting multiple subgraphs in parallel must bound the total resolution time and cancel subgraph requests whose partial results can no longer affect the final response.",
+    "Go services on the standard library context package: context.WithDeadline and WithTimeout derive a child whose Done channel closes at the earliest of its own deadline, an explicit cancel, or the parent's cancellation, so cancelling the root request context tears down the whole goroutine tree, and WithDeadlineCause/WithTimeoutCause attach an explicit cause for attribution.",
+    "Envoy router filter in service meshes: Envoy sets x-envoy-expected-rq-timeout-ms on internal requests - derived from x-envoy-upstream-rq-timeout-ms or the route timeout - so upstream services can read the expected total completion time and exit early instead of finishing work the proxy has already timed out.",
+    "ASP.NET Core gRPC services map the inbound call's deadline onto the handler's CancellationToken; passing that token to database queries, HttpClient calls and Task.Delay stops server-side work the moment the client's deadline expires."
+  ],
+  "avoid_when": [
+    "Single-hop calls with no downstream fan-out: a plain per-call timeout is simpler and sufficient.",
+    "Hops outside your control that cannot carry a deadline or a cancellation signal - local timeouts still work, but propagation has to stop at that boundary.",
+    "The work is not latency-budgeted end to end (background jobs, batch pipelines) where independent stage timeouts are the right model and cancellation of completed stages is not desirable.",
+    "The work is non-cancellable or must complete for correctness (a committed transaction, a non-idempotent side effect): cancelling mid-flight leaves partial state; use per-call timeouts plus idempotent recovery instead.",
+    "A framework already propagates deadlines and represents the remaining time correctly (gRPC with default propagation, many service meshes): configure it rather than rebuilding the mechanism in application code.",
+    "Requests are decoupled through a queue or event log: there is no live call tree for a deadline to travel along, and the consumer's own budget applies instead."
+  ],
+  "language_files": {
+    "generic": "deadline-propagation.generic.json",
+    "c": "deadline-propagation.c.json",
+    "cplusplus": "deadline-propagation.cplusplus.json",
+    "csharp": "deadline-propagation.csharp.json",
+    "go": "deadline-propagation.go.json",
+    "java": "deadline-propagation.java.json",
+    "javascript": "deadline-propagation.javascript.json",
+    "kotlin": "deadline-propagation.kotlin.json",
+    "python": "deadline-propagation.python.json",
+    "ruby": "deadline-propagation.ruby.json",
+    "rust": "deadline-propagation.rust.json",
+    "scala": "deadline-propagation.scala.json",
+    "swift": "deadline-propagation.swift.json",
+    "typescript": "deadline-propagation.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "timeout",
+    "cancellation-token",
+    "circuit-breaker",
+    "retry-with-backoff",
+    "bulkhead",
+    "fail-fast",
+    "correlation-identifier"
+  ],
+  "anti_patterns": [
+    "Per-hop fixed timeouts presented as deadline propagation: a chain of N five-second timeouts still permits N times five seconds of work.",
+    "Forwarding the client's absolute deadline across machines without converting it to remaining time, so clock skew truncates or extends budgets arbitrarily.",
+    "Cancellation that is never observed: the signal expires but blocking calls, batch loops and queries run to completion anyway.",
+    "Retries scheduled inside the same budget without deriving per-attempt timeouts from the remaining time, so a retry either ignores the deadline or instantly exhausts it.",
+    "Deadline checks only in middleware (the budget is set at ingress and handlers ignore it), so the pattern exists in configuration but not in behaviour.",
+    "Giving every stage its own timeout and calling the result a budget: the total is the sum again, just with more code."
+  ],
+  "design_principles": [
+    "One logical budget per logical request: hops may only shorten an inherited deadline, never extend or replace it with a fresh one.",
+    "Explicit request-scoped state: the budget and its cancellation travel with the request rather than living in global configuration.",
+    "Monotonic time: all budget arithmetic uses a clock that cannot jump backwards.",
+    "Cooperative cancellation: every long-running stage exposes a checkpoint that observes the budget and can stop the work.",
+    "End-to-end reasoning: latency budgets are set and enforced across layers, not optimised per module.",
+    "Fail fast when failure is inevitable: capacity is not spent on work whose budget cannot accommodate it."
+  ],
+  "best_practices": [
+    "Set the budget once at the edge and derive everything else from it; a hop's timeout is min(inherited remaining, hop-specific cap).",
+    "Convert the budget to an absolute deadline immediately at ingress and compute remaining time locally on a monotonic clock; send remaining time, not an instant, across the wire.",
+    "Check the budget before each stage and before scheduling a retry; skip stages whose remaining time is smaller than their expected cost.",
+    "Wire the cancellation signal into every in-flight wait and blocking primitive (select/race or a timeout parameter) instead of polling a flag after the call returns.",
+    "Cancel the whole request scope on expiry and release it on completion so child tasks, timers, listeners and connections do not leak.",
+    "Carry a cancellation cause through the layers so logs distinguish client cancellation, upstream expiry and a local timeout.",
+    "Instrument the remaining budget and the expiry rate per hop, and tune the budget from that data instead of from defaults.",
+    "Keep the transport encoding at the boundary: map the protocol's header or call option to a local deadline and back, and let application code see only the local deadline.",
+    "Account for per-hop overhead when propagating: subtract expected network latency and processing time at each boundary so downstream services do not use their full budget leaving no time for the return journey.",
+    "Use adaptive hop budget allocation (remaining_time - latency_p99 * 2) rather than fixed millisecond reductions when latency data is available.",
+    "For parallel fan-out calls, share one budget pool across all branches rather than giving each branch the full remaining time; track the total committed budget and cancel branches that exceed their slice.",
+    "Prefer relative remaining-time headers (X-Timeout-Remaining: 7000ms) over absolute deadlines (X-Request-Deadline: 2024-01-15T10:30:45Z) to avoid clock-skew issues between machines.",
+    "Ensure NTP is configured and monitored across all hosts if absolute timestamps must be used; build tolerance for small skew when computing remaining time.",
+    "Configure circuit breakers to open only on local request-timeout errors, not on propagated context deadline-exceeded errors, to prevent tight upstream deadlines from causing blanket circuit opens.",
+    "Reserve a cleanup margin (e.g., 50-100ms) before propagating to a downstream call: the response still needs to travel back up the chain after the downstream call completes.",
+    "For ROS 2 / DDS pipelines, leverage the DDS deadline QoS policy to propagate end-to-end timing constraints across publish-subscribe chains without middleware involvement."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Google SRE Book, Chapter 22 - Addressing Cascading Failures, section 'Latency and Deadlines' (Mike Ulrich, 2017): deadline propagation sets one deadline high in the stack, every RPC in the tree carries the same absolute deadline with elapsed time deducted per hop, and cancellation propagation prevents doomed work; 'you don't get credit for late assignments'.",
+    "https://sre.google/sre-book/addressing-cascading-failures/",
+    "https://grpc.io/docs/guides/deadlines/ (catalog citation for this row): a deadline is the point past which a client will not wait; servers cancel after it passes; propagation converts the deadline to a remaining timeout so clock skew cannot corrupt it, and C++ must enable propagation explicitly while Java and Go do it by default.",
+    "https://grpc.io/blog/deadlines/",
+    "https://github.com/grpc/grpc/tree/master/examples/cpp/deadline",
+    "Bo Peng, Nathan Fisher, Thidapat Chantem. 'MILP-based Deadline Assignment for End-to-End Flows in Distributed Real-Time Systems.' ACM RTSS 2016. Uses mixed-integer linear programming to optimally assign relative deadlines to frames in end-to-end flows, combining deadline selection with schedulability analysis under EDF scheduling. Establishes that optimal deadline assignment reduces pessimism compared to two-step approaches. https://doi.org/10.1145/2997465.2997498",
+    "Praveen Jayachandran. 'Delay Composition Theory: A Reduction-based Schedulability Theory for Distributed Real-Time Systems.' PhD Thesis, University of Illinois at Urbana-Champaign, 2011. Derives a delay composition rule that computes worst-case end-to-end delay as the maximum over individual resource bottlenecks rather than their sum, enabling distributed systems to be analyzed via uniprocessor techniques. Shows that structural robustness of execution graphs depends on how resources are allocated to execution stages. https://doi.org/10.4233/uuid:2142-18459",
+    "R. DiPPendente, G. Lipari, P. Marturano. 'Distributed Deadline Synchronization Protocol for Real-Time Systems Scheduled by EDF.' IEEE ETFA 2010. Proposes DDSP, a protocol that computes absolute deadlines for jobs in distributed pipelines without requiring global clock synchronization, using deadline propagation rules similar to the release guard protocol. https://www.iris.sssup.it/retrieve/dd9e0b31-bf00-709e-e053-3705fe0a83fd/document_submitted_etfa10.pdf",
+    "Lui Sha, Ragunathan Rajkumar, Shirish S. Sathaye. 'Priority Inheritance Protocols: An Approach to Real-Time Synchronization.' IEEE Transactions on Computers, 1990. Foundational work on bounding priority inversion; pipelined with deadline propagation when high-priority tasks inherit deadlines from blocked high-priority tasks in distributed chains. https://doi.org/10.1109/12.57058",
+    "Grab Engineering Blog. 'Context Deadlines and How to Set Them' (2019). Practical guide to Go context deadline propagation across service boundaries; warns that upstream timeout must always be longer than total downstream timeouts including retries, and circuit breakers should not open on propagated context deadline exceeded errors. https://engineering.grab.com/context-deadlines-and-how-to-set-them",
+    "FlowVerify. 'Distributed Service Timeouts: 3 Failure Modes to Prevent' (2026). Identifies chain amplification, retry multiplier, and deadline propagation as the three timeout failure modes; explains deadline vs timeout distinction and how deadline propagation prevents leaf-service wasted work. https://www.flowverify.co/blog/distributed-service-timeouts-three-failure-modes",
+    "OneNoughtOne. 'Timeout Patterns - Learning Module.' Comprehensive guide covering timeout propagation strategies (header-based, gRPC built-in, context propagation frameworks), per-hop budget formulas (fixed reduction, percentage reduction, adaptive reduction, per-hop budget), and service mesh timeout handling (Istio, Linkerd, Envoy). https://www.onenoughtone.com/learning-path/system-design-hld/learning/timeout-patterns/3",
+    "https://pkg.go.dev/context: Go standard library deadline propagation - WithDeadline/WithTimeout derive child contexts canceled at the earliest of their own deadline, cancel(), or parent completion; WithDeadlineCause/WithTimeoutCause carry an explicit cancellation cause; cancel() MUST be called to release resources.",
+    "https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/router_filter: Envoy router conveys the expected total request completion time to upstream hosts via x-envoy-expected-rq-timeout-ms (derived from x-envoy-upstream-rq-timeout-ms or the route timeout) so upstreams can decide to exit early.",
+    "https://learn.microsoft.com/en-us/aspnet/core/grpc/deadlines-cancellation: ASP.NET Core gRPC maps the client's deadline onto the server handler's CancellationToken; exceeding it cancels the token and every operation that observes it.",
+    "https://github.com/grpc/grpc-go/issues/8961: when the client-side deadline expires the transport sends RST_STREAM, so the server observes context.Canceled rather than DeadlineExceeded - deadline attribution across the hop is lossy in practice.",
+    "https://harrisonsec.com/blog/go-context-distributed-systems-production/: production critique of Go context usage - detaching work with context.Background() breaks the cancellation tree and leaks goroutines; per-call WithTimeout must stay inside the parent deadline; context.Canceled vs context.DeadlineExceeded must be translated at API boundaries.",
+    "https://www.michal-drozd.com/en/blog/grpc-deadline-propagation/: practical gRPC propagation guide - interceptors that reject calls with too little remaining time, reserving a response budget for serialization/network overhead, and metrics on remaining deadline per hop."
+  ],
+  "related_patterns_notes": {
+    "priority-inheritance": "priority-inheritance",
+    "rate-monotonic-analysis": "rate-monotonic-analysis",
+    "delay-composition-theory": "delay-composition-theory",
+    "distributed-deadline-synchronization-protocol": "distributed-deadline-synchronization-protocol"
+  }
+}

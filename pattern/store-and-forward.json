@@ -1,0 +1,161 @@
+{
+  "category": "workflow-messaging",
+  "name": "store-and-forward",
+  "aliases": [
+    "store and forward messaging",
+    "message spooling"
+  ],
+  "intent": "Let a sender accept a message while the receiver or the transport is unreachable: persist it in a local durable store, forward it as soon as the peer is available, and delete the stored copy only after the receiver acknowledged it.",
+  "problem": "Sender and receiver cannot be assumed to be up at the same time - an offline mobile or edge peer, a partner system reachable only in a window, a downstream service restarting during a deployment - yet the work accepted while it is gone must not be lost. A direct send either blocks the caller until the peer returns, or fails and throws the message away, and an in-memory queue disappears together with the process that holds it.",
+  "context": "Asynchronous integration over links that come and go: intermittent or metered networks, peers that restart or are only up in windows, queue-manager-to-queue-manager hops, offline-capable clients that sync later, and edge gateways buffering during WAN outages. The store is local to each node or hop and outlives the process that accepted the message. The guarantee is per hop and at-least-once; exactly-once effects still need an idempotent receiver, and a growing backlog still needs a retention, expiry and dead-letter policy.",
+  "benefits": [
+    "Acceptance is decoupled from delivery: the sender keeps working while the peer is down, and an outage turns into a delay instead of a failed operation.",
+    "Messages survive the sender's own restarts and crashes because the local store, not the process memory, is the source of truth after acceptance.",
+    "Recovery is replay: when connectivity returns the forwarder drains the store, so nobody has to reconstruct what was lost or reconcile it by hand.",
+    "The backlog becomes an operational signal: store depth and the age of the oldest entry are metrics, so a stalled peer is an alert rather than a silent leak.",
+    "One structure covers every 'peer not available' case - offline clients, batch partners, remote queue managers, cross-region hops - because only the store implementation changes.",
+    "Bursts and rate differences are absorbed: the forwarder paces at the rate the peer tolerates instead of dropping messages or blocking the caller."
+  ],
+  "tradeoffs": [
+    "It is durable state the application has to operate: the spool grows, needs retention/expiry, redaction, backup and a bounded-disk story, and a full disk now fails the accept path.",
+    "Latency and throughput pay for durability: each accepted message costs a durable write (fsync, journal commit or broker round trip), often orders of magnitude more than a fire-and-forget send.",
+    "The local store is a single point of failure and a second system: losing it loses the backlog, and the business write plus the stored message are two writes unless one transaction covers both (outbox).",
+    "Redelivery is the normal failure mode: an acknowledgement lost after processing produces a duplicate, so the receiver must be idempotent or deduplicate - a second mechanism with its own state and its own expiry window.",
+    "Ordering and freshness change: draining a backlog serialises the forwarder, and stale messages may be worse than dropped ones, so a TTL and a max-age policy belong to the design.",
+    "A long-lived concurrent component enters the design: reconnect storms, thundering-herd retries after an outage, backoff, supervision and health checks for the forwarder itself.",
+    "It covers one hop only: it does not make the send atomic with a database commit, and it does not give exactly-once semantics end to end."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 4,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Sender / Producer",
+      "responsibility": "Accepts application work and hands it to the local store; the accept is the point of no return and must not report success before the store committed the message."
+    },
+    {
+      "role": "Local Durable Store",
+      "responsibility": "Spool directory, outbox table, local queue or journal that outlives the process; keeps each message until the next hop or the receiver acknowledged it, and carries the retention, expiry and redaction policy."
+    },
+    {
+      "role": "Forwarder",
+      "responsibility": "Long-lived loop (thread, task, background worker or daemon) that reads the store in order, attempts delivery, backs off while the peer is unreachable, and resumes the same way after a restart."
+    },
+    {
+      "role": "Transport Link",
+      "responsibility": "The channel to the peer - queue-manager channel, HTTP endpoint, stream or socket - which may be absent for hours; the forwarder, not the caller, owns its failures and reconnection."
+    },
+    {
+      "role": "Receiver / Endpoint",
+      "responsibility": "Applies the effect and acknowledges; the acknowledgement authorises deletion of the stored copy, so it must mean 'the effect exists', not 'the bytes arrived'."
+    },
+    {
+      "role": "Operator / Management Surface",
+      "responsibility": "Inspects depth and age, pauses or forces replay, adjusts retention and dead-letters entries that will never be delivered."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Offline-capable mobile, desktop or field clients that queue user actions and sync them once connectivity returns (the platform analogues are MSMQ, Android WorkManager and background URLSession uploads).",
+    "A message-queue hop between queue managers, where the local queue manager stores a persistent message until the channel to the remote one becomes available.",
+    "A transactional outbox: the message row commits together with the business change, and a relay forwards it to the broker and removes it afterwards.",
+    "Edge and IoT gateways that buffer batches during a WAN outage and forward them when the link recovers, without losing the local batch on restart.",
+    "Partner and B2B handoffs (EDI, AS2, SFTP drops) where the partner is only available in a window and the payload must be retried until it is acknowledged.",
+    "Service-to-service integration where the downstream is expected to be down during deployments: accept the command, store it, deliver it once the consumer is back.",
+    "IBM MQ networks, where an application puts a message to a remote queue, the local queue manager persists it on a transmission queue, and a message channel agent delivers it to the next queue manager and only then deletes it from the transmission queue - the product documentation calls this a store-and-forward protocol, with one transmission queue held at each hop on the route.",
+    "RabbitMQ publishers that must not lose a message when the consumer or the node is down: durable queues plus messages marked persistent survive a node boot, and publisher confirms make the broker's basic.ack mean 'the message is on disk', so the publisher deletes its own pending copy only after that confirmation.",
+    "The transactional outbox as documented for microservices (microservices.io, Debezium-style relays): a service that must update the database and publish to a broker, but cannot run 2PC across them, writes the message into an outbox table inside the business transaction and lets a relay process forward it to the broker - the database is the store, the relay is the forwarder."
+  ],
+  "avoid_when": [
+    "Both endpoints are reliably up and a synchronous call is possible: a direct call needs no spool and no forwarder.",
+    "A broker or queue manager already provides durability at the hop you care about - use its persistent queues, confirms and dead-letter queues instead of building a second spool in front of it.",
+    "Loss is acceptable or self-healing (metrics, cache invalidation, telemetry samples): a non-persistent channel is far cheaper.",
+    "The receiver cannot be made idempotent and duplicates are unacceptable - fix that first; this pattern guarantees at-least-once, never once.",
+    "Hard real-time budgets where a durable write per message is fatal, or where the store's disk is not sized for the worst-case backlog."
+  ],
+  "language_files": {
+    "generic": "store-and-forward.generic.json",
+    "c": "store-and-forward.c.json",
+    "cplusplus": "store-and-forward.cplusplus.json",
+    "csharp": "store-and-forward.csharp.json",
+    "go": "store-and-forward.go.json",
+    "java": "store-and-forward.java.json",
+    "javascript": "store-and-forward.javascript.json",
+    "kotlin": "store-and-forward.kotlin.json",
+    "python": "store-and-forward.python.json",
+    "ruby": "store-and-forward.ruby.json",
+    "rust": "store-and-forward.rust.json",
+    "scala": "store-and-forward.scala.json",
+    "swift": "store-and-forward.swift.json",
+    "typescript": "store-and-forward.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "guaranteed-delivery",
+    "message-store",
+    "transactional-message-queue",
+    "idempotent-receiver",
+    "durable-subscriber",
+    "retry",
+    "write-behind",
+    "dead-letter-channel"
+  ],
+  "anti_patterns": [
+    "In-memory 'durable' queue: a BlockingQueue, System.Threading.Channels, a Go channel or a queue.Queue presented as the spool - it dies with the process and takes accepted-but-unsent messages with it.",
+    "Delete before acknowledge: unlinking the spool entry or marking the outbox row sent when the write to the socket succeeded, so a crash or a lost acknowledgement silently drops the message.",
+    "Unbounded spool with no capacity limit, no TTL and no dead-letter path, so one unreachable peer fills the disk and becomes an outage of the sender.",
+    "At-least-once claimed as exactly-once: hand-rolled forwarding with no deduplication on the receiving side, so the first retry after a crash doubles the business effect.",
+    "Reinventing a platform queue: hand-rolled spool files where the OS or framework already ships a restart-surviving durable queue (MSMQ, WorkManager, a broker's local store)."
+  ],
+  "design_principles": [
+    "Separate acceptance from delivery: the sender's commit point is the local store, the forwarder owns the network.",
+    "Accept once, deliver at least once: design for duplicates and out-of-order delivery, and make the receiver idempotent on a stable message id.",
+    "Acknowledge after the effect, not after the receipt - the acknowledgement is the delete authorisation.",
+    "Bound everything you persist: capacity, message age, retention, and a dead-letter outcome for what will never be delivered.",
+    "Make restart a normal path: recovery is 'drain the store', so starting the forwarder belongs to process start-up."
+  ],
+  "best_practices": [
+    "Make the accept path durable before it returns: fsync+rename, a committed transaction, or a broker confirm that is actually awaited.",
+    "Drain in insertion order with one forwarder per store (or explicit partitioning), and keep the drain loop's concurrency visible so ordering assumptions stay true.",
+    "Back off on failure with exponential delay and jitter, cap attempts per message, and alert on the age of the oldest entry rather than only on the depth.",
+    "Delete only after the acknowledgement, and define that acknowledgement as 'the receiver's effect is committed'.",
+    "Carry a stable message id and deduplicate or keep handlers idempotent on the receiving side; document what happens after the deduplication window expires.",
+    "Put a TTL on stored messages and a dead-letter outcome for entries that exhaust their attempts, so one poison message cannot stall the spool.",
+    "Where the send must be atomic with a business database write, use an outbox row in the same transaction instead of a spool file written after the commit."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - 'Messaging' (chapter 3) describes messaging as a store-and-forward approach, and 'Guaranteed Delivery' (chapter 4, Messaging Channels) makes each computer's own data store the persistence point.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/GuaranteedMessaging.html",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.message.recoverable?view=netframework-4.8.1",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.messagequeue?view=netframework-4.8.1",
+    "https://docs.oracle.com/javaee/7/tutorial/jms-concepts004.htm",
+    "https://www.rabbitmq.com/docs/confirms",
+    "https://www.rabbitmq.com/docs/queues",
+    "https://www.ibm.com/docs/en/ibm-mq/9.2.x?topic=queues-local",
+    "https://public.dhe.ibm.com/software/integration/wmq/docs/V9.2/PDFs/mq92.techoview.pdf",
+    "https://microservices.io/patterns/data/transactional-outbox.html",
+    "https://docs.solace.com/Messaging/Guaranteed-Msg/HOL-blocking.htm"
+  ]
+}

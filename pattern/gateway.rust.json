@@ -1,0 +1,62 @@
+{
+  "pattern": "gateway",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "trait with async fn over a shared reqwest::Client",
+  "implementation_notes": "The gateway is a trait (the domestic interface) plus a struct holding the foreign client; since Rust 1.75 a trait may declare async fn directly, so reqwest::Client (or sqlx::Pool) can stay an implementation detail without boxing every future by hand. Errors are the translation point: wrap the foreign error type in a domestic enum (thiserror or a hand-written From impl) so callers never see reqwest::Error, and map status codes with error_for_status(). Build the client once - it is internally reference-counted, pools connections and owns the TLS configuration - and pass it in, so tests can point the gateway at a local server or a double. Choose the async form whenever the callers already run on tokio; the classic blocking form only pays off in thread-based applications, where an async trait would force a runtime on every caller.",
+  "code_sketch": "pub trait BookingGateway {\n    async fn slots(&self, len: Duration) -> Result<Vec<Slot>, BookingError>;\n}\n\npub struct HttpBookingGateway { client: reqwest::Client, base: Url }\n\nimpl BookingGateway for HttpBookingGateway {\n    async fn slots(&self, len: Duration) -> Result<Vec<Slot>, BookingError> {\n        let raw: ForeignSlots = self.client.get(self.base.join(\"slots\")?)\n            .query(&[(\"minutes\", len.as_secs() / 60)])\n            .send().await?.error_for_status()?     // transport + HTTP -> BookingError\n            .json().await?;\n        Ok(raw.into_domestic())                       // foreign -> domestic\n    }\n}",
+  "pitfalls": [
+    "async fn in traits is not dyn-compatible: dyn BookingGateway will not compile - box the future, use impl Trait at a concrete call site, or reach for the async-trait crate when dynamic dispatch is required.",
+    "A reqwest::Client constructed per call throws away the connection pool and the TLS configuration; clone the shared client instead (it is cheap).",
+    "Leaking reqwest::Error or sqlx::Error through the trait signature re-exposes the foreign crate to every caller; convert at the boundary.",
+    "Cancellation is drop-based: dropping the future cancels the request, so partial translation work must not be left holding inconsistent state."
+  ],
+  "sources": [
+    "https://docs.rs/reqwest/latest/reqwest/",
+    "https://blog.rust-lang.org/2023/12/28/Rust-1.75.0.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "async-traits",
+      "name": "Trait with async fn over an async reqwest::Client",
+      "paradigm": "concurrent",
+      "idiom_name": "trait with async fn over a shared reqwest::Client",
+      "implementation_notes": "The gateway is a trait (the domestic interface) plus a struct holding the foreign client; since Rust 1.75 a trait may declare async fn directly, so reqwest::Client (or sqlx::Pool) can stay an implementation detail without boxing every future by hand. Errors are the translation point: wrap the foreign error type in a domestic enum (thiserror or a hand-written From impl) so callers never see reqwest::Error, and map status codes with error_for_status(). Build the client once - it is internally reference-counted, pools connections and owns the TLS configuration - and pass it in, so tests can point the gateway at a local server or a double. Choose the async form whenever the callers already run on tokio; the classic blocking form only pays off in thread-based applications, where an async trait would force a runtime on every caller.",
+      "code_sketch": "pub trait BookingGateway {\n    async fn slots(&self, len: Duration) -> Result<Vec<Slot>, BookingError>;\n}\n\npub struct HttpBookingGateway { client: reqwest::Client, base: Url }\n\nimpl BookingGateway for HttpBookingGateway {\n    async fn slots(&self, len: Duration) -> Result<Vec<Slot>, BookingError> {\n        let raw: ForeignSlots = self.client.get(self.base.join(\"slots\")?)\n            .query(&[(\"minutes\", len.as_secs() / 60)])\n            .send().await?.error_for_status()?     // transport + HTTP -> BookingError\n            .json().await?;\n        Ok(raw.into_domestic())                       // foreign -> domestic\n    }\n}",
+      "pitfalls": [
+        "async fn in traits is not dyn-compatible: dyn BookingGateway will not compile - box the future, use impl Trait at a concrete call site, or reach for the async-trait crate when dynamic dispatch is required.",
+        "A reqwest::Client constructed per call throws away the connection pool and the TLS configuration; clone the shared client instead (it is cheap).",
+        "Leaking reqwest::Error or sqlx::Error through the trait signature re-exposes the foreign crate to every caller; convert at the boundary.",
+        "Cancellation is drop-based: dropping the future cancels the request, so partial translation work must not be left holding inconsistent state."
+      ],
+      "sources": [
+        "https://docs.rs/reqwest/latest/reqwest/",
+        "https://blog.rust-lang.org/2023/12/28/Rust-1.75.0.html"
+      ],
+      "min_standard": "Rust1.75",
+      "requires_features": [
+        "async fn in traits",
+        "tokio runtime"
+      ]
+    },
+    {
+      "variant_id": "blocking-client",
+      "name": "Plain trait over reqwest::blocking::Client",
+      "paradigm": "oo",
+      "idiom_name": "trait methods over reqwest::blocking::Client",
+      "implementation_notes": "For thread-based or short-lived applications the same gateway is an ordinary trait with &self methods and a struct that owns a reqwest::blocking::Client (or a rusqlite connection); reqwest documents the blocking client as the convenient API for code that is not already async, and it removes the runtime plumbing entirely. The struct is cheaply cloneable and can be shared across worker threads, with results returned as Result<Domestic, Error> and the foreign error converted once. Pick this shape when no async runtime exists in the process; mixing it into an async application blocks the executor thread and is the reason the async variant exists.",
+      "code_sketch": "pub struct BookingGateway { client: reqwest::blocking::Client, base: String }\nimpl BookingGateway {\n    pub fn slots(&self, len: Duration) -> Result<Vec<Slot>, BookingError> {\n        let raw: ForeignSlots = self.client\n            .get(format!(\"{}/slots\", self.base))\n            .query(&[(\"minutes\", len.as_secs() / 60)])\n            .send()?.error_for_status()?.json()?;   // foreign errors wrapped\n        Ok(raw.into_domestic())\n    }\n}",
+      "pitfalls": [
+        "reqwest::blocking must not be called from inside an async runtime: it blocks the executor thread (use the async client or spawn_blocking).",
+        "A trait with generic methods is not object-safe, so keep the domestic trait free of generics or enumerate the implementations.",
+        "Rusqlite/sqlx connections are not Sync: a gateway shared behind Arc needs a Mutex, which serialises every call - and a deadlock in one method blocks the whole service."
+      ],
+      "sources": [
+        "https://docs.rs/reqwest/latest/reqwest/"
+      ],
+      "min_standard": "Rust2018"
+    }
+  ],
+  "default_variant": "async-traits",
+  "version": "1.0"
+}

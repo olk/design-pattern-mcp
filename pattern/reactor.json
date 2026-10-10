@@ -1,0 +1,216 @@
+{
+  "category": "concurrency-resilience",
+  "name": "reactor",
+  "aliases": [
+    "reactor pattern"
+  ],
+  "intent": "Invert control in an event-driven application: one initiation dispatcher synchronously waits for readiness events on many handles, demultiplexes them and invokes the hook of the event handler registered for each ready handle, so service code reacts to events instead of blocking on or polling individual connections.",
+  "problem": "Many event sources (sockets, pipes, timers, signals, descriptors) must be served concurrently by a small number of threads, but blocking on each handle in turn costs a thread per source and busy-polling them burns the CPU; the application needs one place that waits for readiness on all handles at once and routes each ready handle to the handler that knows what to do with it.",
+  "context": "Event-driven servers and clients with many mostly idle I/O sources and a modest thread budget, on platforms that expose a readiness demultiplexer (select/poll/epoll/kqueue/devpoll, or a runtime's internal selector). It presupposes handlers whose work is short and never blocks, per-handle state that can live in the handler, and a willingness to express control flow as event hooks rather than sequential calls; it is the base on which Acceptor-Connector, Half-Sync/Half-Async and Leader/Followers are layered.",
+  "benefits": [
+    "One thread serves thousands of handles: no thread per connection, no per-connection stack and no context switch per event.",
+    "Demultiplexing and dispatch are separated from the handlers, so handlers can be registered, replaced and removed at runtime while the loop stays closed for modification.",
+    "Portability through one abstraction: the same dispatch structure is retargeted across select/poll/epoll/kqueue (or the runtime's selector) without touching handler code.",
+    "Inversion of control concentrates policy in one place - prioritisation, timers and timeouts, admission control, tracing of event delivery - instead of scattering it across blocking call sites.",
+    "Handlers run to completion on the loop thread, so per-handle state is confined to one thread and needs no locks, and a connection that has nothing to say never occupies a thread.",
+    "Composability: connection establishment (Acceptor-Connector), long handler work (Half-Sync/Half-Async) and thread rotation (Leader/Followers) can be layered onto the same dispatcher."
+  ],
+  "tradeoffs": [
+    "Handlers must never block: a single synchronous call (file or database I/O, DNS, a long computation) stalls every connection the loop serves, and nothing in the structure detects the stall.",
+    "The demultiplexer thread is a serialisation point: demultiplexing, dispatch and handler execution share one CPU, so throughput on one loop is capped by one core; scaling means several loops (one per thread, or sharded by connection) or a hand-off to a worker layer, both of which reintroduce the costs the design avoided.",
+    "Control flow fragments into per-event hooks: sequential protocols become explicit per-connection state machines, and bugs hide in the transitions, in handler lifetime (dispatch after removal) and in partially consumed buffers.",
+    "Changing interest from outside the loop needs an explicit wakeup (self-pipe, eventfd, event-loop execute) plus a thread-safe registration queue; getting it wrong either loses an event or spins the loop, and both failure modes are timing-dependent.",
+    "The ready set is the only queue: it cannot be sized, prioritised, reordered or shed, so fairness and timer starvation must be managed by hand through dispatch budgets, level- versus edge-triggered rearming and separate timer machinery.",
+    "Blast radius: because one loop owns every connection, a handler that crashes, leaks or degrades is a fault of the reactor for all clients, so per-connection isolation and error containment must be built on top.",
+    "io_uring adds complexity: when integrating io_uring alongside epoll/kqueue, managing two completion paths (SQEs vs ready events), buffer lifetime for provided buffers, and SQPOLL CPU overhead requires careful design; naive replacement of epoll with io_uring often yields no measurable benefit below 50k req/s per core."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 7,
+    "maintainability": 5,
+    "simplicity": 3,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Handle",
+      "responsibility": "Operating-system abstraction for one event source (socket, pipe, file, timer, signal); it queues indications and can be waited on, but only the dispatcher decides when it is serviced."
+    },
+    {
+      "role": "Synchronous Event Demultiplexer",
+      "responsibility": "Blocking primitive that waits until one or more registered handles are ready (select/poll/epoll_wait/kqueue, or the runtime's selector) and returns the set of ready handles; it knows nothing about the handlers."
+    },
+    {
+      "role": "Initiation Dispatcher",
+      "responsibility": "Owns the handle-to-handler registry and the demultiplexer's interest set, runs the loop, selects the ready handle whose turn it is, invokes the matching hook and provides registration/removal and loop control."
+    },
+    {
+      "role": "Event Handler",
+      "responsibility": "Abstract interface declaring the hooks the dispatcher may call (handle_event, input, output, timeout, error) plus the accessor that reports the handle it services."
+    },
+    {
+      "role": "Concrete Event Handler",
+      "responsibility": "Application-specific implementation that performs the non-blocking I/O on its handle, updates its own state and returns quickly; it must not assume it is called from a dedicated thread."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "High-throughput HTTP servers and reverse proxies: NGINX uses one reactor per worker process (driven by epoll/kqueue) to serve millions of connections with a small memory footprint and sub-millisecond latency.",
+    "In-memory data stores and caches: Redis runs a single-threaded reactor event loop for all client connections and internal operations, demonstrating the pattern's ability to handle dense, high-frequency request workloads.",
+    "Python asynchronous frameworks: Twisted implements a configurable Reactor as its core event loop, used in production by Dropbox, Quora and other sites for high-concurrency networked services.",
+    "Node.js runtime: Google's V8 JavaScript engine sits atop libuv, which is a C-based, multi-platform reactor implementation that handles all network I/O and asynchronous file operations for the Node.js ecosystem.",
+    "JVM async networking: Netty (used by Cassandra, Elasticsearch, Finagle) and Vert.x (Red Hat) expose reactor-style event loops via their NIO channel and EventLoopGroup abstractions.",
+    "Database connection pooling: PgBouncer and Envoy proxy use reactor-style I/O readiness to multiplex thousands of logical DB connections over a modest pool of physical connections.",
+    "Real-time messaging and pub/sub: Centrifugo and Liveblocks use reactor-based servers to maintain persistent WebSocket connections for thousands of concurrent clients with minimal thread overhead.",
+    "DNS resolvers and health checkers: Libraries like python-adns and tools like consul-template use the reactor pattern to wait on many outstanding DNS queries or health-check sockets without one thread per lookup.",
+    "Embedded and single-threaded daemons: Watchdog processes, logging agents and CI runners that must react to file descriptors, timers and signals without linking a threading library.",
+    "Runtimes exposing reactive I/O to users: Rust's Tokio (via mio), Swift's SwiftNIO, Go's netpoller and Java's java.nio.channels.Selector all present reactor-style APIs to application code.",
+    "Service mesh data planes: Envoy proxy uses one reactor per worker thread (backed by libevent epoll) to handle all downstream and upstream connections; filter chains replace individual handlers, and RCU-based thread-local storage avoids locking on the hot path.",
+    "WebAssembly runtimes: WASM runtimes (Wasmtime, Wasmer) use event-driven I/O waiting for promise resolution and host function calls, implementing a reactor-style dispatch for WebAssembly modules.",
+    "Distributed tracing collectors: Jaeger, Zipkin, and OpenTelemetry collectors use reactor-based I/O to ingest spans from many agents while performing in-process batch processing and forwarding.",
+    "Game server architectures: Real-time game servers use reactor patterns for connection management of thousands of player sessions, with game logic running in separate thread pools or coroutine workers.",
+    "Edge computing and serverless functions: Platforms like Cloudflare Workers and AWS Lambda use isolate-based isolation with event-driven I/O handled by reactor-style loops to maximize density per node.",
+    "Java NIO networking: java.nio.channels.Selector multiplexes registered non-blocking channels and returns ready SelectionKeys, giving a portable readiness reactor for a selector-driven server loop.",
+    "Native libuv services: libuv's uv_loop_t polls platform backends, blocks until I/O activity, and dispatches callbacks; its loop API also supports multiple loops and embedding in another event-loop architecture.",
+    "Tokio applications: Tokio's runtime bundles an I/O event-loop driver, scheduler and timer; its driver polls OS-backed readiness and wakes tasks, illustrating a reactor beneath async Rust."
+  ],
+  "avoid_when": [
+    "There are only a few connections and each is busy most of the time: thread-per-connection blocking I/O is simpler to write, read and debug.",
+    "Handler work is long-running or blocking (heavy CPU, synchronous database or file I/O): Half-Sync/Half-Async or a worker pool with a bounded queue is the right shape, because the reactor serialises it.",
+    "The platform supports efficient completion-based I/O (IOCP, io_uring, POSIX AIO) and completion semantics are acceptable: Proactor gets the same concurrency without the never-block constraint.",
+    "A framework already owns the loop (Netty, Node, asyncio, tokio, SwiftNIO, an NGINX module, a servlet container): build handlers for its dispatcher instead of adding a second reactor.",
+    "The workload needs real CPU parallelism across cores and sharding the loops cannot provide it: use worker pools, actors or processes rather than one loop per core."
+  ],
+  "language_files": {
+    "generic": "reactor.generic.json",
+    "c": "reactor.c.json",
+    "cplusplus": "reactor.cplusplus.json",
+    "csharp": "reactor.csharp.json",
+    "go": "reactor.go.json",
+    "java": "reactor.java.json",
+    "javascript": "reactor.javascript.json",
+    "kotlin": "reactor.kotlin.json",
+    "python": "reactor.python.json",
+    "ruby": "reactor.ruby.json",
+    "rust": "reactor.rust.json",
+    "scala": "reactor.scala.json",
+    "swift": "reactor.swift.json",
+    "typescript": "reactor.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "module",
+  "provenance": [
+    "posa2",
+    "plop"
+  ],
+  "related_patterns": [
+    "proactor",
+    "acceptor-connector",
+    "half-sync-half-async",
+    "leader-followers",
+    "active-object",
+    "asynchronous-completion-token",
+    "observer",
+    "thread-pool"
+  ],
+  "anti_patterns": [
+    "Blocking inside a handler - one synchronous database call, file read or sleep - presented as temporary: it turns the whole reactor into the latency of that call for every connection.",
+    "Registering or removing handlers from other threads without a wakeup channel and a thread-safe queue, so readiness changes are silently delayed or lost.",
+    "Re-arming or busy-looping a level-triggered handle without consuming it, producing the classic 100% CPU event-loop spin.",
+    "Building a second reactor on top of a runtime that already owns the loop (hand-written select loops inside Node, asyncio, Netty or SwiftNIO), leaving two dispatchers fighting over one thread and one descriptor set.",
+    "Using the reactor as a scheduler for CPU-bound jobs: the ready set has no queue semantics, no back-pressure and no fair ordering, so latency and fairness collapse under load.",
+    "Unbounded dispatch per loop iteration: processing all ready handles in one tick starves timers, signals and control events; a dispatch budget (e.g. max N handles per turn) is required for fairness.",
+    "Ignoring graceful shutdown: exiting immediately on SIGTERM drops all in-flight requests; correct shutdown requires failing readiness probes, draining connections under a deadline, then closing resources."
+  ],
+  "design_principles": [
+    "Inversion of control (the Hollywood principle): the dispatcher calls the handler, never the other way round.",
+    "Separation of concerns: readiness detection (demultiplexer) is separate from event handling (handlers) and from registration policy (dispatcher).",
+    "Single responsibility per role: the dispatcher owns registration and dispatch, each handler owns exactly one handle and its state.",
+    "Open/closed principle: new event types and services are added by registering handlers, not by editing the loop.",
+    "Concurrency by structure: handlers run to completion on one thread, so thread confinement replaces locking for per-handle state.",
+    "Bounded execution: every dispatch path must have a budget or timeout; unbounded work in a handler or unbounded iteration over the ready set breaks the reactor's responsiveness guarantees."
+  ],
+  "best_practices": [
+    "Keep handlers short and non-blocking; move long work to a bounded worker layer (Half-Sync/Half-Async, a queue plus a fixed pool) and hand results back through a wakeup. The never-block invariant is the reactor's most critical constraint — a single violation stalls every connection.",
+    "Prefer edge-triggered or one-shot readiness notifications (epolloneshot, EV_DISPATCH) and explicitly re-arm interest after dispatch, so one readiness notification maps to exactly one dispatch and no CPU is wasted re-reporting an already-handled event.",
+    "Implement per-connection output buffering: append to a buffer, register for write readiness only when the buffer is non-empty, drain the buffer on write readiness, and deregister when empty. This prevents the common bug of permanently-watched write handles spinning the CPU.",
+    "Make interest changes from other threads explicit with a self-pipe/eventfd plus a lock-free task queue, or confine all registration to the loop thread. Silent loss of a registration from another thread is the reactor's most common concurrency bug.",
+    "Bound the dispatch budget per iteration: process at most N ready handles per loop tick and yield to the demultiplexer, so a burst of connections cannot starve timers, signals or control events.",
+    "Track per-handle idle time with a timeout priority queue (e.g. a min-heap of expiry timestamps) separate from the ready set; close or pong-stale connections proactively since the demultiplexer does not report idleness.",
+    "Enforce backpressure: cap per-connection send and receive buffers, stop reading from a socket when its application buffer is full (flow control), and close connections that exceed their quota. Without backpressure a fast producer can consume unlimited memory.",
+    "Contain failures per handler: wrap every hook body in a top-level catch, deregister and close the handle on any error, and never dispatch to a handler that has been removed. A crashing handler must not crash the loop.",
+    "Scale horizontally with multiple reactors (one per CPU core, sharded by connection) rather than growing one reactor's thread count; use a shared acceptor that distributes accepted connections across workers.",
+    "Make sockets non-blocking before registering them; attempting to register a blocking socket and then performing blocking I/O inside a handler is the single most common misimplementation of the reactor pattern in new codebases.",
+    "Integrate a hierarchical timer wheel for efficient timer management: Tokio, libuv, and Go's netpoller all use hierarchical timing wheels to achieve O(1) timer insertion and expiration with millions of concurrent timers without per-timer O(log n) heap overhead.",
+    "Implement graceful shutdown in phases: (1) flip readiness to false so load balancers stop routing, (2) stop accepting new connections, (3) drain in-flight work under a hard deadline, (4) cancel remaining tasks with a bounded wait, (5) close connection pools and flush telemetry. Each phase must be individually timed and the total must fit inside the orchestrator's grace period minus margin.",
+    "Instrument the event loop for observability: expose active connection count, event loop lag (time from readiness to dispatch), dispatch budget utilisation, timer queue depth, and connection error rate as metrics; export structured JSON logs and distributed traces via OTLP.",
+    "When integrating io_uring: use it for file I/O batching or high-connection-count network workloads (above ~50k req/s per core); prefer standard epoll for lower throughput or when cross-platform portability (Linux + BSD) is required; be aware that SQPOLL mode dedicates a CPU core and requires CAP_SYS_NICE on kernels before 5.11.",
+    "For cross-platform reactors, abstract the demultiplexer behind a trait: select on Windows, epoll on Linux, kqueue on macOS/BSD, with runtime detection at startup. Platform-specific edge-triggered semantics (EPOLLET vs EV_CLEAR) must be handled correctly in the abstraction.",
+    "Prefer structured concurrency for task management within the reactor: use JoinSet (Rust), TaskGroup (async-std), or structured wait primitives to ensure all spawned tasks are cancelled or completed when the reactor shuts down, preventing leaked goroutines or orphaned tasks."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (Wiley, 2000) — Reactor chapter.",
+    "Schmidt, Reactor — An Object Behavioral Pattern for Event Demultiplexing and Event Handler Dispatching, First Pattern Languages of Programs Conference (PLoP 1994); also in Pattern Languages of Program Design (Addison-Wesley, 1995).",
+    "Schmidt & Pyarali, Strategies for Implementing the Reactor Pattern (POSA2 companion), Vanderbilt University. https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/event-patterns.html",
+    "Schmidt, ACE Framework — Reactor Pattern Implementations. https://www.dre.vanderbilt.edu/~schmidt/patterns-ace.html",
+    "Schmidt, The Design and Implementation of the Reactor (Part 1 of 2), 1993. https://www.cs.wm.edu/~dcschmidt/PDF/Reactor1-93.pdf",
+    "Schmidt, The Design and Implementation of the Reactor (Part 2 of 2), 1993. https://www.dre.vanderbilt.edu/~schmidt/PDF/Reactor2-93.pdf",
+    "Schmidt & Pyarali, Reactor Rules — Strategies for Efficient and Portable Event Handling, 1997 USENIX. https://www.dre.vanderbilt.edu/~schmidt/PDF/reactor-rules.pdf",
+    "Petersen, Patterns in C — Part 5: REACTOR. https://adampetersen.se/Patterns%20in%20C%205,%20REACTOR.pdf",
+    "Wikipedia — Reactor Pattern. https://en.wikipedia.org/wiki/Reactor_pattern",
+    "Linux man-pages — epoll(7) — Linux event interface used by reactor implementations. https://man7.org/linux/man-pages/man7/epoll.7.html",
+    "Tokio Team, I/O Driver and Reactor — Tokio Internals, DeepWiki. https://deepwiki.com/tokio-rs/tokio/3.3-io-driver-and-reactor",
+    "libuv Contributors, libuv Design Overview. https://docs.libuv.org/en/latest/design.html",
+    "Pyarali, Harrison, Jordan & Deshpande, Applying the Proactor Pattern to High-Performance Web Servers (JAWS), Vanderbilt University / OOPSLA 1998. https://www.dre.vanderbilt.edu/JAWS/papers/proactor-jaws.pdf",
+    "Axboe, io_uring Design Documentation, Linux kernel. https://www.kernel.org/doc/html/latest/io/io_uring.html",
+    "Wang, Why Fewer Syscalls Don't Make io_uring Faster Than epoll. https://wanglong.cv/articles/io-uring-vs-epoll-performance/",
+    "Karasiński, epoll vs io_uring: When the Event Loop Isn't Enough. https://devmindset.dev/en/epoll-vs-io_uring-when-the-event-loop-isnt-enough/",
+    "Bengtsson & Seceleanu, High-Performance DBMSs with io_uring: When and How to Use It, VLDB 2025. https://www.vldb.org/pvldb/vol19/p2317-jasny.pdf",
+    "Envoy Proxy Authors, Life of a Request — Envoy Architecture. https://www.envoyproxy.io/docs/envoy/latest/intro/life_of_a_request",
+    "Envoy Proxy Authors, Architecture Overview — Envoy. https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/arch_overview",
+    "Async Concurrency, Graceful Shutdown & Signal Handling. https://async-concurrency.com/resilience-cancellation-error-handling/graceful-shutdown-and-signals/",
+    "Bhagat, Timers, I/O Reactors, and Tokio's Event Loop. https://chandanbhagat.com.np/timers-i-o-reactors-and-tokio-s-event-loop/",
+    "Odendaal, Rust Async Runtime Deep Dive: Tokio Architecture. https://andrewodendaal.com/rust-async-runtime-tokio-architecture/",
+    "Pandey, The Reactor Pattern — How Tokio Actually Works. https://www.atharvapandey.com/post/rust/rust-runtime-reactor-pattern/",
+    "Jaiswal, Node.js Runtime Architecture: Event Loop, Streams, and APIs. https://sujeet.pro/articles/nodejs-runtime-architecture",
+    "Sparkles, libuv (C) — Async I/O Research. https://sparkles-docs.pages.dev/research/async-io/libuv",
+    "Sparkles, Green Threads and M:N User-Mode Runtimes. https://sparkles-docs.pages.dev/research/coroutines/stackful/green-threads",
+    "Kumar, Inside Kotlin Coroutines: How CoroutineScheduler, Work-Stealing, and asCoroutineDispatcher() Actually Work. https://tiwariashuism.medium.com/inside-kotlin-coroutines-how-coroutinescheduler-work-stealing-and-ascoroutinedispatcher-5e0cb0372cb6",
+    "JetBrains, Coroutines and Loom Behind the Scenes, KotlinConf 2023. https://resources.jetbrains.com/storage/products/kotlinconf-2023/Coroutines%20and%20Loom%20Behind%20The%20Scenes.pdf",
+    "tochemey, GoAkt Dispatcher Pool Design — Actor Model on Go. https://github.com/tochemey/goakt/blob/main/architecture/DISPATCHER_POOL_DESIGN.md",
+    "archiyun, CoroPact — C++23 Async Networking Runtime with epoll and io_uring Backends. https://github.com/archiyun/CoroPact",
+    "Dobrosielski, uRocket — Reactor Networking in C# with io_uring. https://dev.to/mda2av/urocket-reactor-networking-in-c-with-iouring-1j95",
+    "Schmidt, Reactor: An Object Behavioral Pattern for Event Demultiplexing and Event Handler Dispatching (PLoP 1994). https://www.dre.vanderbilt.edu/~schmidt/PDF/PLoP-94.pdf",
+    "Oracle, Selector (Java SE 23 API) — multiplexed non-blocking channel readiness. https://docs.oracle.com/en/java/javase/23/docs/api/java.base/java/nio/channels/Selector.html",
+    "libuv Contributors, Event loop API and platform polling. https://docs.libuv.org/en/latest/loop.html",
+    "Tokio Team, tokio::runtime — I/O event loop driver, scheduler and timer. https://docs.rs/tokio/latest/tokio/runtime/",
+    "Twisted Developers, Threading — keep blocking work out of the reactor thread. https://docs.twisted.org/en/stable/core/howto/threading.html"
+  ],
+  "related_patterns_notes": {
+    "proactor": "Proactor inverts the ownership: the reactor waits for readiness and dispatches synchronously, while a proactor waits for completion and dispatches asynchronously with the result already in hand. Both avoid threads-per-connection, but proactor requires OS-level asynchronous I/O (IOCP, io_uring, POSIX AIO) whereas reactor works on any platform that provides a readiness select. The two can be combined: a reactor that offloads blocking work to a thread pool and receives completion callbacks is structurally close to a proactor. Modern io_uring integration often creates a hybrid where the reactor handles network readiness and io_uring handles file/completion operations.",
+    "acceptor-connector": "Acceptor-Connector layers on top of the reactor: the reactor runs the event loop, while an Acceptor accepts new connections and registers them as handles, and a Connector initiates outgoing connections and registers their handles. The acceptor-decoupled connection setup pattern is the standard composition for reactor-based servers.",
+    "half-sync-half-async": "Half-Sync/Half-Async solves the never-block constraint by bridging a synchronous service layer (thread pool) to the reactor's asynchronous event loop via a queue. Handlers perform only non-blocking I/O and then hand off work to the sync layer; results are returned through a wakeup that re-invokes a handler. It is the canonical fix for when reactor handlers must interact with blocking APIs (databases, file systems).",
+    "leader-followers": "Leader-Followers is an alternative thread-pool event demultiplexer: rather than one loop owned by one thread, the thread pool itself demultiplexes events and rotates the leader role. It avoids the reactor's serialisation bottleneck and the Half-Sync/Half-Async queue, but requires more complex thread synchronisation for handle ownership transfer.",
+    "active-object": "Active Object decouples method invocation from execution by serialising method calls onto its own thread or pool; the reactor's per-handler state machine is a common implementation substrate for active objects in network servers, but the coupling is structural (an active object can run inside a reactor handler), not architectural.",
+    "asynchronous-completion-token": "Asynchronous Completion Token (ACT) is a lightweight demultiplexing key used by both reactor and proactor to route asynchronous operation results to the correct handler without a full closure or callback object. In a reactor, an ACT can replace a pointer-sized handle lookup when the callback context is passed through a library's async I/O interface.",
+    "observer": "Observer and reactor share the same notification structure (subject notifies observers when state changes), but reactor's subject is the OS kernel (the demultiplexer), the observers are registered event handlers, and the notification is readiness rather than state change. Reactor can be viewed as a specialisation of observer where the subject is the readiness of a set of handles.",
+    "thread-pool": "A thread pool is a complementary primitive, not a competing pattern. Reactor is often paired with a thread pool (Half-Sync/Half-Async) to handle blocking work, or used as the front-end that distributes work to a pool of dedicated threads. The thread pool replaces the reactor when the workload is CPU-bound and the parallelism is the bottleneck.",
+    "fiber-green-thread": "Fiber/green-thread runtimes (Go goroutines, Kotlin virtual threads, Java Project Loom) implement M:N threading where N user-space fibers run on M OS threads. The I/O integration layer of a green-thread runtime uses the reactor pattern internally: the runtime parks a fiber on would-block by registering with epoll/kqueue/io_uring and waking the fiber on readiness. This is architecturally a reactor plus a scheduling layer; Go's netpoller is the canonical example, where goroutines blocked on I/O are parked and woken by the poller's epoll wait.",
+    "lmax-disruptor": "The LMAX Disruptor is a high-performance inter-thread messaging pattern using a lock-free ring buffer. In reactor-based systems, it can replace a simple task queue between the reactor and worker threads, providing mechanical sympathy by avoiding false sharing and enabling batched event dispatch. Vert.x's internal event loop group has been compared to a Disruptor-style architecture.",
+    "seda": "Staged Event-Driven Architecture (SEDA) decomposes an application into stages connected by event queues. Each stage has its own event loop (reactor) and thread pool. SEDA can be viewed as a scaled-out reactor where the serialisation point is replicated per stage, with queuing between stages providing backpressure and isolation."
+  }
+}

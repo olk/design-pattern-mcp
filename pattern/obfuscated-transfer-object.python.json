@@ -1,0 +1,59 @@
+{
+  "pattern": "obfuscated-transfer-object",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "dataclass holding a cryptography.fernet.Fernet token",
+  "implementation_notes": "Python's standard library has no cipher, so the dominant library supplies the sealing: Fernet.encrypt(serialized_map) returns an opaque, tamper-evident token and decrypt raises InvalidToken if a single byte changed, which is exactly the block the transfer object stores. The holder is a dataclass whose protected attributes are declared field(repr=False) and cleared after sealing, and __getstate__ decides what pickling writes, so the plaintext map never reaches a serialized form. What replaces the classic structure: the Fernet token is the encrypted data map, while the dataclass field configuration plus an explicit accessor is the masked list; MultiFernet covers key rotation when old tokens must stay readable.",
+  "code_sketch": "@dataclass\nclass ObfuscatedTO:\n    id: str\n    protected: dict = field(default_factory=dict, repr=False)\n    sealed: bytes | None = field(default=None, repr=False)\n    def seal(self, fernet: Fernet) -> None:\n        self.sealed = fernet.encrypt(json.dumps(self.protected, sort_keys=True).encode())\n        self.protected.clear()                       # drop the plaintext copy\n    def unseal(self, fernet: Fernet) -> dict:        # InvalidToken = tamper or wrong key\n        try:\n            return json.loads(fernet.decrypt(self.sealed or b\"\"))\n        except InvalidToken as exc:\n            raise SecurityError(\"sealed payload rejected\") from exc",
+  "pitfalls": [
+    "field(repr=False) covers the generated __repr__ only: dataclasses.asdict(), vars(), pprint, logging helpers and exception tracebacks still see the attributes, so the plaintext map must be cleared and the accessor must be the only route.",
+    "Fernet raises InvalidToken for tampering and for a wrong key alike - handle it as a security event, never with a bare except that falls back to an empty map.",
+    "json.dumps output is not canonical (dict order, float formatting): if tokens are compared, cached or hashed, serialize with sort_keys=True or a canonical encoder, or the same logical payload yields different ciphertexts.",
+    "Keys and plaintext live in immutable str/bytes objects that cannot be wiped; limit copies and prefer bytearray for anything you intend to clear."
+  ],
+  "sources": [
+    "https://cryptography.io/en/latest/fernet/",
+    "https://docs.python.org/3/library/dataclasses.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "fernet-sealed-map",
+      "name": "Fernet-sealed payload map in a dataclass",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "dataclass holding a cryptography.fernet.Fernet token",
+      "implementation_notes": "Python's standard library has no cipher, so the dominant library supplies the sealing: Fernet.encrypt(serialized_map) returns an opaque, tamper-evident token and decrypt raises InvalidToken if a single byte changed, which is exactly the block the transfer object stores. The holder is a dataclass whose protected attributes are declared field(repr=False) and cleared after sealing, and __getstate__ decides what pickling writes, so the plaintext map never reaches a serialized form. What replaces the classic structure: the Fernet token is the encrypted data map, while the dataclass field configuration plus an explicit accessor is the masked list; MultiFernet covers key rotation when old tokens must stay readable.",
+      "code_sketch": "@dataclass\nclass ObfuscatedTO:\n    id: str\n    protected: dict = field(default_factory=dict, repr=False)\n    sealed: bytes | None = field(default=None, repr=False)\n    def seal(self, fernet: Fernet) -> None:\n        self.sealed = fernet.encrypt(json.dumps(self.protected, sort_keys=True).encode())\n        self.protected.clear()                       # drop the plaintext copy\n    def unseal(self, fernet: Fernet) -> dict:        # InvalidToken = tamper or wrong key\n        try:\n            return json.loads(fernet.decrypt(self.sealed or b\"\"))\n        except InvalidToken as exc:\n            raise SecurityError(\"sealed payload rejected\") from exc",
+      "pitfalls": [
+        "field(repr=False) covers the generated __repr__ only: dataclasses.asdict(), vars(), pprint, logging helpers and exception tracebacks still see the attributes, so the plaintext map must be cleared and the accessor must be the only route.",
+        "Fernet raises InvalidToken for tampering and for a wrong key alike - handle it as a security event, never with a bare except that falls back to an empty map.",
+        "json.dumps output is not canonical (dict order, float formatting): if tokens are compared, cached or hashed, serialize with sort_keys=True or a canonical encoder, or the same logical payload yields different ciphertexts.",
+        "Keys and plaintext live in immutable str/bytes objects that cannot be wiped; limit copies and prefer bytearray for anything you intend to clear."
+      ],
+      "sources": [
+        "https://cryptography.io/en/latest/fernet/",
+        "https://docs.python.org/3/library/dataclasses.html"
+      ]
+    },
+    {
+      "variant_id": "masked-dataclass",
+      "name": "Masked-field dataclass (stdlib only, repr/state suppression)",
+      "paradigm": "oo",
+      "min_standard": "Python3.7",
+      "idiom_name": "frozen dataclass with field(repr=False) + __getstate__ suppression",
+      "implementation_notes": "The stdlib-only realization of the Masked List strategy: sensitive fields are dataclass fields with repr=False and compare=False where equality or hashing does not need them, __getstate__ returns only the unprotected state so pickle and framework serializers never write them, and readers must call an explicit reveal() accessor. Nothing is encrypted, so the values remain in memory and in the object's attributes - this prevents accidental leakage into logs and serialized artifacts, not access by code that already holds the object. Choose it when the route is trusted and the threat is careless output.",
+      "code_sketch": "@dataclass(frozen=True)\nclass ObfuscatedTO:\n    id: str\n    card_number: str = field(repr=False, compare=False)\n    _masked = (\"card_number\",)                 # single source of truth for output paths\n\n    def __getstate__(self):                    # pickle and framework serializers\n        return {k: v for k, v in self.__dict__.items() if k not in self._masked}\n\n    def reveal(self, name: str) -> str:        # explicit, auditable access\n        if name not in self._masked:\n            raise KeyError(name)\n        return getattr(self, name)",
+      "pitfalls": [
+        "Masking is not protection: repr suppression and __getstate__ stop accidental output, but any code holding the object can still read the attribute (vars(), object.__getattribute__) - never use this variant against an untrusted intermediary.",
+        "Every output path must be enrolled: pprint, logging formatters that walk __dict__, dataclasses.asdict(), ORM/marshmallow/pydantic exporters and pytest failure reports each have their own way of reading the fields.",
+        "frozen=True blocks reassignment, not mutation of nested values, and __getstate__ is bypassed by copy internals unless __reduce__ is defined; test pickling and copying, not just repr."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/pickle.html",
+        "https://docs.python.org/3/library/dataclasses.html"
+      ]
+    }
+  ],
+  "default_variant": "fernet-sealed-map",
+  "version": "1.0"
+}

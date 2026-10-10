@@ -1,0 +1,89 @@
+{
+  "pattern": "cancellation-token",
+  "language": "cplusplus",
+  "support": "library",
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "cpp20-stop-token",
+      "name": "C++20 std::stop_token and std::jthread",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "std::stop_token",
+        "std::stop_source",
+        "std::stop_callback",
+        "std::jthread"
+      ],
+      "idiom_name": "std::stop_source / std::stop_token / std::jthread",
+      "implementation_notes": "C++20 stores the request in the standard library: std::stop_source owns the stop-state and is the only trigger, std::stop_token is the thread-safe read-only view passed to each operation, and std::jthread injects the token into its callable and calls request_stop() in its destructor before joining. Waits become interruptible through std::condition_variable_any::wait(lock, token, pred), and std::stop_callback registers a reaction that runs on the thread that calls request_stop(). Use this whenever the toolchain is C++20; pre-C++20 code keeps the manual atomic flag, and Asio-based I/O uses per-operation cancellation instead.",
+      "code_sketch": "std::jthread worker([](std::stop_token st) {  // jthread owns the stop source\n    while (!st.stop_requested()) {              // safe point\n        if (auto item = queue.pop_for(100ms))\n            process(item);\n    }\n});\nworker.request_stop();                           // request, not termination",
+      "pitfalls": [
+        "The stop-state lives as long as any token or callback references it, but once the stop_source is destroyed no further request can be made - tokens then report stop_possible() == false; keep the source alive for the whole operation it cancels.",
+        "std::stop_callback runs on the thread that calls request_stop(): keep the callback short and non-blocking, and never destroy a callback (or its token) from inside another callback, since that blocks until the running one returns.",
+        "Polling only between large units of work gives no cancellation latency: check the token around each blocking step and prefer interruptible waits over fixed sleeps.",
+        "condition_variable_any::wait(lock, token, pred) can return because of a stop request, not only because the predicate became true - check the predicate (or the token) before using the data."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/stop_token"
+      ]
+    },
+    {
+      "variant_id": "cpp11-atomic-flag",
+      "name": "Pre-C++20 std::atomic flag polling",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "std::atomic",
+        "std::condition_variable_any"
+      ],
+      "idiom_name": "std::atomic<bool> token shared by reference, checked at safe points",
+      "implementation_notes": "Before C++20 the token is hand-written: one std::atomic<bool> (or atomic_flag) owned by the requester and captured by reference or shared_ptr in every operation, with a condition_variable or timed waits so blocked workers wake and re-check. This is the classic form of the pattern in C++ and remains justified when the ABI is frozen, when the token must cross a C boundary, or when a shared_ptr control block is cheaper than a stop-state. Migration to stop_token is mechanical: the flag becomes std::stop_source and the checks become stop_requested().",
+      "code_sketch": "std::atomic<bool> cancelled{false};\nstd::condition_variable cv;\n\nvoid worker() {\n    while (!cancelled.load(std::memory_order_relaxed)) {      // safe point\n        std::unique_lock lk(m);\n        cv.wait_for(lk, 100ms, [] { return ready(); });      // timed wait, then re-check\n        drain(ready());\n    }\n}\ncancelled.store(true); cv.notify_all();                       // request",
+      "pitfalls": [
+        "A relaxed atomic is enough for the flag itself, but the data published together with the cancellation needs its own synchronisation; do not assume the flag orders anything.",
+        "Waiting without a timeout on a condition variable makes the request invisible until the predicate changes: use wait_for/wait_until and re-check the flag in the predicate loop.",
+        "Capturing the flag by reference into a thread that outlives the scope is a dangling reference; own it in a shared_ptr or keep it in a scope that provably outlives every worker."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/stop_token",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/cancellation_signal.html"
+      ]
+    },
+    {
+      "variant_id": "asio-cancellation-signal",
+      "name": "Boost.Asio per-operation cancellation",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "Boost.Asio",
+        "cancellation_signal",
+        "cancellation_slot"
+      ],
+      "idiom_name": "boost::asio::cancellation_signal / cancellation_slot",
+      "implementation_notes": "For asynchronous I/O on Asio, cancellation is per operation rather than per call tree: a cancellation_signal has a single slot, emit() invokes the slot's handler, and the handler cancels exactly the async operation it was bound to. Bind the slot to an operation through bind_cancellation_slot, or hand the signal to composed operations that propagate it to their inner steps. This is the right tool when the thing to stop is an outstanding async_accept/async_read/async_wait rather than a loop; keep an application-level token for the surrounding task lifetime and let the signal do the I/O-level stopping.",
+      "code_sketch": "boost::asio::cancellation_signal signal;\n\nsocket.async_read_some(buffer,\n    bind_cancellation_slot(signal.slot(), [](error_code ec, size_t n) {\n        if (ec == boost::asio::error::operation_aborted) return;  // cancelled\n        handle(n);\n    }));\n\nsignal.emit(boost::asio::cancellation_type::all);   // request per-operation cancellation",
+      "pitfalls": [
+        "A cancellation_signal has one slot: emitting it after the slot was rebound cancels the wrong operation, so keep one signal per outstanding operation (or hand it to a composed operation that owns the binding).",
+        "Cancellation type matters: terminal/partial/total have different effects on composed operations, and an operation may complete successfully before the request is observed - always handle operation_aborted as a normal outcome.",
+        "The signal, the socket and the completion handler must outlive the async operation; an emit after the operation completed is a no-op, not an error."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/cancellation_signal.html"
+      ]
+    }
+  ],
+  "default_variant": "cpp20-stop-token",
+  "idiom_name": "std::stop_source / std::stop_token / std::jthread",
+  "implementation_notes": "C++20 stores the request in the standard library: std::stop_source owns the stop-state and is the only trigger, std::stop_token is the thread-safe read-only view passed to each operation, and std::jthread injects the token into its callable and calls request_stop() in its destructor before joining. Waits become interruptible through std::condition_variable_any::wait(lock, token, pred), and std::stop_callback registers a reaction that runs on the thread that calls request_stop(). Use this whenever the toolchain is C++20; pre-C++20 code keeps the manual atomic flag, and Asio-based I/O uses per-operation cancellation instead.",
+  "code_sketch": "std::jthread worker([](std::stop_token st) {  // jthread owns the stop source\n    while (!st.stop_requested()) {              // safe point\n        if (auto item = queue.pop_for(100ms))\n            process(item);\n    }\n});\nworker.request_stop();                           // request, not termination",
+  "pitfalls": [
+    "The stop-state lives as long as any token or callback references it, but once the stop_source is destroyed no further request can be made - tokens then report stop_possible() == false; keep the source alive for the whole operation it cancels.",
+    "std::stop_callback runs on the thread that calls request_stop(): keep the callback short and non-blocking, and never destroy a callback (or its token) from inside another callback, since that blocks until the running one returns.",
+    "Polling only between large units of work gives no cancellation latency: check the token around each blocking step and prefer interruptible waits over fixed sleeps.",
+    "condition_variable_any::wait(lock, token, pred) can return because of a stop request, not only because the predicate became true - check the predicate (or the token) before using the data."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/stop_token"
+  ]
+}

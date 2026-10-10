@@ -1,0 +1,81 @@
+{
+  "pattern": "raii",
+  "language": "cplusplus",
+  "support": "native",
+  "idiom_name": "resource-owning class - acquire in the constructor, release in the destructor (move-only; the classic Stroustrup handle)",
+  "implementation_notes": "The classic structure is the language mechanism: a class whose constructor acquires and establishes the invariant and whose destructor releases, declared as an automatic variable so stack unwinding destroys it on every exit path, in reverse order of construction. C++11 removed the boilerplate that C++98 guards needed - deleted copy operations plus a move constructor express ownership transfer - and the same shape appears throughout the standard library as a guard type (std::lock_guard, std::unique_lock, std::jthread) whenever the resource is not a pointer. Choose this whenever the owner has a domain meaning of its own; for bare pointers use std::unique_ptr with a deleter instead, and when there is no owner type worth designing use a scope guard.",
+  "code_sketch": "class File {                                // owner: no public close()\npublic:\n    explicit File(const char* p) : f_(std::fopen(p, \"rb\")) {\n        if (!f_) throw std::runtime_error(\"open failed\");  // no half-open state\n    }\n    ~File() { if (f_) std::fclose(f_); }    // non-throwing, exactly once\n    File(File&& o) noexcept : f_(o.f_) { o.f_ = nullptr; }\n    File(const File&) = delete;             // copying would double-release\n    std::FILE* get() const noexcept { return f_; }\nprivate:\n    std::FILE* f_;\n};",
+  "pitfalls": [
+    "A destructor must not throw - a second exception during unwinding calls std::terminate - and it cannot report a failing fclose()/commit(): operations whose failure matters need an explicit flush/commit/close-with-error before the guard dies, with the destructor keeping only the unconditional backstop.",
+    "Copying an owner that manages a raw handle double-releases; delete the copy operations and implement the full Rule of Five (or none of them, the Rule of Zero) - a move that leaves the source holding the same handle is just as bad.",
+    "A guard that captures by reference can outlive the captured variable (scope guards run after the return operand has been destroyed), and a guard created on the heap never fires at scope exit; keep guards as stack objects and capture only what outlives them."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/raii",
+    "https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md",
+    "https://www.stroustrup.com/bs_faq2.html#finally"
+  ],
+  "variants": [
+    {
+      "variant_id": "owner-class",
+      "name": "Resource-owning class (construct acquires, destruct releases)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "resource-owning class - acquire in the constructor, release in the destructor (move-only; the classic Stroustrup handle)",
+      "implementation_notes": "The classic structure is the language mechanism: a class whose constructor acquires and establishes the invariant and whose destructor releases, declared as an automatic variable so stack unwinding destroys it on every exit path, in reverse order of construction. C++11 removed the boilerplate that C++98 guards needed - deleted copy operations plus a move constructor express ownership transfer - and the same shape appears throughout the standard library as a guard type (std::lock_guard, std::unique_lock, std::jthread) whenever the resource is not a pointer. Choose this whenever the owner has a domain meaning of its own; for bare pointers use std::unique_ptr with a deleter instead, and when there is no owner type worth designing use a scope guard.",
+      "code_sketch": "class File {                                // owner: no public close()\npublic:\n    explicit File(const char* p) : f_(std::fopen(p, \"rb\")) {\n        if (!f_) throw std::runtime_error(\"open failed\");  // no half-open state\n    }\n    ~File() { if (f_) std::fclose(f_); }    // non-throwing, exactly once\n    File(File&& o) noexcept : f_(o.f_) { o.f_ = nullptr; }\n    File(const File&) = delete;             // copying would double-release\n    std::FILE* get() const noexcept { return f_; }\nprivate:\n    std::FILE* f_;\n};",
+      "pitfalls": [
+        "A destructor must not throw - a second exception during unwinding calls std::terminate - and it cannot report a failing fclose()/commit(): operations whose failure matters need an explicit flush/commit/close-with-error before the guard dies, with the destructor keeping only the unconditional backstop.",
+        "Copying an owner that manages a raw handle double-releases; delete the copy operations and implement the full Rule of Five (or none of them, the Rule of Zero) - a move that leaves the source holding the same handle is just as bad.",
+        "A guard that captures by reference can outlive the captured variable (scope guards run after the return operand has been destroyed), and a guard created on the heap never fires at scope exit; keep guards as stack objects and capture only what outlives them."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/raii",
+        "https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md",
+        "https://www.stroustrup.com/bs_faq2.html#finally"
+      ]
+    },
+    {
+      "variant_id": "smart-pointer-deleter",
+      "name": "Smart-pointer owner with a custom deleter",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::unique_ptr<T, D> with a custom deleter; std::shared_ptr where ownership is genuinely shared",
+      "implementation_notes": "For pointer-shaped resources no owner class is needed: unique_ptr<T, D> stores the handle plus a deleter and releases it in its destructor, keeps single ownership in the type, and is free of run-time overhead for a stateless deleter. This is the default form for malloc/new blocks, file descriptors, sockets and HANDLEs; std::shared_ptr with a deleter covers the case where several owners must keep the resource alive, and lock guards cover mutexes. Prefer it over a hand-written owner class when the handle has no domain operations of its own, and over raw pointers plus manual free everywhere, because the deleter is the only place that has to be right.",
+      "code_sketch": "struct Fclose { void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); } };\nusing FilePtr = std::unique_ptr<std::FILE, Fclose>;\n\nFilePtr open(const char* path) {\n    if (auto* f = std::fopen(path, \"rb\")) return FilePtr{f};\n    throw std::runtime_error(\"open failed\");   // nothing to release\n}\n// FilePtr releases the handle on every exit path.",
+      "pitfalls": [
+        "The deleter must be non-throwing and null-safe and should be stateless: a capturing deleter is stored inside the unique_ptr, which changes the type's size and every signature that carries it, and it must still be callable after the owner has been moved from.",
+        "A smart pointer only covers the pointer it owns: handing the raw handle out (get(), a C API call, a callback) creates a borrowed reference whose lifetime the type system no longer checks, and use after the owner died is silent undefined behaviour.",
+        "Converting to shared_ptr (or sharing a unique_ptr by moving it into an object with unclear lifetime) turns deterministic release into refcount timing; shared ownership is a design decision, not a convenience."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/unique_ptr",
+        "https://en.cppreference.com/w/cpp/thread/lock_guard"
+      ]
+    },
+    {
+      "variant_id": "scope-guard",
+      "name": "Scope guard (std::experimental::scope_exit / Boost.Scope / gsl::finally)",
+      "paradigm": "procedural",
+      "min_standard": "C++17",
+      "requires_features": [
+        "library-fundamentals-ts-v3"
+      ],
+      "idiom_name": "scope-exit guard for one-off actions: std::experimental::scope_exit / scope_fail, Boost.Scope, gsl::finally",
+      "implementation_notes": "Choose this when the action must run at scope exit but no owner type is worth designing: rollback of a partially applied change, metrics, restoring a flag, unlocking a conditionally held lock. std::experimental::scope_exit calls its exit function on every scope exit, scope_fail and scope_success discriminate on whether an exception is propagating, and release() deactivates the guard; the types live in the Library Fundamentals TS v3 (a standardized std::scope_exit is still only proposed - beman's P3610 targets C++29), so the same shape ships as Boost.Scope/Boost.ScopeExit, GSL gsl::finally, or a hand-written guard where none of those are available. It replaces the owner class with a statement-level object, which is why it belongs to this pattern even though it owns no resource.",
+      "code_sketch": "void update(Store& s) {\n    s.begin();\n    auto rollback = std::experimental::scope_fail{[&] { s.rollback(); }};\n    s.write(payload);          // any throw runs the guard\n    s.commit();                // success: the guard stays inactive\n}",
+      "pitfalls": [
+        "scope_fail/scope_success key off whether an exception is in flight, not business success: an early return with a failure value counts as success, so a guard is no substitute for an error-returning path.",
+        "A guard capturing by reference dies with the captured object if it outlives its scope, and a release() forgotten on the success path fires the action anyway; declare guards in the same scope as the thing they protect.",
+        "Guard actions must not throw either: a throwing rollback during unwinding terminates the program, which is the same constraint the destructor form carries."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/experimental/scope_exit",
+        "https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/p0052r3.pdf",
+        "https://github.com/bemanproject/scope"
+      ]
+    }
+  ],
+  "default_variant": "owner-class",
+  "version": "1.0"
+}

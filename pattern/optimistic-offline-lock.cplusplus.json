@@ -1,0 +1,59 @@
+{
+  "pattern": "optimistic-offline-lock",
+  "language": "cplusplus",
+  "variants": [
+    {
+      "variant_id": "db-version-guard",
+      "name": "Guarded statement through a SQL client (libpqxx / SQLite)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "pqxx::result::affected_rows() / sqlite3_changes() on UPDATE ... WHERE version = ?",
+      "implementation_notes": "The classic form in C++ is the guarded statement issued through a SQL client: keep the version the session read, run the conditional UPDATE inside one RAII-scoped transaction (pqxx::work or a sqlite3 BEGIN), and decide the outcome from the affected-row count - pqxx::result::affected_rows() for libpqxx, sqlite3_changes() when using the SQLite C API from C++. RAII is what makes the discipline natural: the transaction object rolls back on the conflict path, so a thrown error cannot leave the system transaction open.",
+      "code_sketch": "// session holds id and the version it read\npqxx::work tx{conn};                       // one system transaction\npqxx::result r = tx.exec(\n    \"UPDATE account SET balance=$1, version=version+1 \"\n    \"WHERE id=$2 AND version=$3\", {newBalance, id, expected});\nif (r.affected_rows() == 0) { tx.abort(); throw StaleRowError{}; }\ntx.commit();",
+      "pitfalls": [
+        "The check is only atomic because it is in the statement; issuing SELECT ... FOR UPDATE and then a separate UPDATE turns the pattern into a pessimistic lock (and costs a lock for the whole session if the transaction stays open).",
+        "Affected rows must be read from the same result/connection immediately - a logging query or another statement in between overwrites the count.",
+        "An exception thrown between the statement and COMMIT must not skip the rollback: the RAII transaction object handles this, hand-written COMMIT/ROLLBACK pairs do not."
+      ],
+      "sources": [
+        "https://libpqxx.readthedocs.io",
+        "https://sqlite.org/c3ref/changes.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-compare-exchange",
+      "name": "In-process compare-exchange retry loop",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "atomics"
+      ],
+      "idiom_name": "std::atomic<T>::compare_exchange_weak",
+      "implementation_notes": "For shared state that never leaves the process the same validate-then-act mechanics reduce to a CAS loop: the value you read is the expected one, compare_exchange_weak publishes the new value only if the slot still holds it, and a failure hands back the current value so the loop can recompute. Use it for the in-memory form of an edit session; it replaces nothing at the persistence level, where the token must be a real column.",
+      "code_sketch": "std::atomic<Record> slot{initial};\nRecord expected = slot.load();\nRecord desired;\ndo {\n    desired = mutate(expected);          // recompute from the observed state\n} while (!slot.compare_exchange_weak(expected, desired));  // retry on conflict",
+      "pitfalls": [
+        "compare_exchange_weak may fail spuriously: the loop must recompute from the updated expected value, not treat every failure as a real conflict.",
+        "The comparison is bitwise over the object representation, so padding/trap bits or multiple representations of one value (NaN) can make the exchange fail forever.",
+        "A CAS loop only relocates contention: under heavy conflict it burns CPU where a mutex or the database token would be cheaper."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/atomic/atomic/compare_exchange"
+      ]
+    }
+  ],
+  "default_variant": "db-version-guard",
+  "idiom_name": "pqxx::result::affected_rows() / sqlite3_changes() on UPDATE ... WHERE version = ?",
+  "implementation_notes": "The classic form in C++ is the guarded statement issued through a SQL client: keep the version the session read, run the conditional UPDATE inside one RAII-scoped transaction (pqxx::work or a sqlite3 BEGIN), and decide the outcome from the affected-row count - pqxx::result::affected_rows() for libpqxx, sqlite3_changes() when using the SQLite C API from C++. RAII is what makes the discipline natural: the transaction object rolls back on the conflict path, so a thrown error cannot leave the system transaction open.",
+  "code_sketch": "// session holds id and the version it read\npqxx::work tx{conn};                       // one system transaction\npqxx::result r = tx.exec(\n    \"UPDATE account SET balance=$1, version=version+1 \"\n    \"WHERE id=$2 AND version=$3\", {newBalance, id, expected});\nif (r.affected_rows() == 0) { tx.abort(); throw StaleRowError{}; }\ntx.commit();",
+  "pitfalls": [
+    "The check is only atomic because it is in the statement; issuing SELECT ... FOR UPDATE and then a separate UPDATE turns the pattern into a pessimistic lock (and costs a lock for the whole session if the transaction stays open).",
+    "Affected rows must be read from the same result/connection immediately - a logging query or another statement in between overwrites the count.",
+    "An exception thrown between the statement and COMMIT must not skip the rollback: the RAII transaction object handles this, hand-written COMMIT/ROLLBACK pairs do not."
+  ],
+  "sources": [
+    "https://libpqxx.readthedocs.io",
+    "https://sqlite.org/c3ref/changes.html"
+  ],
+  "support": "manual",
+  "version": "1.0"
+}

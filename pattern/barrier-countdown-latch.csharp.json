@@ -1,0 +1,62 @@
+{
+  "pattern": "barrier-countdown-latch",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "new Barrier(participantCount) + SignalAndWait(), CountdownEvent + Signal/Wait",
+  "implementation_notes": "The BCL ships both forms directly. Barrier.SignalAndWait() arrives and waits for the whole party, the post-phase action runs once per phase on the last arriver's thread before anyone is released, and the object is reusable with dynamic membership (ParticipantCount, AddParticipant, RemoveParticipant, CurrentPhaseNumber). CountdownEvent is the one-shot side: Signal() decrements and Wait() blocks until zero, with Reset() available if the counter is deliberately re-armed - unlike Java's CountDownLatch. Choose these when the work runs on dedicated threads; when the work is already task-shaped, Task.WhenAll is simpler.",
+  "code_sketch": "var phase = new Barrier(n, _ => MergePartials());   // reusable, dynamic membership\nvar pool = new Task[n];\nfor (int row = 0; row < n; row++) {\n    int r = row;\n    pool[r] = Task.Run(() => {\n        for (int step = 0; step < steps; step++) { Compute(r, step); phase.SignalAndWait(); }\n    });\n}\nvar done = new CountdownEvent(n);                  // one-shot fan-in\n// producers: done.Signal(); collector:\nif (!done.Wait(TimeSpan.FromSeconds(30))) AbortGroup();",
+  "pitfalls": [
+    "A timeout or cancellation at SignalAndWait lets that caller stop waiting but does not cancel the other participants; they may still wait for missing arrivals, while a failing post-phase action raises BarrierPostPhaseException - propagate group cancellation and catch these cases instead of assuming Java-style BrokenBarrierException.",
+    "Barrier and CountdownEvent implement IDisposable and hold wait handles; abandoned instances leak, and removing a participant without either disposing or signalling leaves the remaining parties waiting.",
+    "Reset() on a CountdownEvent while another thread is waiting races with the waiter: reset only after the count has drained and no wait is in flight.",
+    "CountdownEvent counts signals, not tasks: a producer that signals twice releases the waiter early, and one that throws before signalling strands it - signal from a finally block."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.barrier",
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/countdownevent"
+  ],
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "bcl-barrier-countdownevent",
+      "name": "System.Threading.Barrier and CountdownEvent (blocking)",
+      "paradigm": "concurrent",
+      "min_standard": "C#4",
+      "idiom_name": "new Barrier(participantCount) + SignalAndWait(), CountdownEvent + Signal/Wait",
+      "implementation_notes": "The BCL ships both forms directly. Barrier.SignalAndWait() arrives and waits for the whole party, the post-phase action runs once per phase on the last arriver's thread before anyone is released, and the object is reusable with dynamic membership (ParticipantCount, AddParticipant, RemoveParticipant, CurrentPhaseNumber). CountdownEvent is the one-shot side: Signal() decrements and Wait() blocks until zero, with Reset() available if the counter is deliberately re-armed - unlike Java's CountDownLatch. Choose these when the work runs on dedicated threads; when the work is already task-shaped, Task.WhenAll is simpler.",
+      "code_sketch": "var phase = new Barrier(n, _ => MergePartials());   // reusable, dynamic membership\nvar pool = new Task[n];\nfor (int row = 0; row < n; row++) {\n    int r = row;\n    pool[r] = Task.Run(() => {\n        for (int step = 0; step < steps; step++) { Compute(r, step); phase.SignalAndWait(); }\n    });\n}\nvar done = new CountdownEvent(n);                  // one-shot fan-in\n// producers: done.Signal(); collector:\nif (!done.Wait(TimeSpan.FromSeconds(30))) AbortGroup();",
+      "pitfalls": [
+        "A timeout or cancellation at SignalAndWait lets that caller stop waiting but does not cancel the other participants; they may still wait for missing arrivals, while a failing post-phase action raises BarrierPostPhaseException - propagate group cancellation and catch these cases instead of assuming Java-style BrokenBarrierException.",
+        "Barrier and CountdownEvent implement IDisposable and hold wait handles; abandoned instances leak, and removing a participant without either disposing or signalling leaves the remaining parties waiting.",
+        "Reset() on a CountdownEvent while another thread is waiting races with the waiter: reset only after the count has drained and no wait is in flight.",
+        "CountdownEvent counts signals, not tasks: a producer that signals twice releases the waiter early, and one that throws before signalling strands it - signal from a finally block."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.barrier",
+        "https://learn.microsoft.com/en-us/dotnet/standard/threading/countdownevent"
+      ]
+    },
+    {
+      "variant_id": "task-whenall",
+      "name": "Task.WhenAll and TaskCompletionSource (async)",
+      "paradigm": "concurrent",
+      "min_standard": "C#5",
+      "requires_features": [
+        "async/await"
+      ],
+      "idiom_name": "await Task.WhenAll(tasks) / TaskCompletionSource as the countdown gate",
+      "implementation_notes": "In async-heavy code the rendezvous is not a blocking primitive at all: the fan-in is await Task.WhenAll(tasks), which completes when every task finished and propagates the first fault to the awaiting caller without parking a thread. When completions arrive from callbacks rather than tasks, TaskCompletionSource is the countdown half - a single TCS completed by the last of N arrivals - and awaiting it composes with the rest of the async pipeline. Keep the BCL blocking types when the work lives on dedicated threads or when the counting object must be shared with non-async code; that is also the only variant that offers a reusable phase barrier.",
+      "code_sketch": "var workers = Enumerable.Range(0, n)\n    .Select(i => Task.Run(() => Compute(i)))\n    .ToArray();\nawait Task.WhenAll(workers);          // one-shot fan-in, no thread parked\nMergePartials();\n\nvar allArrived = new TaskCompletionSource();   // callback-driven countdown\nint left = n;\nvoid Arrive() { if (Interlocked.Decrement(ref left) == 0) allArrived.SetResult(); }\nawait allArrived.Task;",
+      "pitfalls": [
+        "Task.WhenAll fails fast on the first fault but the remaining tasks keep running; cancel them (a CancellationTokenSource tied to the group) or a failed fan-in leaks work.",
+        "Awaiting the completion of tasks that need the same bounded thread pool on which the caller blocks (or blocking with .Result/.Wait()) starves the pool - a classic deadlock in async code.",
+        "A TaskCompletionSource completed from one callback must be set exactly once and its continuation may run synchronously on the completing thread; SetResult outside a lock and prefer RunContinuationsAsynchronously for untrusted continuations."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1"
+      ]
+    }
+  ],
+  "default_variant": "bcl-barrier-countdownevent"
+}

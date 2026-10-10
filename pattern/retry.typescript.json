@@ -1,0 +1,57 @@
+{
+  "pattern": "retry",
+  "language": "typescript",
+  "support": "library",
+  "idiom_name": "pRetry<T>(fn, {retries, minTimeout, factor, shouldRetry}) with typed contexts",
+  "implementation_notes": "The JavaScript wrapper is the TypeScript default too, with the type system doing the classification work: pRetry<T> infers the resolved type of the wrapped function, the onFailedAttempt context is typed (error, attemptNumber, retriesLeft, retriesConsumed, retryDelay), shouldRetry and shouldConsumeRetry receive the same context so the decision can be narrowed per error class, and makeRetriable(fn, options) returns a typed function with the policy attached. The options mirror the JS API (retries default 10, minTimeout 1000ms, factor 2, randomize, maxRetryTime, signal), so the TS realization adds static checking rather than a different mechanism - the classic hand-written loop is replaced by the wrapper, and a discriminated-union error type plus shouldRetry is how 'retry 503 but not 400' is expressed type-safely.",
+  "code_sketch": "type ApiError = {kind: 'transient'; status: number} | {kind: 'permanent'; status: number};\n\nconst data = await pRetry<Data>(async attempt => {\n  const res = await fetch(url);\n  if (res.status === 503) throw {kind: 'transient', status: 503} satisfies ApiError;\n  if (!res.ok) throw {kind: 'permanent', status: res.status} satisfies ApiError;\n  return res.json() as Promise<Data>;\n}, {retries: 4, minTimeout: 250, factor: 2,\n    shouldRetry: ({error}) => (error as ApiError).kind === 'transient'});",
+  "pitfalls": [
+    "Thrown values are not typed by the language: unless the wrapped code throws a discriminated union or a class, shouldRetry has to cast, so the error taxonomy must be modelled deliberately.",
+    "p-retry rethrows the last rejection, so callers must narrow the union again after the await - the library does not preserve the error type through its own promise.",
+    "The default retries and minTimeout (10 attempts, 1 second base) are unsafe in a request path with a caller deadline: set retries and maxRetryTime explicitly.",
+    "The AbortSignal option needs AbortController in the tsconfig lib (DOM or the Node types); downlevel targets change the emitted async helpers but not the retry semantics."
+  ],
+  "sources": [
+    "https://github.com/sindresorhus/p-retry"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "p-retry-typed",
+      "name": "Typed p-retry wrapper with discriminated error unions",
+      "paradigm": "functional",
+      "min_standard": "TypeScript4.7",
+      "idiom_name": "pRetry<T>(fn, {retries, minTimeout, factor, shouldRetry}) with typed contexts",
+      "implementation_notes": "The JavaScript wrapper is the TypeScript default too, with the type system doing the classification work: pRetry<T> infers the resolved type of the wrapped function, the onFailedAttempt context is typed (error, attemptNumber, retriesLeft, retriesConsumed, retryDelay), shouldRetry and shouldConsumeRetry receive the same context so the decision can be narrowed per error class, and makeRetriable(fn, options) returns a typed function with the policy attached. The options mirror the JS API (retries default 10, minTimeout 1000ms, factor 2, randomize, maxRetryTime, signal), so the TS realization adds static checking rather than a different mechanism - the classic hand-written loop is replaced by the wrapper, and a discriminated-union error type plus shouldRetry is how 'retry 503 but not 400' is expressed type-safely.",
+      "code_sketch": "type ApiError = {kind: 'transient'; status: number} | {kind: 'permanent'; status: number};\n\nconst data = await pRetry<Data>(async attempt => {\n  const res = await fetch(url);\n  if (res.status === 503) throw {kind: 'transient', status: 503} satisfies ApiError;\n  if (!res.ok) throw {kind: 'permanent', status: res.status} satisfies ApiError;\n  return res.json() as Promise<Data>;\n}, {retries: 4, minTimeout: 250, factor: 2,\n    shouldRetry: ({error}) => (error as ApiError).kind === 'transient'});",
+      "pitfalls": [
+        "Thrown values are not typed by the language: unless the wrapped code throws a discriminated union or a class, shouldRetry has to cast, so the error taxonomy must be modelled deliberately.",
+        "p-retry rethrows the last rejection, so callers must narrow the union again after the await - the library does not preserve the error type through its own promise.",
+        "The default retries and minTimeout (10 attempts, 1 second base) are unsafe in a request path with a caller deadline: set retries and maxRetryTime explicitly.",
+        "The AbortSignal option needs AbortController in the tsconfig lib (DOM or the Node types); downlevel targets change the emitted async helpers but not the retry semantics."
+      ],
+      "sources": [
+        "https://github.com/sindresorhus/p-retry"
+      ]
+    },
+    {
+      "variant_id": "cockatiel-policies",
+      "name": "cockatiel policy composition with a shared IPolicy interface",
+      "paradigm": "oo",
+      "min_standard": "TypeScript4.7",
+      "idiom_name": "retry(handleWhen(...), {maxAttempts, backoff}) + wrap(retry, breaker, timeout)",
+      "implementation_notes": "cockatiel models retry as one policy among several behind a shared IPolicy interface: retry(handleWhen(...), {maxAttempts, backoff: new ExponentialBackoff()}) builds the retry policy, handleType, handleWhen, handleResultType and handleWhenResult compose the classification predicate (including treating a returned error value as a failure), and wrap(retryPolicy, circuitBreakerPolicy, timeoutPolicy) composes policies into a single executable whose events (onRetry, onGiveUp, onSuccess, onFailure) are typed; the @usePolicy decorator applies a policy to a class method. The type-level difference from a single-purpose wrapper is the context object threaded through execute() - the attempt number and an AbortSignal - which lets the retried function see the attempt without an extra parameter. Use it when retry must be composed with a circuit breaker, timeout or bulkhead in one pipeline.",
+      "code_sketch": "import {retry, handleWhen, ExponentialBackoff, wrap, circuitBreaker, ConsecutiveBreaker} from 'cockatiel';\n\nconst retryPolicy = retry(handleWhen(e => (e as ApiError).kind === 'transient'),\n    {maxAttempts: 4, backoff: new ExponentialBackoff()});\nconst pipeline = wrap(retryPolicy, circuitBreaker(handleWhen(e => true),\n    {halfOpenAfter: 10_000, breaker: new ConsecutiveBreaker(5)}));\n\nconst data = await pipeline.execute<Data>(({attempt, signal}) => fetchData(signal));",
+      "pitfalls": [
+        "The classification predicate must be explicit: handleAll retries every error including programming bugs, and handleResultType exists because a non-throwing failure (a 503 returned as a value) would otherwise never be retried.",
+        "wrap() composes policies outside-in: putting retry outside a circuit breaker re-drives calls through the breaker's half-open probe path, so the order is a correctness decision.",
+        "Policy events are observability only: throwing inside an event listener is outside the retry contract and can break the pipeline.",
+        "Backoff strategies are stateful per policy instance; sharing one retry policy across concurrent executions is supported, but using its events to count attempts across unrelated requests mixes state."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/connor4312/cockatiel/master/readme.md"
+      ]
+    }
+  ],
+  "default_variant": "p-retry-typed"
+}

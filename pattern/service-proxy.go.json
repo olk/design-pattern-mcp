@@ -1,0 +1,70 @@
+{
+  "pattern": "service-proxy",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "struct holding ServiceApi, forwarding each method with policy",
+  "implementation_notes": "Go's equivalence anchor is the consumer-side interface: the proxy is a struct holding the real service as that interface and forwarding each method, with policy applied in the forwarders; the compiler then rejects a missing or mistyped method, which is the mechanical check the language provides instead of inheritance. Embedding the interface (type Proxy struct { ServiceApi }) forwards everything by default and lets you override only what needs control, at the cost of also exposing members you may have wanted to hide. For wire services the standard library and gRPC supply the interception machinery instead.",
+  "code_sketch": "type ServiceProxy struct {                 // implements ServiceApi by hand\n\treal    ServiceApi\n\tmetrics *Metrics\n}\nfunc (p *ServiceProxy) Call(ctx context.Context, r Request) (Response, error) {\n\tctx, cancel := context.WithTimeout(ctx, defaultTimeout)   // policy: deadline\n\tdefer cancel()\n\tstart := time.Now()\n\tresp, err := p.real.Call(ctx, r)                          // delegate unchanged\n\tp.metrics.Observe(\"Call\", time.Since(start), err)\n\treturn resp, err                                          // same contract\n}",
+  "pitfalls": [
+    "Replacing the interface's sentinel errors with fresh ones breaks callers that test errors.Is/errors.As; wrap with %w and keep the promised values.",
+    "Holding the service as a concrete type instead of an interface makes the proxy untestable and prevents a fake or second implementation from being fronted.",
+    "Embedding the interface forwards every method including ones the proxy was meant to mask; forward explicitly when the surface must narrow."
+  ],
+  "sources": [
+    "https://go.dev/doc/effective_go"
+  ],
+  "variants": [
+    {
+      "variant_id": "interface-wrapper",
+      "name": "Wrapper struct implementing the consumer-defined service interface",
+      "paradigm": "oo",
+      "idiom_name": "struct holding ServiceApi, forwarding each method with policy",
+      "implementation_notes": "Go's equivalence anchor is the consumer-side interface: the proxy is a struct holding the real service as that interface and forwarding each method, with policy applied in the forwarders; the compiler then rejects a missing or mistyped method, which is the mechanical check the language provides instead of inheritance. Embedding the interface (type Proxy struct { ServiceApi }) forwards everything by default and lets you override only what needs control, at the cost of also exposing members you may have wanted to hide. For wire services the standard library and gRPC supply the interception machinery instead.",
+      "code_sketch": "type ServiceProxy struct {                 // implements ServiceApi by hand\n\treal    ServiceApi\n\tmetrics *Metrics\n}\nfunc (p *ServiceProxy) Call(ctx context.Context, r Request) (Response, error) {\n\tctx, cancel := context.WithTimeout(ctx, defaultTimeout)   // policy: deadline\n\tdefer cancel()\n\tstart := time.Now()\n\tresp, err := p.real.Call(ctx, r)                          // delegate unchanged\n\tp.metrics.Observe(\"Call\", time.Since(start), err)\n\treturn resp, err                                          // same contract\n}",
+      "pitfalls": [
+        "Replacing the interface's sentinel errors with fresh ones breaks callers that test errors.Is/errors.As; wrap with %w and keep the promised values.",
+        "Holding the service as a concrete type instead of an interface makes the proxy untestable and prevents a fake or second implementation from being fronted.",
+        "Embedding the interface forwards every method including ones the proxy was meant to mask; forward explicitly when the surface must narrow."
+      ],
+      "sources": [
+        "https://go.dev/doc/effective_go"
+      ]
+    },
+    {
+      "variant_id": "http-reverse-proxy",
+      "name": "Standard-library reverse proxy (httputil.ReverseProxy)",
+      "paradigm": "oo",
+      "idiom_name": "httputil.ReverseProxy with Rewrite, ModifyResponse and ErrorHandler hooks",
+      "implementation_notes": "For an HTTP service the standard library already ships the service proxy: httputil.ReverseProxy forwards requests with connection pooling, and its hooks are the control surface - Rewrite sets the outbound URL, headers and X-Forwarded values, ModifyResponse inspects or rewrites the reply, ErrorHandler defines the failure contract, and FlushInterval keeps streaming intact. Policy is therefore configuration plus small hooks rather than a wrapper class, and the same idea generalises: any http.RoundTripper can be wrapped to front outgoing calls with the same concerns.",
+      "code_sketch": "proxy := &httputil.ReverseProxy{\n\tRewrite: func(r *httputil.ProxyRequest) {\n\t\tr.SetURL(backend)                            // routing from config\n\t\tr.SetXForwarded()\n\t\tr.Out.Header.Set(\"x-tenant\", tenant(r.In))  // policy\n\t},\n\tTransport: pool,                                 // reuse, dial timeouts\n\tErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {\n\t\thttp.Error(w, \"upstream unavailable\", http.StatusBadGateway)\n\t},\n}\nhttp.Handle(\"/svc/\", proxy)",
+      "pitfalls": [
+        "A proxy that reads the request or response body to inspect it must restore or stream it; otherwise the backend or the caller receives a truncated payload.",
+        "Configuring only the client side leaves the outbound leg unbounded: without Transport dial and response timeouts, one slow backend exhausts connections for everyone.",
+        "Hop-by-hop headers are stripped by design, so security or tenancy headers the backend expects must be re-added in Rewrite."
+      ],
+      "sources": [
+        "https://pkg.go.dev/net/http/httputil#ReverseProxy",
+        "https://pkg.go.dev/net/http#Transport"
+      ]
+    },
+    {
+      "variant_id": "grpc-interceptor-chain",
+      "name": "gRPC-Go interceptor chain",
+      "paradigm": "oo",
+      "idiom_name": "grpc.UnaryServerInterceptor / StreamServerInterceptor with ChainUnaryInterceptor",
+      "implementation_notes": "For a gRPC service the interceptor chain is the proxy: a unary interceptor receives the decoded request, the server info and the handler, so authentication, tracing, rate limiting and error mapping wrap the service call, while a stream interceptor does the same for long-lived streams; both are registered when the server is built (grpc.ChainUnaryInterceptor) and the client side has the mirror-image options (grpc.WithUnaryInterceptor). No wrapper type is needed - the generated interface stays untouched and the chain is composed at construction time.",
+      "code_sketch": "func Policy(ctx context.Context, req any, info *grpc.UnaryServerInfo,\n\thandler grpc.UnaryHandler) (any, error) {\n\tstart := time.Now()\n\tresp, err := handler(ctx, req)         // delegate: the real service\n\tmetrics.Observe(info.FullMethod, time.Since(start), err)\n\treturn resp, err                       // same contract\n}\n\nsrv := grpc.NewServer(grpc.ChainUnaryInterceptor(Policy, Auth, RateLimit))",
+      "pitfalls": [
+        "Chains are per server and per client independently: a policy registered on the server does not govern client calls, which need their own interceptor options.",
+        "Unary-only chains leave streaming RPCs unprotected; register StreamServerInterceptor as well.",
+        "Interceptors share the call context: keep per-request state in context values, not in a package-level map, or concurrent RPCs race."
+      ],
+      "sources": [
+        "https://pkg.go.dev/google.golang.org/grpc#UnaryServerInterceptor",
+        "https://grpc.io/docs/guides/interceptors"
+      ]
+    }
+  ],
+  "default_variant": "interface-wrapper",
+  "version": "1.0"
+}

@@ -1,0 +1,162 @@
+{
+  "category": "concurrency-resilience",
+  "name": "small-object-optimization",
+  "aliases": [
+    "small buffer optimization",
+    "small string optimization"
+  ],
+  "intent": "Keep a small payload inside the object that owns it - a fixed, in-object buffer - and fall back to a heap allocation only when the payload outgrows that buffer, so the typical small instance costs no allocator traffic and no pointer indirection.",
+  "problem": "A type that owns variable-length data (a string, a byte buffer, a callable wrapper, a small vector, a record value) is usually constructed with payloads far below its worst case, yet the straightforward representation allocates on every construction: one heap block per instance, a pointer dereference per access, an owner to track, and an out-of-memory path for values that are tiny. The decision is whether to pay that allocation unconditionally, or to make the object bigger and smarter: reserve a fixed inline region that is part of the object, keep the small case there, and allocate only when a value actually exceeds the buffer. The trigger is a known or measured distribution of small payloads on a path where allocation cost, allocation failure, latency determinism or cache behaviour matters.",
+  "context": "Applies where you define the type yourself - strings and byte buffers, type-erased wrappers (function/any-style containers), small vectors, record values, hot map keys - and the payload size distribution is dominated by small values. The payload must be movable (or byte-copyable) between the two representations, the extra bytes per object must be affordable, and the type must not cross a frozen ABI or serialization boundary where the buffer size would become a contract. It is a value-level layout decision local to one type's definition, not a structure spanning components.",
+  "benefits": [
+    "The common small case performs no allocator call at all - no malloc/free traffic, no allocator metadata, no thread-local cache or lock hop - which is exactly where concurrent workloads suffer most.",
+    "Better locality: the payload lives in the same cache line as the object, so construction and the first access cost one memory touch instead of two dependent ones.",
+    "Deterministic cost: constructing, copying, moving and destroying a small instance cannot fail and cannot block on the allocator, which is what embedded, real-time and pre-allocated-pool systems need.",
+    "Cheap moves: the small case can be relocated by copying bytes (or by fixing one internal pointer), so moving a small value is allocation-free and can be noexcept; the large case stays a pointer hand-off.",
+    "Fewer allocations overall - the inline buffer absorbs the long tail of small values, cutting allocation count, fragmentation and per-allocation overhead.",
+    "Opt-in and invisible: the public contract is unchanged, so the optimization can be introduced, tuned or removed without touching callers."
+  ],
+  "tradeoffs": [
+    "The inline buffer is part of every instance whether or not it is used: sizeof grows and every copy, move and destruction memcpys the whole object - pure loss for instances that spill and for instances that stay empty.",
+    "Two representations in one type: a discriminator decides inline versus heap, so every access branches, and both code paths must be written, kept consistent and tested (empty, exactly at capacity, grown, spilled, moved, copied).",
+    "The buffer size is a layout commitment: once it leaks into the ABI (as std::string's does across library builds) it cannot be tuned without breaking binary compatibility, and the same capacity decides how much of a cache line the object claims.",
+    "References and iterators into the payload behave differently in the two states: a spill or a move invalidates whatever pointed at the inline copy, and the payload's address can change although the object has value semantics.",
+    "Dense storage can regress: an array of objects that each carry a 24-byte buffer streams far more bytes than an array of small handles, so the optimization can lose against the representation it replaces.",
+    "It only pays when small payloads dominate and allocation shows up in the profile; applied speculatively it is added complexity with an unmeasurable benefit and a larger object to move."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 5,
+    "maintainability": 4,
+    "simplicity": 3,
+    "performance": 9,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Value/Object",
+      "responsibility": "The type that owns the payload; its sizeof, alignment and move behaviour are what the pattern reshapes."
+    },
+    {
+      "role": "Inline Buffer",
+      "responsibility": "The fixed, correctly aligned storage region inside the object; it holds the payload while it fits and is otherwise idle."
+    },
+    {
+      "role": "Heap Representation",
+      "responsibility": "The spilled form of the same logical value: a pointer (plus capacity and allocator) to separately owned storage."
+    },
+    {
+      "role": "Discriminator",
+      "responsibility": "The state that tells the access path which representation is live - a tag, a spare bit in a length field, or an encoded capacity."
+    },
+    {
+      "role": "Access/Dispatch Path",
+      "responsibility": "The member functions (or the vtable of a type-erased wrapper) that present a single interface over both representations and implement the transition."
+    },
+    {
+      "role": "Spill/Move Policy",
+      "responsibility": "The rules that decide when a value spills, how the inline payload is relocated, and what remains valid across copy, move and swap."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Strings and byte buffers in parsers, protocol codecs and log/telemetry pipelines where most values are short but a few are large.",
+    "Type-erased callables and value containers (function/any-style wrappers) whose stored targets are typically small captures or plain function pointers.",
+    "Small vectors and keys in hot maps - collections whose element count is usually 0-8 but which must not be capped.",
+    "Embedded and real-time components that must not allocate after startup yet still need variable-length fields whose typical size is known.",
+    "Cache-sensitive structures (order books, game entity components, column values) where per-instance pointers and allocations dominate the cost of resting data.",
+    "Reusable per-thread or per-connection scratch objects that hold short messages inline and grow only for the rare large payload.",
+    "llvm::SmallVector<T,N> and llvm::SmallString across the LLVM compiler: the Programmer's Manual prescribes them exactly where vectors are 'usually small' - a basic block's predecessor/successor lists are usually under 8 elements - so the malloc/free call never costs more than the code fiddling with the elements, at the explicit condition that the vector lives on the stack.",
+    "Folly's type-erased wrappers (Poly-based Function, exception_wrapper) store small callables and exceptions in-situ in a fixed inline buffer, which the library's own docs justify as removing the proliferation of shared_ptrs and unique_ptrs in APIs that heap-stored type erasure forces."
+  ],
+  "avoid_when": [
+    "Payloads are usually larger than any sensible buffer: the representation then costs size and a branch for nothing - keep the plain heap form or reserve capacity once.",
+    "Allocation is not on the critical path: an arena (std::pmr/monotonic), an object pool or one long-lived buffer with reserved capacity removes the allocator without a second representation.",
+    "The type crosses a stable ABI or serialization boundary: the inline capacity becomes part of the contract and can never be tuned - prefer pimpl or an opaque handle.",
+    "Objects are stored densely and iterated linearly: a larger sizeof can hurt more than the avoided allocations save, so measure array-of-structs workloads first.",
+    "The language or runtime already handles it: JVM/JS/Go heaps plus JIT and escape analysis optimise non-escaping values and small allocations, and hand-rolled layouts there fight the runtime.",
+    "The payload is not movable or is address-sensitive (self-referential): relocating it between inline and heap storage is then unsafe or impossible."
+  ],
+  "language_files": {
+    "generic": "small-object-optimization.generic.json",
+    "c": "small-object-optimization.c.json",
+    "cplusplus": "small-object-optimization.cplusplus.json",
+    "csharp": "small-object-optimization.csharp.json",
+    "go": "small-object-optimization.go.json",
+    "java": "small-object-optimization.java.json",
+    "javascript": "small-object-optimization.javascript.json",
+    "kotlin": "small-object-optimization.kotlin.json",
+    "python": "small-object-optimization.python.json",
+    "ruby": "small-object-optimization.ruby.json",
+    "rust": "small-object-optimization.rust.json",
+    "scala": "small-object-optimization.scala.json",
+    "swift": "small-object-optimization.swift.json",
+    "typescript": "small-object-optimization.typescript.json"
+  },
+  "paradigm": [
+    "data-oriented",
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "copy-on-write",
+    "intrusive-reference-counting",
+    "smart-pointer",
+    "type-erasure",
+    "object-pool",
+    "shrink-to-fit",
+    "empty-base-optimization"
+  ],
+  "anti_patterns": [
+    "Adding an inline buffer to every small type 'for performance' without a size distribution: objects bloat, copies get slower and no allocation is actually saved.",
+    "Leaking the inline capacity into the ABI or the serialized form (public constant, wire field, sizeof-dependent allocation) so that tuning the buffer later becomes a breaking change.",
+    "Reimplementing the whole container around the buffer instead of using the platform's type-erased container or small-vector library.",
+    "Ignoring invalidation: caching a pointer into the payload across a spill, a move or a growth, or assuming the payload's address is stable because the type has value semantics.",
+    "Hand-rolling the union without alignment, placement-new lifetime and discriminator invariants - undefined behaviour presented as an optimization.",
+    "Using small object optimization as a remedy for a heap-heavy design: when instances are numerous and uniformly large, pooling or a different data layout is the real lever."
+  ],
+  "design_principles": [
+    "Encapsulation: the representation and the buffer size are implementation details; the public contract must not expose them.",
+    "Optimize the common case: the frequent small path must be the allocation-free one; the rare large path may pay.",
+    "Single transition point: exactly one operation changes representation, so both states stay consistent by construction.",
+    "Value semantics preserved: copy, move, swap and destruction behave the same in both states, and cheap moves follow from the inline case.",
+    "Measure first: keep the simple representation whenever the payload distribution or the profile does not justify the buffer."
+  ],
+  "best_practices": [
+    "Derive the inline capacity from a histogram of real payload sizes in the hot path, not from a round number, and keep it a private constant.",
+    "Prefer to hide the discriminator in spare bits of an existing field (length or capacity) so the object does not grow a separate tag word.",
+    "Implement one spill()/materialize() path and make the small path noexcept: no allocation, no throw for small values.",
+    "Handle alignment and lifetime explicitly: aligned storage or a union, placement new, std::launder where required, and exactly one destruction of the active member.",
+    "Test the boundary cases and the invalidation rules: empty, exactly at capacity, one byte over, spilled, moved-from, swapped, copied - and document what a spill does to references.",
+    "Reach for the platform's existing realization first (std::string/std::any/small_vector, [InlineArray], SmallVec, value classes) before writing a new buffer.",
+    "Validate with the array/iteration workload, not only per-object microbenchmarks, because sizeof and copying dominate in dense collections."
+  ],
+  "version": "1.1",
+  "sources": [
+    "More C++ Idioms (Wikibooks), 'Small Object Optimization', idiom 82 of the catalog that originates this row (Erase-Remove 27, Copy-on-write 19, Counted Body 21 and Shrink-to-fit 81 are sibling entries of the same catalog): https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Small_Object_Optimization",
+    "cppreference, std::any - 'Implementations are encouraged to avoid dynamic allocations for small objects, but such an optimization may only be applied to types for which std::is_nothrow_move_constructible returns true': https://en.cppreference.com/w/cpp/utility/any",
+    "libstdc++ source, bits/basic_string.h - the small-string buffer as enum { _S_local_capacity = 15 / sizeof(_CharT) } over a union of _M_local_buf and _M_allocated_capacity, selected by _M_is_local(): https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/include/bits/basic_string.h",
+    "Boost.Container small_vector header - 'small_vector is a vector-like container optimized for the case when it contains few elements. It contains some preallocated elements in-place': https://github.com/boostorg/container/blob/develop/include/boost/container/small_vector.hpp",
+    "cppreference, std::inplace_vector (C++26) - 'dynamically-resizable array with contiguous inplace storage. The elements of type T are stored and properly aligned within the object itself': https://en.cppreference.com/w/cpp/container/inplace_vector",
+    "docs.rs, smallvec - 'a certain number of elements inline, and fall back to the heap for larger allocations ... improving cache locality and reducing allocator traffic': https://docs.rs/smallvec",
+    "docs.rs, arrayvec - 'array-backed vector and string types, which store their contents inline': https://docs.rs/arrayvec",
+    "Swift standard library source, SmallString.swift - _SmallString stores a (UInt64, UInt64) bit pattern with capacity 15 code units on 64-bit platforms; StringObject.swift carries the isSmall discriminator: https://github.com/swiftlang/swift/blob/main/stdlib/public/core/SmallString.swift",
+    "LLVM Programmer's Manual, llvm/ADT/SmallVector.h - inline storage 'is good for vectors that are usually small (e.g., the number of predecessors/successors of a block is usually less than 8)'; the manual also warns that the inlined elements make the object large 'so you don't want to allocate lots of them': https://llvm.org/docs/ProgrammersManual.html",
+    "Folly docs, Poly.md - type-erasing wrappers 'can often store small objects in-situ, with no dynamic allocation', avoiding the proliferation of shared_ptr/unique_ptr in APIs; folly/ExceptionWrapper.h realizes the same pattern with an in-situ Buffer plus a VTable dispatch: https://github.com/facebook/folly/blob/master/folly/docs/Poly.md",
+    "rust-lang/rust issue #20198, 'String::as_mut_vec prevents small string optimization' - the documented counter-case: Rust's String stays heap-only because its API exposes the underlying byte vector, so an inline buffer would break ownership-transfer guarantees: https://github.com/rust-lang/rust/issues/20198"
+  ]
+}

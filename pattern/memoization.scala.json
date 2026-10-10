@@ -1,0 +1,79 @@
+{
+  "pattern": "memoization",
+  "language": "scala",
+  "support": "idiomatic",
+  "idiom_name": "cache.getOrElseUpdate(key, compute(key))",
+  "implementation_notes": "Scala's standard library carries the pattern on MutableMap: getOrElseUpdate returns the associated value if the key is bound, otherwise it evaluates the by-name default, stores it and returns it - so the memo is a private map plus one call, and the by-name parameter means the computation is genuinely deferred. The scaladoc also states the limitation that shapes the design: concurrent map implementations may evaluate the default expression multiple times, or evaluate it without inserting the result, so exactly-once semantics are not promised. Keep the map private to one owner (or use the TrieMap variant for sharing) and make the computation pure and idempotent; the class-based cache form is justified when the memo needs its own policy (eviction, metrics) rather than a single call.",
+  "code_sketch": "import scala.collection.mutable\n\nprivate val cache = mutable.Map.empty[Key, Report]\n\ndef report(key: Key): Report =\n  cache.getOrElseUpdate(key, compose(key))   // by-name: computed only on a miss\n\ndef invalidate(): Unit = cache.clear()",
+  "pitfalls": [
+    "Concurrent implementations may evaluate the default expression more than once or leave it unstored (scaladoc), so never put side effects in it.",
+    "A recursive function memoized here can re-enter the same key before the entry is stored and recurse forever; insert a placeholder first or restructure.",
+    "mutable.HashMap is not thread-safe: sharing it across threads needs a TrieMap or external synchronisation.",
+    "The map is a strong reference set with no eviction; request-derived keys grow it for the process lifetime."
+  ],
+  "sources": [
+    "https://raw.githubusercontent.com/scala/scala/v2.13.14/src/library/scala/collection/mutable/Map.scala"
+  ],
+  "variants": [
+    {
+      "variant_id": "getorelseupdate-map",
+      "name": "mutable.Map.getOrElseUpdate",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "idiom_name": "cache.getOrElseUpdate(key, compute(key))",
+      "implementation_notes": "Scala's standard library carries the pattern on MutableMap: getOrElseUpdate returns the associated value if the key is bound, otherwise it evaluates the by-name default, stores it and returns it - so the memo is a private map plus one call, and the by-name parameter means the computation is genuinely deferred. The scaladoc also states the limitation that shapes the design: concurrent map implementations may evaluate the default expression multiple times, or evaluate it without inserting the result, so exactly-once semantics are not promised. Keep the map private to one owner (or use the TrieMap variant for sharing) and make the computation pure and idempotent; the class-based cache form is justified when the memo needs its own policy (eviction, metrics) rather than a single call.",
+      "code_sketch": "import scala.collection.mutable\n\nprivate val cache = mutable.Map.empty[Key, Report]\n\ndef report(key: Key): Report =\n  cache.getOrElseUpdate(key, compose(key))   // by-name: computed only on a miss\n\ndef invalidate(): Unit = cache.clear()",
+      "pitfalls": [
+        "Concurrent implementations may evaluate the default expression more than once or leave it unstored (scaladoc), so never put side effects in it.",
+        "A recursive function memoized here can re-enter the same key before the entry is stored and recurse forever; insert a placeholder first or restructure.",
+        "mutable.HashMap is not thread-safe: sharing it across threads needs a TrieMap or external synchronisation.",
+        "The map is a strong reference set with no eviction; request-derived keys grow it for the process lifetime."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/scala/scala/v2.13.14/src/library/scala/collection/mutable/Map.scala"
+      ]
+    },
+    {
+      "variant_id": "lazy-val",
+      "name": "lazy val for a single value",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "idiom_name": "lazy val value: T = compute()",
+      "implementation_notes": "lazy val is Scala's native nullary memo: the initializer runs at most once and the value is then remembered, with the compiler emitting a thread-safe initialization scheme - Scala 3 implements SIP-20 with an explicit state machine so that resources are not held during initialization, which also removes a class of deadlocks. The same page states the boundary: recursive lazy vals are undefined and may deadlock, so a lazy val must never depend on itself. Use it for expensive constants and per-object derived state instead of a hand-written Option guard; it cannot key on arguments, so the map variants remain the form for function memoization.",
+      "code_sketch": "object Registry {\n  lazy val index: Index = buildIndex()     // initialized at most once, thread-safely\n}\n\nclass Report(rows: Seq[Row]) {\n  lazy val summary: Summary = buildSummary(rows)   // per instance, on first use\n}",
+      "pitfalls": [
+        "Recursive lazy vals are undefined and may deadlock (Scala 3 documentation); never let a lazy val depend on itself.",
+        "A lazy val in an object lives for the JVM's lifetime, so its cached value is never released.",
+        "Initialization is synchronized: one slow initializer blocks every other thread that touches the value.",
+        "A throwing initializer does not set the value, so the next access retries and rethrows."
+      ],
+      "sources": [
+        "https://docs.scala-lang.org/scala3/reference/changed-features/lazy-vals-init.html"
+      ]
+    },
+    {
+      "variant_id": "trie-map-concurrent",
+      "name": "TrieMap for a shared memo",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "scala.collection.concurrent.TrieMap"
+      ],
+      "idiom_name": "TrieMap with getOrElseUpdate (lock-free store)",
+      "implementation_notes": "When the memo is shared, scala.collection.concurrent.TrieMap is the store to reach for: it is a lock-free concurrent map, so reads and writes from many threads are safe without external locking, and its getOrElseUpdate is the same shape as the mutable one. The caveat from the standard-library documentation carries over - the default expression may be evaluated more than once under contention and may not be the value finally stored - which is acceptable for a pure function (duplicate computation, identical result) and unacceptable for anything with side effects. For strict once-per-key semantics, store a lazy val or a Future inside the map so that only the winning entry computes, and never update the same key recursively from inside the default block.",
+      "code_sketch": "import scala.collection.concurrent.TrieMap\n\nprivate val cache = TrieMap.empty[Key, Report]\n\ndef report(key: Key): Report =\n  cache.getOrElseUpdate(key, compose(key))   // lock-free store; may compute twice\n\n// strict once-per-key: cache.getOrElseUpdate(key, lazy val / Future wrapper)",
+      "pitfalls": [
+        "The default expression may run more than once under contention, so it must be pure - the same caveat the standard library documents for concurrent maps.",
+        "Recursive updates to the same key from inside the computation can spin or duplicate unbounded work; memoize recursion with an explicit placeholder entry.",
+        "TrieMap has no eviction and no size bound by default: unbounded key domains grow the heap.",
+        "It stores strong references, so keys and results stay reachable for as long as the map does."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/scala/scala/v2.13.14/src/library/scala/collection/mutable/Map.scala",
+        "https://docs.scala-lang.org/scala3/reference/changed-features/lazy-vals-init.html"
+      ]
+    }
+  ],
+  "default_variant": "getorelseupdate-map",
+  "version": "1.0"
+}

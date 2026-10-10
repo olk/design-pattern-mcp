@@ -1,0 +1,62 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "dict[str, asyncio.Future] + asyncio.wait_for",
+  "implementation_notes": "asyncio.Future is the placeholder that another task or callback completes, so the requestor keeps a dict from correlation id to future, publishes, and awaits with asyncio.wait_for(fut, timeout) for the deadline; the reader task looks the id up, checks the future is not done and calls set_result. pika and aio-pika expose the value as BasicProperties.correlation_id on request and reply, which is how the RabbitMQ RPC tutorial's client matches replies - the async version merely replaces the blocking receive with a future. Register the future before publishing and pop the entry in a finally block so cancellation and timeout cannot leak it.",
+  "code_sketch": "class Client:\n    def __init__(self) -> None:\n        self._pending: dict[str, asyncio.Future[Reply]] = {}\n\n    async def call(self, body: str) -> Reply:\n        loop = asyncio.get_running_loop()\n        cid, fut = uuid.uuid4().hex, loop.create_future()\n        self._pending[cid] = fut                       # register BEFORE send\n        try:\n            await self._transport.publish(Request(cid, body))\n            return await asyncio.wait_for(fut, timeout=5.0)   # cancels fut on timeout\n        finally:\n            self._pending.pop(cid, None)\n\n    def _on_reply(self, msg) -> None:\n        fut = self._pending.get(msg.correlation_id)\n        if fut is not None and not fut.done():\n            fut.set_result(msg.payload)                # unknown id: ignore",
+  "pitfalls": [
+    "asyncio.wait_for cancels the future when the deadline expires, so a late reply must not call set_result on it - check fut.done() in the reader or asyncio raises InvalidStateError in the reader task.",
+    "Calling set_result twice raises InvalidStateError: treat the pending-entry removal as the single-delivery gate and deliver before removing, under the same code path.",
+    "Futures must be created on the running loop (asyncio.get_running_loop().create_future()); the deprecated loop= parameter and get_event_loop() outside a coroutine produce futures bound to the wrong loop.",
+    "A future that is never resolved keeps its awaiting task suspended, so every timeout and cancellation path must remove the entry or both the dict and the suspending coroutine leak."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+  ],
+  "variants": [
+    {
+      "variant_id": "asyncio-future-map",
+      "name": "asyncio.Future table with wait_for deadline",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.4",
+      "idiom_name": "dict[str, asyncio.Future] + asyncio.wait_for",
+      "implementation_notes": "asyncio.Future is the placeholder that another task or callback completes, so the requestor keeps a dict from correlation id to future, publishes, and awaits with asyncio.wait_for(fut, timeout) for the deadline; the reader task looks the id up, checks the future is not done and calls set_result. pika and aio-pika expose the value as BasicProperties.correlation_id on request and reply, which is how the RabbitMQ RPC tutorial's client matches replies - the async version merely replaces the blocking receive with a future. Register the future before publishing and pop the entry in a finally block so cancellation and timeout cannot leak it.",
+      "code_sketch": "class Client:\n    def __init__(self) -> None:\n        self._pending: dict[str, asyncio.Future[Reply]] = {}\n\n    async def call(self, body: str) -> Reply:\n        loop = asyncio.get_running_loop()\n        cid, fut = uuid.uuid4().hex, loop.create_future()\n        self._pending[cid] = fut                       # register BEFORE send\n        try:\n            await self._transport.publish(Request(cid, body))\n            return await asyncio.wait_for(fut, timeout=5.0)   # cancels fut on timeout\n        finally:\n            self._pending.pop(cid, None)\n\n    def _on_reply(self, msg) -> None:\n        fut = self._pending.get(msg.correlation_id)\n        if fut is not None and not fut.done():\n            fut.set_result(msg.payload)                # unknown id: ignore",
+      "pitfalls": [
+        "asyncio.wait_for cancels the future when the deadline expires, so a late reply must not call set_result on it - check fut.done() in the reader or asyncio raises InvalidStateError in the reader task.",
+        "Calling set_result twice raises InvalidStateError: treat the pending-entry removal as the single-delivery gate and deliver before removing, under the same code path.",
+        "Futures must be created on the running loop (asyncio.get_running_loop().create_future()); the deprecated loop= parameter and get_event_loop() outside a coroutine produce futures bound to the wrong loop.",
+        "A future that is never resolved keeps its awaiting task suspended, so every timeout and cancellation path must remove the entry or both the dict and the suspending coroutine leak."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+      ]
+    },
+    {
+      "variant_id": "blocking-future-map",
+      "name": "concurrent.futures table with a reader thread (synchronous stacks)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.2",
+      "requires_features": [
+        "concurrent.futures"
+      ],
+      "idiom_name": "dict[str, concurrent.futures.Future] + reader thread + result(timeout=...)",
+      "implementation_notes": "In synchronous stacks - pika's BlockingConnection, plain sockets, CLI RPC clients - the same table holds concurrent.futures.Future objects and a dedicated reader thread completes them while the caller blocks in fut.result(timeout=...), which raises concurrent.futures.TimeoutError on expiry. This is the shape of the RabbitMQ RPC tutorial's client, including its discipline of comparing the reply's correlation_id against the outstanding request and discarding unknown ids instead of failing. Choose it when there is no event loop; inside an async application the asyncio variant is preferable because it avoids the extra thread and the lock.",
+      "code_sketch": "class BlockingClient:\n    def __init__(self) -> None:\n        self._pending: dict[str, Future] = {}\n        self._lock = threading.Lock()\n        threading.Thread(target=self._reader, daemon=True).start()\n\n    def call(self, body: str) -> Reply:\n        cid, fut = uuid.uuid4().hex, Future()\n        with self._lock:\n            self._pending[cid] = fut               # register BEFORE send\n        self._send(Request(cid, body))\n        try:\n            return fut.result(timeout=5)           # raises TimeoutError on expiry\n        finally:\n            with self._lock:\n                self._pending.pop(cid, None)\n\n    def _reader(self) -> None:                     # the transport's blocking loop\n        for msg in self._transport:\n            with self._lock:\n                fut = self._pending.get(msg.correlation_id)\n            if fut is not None and not fut.done():\n                fut.set_result(msg.payload)        # unknown id: drop",
+      "pitfalls": [
+        "concurrent.futures.Future.set_result raises InvalidStateError when the future is already done, and a late reply arriving after the caller timed out must be dropped rather than delivered - guard with done() under the lock.",
+        "The reader thread must not die on one bad message: wrap per-message handling so a single malformed or uncorrelated reply cannot silently stop the only delivery path.",
+        "fut.result(timeout=...) only stops waiting; the request is still outstanding, so keep the id reserved until it is purged or a late reply can satisfy the next request.",
+        "TimeoutError here is concurrent.futures.TimeoutError (aliased to the builtin only since Python 3.11), so catch the right class when targeting older interpreters."
+      ],
+      "sources": [
+        "https://www.rabbitmq.com/tutorials/tutorial-six-python"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-future-map",
+  "version": "1.0"
+}

@@ -1,0 +1,20 @@
+{
+  "pattern": "message-store",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "sqlite3 C API: prepared INSERT in WAL mode + scheduled DELETE and vacuum",
+  "implementation_notes": "C has no store abstraction, so the whole structure is hand-written around the SQLite C API: sqlite3_open_v2 opens the audit database, a CREATE TABLE statement defines the record, and each selected message is appended with a prepared statement (sqlite3_prepare_v2 once, then sqlite3_bind_* / sqlite3_step / sqlite3_reset per message) - the classic Store object and interceptor collapse into one table, one statement and a writer loop. Durability and concurrency are explicit choices: PRAGMA journal_mode=WAL lets reporting readers run while the writer appends, and PRAGMA synchronous=FULL adds the WAL fsync per commit that makes a record survive power loss, where NORMAL survives only a process crash. The tap must not be the delivery thread: hand records to a single writer thread through a bounded queue and count what the queue drops, because SQLite serialises writers and a blocked audit write is exactly the coupling this pattern exists to remove. The hand-written form stays right when the dependency budget is a C toolchain plus libsqlite3; when the goal is durability of delivery rather than of recording, this is the wrong component.",
+  "code_sketch": "sqlite3_exec(db, \"PRAGMA journal_mode=WAL;\", 0, 0, 0);\nsqlite3_exec(db, \"PRAGMA synchronous=FULL;\", 0, 0, 0);\nsqlite3_exec(db, \"CREATE TABLE IF NOT EXISTS msg_store(\"\n                 \"id TEXT PRIMARY KEY, chan TEXT, ts INTEGER, body BLOB);\", 0, 0, 0);\nsqlite3_stmt *ins;                    /* prepared once, reused per message */\nsqlite3_prepare_v2(db, \"INSERT OR IGNORE INTO msg_store VALUES(?,?,?,?)\", -1, &ins, 0);\nsqlite3_bind_text(ins, 1, m->id, -1, SQLITE_STATIC);\nsqlite3_bind_text(ins, 2, m->channel, -1, SQLITE_STATIC);\nsqlite3_bind_int64(ins, 3, now_ms());\nsqlite3_bind_blob(ins, 4, m->body, m->len, SQLITE_STATIC);\nif (sqlite3_step(ins) != SQLITE_DONE) tap_drops++;  /* never fail the sender */\nsqlite3_reset(ins);\n/* retention: DELETE FROM msg_store WHERE ts < ? on a timer, then incremental vacuum */",
+  "pitfalls": [
+    "SQLite reports failures as result codes: a sqlite3_step returning SQLITE_BUSY (a second writer) or SQLITE_FULL silently loses the audit record unless the code is checked and counted.",
+    "One sqlite3 handle must not be used by two threads at once; the classic bug is the delivery thread and the retention job sharing the connection - serialise through a single writer thread, or open with SQLITE_OPEN_FULLMUTEX and accept the lock contention.",
+    "sqlite3_bind_blob with SQLITE_STATIC keeps the caller's pointer, so freeing or reusing the message buffer before sqlite3_step stores garbage or crashes the process.",
+    "PRAGMA synchronous=NORMAL is the WAL default and survives a process crash but can lose recent commits on power loss - for an audit store that is a policy decision to take explicitly rather than a default to inherit."
+  ],
+  "sources": [
+    "https://sqlite.org/c3ref/prepare.html",
+    "https://sqlite.org/wal.html",
+    "https://sqlite.org/c3ref/open.html"
+  ],
+  "version": "1.0"
+}

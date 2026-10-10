@@ -1,0 +1,55 @@
+{
+  "pattern": "load-leveller",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "ring buffer + pthread_mutex_t/pthread_cond_t pair (or a POSIX message queue)",
+  "implementation_notes": "C has queue primitives but no queue abstraction, so the classic structure is written by hand: a statically allocated ring buffer of fixed capacity, one pthread_mutex_t guarding head/tail/length, and two pthread_cond_t - not_full (producers wait) and not_empty (workers wait). Producers block in while (len == CAP) pthread_cond_wait(&not_full, &m), so the buffer bound is the backpressure and a burst is stored rather than dropped. Workers run the same loop on not_empty and process outside the critical section. This remains the honest default because nothing in the C runtime manages queue capacity, worker lifetime or acknowledgement for you.",
+  "code_sketch": "static Job buf[CAP]; static size_t head, tail, len; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;\nstatic pthread_cond_t not_full = PTHREAD_COND_INITIALIZER, not_empty = PTHREAD_COND_INITIALIZER;\nvoid q_push(Job j) {\n    pthread_mutex_lock(&m);\n    while (len == CAP) pthread_cond_wait(&not_full, &m);  /* paced */\n    buf[tail = (tail + 1) % CAP] = j; len++;\n    pthread_cond_broadcast(&not_empty); pthread_mutex_unlock(&m); }\nJob q_pop(void) {\n    pthread_mutex_lock(&m);\n    while (len == 0) pthread_cond_wait(&not_empty, &m);   /* waits */\n    Job j = buf[head = (head + 1) % CAP]; len--;\n    pthread_cond_signal(&not_full); pthread_mutex_unlock(&m); return j; }",
+  "pitfalls": [
+    "pthread_cond_wait can wake spuriously, so the condition must be re-tested in a while loop - an if silently overruns the buffer.",
+    "With several consumers, signal wakes only one waiter; choosing signal vs broadcast incorrectly leaves workers parked with work in the queue.",
+    "A queue built as a malloc'd unbounded linked list has no bound and is the failure mode the pattern exists to prevent.",
+    "Mixing a condition variable with non-atomic length/head/tail updates without holding the mutex is a data race even when the values look correct."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pthread-ring-buffer",
+      "name": "pthread mutex + condition variables over a fixed-capacity ring buffer",
+      "paradigm": "concurrent",
+      "implementation_notes": "C has queue primitives but no queue abstraction, so the classic structure is written by hand: a statically allocated ring buffer of fixed capacity, one pthread_mutex_t guarding head/tail/length, and two pthread_cond_t - not_full (producers wait) and not_empty (workers wait). Producers block in while (len == CAP) pthread_cond_wait(&not_full, &m), so the buffer bound is the backpressure and a burst is stored rather than dropped. Workers run the same loop on not_empty and process outside the critical section. This remains the honest default because nothing in the C runtime manages queue capacity, worker lifetime or acknowledgement for you.",
+      "min_standard": "C11",
+      "idiom_name": "ring buffer + pthread_mutex_t/pthread_cond_t pair (or a POSIX message queue)",
+      "code_sketch": "static Job buf[CAP]; static size_t head, tail, len; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;\nstatic pthread_cond_t not_full = PTHREAD_COND_INITIALIZER, not_empty = PTHREAD_COND_INITIALIZER;\nvoid q_push(Job j) {\n    pthread_mutex_lock(&m);\n    while (len == CAP) pthread_cond_wait(&not_full, &m);  /* paced */\n    buf[tail = (tail + 1) % CAP] = j; len++;\n    pthread_cond_broadcast(&not_empty); pthread_mutex_unlock(&m); }\nJob q_pop(void) {\n    pthread_mutex_lock(&m);\n    while (len == 0) pthread_cond_wait(&not_empty, &m);   /* waits */\n    Job j = buf[head = (head + 1) % CAP]; len--;\n    pthread_cond_signal(&not_full); pthread_mutex_unlock(&m); return j; }",
+      "pitfalls": [
+        "pthread_cond_wait can wake spuriously, so the condition must be re-tested in a while loop - an if silently overruns the buffer.",
+        "With several consumers, signal wakes only one waiter; choosing signal vs broadcast incorrectly leaves workers parked with work in the queue.",
+        "A queue built as a malloc'd unbounded linked list has no bound and is the failure mode the pattern exists to prevent.",
+        "Mixing a condition variable with non-atomic length/head/tail updates without holding the mutex is a data race even when the values look correct."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html"
+      ]
+    },
+    {
+      "variant_id": "posix-mqueue",
+      "name": "POSIX message queue as the buffer (mq_open/mq_send/mq_receive)",
+      "paradigm": "concurrent",
+      "implementation_notes": "A POSIX message queue (librt, <mqueue.h>) moves the buffer into the kernel: mq_open creates it with mq_maxmsg messages of mq_msgsize bytes each, mq_send blocks by default once the queue holds mq_maxmsg messages, and mq_receive blocks until one is available. That gives the bound and the blocking hand-off for free and can be shared between processes on the same host, at the cost of fixed-size messages and no worker management: the consumer loop, acknowledgement and dead-letter handling are still yours.",
+      "idiom_name": "mq_open + mq_send/mq_receive (librt)",
+      "code_sketch": "struct mq_attr a = { .mq_maxmsg = 1024, .mq_msgsize = sizeof(Job) };\nmqd_t q = mq_open(\"/jobs\", O_CREAT | O_RDWR, 0600, &a);\nmq_send(q, (const char *)&job, sizeof job, 0);   /* blocks while full */\n/* worker: */ mq_receive(q, (char *)&job, sizeof job, NULL);",
+      "pitfalls": [
+        "mq_send defaults to blocking (the desired policy); with O_NONBLOCK set it fails with EAGAIN, which must be handled as the shed path rather than ignored.",
+        "Messages are fixed-size byte blocks with no type safety; the payload layout must be versioned by hand.",
+        "The queue lives in the kernel and persists until mq_unlink, so a crashed producer's backlog is still there - and so is a queue that was never cleaned up."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/mq_send.3.html"
+      ]
+    }
+  ],
+  "default_variant": "pthread-ring-buffer",
+  "version": "1.0"
+}

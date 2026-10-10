@@ -1,0 +1,19 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-rolled seen-set (hsearch table) or an SQLite `INSERT OR IGNORE` inbox",
+  "implementation_notes": "C ships no seen-set container: the classic structure is written by hand. In-process, POSIX hcreate/hsearch (man 3 hsearch) gives a hash table keyed by the message id, but it is process-local, non-reentrant and not thread-safe, so it only fits single-threaded receivers and loses everything on restart. The realistic durable realization is an SQLite inbox: `INSERT OR IGNORE INTO seen(id, at) VALUES(?1, ?2)` followed by sqlite3_changes() - one changed row means this delivery won the claim, zero means a duplicate. Keep the claim and the business write in one SQLite transaction and prune rows older than the broker's redelivery window with a periodic DELETE. Where a framework-level broker client exists, prefer its deduplication hooks over this hand-rolled store.",
+  "code_sketch": "sqlite3_exec(db, \"BEGIN IMMEDIATE\", 0, 0, 0);\nsqlite3_prepare_v2(db, \"INSERT OR IGNORE INTO seen(id, at) VALUES(?1, ?2)\", -1, &st, 0);\nsqlite3_bind_text(st, 1, msg_id, -1, SQLITE_TRANSIENT);\nsqlite3_bind_int64(st, 2, now);\nsqlite3_step(st);\nif (sqlite3_changes(db) == 0) {          /* key already claimed */\n    sqlite3_exec(db, \"ROLLBACK\", 0, 0, 0);\n    ack(conn, msg); return;              /* duplicate: absorb, do not reprocess */\n}\napply_business_effects(db, msg);         /* same transaction as the claim */\nsqlite3_exec(db, \"COMMIT\", 0, 0, 0);\nack(conn, msg);",
+  "pitfalls": [
+    "hcreate/hsearch tables are process-local and not thread-safe; a multi-threaded or multi-process receiver silently loses its protection.",
+    "Claim and effects must share one SQLite transaction: committing the claim before the effects loses the message, committing the effects first duplicates it.",
+    "Never pruning the seen table (or pruning too early) breaks the guarantee in opposite ways: unbounded growth versus reopened duplicates."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/hsearch.3.html",
+    "https://sqlite.org/lang_conflict.html",
+    "https://sqlite.org/c3ref/changes.html"
+  ],
+  "version": "1.0"
+}

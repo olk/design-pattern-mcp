@@ -1,0 +1,18 @@
+{
+  "pattern": "store-and-forward",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "local durable store + forwarder loop + delete-after-acknowledge",
+  "implementation_notes": "Language-neutral form: put a durable store on the sender side (spool file, outbox table, local queue, append-only journal), write every message into it before the accept returns, and let a long-lived forwarder read that store in order and attempt delivery. A failed attempt is not an error path: the forwarder backs off (exponential delay with jitter), leaves the entry in place and retries, which is why draining the store belongs to start-up as much as to the steady state. Only an acknowledgement from the next hop or the receiver - meaning its state change is committed - authorises deleting the entry. Bound the store with a capacity limit, a message TTL and a dead-letter outcome, and carry a stable message id so the receiver can deduplicate or apply idempotently, because every lost acknowledgement surfaces as a duplicate delivery. Which technology plays the store matters less than the invariant: after acceptance the local store, not the process, is the source of truth.",
+  "code_sketch": "accept(m):\n    store.put(m.id, m)                 # durable; accept returns only after this\nforward():                             # long-lived loop, also run at start-up\n    for e in store.ordered():\n        try: peer.send(e); peer.wait_for_ack()\n        except Unreachable: backoff(); return   # entry stays in the store\n        else: store.delete(e.id)                # only after the peer acknowledged\nrecover(): forward()                   # restart is a normal path, not an exception",
+  "pitfalls": [
+    "Treating a completed transport write (or a queued in-memory item) as acceptance; only the store's own durability guarantees that the message still exists after a crash.",
+    "Deleting the entry before the acknowledgement, or on a timeout instead of a failure - the window between attempted send and confirm is exactly where messages are lost.",
+    "An unbounded store with no TTL and no dead-letter outcome, so one unreachable peer fills the disk and turns a delivery delay into a sender outage.",
+    "Wrong move: retry a deterministically failing (poison) message forever on the ordered drain -> it fails on every attempt, occupies the only forwarder slot and head-of-line-blocks every healthy message behind it -> instead cap attempts per entry, move exhausted entries to a dead-letter outcome with their payload intact, and alert on that outcome's depth.",
+    "Wrong move: treat 'persistent message sent to a durable queue' as durable without awaiting the broker's confirm -> brokers batch their disk writes (RabbitMQ fsyncs a few hundred milliseconds later), so a node crash before the flush silently loses messages the publisher believed stored -> instead publish in confirm mode and only consider the message accepted once basic.ack arrives after persistence.",
+    "Wrong move: let every destination share one unbounded spool on one forwarder -> a single full or stalled destination monopolises the spool and the link, head-of-line-blocking traffic for every other destination -> instead partition the store or forwarder per destination (as IBM MQ does with one transmission queue per next hop), and give each a depth bound, TTL and age alert."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

@@ -1,0 +1,62 @@
+{
+  "pattern": "functional-core-imperative-shell",
+  "language": "rust",
+  "support": "idiomatic",
+  "idiom_name": "pure fns over owned/borrowed values returning Result/Option; shell owns the handles",
+  "implementation_notes": "The core is a module (or a crate) of free functions that take `&T`/owned values and return owned values or `Result<T, E>` - no `std::fs`, `std::net`, no `SystemTime::now()`, no `println!`; the shell owns the handles (client, pool, clock) and matches on what the core returned. Ownership makes the boundary visible because an effect needs a capability the core must be given, and returning owned values means the shell cannot find itself aliasing core state. The strongest available enforcement is a `#![no_std]`/`no_std + alloc` core crate, which physically cannot do IO without `unsafe`/libc; the classic trait-defined port belongs in the shell or a separate ports crate, and is only justified in the core when the decision must *describe* an effect.",
+  "code_sketch": "// core: no std::io, no clock, no println!\npub fn decide_charge(sub: &Subscription, now: i64) -> Option<Charge> {\n    let monthly = match sub.tier {\n        Tier::Free => return None,\n        Tier::Pro  => 2900,\n        Tier::Team => 9900,\n    };\n    let days = (now - sub.started_at).max(0);\n    Some(Charge { amount_cents: monthly * days / 30 })\n}\n// shell: let sub = db.subscription(user_id)?;\n//        if let Some(c) = decide_charge(&sub, clock.now()) { stripe.charge(c)?; }",
+  "pitfalls": [
+    "`&mut` parameters do not make a function impure, but they do let it mutate the caller's data - the borrow checker guarantees exclusivity, not purity; take `&T` and return new values.",
+    "`SystemTime::now()`, `Instant::now()` and `thread_rng()` compile anywhere and make tests flaky; inject the moment (`now: i64`/`DateTime<Utc>`) and a seeded RNG from the shell.",
+    "`println!`, `tracing::info!` and `Vec::push` on a parameter are effects nobody sees in review; keep the core crate's dependency/import list clean (no `std::fs`, `std::net`, `std::time::SystemTime`) and prefer `no_std` as the mechanical gate."
+  ],
+  "sources": [
+    "https://entropicdrift.com/projects/stillwater/",
+    "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html",
+    "https://doc.rust-lang.org/std/result/"
+  ],
+  "variants": [
+    {
+      "variant_id": "value-result-core",
+      "name": "Pure functions returning values / Result",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "idiom_name": "pure fns over owned/borrowed values returning Result/Option; shell owns the handles",
+      "implementation_notes": "The core is a module (or a crate) of free functions that take `&T`/owned values and return owned values or `Result<T, E>` - no `std::fs`, `std::net`, no `SystemTime::now()`, no `println!`; the shell owns the handles (client, pool, clock) and matches on what the core returned. Ownership makes the boundary visible because an effect needs a capability the core must be given, and returning owned values means the shell cannot find itself aliasing core state. The strongest available enforcement is a `#![no_std]`/`no_std + alloc` core crate, which physically cannot do IO without `unsafe`/libc; the classic trait-defined port belongs in the shell or a separate ports crate, and is only justified in the core when the decision must *describe* an effect.",
+      "code_sketch": "// core: no std::io, no clock, no println!\npub fn decide_charge(sub: &Subscription, now: i64) -> Option<Charge> {\n    let monthly = match sub.tier {\n        Tier::Free => return None,\n        Tier::Pro  => 2900,\n        Tier::Team => 9900,\n    };\n    let days = (now - sub.started_at).max(0);\n    Some(Charge { amount_cents: monthly * days / 30 })\n}\n// shell: let sub = db.subscription(user_id)?;\n//        if let Some(c) = decide_charge(&sub, clock.now()) { stripe.charge(c)?; }",
+      "pitfalls": [
+        "`&mut` parameters do not make a function impure, but they do let it mutate the caller's data - the borrow checker guarantees exclusivity, not purity; take `&T` and return new values.",
+        "`SystemTime::now()`, `Instant::now()` and `thread_rng()` compile anywhere and make tests flaky; inject the moment (`now: i64`/`DateTime<Utc>`) and a seeded RNG from the shell.",
+        "`println!`, `tracing::info!` and `Vec::push` on a parameter are effects nobody sees in review; keep the core crate's dependency/import list clean (no `std::fs`, `std::net`, `std::time::SystemTime`) and prefer `no_std` as the mechanical gate."
+      ],
+      "sources": [
+        "https://entropicdrift.com/projects/stillwater/",
+        "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html",
+        "https://doc.rust-lang.org/std/result/"
+      ]
+    },
+    {
+      "variant_id": "sans-io-effect-description",
+      "name": "Sans-IO core returning effect descriptions",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "sans-io"
+      ],
+      "idiom_name": "core returns `Effect`/`ReconcileResult` values; an Executor applies them",
+      "implementation_notes": "When the decisions are a sequence of IO actions (reconciliation loops, sagas, protocol state machines), return them as data: an `enum Effect` / `ReconcileResult` list, or an `Effect<T, E, Env>` value whose `run(&env)` happens only at the boundary - the shell supplies an interpreter. The decision then stays testable by asserting on the returned effects (a recording executor) with no API mocks, which is the Rust form of the interpreter-as-data style; `no_std` kernels (for example a deterministic transition over immutable state) are the extreme version. Prefer the plain value-returning core when the decisions are computations; the effect vocabulary costs an enum, an interpreter and a shared trait to maintain.",
+      "code_sketch": "pub enum Effect { Upsert(Resource), Delete(Id), Requeue(After) }\npub struct ReconcileResult { pub effects: Vec<Effect> }\npub fn reconcile(snap: &Snapshot, obj: &Resource) -> ReconcileResult {  // pure\n    match snap.get(&obj.id) {\n        Some(cur) if cur == obj => ReconcileResult { effects: vec![] },\n        _ => ReconcileResult {\n            effects: vec![Effect::Upsert(obj.clone()), Effect::Requeue(After::Secs(5))],\n        },\n    }\n}\n// shell: impl Executor applies each Effect to the real cluster;\n// tests: a RecordingExecutor captures them - no API mocks.",
+      "pitfalls": [
+        "An effect vocabulary that grows one variant per call site becomes a second, weaker API beside the real one; keep it small and aligned with the shell's adapters.",
+        "Effects that must run in order need explicit sequencing in the interpreter - a set or an unordered collector silently loses the ordering the imperative version got for free.",
+        "Ownership of the payloads matters: cloning whole resources into `Effect` values is easy, but the shell may then apply a stale snapshot version - carry ids/versions and re-validate at the boundary."
+      ],
+      "sources": [
+        "https://docs.rs/functional-kube/latest/functional_kube/index.html",
+        "https://entropicdrift.com/projects/stillwater/"
+      ]
+    }
+  ],
+  "default_variant": "value-result-core",
+  "version": "1.0"
+}

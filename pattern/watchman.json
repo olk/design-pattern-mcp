@@ -1,0 +1,166 @@
+{
+  "category": "workflow-messaging",
+  "name": "watchman",
+  "aliases": [
+    "dead man's switch",
+    "heartbeat monitor"
+  ],
+  "intent": "Detect that a message flow has gone silent - not that a message failed - and tell a responsible person or system within a bounded time by comparing each flow's arrivals against the cadence its business deadline implies.",
+  "problem": "Message systems fail silently in the one way no error handler observes: nothing arrives. A producer stops emitting, a consumer stops draining, a scheduled job never fires, a credential expires, a partition goes offline - and because no failing code path is ever entered, error dashboards stay green while downstream data quietly goes stale. The recurring trigger: a flow whose absence is business-visible (a nightly feed, an order stream, a partner interface) has no owner-facing signal for 'no messages', so the gap is discovered late - by a customer or a downstream job - instead of by the team that can fix it.",
+  "context": "Applies wherever messages are expected on a knowable cadence (event streams, queues, batch hand-offs, partner interfaces, device check-ins) and their absence is a business-visible failure: the flow has an owner, the expected period and grace window can be derived from a downstream deadline, and either the transport can be observed passively (queue counters, a wire tap) or the producers can emit out-of-band heartbeats. The watchman sits at message-flow or boundary scope - an in-process watcher beside the consumer, a periodic sweep over persisted last-seen state, or a rule in the monitoring stack fed by metrics - and it must itself be watched, because a silent watchman is exactly the failure it exists to catch.",
+  "benefits": [
+    "Catches the silent failure modes nothing else reports: stalled consumer, dead producer, job that was never scheduled, expired credentials, full disk, paused partition - all of which emit no error at all.",
+    "Converts 'no news' into an explicit signal with a name, an owner and a deadline, so the gap is found within the grace window instead of by a customer days later.",
+    "Keeps observation out of the business flow: passive taps or out-of-band heartbeats let producers and consumers stay unaware of monitoring, and the escalation policy can change without touching them.",
+    "Makes expectations reviewable data: expected cadence, grace, severity and owner are declared per subject instead of living in operators' heads, which is also where a looming SLA breach becomes visible early.",
+    "Bounds detection time by design: the alarm arrives at last-arrival + period + grace, so the worst case is a property of the configuration rather than of luck - and it composes with automatic reactions (retry, circuit breaker, bulkhead) when wired to a corrective action.",
+    "Improves diagnosis when paired with a wire tap or message history: the silence alarm says when the flow stopped, the tap says what the last thing that flowed looked like."
+  ],
+  "tradeoffs": [
+    "Expected silence is the default failure mode of the monitor itself: nights, weekends, batch windows and seasonal traffic turn a fixed threshold into a false-alarm generator, so per-subject calibration and quiet periods are ongoing maintenance rather than a one-off setup.",
+    "The signal is ambiguous by construction: absence cannot distinguish 'nothing to send' from 'producer dead', so expectations must come from business deadlines and the pattern needs domain input and an owner - infrastructure alone cannot supply either.",
+    "Liveness traffic costs messages and can pollute the flow it measures: heartbeats on the business channel inflate counts, break schema-strict consumers, can land in the dead-letter channel, and a heartbeat emitted by an unrelated part of the process proves process liveness rather than data-path liveness.",
+    "The watchman and its alert path become new single points of failure: if the monitor dies silently the system looks healthier than before it was added, so the pattern is only honest when it monitors itself (an always-firing watchdog alert or an external dead-man's switch) - which doubles the alerting plumbing.",
+    "One broker or network outage silences many subjects at once: without grouping, deduplication, suppression and severity mapping the watchman produces an alert storm exactly when operators are busiest, and the resulting fatigue is how the next real stall gets ignored.",
+    "The alarm state machine carries real complexity: debounce the first miss, repeat while silent, clear on recovery, and survive a watchman restart - omitting any of these yields a monitor that flaps, pages once and then goes deaf, or forgets that it had already alarmed."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 4,
+    "performance": 7,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Watched Flow",
+      "responsibility": "The channel, queue, endpoint, scheduled feed or device population whose silence is meaningful; it owns the expected cadence, the severity and the owner who must be told."
+    },
+    {
+      "role": "Liveness Signal",
+      "responsibility": "The passive evidence (counter, wire tap, last-seen stamp) or the active messages (heartbeats, test messages) that prove the flow is still moving; it must observe the data path, not merely the process."
+    },
+    {
+      "role": "Watchman",
+      "responsibility": "Holds the per-subject expectation and last-seen state, compares arrivals against the cadence - on a schedule or by waiting on a deadline - and decides when the silence has outlasted the grace window."
+    },
+    {
+      "role": "Expectation Policy",
+      "responsibility": "The declared per-subject period, grace window, quiet hours, severity, repeat interval and owner that turn a raw absence into a judgement; maintained and reviewed like code."
+    },
+    {
+      "role": "Notifier",
+      "responsibility": "Delivers the alarm on the right channel with grouping, deduplication, suppression and an escalation ladder, and optionally triggers a corrective action; separate from detection so routing can change independently."
+    },
+    {
+      "role": "Watchdog of the Watchman",
+      "responsibility": "An always-firing watchdog alert or an external dead-man's switch that alarms when the watchman's own heartbeat stops arriving, so a silent monitor cannot masquerade as a healthy system."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary",
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Nightly batch or ETL feed: page the integration owner when the 02:00 import has produced no messages by its deadline, instead of noticing an empty report at the morning stand-up.",
+    "Business-critical event stream (orders, payments, telemetry): alarm when the produce rate stays at zero through business hours, which separates a healthy quiet topic from a stopped producer.",
+    "External partner interface: notify when no messages have arrived from a B2B partner within the agreed window, turning a looming SLA breach into an early, actionable alert.",
+    "Long-running workflow stage: require a heartbeat from each process-manager step so a stuck instance is noticed before the surrounding batch closes or a compensation becomes necessary.",
+    "Retry or dead-letter pump: verify that the pump still drains failed messages - silence means the pump died, not that the backlog is empty.",
+    "Fleet check-ins (edge devices, agents, cron jobs on many hosts): raise a per-device or per-site alarm when scheduled check-ins stop arriving.",
+    "The alerting pipeline itself: an always-firing watchdog alert routed to an external service, so a broken alert path is discovered by its silence.",
+    "Cron and scheduled-job fleet via Healthchecks.io: each job pings a unique URL, the service holds the Period and Grace Time, flips the check Late then Down when no ping arrives by period + grace, and notifies integrations.",
+    "Dashboard alert rules in Grafana: an alert rule whose query returns no series enters the No Data state and can raise a DatasourceNoData alert - the platform form of deciding what silence means (No Data, Alerting, Normal or Keep last state).",
+    "Apache Burrow for Kafka (LinkedIn): committed offsets are evaluated per partition over a sliding window and a consumer is classified STALLED when its offset is frozen with non-zero lag, or STOPPED when no new commits arrive - consumer-silence detection without fixed lag thresholds."
+  ],
+  "avoid_when": [
+    "You only need to know whether a process or host is up: a health-check endpoint, readiness/liveness probe or supervisor is the simpler, correct tool - flow liveness is a different question.",
+    "The monitoring stack already covers the gap (consumer-lag alarm, queue-depth alarm with an owner): fix and reuse that rule instead of adding a second, competing silence detector.",
+    "Failures are loud and immediate (synchronous calls that return errors): timeout, retry with backoff and circuit breaker are the direct tools, while absence monitoring adds detection latency by design.",
+    "The flow is genuinely bursty or unpredictable with no derivable cadence: start from volume/rate alerts or ask the producer to emit heartbeats; a raw 'no messages' threshold will only produce noise.",
+    "No owner would act on the alert: monitoring without an owner turns an operational gap into permanent noise - assign ownership before instrumenting."
+  ],
+  "language_files": {
+    "generic": "watchman.generic.json",
+    "c": "watchman.c.json",
+    "cplusplus": "watchman.cplusplus.json",
+    "csharp": "watchman.csharp.json",
+    "go": "watchman.go.json",
+    "java": "watchman.java.json",
+    "javascript": "watchman.javascript.json",
+    "kotlin": "watchman.kotlin.json",
+    "python": "watchman.python.json",
+    "ruby": "watchman.ruby.json",
+    "rust": "watchman.rust.json",
+    "scala": "watchman.scala.json",
+    "swift": "watchman.swift.json",
+    "typescript": "watchman.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip",
+    "modern"
+  ],
+  "related_patterns": [
+    "wire-tap",
+    "control-bus",
+    "message-history",
+    "health-check-endpoint",
+    "circuit-breaker",
+    "retry",
+    "dead-letter-channel"
+  ],
+  "anti_patterns": [
+    "Watchman without meta-monitoring: the silence detector (or its alert path) dies and the system looks healthier than before the pattern was added.",
+    "Fixed absence threshold without per-subject expectations: 'alert if no messages for 5 minutes' on a nightly feed pages every night until the team mutes the alert - threshold theater that trains people to ignore alarms.",
+    "A liveness signal that proves the wrong thing: a keep-alive emitted by an unrelated scheduler loop keeps the process looking alive while the consumer is stuck; the signal must travel the data path.",
+    "Per-channel pager with no grouping or suppression: a broker outage fires every subject at once, the storm drowns the incident, and the next real stall is missed.",
+    "Alerting into the void: alarms posted to a chat channel with no owner, severity or escalation ladder, so the pattern's promise - someone is told - is never kept.",
+    "Heartbeats on the production channel: control traffic mixed into business messages inflates counts, breaks schema-strict consumers and can end up in the dead-letter channel."
+  ],
+  "design_principles": [
+    "Separation of concerns: detection (expectation plus last-seen state), notification and reaction are separate; the watchman observes and reports and does not repair.",
+    "Fail-visible: absence of a signal must be a first-class monitored event, and the monitor's own failure must be observable - no silent monitors.",
+    "Explicitness: cadence, grace, severity and ownership are declared data reviewed with the code, not tribal knowledge.",
+    "Single responsibility and least knowledge: the watcher knows the flow's cadence, not its payload, and producers need not know the escalation policy.",
+    "Derive thresholds from business deadlines (from the SLA backwards) rather than from what is easy to measure."
+  ],
+  "best_practices": [
+    "Derive the period and grace window from the downstream business deadline, keep grace above the observed p99 inter-arrival jitter, and re-review both when traffic patterns or SLAs change.",
+    "Stamp liveness on a monotonic clock (steady_clock, nanoTime, CLOCK_MONOTONIC, performance.now, Instant); wall-clock timestamps cause phantom silences and alarms that can never fire.",
+    "Debounce the first miss, repeat the alert while the silence persists and clear the state on recovery; make that state machine explicit and persist or re-seed it across watchman restarts.",
+    "Group, deduplicate and suppress by cause (broker outage, deployment window, planned maintenance) and map every subject to a severity and an owner before adding it.",
+    "Instrument passively where possible (queue counters, consumer lag, Wire Tap); when heartbeats are unavoidable, route them out of band on a Control Bus and make them prove the data path, as a Test Message does.",
+    "Monitor the monitor with an always-firing watchdog alert or an external dead-man's switch, and test the watchman with an injected clock plus a deliberately quiet canary subject.",
+    "Keep the watched set small and owned: fewer, aggregated subjects with clear escalation beat a per-channel firehose, and each subject must have someone who acts on its alarm."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - System Management chapter (Detour, Wire Tap, Message History, Message Store, Test Message, Control Bus), the catalog family this pattern belongs to.",
+    "Hohpe & Woolf, Enterprise Integration Patterns 2 - Heartbeat conversation pattern: a component sends periodic heartbeats and an observer detects the missing heartbeat and triggers an alert or corrective action: https://www.enterpriseintegrationpatterns.com/patterns/conversation/HeartBeat.html",
+    "Hohpe & Woolf, Test Message - active liveness probing of message processing components, and the components (generator, injector, separator, verifier) such probing needs: https://www.enterpriseintegrationpatterns.com/patterns/messaging/TestMessage.html",
+    "Hohpe & Woolf, System Management - out-of-band monitoring and administration of a messaging system: https://www.enterpriseintegrationpatterns.com/patterns/messaging/SystemManagementIntro.html",
+    "Prometheus Operator runbooks, Watchdog alert - an alert that is always firing so that its absence reveals a broken alerting pipeline: https://runbooks.prometheus-operator.dev/runbooks/general/watchdog/",
+    "Healthchecks.io documentation - periodic check-ins with a period and a grace time, transitioning to a Down state and notifying integrations when the signal does not arrive: https://healthchecks.io/docs/",
+    "Amazon CloudWatch, alarms - configurable treatment of missing data, which is the platform form of the absence decision: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Alarms.html",
+    "Prometheus, Alertmanager configuration - routing, grouping, inhibition and silencing of alerts, the escalation half of the pattern: https://prometheus.io/docs/alerting/latest/configuration/",
+    "Healthchecks.io, Configuring checks - simple and cron schedules with Period and Grace Time that move a check to Late and then Down when the ping does not arrive: https://healthchecks.io/docs/configuring_checks/",
+    "Grafana documentation, No Data and Error states - alert rule evaluation when a query returns no data points, with configurable transitions (No Data, Alerting, Normal, Keep last state): https://grafana.com/docs/grafana/latest/alerting/fundamentals/alert-rule-evaluation/nodata-and-error-states/",
+    "Grafana documentation, Handle missing data in Grafana Alerting - No Data and Missing Series do not fire alerts unless the rule is configured to do so, and how DatasourceNoData alerts are named and routed: https://grafana.com/docs/grafana/latest/alerting/guides/missing-data/",
+    "LinkedIn Engineering, Burrow: Kafka Consumer Monitoring Reinvented - sliding-window evaluation of committed offsets classifying Kafka consumer partitions OK, WARNING, STALLED or STOPPED without fixed lag thresholds: https://engineering.linkedin.com/apache-kafka/burrow-kafka-consumer-monitoring-reinvented",
+    "Apache Burrow wiki, Consumer Lag Evaluation Rules - the per-partition rules that mark a consumer STALLED (frozen offset with non-zero lag) or STOPPED (no new commits): https://github.com/linkedin/Burrow/wiki/Consumer-Lag-Evaluation-Rules",
+    "Abstractopedia, Heartbeat and Suspicion Detector - treating missed heartbeats as graded, revisable suspicion rather than confirmed death, and gating irreversible actions on that distinction: https://abstractopedia.org/mechanisms/heartbeat_and_suspicion_detector/"
+  ]
+}

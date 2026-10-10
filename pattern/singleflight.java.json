@@ -1,0 +1,20 @@
+{
+  "pattern": "singleflight",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "ConcurrentHashMap.computeIfAbsent + CompletableFuture registry",
+  "implementation_notes": "Java's standard library supplies both halves: ConcurrentHashMap.computeIfAbsent is the atomic compute-if-absent registration, and CompletableFuture is the shareable completion handle (many threads may wait on it, and complete/completeExceptionally/cancel succeed only once). The registry maps key -> future, waiters join by reading the same future, and the entry is removed on completion (for example with whenComplete plus the two-argument remove(key, future)) so the map holds only in-flight work. Keep the registration step cheap and run the computation on an executor outside the mapping function, then give waiters their own way to stop waiting without exposing the shared future to cancellation.",
+  "code_sketch": "private final ConcurrentMap<String, CompletableFuture<Value>> inflight = new ConcurrentHashMap<>();\n\nCompletableFuture<Value> load(String key) {\n    CompletableFuture<Value> created = new CompletableFuture<>();\n    CompletableFuture<Value> f = inflight.putIfAbsent(key, created);  // atomic register\n    if (f != null) return f;                           // join the existing flight\n    executor.execute(() -> {\n        try { created.complete(source.read(key)); }    // leader runs once\n        catch (Throwable t) { created.completeExceptionally(t); }\n        finally { inflight.remove(key, created); }     // forget on completion\n    });\n    return created;\n}",
+  "pitfalls": [
+    "The mapping function passed to computeIfAbsent must be cheap and must not modify the map: ConcurrentHashMap forbids reentrant updates from inside it, and starting the computation there holds the bin lock - registering an incomplete future with putIfAbsent and completing it on the executor avoids both.",
+    "Remove the entry with the two-argument remove(key, future) so a slow completion cannot evict a newer flight for the same key.",
+    "complete/cancel on a CompletableFuture succeed only once: never expose the shared future to callers that might cancel it on timeout - time out the wait, not the flight.",
+    "Exceptions arrive wrapped: get() throws ExecutionException and join() throws CompletionException, so unwrap before translating to the application's error type; every waiter sees the leader's exception.",
+    "The registry is per process: a multi-instance deployment still performs one load per instance; cross-instance dedup needs a distributed lock or a shared cache."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html"
+  ],
+  "version": "1.0"
+}

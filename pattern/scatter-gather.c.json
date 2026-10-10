@@ -1,0 +1,64 @@
+{
+  "pattern": "scatter-gather",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread_create per recipient + pthread_cond_timedwait gather (absolute deadline)",
+  "implementation_notes": "C offers neither futures nor a scheduler, so both halves of the pattern are hand-written: one worker per recipient posts its reply into a mutex-guarded result box and signals a condition variable, and the gather waits on that condition against an absolute expiry. pthread_cond_timedwait is the only deadline primitive at this level - it returns ETIMEDOUT, which is the normal 'merge what has arrived' outcome, not an error. Nothing in the language replaces the classic Recipient List plus Aggregator structure; the real design choice is threads (this variant) versus a single event loop over non-blocking descriptors (see the epoll variant).",
+  "code_sketch": "struct gather g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, .want = n};\nfor (int i = 0; i < n; i++) pthread_create(&tid[i], NULL, ask, &jobs[i]);\nstruct timespec deadline = mono_now(); deadline.tv_sec += budget_ms / 1000;\npthread_mutex_lock(&g.m);\nwhile (g.done < g.want) {\n    if (pthread_cond_timedwait(&g.cv, &g.m, &deadline) == ETIMEDOUT) break;\n}\npthread_mutex_unlock(&g.m);\nmerge(g.slots, g.done);   /* late replies are dropped, not merged */",
+  "pitfalls": [
+    "pthread_cond_timedwait takes an absolute time: compute the expiry once from a monotonic clock, never by re-adding a relative timeout on every wake-up.",
+    "A worker writing a result after the gather returned is a data race unless every slot access happens under the same mutex; the deadline is a cut-off, not a memory barrier.",
+    "pthread_cancel only takes effect at cancellation points, so a worker blocked in a syscall keeps running: reap stragglers by shutting the socket down or by using non-blocking descriptors instead.",
+    "EINTR from the timed wait must be retried against the same absolute deadline, or the budget silently stretches."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "threads-condvar-deadline",
+      "name": "pthread worker fan-out with a mutex/condvar result box",
+      "paradigm": "concurrent",
+      "min_standard": "C99",
+      "requires_features": [
+        "pthreads",
+        "clock_gettime"
+      ],
+      "idiom_name": "pthread_create per recipient + pthread_cond_timedwait gather (absolute deadline)",
+      "implementation_notes": "C offers neither futures nor a scheduler, so both halves of the pattern are hand-written: one worker per recipient posts its reply into a mutex-guarded result box and signals a condition variable, and the gather waits on that condition against an absolute expiry. pthread_cond_timedwait is the only deadline primitive at this level - it returns ETIMEDOUT, which is the normal 'merge what has arrived' outcome, not an error. Nothing in the language replaces the classic Recipient List plus Aggregator structure; the real design choice is threads (this variant) versus a single event loop over non-blocking descriptors (see the epoll variant).",
+      "code_sketch": "struct gather g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, .want = n};\nfor (int i = 0; i < n; i++) pthread_create(&tid[i], NULL, ask, &jobs[i]);\nstruct timespec deadline = mono_now(); deadline.tv_sec += budget_ms / 1000;\npthread_mutex_lock(&g.m);\nwhile (g.done < g.want) {\n    if (pthread_cond_timedwait(&g.cv, &g.m, &deadline) == ETIMEDOUT) break;\n}\npthread_mutex_unlock(&g.m);\nmerge(g.slots, g.done);   /* late replies are dropped, not merged */",
+      "pitfalls": [
+        "pthread_cond_timedwait takes an absolute time: compute the expiry once from a monotonic clock, never by re-adding a relative timeout on every wake-up.",
+        "A worker writing a result after the gather returned is a data race unless every slot access happens under the same mutex; the deadline is a cut-off, not a memory barrier.",
+        "pthread_cancel only takes effect at cancellation points, so a worker blocked in a syscall keeps running: reap stragglers by shutting the socket down or by using non-blocking descriptors instead.",
+        "EINTR from the timed wait must be retried against the same absolute deadline, or the budget silently stretches."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html"
+      ]
+    },
+    {
+      "variant_id": "epoll-event-loop-deadline",
+      "name": "single-threaded poll/epoll gather over non-blocking recipients",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "epoll",
+        "non-blocking-sockets"
+      ],
+      "idiom_name": "non-blocking connect/send + epoll_wait (or poll) with the budget as the timeout",
+      "implementation_notes": "The event-loop form needs no worker threads: every recipient endpoint is a non-blocking descriptor registered with epoll (or a poll array), the requests are written on writability, and replies are read into per-recipient slots until the recipient count or the budget is reached. The deadline is the epoll_wait timeout (recomputed as the remaining milliseconds at each iteration), so there is exactly one clock for the whole gather. Prefer this shape when the recipients are thousands of sockets, or when per-connection stacks are too expensive; keep the threaded variant when each recipient call blocks on something that is not a file descriptor.",
+      "code_sketch": "epoll_add(ep, fd_of(recipient), EPOLLIN | EPOLLOUT);        /* fan out on writability */\nwhile (pending > 0) {\n    int ms = remaining_ms(deadline);\n    if (ms <= 0) break;                                    /* budget exhausted: merge now */\n    int k = epoll_wait(ep, evs, n, ms);\n    for (int i = 0; i < k; i++) consume(evs[i]);           /* read reply, mark slot done */\n}\nmerge(slots, completed);",
+      "pitfalls": [
+        "epoll_wait's timeout is relative, so it must be recomputed from the absolute deadline on every iteration; otherwise EINTR retries and spurious wake-ups extend the budget.",
+        "Non-blocking connects report completion through EPOLLOUT plus SO_ERROR - treating the first EPOLLOUT as success hides connection failures.",
+        "Replies must be buffered per descriptor: a partial read that is parsed for one recipient corrupts the framing of the next reply."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/poll.2.html"
+      ]
+    }
+  ],
+  "default_variant": "threads-condvar-deadline",
+  "version": "1.0"
+}

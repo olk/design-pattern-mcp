@@ -1,0 +1,59 @@
+{
+  "pattern": "content-enricher",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "hand-written Enricher + abstract DataSource + unordered_map cache",
+  "implementation_notes": "No C++ library implements the Content Enricher, so the realization is a hand-written enricher over an abstract DataSource (virtual find(key) returning std::optional<Record>), with a std::unordered_map in front of the source to absorb repeated keys. Keeping the source abstract lets tests inject a stub and production inject the SQL or HTTP client; the merge is a plain copy of the resolved fields into the message type. Choose this shape whenever the resource call is synchronous and the flow already owns a thread for the message.",
+  "code_sketch": "struct DataSource {\n  virtual std::optional<Customer> find(const std::string& id) = 0;\n  virtual ~DataSource() = default;\n};\n\nOrder enrich(const Order& in, DataSource& src) {\n  Order out = in;\n  if (auto c = src.find(in.customer_id)) {   // absent -> leave the message as it is\n    out.customer_name = c->name; out.region = c->region;\n  }\n  return out;\n}",
+  "pitfalls": [
+    "Copying a reference or pointer into the datasource's internal cache makes the enriched message dangle when the cache evicts; copy the values, not the addresses.",
+    "A virtual call per field looks tidy but degenerates into an N+1 of lookups; resolve once per message key and merge afterwards.",
+    "An unbounded unordered_map cache turns the enricher into a memory leak with a lookup API; bound it or expire entries."
+  ],
+  "sources": [
+    "https://en.cppreference.com/cpp/container/unordered_map",
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/networking/protocols.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "datasource-interface",
+      "name": "Enricher over an abstract DataSource (C++11)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "hand-written Enricher + abstract DataSource + unordered_map cache",
+      "implementation_notes": "No C++ library implements the Content Enricher, so the realization is a hand-written enricher over an abstract DataSource (virtual find(key) returning std::optional<Record>), with a std::unordered_map in front of the source to absorb repeated keys. Keeping the source abstract lets tests inject a stub and production inject the SQL or HTTP client; the merge is a plain copy of the resolved fields into the message type. Choose this shape whenever the resource call is synchronous and the flow already owns a thread for the message.",
+      "code_sketch": "struct DataSource {\n  virtual std::optional<Customer> find(const std::string& id) = 0;\n  virtual ~DataSource() = default;\n};\n\nOrder enrich(const Order& in, DataSource& src) {\n  Order out = in;\n  if (auto c = src.find(in.customer_id)) {   // absent -> leave the message as it is\n    out.customer_name = c->name; out.region = c->region;\n  }\n  return out;\n}",
+      "pitfalls": [
+        "Copying a reference or pointer into the datasource's internal cache makes the enriched message dangle when the cache evicts; copy the values, not the addresses.",
+        "A virtual call per field looks tidy but degenerates into an N+1 of lookups; resolve once per message key and merge afterwards.",
+        "An unbounded unordered_map cache turns the enricher into a memory leak with a lookup API; bound it or expire entries."
+      ],
+      "sources": [
+        "https://en.cppreference.com/cpp/container/unordered_map",
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/networking/protocols.html"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutine-async",
+      "name": "Asio coroutine awaiting the resource lookup (C++20)",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await the resource call inside a Boost.Asio awaitable",
+      "implementation_notes": "With C++20 stackless coroutines and Boost.Asio the enrichment step stops blocking: the resource call is awaited (co_await src.async_find(id)) and the coroutine resumes on the io_context when the data arrives, so one thread keeps enriching messages while lookups are in flight. The DataSource interface stays, but its operations return awaitables and the per-message work is co_spawned. Prefer it when the resource is a network service and the flow must not pin a thread per message.",
+      "code_sketch": "awaitable<Order> enrich(Order in, DataSource& src) {\n  auto rec = co_await src.async_find(in.customer_id);   // async query over a socket\n  if (rec) { in.customer_name = rec->name; in.region = rec->region; }\n  co_return in;\n}\n// co_spawn(io, enrich(std::move(order), src), [](std::exception_ptr e) { if (e) report(e); });",
+      "pitfalls": [
+        "The coroutine must own the message and datasource state across suspension points; references into the caller's frame dangle on resume.",
+        "Detached co_spawn swallows failures - attach a completion handler or an exception channel, or a failed lookup disappears silently.",
+        "A blocking datasource call inside the coroutine stalls the whole io_context, which is exactly what the coroutine form was meant to avoid."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html"
+      ]
+    }
+  ],
+  "default_variant": "datasource-interface"
+}

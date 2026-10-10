@@ -1,0 +1,72 @@
+{
+  "pattern": "reactor",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "Boost.Asio io_context + async_read/async_wait completion handlers",
+  "implementation_notes": "Boost.Asio ships the initiation dispatcher: io_context provides an event processing loop, and its documentation is explicit that run()/poll() must be called for asynchronous operations to progress and that handlers are invoked only by a thread currently calling one of those functions. Sockets, acceptors and deadline_timer are the handles, and the async_* calls carry the handler that the loop dispatches, so the handle-to-handler registry collapses into per-operation completion handlers plus session objects that re-issue the next operation. Two members replace the classic structure explicitly: a strand serialises handler execution so several threads may run one io_context without locking per-session state, and a work guard keeps run() from returning when there is temporarily nothing to do. Write a loop by hand only to integrate a foreign event source through a custom service.",
+  "code_sketch": "boost::asio::io_context io;\nboost::asio::ip::tcp::acceptor acc(io, tcp::endpoint(tcp::v4(), 8080));\n\nstd::function<void()> accept_next = [&] {\n    acc.async_accept([&](error_code ec, tcp::socket s) {\n        if (!ec) std::make_shared<Session>(std::move(s))->start();  /* handler per handle */\n        accept_next();                                              /* re-arm from the handler */\n    });\n};\naccept_next();\nio.run();                                   /* dispatcher loop; handlers run on this thread */",
+  "pitfalls": [
+    "Running blocking work inside a completion handler stalls every operation on that io_context; a handler must re-issue the next async operation and return.",
+    "The loop stops when it runs out of work, so a long-lived service needs a work guard (or an outstanding async operation), otherwise run() returns and the server silently exits.",
+    "With several threads calling run() on one io_context the handlers may execute concurrently; session state must be posted to the session's strand instead of being touched directly in the completion handler."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/io_context.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "boost-asio-io-context",
+      "name": "Boost.Asio io_context with completion handlers",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Asio io_context + async_read/async_wait completion handlers",
+      "implementation_notes": "Boost.Asio ships the initiation dispatcher: io_context provides an event processing loop, and its documentation is explicit that run()/poll() must be called for asynchronous operations to progress and that handlers are invoked only by a thread currently calling one of those functions. Sockets, acceptors and deadline_timer are the handles, and the async_* calls carry the handler that the loop dispatches, so the handle-to-handler registry collapses into per-operation completion handlers plus session objects that re-issue the next operation. Two members replace the classic structure explicitly: a strand serialises handler execution so several threads may run one io_context without locking per-session state, and a work guard keeps run() from returning when there is temporarily nothing to do. Write a loop by hand only to integrate a foreign event source through a custom service.",
+      "code_sketch": "boost::asio::io_context io;\nboost::asio::ip::tcp::acceptor acc(io, tcp::endpoint(tcp::v4(), 8080));\n\nstd::function<void()> accept_next = [&] {\n    acc.async_accept([&](error_code ec, tcp::socket s) {\n        if (!ec) std::make_shared<Session>(std::move(s))->start();  /* handler per handle */\n        accept_next();                                              /* re-arm from the handler */\n    });\n};\naccept_next();\nio.run();                                   /* dispatcher loop; handlers run on this thread */",
+      "pitfalls": [
+        "Running blocking work inside a completion handler stalls every operation on that io_context; a handler must re-issue the next async operation and return.",
+        "The loop stops when it runs out of work, so a long-lived service needs a work guard (or an outstanding async operation), otherwise run() returns and the server silently exits.",
+        "With several threads calling run() on one io_context the handlers may execute concurrently; session state must be posted to the session's strand instead of being touched directly in the completion handler."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/io_context.html"
+      ]
+    },
+    {
+      "variant_id": "ace-reactor",
+      "name": "ACE_Reactor and ACE_Event_Handler (classic POSA2 realization)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "ACE_Reactor / ACE_Event_Handler / register_handler",
+      "implementation_notes": "ACE is where the pattern was first described (POSA2, and C++ Network Programming volume 2 whose chapters 3 and 4 cover the reactor framework and its implementations: ACE_Select_Reactor, ACE_TP_Reactor, ACE_WFMO_Reactor). Handlers derive from ACE_Event_Handler and expose handle_input/handle_timeout hooks; they register with an ACE_Reactor (register_handler), which demultiplexes with select, poll or WFMO and dispatches the hooks. Choose it when the surrounding stack is already ACE - its Acceptor-Connector, Service Configurator and Streams frameworks are built on the same reactor - and let the framework own rearming and handler lifetime instead of re-implementing them.",
+      "code_sketch": "class Session : public ACE_Svc_Handler<ACE_SOCK_Stream, ACE_NULL_SYNCH> {\n  int handle_input(ACE_HANDLE) override { return svc(); }   /* the hook the reactor calls */\n};\n\nACE_Reactor::instance()->register_handler(listener, ACE_Event_Handler::ACCEPT_MASK);\nACE_Reactor::instance()->run_reactor_event_loop();          /* the dispatch loop */",
+      "pitfalls": [
+        "ACE ties handlers to its own frameworks and configuration; pulling in ACE for one loop is rarely worth it unless the Service Configurator/Acceptor-Connector stack is already in use.",
+        "ACE_TP_Reactor changes the single-thread guarantee: handlers may run concurrently on several threads, so handler state needs its own locking.",
+        "Handler destruction is managed by ACE reference counting and deactivation, so deleting a handler while it is still registered leaves the reactor dispatching through a dangling pointer."
+      ],
+      "sources": [
+        "https://www.dre.vanderbilt.edu/~schmidt/ACE/book2/",
+        "https://www.dre.vanderbilt.edu/~schmidt/patterns-ace.html"
+      ]
+    },
+    {
+      "variant_id": "raw-epoll-loop",
+      "name": "Hand-written epoll loop with a function-style handler table (no framework)",
+      "paradigm": "procedural",
+      "min_standard": "C++17",
+      "idiom_name": "epoll_wait loop + std::function handlers keyed by fd",
+      "implementation_notes": "Without a framework the C++ reactor is the C approach with better types: a std::unordered_map<int, std::function<void(uint32_t)>> (or a std::vector indexed by file descriptor) is the handler registry, epoll_wait is the demultiplexer, and the loop dispatches. std::function and lambdas remove the void-pointer context that the C version needs, and the same one-shot or edge-triggered rearm rules apply. Take this route when a dependency is not acceptable, when the reactor must own threads and affinities explicitly, or when the handles are foreign descriptors for which no framework service exists; otherwise the loop reimplements what Asio already ships.",
+      "code_sketch": "std::unordered_map<int, std::function<void(uint32_t)>> handlers;\nhandlers[fd] = [&](uint32_t events) { on_readable(fd, events); };\n\nfor (;;) {\n    int n = epoll_wait(epfd, evs, MAX_EVENTS, -1);              /* demultiplex */\n    for (int i = 0; i < n; ++i) {\n        auto it = handlers.find(evs[i].data.fd);\n        if (it != handlers.end()) it->second(evs[i].events);    /* dispatch */\n    }\n}",
+      "pitfalls": [
+        "Capturing by reference in the handler table keeps references to objects that may be destroyed while still registered; the classic C++ reactor bug is dispatch through a stale capture, so unregister before destruction and mind the iteration order.",
+        "std::function adds an indirection and a possible allocation on the hottest path; keep the table small, or store member-function pointers plus an object pointer where latency matters.",
+        "Readiness stays level-triggered unless the descriptor is registered with EPOLLET/EPOLLONESHOT, so handlers must drain or rearm exactly as in C."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/epoll.7.html"
+      ]
+    }
+  ],
+  "default_variant": "boost-asio-io-context",
+  "version": "1.0"
+}

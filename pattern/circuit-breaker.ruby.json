@@ -1,0 +1,57 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "ruby",
+  "support": "library",
+  "idiom_name": "Stoplight(name, threshold:, cool_off_time:) with run, fallback and colour",
+  "implementation_notes": "Stoplight is the in-process Ruby realization: Stoplight(name, window_size:, threshold:, cool_off_time:, recovery_threshold:) gives every dependency a traffic light whose run { } executes the block, whose run(fallback) { } serves a lambda while the light is red or yellow, and whose Stoplight::Error::RedLight carries light_name, cool_off_time and retry_after metadata; light.color exposes green/yellow/red for health checks, and the gem ships telemetry, data stores (in-memory, Redis) and an admin panel for manual lock/unlock. It replaces the classic hand-written flag with a colour state machine and needs no framework, so the hand-written form is only justified when the breaker must sit inside a driver (see the Semian variant) or when a single process's state is all that matters.",
+  "code_sketch": "PAYMENTS = Stoplight(\"payments\", threshold: 3, cool_off_time: 30, recovery_threshold: 1)\n\nreceipt = PAYMENTS.run(->(error) { Receipt.degraded(error) }) do\n  api.authorize(order)                 # yellow/red: the fallback runs instead\nend\n\nPAYMENTS.color                         # => \"green\" | \"yellow\" | \"red\"\nPAYMENTS.lock(Stoplight::Color::RED)   # manual override for operations",
+  "pitfalls": [
+    "The light is per process and per name: forked or multi-worker servers each keep their own colour unless a shared data store is configured, so the dependency sees N times the failing calls.",
+    "window_size defaults to nil, meaning errors are never aged out of the window, so a slow trickle of failures eventually turns the light red even if the recent past was healthy.",
+    "The fallback lambda runs whenever the light is not green (receiving nil in red state), so a fallback that calls the same dependency defeats the breaker.",
+    "Rescuing StandardError around run catches the RedLight short circuit together with genuine API errors and can hide which path produced the result."
+  ],
+  "sources": [
+    "https://github.com/bolshakov/stoplight",
+    "https://rubygems.org/gems/stoplight"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "stoplight",
+      "name": "Stoplight gem (traffic-light breaker per system)",
+      "paradigm": "oo",
+      "idiom_name": "Stoplight(name, threshold:, cool_off_time:) with run, fallback and colour",
+      "implementation_notes": "Stoplight is the in-process Ruby realization: Stoplight(name, window_size:, threshold:, cool_off_time:, recovery_threshold:) gives every dependency a traffic light whose run { } executes the block, whose run(fallback) { } serves a lambda while the light is red or yellow, and whose Stoplight::Error::RedLight carries light_name, cool_off_time and retry_after metadata; light.color exposes green/yellow/red for health checks, and the gem ships telemetry, data stores (in-memory, Redis) and an admin panel for manual lock/unlock. It replaces the classic hand-written flag with a colour state machine and needs no framework, so the hand-written form is only justified when the breaker must sit inside a driver (see the Semian variant) or when a single process's state is all that matters.",
+      "code_sketch": "PAYMENTS = Stoplight(\"payments\", threshold: 3, cool_off_time: 30, recovery_threshold: 1)\n\nreceipt = PAYMENTS.run(->(error) { Receipt.degraded(error) }) do\n  api.authorize(order)                 # yellow/red: the fallback runs instead\nend\n\nPAYMENTS.color                         # => \"green\" | \"yellow\" | \"red\"\nPAYMENTS.lock(Stoplight::Color::RED)   # manual override for operations",
+      "pitfalls": [
+        "The light is per process and per name: forked or multi-worker servers each keep their own colour unless a shared data store is configured, so the dependency sees N times the failing calls.",
+        "window_size defaults to nil, meaning errors are never aged out of the window, so a slow trickle of failures eventually turns the light red even if the recent past was healthy.",
+        "The fallback lambda runs whenever the light is not green (receiving nil in red state), so a fallback that calls the same dependency defeats the breaker.",
+        "Rescuing StandardError around run catches the RedLight short circuit together with genuine API errors and can hide which path produced the result."
+      ],
+      "sources": [
+        "https://github.com/bolshakov/stoplight",
+        "https://rubygems.org/gems/stoplight"
+      ]
+    },
+    {
+      "variant_id": "semian",
+      "name": "Semian driver-level breaker with cross-process coordination",
+      "paradigm": "concurrent",
+      "idiom_name": "Semian resource adapters (tickets, error_threshold, error_timeout) raising driver-inherited errors",
+      "implementation_notes": "Semian protects the driver instead of the call site: adapters (mysql2, redis, net_http, activerecord_trilogy, activerecord_postgresql, postgres) are monkey-patched so that every connect or query first asks Semian whether the resource is available, coordinating through SysV semaphores in shared memory plus a shared store, and raising CircuitOpenError or ResourceBusyError which inherit from the driver's own base error class. Configuration sits where the client is created (name, tickets, success_threshold, error_threshold, error_timeout, open_circuit_on_oom and friends), so the breaker and the bulkhead are properties of the resource rather than of a block of application code. Choose it over Stoplight when the guarded unit is a database or Redis connection and the state must be visible to every forked worker; choose Stoplight when an arbitrary block of application code needs a breaker.",
+      "code_sketch": "# Gemfile: gem 'semian', require: %w(semian semian/redis)\n\nclient = Redis.new(semian: {\n  name: \"inventory\", tickets: 4, success_threshold: 2,\n  error_threshold: 4, error_timeout: 20, open_circuit_on_oom: false,\n})\n\nbegin\n  client.get(\"stock:sku\")\nrescue Redis::BaseConnectionError => e     # also covers CircuitOpenError\n  degraded_stock(e)\nend",
+      "pitfalls": [
+        "Coordination is server-wide through shared memory, so it does not span hosts: a fleet still builds one circuit per machine.",
+        "Adapters are opt-in through require, so a forgotten adapter silently leaves the resource unprotected even though the client was configured with semian options.",
+        "Semian's exceptions inherit from the driver's base error class, so rescuing a narrower driver error misses CircuitOpenError and the short circuit escapes as an unhandled exception.",
+        "Configuration is only validated strictly when force_config_validation is enabled; otherwise a mistyped threshold is logged and the breaker keeps its defaults."
+      ],
+      "sources": [
+        "https://github.com/Shopify/semian"
+      ]
+    }
+  ],
+  "default_variant": "stoplight"
+}

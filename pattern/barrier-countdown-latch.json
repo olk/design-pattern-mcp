@@ -1,0 +1,218 @@
+{
+  "category": "concurrency-resilience",
+  "name": "barrier-countdown-latch",
+  "aliases": [
+    "barrier",
+    "countdown latch"
+  ],
+  "intent": "Coordinate a known set of concurrent participants at a phase boundary that releases everyone only after all parties arrive (a reusable barrier), or let one or more waiters observe a fixed number of independent completions (a one-shot countdown latch), with explicit timeout, cancellation and failure propagation instead of ad-hoc counters and polling.",
+  "problem": "Parallel work needs either a true rendezvous - no participant may enter phase N+1 until every declared sibling finished phase N - or a fan-in gate - a collector must not publish until N producers completed. Hand-rolled counters, flags and sleep loops spin, miss wakeups and hide the hardest failure: a worker that exits, throws or is cancelled without signalling leaves an indefinite waiter, while a wrong party count releases incomplete work or never releases at all.",
+  "context": "Shared-memory concurrency or a runtime-managed group of known participants - iterative parallel solvers and simulations, multi-stage batch or map-reduce pipelines, fan-out/fan-in service startup and warm-up, load-test harnesses, and distributed runtimes that expose a stage-wide barrier. Participants run in threads, tasks, processes or orchestrated execution slots; the enclosing scope can name the group, and it must define what happens when one participant never arrives (timeout, abort, broken state or cooperative cancellation).",
+  "benefits": [
+    "Phase alignment without polling: participants block in the scheduler instead of spinning, so waiting costs no CPU and release is immediate once the last party arrives.",
+    "One primitive replaces the ad-hoc counter, and with it the whole class of missed-wakeup bugs: the count, the release condition and the happens-before edge between arrival and continuation live inside the barrier rather than in hand-written flags.",
+    "Reusability by construction: a cyclic barrier resets itself every generation, so a fixed party of workers loops through many phases with one object and no re-allocation.",
+    "A built-in leader slot: the barrier action, PTHREAD_BARRIER_SERIAL_THREAD or is_leader() names exactly one participant to do per-phase work (merge partials, publish state) after everyone arrived and before anyone continues.",
+    "Fan-in collapses to one continuation: a latch turns N completions into a single point a collector can wait on or chain off, with no reduction protocol and no custom accumulator.",
+    "Failure becomes explicit instead of accidental: broken-barrier results, timeouts and abort paths surface a dead or mis-counted participant as an error rather than as a silent hang."
+  ],
+  "tradeoffs": [
+    "Liveness is a group property: the rendezvous releases only when the declared number of participants arrives, so one crashed, cancelled or mis-counted participant blocks everyone. The pattern is only usable together with a break/abort/timeout policy - Java models it as all-or-none BrokenBarrierException, Python as BrokenBarrierError, pthreads as undefined behaviour on a wrong count.",
+    "Lockstep stragglers: every phase costs the slowest participant, so ordinary load imbalance is amplified rather than absorbed, and adding a barrier can turn a mildly unbalanced parallel loop into a serialized one.",
+    "Contention ceiling: the rendezvous is one shared point, so arrivals serialize on a single counter and condition variable (and flush cache lines); scaling flattens well before the CPUs are busy, and very large parties need tiered structures (Phaser, hierarchical barriers) to stay cheap.",
+    "Thread-model mismatch: a blocking wait occupies a thread, so a barrier must not be awaited on an event-loop or UI thread, nor on the same bounded pool that executes the counted work - the classic pool-starvation deadlock.",
+    "Lifecycle confusion: one-shot latches cannot be reset (a fresh instance per round), while cyclic barriers auto-reset; mixing them up either allocates per iteration or silently reuses a generation that was already broken.",
+    "Party bookkeeping is a hard invariant: the count must match the actual participants, dynamic membership needs Phaser-like machinery, and a participant that retires changes the release condition for everyone.",
+    "Diagnosis cost: a stuck barrier looks like a frozen process, and without per-phase logging, timeouts and broken-state checks it is hard to tell a dead worker from a merely slow one."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 5,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 6,
+    "reliability": 7,
+    "security": 4,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Barrier / Latch",
+      "responsibility": "The synchronization object holding the party count (or the remaining count) and the release condition; it owns the generation and broken/aborted state and the memory-visibility edge between the last arrival and every release."
+    },
+    {
+      "role": "Participant",
+      "responsibility": "Performs one phase of work, arrives at the rendezvous and blocks until released; in barrier forms it may be the designated leader for phase-local work."
+    },
+    {
+      "role": "Waiter (collector)",
+      "responsibility": "In the latch form, the single caller that waits for the counted completions and continues - or aborts - when the count reaches zero; it does not perform the counted work itself."
+    },
+    {
+      "role": "Barrier action / phase hook",
+      "responsibility": "Per-phase work executed exactly once per generation after the last arrival and before any release: partial-result reduction, state publication, phase bookkeeping."
+    },
+    {
+      "role": "Completion signaller",
+      "responsibility": "In the latch form, each producer that signals one completion on every exit path, including the error path, so the waiter cannot be stranded by a failure."
+    },
+    {
+      "role": "Cancellation / failure policy",
+      "responsibility": "The defined behaviour when a participant cannot arrive: timeout, abort or reset, broken-state propagation, or an explicit cancellation signal that releases every waiter instead of letting the group hang."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Iterative parallel solvers and simulations (Jacobi/SOR, domain decomposition, lattice updates) where no worker may read the neighbour state of iteration N+1 before every worker finished iteration N.",
+    "Map-reduce style batch jobs and shard fan-in: a collector waits for all N shards - or for the last contributor - before merging and publishing results.",
+    "Service warm-up and fan-out startup: begin accepting traffic only after N caches, connection pools and feature clients report ready, with a bounded wait so a dead dependency fails startup instead of hanging it.",
+    "Parallel test and load-generation harnesses that must have all workers positioned before a timed section starts and release them together.",
+    "Multi-stage pipelines whose workers rendezvous between stages, using the barrier action to swap roles or publish the stage's output before the next stage begins.",
+    "Coordinated checkpointing in long-running workers: a latch per round so a snapshot starts only when every worker reached a safe point.",
+    "Parallel checkout optimization: coordinate multiple independent service calls (inventory, fraud, shipping, loyalty, promotions, pricing) that must all complete before rendering the checkout page, using a barrier to fan-in their results with sub-second latency budgets.",
+    "Distributed simulation synchronization: in agent-based or physics simulations, each simulation step requires all compute nodes to finish their slice before the next timestep begins, ensuring spatial/temporal consistency across the domain.",
+    "Apache Spark's barrier execution mode launches a fixed task set that must enter a stage-wide rendezvous together; use it for gang-scheduled stages, not as a replacement for ordinary Spark task fan-in."
+  ],
+  "avoid_when": [
+    "The work is a plain one-shot fork/join with no phase boundary: join the tasks or threads (Promise.all/Future.all, Task.WhenAll, Future.await, thread::join, or a structured-concurrency scope) instead of introducing a shared synchronizer.",
+    "Only the number of concurrent operations must be bounded: use a counting semaphore, whose permits represent resource capacity and can be reacquired; its release does not mean that a fixed group finished or that phases align.",
+    "The runtime is asynchronous and blocking a thread is unacceptable: use Promise.all, Future.all, CompletableFuture.allOf, asyncio.gather, awaitAll, TaskGroup or the runtime's own async barrier rather than importing a blocking wait.",
+    "Participants are independent and never need to observe each other's phase: a barrier adds coupling, contention and a deadlock surface without providing a useful invariant.",
+    "The fan-in set is unbounded or streams over time: use a queue with an explicit completion signal or an operator-style aggregation that can represent unknown N.",
+    "The runtime already owns task completion and cancellation (for example Promise.all/Future.all, Task.WhenAll, TaskGroup or errgroup): compose those handles so errors propagate instead of hiding them behind a latch.",
+    "The synchronization crosses machines without a runtime-provided distributed barrier: an in-process primitive cannot coordinate remote participants; use the system's distributed coordination protocol instead."
+  ],
+  "anti_patterns": [
+    "Wrong move: use the barrier as a lock -> failure: no participant is excluded and one missing party can stall the group -> instead: use a mutex for ownership or a semaphore for capacity.",
+    "Wrong move: let runtime membership drift from the declared party count -> failure: the barrier releases early or waits forever -> instead: register/deregister with Phaser or adjust membership before the generation.",
+    "Wrong move: perform long or unbounded work after arriving -> failure: one straggler serializes every phase -> instead: finish work before arriving and keep the hook bounded.",
+    "Wrong move: reuse a one-shot latch -> failure: a later await returns immediately on stale completion or cannot be re-armed -> instead: allocate a new latch per round or use a cyclic barrier.",
+    "Wrong move: await on the same bounded pool that runs counted tasks -> failure: the waiter consumes the producer slot and self-deadlocks -> instead: use a separate coordinator or non-blocking task composition.",
+    "Wrong move: implement the rendezvous with polling or unpredicated condition waits -> failure: CPU burn, missed wakeups or races -> instead: use the platform primitive with a predicate and timeout.",
+    "Wrong move: block a barrier wait in an event loop, UI thread or shared coroutine loop -> failure: producers cannot run and the group times out or freezes -> instead: use the async barrier/task combinator or move blocking work off-loop."
+  ],
+  "language_files": {
+    "generic": "barrier-countdown-latch.generic.json",
+    "c": "barrier-countdown-latch.c.json",
+    "cplusplus": "barrier-countdown-latch.cplusplus.json",
+    "csharp": "barrier-countdown-latch.csharp.json",
+    "go": "barrier-countdown-latch.go.json",
+    "java": "barrier-countdown-latch.java.json",
+    "javascript": "barrier-countdown-latch.javascript.json",
+    "kotlin": "barrier-countdown-latch.kotlin.json",
+    "python": "barrier-countdown-latch.python.json",
+    "ruby": "barrier-countdown-latch.ruby.json",
+    "rust": "barrier-countdown-latch.rust.json",
+    "scala": "barrier-countdown-latch.scala.json",
+    "swift": "barrier-countdown-latch.swift.json",
+    "typescript": "barrier-countdown-latch.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "counting-semaphore",
+    "future-promise",
+    "structured-concurrency",
+    "fork-join",
+    "thread-pool",
+    "producer-consumer",
+    "guarded-suspension",
+    "cancellation-token",
+    "active-object"
+  ],
+  "design_principles": [
+    "Declare the rendezvous contract: the party count (or completion count) is part of the interface, and mismatches must be detected rather than absorbed.",
+    "Fail-safe liveness over perfect synchronization: every wait is bounded (timeout, cancellation, abort) so a missing participant degrades the group instead of freezing it.",
+    "Single responsibility: the barrier holds synchronization state only; business state and phase results stay with the participants or the phase hook.",
+    "Separate arrival from work: the phase hook (barrier action or leader slot) runs once per generation and keeps aggregation out of the participants' race.",
+    "Prefer the platform primitive over a hand-rolled counter; when the runtime's concurrency model cannot block, use the runtime's own construct instead of importing a blocking one.",
+    "Structured lifetime: the rendezvous lives inside the scope that owns the participants, so cancelling that scope also releases or aborts the waiters."
+  ],
+  "best_practices": [
+    "Use the standard primitive rather than a shared counter: std::barrier/std::latch, CyclicBarrier/CountDownLatch/Phaser, threading.Barrier/asyncio.Barrier, Barrier/CountdownEvent, sync.WaitGroup plus errgroup, std::sync::Barrier, pthread_barrier_t, DispatchGroup/TaskGroup.",
+    "Always bind the wait: timed await or wait(timeout), a cancellation token, or an abort path, plus a caller-visible error when the rendezvous is broken.",
+    "Decide one-shot versus reusable explicitly - allocate a fresh latch per round or use a cyclic barrier; never reuse a latch by accident.",
+    "Do per-phase aggregation in the barrier action or leader slot rather than in a separate last-arrival protocol.",
+    "Keep the wait off the thread that must also produce: separate pools for producers and the collector, or use the non-blocking combinator form.",
+    "Count and name the participants in one place; adjust the party count whenever membership changes, or use a dynamic primitive (Phaser) when workers come and go.",
+    "Test the failure paths as first-class scenarios - participant skipped, participant throws, cancellation, timeout - and log phases and generations so a hang can be attributed to a participant.",
+    "Wrap the countdown or arrival signal in a finally/defer/try-finally block so that exceptional exits still release the latch/barrier rather than stranding waiters.",
+    "Prefer structured concurrency scopes (TaskGroup, scope::spawn, errgroup) over bare threads with a shared barrier: cancellation of the scope automatically tears down participants rather than leaving them at a dangling rendezvous.",
+    "Log arrival and release events with generation numbers: when a barrier hangs, generation-correlated logs immediately isolate the straggler without requiring a debugger attachment."
+  ],
+  "pitfalls": [
+    "countdown-not-in-final: Wrong move: call countDown(), arrive() or Done() only after successful work -> failure: an exception or cancellation skips the signal and strands every waiter -> instead: signal in finally/defer/ensure and report the worker failure separately. [severity: critical; languages: java, python, go, cpp]",
+    "pool-starvation-deadlock: Awaiting the latch or barrier inside a bounded thread pool while producers also run on that same pool: the waiter occupies a slot the producers need, creating a self-deadlock that only manifests under load. [severity: high; languages: java, python, go]",
+    "one-shot-reuse: Reusing a CountDownLatch or latch equivalent across a second phase without recreating it: the second await returns immediately (count already zero) but the work for that phase has not actually completed, producing silent data corruption or stale results. [severity: critical; languages: java, python, cpp]",
+    "party-count-mismatch: The declared party count does not match the actual number of participants at runtime: workers added, removed, or retried without updating the count cause the barrier to either release early (incomplete work) or hang forever (over-counted). [severity: high; languages: java, python, cpp, rust]",
+    "broken-barrier-not-handled: Catching BrokenBarrierException or BrokenBarrierError and continuing instead of aborting the phase: the barrier is in a broken state and subsequent await calls will immediately throw again, leading to cascading failures that are hard to attribute. [severity: medium; languages: java, python]",
+    "interrupt-status-not-restored: Catching InterruptedException during an await and not re-interrupting the current thread: the interrupt flag is consumed, so the thread appears unaffected but downstream blocking operations will also miss the interrupt, making cancellation unreliable. [severity: medium; languages: java]",
+    "cyclic-barrier-single-party: Using a CyclicBarrier or barrier with a party count of 1: the barrier trips on every single await with no actual synchronization, and the second phase will deadlock because the same thread cannot arrive twice as two distinct parties. [severity: medium; languages: java, python, cpp]",
+    "barrier-in-event-loop: Using a blocking barrier wait (threading.Barrier, CountDownLatch.await) inside an asyncio event loop or UI thread: the loop cannot process other tasks, effectively serializing what should be concurrent work and causing timeouts or UI freeze. [severity: high; languages: python, javascript]",
+    "waitgroup-add-inside-goroutine: Calling WaitGroup.Add() from within the goroutine after it has started instead of before: this races with the Wait() call on the parent and can cause a deadlock that manifests non-deterministically. [severity: critical; languages: go]",
+    "dropped-barrier-while-waiting: Allowing the barrier object to be dropped (Python GC, C++ RAII destructor, Rust Drop) while threads are still waiting: results in undefined behavior (C++ std::terminate, Rust silent corruption, Python BrokenBarrierError). [severity: high; languages: python, cpp, rust]",
+    "await-without-timeout: Wrong move: call an indefinite await()/wait() when a participant or dependency can fail -> failure: the collector hangs forever with no failure boundary -> instead: use a timed wait or cancellation/abort path and treat timeout as group failure. [severity: high; languages: java, python, go, csharp]",
+    "latch-success-confusion: Wrong move: treat a latch reaching zero as proof that every producer succeeded -> failure: a failed worker can still signal completion and the collector publishes partial or invalid state -> instead: record errors/results separately and gate publication on both completion and success. [severity: high; languages: java, python, go, csharp]"
+  ],
+  "version": "1.2",
+  "sources": [
+    "Oracle, Java SE 21 API: java.util.concurrent.CyclicBarrier and CountDownLatch - originating catalog citation for this row (docs/design-patterns.md footnote for Barrier / Countdown Latch).",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CyclicBarrier.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CountDownLatch.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Phaser.html",
+    "https://man7.org/linux/man-pages/man3/pthread_barrier_wait.3p.html",
+    "https://en.cppreference.com/w/cpp/thread/barrier",
+    "https://en.cppreference.com/w/cpp/thread/latch",
+    "https://docs.python.org/3/library/asyncio-sync.html#asyncio.Barrier",
+    "https://docs.python.org/3/library/threading.html#threading.Barrier",
+    "https://github.com/python/cpython/pull/155235",
+    "https://doc.rust-lang.org/std/sync/struct.Barrier.html",
+    "https://docs.rs/tokio/latest/tokio/sync/struct.Barrier.html",
+    "https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "https://pkg.go.dev/sync#WaitGroup",
+    "https://www.baeldung.com/java-cyclicbarrier-countdownlatch",
+    "https://javarevisited.substack.com/p/difference-between-cyclicbarrier",
+    "https://thecodeforge.io/java/countdownlatch-cyclicbarrier-java/",
+    "https://www.javaspecialists.eu/archive/Issue257-CountDownLatch-vs-CyclicBarrier-vs-Phaser.html",
+    "https://scalemind.dev/java/concurrency/one-shot-gates-vs-reusable-barriers-in-java/",
+    "https://medium.com/@gaddamnaveen192/i-used-cyclicbarrier-to-cut-checkout-latency-from-4-seconds-to-under-900ms-in-java-ecfcf3be7eef",
+    "https://stackoverflow.com/questions/4168772/java-concurrency-countdown-latch-vs-cyclic-barrier",
+    "https://jcip.net/",
+    "https://jcip.net/jcip-sample.pdf",
+    "https://www.informit.com/store/java-concurrency-in-practice-9780321349606",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Semaphore.html",
+    "https://www.baeldung.com/java-countdown-latch",
+    "https://www.baeldung.com/java-cyclic-barrier",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.barrier?view=net-10.0",
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/countdownevent",
+    "https://docs.aws.amazon.com/codeguru/detector-library/java/missing-timeout-check-on-latch-await/",
+    "https://spark.apache.org/docs/latest/rdd-programming-guide.html#barrier-execution-mode",
+    "https://www.open-mpi.org/doc/v4.1/man3/MPI_Barrier.3.php"
+  ],
+  "related_patterns_notes": {
+    "counting-semaphore": "controls concurrent access to a limited resource; it does not wait for a fixed group to finish or align phases.",
+    "future-promise": "represents one asynchronous result and composes fan-in; use it instead of a blocking latch when results and failure propagation are already task-shaped.",
+    "structured-concurrency": "scopes child lifetimes and propagates cancellation; it usually replaces a one-shot latch but does not itself create a reusable phase rendezvous.",
+    "fork-join": "joins child tasks after their work; it is the simpler one-shot alternative when no shared phase boundary is needed.",
+    "thread-pool": "supplies execution capacity; do not confuse its worker count with the barrier party count.",
+    "producer-consumer": "decouples work through a queue; it absorbs arrival skew where a barrier intentionally couples workers.",
+    "guarded-suspension": "waits for a state predicate under a guard; it protects a resource or state condition rather than requiring all named parties.",
+    "cancellation-token": "propagates stop intent; pair it with a bounded wait to break a stuck barrier rather than treating cancellation as arrival.",
+    "phaser": "supports dynamic registration and multi-phase advance; choose it when party membership changes and a fixed CyclicBarrier count does not fit.",
+    "staged-event-barrier": "sequences asynchronous stages or events; it can replace a blocking barrier in event-driven runtimes but does not imply thread rendezvous.",
+    "active-object": "serializes requests behind an object's executor; it avoids shared-party waiting rather than aligning independent workers."
+  }
+}

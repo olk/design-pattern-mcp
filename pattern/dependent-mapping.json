@@ -1,0 +1,200 @@
+{
+  "category": "persistence-state",
+  "name": "dependent-mapping",
+  "aliases": [],
+  "intent": "Let the parent object's mapper perform the mapping for a dependent child object, so the child needs no identity, no finder and no mapper of its own while its rows are still loaded, saved and deleted with the parent.",
+  "problem": "A child object exists only in the context of its parent - order lines, tracks on an album, invoice positions - and no other table references it, yet the ordinary one-mapper-per-class approach gives it its own identity, its own finders and its own mapper: API surface and code that suggest an independent lifecycle the domain does not have, and that invite loads and saves out of context. The decision trigger is the child's mapping strategy: map it like any other class, or let the parent's mapper map it as part of the parent?",
+  "context": "Object-relational or document mapping where a parent owns a collection (or a single child) whose lifecycle never outlives the parent, and the store is reached only through the parent. Applies when no other table holds a foreign key to the child, when the child has no meaningful identity of its own (or only a key that is unique within the parent), and when a Data Mapper or an ORM session can drive the child's rows from the parent. It stops applying as soon as another aggregate references the child or the child must be queried on its own.",
+  "benefits": [
+    "One mapper instead of two: the SQL for the whole dependent graph lives in the parent's mapper, so there is no child mapper, no child repository and no child finders to keep consistent.",
+    "A truthful API surface: because the child is unreachable independently, callers cannot load or save it out of context, which removes a whole class of consistency bugs.",
+    "A smaller mapping surface: the child needs no identity field, no equality contract and no change tracking of its own - the parent's save always writes a consistent set.",
+    "Replacement is simple and atomic: the mapper writes the child rows inside the parent's transaction (delete-then-insert or an upsert of the whole collection), so the set is never half-updated.",
+    "The aggregate boundary becomes explicit in code: the parent is the only entry point, which keeps the cluster small and the ownership rules reviewable."
+  ],
+  "tradeoffs": [
+    "Delete-and-reinsert churn: on update the child rows are typically replaced, so their row identity, defaults, created timestamps and audit history are lost - and anything pointing at a child row (foreign key, trigger, log) breaks or goes stale.",
+    "The child is unreachable on its own: no finder, no pagination, no per-child query. Use cases that need one row across many parents must drop to bulk SQL, and if that becomes common the pattern is the wrong fit.",
+    "The precondition is a schema fact, not a design intention: as soon as another table references the child, the replacement strategy either violates the foreign key or silently orphans rows.",
+    "One mapper now knows two mappings: the parent's mapper grows with the child's schema, and the child's mapping cannot be reused by another aggregate.",
+    "Wholesale cascade writes are a data-loss hazard: a parent save deletes the child rows that are no longer attached, so a partially loaded aggregate erases data instead of leaving it alone.",
+    "It hides the store's real cost: the collection is loaded and written as a unit, so a large dependent set turns every parent save into a full rewrite while still looking like a single object update.",
+    "ORM flush ordering can cause unique constraint violations: SQLAlchemy's Unit of Work issues INSERT before DELETE when replacing a collection — if the new child shares unique key values with the old child, the INSERT fires first and violates the constraint before the DELETE runs (a known unresolved issue as of 2026)."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 5,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Parent (Owner)",
+      "responsibility": "The aggregate object that owns the dependents; it is the only entry point, defines their lifecycle, and never exposes a path that saves them independently."
+    },
+    {
+      "role": "Dependent (Child)",
+      "responsibility": "The object mapped through the parent; it has no identity of its own (or only a key unique within the parent), no finder and no mapper, and is not referenced from outside the parent."
+    },
+    {
+      "role": "Parent Mapper",
+      "responsibility": "The Data Mapper for the parent that also performs the dependent's mapping - loading, inserting, updating and deleting the child rows as part of loading and saving the parent."
+    },
+    {
+      "role": "Unit of Work / Session",
+      "responsibility": "Flushes the parent's changes once, so the replacement of the dependent set happens inside a single transaction."
+    },
+    {
+      "role": "Child Table (Store)",
+      "responsibility": "Holds one row per dependent with a foreign key to the parent and no independent access path; an ON DELETE CASCADE backstop keeps a parent delete from leaving rows behind."
+    },
+    {
+      "role": "Client",
+      "responsibility": "Works only through the parent or the parent's repository and never asks the store for a dependent directly."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Order lines, invoice positions or shipment items: rows that exist only inside one parent and are edited through it (Fowler's album/tracks example).",
+    "Value-like children of an aggregate root — address entries, contact methods, tags owned by one aggregate — which are never looked up on their own.",
+    "Legacy schemas where the child table has no natural key of its own and is identified only by the parent's key plus a position column.",
+    "Offline or mobile sync payloads that ship a parent graph as one unit, so the child is written only as part of the parent's message.",
+    "Import or reporting pipelines that rebuild a parent and its details in one transaction and must never leave orphan rows behind.",
+    "Coarse-grained clusters already persisted as one unit (Composite Entity) where the children must be given exactly one write path.",
+    "Owned collections of value objects — e.g. a product's size variants, a customer's historical addresses — where the collection is always loaded as a whole and mutated only through the parent.",
+    "Post/comment hierarchies in a blogging aggregate where comments have no global identity and are only reachable through their parent post.",
+    "Playlist tracks, album tracks, or setlist items: each track belongs to exactly one parent playlist/album and is never referenced by another aggregate.",
+    "Configuration sections or preference rows that are scoped to a single user or tenant and are replaced wholesale on update.",
+    "EF Core owned types (OwnsOne/OwnsMany): the owned type cannot have its own DbSet, is keyed as (owner key, per-item key) or a shadow key, and is loaded, saved and deleted only through the owner — dependent mapping as a first-class modeling concept in Microsoft's ORM.",
+    "JPA @ElementCollection of @Embeddable elements (e.g. Person.nickNames in the Jakarta Persistence spec example): the elements get a collection table keyed by the owner and no entity identity, finder or lifecycle of their own.",
+    "SQLAlchemy's cascade='all, delete-orphan' relationships: a child de-associated from its parent is deleted by the Session, making the parent's Session the single write path for child rows."
+  ],
+  "avoid_when": [
+    "Another aggregate references the child by foreign key: give it its own mapper and identity (Data Mapper plus Identity Field), because replacing it would break the reference.",
+    "Use cases need to query, page or update the child independently: model it as a first-class entity with its own repository rather than as a dependent.",
+    "The child is really a value whose fields belong in the parent's row: map it as Embedded Value (a JPA @Embeddable, an EF complex type) and skip the extra table entirely.",
+    "The dependent set is large or unbounded (logs, audit trails, history): mapping it through the parent means loading and rewriting it whole — use Lazy Load with an independent entity, or Serialized LOB when the graph is only ever read back entire.",
+    "The store is a document database where embedding is the natural mapping (Mongoose subdocuments, Mongo embedded documents): the store already implements the pattern, so there is nothing to decide.",
+    "The child has independent business behaviour that other parts of the system rely on directly — a dependent that is really an entity in disguise will cause constant promotion-and-downgrade churn."
+  ],
+  "language_files": {
+    "generic": "dependent-mapping.generic.json",
+    "c": "dependent-mapping.c.json",
+    "cplusplus": "dependent-mapping.cplusplus.json",
+    "csharp": "dependent-mapping.csharp.json",
+    "go": "dependent-mapping.go.json",
+    "java": "dependent-mapping.java.json",
+    "javascript": "dependent-mapping.javascript.json",
+    "kotlin": "dependent-mapping.kotlin.json",
+    "python": "dependent-mapping.python.json",
+    "ruby": "dependent-mapping.ruby.json",
+    "rust": "dependent-mapping.rust.json",
+    "scala": "dependent-mapping.scala.json",
+    "swift": "dependent-mapping.swift.json",
+    "typescript": "dependent-mapping.typescript.json"
+  },
+  "paradigm": [
+    "oo"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "data-mapper",
+    "composite-entity",
+    "embedded-value",
+    "foreign-key-mapping",
+    "unit-of-work",
+    "identity-map",
+    "lazy-load",
+    "aggregate",
+    "serialized-lob",
+    "association-table-mapping",
+    "value-object",
+    "repository"
+  ],
+  "anti_patterns": [
+    "A child model that still keeps its own service or repository 'for convenience': the second write path defeats the mapping discipline and leaves the aggregate inconsistent.",
+    "Pointing a foreign key from another table at a dependent row: delete-and-reinsert then either fails on the constraint or silently breaks the other table's references.",
+    "Using dependent mapping for a large or unbounded child set: every parent load and save pulls the whole set, so a bounded aggregate degenerates into an accidental BLOB.",
+    "Hiding an independent entity behind the pattern: a child with its own identity, business behaviour and cross-aggregate references is not dependent — it is a domain object that lost its mapper.",
+    "Trusting a cascade flag without checking its semantics: framework cascades only traverse loaded relations, so a partial aggregate silently deletes rows the caller never saw.",
+    "Using cascade='all' or cascade='all, delete-orphan' on a @ManyToOne association: cascades REMOVE upward to a shared parent entity, silently deleting data that other children still reference.",
+    "Relying on Hibernate's automatic dirty-checking to write dependent changes without explicitly marking the parent dirty: unmapped changes to a lazy-loaded dependent do not always propagate to the parent's flush.",
+    "Mixing ORM-level cascade delete with a database-level ON DELETE CASCADE constraint on the same FK: the ORM and the DB both try to manage deletion, causing constraint violations or double-deletions.",
+    "Using @ElementCollection (JPA) for dependent entities that have their own lifecycle events (@PrePersist, @PreRemove): embeddables skip these callbacks, silently dropping required behaviour.",
+    "Exposing a child collection getter on the parent aggregate root that returns a live ORM collection: callers can call .clear() or .remove(index) triggering orphanRemoval DELETE without going through the aggregate's own mutation methods."
+  ],
+  "design_principles": [
+    "Information hiding: the child table, its columns and its key are an implementation detail of the parent's mapping.",
+    "Single responsibility: exactly one object — the parent's mapper — owns the dependent's persistence.",
+    "Explicit aggregate boundary: objects belong together only if their lifecycles coincide, and that boundary decides what may be replaced wholesale.",
+    "Separation of concerns: the child class carries behaviour, the parent's mapper carries both mappings.",
+    "Proportionality: do not pay for an indirection (a child mapper) that the domain cannot use.",
+    "Ownership as a schema constraint: the dependent's FK to the parent plus ON DELETE CASCADE is not just an implementation detail — it is the runtime enforcement of the ownership rule.",
+    "Immutability preference: making dependents immutable simplifies the mapper's job (any change = delete+insert) and eliminates subtle in-memory mutation bugs, at the cost of a less convenient domain API.",
+    "Composition over indirection: when a child has no identity outside its parent, modelling it as a separate entity with a repository is over-engineering that creates multiple write-path hazards."
+  ],
+  "best_practices": [
+    "Check the schema first: no foreign key from any other table may point at the dependent, otherwise it is not dependent.",
+    "Keep the child's identity internal — a composite key of (parent_id, position/index) or (parent_id, ordinal) — not a globally meaningful surrogate.",
+    "Express the ownership in the schema as well as in code: foreign key to the parent plus ON DELETE CASCADE as a backstop so a parent delete cannot leave child rows behind.",
+    "Write the whole dependent set inside one transaction; never leave a window where the parent is saved and the children are not.",
+    "Expose only coarse-grained operations on the parent (addLine, removeLine, reorder) and keep child mutation off the public API.",
+    "Revisit the decision when a child row starts to be referenced or queried on its own: promote it to an entity with its own mapper and identity.",
+    "In JPA/Hibernate, prefer @ElementCollection with @OrderColumn for owned collections of value-like children — it generates efficient per-index UPDATE/DELETE instead of full delete+reinsert.",
+    "In SQLAlchemy, use cascade='all, delete-orphan' with passive_deletes=True and ON DELETE CASCADE at the DB level for large dependent collections to avoid loading every child into the persistence context.",
+    "Consider making children immutable: any modification creates a new instance, and the parent's save always does delete+insert. This avoids the need for the mapper to track in-memory deltas.",
+    "Track changes at the parent level: any mutation to a dependent must mark the parent dirty so the parent's Unit of Work or session triggers the flush.",
+    "In Hibernate, avoid clear()+addAll() on an orphanRemoval collection — it generates DELETE for every old element followed by INSERT for every new one regardless of whether anything changed; use diff-based updates for large collections.",
+    "Use Vlad Mihalcea's aggregate-field pattern (a denormalised balance or count column on the parent) to avoid initialising large dependent collections just to compute derived values.",
+    "For EF Core, prefer ComplexProperty for single-value dependents (EF Core 8+) over OwnsOne when the dependent has no identity and belongs in the parent's table — it has no shadow key and column-level change tracking.",
+    "For EF Core OwnsMany collections, use BeforeSaveBehavior.Delete to intercept and skip unwanted cascades rather than relying on global cascade conventions.",
+    "Periodically audit FK constraints to enforce the 'no external references' precondition: a new foreign key pointing at a dependent row is a schema regression that the application code cannot detect."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (2002) — Dependent Mapping (Object-Relational Structural Patterns, ch. 12).",
+    "https://martinfowler.com/eaaCatalog/dependentMapping.html",
+    "Fowler, ISA: Dependent Mapping (archived mirror) — additional discussion on delete-reinsert strategy, immutability trade-offs, and hierarchy of dependents. http://thierryroussel.free.fr/java/books/martinfowler/www.martinfowler.com/isa/dependentObject.html",
+    "Vlad Mihalcea, 'How does orphanRemoval work with JPA and Hibernate' (2020) — detailed mechanics of orphanRemoval vs CascadeType.ALL, SQL generation, and bidirectional association synchronization. https://vladmihalcea.com/orphanremoval-jpa-hibernate/",
+    "Baeldung, 'JPA CascadeType.REMOVE vs orphanRemoval' (2026) — practical comparison with OrderRequest/LineItem domain, integration test examples, and trigger conditions for each. https://www.baeldung.com/jpa-cascade-remove-vs-orphanremoval",
+    "Ankur, 'JPA Cascade Types in Hibernate 7: A Decision Tree' (2026) — composition vs aggregation cascade strategy, @ManyToOne cascade gotchas, bulk DELETE vs cascading, and performance analysis. https://ankurm.com/master-hibernate-7-the-ultimate-guide-to-jpa-cascade-types/",
+    "The Solid Snake, 'Implementing Aggregate Root In JPA: @OneToMany or @ElementCollection?' (2014) — practical comparison of cascade strategies, orphanRemoval behaviour, @OrderColumn indexing, and Hibernate query generation. https://thesolidsnake.wordpress.com/2014/03/07/implementing-aggregate-root-in-jpa-onetomany-or-elementcollection/",
+    "Benjamin Eberlei (Doctrine Project), 'Aggregate Fields' — aggregate root pattern with balance field for avoiding collection initialisation overhead. https://www.doctrine-project.org/projects/doctrine-orm/en/latest/cookbook/aggregate-fields.html",
+    "Matthias Noback, 'Doctrine ORM and DDD aggregates' (2018) — mapping aggregates to relational schema, child entity identity within aggregate, embeddables vs child entities, and flush-per-aggregate discipline. https://matthiasnoback.nl/2018/06/doctrine-orm-and-ddd-aggregates/",
+    "Gojko Adzic, 'DDD and relational databases – the value object dilemma' (2009) — when to embed value objects, use separate tables, or serialize; hybrid approach for querying normalized + denormalized data. https://gojko.net/2009/09/30/ddd-and-relational-databases-the-value-object-dilemma/",
+    "Steffen, 'Storing Value Objects in Postgres: A Tactical DDD Pattern Approach' (2024) — @Embeddable, @ElementCollection, @AttributeOverrides for persisting value objects with PostgreSQL and Hibernate. https://codecraftsphere.substack.com/p/storing-value-objects-in-postgres",
+    "SQLAlchemy, 'Special Relationship Persistence Patterns' (v2.1) — passive_updates, passive_deletes, post_update, ON UPDATE CASCADE, and large collection handling with WriteOnlyCollection. https://docs.sqlalchemy.org/en/21/orm/relationship_persistence.html",
+    "SQLAlchemy, 'Working with Large Collections' (v2.0) — WriteOnlyCollection, passive_deletes, raiseload strategy, and bulk operations for large dependent collections. https://dokk.org/documentation/sqlalchemy/rel_2_0_23/orm/large_collections/",
+    "GitHub Issue sqlalchemy/sqlalchemy#2765 — 'Cascading with delete-orphan will insert new children before deleting removed children, causing unique constraint violations' (open since 2013, unresolved as of 2026). https://github.com/sqlalchemy/sqlalchemy/issues/2765",
+    "GitHub Discussion sqlalchemy/sqlalchemy#13226 (2026) — duplicate report confirming SQLAlchemy UOW flush ordering inserts before deleting, causing IntegrityError on UNIQUE constraint during collection replacement. https://github.com/sqlalchemy/sqlalchemy/discussions/13226",
+    "Serard.dev, 'Value Objects and Owned Types' (2026) — EF Core ComplexType vs Owned entities decision matrix, @ComplexProperty, OwnsOne/OwnsMany, null semantics, and DDD alignment. https://serard.dev/content/blog/entity-dsl/04-value-objects-and-owned-types.html",
+    "Coding Droplets, 'EF Core Owned Entities vs Complex Types for Value Objects' — ComplexType (EF Core 8+) as preferred mapping for value objects without identity, comparison with OwnsOne/OwnsMany, change tracking differences. https://codingdroplets.com/ef-core-owned-entities-vs-complex-types-value-objects",
+    "Kite Metric, 'Mastering DDD: From ORMs to Aggregates' — transitioning from ORM entities to DDD aggregates, entities vs value objects, repositories, and ORM pitfalls in DDD contexts. https://kitemetric.com/blogs/moving-from-orm-models-to-domain-driven-design-aggregates",
+    "Retheviper, 'JPA / Hibernate Pitfalls I Hit in a Real Product' (2026) — CascadeType.REFRESH lazy loading traps, orphanRemoval full-replacement gotcha, detach() non-cascading gotcha, and flush+refresh double-lifecycle issues. https://blog.retheviper.com/en/posts/jpa-hibernate-pitfalls/",
+    "InformIT, 'Structural Mapping Patterns' (Fowler EAA excerpt) — Dependent Mapping as simplification over Foreign Key Mapping for non-shared collections. https://www.informit.com/articles/article.aspx?p=30661&seqNum=4",
+    "Microsoft Learn, 'Owned Entity Types - EF Core' — OwnsOne/OwnsMany ownership semantics, composite vs surrogate keys for owned collections, no DbSet for owned types, same-table vs separate-table mapping. https://learn.microsoft.com/en-us/ef/core/modeling/owned-entities",
+    "SQLAlchemy, 'Cascades' (v2.1) — delete and delete-orphan cascade semantics, single_parent requirement on many-to-one, and passive_deletes interaction with ON DELETE CASCADE. https://docs.sqlalchemy.org/en/21/orm/cascades.html",
+    "Jakarta Persistence 3.2, @ElementCollection javadoc — collections of basic or embeddable types stored in a separate collection table owned by the entity, lazy by default. https://jakarta.ee/specifications/persistence/3.2/apidocs/jakarta.persistence/jakarta/persistence/elementcollection",
+    "Mongoose, 'SubDocuments' (v9) — embedded subdocument arrays and single nested subdocuments are saved and validated only as part of the top-level document; the store itself implements dependent mapping. https://mongoosejs.com/docs/subdocs.html",
+    "Fowler, 'Orm Hate' (bliki) — the recurring criticism context: ORMs cover most mapping but the hard 10-20% (complex aggregates, bidirectional sync, concurrency) is where dependent/owned mappings get tricky; alternatives include CQRS reads or aggregate-shaped stores. https://martinfowler.com/bliki/OrmHate.html"
+  ],
+  "related_patterns_notes": {
+    "cascade": "cascade",
+    "write-only-collection": "write-only-collection"
+  }
+}

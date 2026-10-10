@@ -1,0 +1,59 @@
+{
+  "pattern": "content-enricher",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "fn enrich(msg, &dyn DataSource) + moka::sync cache + Result-typed failure",
+  "implementation_notes": "Rust has no enricher framework: the realization is a function taking the message and a DataSource (a trait object or a generic bound), resolving the key and returning a new message with the fields filled - ownership makes the merge explicit, and the enriched type can be a distinct struct so 'not yet enriched' is unrepresentable. A concurrent cache (moka::sync) in front of the source absorbs repeated keys with bounding and TTL, and failures are modelled in the return type so 'resource unavailable' cannot be confused with 'field empty'. Choose this for consumers and services that call the resource synchronously or from a spawned task.",
+  "code_sketch": "pub trait CustomerSource { fn find(&self, id: &str) -> Result<Option<Customer>, SourceError>; }\n\npub fn enrich(msg: Order, src: &dyn CustomerSource, cache: &Cache<String, Option<Customer>>)\n    -> Result<EnrichedOrder, SourceError> {\n    let customer = cache.try_get_with(msg.customer_id.clone(), || src.find(&msg.customer_id))\n        .map_err(|e| SourceError::Unavailable(e.to_string()))?;\n    Ok(EnrichedOrder { customer_name: customer.as_ref().map(|c| c.name.clone()), ..msg.into() })\n}",
+  "pitfalls": [
+    "get_with/try_get_with force an owned key, so clone cheaply (Arc<str>) rather than cloning the whole id string per message.",
+    "Never cache the Err arm of the lookup: a transient resource failure cached as 'missing' outlives the outage for the whole TTL.",
+    "In async consumers the datasource reference must be Send + Sync; a &dyn DataSource without those bounds fails to compile inside a spawned task."
+  ],
+  "sources": [
+    "https://docs.rs/moka/latest/moka/sync/struct.Cache.html",
+    "https://docs.rs/tower/latest/tower/trait.Layer.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "datasource-trait",
+      "name": "enrich fn over a DataSource trait with a moka cache",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "fn enrich(msg, &dyn DataSource) + moka::sync cache + Result-typed failure",
+      "implementation_notes": "Rust has no enricher framework: the realization is a function taking the message and a DataSource (a trait object or a generic bound), resolving the key and returning a new message with the fields filled - ownership makes the merge explicit, and the enriched type can be a distinct struct so 'not yet enriched' is unrepresentable. A concurrent cache (moka::sync) in front of the source absorbs repeated keys with bounding and TTL, and failures are modelled in the return type so 'resource unavailable' cannot be confused with 'field empty'. Choose this for consumers and services that call the resource synchronously or from a spawned task.",
+      "code_sketch": "pub trait CustomerSource { fn find(&self, id: &str) -> Result<Option<Customer>, SourceError>; }\n\npub fn enrich(msg: Order, src: &dyn CustomerSource, cache: &Cache<String, Option<Customer>>)\n    -> Result<EnrichedOrder, SourceError> {\n    let customer = cache.try_get_with(msg.customer_id.clone(), || src.find(&msg.customer_id))\n        .map_err(|e| SourceError::Unavailable(e.to_string()))?;\n    Ok(EnrichedOrder { customer_name: customer.as_ref().map(|c| c.name.clone()), ..msg.into() })\n}",
+      "pitfalls": [
+        "get_with/try_get_with force an owned key, so clone cheaply (Arc<str>) rather than cloning the whole id string per message.",
+        "Never cache the Err arm of the lookup: a transient resource failure cached as 'missing' outlives the outage for the whole TTL.",
+        "In async consumers the datasource reference must be Send + Sync; a &dyn DataSource without those bounds fails to compile inside a spawned task."
+      ],
+      "sources": [
+        "https://docs.rs/moka/latest/moka/sync/struct.Cache.html",
+        "https://docs.rs/tower/latest/tower/trait.Layer.html"
+      ]
+    },
+    {
+      "variant_id": "tower-layer",
+      "name": "enrichment as a tower Layer over the inner Service",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "async"
+      ],
+      "idiom_name": "tower::Layer + Service wrapping the request path",
+      "implementation_notes": "In an axum/hyper/tower stack the enricher is middleware: a Layer wraps the inner Service, awaits the resource client and passes an enriched request to the next service, so it composes with timeouts, retries, concurrency limits and tracing in the same ServiceBuilder chain. Use it when enrichment belongs to the request path of a service rather than to a consumer; the enrichment logic itself is still hand-written inside the Layer's call, and poll_ready must be delegated to the inner service.",
+      "code_sketch": "impl<S> Layer<S> for EnrichLayer { type Service = Enrich<S>; /* ... */ }\n\nimpl<S, B> Service<Request<B>> for Enrich<S>\nwhere S: Service<Request<B>> + Clone + Send + 'static {\n    fn call(&mut self, mut req: Request<B>) -> Self::Future {\n        let src = self.source.clone();\n        Box::pin(async move {\n            let id = req.headers()[\"x-customer-id\"].to_str()?.to_owned();\n            req.extensions_mut().insert(src.find(&id).await?);   // enrich the request\n            self.inner.call(req).await\n        })\n    }\n}",
+      "pitfalls": [
+        "poll_ready must be delegated to the inner service; skipping it breaks backpressure and the readiness contract of the stack.",
+        "A per-request lookup adds latency to every call the layer is attached to - cache it or scope the layer to the routes that need enrichment.",
+        "Boxing the future per call is the usual price of an async layer; a named future type avoids it but is markedly harder to maintain."
+      ],
+      "sources": [
+        "https://docs.rs/tower/latest/tower/trait.Layer.html"
+      ]
+    }
+  ],
+  "default_variant": "datasource-trait"
+}

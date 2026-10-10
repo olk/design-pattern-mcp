@@ -1,0 +1,19 @@
+{
+  "pattern": "idempotent-client",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-rolled operation id (getrandom(2)) + deduplication by SQLite UPSERT ON CONFLICT",
+  "implementation_notes": "C has no HTTP client and no retry facility in the standard library, so every part of the pattern is hand-written: draw 16 bytes from getrandom(2) (or /dev/urandom) before the first attempt, render a canonical UUIDv4 string, keep it in the pending-work record, and let the retry loop reuse that same value on every attempt. Detection is delegated to the store rather than to application logic: a UNIQUE index on the key with INSERT ... ON CONFLICT(key) DO NOTHING (or an equivalent conditional insert) makes exactly one attempt the winner, and the affected-row count tells the loser that the operation already ran. Nothing replaces the classic structure here; the one honest simplification is to make the effect itself idempotent - an upsert keyed on a business identifier instead of a key table.",
+  "code_sketch": "unsigned char rnd[16];\ngetrandom(rnd, sizeof rnd, 0);            /* once per logical operation */\nchar key[37];\nuuid4_format(rnd, key);                   /* canonical text form */\nfor (int attempt = 0; attempt < 3; attempt++) {\n    if (charge_send(key, payload) == 0)   /* same key on every attempt */\n        break;\n    sleep_backoff(attempt);\n}\n/* receiver: INSERT INTO charges(req_key, ...) VALUES(?, ...)\n              ON CONFLICT(req_key) DO NOTHING;  then read the change count */",
+  "pitfalls": [
+    "The key must be generated and persisted (fsync the pending-work record) before the first attempt; a key that exists only in a stack buffer is lost on crash and the replay becomes a second charge.",
+    "getrandom(2) blocks until the entropy pool is initialised unless GRND_NONBLOCK is passed, so seed once at start-up rather than drawing inside the retry loop.",
+    "UPSERT arbitrates only when a real UNIQUE or PRIMARY KEY constraint exists; without it the second INSERT succeeds and the deduplication silently disappears."
+  ],
+  "sources": [
+    "https://sqlite.org/lang_upsert.html",
+    "https://man7.org/linux/man-pages/man2/getrandom.2.html",
+    "https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods"
+  ],
+  "version": "1.0"
+}

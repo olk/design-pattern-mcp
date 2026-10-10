@@ -1,0 +1,18 @@
+{
+  "pattern": "aggregator",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "mutex-protected partial-result table + condition variable collector",
+  "implementation_notes": "C has no futures or channels in the standard library, so the classic stateful filter is written directly: a mutex-protected table of partial results keyed by correlation id, an expected-count field, and a pthread_cond_t that the merging thread waits on until the completeness condition (count reached or deadline passed) holds; the merge then runs in that thread and the aggregate is handed to the output queue before the entry is freed. POSIX pthread_mutex_lock/pthread_cond_wait/pthread_cond_timedwait provide the synchronization, and the same lock must cover both the table update and the completeness check so a partial cannot arrive between them. The classic structure stays the right shape whenever sub-messages arrive from independent threads or processes and completion is decided by arrival count rather than by a single join point.",
+  "code_sketch": "pthread_mutex_lock(&agg->lock);\nstruct part *p = table_get_or_add(agg, corr_id, expected);\np->items[p->n++] = msg;                       /* partial result store */\nif (p->n == p->expected || now_ms() >= p->deadline) {\n    struct agg_msg out = merge(p, &p->n);     /* aggregation algorithm */\n    table_remove(agg, corr_id);               /* release state */\n    queue_push(agg->out, out);\n}\npthread_mutex_unlock(&agg->lock);",
+  "pitfalls": [
+    "pthread_cond_wait must be called with the mutex held and re-checked in a while loop (spurious wakeups); a single if lets the collector merge an incomplete aggregate.",
+    "Each correlation entry must be freed exactly once on both the completion and the timeout path, or the table leaks one entry per lost partial.",
+    "A single global mutex serializes every aggregate: partition the table by correlation-id hash and use pthread_cond_timedwait per partition once fan-in grows."
+  ],
+  "sources": [
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cond_wait.html",
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_mutex_lock.html"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,59 @@
+{
+  "pattern": "circuit-breaker",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "CircuitBreaker(system.scheduler, maxFailures, callTimeout, resetTimeout)",
+  "implementation_notes": "The toolkit's own breaker is the Scala default: CircuitBreaker(system.scheduler, maxFailures = 5, callTimeout = 1.second, resetTimeout = 15.seconds) guards futures with withCircuitBreaker, synchronous blocks with withSyncCircuitBreaker and CompletionStage calls from Java, fails fast with CircuitBreakerOpenException, admits only the first call in the half-open state, and can multiply resetTimeout on repeated failures for exponential backoff; defineFailureFn (Try => Boolean) classifies outcomes and onOpen/onClose/onHalfOpen plus onCallSuccess/onCallFailure/onCallTimeout listeners cover observability. Because the breaker is created on first access by configuration name and driven by the actor system's scheduler, the cooldown clock and lookup are managed for you. The hand-rolled variant stays relevant when the application must not depend on the actor toolkit, and the Apache Pekko fork keeps the same API for teams that moved away from Akka's licence.",
+  "code_sketch": "val payments = CircuitBreaker(\n  system.scheduler, maxFailures = 5,\n  callTimeout = 1.second, resetTimeout = 15.seconds)\n  .onOpen(log.warning(\"payments circuit open\"))\n\ndef authorize(order: Order): Future[Receipt] =\n  payments.withCircuitBreaker(api.authorize(order))\n  // open -> CircuitBreakerOpenException: map it to the degraded receipt",
+  "pitfalls": [
+    "The synchronous API blocks the calling thread until the call timeout; inside an actor that stalls the mailbox and on the default execution context it starves the pool, so prefer the Future API.",
+    "Half-open admits only the first call and fails the rest fast, so a burst of callers during recovery sees CircuitBreakerOpenException and must be routed to the fallback.",
+    "State-transition listeners run on the supplied execution context: a slow listener delays every transition and a throwing listener can change breaker behaviour.",
+    "The named form (CircuitBreaker(name)(system)) is cached per name while the constructor form creates a new instance, so mixing the two produces two breakers for one dependency."
+  ],
+  "sources": [
+    "https://pekko.apache.org/docs/pekko/current/common/circuitbreaker.html",
+    "https://doc.akka.io/libraries/akka-core/current/common/circuitbreaker.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "pekko-akka-circuit-breaker",
+      "name": "Pekko/Akka CircuitBreaker (scheduler-backed, Future API)",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "idiom_name": "CircuitBreaker(system.scheduler, maxFailures, callTimeout, resetTimeout)",
+      "implementation_notes": "The toolkit's own breaker is the Scala default: CircuitBreaker(system.scheduler, maxFailures = 5, callTimeout = 1.second, resetTimeout = 15.seconds) guards futures with withCircuitBreaker, synchronous blocks with withSyncCircuitBreaker and CompletionStage calls from Java, fails fast with CircuitBreakerOpenException, admits only the first call in the half-open state, and can multiply resetTimeout on repeated failures for exponential backoff; defineFailureFn (Try => Boolean) classifies outcomes and onOpen/onClose/onHalfOpen plus onCallSuccess/onCallFailure/onCallTimeout listeners cover observability. Because the breaker is created on first access by configuration name and driven by the actor system's scheduler, the cooldown clock and lookup are managed for you. The hand-rolled variant stays relevant when the application must not depend on the actor toolkit, and the Apache Pekko fork keeps the same API for teams that moved away from Akka's licence.",
+      "code_sketch": "val payments = CircuitBreaker(\n  system.scheduler, maxFailures = 5,\n  callTimeout = 1.second, resetTimeout = 15.seconds)\n  .onOpen(log.warning(\"payments circuit open\"))\n\ndef authorize(order: Order): Future[Receipt] =\n  payments.withCircuitBreaker(api.authorize(order))\n  // open -> CircuitBreakerOpenException: map it to the degraded receipt",
+      "pitfalls": [
+        "The synchronous API blocks the calling thread until the call timeout; inside an actor that stalls the mailbox and on the default execution context it starves the pool, so prefer the Future API.",
+        "Half-open admits only the first call and fails the rest fast, so a burst of callers during recovery sees CircuitBreakerOpenException and must be routed to the fallback.",
+        "State-transition listeners run on the supplied execution context: a slow listener delays every transition and a throwing listener can change breaker behaviour.",
+        "The named form (CircuitBreaker(name)(system)) is cached per name while the constructor form creates a new instance, so mixing the two produces two breakers for one dependency."
+      ],
+      "sources": [
+        "https://pekko.apache.org/docs/pekko/current/common/circuitbreaker.html",
+        "https://doc.akka.io/libraries/akka-core/current/common/circuitbreaker.html"
+      ]
+    },
+    {
+      "variant_id": "atomic-future-state-machine",
+      "name": "Hand-rolled AtomicReference state machine over Futures",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "idiom_name": "AtomicReference[State] + Future callbacks + System.nanoTime cooldown",
+      "implementation_notes": "Without the toolkit the breaker is an AtomicReference holding an immutable state (colour, failure count, window start, open-until deadline) updated with a compare-and-set loop, plus an admit/record pair: the hot path is one atomic read, the transition is a CAS, and the cooldown is measured with System.nanoTime() because that is the monotonic clock (System.currentTimeMillis() follows the wall clock). Outcomes are recorded in a Future callback so the protected call stays outside any lock and no thread is blocked, which is the same shape effect systems write as Ref.modify plus a scheduled IO.sleep transition. This is the realization to choose when the application is future-based, when the toolkit must not be a dependency, or when the trip rule is domain-specific such as counting only timeouts.",
+      "code_sketch": "private val state = new AtomicReference[State](Closed)\n\ndef authorize(order: Order)(using ec: ExecutionContext): Future[Receipt] =\n  if (!admit()) Future.failed(CircuitOpen(\"payments\"))\n  else api.authorize(order).andThen { case outcome => record(outcome) }\n\nprivate def admit(): Boolean =\n  @tailrec def go(s: State): Boolean = s match\n    case Open(until) if System.nanoTime() < until => false        // cooling down\n    case s: Open => if (state.compareAndSet(s, HalfOpen(0))) true else go(state.get)\n    case _ => true\n  go(state.get)",
+      "pitfalls": [
+        "System.nanoTime() is the only correct cooldown clock here; System.currentTimeMillis() can open or close the circuit at the wrong moment when the clock is adjusted.",
+        "A CAS loop that allocates a new state on every attempt can spin under contention: keep the state small and immutable, and use a LongAdder for counters if they are hot.",
+        "Outcome recording runs on the execution context as a callback, so an exception thrown there is reported to the context rather than the caller and can go unrecorded, which silently prevents tripping.",
+        "The breaker must be shared per dependency; constructing it inside the request method resets the counters on every call."
+      ],
+      "sources": [
+        "https://docs.scala-lang.org/overviews/core/futures.html"
+      ]
+    }
+  ],
+  "default_variant": "pekko-akka-circuit-breaker"
+}

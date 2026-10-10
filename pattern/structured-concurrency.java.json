@@ -1,0 +1,81 @@
+{
+  "pattern": "structured-concurrency",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "try (var scope = StructuredTaskScope.open()) { scope.fork(...); scope.join(); }",
+  "implementation_notes": "The JEP 505 API opens an owner-scoped task scope in try-with-resources, forks subtasks (virtual threads by default), joins them as a unit, and on close cancels leftovers and waits for them to terminate. The default Joiner fails if any subtask fails and cancels the others; Joiner.anySuccessfulResultOrThrow() gives a race, allSuccessfulOrThrow() and awaitAll() give other completion policies. It requires --enable-preview, fork/join/close may only be called by the owner thread, and subtasks must respond to interruption or close() blocks.",
+  "code_sketch": "try (var scope = StructuredTaskScope.open()) {\n    var user  = scope.fork(() -> findUser(id));\n    var order = scope.fork(() -> fetchOrder(id));\n    scope.join();                    // throws if either subtask failed\n    return new Response(user.get(), order.get());\n}                                    // close(): cancel + join stragglers",
+  "pitfalls": [
+    "close() always waits for interrupted subtasks to finish, so a subtask blocking on non-interruptible calls can delay scope exit indefinitely.",
+    "fork/join/close must be invoked by the owner thread; violations surface as StructureViolationException at run time.",
+    "A Joiner must not be shared across scopes (create one per scope), and Subtask.get() before join() throws."
+  ],
+  "sources": [
+    "https://openjdk.org/jeps/505",
+    "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "structuredtaskscope",
+      "name": "StructuredTaskScope (JEP 505, JDK 25 preview)",
+      "paradigm": "concurrent",
+      "min_standard": "Java25",
+      "requires_features": [
+        "preview APIs"
+      ],
+      "idiom_name": "try (var scope = StructuredTaskScope.open()) { scope.fork(...); scope.join(); }",
+      "implementation_notes": "The JEP 505 API opens an owner-scoped task scope in try-with-resources, forks subtasks (virtual threads by default), joins them as a unit, and on close cancels leftovers and waits for them to terminate. The default Joiner fails if any subtask fails and cancels the others; Joiner.anySuccessfulResultOrThrow() gives a race, allSuccessfulOrThrow() and awaitAll() give other completion policies. It requires --enable-preview, fork/join/close may only be called by the owner thread, and subtasks must respond to interruption or close() blocks.",
+      "code_sketch": "try (var scope = StructuredTaskScope.open()) {\n    var user  = scope.fork(() -> findUser(id));\n    var order = scope.fork(() -> fetchOrder(id));\n    scope.join();                    // throws if either subtask failed\n    return new Response(user.get(), order.get());\n}                                    // close(): cancel + join stragglers",
+      "pitfalls": [
+        "close() always waits for interrupted subtasks to finish, so a subtask blocking on non-interruptible calls can delay scope exit indefinitely.",
+        "fork/join/close must be invoked by the owner thread; violations surface as StructureViolationException at run time.",
+        "A Joiner must not be shared across scopes (create one per scope), and Subtask.get() before join() throws."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/505",
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html"
+      ]
+    },
+    {
+      "variant_id": "executorservice-virtual-threads",
+      "name": "Virtual-thread ExecutorService + invokeAll (stable JDK)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + submit/invokeAll + Future.get",
+      "implementation_notes": "On stable JDKs, virtual threads plus a try-with-resources ExecutorService are the practical realization: submit or invokeAll starts children on virtual threads and Future.get joins them, while the executor's close cancels and waits for the unfinished tasks. Failure does not cancel siblings automatically, so catch the first ExecutionException, cancel the remaining futures and join them before leaving the try block - that explicit dance is what StructuredTaskScope later automates.",
+      "code_sketch": "try (var exec = Executors.newVirtualThreadPerTaskExecutor()) {\n    Future<String> user  = exec.submit(() -> findUser(id));\n    Future<Integer> order = exec.submit(() -> fetchOrder(id));\n    try { return new Response(user.get(), order.get()); }   // join\n    catch (ExecutionException e) { throw new RuntimeException(e.getCause()); }\n}   // close: cancel + wait for the remaining virtual threads",
+      "pitfalls": [
+        "Future.get wraps the real failure in ExecutionException; unwrap getCause() or the scope's error taxonomy is lost.",
+        "There is no automatic sibling cancellation: the first failure leaves the other child running unless it is cancelled explicitly.",
+        "Blocking on get() from a task of a small fixed-size executor can deadlock; with virtual threads the risk shifts to pinning and contended synchronization."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/505",
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html"
+      ]
+    },
+    {
+      "variant_id": "completablefuture-allof",
+      "name": "CompletableFuture.allOf (Java 8 baseline)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.allOf + join() collection",
+      "implementation_notes": "The Java 8 baseline realization is CompletableFuture.allOf: it joins a fixed set of stages and completes only when all of them have, with results collected afterwards via join(). There is no cancellation propagation - a failure still waits for every other stage - so add exceptionally/handle to cancel siblings explicitly, and unwrap CompletionException at the boundary. Use it when the codebase is pinned to Java 8; newer JDKs should prefer StructuredTaskScope or virtual threads.",
+      "code_sketch": "var user  = CompletableFuture.supplyAsync(() -> findUser(id));\nvar order = CompletableFuture.supplyAsync(() -> fetchOrder(id));\nreturn CompletableFuture.allOf(user, order)\n        .thenApply(v -> new Response(user.join(), order.join()));   // join",
+      "pitfalls": [
+        "allOf has no fail-fast semantics: one failure still waits for every remaining stage to finish.",
+        "join()/get() inside a completion stage can block pool threads and deadlock the common pool; compose asynchronously or use explicit executors.",
+        "Failures arrive wrapped in CompletionException, and stages whose errors are never observed surface only later as unhandled."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/505",
+        "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html"
+      ]
+    }
+  ],
+  "default_variant": "structuredtaskscope",
+  "version": "1.0"
+}

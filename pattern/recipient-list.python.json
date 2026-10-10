@@ -1,0 +1,54 @@
+{
+  "pattern": "recipient-list",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "asyncio.TaskGroup fan-out (or gather with return_exceptions)",
+  "implementation_notes": "asyncio.TaskGroup (3.11+) is the structural-concurrency realization: one tg.create_task(deliver(r, copy)) per recipient and the async with block awaits them all on exit, cancelling the siblings when one delivery raises. asyncio.gather(*coros, return_exceptions=True) is the older, continue-on-error form that reports per-recipient outcomes, and Celery/Kombu are only needed when delivery must survive a process restart. Both asyncio forms replace the router component; what remains yours is the recipient computation and the decision between fail-fast and continue.",
+  "code_sketch": "async def fan_out(msg: Message, recipients: list[Recipient]) -> None:\n    async with asyncio.TaskGroup() as tg:        # Python 3.11+\n        for r in recipients:                     # runtime-computed recipient set\n            tg.create_task(r.deliver(copy.deepcopy(msg)))   # own copy per recipient\n    # exiting the block awaits every task and cancels the rest on first failure",
+  "pitfalls": [
+    "A failing delivery is wrapped in an ExceptionGroup, so callers need except* (or gather(return_exceptions=True)) to see per-recipient outcomes rather than one aggregated crash.",
+    "asyncio.create_task holds only a weak reference: a fire-and-forget send that is not stored can be garbage-collected mid-flight.",
+    "A synchronous blocking client (requests, pika) inside a task blocks the whole event loop for every recipient; use the async client or run_in_executor."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "asyncio-task-group-fanout",
+      "name": "asyncio TaskGroup / gather fan-out",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.11",
+      "idiom_name": "asyncio.TaskGroup fan-out (or gather with return_exceptions)",
+      "implementation_notes": "asyncio.TaskGroup (3.11+) is the structural-concurrency realization: one tg.create_task(deliver(r, copy)) per recipient and the async with block awaits them all on exit, cancelling the siblings when one delivery raises. asyncio.gather(*coros, return_exceptions=True) is the older, continue-on-error form that reports per-recipient outcomes, and Celery/Kombu are only needed when delivery must survive a process restart. Both asyncio forms replace the router component; what remains yours is the recipient computation and the decision between fail-fast and continue.",
+      "code_sketch": "async def fan_out(msg: Message, recipients: list[Recipient]) -> None:\n    async with asyncio.TaskGroup() as tg:        # Python 3.11+\n        for r in recipients:                     # runtime-computed recipient set\n            tg.create_task(r.deliver(copy.deepcopy(msg)))   # own copy per recipient\n    # exiting the block awaits every task and cancels the rest on first failure",
+      "pitfalls": [
+        "A failing delivery is wrapped in an ExceptionGroup, so callers need except* (or gather(return_exceptions=True)) to see per-recipient outcomes rather than one aggregated crash.",
+        "asyncio.create_task holds only a weak reference: a fire-and-forget send that is not stored can be garbage-collected mid-flight.",
+        "A synchronous blocking client (requests, pika) inside a task blocks the whole event loop for every recipient; use the async client or run_in_executor."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html"
+      ]
+    },
+    {
+      "variant_id": "celery-broker-fanout",
+      "name": "Celery broker fan-out (durable, cross-process)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "idiom_name": "Celery send_task/apply_async per recipient queue",
+      "implementation_notes": "When the recipients are remote workers and the fan-out must survive a restart, each recipient becomes one published task rather than one asyncio task: the computed recipient data selects the queue, and Celery (or Kombu for raw AMQP) supplies the broker transport, publish retries and acknowledgement semantics. This variant trades latency and a broker dependency for durability and cross-process delivery, and it is the only form that keeps delivering when the producing process dies mid-fan-out. The in-process TaskGroup variant remains the right choice for local, low-latency fan-out.",
+      "code_sketch": "for recipient in resolve_recipients(msg):          # recipient data -> queue name\n    app.send_task(\n        \"notify.deliver\",\n        args=[msg.payload()],\n        queue=recipient.queue,\n        retry=True, retry_policy={\"max_retries\": 3},\n    )   # no result backend => fire-and-forget, per-recipient outcome unknown",
+      "pitfalls": [
+        "Tasks scheduled with eta/countdown live in worker memory until due and are redelivered when a Redis visibility timeout is exceeded - neither is a substitute for durable scheduling.",
+        "apply_async is fire-and-forget by design: without a result backend and correlation ids the fan-out has no per-recipient outcome at all.",
+        "Broker retries can publish a duplicate task; receivers must deduplicate (Idempotent Receiver) because the broker guarantees at-least-once, not exactly-once."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/calling.html"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-task-group-fanout",
+  "version": "1.0"
+}

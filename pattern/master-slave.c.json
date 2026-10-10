@@ -1,0 +1,19 @@
+{
+  "pattern": "master-slave",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread master loop + fixed worker threads over a mutex/condition-variable work queue",
+  "implementation_notes": "C has no worker abstraction, only the primitives: pthread_create starts a worker, pthread_join is the master's join point, and a shared struct guarded by pthread_mutex plus pthread_cond_wait/pthread_cond_broadcast is the work queue. The classic structure is therefore hand-written: partition into jobs, push them under the mutex, signal one waiter per job (broadcast on shutdown), let each worker pop-and-process until it sees the done flag, then join every worker and reduce the partial results - the combine step starts only after the joins, which also order the partial-result memory. OpenMP (taskloop, which generates explicit tasks for a team and can reduce) and MPI (rank 0 as master, ranks 1..N as workers) are the library substitutes when a compiler or runtime can own the decomposition; hand-rolled pthreads remain justified for heterogeneous, long-lived or specially pinned workers, and when the queue itself is the tuning point.",
+  "code_sketch": "/* master: partition, dispatch, join, combine */\nfor (i = 0; i < NWORKERS; i++) pthread_create(&tid[i], NULL, worker, &ctx[i]);\nfor (int lo = 0; lo < n; lo += chunk) {                 /* partition */\n    pthread_mutex_lock(&m);\n    queue_push(&q, (struct job){lo, min(lo + chunk, n)});\n    pthread_cond_signal(&has_work);                     /* dispatch */\n    pthread_mutex_unlock(&m);\n}\npthread_mutex_lock(&m); q.done = 1; pthread_cond_broadcast(&has_work);\npthread_mutex_unlock(&m);\nfor (i = 0; i < NWORKERS; i++) pthread_join(tid[i], NULL);   /* join */\ntotal = reduce(partial, NWORKERS);                           /* combine */",
+  "pitfalls": [
+    "A worker that exits on error leaves the master waiting forever: every wait needs a predicate plus an error/completion flag, so the master can tell 'no work yet' from 'worker died'.",
+    "Signalling without holding the mutex (or before a worker reaches pthread_cond_wait) loses wakeups; push and signal under the same lock and re-check the predicate in a while loop.",
+    "Broadcasting for every queued job thrashes with many workers: signal once per pushed item and reserve broadcast for shutdown, or use a work-stealing deque.",
+    "The result array is read by the master while workers may still write it: an unguarded reduction is a data race; combine only after pthread_join, which is also the synchronisation edge."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_create.3.html",
+    "https://www.openmp.org/spec-html/5.0/openmpsu47.html"
+  ],
+  "version": "1.0"
+}

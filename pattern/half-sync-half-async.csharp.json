@@ -1,0 +1,56 @@
+{
+  "pattern": "half-sync-half-async",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "async/await I/O layer plus a bounded Channel<T> drained by Task.Run workers",
+  "implementation_notes": "The asynchronous layer is ordinary async/await over sockets or HTTP, where the runtime's I/O completion machinery demultiplexes instead of a thread; the queueing layer is a bounded Channel<T> and the synchronous layer is a small set of long-running Task workers started with Task.Run that drain it with await foreach over ReadAllAsync(). BlockingCollection<T> remains the classic alternative where a strictly blocking consumer loop is wanted. Never block the I/O layer (no .Result, no .Wait(), no lock held across an await): a blocked thread-pool thread is the thing this split exists to avoid.",
+  "code_sketch": "var channel = Channel.CreateBounded<Request>(new BoundedChannelOptions(1024) {\n    FullMode = BoundedChannelFullMode.Wait });                       // queueing layer\nvar workers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () => {\n    await foreach (var req in channel.Reader.ReadAllAsync())         // synchronous layer\n        await Handle(req);\n})).ToArray();\n// asynchronous layer: async socket/HTTP reads push into channel.Writer.TryWrite(...)",
+  "pitfalls": [
+    "Blocking a worker with .Result or .Wait() on the async I/O layer converts concurrency into thread-pool starvation.",
+    "A bounded channel must be given a FullMode: the default Wait parks producers forever and looks like a hang unless cancellation and timeouts are handled.",
+    "Task.Run workers are thread-pool threads; a worker that blocks for the duration of a long job needs TaskCreationOptions.LongRunning or a dedicated thread."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.run"
+  ],
+  "variants": [
+    {
+      "variant_id": "channels-pipeline",
+      "name": "System.Threading.Channels with Task workers",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "idiom_name": "async/await I/O layer plus a bounded Channel<T> drained by Task.Run workers",
+      "implementation_notes": "The asynchronous layer is ordinary async/await over sockets or HTTP, where the runtime's I/O completion machinery demultiplexes instead of a thread; the queueing layer is a bounded Channel<T> and the synchronous layer is a small set of long-running Task workers started with Task.Run that drain it with await foreach over ReadAllAsync(). BlockingCollection<T> remains the classic alternative where a strictly blocking consumer loop is wanted. Never block the I/O layer (no .Result, no .Wait(), no lock held across an await): a blocked thread-pool thread is the thing this split exists to avoid.",
+      "code_sketch": "var channel = Channel.CreateBounded<Request>(new BoundedChannelOptions(1024) {\n    FullMode = BoundedChannelFullMode.Wait });                       // queueing layer\nvar workers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () => {\n    await foreach (var req in channel.Reader.ReadAllAsync())         // synchronous layer\n        await Handle(req);\n})).ToArray();\n// asynchronous layer: async socket/HTTP reads push into channel.Writer.TryWrite(...)",
+      "pitfalls": [
+        "Blocking a worker with .Result or .Wait() on the async I/O layer converts concurrency into thread-pool starvation.",
+        "A bounded channel must be given a FullMode: the default Wait parks producers forever and looks like a hang unless cancellation and timeouts are handled.",
+        "Task.Run workers are thread-pool threads; a worker that blocks for the duration of a long job needs TaskCreationOptions.LongRunning or a dedicated thread."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.run"
+      ]
+    },
+    {
+      "variant_id": "blockingcollection-classic",
+      "name": "BlockingCollection<T> with dedicated consumer threads",
+      "paradigm": "oo",
+      "min_standard": "C#4",
+      "idiom_name": "BlockingCollection<T> over a ConcurrentQueue with a dedicated consumer thread per worker",
+      "implementation_notes": "The pre-Channels .NET idiom: a bounded BlockingCollection<T> is the queueing layer, producers add from the asynchronous callbacks (APM or async/await) and a fixed set of dedicated threads blocks in a foreach over GetConsumingEnumerable(). Choose it when targeting .NET Framework or when a purely blocking consumer loop matches existing service code; it costs one OS thread per consumer and offers no async read API.",
+      "code_sketch": "var q = new BlockingCollection<Request>(new ConcurrentQueue<Request>(), 1024);\nvar workers = Enumerable.Range(0, 4).Select(_ => new Thread(() => {\n    foreach (var req in q.GetConsumingEnumerable()) Handle(req);     // blocks\n})).ToArray();\nforeach (var w in workers) w.Start();\n// async layer: q.Add(request) from the I/O completion callback",
+      "pitfalls": [
+        "Mixing Take() with async code deadlocks the thread pool under load; the consumer must stay purely blocking, or use the Channel variant instead.",
+        "GetConsumingEnumerable() never returns until CompleteAdding() is called during shutdown, otherwise workers park forever."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.blockingcollection-1",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.run"
+      ]
+    }
+  ],
+  "default_variant": "channels-pipeline",
+  "version": "1.0"
+}

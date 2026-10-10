@@ -1,0 +1,68 @@
+{
+  "pattern": "recursive-descent-parser",
+  "language": "rust",
+  "support": "manual",
+  "default_variant": "hand-rolled-functions",
+  "idiom_name": "one function per rule over a token slice, Result + ? for positioned errors",
+  "implementation_notes": "Rust's enums, pattern matching and the ? operator make the hand-written parser clean but do not remove it: a token enum (usually with spans), a parser struct holding the slice and an index, one function per rule returning Result<Node, ParseError>, and peek/bump/expect helpers; errors are ordinary values with spans, so a rule fails without unwinding. What replaces the classic structure is the type system rather than a library: the token enum plus exhaustive match is the dispatch, Result is the error path, and the borrow checker forces the cursor design (indices into a slice or a separate token iterator). Keep this form when the grammar is yours, when diagnostics and recovery matter and when dependencies should stay small; pick a combinator variant when the grammar is better declared than coded.",
+  "code_sketch": "struct Parser<'a> { toks: &'a [Token], pos: usize }\nimpl Parser<'_> {\n    fn bump(&mut self) -> &Token { let t = &self.toks[self.pos]; self.pos += 1; t }\n    fn expr(&mut self) -> Result<Node, ParseError> {\n        let mut left = self.term()?;                       // ? propagates positioned errors\n        while matches!(self.toks[self.pos].kind, Kind::Plus | Kind::Minus) {  // loop, not left recursion\n            let op = self.bump().kind;\n            left = Node::Binary(Box::new(left), op, Box::new(self.term()?));\n        }\n        Ok(left)\n    }\n}",
+  "pitfalls": [
+    "Rust has no guaranteed tail-call elimination and stack overflow aborts the process instead of unwinding, so recursive rules need an explicit depth limit for untrusted input.",
+    "Borrowing the token slice immutably while mutating the position works only while the cursor is an index; returning references into the input from rules that also mutate shared state fights the borrow checker - choose indices or an owned token stream deliberately.",
+    "Result-based errors lose recovery information: decide early whether a rule aborts on the first error or collects diagnostics, and give the error type spans so messages can point at the offending token."
+  ],
+  "sources": [
+    "https://docs.rs/nom/latest/nom/",
+    "https://docs.rs/pest/latest/pest/"
+  ],
+  "variants": [
+    {
+      "variant_id": "hand-rolled-functions",
+      "name": "Hand-written functions per rule",
+      "paradigm": "procedural",
+      "idiom_name": "one function per rule over a token slice, Result + ? for positioned errors",
+      "implementation_notes": "Rust's enums, pattern matching and the ? operator make the hand-written parser clean but do not remove it: a token enum (usually with spans), a parser struct holding the slice and an index, one function per rule returning Result<Node, ParseError>, and peek/bump/expect helpers; errors are ordinary values with spans, so a rule fails without unwinding. What replaces the classic structure is the type system rather than a library: the token enum plus exhaustive match is the dispatch, Result is the error path, and the borrow checker forces the cursor design (indices into a slice or a separate token iterator). Keep this form when the grammar is yours, when diagnostics and recovery matter and when dependencies should stay small; pick a combinator variant when the grammar is better declared than coded.",
+      "code_sketch": "struct Parser<'a> { toks: &'a [Token], pos: usize }\nimpl Parser<'_> {\n    fn bump(&mut self) -> &Token { let t = &self.toks[self.pos]; self.pos += 1; t }\n    fn expr(&mut self) -> Result<Node, ParseError> {\n        let mut left = self.term()?;                       // ? propagates positioned errors\n        while matches!(self.toks[self.pos].kind, Kind::Plus | Kind::Minus) {  // loop, not left recursion\n            let op = self.bump().kind;\n            left = Node::Binary(Box::new(left), op, Box::new(self.term()?));\n        }\n        Ok(left)\n    }\n}",
+      "pitfalls": [
+        "Rust has no guaranteed tail-call elimination and stack overflow aborts the process instead of unwinding, so recursive rules need an explicit depth limit for untrusted input.",
+        "Borrowing the token slice immutably while mutating the position works only while the cursor is an index; returning references into the input from rules that also mutate shared state fights the borrow checker - choose indices or an owned token stream deliberately.",
+        "Result-based errors lose recovery information: decide early whether a rule aborts on the first error or collects diagnostics, and give the error type spans so messages can point at the offending token."
+      ],
+      "sources": [
+        "https://docs.rs/nom/latest/nom/",
+        "https://docs.rs/pest/latest/pest/"
+      ]
+    },
+    {
+      "variant_id": "nom-combinators",
+      "name": "nom parser combinators",
+      "paradigm": "functional",
+      "idiom_name": "nom IResult functions composed with alt/opt/many0/delimited",
+      "implementation_notes": "nom is a parser combinator library focused on safe parsing, streaming and zero-copy: a parser is a function from input to IResult (the remaining input plus the output, or a nom error), and rules are composed from combinators such as tag, take_while, alt, opt, many0 and delimited, or written imperatively with ? inside a function. Choose it when the grammar is a pipeline of small recognisers over bytes or &str and zero-copy slices into the input are wanted; the cost is combinator type noise (mitigated by impl Parser and boxing) and error types that must be shaped by hand.",
+      "code_sketch": "use nom::{IResult, Parser, bytes::complete::tag, branch::alt, combinator::opt, multi::many0};\n\nfn sign(i: &str) -> IResult<&str, Option<&str>> {\n    opt(alt((tag(\"+\"), tag(\"-\")))).parse(i)\n}\nfn integer(i: &str) -> IResult<&str, i64> {\n    let (rest, _) = sign(i)?;\n    let (rest, digits) = nom::character::complete::digit1(rest)?;\n    Ok((rest, digits.parse().unwrap()))\n}",
+      "pitfalls": [
+        "nom errors are values with an ErrorKind and an input position, not messages: user-facing diagnostics need a custom error type implementing ParseError and a conversion step.",
+        "Combinators consume input positionally, so a parser that returns a borrowed slice cannot also stream incrementally without the streaming variants; mixing streaming and complete submodules is a classic bug source."
+      ],
+      "sources": [
+        "https://docs.rs/nom/latest/nom/"
+      ]
+    },
+    {
+      "variant_id": "pest-peg-grammar",
+      "name": "pest PEG grammar (.pest file)",
+      "paradigm": "declarative",
+      "idiom_name": "pest_derive #[grammar = \"x.pest\"] + Pairs stream",
+      "implementation_notes": "pest compiles a PEG grammar written in its own .pest syntax into a parser via pest_derive: rules are declarative (expr = { term ~ (\"+\" | \"-\") ~ term }), whitespace and comments are handled by the WHITESPACE/COMMENT special rules, atomic rules suppress them for lexeme-like rules, and PUSH/POP/PEEK match delimiters using a stack. Choose it when the grammar should live in a grammar file with tooling (the pest fiddle, grammar analysis) and ordered choice plus unlimited lookahead is acceptable; the cost is a derive macro, a second language for the grammar, and a pair stream to walk instead of an AST you control.",
+      "code_sketch": "// grammar.pest\n// expr   = { term ~ ((\"+\" | \"-\") ~ term)* }\n// term   = { factor ~ ((\"*\" | \"/\") ~ factor)* }\n// factor = { ASCII_DIGIT+ | \"(\" ~ expr ~ \")\" }\n// WHITESPACE = _{ \" \" | \"\\t\" }\n\n#[derive(pest_derive::Parser)]\n#[grammar = \"grammar.pest\"]\nstruct ExprParser;\n\n// let pairs = ExprParser::parse(Rule::expr, input)?;",
+      "pitfalls": [
+        "The generated pair stream is a flat token-pair sequence, not an AST: building typed nodes means writing a walker over Pairs, and getting the nesting wrong is the common failure.",
+        "WHITESPACE and COMMENT are implicit in non-atomic rules, so a grammar that forgets atomic rules for keywords ends up accepting whitespace inside tokens it should reject."
+      ],
+      "sources": [
+        "https://docs.rs/pest/latest/pest/"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,19 @@
+{
+  "pattern": "message-store",
+  "language": "python",
+  "support": "idiomatic",
+  "idiom_name": "sqlite3 connection in WAL mode + queue.Queue drained by one writer thread",
+  "implementation_notes": "The standard library is the store: sqlite3.connect with explicit transaction control (isolation_level=None plus BEGIN IMMEDIATE/COMMIT, or the autocommit attribute on newer interpreters) decides when a record is durable, PRAGMA journal_mode=WAL lets reporting readers run while the writer appends, and executemany batches the copy so the fsync cost is amortised. The tap is a queue.Queue drained by one writer thread, or asyncio.to_thread from a coroutine, so the request path only enqueues - which is what replaces the classic Store object and interceptor. Retention is a DELETE plus periodic VACUUM on a timer, and reporting queries the same file, ideally through a read-only connection. A SQLAlchemy model over Postgres is the same shape at larger scale; a hand-written Store interface is only justified when several backends must be pluggable.",
+  "code_sketch": "q: queue.Queue[Record] = queue.Queue(maxsize=10_000)\ndef tap(rec: Record) -> None:\n    try:\n        q.put_nowait(rec)          # enqueue only; never write on the request path\n    except queue.Full:\n        DROPS.inc()                # explicit, monitored loss policy\ndef writer(db_path: str) -> None:\n    con = sqlite3.connect(db_path, isolation_level=None)\n    con.execute(\"PRAGMA journal_mode=WAL\")     # readers do not block the writer\n    while (rec := q.get()) is not None:\n        with con:                  # BEGIN/COMMIT per record (or batched)\n            con.execute(\"INSERT OR IGNORE INTO msg_store VALUES (?,?,?,?)\",\n                        (rec.id, rec.channel, rec.at, rec.body_json))",
+  "pitfalls": [
+    "sqlite3 connections are per-thread by default (check_same_thread): the writer-thread design avoids the problem entirely, whereas disabling the check without your own lock corrupts the connection.",
+    "With isolation_level left at its default the module's implicit transactions can stay open across statements, so the retention job and the writer collide with 'database is locked'; WAL plus short explicit transactions is the fix.",
+    "A queue is process-local: a crash of the writer thread loses whatever is still queued, so count and alert on it - otherwise the audit trail's gap is invisible.",
+    "json.dumps of arbitrary payloads can raise or be slow on the request path; serialise in the writer, or store the bytes you already received."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/sqlite3.html",
+    "https://docs.python.org/3/library/queue.html"
+  ],
+  "version": "1.0"
+}

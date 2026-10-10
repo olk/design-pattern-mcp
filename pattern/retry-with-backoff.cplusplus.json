@@ -1,0 +1,57 @@
+{
+  "pattern": "retry-with-backoff",
+  "language": "cplusplus",
+  "support": "manual",
+  "variants": [
+    {
+      "variant_id": "blocking-loop",
+      "name": "Blocking attempt loop with std::this_thread::sleep_for",
+      "paradigm": "procedural",
+      "min_standard": "C++11",
+      "idiom_name": "bounded loop + std::this_thread::sleep_for + <random> jitter",
+      "implementation_notes": "C++ ships no retry facility, so the schedule is a hand-written loop: compute delay = min(cap, base * 2^(attempt-1)), draw the jittered delay from a std::uniform_real_distribution (full jitter), then std::this_thread::sleep_for. The standard requires sleep_for to block for at least the requested duration and recommends measuring that duration with a steady clock, so keep the total budget on std::chrono::steady_clock. The classic blocking form is still justified whenever the calling thread is dedicated to the operation and cancellation is not required; in an io_context-driven service, prefer the timer variant so the wait does not consume a thread.",
+      "code_sketch": "using namespace std::chrono_literals;\nstd::mt19937 rng{std::random_device{}()};\nstd::uniform_real_distribution<double> u01(0.0, 1.0);\nfor (int attempt = 1; attempt <= max_attempts; ++attempt) {\n    auto result = call_dependency();\n    if (result || !transient(result.error())) return result;\n    auto ceiling = std::min(cap, base * (1 << (attempt - 1)));\n    std::this_thread::sleep_for(ceiling * u01(rng));   // full jitter\n}",
+      "pitfalls": [
+        "sleep_for may oversleep (scheduling, resource contention) and a wall-clock budget can drift; measure the total budget on std::chrono::steady_clock.",
+        "A thread parked in sleep_for cannot be interrupted, so shutdown and caller deadlines wait out the full delay; use the timer variant or a condition_variable when cancellation matters.",
+        "Seeding a std::mt19937 from the clock inside the call re-synchronizes concurrent callers; keep one generator per thread (thread_local) or pass one in."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/sleep_for"
+      ]
+    },
+    {
+      "variant_id": "asio-timer-coroutines",
+      "name": "Boost.Asio steady_timer / C++20 coroutine wait",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await boost::asio::steady_timer::async_wait",
+      "implementation_notes": "When the operation already runs on an io_context, the backoff should be a timer event rather than a blocked thread: a boost::asio::steady_timer with expires_after(delay) and async_wait (or co_await with C++20 stackless coroutines) schedules the next attempt while releasing the thread, and the steady_timer typedef selects the steady clock that must measure the delay anyway. Cancellation is explicit: changing the expiry of a pending async_wait cancels it and the handler completes with operation_aborted, which is how a caller deadline or object destruction aborts the retry loop. Choose this variant in event-loop services where a sleeping thread per pending retry would exhaust the pool.",
+      "code_sketch": "asio::steady_timer timer(io);\nfor (int attempt = 1; attempt <= max_attempts; ++attempt) {\n    auto [ec, resp] = co_await client.async_call(as_tuple(use_awaitable));\n    if (!ec || !transient(ec)) co_return resp;\n    timer.expires_after(delay_for(attempt) * jitter01());\n    co_await timer.async_wait(as_tuple(use_awaitable));   // or operation_aborted on cancel\n}",
+      "pitfalls": [
+        "The timer and the operation must share one executor; awaiting a timer on a different context deadlocks or races.",
+        "A cancelled async_wait completes with operation_aborted, which must not be mistaken for a dependency failure and retried.",
+        "Detached co_spawn erases ownership: the retry coroutine must own its state, or the timer and the operation outlive the objects they touch."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    }
+  ],
+  "default_variant": "blocking-loop",
+  "version": "1.0",
+  "idiom_name": "bounded loop + std::this_thread::sleep_for + <random> jitter",
+  "implementation_notes": "C++ ships no retry facility, so the schedule is a hand-written loop: compute delay = min(cap, base * 2^(attempt-1)), draw the jittered delay from a std::uniform_real_distribution (full jitter), then std::this_thread::sleep_for. The standard requires sleep_for to block for at least the requested duration and recommends measuring that duration with a steady clock, so keep the total budget on std::chrono::steady_clock. The classic blocking form is still justified whenever the calling thread is dedicated to the operation and cancellation is not required; in an io_context-driven service, prefer the timer variant so the wait does not consume a thread.",
+  "code_sketch": "using namespace std::chrono_literals;\nstd::mt19937 rng{std::random_device{}()};\nstd::uniform_real_distribution<double> u01(0.0, 1.0);\nfor (int attempt = 1; attempt <= max_attempts; ++attempt) {\n    auto result = call_dependency();\n    if (result || !transient(result.error())) return result;\n    auto ceiling = std::min(cap, base * (1 << (attempt - 1)));\n    std::this_thread::sleep_for(ceiling * u01(rng));   // full jitter\n}",
+  "pitfalls": [
+    "sleep_for may oversleep (scheduling, resource contention) and a wall-clock budget can drift; measure the total budget on std::chrono::steady_clock.",
+    "A thread parked in sleep_for cannot be interrupted, so shutdown and caller deadlines wait out the full delay; use the timer variant or a condition_variable when cancellation matters.",
+    "Seeding a std::mt19937 from the clock inside the call re-synchronizes concurrent callers; keep one generator per thread (thread_local) or pass one in."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/sleep_for"
+  ]
+}

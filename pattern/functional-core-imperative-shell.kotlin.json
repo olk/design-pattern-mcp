@@ -1,0 +1,63 @@
+{
+  "pattern": "functional-core-imperative-shell",
+  "language": "kotlin",
+  "support": "idiomatic",
+  "idiom_name": "val data classes + sealed interface outcomes; shell is main or the Ktor route",
+  "implementation_notes": "Model the core on `data class`es with `val` properties (`copy()` for non-destructive update) and a `sealed interface` for the decision space, and write top-level or `object` functions that are pure - no `Instant.now()`, no repository, no `println`; the shell (a Ktor/Spring route or `main`) loads the data, calls the core and executes the returned decision. Declare dependencies as interfaces in the core but implement them in the shell (a `core/` package of value types plus effect declarations and a `shell/` package of HTTP, DB and pub/sub). That replaces the classic DI service, which is worth keeping only where a framework drives construction; plain functions keep the core testable without a container.",
+  "code_sketch": "data class Reservation(val seats: Int, val taken: Int)\nsealed interface Booking { data class Ok(val ref: String) : Booking\n                           data class Rejected(val reason: String) : Booking }\nfun reserve(r: Reservation, requested: Int, ref: String): Booking =   // pure\n    when {\n        requested <= 0 -> Booking.Rejected(\"invalid seat count\")\n        r.taken + requested > r.seats -> Booking.Rejected(\"no capacity\")\n        else -> Booking.Ok(ref)\n    }\n// shell: val decision = reserve(repo.load(id), body.seats, uuid())\n//        when (decision) { is Ok -> { repo.add(id, body.seats); respond(decision) } }",
+  "pitfalls": [
+    "A `data class` with `var` properties or a `MutableList` field is a mutable value: `copy()` is shallow, and the compiler copies nothing for you, so collections handed across the boundary need `toList()`/immutable copies.",
+    "`suspend` functions are effects - they need a coroutine context and cannot be called from a plain unit test without `runBlocking` - so keep the core non-suspending and let the shell await the IO.",
+    "`kotlin.Result` models *computational* failure (it is designed for `runCatching`), not expected business outcomes; using it for decisions costs an exhaustive `when` and hides the reason - a sealed interface is the idiomatic carrier."
+  ],
+  "sources": [
+    "https://kotlinlang.org/docs/data-classes.html",
+    "https://arrow-kt.io/learn/typed-errors/working-with-typed-errors/"
+  ],
+  "variants": [
+    {
+      "variant_id": "data-class-sealed-core",
+      "name": "Data classes + sealed decisions (Kotlin 1.5)",
+      "paradigm": "functional",
+      "min_standard": "Kotlin1.5",
+      "requires_features": [
+        "sealed-interfaces"
+      ],
+      "idiom_name": "val data classes + sealed interface outcomes; shell is main or the Ktor route",
+      "implementation_notes": "Model the core on `data class`es with `val` properties (`copy()` for non-destructive update) and a `sealed interface` for the decision space, and write top-level or `object` functions that are pure - no `Instant.now()`, no repository, no `println`; the shell (a Ktor/Spring route or `main`) loads the data, calls the core and executes the returned decision. Declare dependencies as interfaces in the core but implement them in the shell (a `core/` package of value types plus effect declarations and a `shell/` package of HTTP, DB and pub/sub). That replaces the classic DI service, which is worth keeping only where a framework drives construction; plain functions keep the core testable without a container.",
+      "code_sketch": "data class Reservation(val seats: Int, val taken: Int)\nsealed interface Booking { data class Ok(val ref: String) : Booking\n                           data class Rejected(val reason: String) : Booking }\nfun reserve(r: Reservation, requested: Int, ref: String): Booking =   // pure\n    when {\n        requested <= 0 -> Booking.Rejected(\"invalid seat count\")\n        r.taken + requested > r.seats -> Booking.Rejected(\"no capacity\")\n        else -> Booking.Ok(ref)\n    }\n// shell: val decision = reserve(repo.load(id), body.seats, uuid())\n//        when (decision) { is Ok -> { repo.add(id, body.seats); respond(decision) } }",
+      "pitfalls": [
+        "A `data class` with `var` properties or a `MutableList` field is a mutable value: `copy()` is shallow, and the compiler copies nothing for you, so collections handed across the boundary need `toList()`/immutable copies.",
+        "`suspend` functions are effects - they need a coroutine context and cannot be called from a plain unit test without `runBlocking` - so keep the core non-suspending and let the shell await the IO.",
+        "`kotlin.Result` models *computational* failure (it is designed for `runCatching`), not expected business outcomes; using it for decisions costs an exhaustive `when` and hides the reason - a sealed interface is the idiomatic carrier."
+      ],
+      "sources": [
+        "https://kotlinlang.org/docs/data-classes.html",
+        "https://arrow-kt.io/learn/typed-errors/working-with-typed-errors/"
+      ]
+    },
+    {
+      "variant_id": "arrow-typed-errors",
+      "name": "Arrow typed errors in the core (Either / Raise)",
+      "paradigm": "functional",
+      "min_standard": "Kotlin1.5",
+      "requires_features": [
+        "arrow-kt"
+      ],
+      "idiom_name": "Either<Problem, Value> / Raise<Problem> from arrow-kt",
+      "implementation_notes": "With Arrow the core's fallible decisions become `Either<Problem, Value>` values (or `Raise<Problem>` computations inside an `either { }` block) instead of exceptions or ad-hoc sealed classes, and the shell only renders left/right at the boundary; `zipOrAccumulate`/`EitherNel` collect several validation problems instead of failing on the first, which is exactly what a pure validation core wants. Choose it when the core has many fallible steps that must stay composable and testable without `try`/`catch`; without the library the data-class/sealed-interface form above is smaller and needs no dependency.",
+      "code_sketch": "sealed interface AgeProblem {\n    object InvalidAge : AgeProblem\n    object NotLegalAdult : AgeProblem\n}\n@JvmInline value class Age(val age: Int)\nfun validAdult(age: Int): Either<AgeProblem, Age> = when {     // pure, arrow-kt\n    age < 0  -> AgeProblem.InvalidAge.left()\n    age < 18 -> AgeProblem.NotLegalAdult.left()\n    else     -> Age(age).right()\n}\n// shell:\n// validAdult(input).fold({ call.respond(BadRequest, it) }, { repo.save(it) })",
+      "pitfalls": [
+        "`Either` puts the error type in every signature: that is fine for pure decision functions, but `Either.catch { ... }` inside the core re-introduces impure exception catching and hides which effects run.",
+        "Accumulation only works for independent checks - `zipOrAccumulate` on rules that must run in sequence reports problems that a fail-fast rule would never have reached.",
+        "Returning `Either` from `suspend`/`Flow` code leaks typed errors into effectful types; unwrap to the decision value before crossing into the shell's coroutines."
+      ],
+      "sources": [
+        "https://arrow-kt.io/learn/typed-errors/wrappers/either-and-ior/",
+        "https://arrow-kt.io/learn/typed-errors/working-with-typed-errors/"
+      ]
+    }
+  ],
+  "default_variant": "data-class-sealed-core",
+  "version": "1.0"
+}

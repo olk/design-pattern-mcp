@@ -1,0 +1,56 @@
+{
+  "pattern": "request-reply",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "buffered reply chan + select on ctx.Done()",
+  "implementation_notes": "Go's channel is the per-request reply channel: the caller allocates a buffered channel, hands it to the request, and selects between the reply and the context's Done channel, so context.WithTimeout supplies the deadline and cancellation instead of a correlation table. The classic structure is only rebuilt when replies arrive on a shared connection: then one reader demultiplexes by request id into a map of channels, or a client library does it - nats.go's Conn.Request allocates an inbox subject, subscribes, publishes and waits with a timeout, returning nats.ErrTimeout when nothing arrives.",
+  "code_sketch": "func Call(ctx context.Context, req Request) (Reply, error) {\n    reply := make(chan Reply, 1)              // buffered: replier never blocks\n    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)\n    defer cancel()\n    bus <- Request{payload: req, reply: reply} // the channel IS the correlation\n    select {\n    case r := <-reply:\n        return r, nil\n    case <-ctx.Done():\n        return Reply{}, ctx.Err()             // deadline or cancellation\n    }\n}",
+  "pitfalls": [
+    "An unbuffered reply channel lets a timed-out caller block the replier forever; buffer it by one or have the replier select on ctx.Done() too.",
+    "time.After allocates a timer that cannot be collected before it fires - prefer context.WithTimeout or a time.Timer that is stopped in hot paths.",
+    "The context deadline cancels only the wait: unless the request carries the same deadline, the replier keeps working on an abandoned request."
+  ],
+  "sources": [
+    "https://pkg.go.dev/context",
+    "https://pkg.go.dev/time"
+  ],
+  "variants": [
+    {
+      "variant_id": "channel-reply-timeout",
+      "name": "Buffered reply channel selected against a context deadline",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.7",
+      "idiom_name": "buffered reply chan + select on ctx.Done()",
+      "implementation_notes": "Go's channel is the per-request reply channel: the caller allocates a buffered channel, hands it to the request, and selects between the reply and the context's Done channel, so context.WithTimeout supplies the deadline and cancellation instead of a correlation table. The classic structure is only rebuilt when replies arrive on a shared connection: then one reader demultiplexes by request id into a map of channels, or a client library does it - nats.go's Conn.Request allocates an inbox subject, subscribes, publishes and waits with a timeout, returning nats.ErrTimeout when nothing arrives.",
+      "code_sketch": "func Call(ctx context.Context, req Request) (Reply, error) {\n    reply := make(chan Reply, 1)              // buffered: replier never blocks\n    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)\n    defer cancel()\n    bus <- Request{payload: req, reply: reply} // the channel IS the correlation\n    select {\n    case r := <-reply:\n        return r, nil\n    case <-ctx.Done():\n        return Reply{}, ctx.Err()             // deadline or cancellation\n    }\n}",
+      "pitfalls": [
+        "An unbuffered reply channel lets a timed-out caller block the replier forever; buffer it by one or have the replier select on ctx.Done() too.",
+        "time.After allocates a timer that cannot be collected before it fires - prefer context.WithTimeout or a time.Timer that is stopped in hot paths.",
+        "The context deadline cancels only the wait: unless the request carries the same deadline, the replier keeps working on an abandoned request."
+      ],
+      "sources": [
+        "https://pkg.go.dev/context",
+        "https://pkg.go.dev/time"
+      ]
+    },
+    {
+      "variant_id": "nats-request-reply",
+      "name": "NATS request with an inbox subject and timeout",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.20",
+      "idiom_name": "nats.go Conn.Request / RequestWithContext",
+      "implementation_notes": "nats.go's Conn.Request(subj, data, timeout) creates a fresh inbox subject, subscribes to it, publishes the request with the reply subject and returns the matching message or nats.ErrTimeout; RequestWithContext ties the wait to a context deadline, and RequestMsg lets the request carry headers. Use it when a broker is already in the stack: it removes the per-call plumbing but adds a broker dependency and hides the reply subject from the application.",
+      "code_sketch": "msg, err := nc.Request(\"orders.status\", payload, 500*time.Millisecond)\nif errors.Is(err, nats.ErrTimeout) {\n    return Status{}, ErrTimeout\n}\nif err != nil {\n    return Status{}, err\n}\nreturn decodeStatus(msg.Data)",
+      "pitfalls": [
+        "One connection multiplexes every request and reply on a single socket, so unlimited in-flight requests share the subscription map - bound concurrency yourself.",
+        "The inbox subscription lives only for the duration of the request: a connection drop mid-call looks like a timeout unless connection status is checked."
+      ],
+      "sources": [
+        "https://pkg.go.dev/github.com/nats-io/nats.go",
+        "https://docs.nats.io/concepts/request-reply"
+      ]
+    }
+  ],
+  "default_variant": "channel-reply-timeout",
+  "version": "1.0"
+}

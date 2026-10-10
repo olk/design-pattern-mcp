@@ -1,0 +1,268 @@
+{
+  "category": "workflow-messaging",
+  "name": "retry",
+  "aliases": [
+    "retry policy",
+    "retry logic"
+  ],
+  "intent": "Re-execute an operation whose failure is known to be transient, up to a bounded number of attempts with a wait between them, so that momentary faults - a reset connection, a throttled or briefly unavailable service, a deadlock victim - are absorbed by the caller instead of surfacing as errors.",
+  "problem": "An operation against a remote or shared resource fails for a reason that is not about the request itself: the connection was reset, the service is momentarily throttled or busy, a transaction was chosen as a deadlock victim, a DNS lookup raced with a failover. The fault is self-correcting - the same call a moment later usually succeeds - but the code that made the call has already given up, so a blip becomes a user-visible error, a failed batch job or an abandoned message.",
+  "context": "Any interaction with a remote or shared resource whose failures are partly transient: HTTP/RPC calls to another service, cloud SDK calls, database transactions that can lose a deadlock race, message-handler invocations, connection establishment. The pattern lives at the call site or in a client/policy layer that wraps it, and it presupposes two things: the failure can be classified (status code, exception type, error code) and repeating the operation is safe (idempotent, or made so by an idempotency key).",
+  "benefits": [
+    "Transient faults stop becoming user-visible failures: a blip that clears in a second costs one retry instead of a failed request, a failed batch or a dead-lettered message.",
+    "The policy lives in one place - attempt budget, delay schedule, retryable errors, exhaustion behaviour - instead of being re-implemented as an ad-hoc loop at every call site, so it can be reviewed, tested and tuned as a unit.",
+    "It composes with the rest of the resilience stack: a retry sits naturally inside a timeout, circuit-breaker or fallback pipeline, and the dominant libraries expose all of those through the same policy object.",
+    "Writing down which errors are retryable forces an explicit failure taxonomy, separating transient infrastructure faults from permanent business errors that must never be repeated.",
+    "Retry state becomes observable: attempt counts, delays and exhaustion events can be logged and exported as metrics, which is what makes 'the dependency is flaky' measurable instead of anecdotal.",
+    "A dependency that recovers needs no manual intervention or replay; the caller's success rate for the common blip case improves at the cost of a delay, not of a redesign."
+  ],
+  "tradeoffs": [
+    "Latency amplification: retries stretch the worst case, and without a total deadline the caller can wait attempts x (call timeout + delay) before it hears about the failure at all.",
+    "Load amplification and retry storms: a dependency that is slow because it is saturated receives every failed call again, and synchronised clients can turn a short blip into an outage - the reason backoff, jitter and retry budgets exist.",
+    "Duplicate side effects: if the request was processed but the response was lost, retrying executes the work twice unless the operation is idempotent or carries an idempotency key.",
+    "Masking: a bounded retry hides a slowly growing permanent fault behind successful-looking latency until the attempt budget runs out; dashboards that only count final failures see nothing until the retries stop working.",
+    "Classification is guesswork on many APIs: retrying only on connection errors misses an HTTP 503, retrying on every exception retries programming errors, and the taxonomy that separates them is rarely documented per endpoint.",
+    "Nested retries multiply: three attempts in the SDK, three in the client and three in the handler make twenty-seven calls for one logical failure, blowing latency budgets and flooding logs.",
+    "Log and alert noise: every attempt looks like a failure, so without level discipline (attempts informational, exhaustion as error) operators are paged for calls that succeed on the second try.",
+    "Retry state must stay per-operation: attempt counters, deadlines and cancellation tokens belong to the call, and sharing one policy object across callers leaks state or blocks them on each other.",
+    "Retry storms are a self-inflicted Denial-of-Wallet (DoW) risk: during a partial outage, retry amplification can drive billing to multiples of baseline even with standard retry policies configured, making cost containment as important as availability."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 4,
+    "reliability": 8,
+    "security": 4,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Retryable operation",
+      "responsibility": "The unit of work being repeated - a call, a transaction, a message-handler invocation. It must be safe to repeat (idempotent) or carry an idempotency key, and it should be a bounded, self-contained action rather than half of a larger workflow."
+    },
+    {
+      "role": "Failure classifier",
+      "responsibility": "Decides whether a given failure is transient and retryable - status codes such as 408/429/5xx, exception types such as connection reset or timeout, error codes such as deadlock victim, serialization failure or EAGAIN - and whether a successful-looking result should also be treated as a failure."
+    },
+    {
+      "role": "Retry policy",
+      "responsibility": "The declarative decision surface: maximum attempts or a time budget, the delay schedule and its jitter, which errors are retryable and which are excluded, and what happens when the budget is exhausted."
+    },
+    {
+      "role": "Attempt executor",
+      "responsibility": "Runs the operation, catches the failure, consults the classifier, keeps the attempt state, waits for the delay and re-invokes - the mechanism the policy configures."
+    },
+    {
+      "role": "Delay mechanism and clock",
+      "responsibility": "Provides the wait between attempts (thread sleep, async timer, scheduler) and the time source the deadline is measured against; on modern platforms it must be cancellable so that a caller deadline or shutdown can stop the retry loop."
+    },
+    {
+      "role": "Exhaustion handler",
+      "responsibility": "The decision after the last attempt: surface the original error, fall back to a degraded result, dead-letter the message or trip a circuit breaker - the place where 'the failure was not transient after all' becomes explicit."
+    },
+    {
+      "role": "Retry budget controller",
+      "responsibility": "A per-service or per-dependency cap that limits retries as a fraction of total request volume (e.g. ≤10 % of traffic), preventing retry amplification from turning a partial outage into a cascade. This is a newer participant that operates alongside the per-call policy to address fleet-wide retry storms."
+    },
+    {
+      "role": "Error-ownership propagator",
+      "responsibility": "In deep call chains (A→B→C→D), attributes errors to their originating downstream (claim/unclaim) so that only the service immediately below the fault retries, preventing exponential fan-out of retries up the call stack."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "HTTP or RPC calls to a service that occasionally returns 429/503 or drops a connection under load.",
+    "Cloud SDK calls (object storage, queues, managed databases) where the provider documents transient error codes and a recommended retry policy.",
+    "Database transactions that can be chosen as deadlock or serialization-failure victims and must be replayed to make progress.",
+    "Message consumers whose handler can fail transiently - a dependency briefly unavailable - where an in-process retry is cheaper than redelivery or dead-lettering.",
+    "Connection establishment and DNS resolution races, which is why gRPC retries some failures transparently even when no retry policy is configured.",
+    "Polling a resource that becomes ready asynchronously (job status, index availability) where the failure to observe a result is temporary by nature.",
+    "Polling a long-running operation or an asynchronously-created resource (build status, document index, batch job outcome) where observing a transient 404 is expected before the resource exists.",
+    "Eventually-consistent reads against a read replica or a CDN where a stale response is preferable to a hard failure.",
+    "External payment or notification webhooks that must succeed at least once, where an idempotency key on the caller's side makes the retry safe.",
+    "Health-check or readiness-probe endpoints that need to survive transient unavailability without tripping alerting thresholds.",
+    "gRPC streaming RPCs where the client reconnects after a transient transport error and needs to resume from the last received sequence number, making the retry part of a larger resumable-stream pattern.",
+    "Kubernetes service mesh (Istio/Envoy) sidecar retry policies for east-west service calls, where retries are configured per-VirtualService route without application code changes.",
+    "Kafka or SQS consumer redelivery with exponential backoff via delayed queue topics or tiered retry topics, where the broker handles redelivery asynchronously rather than the consumer tight-looping.",
+    "GraphQL federation subgraph calls where one subgraph returning a partial error may be retried against an alternative subgraph instance or the same instance after a brief backoff.",
+    "AWS SDK clients configured with Standard or Adaptive retry modes for throttling and transient service errors, using the SDK's retry quota, backoff with jitter, max-attempt setting and (for Adaptive) client-side rate limiter.",
+    ".NET Polly or Java Resilience4j resilience pipelines that wrap a remote call with an exception/result predicate, bounded attempts and a fixed, exponential or randomized delay strategy.",
+    "gRPC method calls configured through a Service Config retryPolicy, which scopes maxAttempts, exponential backoff, retryable status codes and retry throttling to the methods that are safe to replay."
+  ],
+  "avoid_when": [
+    "The failure is permanent or about the request itself (404, validation error, business-rule rejection): fail fast instead and let the caller see the real error.",
+    "The operation is not idempotent and cannot be made so (a payment without an idempotency key): make it idempotent first (Idempotent Receiver / Idempotent Client) or do not retry it.",
+    "The caller has a hard deadline that a retry budget would exceed: propagate the remaining deadline and fail fast rather than spending it on attempts.",
+    "The dependency is hard-down rather than blipping: a circuit breaker should stop the calls while it recovers, and retrying into an outage only adds load.",
+    "The failures are caused by overload on your side or the dependency's: rate limiting or load levelling is the right lever, and retries make it worse.",
+    "A lower layer already retries this call (SDK, ORM, message broker redelivery): configure that layer instead of stacking a second policy on top of it.",
+    "The call chain is deep (4+ hops) and every layer retries independently: the multiplicative fan-out will overwhelm the deepest layer. Disable retries at inner layers and rely on the outermost caller only."
+  ],
+  "language_files": {
+    "generic": "retry.generic.json",
+    "c": "retry.c.json",
+    "cplusplus": "retry.cplusplus.json",
+    "csharp": "retry.csharp.json",
+    "go": "retry.go.json",
+    "java": "retry.java.json",
+    "javascript": "retry.javascript.json",
+    "kotlin": "retry.kotlin.json",
+    "python": "retry.python.json",
+    "ruby": "retry.ruby.json",
+    "rust": "retry.rust.json",
+    "scala": "retry.scala.json",
+    "swift": "retry.swift.json",
+    "typescript": "retry.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "declarative"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [],
+  "anti_patterns": [
+    "Retry forever: an unbounded loop with no attempt cap and no deadline, which turns a permanent failure into a hung thread or a hot loop.",
+    "Immediate retry with no delay against a dependency that is throttling: the retries arrive while the condition that caused the failure is still there.",
+    "Blanket retry on every exception, so null-pointer errors, validation failures and business-rule rejections are attempted again and again.",
+    "Retrying non-idempotent writes without an idempotency key, producing duplicate orders, duplicate charges or duplicate messages.",
+    "Retrying at every layer (SDK + client + handler + broker) with no shared budget, so one logical failure becomes dozens of calls.",
+    "Using retry as the answer to a dependency that is simply too slow or too small: the fix is a circuit breaker, a rate limit or more capacity, not more attempts.",
+    "Retry loops that ignore cancellation and deadlines, keeping processes alive after shutdown and holding requests nobody is waiting for.",
+    "Thundering herd: pure exponential backoff with no jitter, so all clients retry at the same instant, creating a coordinated spike in load on the recovering dependency.",
+    "Retry storm: a widely deployed retry policy with no per-client jitter and no server-aware Retry-After, turned loose during an outage, amplifying load on a dependency that is already overloaded.",
+    "Retry-after-exhaustion: continuing to retry after the caller's deadline has passed, spending resources on work that the original requester will never receive.",
+    "Optimistic retry: retrying a write operation without first confirming that the previous attempt's response was genuinely lost (vs. the operation having succeeded and the response being delayed), producing duplicate effects.",
+    "Retry in deep fan-out chains without error-ownership discipline: when A→B→C→D and D returns an error, if B and C both retry independently before propagating the error, the result is exponential fan-out multiplying load at D by the product of all layers' retry counts.",
+    "Retry storm amplification during partial outage: retrying without a retry budget when a dependency is still partially available can drive billing to multiples of baseline (e.g., 10 % failure rate × 3 retries = 30 % extra load = DoW). Adaptive retry suppression is needed to prevent this.",
+    "Retrying a request where the sidecar mesh (Istio/Envoy) retries by default on 503 without verifying the request reached the destination: if the connection died mid-processing, the retry re-executes the handler, potentially duplicating a payment or write operation."
+  ],
+  "design_principles": [
+    "Explicit failure taxonomy: transient versus permanent is a decision written down per dependency, not guessed by a catch-all.",
+    "Bounded resources: attempts and elapsed time are budgets, and a budget without a bound is a leak.",
+    "Idempotency as a precondition: repeating an operation is only safe if the operation's effect is repeat-safe.",
+    "Separation of mechanism and policy: the loop is fixed, while attempts, delay and classification are configuration.",
+    "Single responsibility: classifying a failure, executing an attempt, waiting and deciding exhaustion are four different jobs.",
+    "Fail fast for the non-retryable: the cheaper the rejection, the sooner the caller can compensate.",
+    "Idempotency before retry: retrying an operation that has unknown side effects is a data-integrity risk, not a resilience tactic.",
+    "Jitter is not optional: in any deployment where more than one client retries the same dependency, un-jittered backoff is a coordinated denial-of-service against that dependency.",
+    "Exhaustion is a signal, not a fallback: when the retry budget is spent, the caller must make an explicit decision — fail, fall back, dead-letter — and that decision must be observable.",
+    "Retry at one layer per hop: configure retries at the outermost caller or at a single well-defined layer; inner layers should propagate failures and let the caller retry, preventing multiplicative fan-out.",
+    "A retry budget at the service level prevents fleet-wide retry amplification during sustained partial outages, complementing per-call attempt limits.",
+    "Error attribution limits blast radius: in a call chain, only the service immediately downstream of the fault should retry; upstream services that merely forward the error must unclaim it and suppress their own retries to contain the retry storm radius."
+  ],
+  "best_practices": [
+    "Bound the retry twice: a maximum attempt count and a maximum total elapsed time, both measured across attempts and delays. Prefer the lesser of the two budgets as the actual cutoff.",
+    "Retry only what you have classified as transient (specific HTTP status codes such as 408/429/500/502/503/504, exception types such as connection reset or timeout, or explicit error codes such as deadlock victim or EAGAIN) and make the excluded list explicit in code, not in comments.",
+    "Make the operation idempotent before you make it retryable: add an idempotency key to POST/PUT requests, use upsert semantics, or rely on the idempotency guarantees of the target API. Retrying a non-idempotent operation is a data-integrity hazard.",
+    "Use a growing delay with jitter. The canonical formula is sleep = min(cap, random(0, base × 2^attempt)) for full jitter, or sleep = min(cap, random(base × 2^attempt / 2, base × 2^attempt)) for equal jitter. Pure exponential backoff without jitter causes a thundering herd when many clients retry simultaneously.",
+    "Honour a server-provided Retry-After header when the protocol offers one (HTTP 503 or 429). Parse it as a delay in seconds or as an absolute HTTP-date and use it in preference to the computed backoff for that attempt. Always add jitter on top of the Retry-After value to desynchronise clients that all received the same Retry-After directive.",
+    "Propagate the caller's remaining deadline and cancellation token into the retry loop. The retry must stop when the caller times out, not when its own attempt budget runs out.",
+    "Give each dependency its own policy object. A database deadlock, an object-store 503, and a downstream HTTP endpoint do not deserve the same attempt count, delay, or timeout.",
+    "Prevent nested retries: if an SDK or ORM already retries some failures, do not add a second retry wrapper on top. Configure the inner layer's retry policy instead of stacking policies.",
+    "Log every attempt at INFO or DEBUG level with the attempt number, the error being retried, and the delay used. Log only the final exhaustion as ERROR. Export attempt counts as a metric (attempts_total, retry_exhausted_total).",
+    "Test the policy with an injected clock and a fake operation: verify that attempt counts match the budget, that delays follow the backoff curve, that classification is correct, and that exhaustion surfaces the right error. Use property-based testing to cover all error-type branches.",
+    "Decide the exhaustion behaviour explicitly and document it: surface the original error, fall back to a cached or degraded result, dead-letter the message, or trip a circuit breaker. Letting the last error escape by accident is an undefined failure mode.",
+    "For background jobs and pipelines, prefer a bounded time budget (e.g., 300 s) over a fixed attempt count, so that slow-but-eventually-successful dependencies do not exhaust the budget early.",
+    "When retrying on HTTP 409 or equivalent conflict errors (ABORTED in gRPC), retry the full read-modify-write sequence, not just the failing write step.",
+    "Implement a per-dependency retry budget (≤10 % of total request volume as retries) in addition to per-call attempt limits. Track retry_to_request_ratio per downstream and disable retries when the ratio exceeds the threshold, preventing a partial outage from escalating into a retry storm. Consider an adaptive controller like RetryGuard that dynamically enables/disables retries based on measured rejection rates.",
+    "Pair retries with distributed tracing: tag each retry attempt with the original trace ID and the attempt count as span attributes (e.g., retry.attempt, original_trace_id). This lets you reconstruct the fan-out graph of a retry storm in Jaeger or Tempo.",
+    "In deep call chains (3+ hops), configure retries only at the outermost layer or at a single intermediate layer closest to the actual failure. Ensure inner layers propagate errors without independent retry, or use an error-ownership scheme to attribute errors to the originating downstream before deciding which service retries.",
+    "In service mesh environments (Istio/Envoy), be explicit about which status codes trigger retries: remove retriable-status-codes from the default mesh retry policy and configure per-service VirtualService retry policies that only retry on explicitly safe conditions (connect-failure, refused-stream, reset, resource-exhausted), never on a blanket 5xx or 503 unless the application team confirms the endpoint is idempotent.",
+    "Instrument three metrics per retry site: retry_attempts_total (labelled by service, endpoint, attempt_number), retry_exhausted_total, and retry_delay_seconds (histogram). Correlate retry_exhausted events with the upstream dependency's error rate to distinguish transient blips from sustained degradation."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Amazon Web Services, AWS Architecture Blog - Exponential Backoff and Jitter (AWS, 2015, updated 2025).",
+    "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/",
+    "Amazon Web Services, AWS Prescriptive Guidance - Retry with Backoff Pattern (AWS, latest edition).",
+    "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/retry-backoff.html",
+    "Amazon Web Services, AWS Well-Architected Framework - Limit Retries (Reliability Pillar).",
+    "https://docs.aws.amazon.com/wellarchitected/2023-04-10/framework/rel_mitigate_interaction_failure_limit_retries.html",
+    "AWS Builder Center - Timeouts, Retries, and Backoff with Jitter (AWS, 2025).",
+    "https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter",
+    "Microsoft, Azure Architecture Center - Cloud Design Patterns: Retry pattern (Azure Architecture Center cloud design pattern catalogue, Microsoft, 2024 edition).",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/retry",
+    "Microsoft, Azure Well-Architected Framework - Handle Transient Faults (Resilience best practices).",
+    "https://learn.microsoft.com/en-us/azure/well-architected/design-guides/handle-transient-faults",
+    "Google Cloud, IAM Documentation - Retry Failed Requests (Google Cloud SRE guidance).",
+    "https://docs.cloud.google.com/iam/docs/retry-strategy",
+    "Google Cloud, Cloud Storage Documentation - Retry Strategy (Google Cloud SRE guidance).",
+    "https://docs.cloud.google.com/storage/docs/retry-strategy",
+    "Martin Fowler, Bliki - Circuit Breaker.",
+    "https://martinfowler.com/bliki/CircuitBreaker.html",
+    "Martin Fowler, Articles - Idempotent Receiver (Patterns of Distributed Systems).",
+    "https://martinfowler.com/articles/patterns-of-distributed-systems/idempotent-receiver.html",
+    "Polly Project - Resilience and Transient-Fault-Handling .NET Library Documentation.",
+    "https://www.pollydocs.org/",
+    "Resilience4j - Retry Module Documentation.",
+    "https://resilience4j.readme.io/docs/retry",
+    "gRPC Project - Retry Design Guide.",
+    "https://grpc.io/docs/guides/retry/",
+    "Tavori et al., RetryGuard: Preventing Self-Inflicted Retry Storms in Cloud Microservices Applications (arXiv:2511.23278, 2025).",
+    "https://arxiv.org/html/2511.23278",
+    "Uber Engineering, How Uber Protects Against Retry Storms - Error Ownership and At-Least-Once Retry Guarantee (Uber, 2026).",
+    "https://www.uber.com/pt/en/blog/protecting-against-retry-storms/",
+    "Istio Documentation - Retry Policy (Istio, 2024-2025).",
+    "https://istio.io/latest/docs/concepts/traffic-management/",
+    "Envoy Proxy Documentation - Automatic Retries (Envoy, 2024).",
+    "https://github.com/envoyproxy/learnenvoy/blob/master/_articles/automatic-retries.md",
+    "Karl Stoney, Retry Policies in Istio - Why the Default Retry Policy Is Not Safe (Karl Stoney, 2024).",
+    "https://karlstoney.com/retry-policies-in-istio/",
+    "Matthew Palma, Exponential Backoff and Retry Storms: Jitter, Retry Budgets, and Why Naive Retries Cause Outages (Matthew Palma, 2026).",
+    "https://matthewpalma.dev/blog/exponential-backoff-retry-storms-jitter-retry-budgets",
+    "Let's Build Solutions, Retry Patterns in Distributed Systems: Exponential Backoff, Jitter, and Dead Letter Queues (Let's Build Solutions, 2026).",
+    "https://letsbuildsolutions.com/blog/system-design/retry-patterns-in-distributed-systems-exponential-backoff-jitter-and-dead-letter-queues/",
+    "Solana Garden, Exponential Backoff and Retry Patterns Explained: Jitter, Budgets and Idempotency (Solana Garden, 2026).",
+    "https://solana.garden/guides/exponential-backoff-retry-patterns-explained/",
+    "Tejas Ghadge, When Do Retry, Backoff, and Jitter Work? (The New Stack, 2025).",
+    "https://thenewstack.io/when-do-retry-backoff-and-jitter-work/",
+    "Vetora Labs, Retry with Exponential Backoff and Jitter - Reliability and Resilience (Vetora Labs, 2026).",
+    "https://vetoralabs.com/system-design/concepts/reliability/retry-backoff-jitter",
+    "Tenacity Documentation - Python Retry Library (Read the Docs, 2024-2025).",
+    "https://tenacity.readthedocs.io/",
+    "Smart TL;DR, Retry Libraries and Tenacity - Deep Dive (Smart TL;DR, 2026).",
+    "https://smarttldr.com/he/topic/python-retry-libraries-tenacity/deep-dive",
+    "Techoral, Python Tenacity: Retry Logic and Backoff Strategies (Techoral, 2026).",
+    "https://techoral.com/python/tenacity-retry.html",
+    "telemetry-sh, retry-storm-lab - Retry Storm Simulation (GitHub, 2026).",
+    "https://github.com/telemetry-sh/retry-storm-lab",
+    "DistributedRequest, Mitigating Thundering Herd During Retry Storms - DistributedRequest Runbook (DistributedRequest, 2026).",
+    "https://www.distributedrequest.com/distributed-coordination-locking-strategies/preventing-race-conditions-in-microservices/mitigating-thundering-herd-during-retry-storms/",
+    "EmergentMind, Retry Storms: Amplification and Mitigation - Research Overview (EmergentMind, 2025).",
+    "https://www.emergentmind.com/topics/retry-storms",
+    "Ofek Lavi, RetryGuard: Preventing Self-Inflicted and Attack-Driven Retry Storms in Cloud Applications (alphaXiv, 2026).",
+    "https://www.alphaxiv.org/abs/2511.23278",
+    "Amazon Web Services, AWS SDKs and Tools - Retry behavior (Standard, Adaptive and Legacy modes).",
+    "https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html",
+    "Amazon Web Services, Boto3 - Retries (max_attempts semantics and retry modes).",
+    "https://docs.aws.amazon.com/boto3/latest/guide/retries.html",
+    "Microsoft, Azure Architecture Center - Retry storm anti-pattern (misuse guidance).",
+    "https://learn.microsoft.com/en-us/azure/architecture/antipatterns/retry-storm/",
+    "Amazon Web Services, Durable Execution SDK - Idempotency and retries.",
+    "https://docs.aws.amazon.com/durable-execution/patterns/best-practices/idempotency/"
+  ],
+  "related_patterns_notes": {
+    "retry-with-backoff": "retry-with-backoff (separate backoff strategy variant)",
+    "circuit-breaker": "circuit-breaker (stops retrying when a dependency is hard-down)",
+    "timeout": "timeout (outer time bound; retry should compose inside it)",
+    "deadline-propagation": "deadline-propagation (caller's remaining time must bound the retry budget)",
+    "idempotent-receiver": "idempotent-receiver (server-side guarantee that a retried request is harmless)",
+    "idempotent-client": "idempotent-client (client-side idempotency key that makes retries safe)",
+    "dead-letter-channel": "dead-letter-channel (exhausted retries become a DLQ message instead of a silent drop)",
+    "bulkhead": "bulkhead (isolates which dependency's retries can affect which caller)",
+    "rate-limiter": "rate-limiter (retry storms are a form of self-inflicted overload; rate limiting is the complement)",
+    "error-ownership-uber-s-propagation-scheme": "only the service immediately below a fault retries; upstream services unclaim the error and do not retry, limiting the blast radius of a retry storm to at most 3 hops)",
+    "retry-guard": "retry-guard (adaptive per-service retry controller that dynamically disables retries when rejection rates or latency exceed a threshold, preventing self-inflicted retry storms and Denial-of-Wallet scenarios)"
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "pattern": "competing-consumers",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "Bounded ring buffer + pthreads (classic structure)",
+  "implementation_notes": "The full structure is hand-written: one bounded ring buffer guarded by a pthread_mutex_t with two condition variables (not-empty and not-full), plus N worker threads that wait for a message, dequeue under the lock, then process it outside the lock. The mutex is what replaces the broker: only one worker can complete a dequeue, so exactly one consumer gets each message, and the not-full condition gives producers backpressure.",
+  "code_sketch": "static void *worker(void *arg) {\n    struct queue *q = arg;\n    for (;;) {\n        pthread_mutex_lock(&q->m);\n        while (q->count == 0) pthread_cond_wait(&q->not_empty, &q->m);\n        job_t j = q->buf[q->tail++ % q->cap]; q->count--;\n        pthread_cond_signal(&q->not_full);\n        pthread_mutex_unlock(&q->m);\n        handle(&j);                        /* process OUTSIDE the lock */\n    }\n}\n/* start N workers on the SAME queue: pthread_create(&t[i], NULL, worker, q); */",
+  "pitfalls": [
+    "Wait predicates must be re-checked in a while loop: spurious wakeups and missed signals otherwise hand a worker an empty queue or park it forever.",
+    "Holding the mutex while processing serialises the pool; dequeue under the lock, work outside it.",
+    "A job is removed before it is handled, so a crash mid-handler loses it - C has no redelivery unless the queue is durable or failed jobs are explicitly re-enqueued."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "pthread-condvar-queue",
+      "name": "Bounded ring buffer + pthreads (classic structure)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "Bounded ring buffer + pthreads (classic structure)",
+      "implementation_notes": "The full structure is hand-written: one bounded ring buffer guarded by a pthread_mutex_t with two condition variables (not-empty and not-full), plus N worker threads that wait for a message, dequeue under the lock, then process it outside the lock. The mutex is what replaces the broker: only one worker can complete a dequeue, so exactly one consumer gets each message, and the not-full condition gives producers backpressure.",
+      "code_sketch": "static void *worker(void *arg) {\n    struct queue *q = arg;\n    for (;;) {\n        pthread_mutex_lock(&q->m);\n        while (q->count == 0) pthread_cond_wait(&q->not_empty, &q->m);\n        job_t j = q->buf[q->tail++ % q->cap]; q->count--;\n        pthread_cond_signal(&q->not_full);\n        pthread_mutex_unlock(&q->m);\n        handle(&j);                        /* process OUTSIDE the lock */\n    }\n}\n/* start N workers on the SAME queue: pthread_create(&t[i], NULL, worker, q); */",
+      "pitfalls": [
+        "Wait predicates must be re-checked in a while loop: spurious wakeups and missed signals otherwise hand a worker an empty queue or park it forever.",
+        "Holding the mutex while processing serialises the pool; dequeue under the lock, work outside it.",
+        "A job is removed before it is handled, so a crash mid-handler loses it - C has no redelivery unless the queue is durable or failed jobs are explicitly re-enqueued."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html"
+      ]
+    },
+    {
+      "variant_id": "posix-mqueue",
+      "name": "POSIX message queue (kernel hand-off)",
+      "paradigm": "concurrent",
+      "min_standard": "POSIX.1b",
+      "idiom_name": "POSIX message queue (kernel hand-off)",
+      "implementation_notes": "POSIX realtime message queues move the delivery rule into the kernel: when several threads or processes are blocked in mq_receive on one queue, exactly one of them receives each message, so the competing-consumer contract needs no hand-written locking. Link with -lrt and respect the queue's own limits (mq_maxmsg, mq_msgsize, /dev/mqueue accounting); the queue is not durable across reboot, so at-least-once semantics still require an acknowledgement protocol or a broker.",
+      "code_sketch": "mqd_t q = mq_open(\"/orders\", O_CREAT | O_RDWR, 0600, NULL);\nfor (int i = 0; i < n; i++)            /* N competing receivers */\n    pthread_create(&t[i], NULL, worker, (void *)(intptr_t)q);\n\nvoid *worker(void *arg) {\n    mqd_t q = (mqd_t)(intptr_t)arg;\n    char buf[MSG_SIZE]; unsigned prio; ssize_t len;\n    while ((len = mq_receive(q, buf, sizeof buf, &prio)) >= 0)\n        handle(buf, (size_t)len);      /* exactly one receiver got it */\n    return NULL;\n}",
+      "pitfalls": [
+        "POSIX queues are not durable across reboot and have small default capacities; they buffer work but do not guarantee it.",
+        "mq_receive copies into a caller buffer sized for the queue's mq_msgsize - a short buffer fails with EMSGSIZE rather than truncating.",
+        "The kernel discards a message as soon as one receiver has read it, so a receiver crashing mid-handle still loses the message."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/mq_receive.3.html"
+      ]
+    }
+  ],
+  "default_variant": "pthread-condvar-queue"
+}

@@ -1,0 +1,76 @@
+{
+  "pattern": "caching",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "LinkedHashMap(accessOrder=true) + removeEldestEntry, wrapped for concurrency",
+  "implementation_notes": "The JDK ships the ingredients, not the cache: extend LinkedHashMap with accessOrder=true and override removeEldestEntry so a hit reorders the doubly linked list and the eldest entry is dropped at capacity - the classic hash table plus recency list in about ten lines. LinkedHashMap is not thread-safe, so shared caches wrap it (Collections.synchronizedMap, or explicit locking of every compound operation), and iteration over the synchronized wrapper still requires holding the map's own lock. Production code generally reaches for Caffeine or the Spring cache abstraction instead; for derived values whose memory may be reclaimed under pressure, SoftReference/WeakReference keyed maps are the JDK fallback.",
+  "code_sketch": "final class LruCache<K, V> extends LinkedHashMap<K, V> {\n    private final int capacity;\n    LruCache(int capacity) { super(capacity, 0.75f, true); this.capacity = capacity; }\n    @Override protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {\n        return size() > capacity;                 // evict least-recently-used\n    }\n}\n// thread-safe handle:\nMap<String, User> cache = Collections.synchronizedMap(new LruCache<>(10_000));\ncache.remove(userId);                             // writer path: invalidate after commit",
+  "pitfalls": [
+    "accessOrder=true makes every get() a structural modification, so an unsynchronized map breaks under concurrent readers - and iterating the synchronized wrapper still needs the map's own lock.",
+    "Caching mutable entities shares them across threads; cache immutable snapshots or defensive copies.",
+    "Softly-referenced values can vanish at any allocation, so get() must handle absence; they are reclaimed under memory pressure, not on invalidation.",
+    "The map's own mutation on get() writes to the entry list; under contention the LRU lock becomes the bottleneck, which is what sharded caches avoid."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashMap.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ref/SoftReference.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "jdk-linkedhashmap-lru",
+      "name": "JDK-only LRU via LinkedHashMap(accessOrder=true)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "LinkedHashMap(accessOrder=true) + removeEldestEntry, wrapped for concurrency",
+      "implementation_notes": "The JDK ships the ingredients, not the cache: extend LinkedHashMap with accessOrder=true and override removeEldestEntry so a hit reorders the doubly linked list and the eldest entry is dropped at capacity - the classic hash table plus recency list in about ten lines. LinkedHashMap is not thread-safe, so shared caches wrap it (Collections.synchronizedMap, or explicit locking of every compound operation), and iteration over the synchronized wrapper still requires holding the map's own lock. Production code generally reaches for Caffeine or the Spring cache abstraction instead; for derived values whose memory may be reclaimed under pressure, SoftReference/WeakReference keyed maps are the JDK fallback.",
+      "code_sketch": "final class LruCache<K, V> extends LinkedHashMap<K, V> {\n    private final int capacity;\n    LruCache(int capacity) { super(capacity, 0.75f, true); this.capacity = capacity; }\n    @Override protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {\n        return size() > capacity;                 // evict least-recently-used\n    }\n}\n// thread-safe handle:\nMap<String, User> cache = Collections.synchronizedMap(new LruCache<>(10_000));\ncache.remove(userId);                             // writer path: invalidate after commit",
+      "pitfalls": [
+        "accessOrder=true makes every get() a structural modification, so an unsynchronized map breaks under concurrent readers - and iterating the synchronized wrapper still needs the map's own lock.",
+        "Caching mutable entities shares them across threads; cache immutable snapshots or defensive copies.",
+        "Softly-referenced values can vanish at any allocation, so get() must handle absence; they are reclaimed under memory pressure, not on invalidation.",
+        "The map's own mutation on get() writes to the entry list; under contention the LRU lock becomes the bottleneck, which is what sharded caches avoid."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashMap.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ref/SoftReference.html"
+      ]
+    },
+    {
+      "variant_id": "caffeine-cache",
+      "name": "Caffeine cache with statistics (JVM library)",
+      "paradigm": "concurrent",
+      "min_standard": "Java11",
+      "idiom_name": "Caffeine.newBuilder().maximumSize().expireAfterWrite().build(loader)",
+      "implementation_notes": "Caffeine is the de-facto JVM cache: Caffeine.newBuilder().maximumSize(...)/maximumWeight(...).weigher(...).expireAfterWrite(...).refreshAfterWrite(...).recordStats().build(loader) returns a Cache whose get(key, mappingFunction) loads atomically per key (no duplicate loads), whose refreshAfterWrite keeps serving the old value while refreshing asynchronously, and whose stats() expose hit, miss and eviction rates. AsyncCache/AsyncLoadingCache wrap CompletableFuture for non-blocking loaders. Choose it over the JDK idiom when eviction quality (Window TinyLFU), statistics or stampede-free loading matter.",
+      "code_sketch": "LoadingCache<Long, Product> cache = Caffeine.newBuilder()\n    .maximumSize(10_000)\n    .expireAfterWrite(Duration.ofMinutes(10))\n    .refreshAfterWrite(Duration.ofMinutes(2))\n    .recordStats()\n    .build(key -> repo.load(key));\n\nProduct p = cache.get(id);          // single load per key, even under concurrency\ncache.invalidate(id);               // writer path after commit\ncache.stats().hitRate();            // prove the cache earns its keep",
+      "pitfalls": [
+        "refreshAfterWrite requires a loader (build(CacheLoader)) and an executor; with plain build() the mapping function runs on the calling thread and a slow one blocks callers.",
+        "Caffeine is not distributed: maximumSize is per JVM, so several instances hold independently inconsistent copies unless a shared tier backs it.",
+        "get() returns a reference to the cached object: mutating it mutates every hit for every thread."
+      ],
+      "sources": [
+        "https://github.com/ben-manes/caffeine/wiki"
+      ]
+    },
+    {
+      "variant_id": "spring-cacheable",
+      "name": "Spring declarative caching (@Cacheable / @CacheEvict)",
+      "paradigm": "declarative",
+      "min_standard": "Java8",
+      "idiom_name": "@Cacheable / @CachePut / @CacheEvict over a CacheManager",
+      "implementation_notes": "Spring's cache abstraction makes retention and invalidation declarative: @Cacheable on the read method performs cache-aside without code, @CachePut updates the entry with the new value on writes and @CacheEvict removes it (allEntries or beforeInvocation as needed), while the CacheManager decides whether that is a ConcurrentMapCache, Caffeine or Redis. Keys come from a KeyGenerator or a SpEL key expression, so the canonical-key rule lives in one annotation instead of at every call site; sync=true gives single-flight semantics for the annotated method. Choose it inside Spring applications where the write paths are service methods - it does not apply to calls that bypass the proxy.",
+      "code_sketch": "@Cacheable(cacheNames = \"products\", key = \"#id\")\npublic Product find(long id) { return repo.load(id); }\n\n@CachePut(cacheNames = \"products\", key = \"#p.id\")\npublic Product save(Product p) { return repo.save(p); }\n\n@CacheEvict(cacheNames = \"products\", key = \"#id\")\npublic void delete(long id) { repo.deleteById(id); }",
+      "pitfalls": [
+        "Self-invocation (this.find(...)) bypasses the proxy, so nothing is cached and no error is raised - a classic silent bug.",
+        "The default CacheManager (ConcurrentMapCache) has no eviction or TTL, turning the cache into an unbounded process-wide map unless Caffeine/Redis and explicit expirations are configured.",
+        "Null results are cached unless unless=\"#result == null\" is set, which can mask missing data behind a hit."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html",
+        "https://docs.spring.io/spring-framework/reference/integration/cache.html"
+      ]
+    }
+  ],
+  "default_variant": "jdk-linkedhashmap-lru",
+  "version": "1.1"
+}

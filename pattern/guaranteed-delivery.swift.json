@@ -1,0 +1,67 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "actor DurableOutbox over Data.write(.atomic) + FileHandle.synchronizeFile()",
+  "implementation_notes": "Foundation supplies the primitives, not the pattern: encode the message, write it into the app's spool directory with Data.write(to:options:.atomic) (write to a temporary file plus rename), then call FileHandle.synchronizeFile() - which does not return until memory is flushed - and only then treat the send as accepted; remove the file after the peer acknowledged. An actor serializes spool state and replays the directory on launch, and a BGProcessingTaskRequest schedules retries when the app is not running. No iOS framework offers a durable queue for arbitrary messages, so the classic structure stays hand-written; where delivery is an HTTP upload, the OS-managed background session (next variant) replaces the spool.",
+  "code_sketch": "actor DurableOutbox {\n  func enqueue(_ msg: Message) throws {\n    let url = spoolURL(msg.id)\n    try JSONEncoder().encode(msg).write(to: url, options: .atomic)  // temp + rename\n    let h = try FileHandle(forWritingTo: url)\n    try h.synchronizeFile()          // fsync: this is the commit point\n    try h.close()\n  }\n  func acknowledge(_ id: MessageID) throws {\n    try FileManager.default.removeItem(at: spoolURL(id))\n  }\n}",
+  "pitfalls": [
+    "An .atomic write is not a durability guarantee by itself - the bytes can still sit in the page cache, so synchronizeFile() is what makes the spool entry a commitment.",
+    "App suspension or termination kills in-flight sends, so replay must be driven from launch and from BGTaskScheduler, not from a background thread someone forgot.",
+    "The default data protection class makes the spool unreadable while the device is locked; set a class that allows background replay (for example completeUntilFirstUserAuthentication).",
+    "Container paths change between releases: persist message identifiers, never absolute file URLs, and clean the spool of entries whose ack was never received."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/foundation/filehandle/synchronizefile()",
+    "https://developer.apple.com/documentation/backgroundtasks/bgprocessingtaskrequest"
+  ],
+  "variants": [
+    {
+      "variant_id": "foundation-durable-spool",
+      "name": "Foundation durable spool (atomic write + synchronizeFile)",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.9",
+      "requires_features": [
+        "swift-concurrency"
+      ],
+      "idiom_name": "actor DurableOutbox over Data.write(.atomic) + FileHandle.synchronizeFile()",
+      "implementation_notes": "Foundation supplies the primitives, not the pattern: encode the message, write it into the app's spool directory with Data.write(to:options:.atomic) (write to a temporary file plus rename), then call FileHandle.synchronizeFile() - which does not return until memory is flushed - and only then treat the send as accepted; remove the file after the peer acknowledged. An actor serializes spool state and replays the directory on launch, and a BGProcessingTaskRequest schedules retries when the app is not running. No iOS framework offers a durable queue for arbitrary messages, so the classic structure stays hand-written; where delivery is an HTTP upload, the OS-managed background session (next variant) replaces the spool.",
+      "code_sketch": "actor DurableOutbox {\n  func enqueue(_ msg: Message) throws {\n    let url = spoolURL(msg.id)\n    try JSONEncoder().encode(msg).write(to: url, options: .atomic)  // temp + rename\n    let h = try FileHandle(forWritingTo: url)\n    try h.synchronizeFile()          // fsync: this is the commit point\n    try h.close()\n  }\n  func acknowledge(_ id: MessageID) throws {\n    try FileManager.default.removeItem(at: spoolURL(id))\n  }\n}",
+      "pitfalls": [
+        "An .atomic write is not a durability guarantee by itself - the bytes can still sit in the page cache, so synchronizeFile() is what makes the spool entry a commitment.",
+        "App suspension or termination kills in-flight sends, so replay must be driven from launch and from BGTaskScheduler, not from a background thread someone forgot.",
+        "The default data protection class makes the spool unreadable while the device is locked; set a class that allows background replay (for example completeUntilFirstUserAuthentication).",
+        "Container paths change between releases: persist message identifiers, never absolute file URLs, and clean the spool of entries whose ack was never received."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/foundation/filehandle/synchronizefile()",
+        "https://developer.apple.com/documentation/backgroundtasks/bgprocessingtaskrequest"
+      ]
+    },
+    {
+      "variant_id": "background-urlsession",
+      "name": "OS-managed background URLSession upload",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "urlsession-background"
+      ],
+      "idiom_name": "URLSessionConfiguration.background(withIdentifier:) + sessionSendsLaunchEvents",
+      "implementation_notes": "For HTTP sinks, Apple's background transfer system is the durable store and the retry engine: a URLSessionConfiguration.background(withIdentifier:) session hands upload tasks to the system daemon, which retries them across app suspension and termination and relaunches the app when a transfer completes (sessionSendsLaunchEvents = true; the app must call the stored completion handler in application(_:handleEventsForBackgroundURLSession:)). Uploading from a file keeps the payload on disk until the transfer finishes. Use it where delivery is an HTTP request; anything that is not an upload/download (sockets, arbitrary protocols) needs the Foundation spool variant instead.",
+      "code_sketch": "let cfg = URLSessionConfiguration.background(withIdentifier: \"com.acme.outbox\")\ncfg.sessionSendsLaunchEvents = true\ncfg.isDiscretionary = false          // deliver promptly, not at the system's leisure\nlet session = URLSession(configuration: cfg)\nvar req = URLRequest(url: endpoint)\nreq.httpMethod = \"POST\"\nsession.uploadTask(with: req, fromFile: spoolURL(msg.id)).resume()   // OS owns retry",
+      "pitfalls": [
+        "Background sessions only support upload and download tasks; a socket or custom protocol cannot be handed to the system this way.",
+        "The transfer is retried by the system, so the receiver sees duplicates: the request must carry an idempotency key and the server must dedup on it.",
+        "isDiscretionary = true lets the system delay delivery until convenient (charging, Wi-Fi) - a guarantee about eventual delivery, not about latency.",
+        "The file passed to uploadTask(fromFile:) must survive until the task completes; deleting it in the ack handler is safe, deleting it when the task is created is not."
+      ],
+      "sources": [
+        "https://developer.apple.com/documentation/foundation/urlsessionconfiguration/background(withidentifier:)",
+        "https://developer.apple.com/documentation/foundation/urlsessionconfiguration/sessionsendslaunchevents",
+        "https://developer.apple.com/documentation/foundation/url_loading_system/downloading_files_in_the_background"
+      ]
+    }
+  ],
+  "default_variant": "foundation-durable-spool",
+  "version": "1.0"
+}

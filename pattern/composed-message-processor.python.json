@@ -1,0 +1,57 @@
+{
+  "pattern": "composed-message-processor",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "asyncio.gather(*(route(p) for p in parts)) + reduce",
+  "implementation_notes": "asyncio.gather schedules one task per part and returns the results in the order of the awaitables regardless of completion order - that list is the aggregation input and its index is the correlation state; TaskGroup (3.11+) is the structured variant that cancels the remaining tasks when one raises. The classic Aggregator object is only needed once parts leave the process (a broker, a worker fleet); in-process, gather plus a reduce is the complete realization.",
+  "code_sketch": "async def process(order: dict) -> Report:\n    parts = split(order)                                  # [{kind, payload}, ...]\n    results = await asyncio.gather(*(route(p) for p in parts))\n    return functools.reduce(lambda acc, r: acc.merge(r), results, Report.empty())",
+  "pitfalls": [
+    "gather() (unlike TaskGroup) does not cancel the remaining tasks when one raises, so losing parts keep running and may fail later unnoticed.",
+    "A blocking call inside route() blocks the event loop and serialises the fan-out; offload with asyncio.to_thread or a ProcessPoolExecutor.",
+    "Unbounded gather over a large parts list creates thousands of tasks; gate with an asyncio.Semaphore or chunk the parts."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "asyncio-tasks",
+      "name": "asyncio.gather / TaskGroup over per-part coroutines",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.11",
+      "idiom_name": "asyncio.gather(*(route(p) for p in parts)) + reduce",
+      "implementation_notes": "asyncio.gather schedules one task per part and returns the results in the order of the awaitables regardless of completion order - that list is the aggregation input and its index is the correlation state; TaskGroup (3.11+) is the structured variant that cancels the remaining tasks when one raises. The classic Aggregator object is only needed once parts leave the process (a broker, a worker fleet); in-process, gather plus a reduce is the complete realization.",
+      "code_sketch": "async def process(order: dict) -> Report:\n    parts = split(order)                                  # [{kind, payload}, ...]\n    results = await asyncio.gather(*(route(p) for p in parts))\n    return functools.reduce(lambda acc, r: acc.merge(r), results, Report.empty())",
+      "pitfalls": [
+        "gather() (unlike TaskGroup) does not cancel the remaining tasks when one raises, so losing parts keep running and may fail later unnoticed.",
+        "A blocking call inside route() blocks the event loop and serialises the fan-out; offload with asyncio.to_thread or a ProcessPoolExecutor.",
+        "Unbounded gather over a large parts list creates thousands of tasks; gate with an asyncio.Semaphore or chunk the parts."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-task.html"
+      ]
+    },
+    {
+      "variant_id": "celery-chord",
+      "name": "Celery chord (header group + body callback)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "Celery"
+      ],
+      "idiom_name": "celery.chord(group(route.s(p) for p in parts), merge.s())",
+      "implementation_notes": "Celery's chord is the distributed realization: the canvas chapter defines a chord as a group with a callback, so group(route.s(p) for p in parts) is the split and fan-out, the body task merge.s() is the aggregator, and the broker plus result backend hold the correlation state across process restarts. Chunks (chord of chunks) bound the fan-out when the part count is large, and each part can be retried independently - the reasons to accept the broker dependency in exchange for horizontal scale.",
+      "code_sketch": "from celery import chord, group\n\n@app.task\ndef route(part): return process_part(part)\n\n@app.task\ndef merge(results): return build_report(results)      # aggregate\n\ndef process(order):\n    return chord(group(route.s(p) for p in parts), merge.s()).apply_async()",
+      "pitfalls": [
+        "The chord body runs only when every header task succeeded and the results could be stored: a lost or failed part leaves the composite without an aggregate unless the body is also scheduled on failure (link_error/chord_errback).",
+        "Chords need a result backend to hand the header results to the body; without one the callback cannot fire (the canvas chapter notes chords are a group with a callback receiving the results).",
+        "Free prefetched parts and worker restarts can redeliver header tasks, so route() must be idempotent or the aggregate double-counts."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/canvas.html"
+      ]
+    }
+  ],
+  "default_variant": "asyncio-tasks",
+  "version": "1.0"
+}

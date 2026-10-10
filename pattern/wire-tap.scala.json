@@ -1,0 +1,28 @@
+{
+  "pattern": "wire-tap",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "Apache Pekko Streams alsoTo into a buffer(dropHead) async side sink",
+  "implementation_notes": "For 2025+ Scala the open-source reactive substrate is Apache Pekko (a fork of Akka 2.6.x made before Akka's move to the Business Source License; the same operators exist on Akka 2.10+/3.x under BSL). In pekko-stream the tap is a fan-out operator: Flow.alsoTo(sideSink) sends every element passing through the Flow to the analyzer Sink too — but the demand is coupled: alsoTo emits only when both the Sink and the downstream have demand and backpressures when either backpressures (a Broadcast stage behaves the same way: it emits only when all outputs stop backpressuring). The Wire Tap decoupling therefore lives in the side leg: prefix the analyzer Sink with buffer(n, OverflowStrategy) and end the leg with .async, which moves the analyzer onto its own processing island (Pekko's Broadcast docs note that asynchronous boundaries for the output streams must be added explicitly if parallel execution is desired). The OverflowStrategy is the explicit loss policy — dropHead keeps the newest samples, dropNew keeps the oldest, backpressure re-couples the analyzer's speed to the primary, fail fails the stream with BufferOverflowException — and since overflow is invisible you count arrivals/drops in a stage in front of the buffer. Pekko also ships a literal wireTap operator: fire-and-forget, the mainline flow is never affected and elements are dropped whenever the tap Sink backpressures — zero coupling, silently lossy. Elements go to both legs by reference, so immutable case classes are fine but a mutable payload must be cloned or serialized at the tap boundary. Actor-level alternative: tell a copy to a watcher ActorRef while forwarding the original — but the default mailbox is unbounded, so cap it with a bounded mailbox (overflow goes to dead letters, monitor those) or sample. In functional stacks: ZIO's ZStream.broadcast(2, maximumLag) bounds analyzer lag yet still slows the source to the slowest leg, so Hub.dropping or Hub.sliding is the out-of-band choice there; fs2's broadcastThrough/Topic semantically blocks the publisher when any subscriber hits its maxQueued, so prefetch the slow leg. Choose alsoTo + buffer + async for a live-stream tap that must not stall the source, wireTap for pure best-effort observation, and a durable external queue (Kafka, JMS) when the tap may not lose data.",
+  "code_sketch": "import org.apache.pekko.NotUsed\nimport org.apache.pekko.stream.OverflowStrategy\nimport org.apache.pekko.stream.scaladsl.{Flow, Sink}\n\nval seen = new java.util.concurrent.atomic.AtomicLong  // visible tap counter\n\nval analyzer: Sink[Message, NotUsed] =\n  Flow[Message]\n    .map { m => seen.incrementAndGet(); m }     // count what the tap sees\n    .buffer(1024, OverflowStrategy.dropHead)    // explicit loss policy: keep newest\n    .async                                      // tap runs on its own island\n    .to(Sink.foreach(inspect))\n\n// primary path unchanged; swapping the tap only edits this line\nval tapped: Flow[Message, Message, NotUsed] =\n  Flow[Message].alsoTo(analyzer).map(primary.handle)",
+  "pitfalls": [
+    "Demand is coupled across the fan-out: alsoTo emits only when demand exists both from the Sink and the downstream and backpressures if either side does, and Broadcast emits only when all outputs stop backpressuring — a slow analyzer becomes a slow source unless you put buffer(n, OverflowStrategy) plus an async boundary on the tap leg.",
+    "Overflow is silent: a full buffer drops per its strategy without notice (only fail surfaces, as BufferOverflowException) and the wireTap operator drops tap elements whenever the tap Sink backpressures, with no drop counter — the analyzer's blind spot is invisible unless you instrument before the buffer.",
+    "By default alsoTo cancels the main stream when the attached Sink cancels or fails, so a dying analyzer kills the primary flow; the alsoTo overload with propagateCancellation = false exists exactly so a best-effort side sink (logging, metrics) can fail without terminating the mainline.",
+    "A hand-rolled actor tap (tell a copy to a watcher) inherits the default unbounded mailbox: if messages arrive faster than the watcher processes them the mailbox grows until the application runs out of memory, and the bounded mailbox instead discards overflowing messages into dead letters — monitor dead letters or sample explicitly.",
+    "Both legs receive the same element instance: safe for immutable case classes, but if the analyzer mutates a mutable payload the primary path sees the corruption — clone or serialize at the tap boundary."
+  ],
+  "sources": [
+    "https://pekko.apache.org/docs/pekko/current/stream/operators/Source-or-Flow/alsoTo.html",
+    "https://pekko.apache.org/docs/pekko/2.0/stream/operators/Source-or-Flow/alsoTo.html",
+    "https://pekko.apache.org/docs/pekko/current/stream/operators/Broadcast.html",
+    "https://pekko.apache.org/docs/pekko/current/stream/operators/Source-or-Flow/buffer.html",
+    "https://pekko.apache.org/docs/pekko/current/stream/operators/Source-or-Flow/wireTap.html",
+    "https://pekko.apache.org/docs/pekko/current/typed/mailboxes.html",
+    "https://pekko.apache.org/",
+    "https://zio.dev/reference/stream/zstream/operations.md",
+    "https://zio.dev/reference/concurrency/hub.md",
+    "https://raw.githubusercontent.com/typelevel/fs2/v3.9.4/core/shared/src/main/scala/fs2/concurrent/Topic.scala"
+  ],
+  "version": "1.1"
+}

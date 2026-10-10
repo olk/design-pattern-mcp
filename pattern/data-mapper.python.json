@@ -1,0 +1,76 @@
+{
+  "pattern": "data-mapper",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "registry.map_imperatively() over a plain class or dataclass",
+  "implementation_notes": "SQLAlchemy's Session is the unit of work plus identity map and the Mapper owns the translation; map_imperatively() attaches that mapper to a class that carries no declarative attributes at all, which is the pattern in its purest Python form. Define tables on registry.metadata and use relationship()/composite() for links and value objects, so the domain object keeps its invariants and never imports SQLAlchemy. Choose this form when the model must also be usable unmapped (pure unit tests, other stores).",
+  "code_sketch": "mapper_registry = registry()\n\ncustomer_table = Table(\"customers\", mapper_registry.metadata,\n                       Column(\"id\", BigInteger, primary_key=True),\n                       Column(\"name\", String(64), nullable=False))\n\n@dataclass\nclass Customer:                      # domain object: no SQLAlchemy attributes at all\n    id: int\n    name: str\n\nmapper_registry.map_imperatively(Customer, customer_table)   # the mapper layer\n# with Session(engine) as s: c = s.get(Customer, 42); c.name = \"Ada\"; s.commit()",
+  "pitfalls": [
+    "The Session's identity map is also an implicit dirty-tracking context: mutating a loaded object means the next flush writes it, so accidental edits become UPDATEs.",
+    "After commit or close the Session expires instances; touching an attribute afterwards raises DetachedInstanceError or triggers a refresh - return plain data from the session if callers keep it.",
+    "Lazy relationships loaded outside the Session are unusable, and a lazy load inside a loop is an N+1: plan selectinload/joinedload in the mapper.",
+    "A single Mapper per class is global state: mapping a class twice (re-import under a different module path) raises only at configuration time."
+  ],
+  "sources": [
+    "https://docs.sqlalchemy.org/en/20/orm/mapping_styles.html",
+    "https://docs.python.org/3/library/dataclasses.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "sqlalchemy-imperative",
+      "name": "SQLAlchemy imperative mapping (registry.map_imperatively)",
+      "paradigm": "oo",
+      "min_standard": "Python3.7",
+      "idiom_name": "registry.map_imperatively() over a plain class or dataclass",
+      "implementation_notes": "SQLAlchemy's Session is the unit of work plus identity map and the Mapper owns the translation; map_imperatively() attaches that mapper to a class that carries no declarative attributes at all, which is the pattern in its purest Python form. Define tables on registry.metadata and use relationship()/composite() for links and value objects, so the domain object keeps its invariants and never imports SQLAlchemy. Choose this form when the model must also be usable unmapped (pure unit tests, other stores).",
+      "code_sketch": "mapper_registry = registry()\n\ncustomer_table = Table(\"customers\", mapper_registry.metadata,\n                       Column(\"id\", BigInteger, primary_key=True),\n                       Column(\"name\", String(64), nullable=False))\n\n@dataclass\nclass Customer:                      # domain object: no SQLAlchemy attributes at all\n    id: int\n    name: str\n\nmapper_registry.map_imperatively(Customer, customer_table)   # the mapper layer\n# with Session(engine) as s: c = s.get(Customer, 42); c.name = \"Ada\"; s.commit()",
+      "pitfalls": [
+        "The Session's identity map is also an implicit dirty-tracking context: mutating a loaded object means the next flush writes it, so accidental edits become UPDATEs.",
+        "After commit or close the Session expires instances; touching an attribute afterwards raises DetachedInstanceError or triggers a refresh - return plain data from the session if callers keep it.",
+        "Lazy relationships loaded outside the Session are unusable, and a lazy load inside a loop is an N+1: plan selectinload/joinedload in the mapper.",
+        "A single Mapper per class is global state: mapping a class twice (re-import under a different module path) raises only at configuration time."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/mapping_styles.html",
+        "https://docs.python.org/3/library/dataclasses.html"
+      ]
+    },
+    {
+      "variant_id": "sqlalchemy-declarative",
+      "name": "SQLAlchemy declarative mapping (DeclarativeBase + Mapped)",
+      "paradigm": "declarative",
+      "min_standard": "Python3.7",
+      "idiom_name": "DeclarativeBase subclass with Mapped[...] = mapped_column(...)",
+      "implementation_notes": "The common SQLAlchemy style: a DeclarativeBase subclass and Mapped[...] = mapped_column(...) declare table and mapping inside the class, so the mapper is generated from the class's own attributes. Persistence ignorance is weaker than with imperative mapping - the domain type now names columns and table - but SQL and the load/save logic still live outside it, which is the practical threshold most teams accept. Prefer it for greenfield code and move to imperative mapping when the model must be reused unmapped.",
+      "code_sketch": "class Base(DeclarativeBase):\n    pass\n\nclass Customer(Base):                 # the class itself carries the mapping metadata\n    __tablename__ = \"customers\"\n    id: Mapped[int] = mapped_column(primary_key=True)\n    name: Mapped[str] = mapped_column(String(64))\n    orders: Mapped[list[\"Order\"]] = relationship(back_populates=\"customer\")\n\n# with Session(engine) as s: c = s.get(Customer, 42); c.name = \"Ada\"; s.commit()",
+      "pitfalls": [
+        "Mapping metadata inside the class means schema changes edit domain files; keep relationships and column details in a mixin or config module when the model is shared.",
+        "String relationship targets are resolved lazily, so typos surface at first mapper configuration (import time) rather than at any static check.",
+        "MappedAsDataclass changes __init__, repr and equality: review eq semantics, since two instances of the same row compare equal by value yet are the same object in the Session."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/mapping_styles.html"
+      ]
+    },
+    {
+      "variant_id": "manual-dataclass-mapper",
+      "name": "Hand-written dataclass mapper over sqlite3/psycopg",
+      "paradigm": "procedural",
+      "min_standard": "Python3.7",
+      "idiom_name": "from_row()/to_params() conversion functions plus repository functions",
+      "implementation_notes": "Without an ORM the mapper is literal code: a from_row classmethod or conversion function plus repository functions that run parameterised statements through sqlite3 or psycopg. It is fully explicit, reads well and has no metadata to drift - but there is no identity map, no change tracking and no lazy loading, so dirty checks and transaction helpers are yours to write. That is the right trade for small schemas and for services whose queries are hand-tuned.",
+      "code_sketch": "@dataclass(frozen=True)\nclass Customer:\n    id: int\n    name: str\n\n    @classmethod\n    def from_row(cls, row: sqlite3.Row) -> \"Customer\":\n        return cls(id=row[\"id\"], name=row[\"name\"])\n\ndef load_customer(conn: sqlite3.Connection, cid: int) -> Customer | None:\n    row = conn.execute(\"SELECT id, name FROM customers WHERE id = ?\", (cid,)).fetchone()\n    return Customer.from_row(row) if row else None",
+      "pitfalls": [
+        "sqlite3 connections are bound to their creating thread (check_same_thread) and cannot be shared between threads without serialising access.",
+        "Row keys depend on the SELECT list: an alias changes the key names, and a missing key fails only at the accessor - keep SELECT lists and from_row in the same module.",
+        "Nothing tracks changes: dirty-checking is the mapper's job, so a forgotten UPDATE is a silently lost write and a forgotten WHERE is a mass update."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/sqlite3.html",
+        "https://docs.python.org/3/library/dataclasses.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlalchemy-imperative",
+  "version": "1.0"
+}

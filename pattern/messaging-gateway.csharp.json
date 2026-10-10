@@ -1,0 +1,57 @@
+{
+  "pattern": "messaging-gateway",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "MassTransit IRequestClient<T> + GetResponse<TResponse>",
+  "implementation_notes": "The gateway is an interface plus an injected client: a gateway method awaits client.GetResponse<OrderStatusResult>(request, cancellationToken) and MassTransit publishes the request with a response address, correlates the reply and completes the returned Task; a consumer exception comes back as Fault<T>, which the client rethrows as RequestFaultException. What replaces the classic gateway class is the request client plus the message contracts - you write the domain interface and the request/response records instead of the send-correlate-parse loop. The hand-written route (RabbitMQ.Client with ReplyTo/CorrelationId, as in the .NET RPC tutorial) is only justified when the stack cannot take a bus dependency.",
+  "code_sketch": "public interface IOrderGateway {                    // domain contract\n    Task<OrderStatusResult> GetStatusAsync(string orderId, CancellationToken ct);\n}\n\npublic sealed class OrderGateway : IOrderGateway {\n    private readonly IRequestClient<CheckOrderStatus> _client;\n    public OrderGateway(IRequestClient<CheckOrderStatus> client) => _client = client;\n\n    public async Task<OrderStatusResult> GetStatusAsync(string orderId, CancellationToken ct)\n        => (await _client.GetResponse<OrderStatusResult>(new { orderId }, ct)).Message;\n}",
+  "pitfalls": [
+    "Cancelling GetResponse only stops waiting: the request message stays on the queue until it is consumed or its time-to-live expires (the TTL defaults to the request timeout, 30 seconds), so a timed-out call can still execute remotely.",
+    "A failing consumer is reported as Fault<T> and rethrown as RequestFaultException, so the original stack trace does not survive the boundary.",
+    "Request messages are published by default and must be consumed by exactly one endpoint; adding a second consumer silently turns the request into load-balanced work.",
+    "Resolving IRequestClient per call instead of injecting the singleton costs an extra bus endpoint and wastes the first-request latency."
+  ],
+  "sources": [
+    "https://masstransit.io/documentation/concepts/requests"
+  ],
+  "variants": [
+    {
+      "variant_id": "masstransit-request-client",
+      "name": "MassTransit request client (framework-provided request-reply)",
+      "paradigm": "oo",
+      "min_standard": "C#10",
+      "idiom_name": "MassTransit IRequestClient<T> + GetResponse<TResponse>",
+      "implementation_notes": "The gateway is an interface plus an injected client: a gateway method awaits client.GetResponse<OrderStatusResult>(request, cancellationToken) and MassTransit publishes the request with a response address, correlates the reply and completes the returned Task; a consumer exception comes back as Fault<T>, which the client rethrows as RequestFaultException. What replaces the classic gateway class is the request client plus the message contracts - you write the domain interface and the request/response records instead of the send-correlate-parse loop. The hand-written route (RabbitMQ.Client with ReplyTo/CorrelationId, as in the .NET RPC tutorial) is only justified when the stack cannot take a bus dependency.",
+      "code_sketch": "public interface IOrderGateway {                    // domain contract\n    Task<OrderStatusResult> GetStatusAsync(string orderId, CancellationToken ct);\n}\n\npublic sealed class OrderGateway : IOrderGateway {\n    private readonly IRequestClient<CheckOrderStatus> _client;\n    public OrderGateway(IRequestClient<CheckOrderStatus> client) => _client = client;\n\n    public async Task<OrderStatusResult> GetStatusAsync(string orderId, CancellationToken ct)\n        => (await _client.GetResponse<OrderStatusResult>(new { orderId }, ct)).Message;\n}",
+      "pitfalls": [
+        "Cancelling GetResponse only stops waiting: the request message stays on the queue until it is consumed or its time-to-live expires (the TTL defaults to the request timeout, 30 seconds), so a timed-out call can still execute remotely.",
+        "A failing consumer is reported as Fault<T> and rethrown as RequestFaultException, so the original stack trace does not survive the boundary.",
+        "Request messages are published by default and must be consumed by exactly one endpoint; adding a second consumer silently turns the request into load-balanced work.",
+        "Resolving IRequestClient per call instead of injecting the singleton costs an extra bus endpoint and wastes the first-request latency."
+      ],
+      "sources": [
+        "https://masstransit.io/documentation/concepts/requests"
+      ]
+    },
+    {
+      "variant_id": "raw-amqp-facade",
+      "name": "Hand-written async facade over RabbitMQ.Client",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "gateway class with CallAsync over BasicPublishAsync/BasicConsumeAsync (ReplyTo + CorrelationId)",
+      "implementation_notes": "Without a bus, the gateway is the class from the .NET RPC tutorial: an exclusive callback queue declared at construction, CallAsync generating a correlation id, publishing with ReplyTo/CorrelationId and awaiting the matching delivery. What the classic class needs here is precisely what a framework would have generated: the correlation table, the reply dispatch and the timeout. Choose this route when adding a broker library is acceptable but a bus framework is not - for example inside a small service or a library that must not dictate the messaging platform.",
+      "code_sketch": "public sealed class InventoryGateway : IAsyncDisposable {   // hand-written\n    private readonly IChannel _channel;                       // RabbitMQ.Client\n    private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _pending = new();\n    public async Task<string> CheckStockAsync(string sku, CancellationToken ct) {\n        var corrId = Guid.NewGuid().ToString();\n        _pending[corrId] = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);\n        await _channel.BasicPublishAsync(\"\", \"inventory.check\", mandatory: false,\n            basicProperties: new BasicProperties { ReplyTo = _replyQueue, CorrelationId = corrId },\n            body: Encoding.UTF8.GetBytes(sku), cancellationToken: ct);\n        return await _pending[corrId].Task.WaitAsync(ct);      // consumer completes it\n    }\n}",
+      "pitfalls": [
+        "The reply consumer runs on its own thread, so the waiting caller needs an explicit handoff (a TaskCompletionSource); blocking the dispatch thread deadlocks the client.",
+        "One callback queue per client plus a correlation table is the documented design - declaring an exclusive reply queue per call multiplies broker objects for every request.",
+        "Nothing times out by itself: with no server running the call waits indefinitely unless WaitAsync/ct carries a deadline (the tutorial lists exactly these unsolved gaps).",
+        "Unknown correlation ids must be discarded, not thrown on: a restarted consumer can answer the same request twice."
+      ],
+      "sources": [
+        "https://www.rabbitmq.com/tutorials/tutorial-six-dotnet"
+      ]
+    }
+  ],
+  "default_variant": "masstransit-request-client",
+  "version": "1.0"
+}

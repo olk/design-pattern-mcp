@@ -1,0 +1,68 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "FutureProducer::send + DeliveryFuture + enable.idempotence=true",
+  "implementation_notes": "The Kafka client is the durable store: FutureProducer::send returns a DeliveryFuture that resolves to an OwnedDeliveryResult only when the record was acknowledged (or to a KafkaError when retries were exhausted), so the await point is the send-side acknowledgement and the spool/retry decision belongs in its error arm. enable.idempotence=true (with acks=all) makes retries safe against duplicate writes, and Producer::init_transactions/commit_transaction extend the same guarantee over consume-transform-produce. Idempotence is what replaces the pattern's classic hand-written dedup bookkeeping; a local spool is still needed when the business write and the produce must be atomic.",
+  "code_sketch": "let producer: FutureProducer = ClientConfig::new()\n    .set(\"bootstrap.servers\", brokers)\n    .set(\"enable.idempotence\", \"true\")     // implies acks=all, bounded in-flight\n    .create()?;\nlet fut = producer.send(\n    FutureRecord::to(\"orders\").key(id).payload(body),\n    Timeout::After(Duration::from_secs(10)),\n);\nif let Err((e, _)) = fut.await { spool(id, body)?; }   // only the future is delivery",
+  "pitfalls": [
+    "send() returning Ok only means the record was enqueued; dropping the future or not awaiting it throws the delivery result away.",
+    "QueueFull is the one error where the record was definitely not enqueued and a retry is safe - retrying any other error is safe only because idempotence is enabled.",
+    "FutureRecord borrows its key and payload: an async task needs the owning variants (FutureRecord::to(&topic).key(&k).payload(&v) with owned buffers moved in), otherwise lifetimes refuse to compile or you clone per retry.",
+    "Idempotence is silently dropped by conflicting configuration (acks not all, or an unsupported combination) - rdkafka then behaves like a plain at-most-once producer."
+  ],
+  "sources": [
+    "https://docs.rs/rdkafka/latest/rdkafka/producer/struct.FutureProducer.html",
+    "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "rdkafka-idempotent",
+      "name": "rdkafka FutureProducer with idempotent production",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "rdkafka"
+      ],
+      "idiom_name": "FutureProducer::send + DeliveryFuture + enable.idempotence=true",
+      "implementation_notes": "The Kafka client is the durable store: FutureProducer::send returns a DeliveryFuture that resolves to an OwnedDeliveryResult only when the record was acknowledged (or to a KafkaError when retries were exhausted), so the await point is the send-side acknowledgement and the spool/retry decision belongs in its error arm. enable.idempotence=true (with acks=all) makes retries safe against duplicate writes, and Producer::init_transactions/commit_transaction extend the same guarantee over consume-transform-produce. Idempotence is what replaces the pattern's classic hand-written dedup bookkeeping; a local spool is still needed when the business write and the produce must be atomic.",
+      "code_sketch": "let producer: FutureProducer = ClientConfig::new()\n    .set(\"bootstrap.servers\", brokers)\n    .set(\"enable.idempotence\", \"true\")     // implies acks=all, bounded in-flight\n    .create()?;\nlet fut = producer.send(\n    FutureRecord::to(\"orders\").key(id).payload(body),\n    Timeout::After(Duration::from_secs(10)),\n);\nif let Err((e, _)) = fut.await { spool(id, body)?; }   // only the future is delivery",
+      "pitfalls": [
+        "send() returning Ok only means the record was enqueued; dropping the future or not awaiting it throws the delivery result away.",
+        "QueueFull is the one error where the record was definitely not enqueued and a retry is safe - retrying any other error is safe only because idempotence is enabled.",
+        "FutureRecord borrows its key and payload: an async task needs the owning variants (FutureRecord::to(&topic).key(&k).payload(&v) with owned buffers moved in), otherwise lifetimes refuse to compile or you clone per retry.",
+        "Idempotence is silently dropped by conflicting configuration (acks not all, or an unsupported combination) - rdkafka then behaves like a plain at-most-once producer."
+      ],
+      "sources": [
+        "https://docs.rs/rdkafka/latest/rdkafka/producer/struct.FutureProducer.html",
+        "https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html"
+      ]
+    },
+    {
+      "variant_id": "lapin-publisher-confirms",
+      "name": "lapin publisher confirms over AMQP with durable queues",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "requires_features": [
+        "lapin",
+        "rabbitmq"
+      ],
+      "idiom_name": "Channel::confirm_select + basic_publish -> PublisherConfirm + delivery.ack()",
+      "implementation_notes": "With RabbitMQ the store is the broker: declare a durable queue, call Channel::confirm_select, and use the PublisherConfirm future returned by basic_publish - it resolves to Confirmation::Ack only after the broker persisted the message (RabbitMQ confirms a persistent message on a durable queue after writing it to disk). On the consumer side basic_consume yields a Consumer stream whose Delivery values must be acked explicitly, so delivery.ack() after the business commit is the receiver half. Choose it when RabbitMQ is the broker; unlike the Kafka variant there is no broker-side producer idempotence, so deduplication on a message id remains the consumer's responsibility.",
+      "code_sketch": "let ch = conn.create_channel().await?;\nch.queue_declare(\"orders\".into(), QueueDeclareOptions::durable(), FieldTable::default())\n  .await?;\nch.confirm_select(ConfirmSelectOptions::default()).await?;\nch.basic_publish(\"\", \"orders\", BasicPublishOptions::default(), &body,\n                 BasicProperties::default().with_delivery_mode(2)).await?  // PublisherConfirm\n  .await?;                                                              // Confirmation::Ack\nwhile let Some(d) = consumer.next().await { let d = d?; save(&d).await?; d.ack(BasicAckOptions::default()).await?; }",
+      "pitfalls": [
+        "The AMQP specification and RabbitMQ discourage sharing a channel across threads - one channel per task, or every publish/confirm future races.",
+        "delivery_mode=2 is only persistent on a durable queue; a non-durable queue plus confirms gives a guarantee that ends at the next broker restart.",
+        "Dropping the PublisherConfirm future without awaiting it discards the ack (and any error), which is exactly the silent-loss shape the pattern removes.",
+        "Auto-recovery replays topology and consumers, not unconfirmed publishes: on reconnect the application decides what to re-publish, and duplicates land on the consumer."
+      ],
+      "sources": [
+        "https://docs.rs/lapin/latest/lapin/",
+        "https://docs.rs/lapin/latest/lapin/struct.Channel.html",
+        "https://www.rabbitmq.com/docs/confirms"
+      ]
+    }
+  ],
+  "default_variant": "rdkafka-idempotent",
+  "version": "1.0"
+}

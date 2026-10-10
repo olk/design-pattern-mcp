@@ -1,0 +1,66 @@
+{
+  "pattern": "two-phase-termination",
+  "language": "c",
+  "support": "manual",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "cooperative-flag-join",
+      "name": "Atomic stop flag + condition variable + pthread_join",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "requires_features": [
+        "POSIX threads",
+        "C11 atomics or a mutex-protected flag"
+      ],
+      "idiom_name": "atomic stop flag + condvar wake-up + pthread_join",
+      "implementation_notes": "C has no worker abstraction, so the classic structure survives almost verbatim: an atomic (or mutex-protected) stop flag is phase 1, a condition variable - or a self-pipe/eventfd, since a waiting thread must be woken explicitly - carries the request into a blocked worker, and pthread_join() is the only way to know that termination (phase 2) has completed, as the man page states. The participant performs its own cleanup and returns. Prefer a mutex-protected predicate when cleanup needs the lock anyway, and keep the flag one-way and idempotent so concurrent stop requests are harmless.",
+      "code_sketch": "static _Atomic bool stop_flag;                  /* phase-1 latch */\nstatic pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;\nstatic pthread_cond_t  cv = PTHREAD_COND_INITIALIZER;\n\nvoid *worker(void *_) {\n    pthread_mutex_lock(&m);\n    while (!atomic_load(&stop_flag)) pthread_cond_wait(&cv, &m);\n    pthread_mutex_unlock(&m);\n    flush_and_release();                        /* phase 2 */\n    return NULL;\n}\n/* controller */ atomic_store(&stop_flag, true); pthread_cond_signal(&cv);\n/* controller */ pthread_join(tid, NULL);        /* completion */",
+      "pitfalls": [
+        "Setting the flag outside the mutex that guards the predicate is a lost-wakeup bug: the notification can arrive between the worker's test and its pthread_cond_wait, and the worker parks until the next unrelated signal.",
+        "A blocked worker that is never woken (no condvar/self-pipe/short timeout) never sees phase 1 - and a self-pipe or signalfd is required when the trigger arrives in a signal handler, where only async-signal-safe calls are legal.",
+        "Resources the worker acquired are released only on paths you actually wrote: an exit through pthread_exit() or an early return skips ordinary teardown unless cleanup is registered with pthread_cleanup_push/pop."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_join.3.html",
+        "https://pubs.opengroup.org/onlinepubs/9699959099/functions/xsh_chap02_09.html"
+      ]
+    },
+    {
+      "variant_id": "pthread-cancel-cleanup",
+      "name": "Deferred pthread_cancel with cancellation cleanup handlers",
+      "paradigm": "concurrent",
+      "min_standard": "C99",
+      "requires_features": [
+        "pthread_cancel deferred cancellation",
+        "pthread_cleanup_push/pop"
+      ],
+      "idiom_name": "pthread_cancel + cleanup handlers + pthread_join",
+      "implementation_notes": "POSIX offers its own version of the two phases: pthread_cancel() queues a cancellation request (phase 1) which is acted upon at the next cancellation point, at which time the thread's cleanup handlers run in LIFO order before it terminates (phase 2, performed by the library's control flow rather than by explicit code in the worker), and pthread_join() reports PTHREAD_CANCELED once that has completed. Use it for worker loops whose blocking calls are cancellation points and whose cleanup is already expressed with handler stacks; keep the cooperative flag variant when the worker must decide how to finish, because cancellation handlers are the only cleanup the request guarantees.",
+      "code_sketch": "static void release(void *arg) {        /* phase 2, library-driven */\n    close_handles(arg); flush_state(arg);\n}\n\nvoid *worker(void *arg) {\n    pthread_cleanup_push(release, arg);  /* matched with pop below */\n    for (;;) {\n        blocking_read(arg);              /* cancellation point */\n        process(arg);\n    }\n    pthread_cleanup_pop(0);\n}\n/* controller */ pthread_cancel(tid); pthread_join(tid, &res);",
+      "pitfalls": [
+        "pthread_cancel() merely queues the request and returns: only the join tells you that the thread and its handlers have finished, and a thread that never reaches a cancellation point stays alive indefinitely.",
+        "Cleanup handlers can be run while a mutex or lock is held (a cancellation while waiting on a condition variable re-acquires the mutex first), so handler code must be careful about locks it may already own.",
+        "Asynchronous cancellation (PTHREAD_CANCEL_ASYNCHRONOUS) can terminate a thread anywhere, including inside malloc or while holding a lock - keep the default deferred type.",
+        "A thread that disables cancellation (pthread_setcancelstate) for a critical section leaves the request pending; nothing in the protocol tells the caller how long that section takes."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cancel.3.html",
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cleanup_push.html"
+      ]
+    }
+  ],
+  "default_variant": "cooperative-flag-join",
+  "idiom_name": "atomic stop flag + condvar wake-up + pthread_join",
+  "implementation_notes": "C has no worker abstraction, so the classic structure survives almost verbatim: an atomic (or mutex-protected) stop flag is phase 1, a condition variable - or a self-pipe/eventfd, since a waiting thread must be woken explicitly - carries the request into a blocked worker, and pthread_join() is the only way to know that termination (phase 2) has completed, as the man page states. The participant performs its own cleanup and returns. Prefer a mutex-protected predicate when cleanup needs the lock anyway, and keep the flag one-way and idempotent so concurrent stop requests are harmless.",
+  "code_sketch": "static _Atomic bool stop_flag;                  /* phase-1 latch */\nstatic pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;\nstatic pthread_cond_t  cv = PTHREAD_COND_INITIALIZER;\n\nvoid *worker(void *_) {\n    pthread_mutex_lock(&m);\n    while (!atomic_load(&stop_flag)) pthread_cond_wait(&cv, &m);\n    pthread_mutex_unlock(&m);\n    flush_and_release();                        /* phase 2 */\n    return NULL;\n}\n/* controller */ atomic_store(&stop_flag, true); pthread_cond_signal(&cv);\n/* controller */ pthread_join(tid, NULL);        /* completion */",
+  "pitfalls": [
+    "Setting the flag outside the mutex that guards the predicate is a lost-wakeup bug: the notification can arrive between the worker's test and its pthread_cond_wait, and the worker parks until the next unrelated signal.",
+    "A blocked worker that is never woken (no condvar/self-pipe/short timeout) never sees phase 1 - and a self-pipe or signalfd is required when the trigger arrives in a signal handler, where only async-signal-safe calls are legal.",
+    "Resources the worker acquired are released only on paths you actually wrote: an exit through pthread_exit() or an early return skips ordinary teardown unless cleanup is registered with pthread_cleanup_push/pop."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_join.3.html",
+    "https://pubs.opengroup.org/onlinepubs/9699959099/functions/xsh_chap02_09.html"
+  ]
+}

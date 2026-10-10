@@ -1,0 +1,25 @@
+{
+  "pattern": "wire-tap",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "asyncio forwarding task with put_nowait into a bounded tap queue holding a deepcopy",
+  "implementation_notes": "Python supplies the secondary channel, not the tap. asyncio.Queue is single-consumer - get() removes and returns an item to one waiter - so the tap fans out by interposing a hand-written forwarding coroutine: it reads the channel, puts a snapshot into a bounded tap queue with put_nowait, then awaits the primary put unchanged. put_nowait never suspends; it raises asyncio.QueueFull on a full queue, and that except branch is the only place an explicit, counted drop policy can live (await tap_q.put() would suspend the forwarding task and leak analyzer backpressure into the primary flow). Thread model: everything runs on one event loop - the analyzer is a separate task draining the tap queue, and because the loop executes all tasks in one thread, any CPU-bound analysis done inline delays every task, so heavy inspection belongs in run_in_executor/asyncio.to_thread or another process. Copy semantics: queues pass object references, so deepcopy (or a per-message serializer) before handoff, else analyzer mutations are visible to the receiver. Overflow: tap_q = asyncio.Queue(maxsize=N); the default maxsize=0 is infinite and hides analyzer lag as memory growth. Choose the asyncio form when producer and consumer are coroutines on one loop; in threaded code keep the same shape with queue.Queue (put_nowait raises queue.Full); choose multiprocessing.Queue when the analyzer must be isolated from loop stalls - its payload is serialized, which is a genuine deep copy, at the cost of the feeder-thread join behaviour. The stdlib analogue is logging: a fixed handler list plus logging.handlers.QueueHandler/QueueListener, but that is LogRecord-specific and its overflow routes through handleError and can drop records silently - for arbitrary messages the tap stays hand-written, and async brokers (e.g. aiokafka) ship no producer interceptor to hook instead.",
+  "code_sketch": "tap_q = asyncio.Queue(maxsize=1024)\n\nclass Tap:\n    def __init__(self, primary_q):\n        self.primary_q, self.drops = primary_q, 0\n\n    async def forward(self, msg):\n        try:\n            tap_q.put_nowait(copy.deepcopy(msg))   # independent copy\n        except asyncio.QueueFull:\n            self.drops += 1                        # counted drop, never blocks\n        await self.primary_q.put(msg)              # original, unchanged\n\nasync def analyzer():\n    while True:\n        await asyncio.to_thread(inspect, await tap_q.get())  # off the loop",
+  "pitfalls": [
+    "asyncio.Queue defaults to maxsize=0, which the docs define as infinite: the tap never reports QueueFull, the drop counter stays at zero, and a lagging analyzer surfaces as unbounded memory growth instead of visible loss - set maxsize and count drops in the except branch.",
+    "Handing off with await tap_q.put(msg) makes a full tap queue suspend the forwarding coroutine until the analyzer drains it, so the analyzer's latency throttles the primary flow in-band - exactly what a Wire Tap must never do; only put_nowait keeps the handoff non-blocking.",
+    "Queues pass references, not copies: without deepcopy or serialization the analyzer and the primary receiver share one object, and copy.deepcopy itself will not copy file, socket or similar types and may copy too much - define an explicit snapshot per message type.",
+    "All Tasks run in the event loop's single thread, so a CPU-bound analyzer inspecting inline delays every task and IO operation on that loop no matter what queue fronts it - offload with loop.run_in_executor/asyncio.to_thread or a separate process.",
+    "A multiprocessing.Queue tap hands the analyzer a pickled (hence genuinely deep-copied) payload, but a feeder thread transfers buffered items asynchronously: a producer process that is joined before its items are drained hangs (the docs' deadlock example), and qsize() is explicitly unreliable - never treat that queue's counters as proof the tap delivered."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-queue.html",
+    "https://docs.python.org/3/library/asyncio-dev.html",
+    "https://docs.python.org/3/library/copy.html",
+    "https://docs.python.org/3/library/queue.html",
+    "https://docs.python.org/3/library/multiprocessing.html",
+    "https://docs.python.org/3/library/logging.handlers.html",
+    "https://aiokafka.readthedocs.io/en/stable/producer.html"
+  ],
+  "version": "1.1"
+}

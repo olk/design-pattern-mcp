@@ -1,0 +1,61 @@
+{
+  "pattern": "backpressure",
+  "language": "cplusplus",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "asio-async-write",
+      "name": "Boost.Asio composed async_write (callback chain)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Asio async_write + bounded outbound deque",
+      "implementation_notes": "The modern C++ default is Boost.Asio's composed operation: one async_write sleeps until the previous buffer has been fully handed to the socket, so a producer that starts the next write from inside the completion handler is paced by the peer and by the kernel send buffer - the callback chain replaces the classic queue-and-block structure entirely. Because the protocol is a free function, only one async_write may be outstanding per socket or the buffers interleave; keep the messages in a std::deque and pop the front in the handler. Asio does not bound what you queue yourself, so the outbound deque still needs an explicit capacity and a full policy (wait for the handler, drop, or close the session).",
+      "code_sketch": "void Session::send(Msg m) {\n  const bool idle = out_.empty();\n  out_.push_back(std::move(m));\n  if (idle) write_next();                 // one outstanding write per socket\n}\nvoid Session::write_next() {\n  asio::async_write(sock_, asio::buffer(out_.front().bytes),\n      [this](error_code ec, std::size_t) {\n        if (!ec) { out_.pop_front();        // completes only when fully sent\n                   if (!out_.empty()) write_next(); }\n      });\n}",
+      "pitfalls": [
+        "Two overlapping async_write calls on one socket interleave and corrupt the stream; serialize with a single outbound deque.",
+        "The buffer passed to async_write must stay alive and unmoved until the completion handler runs - moving or reallocating the deque element is a classic dangling-buffer bug.",
+        "A single-threaded io_context must never run blocking work inside the completion handler: it stops accepting and writing for every other connection.",
+        "Asio's per-operation buffering is unbounded from the application's point of view; the bound has to be your deque."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/async_write.html"
+      ]
+    },
+    {
+      "variant_id": "bounded-queue-semaphore",
+      "name": "Bounded queue with std::counting_semaphore / condition_variable",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "semaphores"
+      ],
+      "idiom_name": "std::counting_semaphore<> + bounded deque (C++20), or std::condition_variable (C++11)",
+      "implementation_notes": "Outside Asio, the portable C++ structure is a bounded deque plus std::condition_variable (producer waits while full, consumer signals not_full), and since C++20 std::counting_semaphore gives the permit form directly: acquire() before enqueue blocks when the bound is reached, release() after the consumer takes an item. Use the semaphore when a permit is enough (the queue itself can stay lock-protected or single-producer/single-consumer) and the condition variable when you also need a predicate (shutdown, flush, priority). Both are the same hand-written structure the classic pattern describes - the standard library only supplies the primitives, never the queue.",
+      "code_sketch": "std::counting_semaphore<64> slots{64};   // C++20: free queue slots\nstd::counting_semaphore<64> items{0};    // queued items available\nstd::deque<Msg> q;  std::mutex m;\n\nvoid produce(Msg msg) {\n  slots.acquire();                        // blocks while 64 are queued\n  { std::lock_guard lk{m}; q.push_back(std::move(msg)); }\n  items.release();\n}\nMsg consume() {\n  items.acquire();                        // blocks while the queue is empty\n  Msg msg;\n  { std::lock_guard lk{m}; msg = std::move(q.front()); q.pop_front(); }\n  slots.release();  return msg;           // room for one more\n}",
+      "pitfalls": [
+        "counting_semaphore::try_acquire can fail spuriously, so a reliable non-blocking check needs a retry loop and a bounded wait needs try_acquire_for/try_acquire_until.",
+        "Forgetting release() on an exception path shrinks the bound permanently until the stage stops accepting work.",
+        "Destructing a counting_semaphore while a producer is blocked in acquire() is undefined/never safe; shut the pipeline down through a documented path.",
+        "Relying on condition_variable without a predicate (if instead of while, or without the mutex held) loses the bound under spurious wakeups."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/counting_semaphore",
+        "https://en.cppreference.com/w/cpp/thread/condition_variable"
+      ]
+    }
+  ],
+  "default_variant": "asio-async-write",
+  "idiom_name": "Boost.Asio async_write + bounded outbound deque",
+  "implementation_notes": "The modern C++ default is Boost.Asio's composed operation: one async_write sleeps until the previous buffer has been fully handed to the socket, so a producer that starts the next write from inside the completion handler is paced by the peer and by the kernel send buffer - the callback chain replaces the classic queue-and-block structure entirely. Because the protocol is a free function, only one async_write may be outstanding per socket or the buffers interleave; keep the messages in a std::deque and pop the front in the handler. Asio does not bound what you queue yourself, so the outbound deque still needs an explicit capacity and a full policy (wait for the handler, drop, or close the session).",
+  "code_sketch": "void Session::send(Msg m) {\n  const bool idle = out_.empty();\n  out_.push_back(std::move(m));\n  if (idle) write_next();                 // one outstanding write per socket\n}\nvoid Session::write_next() {\n  asio::async_write(sock_, asio::buffer(out_.front().bytes),\n      [this](error_code ec, std::size_t) {\n        if (!ec) { out_.pop_front();        // completes only when fully sent\n                   if (!out_.empty()) write_next(); }\n      });\n}",
+  "pitfalls": [
+    "Two overlapping async_write calls on one socket interleave and corrupt the stream; serialize with a single outbound deque.",
+    "The buffer passed to async_write must stay alive and unmoved until the completion handler runs - moving or reallocating the deque element is a classic dangling-buffer bug.",
+    "A single-threaded io_context must never run blocking work inside the completion handler: it stops accepting and writing for every other connection.",
+    "Asio's per-operation buffering is unbounded from the application's point of view; the bound has to be your deque."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/async_write.html"
+  ],
+  "version": "1.1"
+}

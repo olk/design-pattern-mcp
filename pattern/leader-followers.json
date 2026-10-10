@@ -1,0 +1,229 @@
+{
+  "category": "concurrency-resilience",
+  "name": "leader-followers",
+  "aliases": [
+    "leader/followers",
+    "leader-follower"
+  ],
+  "intent": "Let a bounded pool of threads take turns acting as the single thread that waits on one shared set of event sources, so that the thread which detects an event also processes it and no queue, data hand-off or extra context switch sits between readiness and handling.",
+  "problem": "A server must serve many event sources with a bounded number of threads, but the platform's demultiplexer cannot be used concurrently: several threads calling select(2)/poll(2) on the same descriptor set double-report readiness and several threads reading the same bytestream handle corrupt or lose data - while the safe alternative, one designated I/O thread feeding a worker pool through a queue, costs a lock, a dynamic allocation and two context switches per event even in the best case.",
+  "context": "Event-driven servers and hybrid client/server applications on platforms with iterative handle sets (select/poll), where the number of connections exceeds the thread budget; also the client side of multiplexed request/reply traffic, where the thread that sent a request must be the one that processes the reply (bound handle/thread associations). It presupposes a fixed, pre-spawned thread set, handlers that do not block on new events, and a runtime that exposes the handle set to application code.",
+  "benefits": [
+    "CPU cache affinity with no dynamic allocation or buffer sharing: the thread that detected the event reads it into its own stack frame or thread-local buffer, so no request object crosses threads.",
+    "Minimal locking: control moves with the event and no data does, so the hot path needs no mutex-protected request queue - only the role transitions are synchronised.",
+    "No context switch between demultiplexing and handling: the leader that detected the event dispatches the handler itself, so only the promotion of the next leader costs a switch.",
+    "Reduced priority inversion and jitter: there is no queueing layer whose ordering decisions can delay an event arbitrarily, which is what real-time servers need.",
+    "Bounded thread count: the pool is fixed and pre-spawned, so a connection flood consumes descriptors and kernel readiness entries rather than threads.",
+    "Unbound associations keep the pool symmetric - any thread may process any event - so no per-connection state has to be pinned to a thread unless the bound variant is chosen deliberately."
+  ],
+  "tradeoffs": [
+    "The role transitions are the hard part: promotion, rejoin and handle-set updates interleave in unpredictable order, so the pool state machine must be updated atomically - this is the pattern's dominant implementation cost.",
+    "There is no queue, so events cannot be discarded, reordered, prioritised or retried; different levels of service require separate leader/follower groups.",
+    "Only one thread demultiplexes at a time (mandatory for select/poll), so the readiness wait is a serialisation point that can become the bottleneck on I/O-heavy servers with many connections, unless the platform offers concurrent handle sets or the design uses several leaders or shards.",
+    "Promotion itself requires a context switch before dispatch, so when two events arrive together the second waits behind the promotion - burst dispatch latency is no better than a queued thread pool.",
+    "A processing thread cannot wait for new events: a handler that needs another event (a reply on a multiplexed connection, a nested upcall) must use bound thread/handle associations with explicit hand-offs, or it blocks a pool member and enough such threads stall the pool.",
+    "Handle-set changes made by non-leader threads need an explicit wakeup plus the deactivate/reactivate protocol; omitting either yields duplicate dispatch or a leader that never notices new interest, and both failure modes are timing-dependent.",
+    "NUMA and cache-line contention: all threads share the same handle-set data structures (epoll fd rb-tree), so on multi-socket systems the memory traffic from updating ready-lists can degrade performance at higher concurrency levels, a phenomenon not predicted by analytical models."
+  ],
+  "quality_attributes": {
+    "testability": 4,
+    "extensibility": 5,
+    "maintainability": 4,
+    "simplicity": 3,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Handle",
+      "responsibility": "Operating-system abstraction for one event source (socket, connection, timer, file); it queues events and can be waited on, but an iterative handle may be acted on by only one thread at a time."
+    },
+    {
+      "role": "Handle Set",
+      "responsibility": "Collection of handles that a leader waits on as a unit (select/poll/kqueue/epoll); it returns when an operation on one or more of its handles will not block, and an iterative handle set must not be waited on by several threads concurrently."
+    },
+    {
+      "role": "Thread Pool",
+      "responsibility": "The fixed, pre-spawned thread set plus its synchronizer; it maintains the leader slot and the waiting followers and exposes join() and promote_new_leader()."
+    },
+    {
+      "role": "Event Handler",
+      "responsibility": "Interface with the hook that processes an event on a handle and the accessor that reports the handle it services."
+    },
+    {
+      "role": "Concrete Event Handler",
+      "responsibility": "Application-specific implementation of the hook; it runs in whichever thread is currently processing the event and must not assume thread affinity in the unbound variant."
+    },
+    {
+      "role": "Leader",
+      "responsibility": "The one thread currently blocked in the demultiplexer on the shared handle set; on an event it promotes a follower and then becomes a processing thread."
+    },
+    {
+      "role": "Follower",
+      "responsibility": "A pool thread waiting on the pool synchronizer; it either becomes the next leader or, in the bound variant, receives an event handed off for its own handle."
+    },
+    {
+      "role": "Processing Thread",
+      "responsibility": "The former leader, which demultiplexes the detected event to its handler and runs the hook; when the handler returns it reverts to follower - or becomes leader immediately if the slot is free."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "boundary",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "OLTP front-end and back-end communication servers that process simultaneous requests from very many clients with a fixed thread budget and no per-request queueing.",
+    "CORBA ORB cores and middleware that use the pattern on both sides - server upcall threads and client-side multiplexed connections; TAO's TAO_Leader_Follower is a reference implementation.",
+    "Web and application servers on platforms where several threads may not call accept() on one passive socket - the JAWS web server uses the leader/followers pool exactly for that case.",
+    "Transaction monitors that bind threads to transactions so that a response is processed by the thread that owns the transaction (bound handle/thread associations).",
+    "Real-time servers built on a real-time I/O subsystem with a fixed pool, where priority inversion and non-determinism must be minimised.",
+    "Client-side multiplexing: many application threads share one upstream connection, and the leader hands each reply to the thread waiting for that request id.",
+    "High-frequency trading systems and market data feeds where sub-microsecond latency is critical and thread affinity to CPU caches must be maximised.",
+    "Network appliances (load balancers, proxies, firewalls) that terminate many connections on a fixed thread pool and must avoid per-connection queueing overhead.",
+    "Embedded middleware on DRE (Distributed Real-time Embedded) systems where dynamic memory allocation in the critical path is prohibited, such as avionics and defense systems using TAO or similar ORBs.",
+    "Modern C++ I/O task systems: libtasks (adtechlabs/libtasks) implements the pattern with libev as the event loop, providing HTTP/uwsgi and Thrift server capabilities with network and disk I/O support.",
+    "Multi-tier OLTP servers with multiplexed back-end connections: a front-end server multiplexes many client requests over a smaller number of back-end connections, binding threads to specific back-end socket handles via the bound variant to avoid data corruption and enable correct request-response correlation by request ID.",
+    "Middleware for distributed real-time embedded (DRE) systems: CIAO and OpenDDS use leader/followers-derived concurrency models in their ORB cores for service access and event handling in avionics, defense, and industrial control deployments.",
+    "Game server engines and real-time simulation hosts where bounded latency is required and thread-per-connection models exhaust OS resources at scale.",
+    "ACE_TP_Reactor in the Adaptive Communication Environment (ACE) provides a production thread-pool reactor: one thread waits for readiness, promotes a follower, and dispatches the activated handler while the pool remains bounded.",
+    "TAO's TAO_Leader_Follower manager in the CORBA ORB core applies leader/followers to multiplexed GIOP transports, including follower allocation and client-leader coordination for request/reply traffic.",
+    "adtechlabs/libtasks is a modern C++ I/O task system built around libev that applies leader/followers to network and disk I/O, demonstrating the pattern outside the ACE/TAO middleware lineage."
+  ],
+  "avoid_when": [
+    "The runtime already multiplexes handles for you (asyncio, libuv/Node, tokio, Go's runtime netpoller, SwiftNIO, Netty): hand-rolling a leadership protocol on top re-creates a worse scheduler.",
+    "Events must be reordered, prioritised, shed or retried - use a queueing design (Half-Sync/Half-Async, Active Object, Producer-Consumer); leader/followers has nowhere to put them.",
+    "The platform offers efficient asynchronous I/O (IOCP, io_uring, POSIX AIO) and completion-based inversion of control is acceptable: Proactor achieves the same concurrency without an application-level pool.",
+    "Connections are very short-lived, or the handles and handle set are concurrent (datagram sockets, Win32-style concurrent sets), so plain blocking operations on many threads are already safe and the serialisation buys nothing.",
+    "Handlers must block on another event (a downstream reply) and the bound variant's hand-off machinery is more than the team will maintain - an async/await or queue-based design is simpler and testable.",
+    "The workload is highly asymmetric (occasional very heavy events mixed with many light ones) and cannot be served by a homogeneous fixed pool without severe starvaton or priority inversion.",
+    "You need per-task queue depth monitoring, backpressure, or rejection policies - these require a queueing layer that leader/followers explicitly lacks."
+  ],
+  "language_files": {
+    "generic": "leader-followers.generic.json",
+    "c": "leader-followers.c.json",
+    "cplusplus": "leader-followers.cplusplus.json",
+    "csharp": "leader-followers.csharp.json",
+    "go": "leader-followers.go.json",
+    "java": "leader-followers.java.json",
+    "javascript": "leader-followers.javascript.json",
+    "kotlin": "leader-followers.kotlin.json",
+    "python": "leader-followers.python.json",
+    "ruby": "leader-followers.ruby.json",
+    "rust": "leader-followers.rust.json",
+    "scala": "leader-followers.scala.json",
+    "swift": "leader-followers.swift.json",
+    "typescript": "leader-followers.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "module",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "reactor",
+    "proactor",
+    "half-sync-half-async",
+    "thread-pool",
+    "acceptor-connector",
+    "monitor-object",
+    "active-object",
+    "wrapper-facade"
+  ],
+  "anti_patterns": [
+    "thread-per-connection masquerading as leader/followers: A fresh thread per accepted connection with no shared handle set and no leader election - the name 'leader/followers' is applied to the opposite of the pattern's bounded-pool property. The telltale sign is unbounded thread creation under load.",
+    "unsynchronised shared handle set: Several threads calling select(2)/poll(2) on one descriptor set without serialisation. Readiness is reported to more than one thread and the handler runs twice (or corrupts the bytestream for TCP handles). The only safe serialisation is the leader/followers protocol.",
+    "dispatch without deactivate: Promoting a follower and dispatching the event without first removing the ready handle from the set: the newly promoted leader demultiplexes the same event a second time, causing duplicate processing or protocol errors.",
+    "leader processes without promoting: The leader handles an event without promoting a follower to take its place. All followers sleep and the next event waits for the current handler to finish, collapsing the pool to a single-threaded server.",
+    "blocking handlers in unbound pool: A slow handler (database call, file I/O) in an unbound pool ties up a pool member. Enough slow handlers drain the pool entirely: no leader exists, no one calls select(), and all incoming events queue in the kernel until a handler returns. This is the most common catastrophic failure mode and is timing-dependent, making it hard to reproduce.",
+    "missing reactivate after handler returns: The handle is deactivated before dispatch but never reactivated after the handler returns, so the handle is permanently removed from the handle set and its future events are silently discarded.",
+    "holding lock across demultiplexer wait: The pool lock is held while the leader calls select()/poll(). All followers are blocked waiting for the lock and must context-switch and contend when the event arrives, negating the latency benefit. The lock must be released before blocking in the demultiplexer and re-acquired only to update role state.",
+    "event-starvation cascade (unchecked burst): A burst of simultaneous events (e.g., a flood of connections) causes all N threads to become processing threads at once. No leader exists; select() is not called. Events accumulate in the kernel socket buffers. If the processing time is highly variable, short requests wait behind long ones in the kernel buffer with no visibility or admission control at the application layer.",
+    "ignoring edge vs level triggered demultiplexer semantics: Using level-triggered select/poll on a leader/followers pool causes redundant re-dispatch: if a handle is still ready when the promoted leader calls select() again, the same event fires again and may be dispatched twice. Use edge-triggered epoll (EPOLLET) or kqueue (EV_CLEAR) to receive exactly one notification per readiness transition, eliminating this class of duplicate-dispatch bug entirely.",
+    "unsharded NUMA handle-set contention: On multi-socket servers, all threads contend for a single shared epoll fd (the rb-tree of registered handles and its associated ready-list updates). MUSEP 2012 measured up to 2× performance degradation at high concurrency from this effect. Failing to shard handles across multiple independent leader/follower pools each with its own epoll instance leaves significant throughput on the table."
+  ],
+  "design_principles": [
+    "Move control with the event, not through a queue: the thread that observed readiness handles the event, so no request state crosses threads and no lock protects it.",
+    "Single owner per handle at a time: iterative handles (bytestream sockets) must be touched by one thread, which the role protocol enforces structurally rather than by convention.",
+    "Explicit role state machine: leader, follower and processing are enumerated states with atomic transitions, not 'whoever wakes up does the work'.",
+    "Least privilege for the lock: the pool synchronizer guards only role transitions, while the readiness wait and the handler run unlocked.",
+    "Peer symmetry in the unbound variant: all threads are interchangeable, so no thread is a bottleneck by design and specialisation is introduced only where the bound variant requires it.",
+    "No heap allocation in the critical path: read request data into stack frames or thread-local buffers; allocate no request objects on the heap between detection and handling."
+  ],
+  "best_practices": [
+    "Deactivate before dispatch: Remove the ready handle from the handle set (or use an one-shot readiness mode) before promoting the next leader, and rearm it after the handler returns. This is the single most-cited implementation error; omitting it causes duplicate dispatch whose failure mode is timing-dependent and hard to reproduce.",
+    "Choose promotion order deliberately: LIFO for cache affinity (the promoted thread's instruction cache is hot from waiting), priority order for real-time pools, FIFO or per-thread contexts for bound associations. The native synchronizer's order is acceptable only when simplicity outweighs cache behaviour.",
+    "Never hold the pool lock across the readiness wait or the handler: Release the synchronizer before blocking in the demultiplexer and re-acquire only to update roles. Holding it across the wait serialises all followers on wakeup and eliminates the concurrency benefit.",
+    "Wake the leader on handle-set changes from non-leader threads: Use self-pipe/eventfd/user-space eventfd on Linux, or equivalent, to interrupt the select()/poll() wait when a handle is added or removed from another thread. Without this, a follower that registers a new handle will wait indefinitely because the leader is blocked in select() and cannot observe the new interest.",
+    "Size the pool to cores and handler blocking: Use the formula N = C × U × (1 + W/S): C = available CPU cores, U = target CPU utilisation (0.8-0.9), W = average wait time, S = average service time. For CPU-bound work, N ≈ C + 1. For I/O-bound work the multiplier (1 + W/S) can be 5-50×. Size the pool so that even if all N threads are simultaneously in the processing state, enough CPU headroom remains for the OS to schedule the leader wakeup.",
+    "Prefer edge-triggered demultiplexers (epoll, kqueue) over level-triggered (select, poll): Edge-triggered mode delivers one notification per transition, eliminating redundant wakeups and reducing per-event overhead. Level-triggered select/poll re-notifies on every loop iteration if the condition persists.",
+    "Instrument the pool exhaust window: Track how often all threads are simultaneously in the processing state (zero leaders). This window is when incoming events queue in the kernel and latency becomes unpredictable. Alert if this exceeds a threshold (e.g., >1% of sampling intervals). Make this window visible via metrics rather than letting it be a silent failure mode.",
+    "Treat the kernel ready-list as the back-pressure surface: Because there is no user-space queue, admission control, pool sizing and handler time budgets are the only knobs. Instrument all three and treat them as load-shedding boundaries. If the kernel buffer fills, events are dropped - which is the only form of implicit back-pressure available.",
+    "Separate pools for different service levels: Because events cannot be prioritised within a single pool, use separate leader/follower groups for different priority classes. A high-priority pool of small depth handles latency-sensitive traffic; a lower-priority pool handles best-effort work.",
+    "Keep handlers non-blocking: Any handler that blocks on I/O (database, file, downstream RPC) removes a thread from the pool. Use async I/O, thread-per-request for the blocking step (outside the leader/followers pool), or the bound variant with explicit hand-off to a dedicated thread. Never mix blocking handlers with an unbound leader/followers pool.",
+    "On NUMA systems, shard handle sets: When all threads access a single epoll fd (the shared handle set), the rb-tree updates from event processing threads cause cache-line invalidations on remote sockets on multi-socket servers. Consider sharding connections across multiple leader/follower pools, each with its own handle set and epoll instance, and a front-end load-balancer distributing connections across shards.",
+    "Test promotion races explicitly: The most subtle bugs are race conditions between promotion, rejoin and handle-set updates. Use a thread sanitizer (TSan) or a model checker (SPIN, TLA+) to verify the pool state machine. Timing-dependent bugs in this pattern are notoriously hard to reproduce with unit tests alone.",
+    "Use edge-triggered readiness notifications by default: Configure epoll with EPOLLET (edge-triggered) or kqueue with EV_CLEAR. Level-triggered select/poll re-report readiness on every call if the condition persists, causing duplicate dispatch bugs where the newly promoted leader immediately re-receives the same event. Edge-triggered mode eliminates this class of bug and reduces per-event overhead. The one-shot variant (EPOLLONESHOT) further simplifies handle deactivation/reactivation at the cost of requiring explicit re-arm after each event.",
+    "Prefer self-pipe trick or eventfd for handle-set change wakeups: On Linux, use an eventfd or a self-pipe (a pipe whose write end is written to when a non-leader thread modifies the handle set) to interrupt the leader's blocking select()/epoll_wait(). Without this, a follower adding a new handle while the leader is blocked will wait indefinitely. bare epoll_ctl EPOLL_CTL_MOD on the listening socket does not wake a leader blocked in epoll_wait without the self-pipe or EPOLLPRI event on an additional pipe-end.",
+    "Profile before adding a second leader/follower pool: If a single pool becomes a bottleneck because the leader's serialised demultiplexing wait limits throughput, consider horizontal scaling: split the handle set into K independent shards, each with its own leader/follower pool and one thread calling epoll_wait per shard. This trades off complexity for throughput; the MUSEP 2012 study showed diminishing returns beyond 4-8 cores for a single shared handle set due to NUMA effects. Only shard when profiling demonstrates the serialised demultiplexer is the bottleneck, not lock contention or handler CPU.",
+    "Implement graceful degradation under pool exhaustion: When all N threads are simultaneously processing events, no leader exists and the kernel buffers incoming data. Implement a monitoring hook that detects this window (zero-leader state) and either logs an alert, triggers admission control (e.g., close idle connections, shed low-priority traffic), or scales the pool temporarily using a hybrid approach where a small set of overflow threads can join the pool only during burst windows. This prevents the silent failure mode where latency grows unbounded with no observable signal."
+  ],
+  "version": "1.4",
+  "sources": [
+    "Schmidt, O'Ryan, Pyarali, Kircher & Buschmann, 'Leader/Followers: A Design Pattern for Efficient Multi-threaded Event Demultiplexing and Dispatching', 7th Pattern Languages of Programs Conference (PLoP 2000), Allerton Park, Illinois, August 2000. Primary original publication.",
+    "Schmidt, Stal, Rohnert & Buschmann, 'Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects', Wiley, 2000 - Leader/Followers chapter in the Concurrency Patterns section of POSA2.",
+    "ACE TP_Reactor implementation: https://www.dre.vanderbilt.edu/~schmidt/PDF/lf.pdf - contains the full ACE C++ thread-pool reactor design and code sketch.",
+    "ACE_TP_Reactor.h: https://raw.githubusercontent.com/DOCGroup/ACE_TAO/master/ACE/ace/TP_Reactor.h - production C++ header implementing thread-pool reactor over ACE_Reactor.",
+    "TAO Leader Follower: https://www.dre.vanderbilt.edu/Doxygen/6.5.14/html/libtao-doc/a06606.html - TAO ORB's production implementation of client-side leader/followers for multiplexed GIOP connections.",
+    "TAO_Wait_On_Leader_Follower: https://tool.oschina.net/uploads/apidocs/ace/libtao-doc/a00533.html - TAO wait strategy implementing the LF concurrency model for muxed transports, including bound handle/thread association semantics for per-transport wait state.",
+    "Fraunhofer Institute, 'Analysis of Event Processing Design Patterns and Their Performance Dependency on I/O Notification Mechanisms', International Conference on Multicore Software Engineering, Performance, and Tools (MUSEP 2012), Springer 2012 - quantitative comparison of Half-Sync/Half-Async vs Leader/Followers on epoll across multiple workloads and core counts; key finding: I/O notification mechanism choice impacts performance by up to 2×; edge-triggered epoll preferred for LF; NUMA shared handle-set access degrades performance at high concurrency.",
+    "Schmidt, 'Applying Optimization Principle Patterns to Real-time ORBs', 6th Conference on Real-Time Systems (COOTS 1999) - empirical benchmark comparing leader/followers vs queue-based worker thread pool in TAO, showing up to 2800% improvement for small thread counts and light workloads.",
+    "Schmidt, O'Ryan, Pyarali, Kircher & Buschmann, 'Leader/Followers Pattern', Vanderbilt DOC Group: https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/ and https://www.dre.vanderbilt.edu/~schmidt/patterns-ace.html.",
+    "Kircher & Pyarali, 'Leader/Followers' PDF: http://www.kircher-schwanninger.de/michael/publications/lf.pdf - alternative source for the full PLoP 2000 paper, includes bound vs unbound handle/thread association details.",
+    "Flylib, 'The ACE_TP_Reactor Class', C++ Network Programming Volume I: Mastering Complexity with ACE and Patterns - production ACE_TP_Reactor implementation details and role of Monitor Object pattern in thread pool synchronizer: https://flylib.com/books/en/3.20.1.32/1/.",
+    "adtechlabs/libtasks GitHub: https://github.com/adtechlabs/libtasks - modern C++17 implementation of the Leader/Followers pattern using libev as the event loop, with HTTP/uwsgi and Thrift server examples demonstrating real-world I/O task systems.",
+    "CiteSeerX DOI 10.1.1.112.8033: http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.112.8033 - archived version of the original paper.",
+    "Java Design Patterns community page for Leader-Followers: https://java-design-patterns.com/patterns/leader-followers/ - includes Java code sketch and pattern overview with dynamic worker allocation.",
+    "Kumar Locham, 'Why Your Context Switches Are Killing Your Throughput (Leader-Follower Pattern)', Medium 2024 - C++20 POSIX UDP implementation of leader-followers with a condition variable election protocol, demonstrating practical high-throughput server design.",
+    "Schmidt, 'Reactor and Proactor: Comparing Two High-Performance I/O Design Patterns', artima.com 2005 - clarifies the relationship between Reactor (synchronous), Proactor (asynchronous) and the Leader/Followers concurrency layer built on top of them.",
+    "Pyarali, 'The Proactor Pattern', PLoP 1997 / Vanderbilt PDF - describes how Proactor complements Leader/Followers as the async I/O alternative.",
+    "Goetz, 'Java Concurrency in Practice', Addison-Wesley 2006 - provides the N = C × U × (1 + W/S) thread pool sizing formula used in the best practices section.",
+    "Baeldung, 'Guide to the Fork/Join Framework in Java', 2016 - explains work-stealing as the modern evolutionary successor to leader/followers for divide-and-conquer workloads (ForkJoinPool).",
+    "Zalando Engineering Blog, 'How to Set an Ideal Thread Pool Size', 2019 - practical application of Goetz's formula and Little's Law for pool sizing.",
+    "Vanderbilt DOC Group POSA2 pattern language page: https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/pattern-language.html - the full 17-pattern POSA2 pattern language catalogue showing Leader/Followers' position within the concurrency patterns section alongside Reactor, Proactor, Half-Sync/Half-Async, and Monitor Object.",
+    "Cosmiclearn: Leader Followers Pattern — Concise overview emphasising CPU cache affinity: the pattern ensures the same thread demultiplexes and processes an event, avoiding cross-thread data transfer and maximising cache locality. Also covers comparison with Thread Pool.",
+    "https://cosmiclearn.com/designpatterns/leader_followers_pattern.php",
+    "Stack Overflow: In a multi-threaded application, which concurrency pattern is faster, half-sync/half-async or leader-follower? — Practical comparison of HS/HA vs Leader-Follower for multi-threaded C/C++ apps under heavy load. Community answers discuss trade-offs in context-switch overhead, implementation complexity, and when each pattern outperforms the other.",
+    "https://stackoverflow.com/questions/29099453/",
+    "MUSEP 2012: Analysis of Event Processing Design Patterns and Their Performance Dependency on I/O Notification Mechanisms — Full ACM DOI link for the Fraunhofer MUSEP 2012 paper. Quantitative comparison of Half-Sync/Half-Async vs Leader/Followers on select, level-triggered epoll, and edge-triggered epoll across multiple cores. Key findings: I/O notification primitive choice yields up to 2x throughput difference; edge-triggered epoll preferred for LF; NUMA handle-set contention degrades LF more than HS/HA at high concurrency.",
+    "https://dl.acm.org/doi/10.1007/978-3-642-31202-1_6",
+    "POSA2 Concurrency Patterns Chapter — Vanderbilt-hosted chapter overview of all five POSA2 concurrency patterns (Active Object, Monitor Object, Half-Sync/Half-Async, Leader/Followers, Thread-Specific Storage) with relationships and design guidance. Authoritative primary source for the pattern catalogue.",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html",
+    "Canonical origin: O'Ryan, 'Leader/Followers' (PLoP 2000): https://www.plopcon.org/pastplops/plop2k/proceedings/ORyan/ORyan.pdf",
+    "ACE TP_Reactor official reference: https://www.dre.vanderbilt.edu/Doxygen/7.0.1/html/libace-doc/a07998.html",
+    "TAO_Leader_Follower official reference: https://www.dre.vanderbilt.edu/Doxygen/6.1.5/html/libtao-doc/a00296.html",
+    "adtechlabs/libtasks official repository: https://github.com/adtechlabs/libtasks",
+    "Misuse guidance: Node.js, 'Don't Block the Event Loop (or the Worker Pool)': https://nodejs.org/learn/asynchronous-work/dont-block-the-event-loop"
+  ],
+  "related_patterns_notes": {
+    "reactor": "Leader/Followers uses Reactor as its event-demultiplexing engine; the leader thread calls the reactor's handle_events() just as a single-threaded Reactor server does. The key difference: Reactor is single-threaded while Leader/Followers adds a thread pool that takes turns in the leader role.",
+    "proactor": "Both Leader/Followers and Proactor provide concurrency without per-request dynamic allocation. Proactor offloads I/O to the OS and completes in a callback; Leader/Followers keeps the event-detection loop in-process. Proactor requires OS-level async I/O; Leader/Followers works on any platform with select/poll. On Linux, io_uring makes Proactor viable where it previously was not.",
+    "half-sync-half-async": "Half-Sync/Half-Async (HSHA) is the main alternative: it uses a dedicated I/O thread feeding a queue, which workers drain. HSHA is simpler to implement and supports prioritisation, retry and event shedding through the queue. Leader/Followers eliminates the queue's lock, allocation and two context switches at the cost of higher implementation complexity and no built-in prioritisation. Quantitative studies (Fraunhofer 2012) show Leader/Followers outperforms HSHA for low-to-medium computation workloads on epoll, but degrades more steeply at high concurrency on NUMA systems due to shared handle-set access.",
+    "thread-pool": "A thread pool assigns any available thread to the next task via a queue. Leader/Followers is a specialisation where the 'task' is the role of waiting on the handle set, and the thread that detects the event must be the one that processes it. Thread pools with a single queue introduce lock contention at low task granularity; Leader/Followers eliminates that by making detection and handling the same thread. However, a standard thread pool tolerates blocking handlers whereas a leader/followers pool loses its demultiplexer when all threads are blocked in handlers.",
+    "work-stealing": "Work-stealing (Java ForkJoinPool, Go goroutine scheduler, Go's sync.Pool) is a modern evolution: idle threads steal tasks from busy threads' deques rather than drawing from a shared queue. Unlike Leader/Followers, work-stealing supports nested/recursive task decomposition (fork/join) and tolerates blocking handlers since steal attempts only happen when a thread's deque is empty. For divide-and-conquer CPU-bound workloads, ForkJoinPool outperforms fixed thread pools; for I/O-bound servers with a fixed handle set, Leader/Followers remains superior because the event source (socket) cannot be stolen - only one thread may wait on it at a time.",
+    "acceptor-connector": "Acceptor-Connector decouples connection establishment from service initialisation. It is orthogonal to Leader/Followers: an Acceptor uses the Leader/Followers pool (or any concurrency model) to accept connections, and once a connection is accepted the resulting handle is registered with the Leader/Followers handle set for event processing.",
+    "monitor-object": "The Thread Pool participant in Leader/Followers is often implemented using Monitor Object to protect the follower/leader state transitions. The condition variable that followers wait on is exactly the Monitor Object pattern's wait/notify mechanism applied to the pool state; responsibility: Synchronisation",
+    "active-object": "Active Object decouples method invocation from execution. In bound handle/thread associations, the leader hands off an event to a follower thread, which then processes it asynchronously - this is a form of Active Object where the event is the method and the follower is the activation context. The Leader/Followers pool can be seen as a factory for Active Object threads.",
+    "wrapper-facade": "Wrapper Facade (ACE wrappers for POSIX sockets, pthreads) is the foundation: Leader/Followers is built on top of handle abstractions (socket wrappers) and thread wrappers. The pattern does not define these wrappers; it assumes they exist and provides the concurrency topology on top of them.",
+    "specific-notification": "The Specific Notification pattern (POSA2) is used in the bound handle/thread association variant to hand off a detected event to a designated follower thread. When the leader demultiplexes a multiplexed connection and identifies the target thread by request ID, it signals that thread's specific condition variable rather than broadcasting to all followers. This decouples the notification from follower/leader role transitions and prevents thundering-herd wakeups on multiplexed connections."
+  }
+}

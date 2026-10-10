@@ -1,0 +1,56 @@
+{
+  "pattern": "cache-aside",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "Caffeine newBuilder + get(key, k => load(k)) + invalidate",
+  "implementation_notes": "Scala uses the JVM caches: Caffeine's get(key, k => load(k)) performs the atomic compute-and-insert, expireAfterWrite and maximumSize carry TTL and eviction, and invalidate(key) runs after the store commit. The asMap view keeps the ConcurrentMap methods available for migration, and for asynchronous paths the CompletableFuture-based AsyncCache pairs with Scala's Future through the JDK converters or stays synchronous with the loading done outside the cache. There is no Scala-specific cache in the standard library, so the choice mirrors Java's Caffeine/JCache decision.",
+  "code_sketch": "private val cache = Caffeine.newBuilder()\n  .expireAfterWrite(5, TimeUnit.MINUTES)\n  .maximumSize(100_000)\n  .build[String, Entity]()\n\ndef read(id: String): Entity = cache.get(id, key => store.find(key))  // populate on miss\ndef update(e: Entity): Unit = { store.save(e); cache.invalidate(e.id) }  // store first",
+  "pitfalls": [
+    "Caffeine's loader runs once per key while other callers wait, so it must not block indefinitely or call back into the same entry.",
+    "The cache is heap-local per JVM: a multi-node service needs a shared tier and an invalidation broadcast (or short TTLs) to bound staleness between nodes.",
+    "Scala 2.13 and Scala 3 collection types differ; converting between scala.jdk and scala.collection around the cache adds wrappers that the Java API avoids."
+  ],
+  "sources": [
+    "https://github.com/ben-manes/caffeine/wiki/Population",
+    "https://www.scala-lang.org/api/current/scala/collection/concurrent/TrieMap.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "caffeine",
+      "name": "Caffeine Cache.get(key, loader) on the JVM",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "idiom_name": "Caffeine newBuilder + get(key, k => load(k)) + invalidate",
+      "implementation_notes": "Scala uses the JVM caches: Caffeine's get(key, k => load(k)) performs the atomic compute-and-insert, expireAfterWrite and maximumSize carry TTL and eviction, and invalidate(key) runs after the store commit. The asMap view keeps the ConcurrentMap methods available for migration, and for asynchronous paths the CompletableFuture-based AsyncCache pairs with Scala's Future through the JDK converters or stays synchronous with the loading done outside the cache. There is no Scala-specific cache in the standard library, so the choice mirrors Java's Caffeine/JCache decision.",
+      "code_sketch": "private val cache = Caffeine.newBuilder()\n  .expireAfterWrite(5, TimeUnit.MINUTES)\n  .maximumSize(100_000)\n  .build[String, Entity]()\n\ndef read(id: String): Entity = cache.get(id, key => store.find(key))  // populate on miss\ndef update(e: Entity): Unit = { store.save(e); cache.invalidate(e.id) }  // store first",
+      "pitfalls": [
+        "Caffeine's loader runs once per key while other callers wait, so it must not block indefinitely or call back into the same entry.",
+        "The cache is heap-local per JVM: a multi-node service needs a shared tier and an invalidation broadcast (or short TTLs) to bound staleness between nodes.",
+        "Scala 2.13 and Scala 3 collection types differ; converting between scala.jdk and scala.collection around the cache adds wrappers that the Java API avoids."
+      ],
+      "sources": [
+        "https://github.com/ben-manes/caffeine/wiki/Population",
+        "https://www.scala-lang.org/api/current/scala/collection/concurrent/TrieMap.html"
+      ]
+    },
+    {
+      "variant_id": "triemap-manual",
+      "name": "scala.collection.concurrent.TrieMap with an entry wrapper",
+      "paradigm": "concurrent",
+      "min_standard": "Scala2.13",
+      "idiom_name": "TrieMap get/putIfAbsent with a deadline wrapper (no dependencies)",
+      "implementation_notes": "The dependency-free form uses scala.collection.concurrent.TrieMap, a lock-free hash-trie with atomic single-key operations (putIfAbsent, remove) and O(1) lock-free snapshots, wrapping each value together with an expiry instant. Because only single-key operations are atomic, a concurrent miss can run the loader more than once, so the loader must be idempotent, the first stored value must win (putIfAbsent rather than update), or the load is shared through a per-key Promise; TTL sweeping and eviction stay application code.",
+      "code_sketch": "private val map = TrieMap.empty[String, Entry]\n\ndef read(id: String): Entity =\n  map.get(id).filterNot(_.expired).map(_.value).getOrElse {  // cache hit check\n    val v = store.find(id)                                    // may run twice under a race\n    map.putIfAbsent(id, Entry(v, Deadline(5.minutes)))         // first writer wins\n    v\n  }\n\ndef update(e: Entity): Unit = { store.save(e); map.remove(e.id) }  // store first, then invalidate",
+      "pitfalls": [
+        "Only single-key operations are atomic on a TrieMap: the loader can run concurrently for the same key, so it must be idempotent or guarded, and putIfAbsent preserves the first stored value.",
+        "Expired entries are only filtered on read - they stay in the map and leak unless a sweep removes them.",
+        "Iteration and size are snapshot-based; do not base eviction decisions on them as if they were exact and current."
+      ],
+      "sources": [
+        "https://www.scala-lang.org/api/current/scala/collection/concurrent/TrieMap.html"
+      ]
+    }
+  ],
+  "default_variant": "caffeine",
+  "version": "1.0"
+}

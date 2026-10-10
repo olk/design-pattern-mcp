@@ -1,0 +1,20 @@
+{
+  "pattern": "message-store",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "EF Core MessageRecord entity over Microsoft.Data.Sqlite + Channel writer",
+  "implementation_notes": "The store is an ordinary mapped table: a MessageRecord entity keyed by the message id plus a DbContext over Microsoft.Data.Sqlite (or any provider), so append is Add + SaveChangesAsync and reporting is a LINQ query - the classic Store and record split collapses into one entity plus a query surface, with the provider doing transactions and the engine doing durability. Because EF Core writes synchronously with the caller, the tap belongs off the request path: publish the record into a System.Threading.Channels.Channel<MessageRecord> (or a hosted BackgroundService) and let one consumer write batches, so a slow store degrades the audit trail instead of the API. Retention is a set-based sweep (ExecuteDeleteAsync with a timestamp filter, or partitioned tables where the database supports them), and the payload column carries the already-redacted projection. Hand-write the ADO.NET SqliteCommand form only where the mapping cost is measurable; the entity form stays right whenever the store is queried as data rather than as bytes.",
+  "code_sketch": "public sealed class MessageRecord {\n    public required string MessageId { get; init; }      // key\n    public string? CorrelationId { get; init; }\n    public required string Channel { get; init; }\n    public DateTimeOffset RecordedAt { get; init; }\n    public string Payload { get; init; } = \"\";          // already redacted\n}\nvar channel = Channel.CreateBounded<MessageRecord>(10_000);\nchannel.Writer.TryWrite(new MessageRecord { MessageId = m.Id, Channel = m.Channel,\n    RecordedAt = DateTimeOffset.UtcNow, Payload = Redact(m.Body) });   // off the request path\nawait db.MessageRecords.Where(r => r.RecordedAt < cutoff)\n                       .ExecuteDeleteAsync();                      // retention sweep",
+  "pitfalls": [
+    "SaveChanges on the request path makes an audit feature a latency and availability dependency of the API; write to a bounded Channel and batch in a background service, and document the drop policy when the channel is full.",
+    "SQLite serialises writers: a single SqliteConnection shared by concurrent requests throws 'database is locked' unless WAL is enabled and writes are funnelled through one writer, which is also what the Channel consumer gives you.",
+    "The audit table inherits your migrations: a payload contract change becomes a migration on stored history, so version the payload column and keep record changes additive.",
+    "The SQLite provider stores DateTimeOffset as text; comparing mixed offsets orders incorrectly, so normalise to UTC before writing and before filtering retention."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/",
+    "https://learn.microsoft.com/en-us/ef/core/providers/sqlite/",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel-1"
+  ],
+  "version": "1.0"
+}

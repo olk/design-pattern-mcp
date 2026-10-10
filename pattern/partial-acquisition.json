@@ -1,0 +1,173 @@
+{
+  "category": "persistence-state",
+  "name": "partial-acquisition",
+  "aliases": [
+    "staged acquisition",
+    "split acquisition"
+  ],
+  "intent": "Break the acquisition of one resource into ordered stages so that only the part needed now is acquired up front, while the expensive or optional remainder is deferred, fetched incrementally as it is consumed, or acquired once and shared.",
+  "problem": "A resource is expensive as a whole but only partly needed at the point where it is acquired: acquiring it atomically forces every holder to pay the full cost - transfer, decompression, decoding, index build, connection setup - for parts it may never touch, and under real constraints (memory, file descriptors, quota, licences) the full acquisition cannot be performed at all. The recurring decision is therefore where to cut the acquisition into stages, which stage may be eager, and what the remaining stages are gated on: availability of the resource now needed, capacity left for acquiring more, or the consumer simply asking for the next part.",
+  "context": "Resource-management decisions for resources that are larger or more expensive than the consumer's need: archives and container formats with an index, remote responses whose headers and body have very different costs, query results that stream in batches, model or asset bundles with shards, media with a seek index. It applies when the provider keeps the remaining parts addressable for the lifetime of the holder, when consumers differ in how much of the resource they touch, and when the platform's resource handle (descriptor, connection, cursor, stub, index) is separable from the resource's content - and it is the wrong answer when the resource must be consistent at one instant or when it fits comfortably in memory.",
+  "benefits": [
+    "Cost becomes proportional to use: a holder that needs the index, headers, manifest or first page never pays for the payload, and the remaining stages are only performed for consumers that actually reach them.",
+    "Resources that cannot be acquired in full under the current constraints - memory budget on a device, connection or licence limits, a metered link, a bounded cache - become usable stage by stage instead of being unavailable.",
+    "The expensive part can be acquired once and shared: a common index, prepared statement, decompressed dictionary, mapped window or pooled connection is paid for once while each holder keeps a cheap private handle.",
+    "Cheap stages are natural admission points: existence, type, size, version, ownership and permission can all be checked on the first part, so work is rejected before the expensive stage is committed.",
+    "Later stages are gateable, so capacity, deadlines, rate limits and back-pressure apply at the stage boundaries instead of on one indivisible acquisition.",
+    "Consumers can start working early (streaming, paging, first-frame rendering) instead of waiting for the whole resource to arrive."
+  ],
+  "tradeoffs": [
+    "Partial failure is a legal state: any later stage can fail after earlier stages succeeded, so the design must say what a half-acquired resource means - roll back what was taken, degrade to the part that is available, or abandon the holder - and every caller has to honour that decision.",
+    "Staged acquisition implies staged release in reverse order, idempotently: an undrained response body, an unclosed cursor, an open decompressor or an unmapped window each keeps the expensive stage occupied long after the caller believes it is finished.",
+    "The provider must stay reachable across the gap between stages; idle reaping by a middlebox, a moved or rewritten resource, or a one-shot stream turns a deferred part into an error the caller cannot repair, which eager acquisition would have surfaced immediately.",
+    "Concurrent consumers of one partial resource need explicit coordination (a guard or single-flight around the shared expensive stage, and a policy for interleaved readers of one handle), and interleaving a seekable or streaming handle is a correctness hazard rather than a performance detail.",
+    "The holder becomes a small state machine with more components - stage plan, gates, part provider, release path - than an atomic acquire, and failures can now originate in any stage, so diagnosis and support cost more.",
+    "Cost and latency are sums over stages: budgets, timeouts and alert thresholds must be defined per stage, and capacity planning can no longer read the whole acquisition cost off one place.",
+    "Without a shared guard the expensive stage is duplicated per holder - the lazy-acquisition failure mode repeated at every stage boundary, now with a partially acquired resource per holder."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 8,
+    "reliability": 6,
+    "security": 6,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Resource User",
+      "responsibility": "Obtains the cheap first stage, uses the resource strictly through the staged interface, triggers the later stages it needs, and never observes a partially acquired resource as if it were complete."
+    },
+    {
+      "role": "Partial Resource (Handle)",
+      "responsibility": "The first-stage object: a cheap, immediately valid representation of the whole resource - descriptor, connection, cursor, stub, index, metadata - that is self-describing enough to decide what to acquire next."
+    },
+    {
+      "role": "Acquisition Plan (Stage Sequence)",
+      "responsibility": "Defines which stages exist, what each one acquires, in which order they may run, and which constraints (memory, other resources, deadline, back-pressure) gate the next stage."
+    },
+    {
+      "role": "Remaining-Part Provider",
+      "responsibility": "Supplies the parts of the resource that were not acquired in the first stage - file, stream, remote service, decompressor, database - and must stay addressable for as long as later stages are possible."
+    },
+    {
+      "role": "Shared Expensive Part",
+      "responsibility": "The optional portion that is acquired once and shared by many holders (index, prepared statement, decompressed dictionary, mapped window, pooled connection); it is the reason partial acquisition is also a sharing pattern, and it needs a guard or single-flight."
+    },
+    {
+      "role": "Lifecycle Owner",
+      "responsibility": "Releases every stage that was actually acquired, in reverse order and idempotently, and decides the semantics of abandoned or failed stages."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Archive and container formats: opening reads the central directory or header only, and each member is decompressed or decoded when it is actually read.",
+    "HTTP and RPC responses: status and headers arrive first and drive routing, caching and validation decisions, while the body is streamed in bounded chunks or fetched by range when needed.",
+    "Database access: connect and prepare the statement as the shared first stage, then execute and consume rows in batches (fetch size, cursors, cursors plus paging) instead of materialising the whole result.",
+    "Model and asset loading: load the manifest, index and metadata eagerly, and fetch the weight shards or textures on first use or first request for that layer.",
+    "Media playback and editing: read the container header and seek index, then decode only the frames, tiles or segments the user actually reaches.",
+    "Object and blob stores: list or stat metadata first, fetch the body only if the consumer matches, and fetch large objects as parallel or resumable parts.",
+    "Connection and session pools: the pooled physical resource is the shared expensive stage, while each logical connection or session is a cheap per-client handle that acquires the physical part only when it is first used.",
+    "Amazon S3 GetObject supports a concrete byte-range stage: a caller can use Range or partNumber to retrieve only the requested object slice rather than materialising the whole object.",
+    "PostgreSQL server-side cursors expose a staged result: DECLARE establishes the cursor, and FETCH count advances through bounded row batches so a consumer need not acquire every result row.",
+    "HTTP servers that implement Range requests let clients acquire headers and validators first, then request 206 Partial Content byte windows for media seeking or resumable transfer."
+  ],
+  "avoid_when": [
+    "The resource is small or cheap to acquire whole: acquire it atomically, or defer it entirely with Lazy Acquisition when it may not be needed at all - the staging machinery is pure overhead otherwise.",
+    "The resource must be consistent at one instant (checksum, signature, snapshot, schema-validated document): acquire and verify it as a whole, or stage behind an immutable snapshot, because parts fetched at different times may belong to different versions.",
+    "The runtime already stages the resource for you (streams, iterators, lazy collections, the HTTP client's body stream, the database driver's cursor): use that mechanism - add Caching or Pooling only if reuse rather than deferral is the actual problem.",
+    "The provider cannot keep the later parts addressable (one-shot stream, expiring URL, transient result set): a deferred stage that can no longer be fetched is worse than an eager acquisition.",
+    "Every consumer of the resource consumes all of it: splitting acquisition then adds state, failure modes and release obligations without deferring anything.",
+    "The dominant cost is per-part overhead rather than per-byte cost (tiny requests, per-row round trips): staged acquisition multiplies fixed costs, so batch sizes and part granularity must be chosen before adopting the pattern."
+  ],
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "posa3"
+  ],
+  "related_patterns": [
+    "lookup",
+    "lazy-acquisition",
+    "eager-acquisition",
+    "caching",
+    "object-pool",
+    "resource-return",
+    "lazy-load",
+    "flyweight"
+  ],
+  "anti_patterns": [
+    "Staging as an alibi for a missing index: every access re-scans or re-reads the resource to find the part it wants, so the later stage is itself a full acquisition and nothing is ever amortised.",
+    "Handing out half-acquired resources as normal state: a checked-out connection whose transaction never runs, a response body that is never read or drained, a decompressor left open - the cheap stage is held while the expensive stage leaks.",
+    "Deferring the stage that must validate: authorization, quota and capability checks pushed into a later stage let an unqualified holder occupy the shared first stage and force rejection after part of the cost has been paid.",
+    "Assuming a deferred stage is guaranteed: holding a handle across arbitrary delay and still expecting the provider to serve the later part (a reaped connection, an expired signed URL) turns a design decision into an outage.",
+    "Part granularity chosen by accident: a fetch size or chunk size left at its default turns a streamed read into thousands of round trips, or a staged resource into a materialised one.",
+    "Re-implementing staging the platform already performs (page cache, read-ahead, cursor, stream) on top of it, duplicating buffers and defeating the prefetching the platform was doing."
+  ],
+  "migration_from": [
+    "eager-acquisition",
+    "lazy-acquisition"
+  ],
+  "migration_to": [
+    "caching",
+    "object-pool",
+    "resource-return"
+  ],
+  "design_principles": [
+    "Separation of concerns: the stage plan (which parts exist and in what order) is separate from the providers that supply them and from the user's access pattern.",
+    "Proportionality: each stage may cost only what it delivers, so the first stage must be cheap and the later ones bounded.",
+    "Constraints as gates: resource availability decides when a later stage may run, which makes staging a resource-policy decision rather than mere laziness.",
+    "Explicit partial states: a partially acquired resource is a named, legal state with defined operations, never an accident discovered by the caller.",
+    "Reversibility: whatever a stage acquires must be releasable, and staged acquisition therefore implies staged release in reverse order.",
+    "Fail before paying: order the stages so that anything able to reject the work is checked in the cheapest stage."
+  ],
+  "best_practices": [
+    "Cut the acquisition where the costs and needs actually differ - index versus payload, headers versus body, plan versus execution, metadata versus content - not at an arbitrary byte count.",
+    "Make the first stage cheap, complete and self-describing: existence, size, type, version, ownership and permission must be answerable without touching the expensive part.",
+    "Single-flight and share the expensive stage (once-guard, pool, cache) so concurrent holders do not each pay for it and each hold a partial copy.",
+    "Never let a partially acquired resource escape the code that owns the stages: expose only the operations legal in the current state and keep the stage state inside the holder.",
+    "Release in reverse order, idempotently, and drain what the platform expects (body, cursor, decompressor, mapping) even when the resource is abandoned early.",
+    "Bound every deferred stage: part size, part count, timeout and cancellation, so the deferred part cannot become an unbounded hang on a path with no timeout.",
+    "Keep the provider's freshness window in mind: acquire the deferred part while the handle is fresh, or re-resolve and re-authenticate it (Lookup) before use.",
+    "Instrument the stages - parts fetched, bytes moved, rows read, first-part latency - so the deferral stays observable and the cost model remains honest."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Kircher & Jain, Pattern-Oriented Software Architecture Vol. 3: Patterns for Resource Management (Wiley, 2004) - Partial Acquisition, p. 66, in the Resource Acquisition group together with Lookup (p. 21), Lazy Acquisition (p. 38) and Eager Acquisition (p. 53); the volume's summary defines it as breaking acquisition of a resource into multiple stages, each stage acquiring part of the resource depending on system constraints such as available memory and the availability of other resources.",
+    "https://assets.thalia.media/doc/artikel/6b5/06d/6b506d9a9ad677104f3798e1d9a1e98f48bf48ac.pdf - publisher sample chapter: pattern summaries for the acquisition, lifecycle and release groups plus the table of contents with the page numbers cited above.",
+    "https://www.dre.vanderbilt.edu/POSA/ - POSA series index; POSA3 presents the patterns for the complete resource lifecycle (acquisition, coordination, release).",
+    "https://www.wiley.com/en-us/pattern-oriented-software-architecture-volume-3-patterns-for-resource-management-p-9781118725238 - Wiley product page for the volume.",
+    "https://www.wiley-vch.de/en/areas-interest/computing-computer-sciences/pattern-oriented-software-architecture-978-0-470-84525-7",
+    "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests",
+    "https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html",
+    "https://www.postgresql.org/docs/current/sql-fetch.html",
+    "https://www.doctrine-project.org/projects/doctrine-orm/en/3.7/reference/partial-objects.html"
+  ],
+  "language_files": {
+    "generic": "partial-acquisition.generic.json",
+    "c": "partial-acquisition.c.json",
+    "cplusplus": "partial-acquisition.cplusplus.json",
+    "csharp": "partial-acquisition.csharp.json",
+    "go": "partial-acquisition.go.json",
+    "java": "partial-acquisition.java.json",
+    "javascript": "partial-acquisition.javascript.json",
+    "kotlin": "partial-acquisition.kotlin.json",
+    "python": "partial-acquisition.python.json",
+    "ruby": "partial-acquisition.ruby.json",
+    "rust": "partial-acquisition.rust.json",
+    "scala": "partial-acquisition.scala.json",
+    "swift": "partial-acquisition.swift.json",
+    "typescript": "partial-acquisition.typescript.json"
+  }
+}

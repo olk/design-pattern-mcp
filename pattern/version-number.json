@@ -1,0 +1,161 @@
+{
+  "category": "persistence-state",
+  "name": "version-number",
+  "aliases": [
+    "rowversion",
+    "entity versioning"
+  ],
+  "intent": "Store a version token alongside each persistent record and make every write assert the token it read, so a write computed from stale data fails as a detectable conflict instead of silently overwriting a newer value.",
+  "problem": "Two sessions read the same record, both edit it, and the later write wins: the earlier update vanishes without any error (the lost update). Once the read-modify-write spans more than one system transaction the database cannot tell 'this is the record I read' from 'this record changed under me', so no code path can notice in time - unless the record itself carries a per-row token that changes on every write and the write tests that token before committing.",
+  "context": "Applies to records that outlive the transaction that read them: edits spanning user think time, a web form round-trip, an offline client, a batch worker holding aggregates, or any read-modify-write over data other writers touch in between. It needs a store that can test the token and change the record in one atomic step (a conditional UPDATE, a compare-and-swap, a document revision check) and a caller willing to act on the conflict - re-read, merge, retry, or report. It assumes conflicts are the exception; when they are the rule a pessimistic lock prevents the wasted work instead.",
+  "benefits": [
+    "Lost updates become observable: the stale write fails with a first-class conflict outcome (StaleDataError, DbUpdateConcurrencyException, StaleObjectError, OptimisticLockException, OptimisticLockError) that the caller must answer, instead of silently discarding another session's work.",
+    "No lock is held between read and write: readers and editors are never blocked, which is the only workable option when the gap is a user's think time rather than milliseconds.",
+    "Cheap and portable: one attribute per record plus one predicate per statement, with no lock manager, no coordinator and no extra round trip; the same mechanism works over SQL rows, documents and in-memory shared state.",
+    "Conflict cost is proportional to conflicts rather than to traffic: writes on unchanged records never pay, and only the writer whose token is out of date is rejected.",
+    "The refusal is decidable: the caller gets a definite 'your copy is stale' signal and can re-read, merge field-wise, retry an idempotent command, or ask the user to reconcile.",
+    "Composes with a Unit of Work: each dirty record's flush carries its own version predicate, so one stale row aborts the whole commit instead of half-applying it."
+  ],
+  "tradeoffs": [
+    "Conflicts arrive as failures after the work has been done: the session must replay, merge or reload, and the pattern itself supplies no resolution strategy.",
+    "The guarantee is only as strong as the least careful statement: bulk UPDATE/DELETE, raw SQL, admin scripts, triggers and foreign writers bypass the predicate unless every path is taught the convention.",
+    "Extra schema and mapping maintenance: a column or field that every migration, mapper, fixture and write path must carry and must never forget to bump.",
+    "Retry storms under contention: frequent conflicts turn into re-read/retry loops that burn CPU while a real lock would have serialised the writers deterministically.",
+    "Timestamp-style tokens inherit the storage clock's resolution and skew: a token that is not strictly increasing can miss a change (same tick) or flag a phantom conflict (skewed clocks).",
+    "It cannot see write skew: a rule spanning several rows can be violated by two individually fresh writes, because each row's token is still valid.",
+    "The token leaks if exposed carelessly: serving it as a public version field or ETag turns an internal concurrency artefact into an external contract that must then stay stable."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 7,
+    "performance": 6,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Version Token",
+      "responsibility": "The per-record version attribute (integer counter, GUID, database rowversion, document revision, sequence number) read together with the data and changed by every write; only its value is compared, never its meaning."
+    },
+    {
+      "role": "Versioned Record",
+      "responsibility": "The row, entity or document that carries the token; every in-memory copy remembers the token it was loaded at, and the write path must keep snapshot and token in step."
+    },
+    {
+      "role": "Write Operation",
+      "responsibility": "The statement or operation that changes the record - conditional UPDATE/DELETE, save() through a mapper, or an atomic compare-and-swap - and that carries the token predicate in the same atomic step."
+    },
+    {
+      "role": "Conflict Test",
+      "responsibility": "The affected-row count, exchange result or revision comparison that decides whether the token still matched; zero matches or a failed exchange means the copy was stale."
+    },
+    {
+      "role": "Conflict Handler",
+      "responsibility": "The caller-side policy on detection: re-read and retry, merge field-wise, fail the business transaction, or surface the conflict to the user. The pattern stops at detection and delegates this decision."
+    },
+    {
+      "role": "Exempt Write Path (optional)",
+      "responsibility": "Bulk statements, migrations, administrative tools and other writers allowed to change records without the token; each must be declared explicitly, because it silently removes the guarantee for the rows it touches."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Web forms and editors: a record is loaded into a page, edited for minutes or hours, then saved - the token makes the stale save fail instead of clobbering the other editor's change.",
+    "Distributed workers applying commands to the same entity: the second worker's write is rejected so it can refresh and re-apply, giving first-writer-wins with no held lock.",
+    "Data mappers and units of work: every dirty entity flushed at commit carries the version it was loaded with, so the whole transaction aborts on the first stale row.",
+    "Document stores and revision-based APIs: Mongoose's __v with optimisticConcurrency, CouchDB-style revisions, or a REST ETag/If-Match precondition all expose the same per-document token.",
+    "Leases, leader election and configuration records: one row represents ownership or a monotonic generation, and a write must prove it still holds the revision it acted on.",
+    "Offline or mobile sync: clients push edits made against a snapshot taken days earlier, and the version check decides which edits apply directly and which must go through a merge.",
+    "Hibernate ORM / JPA @Version: the mapper owns an integer (or timestamp) version property, appends it to every UPDATE's WHERE clause, bumps it on flush and raises StaleObjectStateException / OptimisticLockException when zero rows match, so the application code never writes the predicate by hand.",
+    "DynamoDB conditional writes: each item carries a Version attribute; UpdateItem sends ConditionExpression 'Version = :read_value' and increments Version in the same request, and ConditionalCheckFailedException is the conflict signal that triggers a bounded re-read-and-retry — the same contract exposed as @DynamoDBVersionAttribute in the enhanced client.",
+    "Cassandra lightweight transactions: UPDATE ... SET col = ? WHERE id = ? IF col = ? is a Paxos-backed compare-and-set, giving the token test linearizable semantics across replicas — at a documented cost (roughly four extra round-trips per conditional write), so it is reserved for rows that genuinely need the guard."
+  ],
+  "avoid_when": [
+    "The read-modify-write already runs inside one transaction with a row lock (SELECT ... FOR UPDATE, repeatable read): the lock excludes the lost update and an additional token adds only maintenance.",
+    "Conflicts are frequent or the work between read and write is expensive: a Pessimistic Offline Lock (or Coarse-Grained Lock) prevents the wasted effort instead of merely detecting it.",
+    "Set-based writes dominate (mass reclassification, retention deletes, backfills): per-row tokens either explode into per-row statements or are bypassed - give the batch an exclusive window instead.",
+    "The store already versions the data for you - an event-sourced aggregate with sequence numbers, an append-only log, a session state that is simply replaced - and a second token adds no information.",
+    "There is only one writer at a time (single-threaded batch, exclusive queue consumer, embedded store): stale data cannot exist, so the token is pure ceremony."
+  ],
+  "language_files": {
+    "generic": "version-number.generic.json",
+    "c": "version-number.c.json",
+    "cplusplus": "version-number.cplusplus.json",
+    "csharp": "version-number.csharp.json",
+    "go": "version-number.go.json",
+    "java": "version-number.java.json",
+    "javascript": "version-number.javascript.json",
+    "kotlin": "version-number.kotlin.json",
+    "python": "version-number.python.json",
+    "ruby": "version-number.ruby.json",
+    "rust": "version-number.rust.json",
+    "scala": "version-number.scala.json",
+    "swift": "version-number.swift.json",
+    "typescript": "version-number.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "optimistic-offline-lock",
+    "pessimistic-offline-lock",
+    "coarse-grained-lock",
+    "implicit-lock",
+    "unit-of-work",
+    "identity-map",
+    "dirty-flag",
+    "write-behind"
+  ],
+  "anti_patterns": [
+    "A version column that nothing increments (or that some writers forget): the predicate always matches and the protection is theatre.",
+    "Checking the token after the write - re-reading the row 'to see whether it changed' is a separate step and races with exactly the writers the check is meant to catch.",
+    "Retry-by-overwrite: catching the conflict and immediately saving the same stale in-memory values again, which converts detection into a delayed lost update.",
+    "Using the token as a business key or ordering value: bumping it on unrelated writes, sorting by it, or exposing it as the entity id.",
+    "Comparing wall-clock timestamps written by different machines and calling clock skew a conflict policy.",
+    "Versioning one row and believing a cross-row invariant (allocation sums, parent/child totals) is protected - write skew needs the aggregate or the isolation level to be guarded."
+  ],
+  "design_principles": [
+    "Detect rather than prevent: pay for concurrency only when a conflict actually occurs.",
+    "Put the guard and the mutation in one atomic step - a precondition that can be separated from the write is not a precondition.",
+    "Make the failure explicit: a stale write must be an observable outcome of the write call, not a log line and not silence.",
+    "Give the token one owner (mapper, repository, unit of work); scattered maintenance is how a predicate gets forgotten.",
+    "Identifier and token are different things: identity is stable, the version changes on every write and must never be used as identity."
+  ],
+  "best_practices": [
+    "Carry the version predicate in the same statement (or compare-and-swap) that performs the write, and branch on the affected-row count or exchange result immediately.",
+    "Keep the loaded token with the record snapshot; never re-read the version after the write to decide whether it had been stale.",
+    "Define one conflict policy per use case - retry after re-reading, merge field-wise, or fail the transaction - and never retry with stale values.",
+    "Confine the token to persistence, or expose it deliberately as a concurrency precondition (ETag/If-Match); never as a domain attribute or ordering key.",
+    "In a unit of work, test every flushed record and abort the whole transaction on the first conflict rather than committing the rest.",
+    "Audit non-standard write paths (bulk statements, admin tools, migrations, triggers) and either make them token-aware or declare them exempt.",
+    "Prefer a strictly increasing integer or a database-generated rowversion over wall-clock timestamps; if a timestamp or GUID is used, document its resolution and ordering assumptions."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Fowler, Patterns of Enterprise Application Architecture (Addison-Wesley, 2003) - Optimistic Offline Lock (Offline Concurrency Patterns, ch. 16), which prescribes the version number (or timestamp) token as its conflict check.",
+    "https://martinfowler.com/eaaCatalog/optimisticOfflineLock.html",
+    "https://java-design-patterns.com/patterns/version-number/",
+    "https://docs.sqlalchemy.org/en/20/orm/versioning.html",
+    "https://learn.microsoft.com/en-us/sql/t-sql/data-types/rowversion-transact-sql",
+    "https://docs.hibernate.org/orm/5.2/userguide/html_single/chapters/locking/Locking.html",
+    "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BestPractices_OptimisticLocking.html",
+    "https://docs.datastax.com/en/cassandra-oss/3.x/cassandra/dml/dmlLtwtTransactions.html",
+    "https://vladmihalcea.com/an-entity-modeling-strategy-for-scaling-optimistic-locking/",
+    "https://martendb.io/documents/concurrency.html"
+  ]
+}

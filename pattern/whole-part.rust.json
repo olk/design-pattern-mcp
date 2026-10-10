@@ -1,0 +1,76 @@
+{
+  "pattern": "whole-part",
+  "language": "rust",
+  "support": "native",
+  "idiom_name": "struct fields + Vec + Drop (owned parts)",
+  "implementation_notes": "The default Rust reading of Whole-Part is the language's own ownership model: a struct's fields are its parts, the whole owns them exclusively, dropping the whole drops them (each part's Drop runs as the whole's fields are dropped), and the borrow checker refuses to let a part escape as a borrowed reference or outlive its whole. Moves and in-place mutation are explicit (&mut, take, mem::replace), which is exactly the pattern's exclusive-ownership invariant checked at compile time. Rc/Arc plus Weak are the escape hatch when parts really must be shared; reach for them only when the owning form stops working, because they move ownership checking to run time (RefCell panics) or into a cycle-collection problem.",
+  "code_sketch": "pub struct Document {              // the Whole\n    parts: Vec<Paragraph>,         // owned parts: dropped with the document\n    backing: File,                 // owned resource: closed on drop\n}\nimpl Document {\n    pub fn add(&mut self, text: &str) { self.parts.push(Paragraph::new(text)); }\n    pub fn total_len(&self) -> usize { self.parts.iter().map(Paragraph::len).sum() }\n}",
+  "pitfalls": [
+    "Returning &mut Paragraph (or &mut self.parts) publishes a borrow of the whole: while the caller holds it the whole cannot be used and its invariants cannot be re-checked, so prefer domain methods that borrow internally.",
+    "A type that implements Drop cannot be partially moved out of: taking a part out of the whole needs Option, mem::replace or a separate owning container.",
+    "Drop order is declaration order reversed: a part whose Drop reads another field must be declared after that field."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/stable/book/ch15-06-reference-cycles.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "owned-composition",
+      "name": "Struct composition with exclusive ownership (Drop cascade)",
+      "paradigm": "oo",
+      "min_standard": "Rust2015",
+      "idiom_name": "struct fields + Vec + Drop (owned parts)",
+      "implementation_notes": "The default Rust reading of Whole-Part is the language's own ownership model: a struct's fields are its parts, the whole owns them exclusively, dropping the whole drops them (each part's Drop runs as the whole's fields are dropped), and the borrow checker refuses to let a part escape as a borrowed reference or outlive its whole. Moves and in-place mutation are explicit (&mut, take, mem::replace), which is exactly the pattern's exclusive-ownership invariant checked at compile time. Rc/Arc plus Weak are the escape hatch when parts really must be shared; reach for them only when the owning form stops working, because they move ownership checking to run time (RefCell panics) or into a cycle-collection problem.",
+      "code_sketch": "pub struct Document {              // the Whole\n    parts: Vec<Paragraph>,         // owned parts: dropped with the document\n    backing: File,                 // owned resource: closed on drop\n}\nimpl Document {\n    pub fn add(&mut self, text: &str) { self.parts.push(Paragraph::new(text)); }\n    pub fn total_len(&self) -> usize { self.parts.iter().map(Paragraph::len).sum() }\n}",
+      "pitfalls": [
+        "Returning &mut Paragraph (or &mut self.parts) publishes a borrow of the whole: while the caller holds it the whole cannot be used and its invariants cannot be re-checked, so prefer domain methods that borrow internally.",
+        "A type that implements Drop cannot be partially moved out of: taking a part out of the whole needs Option, mem::replace or a separate owning container.",
+        "Drop order is declaration order reversed: a part whose Drop reads another field must be declared after that field."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/stable/book/ch15-06-reference-cycles.html"
+      ]
+    },
+    {
+      "variant_id": "shared-part-graph",
+      "name": "Shared parts with Rc/Arc and Weak back-references",
+      "paradigm": "concurrent",
+      "min_standard": "Rust1.4",
+      "requires_features": [
+        "Rc",
+        "Weak"
+      ],
+      "idiom_name": "Rc<RefCell<...>> / Arc<Mutex<...>> with Weak parent links",
+      "implementation_notes": "When a part must be reachable from more than one place - observers, parent links, caches - exclusive ownership is abandoned deliberately: parts go behind Rc<RefCell<T>> (single-threaded) or Arc<Mutex<T>>/Arc<RwLock<T>> (shared across threads), and every back-reference from a part to its whole is a Weak, because an owning cycle never frees the whole. The standard library states the rule directly (strong references keep the value alive, Weak does not, and a tree keeps strong Rc pointers from parent to children and Weak pointers from children back to their parents), and Weak must be upgraded with Option handling before use; Rc::new_cyclic exists for structures that need a weak pointer to themselves during construction.",
+      "code_sketch": "pub struct Document { parts: RefCell<Vec<Rc<Paragraph>>> }     // owns its parts\npub struct Paragraph { text: String, parent: RefCell<Weak<Document>> }\nfn owner_summary(p: &Paragraph) -> Option<String> {\n    let doc = p.parent.borrow().upgrade()?;   // None once the whole has been dropped\n    Some(format!(\"{} parts\", doc.parts.borrow().len()))\n}",
+      "pitfalls": [
+        "Any strong cycle (parent holds Rc<child>, child holds Rc<parent>) leaks the whole graph: exactly one direction owns and the other uses Weak.",
+        "RefCell borrow_mut panics at run time when a part calls back into the whole during iteration - the check the compiler used to perform becomes a panic path; use try_borrow or restructure.",
+        "Arc<Mutex<...>> serialises access and adds atomic overhead: share parts across threads only when the parts really are the concurrency boundary."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/stable/std/rc/struct.Weak.html",
+        "https://doc.rust-lang.org/stable/book/ch15-04-rc.html"
+      ]
+    },
+    {
+      "variant_id": "arena-indexed",
+      "name": "Owning arena with index handles (data-oriented)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2015",
+      "idiom_name": "Vec<Node> arena + typed index handles instead of references",
+      "implementation_notes": "The data-oriented realization keeps one owner and no reference cycles: the whole owns a single arena (a Vec of nodes) and hands out index handles instead of references, so parent/child and sibling links are plain indices that cannot dangle past the arena's lifetime and the borrow checker has only one owner to track. Structural edits become operations on the arena (insert child, remove subtree, compact) and iteration is an index loop rather than pointer chasing - cache-friendly and free of Rc/RefCell overhead. Generational indices are the refinement when removal must invalidate stale handles; the cost is that a handle is only valid against the arena that issued it, so it must carry or be scoped to its owner.",
+      "code_sketch": "pub struct Document { nodes: Vec<Node>, root: NodeId }      // the Whole owns everything\npub struct Node { parent: Option<NodeId>, children: Vec<NodeId>, text: String }\nimpl Document {\n    pub fn add_child(&mut self, parent: NodeId, text: String) -> NodeId {\n        let id = NodeId(self.nodes.len() as u32);\n        self.nodes.push(Node { parent: Some(parent), children: Vec::new(), text });\n        self.nodes[parent.0 as usize].children.push(id);    // link as an index\n        id\n    }\n}",
+      "pitfalls": [
+        "An index from one arena used against another is silently wrong (or panics): type handles per owner and keep them out of APIs that accept arbitrary collections.",
+        "Removal invalidates handles: without generations a stale NodeId reaches a reused slot - use tombstones, compaction or generational indices.",
+        "The arena retains removed nodes until compaction, so long-lived editors must compact or reuse slots deliberately."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/stable/book/ch15-06-reference-cycles.html"
+      ]
+    }
+  ],
+  "default_variant": "owned-composition"
+}

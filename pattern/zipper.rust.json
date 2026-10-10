@@ -1,0 +1,62 @@
+{
+  "pattern": "zipper",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "enum Tree + enum Path (Box), moves consume and return the cursor",
+  "implementation_notes": "std has no zipper, so it is hand-written, and the ownership rules shape the design: model the tree as an enum whose recursive case is Box (or Rc/Arc when subtrees must be shared), model the context as a second enum whose variants mirror the tree's shape, and take self by value in every move so ownership of the tree travels with the cursor instead of fighting the borrow checker. wezterm's bintree Cursor is exactly this shape - an owned subtree plus a Path of Left/Right/Top frames - and no allocation happens per move beyond the boxes the tree already has. The mutable alternative (Rc<RefCell<Node>> with weak parent pointers) leaks cycles and moves borrow errors to runtime panics, which is what the cursor form exists to avoid.",
+  "code_sketch": "enum Tree { Leaf(i32), Node { left: Box<Tree>, right: Box<Tree> } }\nenum Path { Top, Left { right: Box<Tree>, up: Box<Path> }, Right { left: Box<Tree>, up: Box<Path> } }\nstruct Cursor { it: Box<Tree>, path: Box<Path> }        // the location\nimpl Cursor {\n    fn up(self) -> Result<Self, Self> {                  // consume; rebuild the parent\n        match *self.path {\n            Path::Top => Err(self),\n            Path::Left { right, up } => Ok(Self { it: Box::new(Tree::Node { left: self.it, right }), path: up }),\n            Path::Right { left, up } => Ok(Self { it: Box::new(Tree::Node { left, right: self.it }), path: up }),\n        }\n    }\n}",
+  "pitfalls": [
+    "Take and return ownership (or borrow mutably) consistently: a cursor that hands out references into the tree while also moving it will not compile, and that usually means the representation is wrong.",
+    "Box-based recursive types are dropped recursively, so a deep tree can overflow the stack on drop and on build; parse iteratively or provide an iterative Drop impl for unbounded input.",
+    "Sharing instead of moving (Rc/Arc) reintroduces the mutable pattern: parent pointers via Weak plus RefCell borrow-check at runtime, with panics and leaks as the failure mode.",
+    "A cursor pins a version: keeping one in a long-lived map keeps the whole tree alive, and it must be discarded (or replaced) after any other edit."
+  ],
+  "sources": [
+    "https://github.com/wezterm/wezterm/blob/577474d8/bintree/src/lib.rs",
+    "https://doc.rust-lang.org/std/boxed/index.html",
+    "https://doc.rust-lang.org/std/rc/struct.Rc.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "owned-path-cursor",
+      "name": "Owned tree with a Box-based Path enum cursor",
+      "paradigm": "functional",
+      "min_standard": "Rust2018",
+      "idiom_name": "enum Tree + enum Path (Box), moves consume and return the cursor",
+      "implementation_notes": "std has no zipper, so it is hand-written, and the ownership rules shape the design: model the tree as an enum whose recursive case is Box (or Rc/Arc when subtrees must be shared), model the context as a second enum whose variants mirror the tree's shape, and take self by value in every move so ownership of the tree travels with the cursor instead of fighting the borrow checker. wezterm's bintree Cursor is exactly this shape - an owned subtree plus a Path of Left/Right/Top frames - and no allocation happens per move beyond the boxes the tree already has. The mutable alternative (Rc<RefCell<Node>> with weak parent pointers) leaks cycles and moves borrow errors to runtime panics, which is what the cursor form exists to avoid.",
+      "code_sketch": "enum Tree { Leaf(i32), Node { left: Box<Tree>, right: Box<Tree> } }\nenum Path { Top, Left { right: Box<Tree>, up: Box<Path> }, Right { left: Box<Tree>, up: Box<Path> } }\nstruct Cursor { it: Box<Tree>, path: Box<Path> }        // the location\nimpl Cursor {\n    fn up(self) -> Result<Self, Self> {                  // consume; rebuild the parent\n        match *self.path {\n            Path::Top => Err(self),\n            Path::Left { right, up } => Ok(Self { it: Box::new(Tree::Node { left: self.it, right }), path: up }),\n            Path::Right { left, up } => Ok(Self { it: Box::new(Tree::Node { left, right: self.it }), path: up }),\n        }\n    }\n}",
+      "pitfalls": [
+        "Take and return ownership (or borrow mutably) consistently: a cursor that hands out references into the tree while also moving it will not compile, and that usually means the representation is wrong.",
+        "Box-based recursive types are dropped recursively, so a deep tree can overflow the stack on drop and on build; parse iteratively or provide an iterative Drop impl for unbounded input.",
+        "Sharing instead of moving (Rc/Arc) reintroduces the mutable pattern: parent pointers via Weak plus RefCell borrow-check at runtime, with panics and leaks as the failure mode.",
+        "A cursor pins a version: keeping one in a long-lived map keeps the whole tree alive, and it must be discarded (or replaced) after any other edit."
+      ],
+      "sources": [
+        "https://github.com/wezterm/wezterm/blob/577474d8/bintree/src/lib.rs",
+        "https://doc.rust-lang.org/std/boxed/index.html",
+        "https://doc.rust-lang.org/std/rc/struct.Rc.html"
+      ]
+    },
+    {
+      "variant_id": "arena-index-cursor",
+      "name": "Arena with NodeId cursor (indextree)",
+      "paradigm": "data-oriented",
+      "min_standard": "Rust2021",
+      "idiom_name": "indextree Arena + NodeId cursor (no Rc, no RefCell)",
+      "implementation_notes": "When many locations must coexist or traversal should be parallel, the pointer-free form is an arena: indextree stores every node in one Vec and addresses it by NodeId, so the cursor is a NodeId plus the ancestor ids and no Rc/RefCell is needed - mutability follows the arena's unique &mut, which makes the tree Send and Sync like the Vec it is. The crate supplies parent/children/preceding-siblings/descendants accessors that return iterators of NodeId, checked_* mutations returning Result instead of panicking, and detach/append/insert_before for local edits; because edits are in place, versions must be snapshotted explicitly, which is the guarantee the owned-cursor variant keeps.",
+      "code_sketch": "use indextree::{Arena, NodeId};\n\nlet mut arena = Arena::new();\nlet root = arena.new_node(\"root\");\nlet child = root.append_value(\"child\", &mut arena);          // returns NodeId\nlet siblings: Vec<NodeId> = root.children(&arena).collect();\nlet parent: Option<NodeId> = child.ancestors(&arena).nth(1);  // walk up\nlet other = arena.new_node(\"other\");\nroot.checked_append(other, &mut arena)?;                        // Result, not panic",
+      "pitfalls": [
+        "Removed slots are recycled: a NodeId kept across a removal can address a different node later, so check is_removed (or keep your own generation stamp) before trusting a stored cursor.",
+        "Indices are valid only for the arena that produced them; serialising raw ids and reusing them against another arena silently reads the wrong node.",
+        "Never hold a &Node across a mutation: the Vec can reallocate and the borrow checker will refuse the mutation anyway - keep NodeIds (Copy) instead.",
+        "There is no persistence here, so readers concurrent with a writer need a snapshot or an arena-level discipline; this variant trades immutability for index-based navigation."
+      ],
+      "sources": [
+        "https://docs.rs/indextree/latest/indextree/",
+        "https://doc.rust-lang.org/std/vec/struct.Vec.html"
+      ]
+    }
+  ],
+  "default_variant": "owned-path-cursor",
+  "version": "1.0"
+}

@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "ruby",
+  "support": "manual",
+  "idiom_name": "Mutex-guarded Hash<id, Thread::Queue> + Queue#pop(timeout:)",
+  "implementation_notes": "The Ruby stdlib has no future, so the requestor builds the structure by hand: a Mutex-protected Hash mapping the correlation id to a Thread::Queue (or a Thread::ConditionVariable plus its mutex), with the caller blocking in queue.pop(timeout: seconds), which returns nil when the deadline expires, and the transport's reader thread removing the entry and pushing the reply. concurrent-ruby's Promise/Future is the usual gem-level upgrade when the same shape is wanted with fulfill/value!(timeout) semantics and thread pools; the process-global interpreter lock still lets other threads run while one blocks, so the waiting is cheap for I/O-bound calls. Because the code is hand-written, the entry-removal path and the timeout path must be kept in one place or the table leaks.",
+  "code_sketch": "class Client\n  def initialize\n    @pending = {}\n    @mutex = Mutex.new\n  end\n\n  def call(body)\n    id = SecureRandom.uuid\n    queue = Thread::Queue.new\n    @mutex.synchronize { @pending[id] = queue }       # register BEFORE send\n    transport.send_message(id, body)\n    queue.pop(timeout: 5) || raise(\"no reply for #{id}\")   # nil on timeout\n  ensure\n    @mutex.synchronize { @pending.delete(id) }\n  end\nend\n# reader thread: @mutex.synchronize { @pending.delete(msg.correlation_id) }&.push(msg.payload)",
+  "pitfalls": [
+    "Thread::Queue#pop(timeout:) is recent: on older rubies the wait must be built from Thread::ConditionVariable#wait with a deadline (or Timeout.timeout), and the expiry signal differs - nil versus a raised exception - so wrap the transport's wait in one place.",
+    "An exception raised inside the reader thread is invisible to the waiting caller, so the queue must carry error results or a sentinel value, otherwise the call hangs until its deadline with no diagnostic.",
+    "A plain Hash is not safe for concurrent mutation: every insert, lookup and delete must go through the mutex or a reply can be lost or the entry corrupted under JRuby/TruffleRuby and Ractors.",
+    "The ensure block removes the entry on every path, but a reply that already removed it and then pushes leaves a value in a queue nobody reads - that is the expected late-reply drop, not a leak of the table."
+  ],
+  "sources": [
+    "https://docs.ruby-lang.org/en/master/Thread/Queue.html",
+    "https://github.com/ruby-concurrency/concurrent-ruby"
+  ],
+  "version": "1.0"
+}

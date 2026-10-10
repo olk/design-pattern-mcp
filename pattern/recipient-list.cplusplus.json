@@ -1,0 +1,72 @@
+{
+  "pattern": "recipient-list",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::vector<Recipient> + dispatch loop",
+  "implementation_notes": "The classic roles collapse into data plus a loop: the recipient set is a std::vector of endpoints - a socket or queue handle, or a std::function<void(const Message&)> target - computed per message, and the traversal is a range-for that hands each element its own copy. std::function (or a variant of concrete targets) supplies the polymorphism that a Router class hierarchy used to provide, so no new type is needed until per-recipient policy becomes pluggable. The class-based classic form is still justified when handlers must be configured and swapped independently of the router, or when a framework (ACE, Asio) already owns the event loop and expects hand-off objects.",
+  "code_sketch": "void fanOut(const Message& msg, const std::vector<Recipient>& recipients)\n{\n    for (const auto& r : recipients)          // recipients computed per message\n        r.deliver(msg);                        // each recipient gets its own copy\n}\n// the list itself is data:\n// auto recipients = registry.resolve(msg);   // std::vector<Recipient>",
+  "pitfalls": [
+    "Passing the message by const& is only safe while deliver() does not retain it; if a recipient stores a reference, all recipients share mutable state and content changes leak across the fan-out.",
+    "A std::function target capturing a reference to a short-lived connection or buffer dangles once the loop moves on; the recipient container must own what its targets use.",
+    "Sequential delivery makes total latency the sum of all sends, so one slow or dead endpoint delays every later recipient unless sends are made asynchronous or time-bounded."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/utility/functional/function"
+  ],
+  "variants": [
+    {
+      "variant_id": "manual-fan-out-loop",
+      "name": "Manual recipient vector + dispatch loop",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::vector<Recipient> + dispatch loop",
+      "implementation_notes": "The classic roles collapse into data plus a loop: the recipient set is a std::vector of endpoints - a socket or queue handle, or a std::function<void(const Message&)> target - computed per message, and the traversal is a range-for that hands each element its own copy. std::function (or a variant of concrete targets) supplies the polymorphism that a Router class hierarchy used to provide, so no new type is needed until per-recipient policy becomes pluggable. The class-based classic form is still justified when handlers must be configured and swapped independently of the router, or when a framework (ACE, Asio) already owns the event loop and expects hand-off objects.",
+      "code_sketch": "void fanOut(const Message& msg, const std::vector<Recipient>& recipients)\n{\n    for (const auto& r : recipients)          // recipients computed per message\n        r.deliver(msg);                        // each recipient gets its own copy\n}\n// the list itself is data:\n// auto recipients = registry.resolve(msg);   // std::vector<Recipient>",
+      "pitfalls": [
+        "Passing the message by const& is only safe while deliver() does not retain it; if a recipient stores a reference, all recipients share mutable state and content changes leak across the fan-out.",
+        "A std::function target capturing a reference to a short-lived connection or buffer dangles once the loop moves on; the recipient container must own what its targets use.",
+        "Sequential delivery makes total latency the sum of all sends, so one slow or dead endpoint delays every later recipient unless sends are made asynchronous or time-bounded."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/functional/function"
+      ]
+    },
+    {
+      "variant_id": "asio-async-fanout",
+      "name": "Boost.Asio asynchronous fan-out with a completion barrier",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "asio::async_write per recipient + pending counter / make_parallel_group",
+      "implementation_notes": "The recipient set becomes a vector of connected sockets or Asio objects and the traversal becomes N async_write operations started from one loop; a shared pending counter (or boost::asio::experimental::make_parallel_group, which Asio provides for exactly this co-ordination) fires the completion when the last recipient has been written to. This variant replaces the blocking loop's latency summation with true overlap while keeping one thread; the manual loop remains the better choice for few, local or genuinely blocking destinations.",
+      "code_sketch": "auto pending = std::make_shared<std::atomic<int>>(recipients.size());\nfor (auto& r : recipients)\n    asio::async_write(r.socket, asio::buffer(payload),\n        [pending, done](error_code ec, size_t) {\n            if (ec) record_failure(ec);\n            if (--*pending == 0) done();     // last recipient -> fan-out complete\n        });",
+      "pitfalls": [
+        "The payload buffer, the sockets and the completion handler state must outlive every outstanding async_write; dangling buffers are the classic Asio fan-out bug.",
+        "Without a per-send timeout or cancellation, a dead peer leaves the pending counter above zero and the completion never fires - Asio cancellation slots/steady_timer are the tools."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference.html"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutines-fanout",
+      "name": "Boost.Asio fan-out with C++20 coroutines",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await async_write per recipient (use_awaitable)",
+      "implementation_notes": "Stackless coroutines turn the fan-out back into a linear loop over the computed recipient list: each co_await async_write delivers one copy, and because the loop body is sequential the completion condition is just the loop ending. Use it when the toolchain is C++20 and readability of the per-recipient error handling matters; the callback variant still wins when all sends must overlap, and co_spawn with awaitable_operators (&&/||) covers that case without leaving the coroutine model.",
+      "code_sketch": "asio::awaitable<void> fanOut(std::vector<Socket> recipients, std::string payload)\n{\n    for (auto& s : recipients)\n        co_await asio::async_write(s, asio::buffer(payload),\n                                   asio::as_tuple(asio::use_awaitable));\n}   // every recipient has received its copy when the coroutine resumes",
+      "pitfalls": [
+        "A coroutine loop is sequential by construction: total latency is the sum of the sends, so overlap requires co_spawn plus awaitable_operators instead.",
+        "Awaited operations throw a system_error by default; without as_tuple/redirect_error one failed recipient aborts the fan-out mid-list."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html"
+      ]
+    }
+  ],
+  "default_variant": "manual-fan-out-loop",
+  "version": "1.0"
+}

@@ -1,0 +1,70 @@
+{
+  "pattern": "watchman",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread monitor thread on a pthread_cond_timedwait deadline (CLOCK_MONOTONIC)",
+  "implementation_notes": "POSIX supplies only the timing primitives - clock_gettime(CLOCK_MONOTONIC), pthread_cond_timedwait on an absolute deadline, or timer_create with SIGEV_THREAD - so the watchman survives verbatim in C: the arrival path stamps last_seen under a mutex and signals the condition variable, one monitor thread waits for the deadline last_seen + period, and ETIMEDOUT is the absence alarm. The classic structure is not replaced by anything; only its clock and its wake-up are library calls. The timer_create variant can drive a single process-wide watchman without a monitor thread, but then the alert path runs in a signal handler and must stay async-signal-safe.",
+  "code_sketch": "static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;\nstatic pthread_cond_t stamp;              /* attr: clock = CLOCK_MONOTONIC */\nstatic struct timespec last_seen;\n/* arrival path: lock(mu); clock_gettime(CLOCK_MONOTONIC, &last_seen); signal(stamp); unlock(mu); */\nfor (;;) {\n    struct timespec deadline = add_ms(last_seen, period_ms);   /* last_seen + budget */\n    int rc = pthread_cond_timedwait(&stamp, &mu, &deadline);\n    if (rc == ETIMEDOUT)\n        alert(\"no message on %s for %d ms\", subject, period_ms);\n}",
+  "pitfalls": [
+    "pthread_cond_timedwait's absolute deadline defaults to the CLOCK_REALTIME origin, so an NTP step or a manual clock change can fire the alarm early or postpone it indefinitely; create the condition variable with pthread_condattr_setclock(CLOCK_MONOTONIC) and keep every timestamp in that clock.",
+    "The signal-handler form (alarm/timer_create with SIGEV_SIGNAL) may only call async-signal-safe functions and may only touch volatile sig_atomic_t state; logging, malloc or locking inside the handler is undefined behaviour - hand the event to a thread instead.",
+    "Reading the clock with time(NULL) or gettimeofday() makes the watchman wall-clock dependent: after a backwards step last_seen lies in the future and the alarm can never fire - always stamp with clock_gettime(CLOCK_MONOTONIC).",
+    "ETIMEDOUT must not be conflated with EINTR or EINVAL from pthread_cond_timedwait; treating any non-zero return as silence alarms on every signal delivered to the process.",
+    "The predicate must be re-checked after every wake-up: pthread_cond_timedwait may return spuriously and another thread may have stamped a fresher last_seen.",
+    "A producer that signals on every message keeps the monitor thread runnable without ever making the deadline pass, so correctness rests on the re-checked predicate, not on the wake-up count; keep the arrival critical section to a timestamp update so it cannot delay evaluation."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html",
+    "https://man7.org/linux/man-pages/man2/clock_gettime.2.html",
+    "https://man7.org/linux/man-pages/man2/timer_create.2.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "c-condvar-deadline",
+      "name": "Monitor thread on a condition-variable deadline",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "requires_features": [
+        "POSIX threads"
+      ],
+      "idiom_name": "pthread monitor thread on a pthread_cond_timedwait deadline (CLOCK_MONOTONIC)",
+      "implementation_notes": "POSIX supplies only the timing primitives - clock_gettime(CLOCK_MONOTONIC), pthread_cond_timedwait on an absolute deadline, or timer_create with SIGEV_THREAD - so the watchman survives verbatim in C: the arrival path stamps last_seen under a mutex and signals the condition variable, one monitor thread waits for the deadline last_seen + period, and ETIMEDOUT is the absence alarm. The classic structure is not replaced by anything; only its clock and its wake-up are library calls. The timer_create variant can drive a single process-wide watchman without a monitor thread, but then the alert path runs in a signal handler and must stay async-signal-safe.",
+      "code_sketch": "static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;\nstatic pthread_cond_t stamp;              /* attr: clock = CLOCK_MONOTONIC */\nstatic struct timespec last_seen;\n/* arrival path: lock(mu); clock_gettime(CLOCK_MONOTONIC, &last_seen); signal(stamp); unlock(mu); */\nfor (;;) {\n    struct timespec deadline = add_ms(last_seen, period_ms);   /* last_seen + budget */\n    int rc = pthread_cond_timedwait(&stamp, &mu, &deadline);\n    if (rc == ETIMEDOUT)\n        alert(\"no message on %s for %d ms\", subject, period_ms);\n}",
+      "pitfalls": [
+        "pthread_cond_timedwait's absolute deadline defaults to the CLOCK_REALTIME origin, so an NTP step or a manual clock change can fire the alarm early or postpone it indefinitely; create the condition variable with pthread_condattr_setclock(CLOCK_MONOTONIC) and keep every timestamp in that clock.",
+        "The signal-handler form (alarm/timer_create with SIGEV_SIGNAL) may only call async-signal-safe functions and may only touch volatile sig_atomic_t state; logging, malloc or locking inside the handler is undefined behaviour - hand the event to a thread instead.",
+        "Reading the clock with time(NULL) or gettimeofday() makes the watchman wall-clock dependent: after a backwards step last_seen lies in the future and the alarm can never fire - always stamp with clock_gettime(CLOCK_MONOTONIC).",
+        "ETIMEDOUT must not be conflated with EINTR or EINVAL from pthread_cond_timedwait; treating any non-zero return as silence alarms on every signal delivered to the process.",
+        "The predicate must be re-checked after every wake-up: pthread_cond_timedwait may return spuriously and another thread may have stamped a fresher last_seen.",
+        "A producer that signals on every message keeps the monitor thread runnable without ever making the deadline pass, so correctness rests on the re-checked predicate, not on the wake-up count; keep the arrival critical section to a timestamp update so it cannot delay evaluation."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_cond_timedwait.3.html",
+        "https://man7.org/linux/man-pages/man2/clock_gettime.2.html",
+        "https://man7.org/linux/man-pages/man2/timer_create.2.html"
+      ]
+    },
+    {
+      "variant_id": "c-posix-timer",
+      "name": "POSIX per-process timer with SIGEV_THREAD notification",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "POSIX timers"
+      ],
+      "idiom_name": "timer_create(CLOCK_MONOTONIC, SIGEV_THREAD) re-armed on every arrival",
+      "implementation_notes": "For a single-process watchman without a dedicated thread, arm one timer_create timer per subject and re-arm it (timer_settime with an absolute value) on every arrival; SIGEV_THREAD invokes the notification as a fresh thread, which keeps the alert logic out of signal context at the price of a thread per expiry. The last-arrival bookkeeping is still needed for reporting, but detection is entirely in the kernel timer.",
+      "code_sketch": "struct sigevent sev = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = on_silence};\ntimer_t t; timer_create(CLOCK_MONOTONIC, &sev, &t);\n/* arrival: */\nstruct itimerspec its = {{0, 0}, {period_s, 0}};\ntimer_settime(t, 0, &its, NULL);        /* re-arm, relative */",
+      "pitfalls": [
+        "SIGEV_THREAD starts a new thread for every expiry: under repeat-while-silent behaviour that is one thread per alert interval unless the handler re-arms or a state machine suppresses it.",
+        "timer_settime with a zero interval is one-shot; a real repeating timer must set it_interval, and mixing both forms in one subject produces either one alert or an unstoppable stream."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/timer_create.2.html",
+        "https://man7.org/linux/man-pages/man2/clock_gettime.2.html"
+      ]
+    }
+  ],
+  "default_variant": "c-condvar-deadline",
+  "version": "1.0"
+}

@@ -1,0 +1,20 @@
+{
+  "pattern": "process-manager",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "state enum column + apply(instance, event) function + outbox row + asyncio deadlines",
+  "implementation_notes": "Python has no standard process manager, so the common realization is a state column (or a small enum) on the business record, an apply(instance, event) function whose branching decides the next step, and an outbox row written in the same transaction as the state change; asyncio.timeout/wait_for bound in-process awaits, while deadlines that must survive a restart live in the row and are enforced by a scheduled job (APScheduler, Celery beat, a cron worker). pytransitions supplies a declarative state machine if the flow is large, and a durable-execution SDK (Temporal Python) supplies the whole pattern including history and timers, but neither is the language default, so the pattern stays hand-written here. The classic form is worth it when the flow is long-lived and crosses services; otherwise an ordinary transaction or a retry queue is smaller.",
+  "code_sketch": "def apply(order: Order, ev: Event, db: Connection) -> None:\n    if ev.id in order.handled_ids:            # idempotence by message id\n        return\n    match order.state:\n        case \"awaiting_payment\":\n            if ev.kind != \"payment_ok\":\n                return                        # stale or duplicate reply\n            with db:                          # one transaction: state + outbox\n                db.execute(\"update orders set state='awaiting_stock' where id=%s\", (order.id,))\n                enqueue(db, ReserveStock(order.id))\n        case \"awaiting_stock\":\n            with db:\n                db.execute(\"update orders set state='done' where id=%s\", (order.id,))\n\nasync def await_with_deadline(cid):\n    return await asyncio.wait_for(reply_queue.get(cid), timeout=3600)",
+  "pitfalls": [
+    "State held in a long-lived object or a module-level dict is lost on deploy; the row is the source of truth and the transition must commit with the outgoing message.",
+    "asyncio.wait_for cancels the awaiting task, not the remote call it started, so a step that already ran can still complete and must be idempotent.",
+    "Celery/RQ or a broker redelivers the same event after a worker restart; without per-message-id idempotence the flow advances twice.",
+    "Mutable default arguments or a shared connection per process leak state across instances - one connection/transaction per transition, keyed by the correlation id."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html",
+    "https://docs.temporal.io/develop/python",
+    "https://github.com/pytransitions/transitions"
+  ],
+  "version": "1.0"
+}

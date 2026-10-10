@@ -1,0 +1,213 @@
+{
+  "category": "concurrency-resilience",
+  "name": "deforestation",
+  "aliases": [
+    "fusion",
+    "stream fusion",
+    "loop fusion",
+    "shortcut fusion",
+    "foldr/build fusion",
+    "transducer composition"
+  ],
+  "intent": "Eliminate the intermediate data structures that each stage of a transformation chain would otherwise build, so the pipeline executes as a single pass - one element live at a time - keeping the declarative shape of the chain while paying the cost of a hand-written fused loop.",
+  "problem": "A transformation pipeline is written as a chain of independent stages (map/filter/flatMap/fold, range adaptors, iterator chains, query operators), and the direct implementation materializes one whole collection per stage: allocation, cache traffic and GC pressure scale with the length of the chain, the readable composition gets abandoned for a monolithic loop just to keep the hot path cheap, and generated, streamed or unbounded sources cannot be processed at all.",
+  "context": "Functional-style data transformation over large, generated or streamed data - collection pipelines, iterators, streams, view/adaptor chains, ETL and inference batches - where each stage's output is consumed exactly once by the next stage, the stages are pure, and the language or its ecosystem offers a lazy composition form (views, sequences, iterator adapters, transducers) or a compiler/library rewrite that removes the intermediate structures.",
+  "benefits": [
+    "The pipeline keeps its named, composable stages while costing one pass over the data: no intermediate collection is allocated, populated, traversed and discarded per stage.",
+    "Peak memory tracks the working element plus the accumulator instead of the sum of the stage outputs, which is what makes generated, streamed or unbounded sources usable at all.",
+    "Locality and branch behaviour improve together: one loop over one element stream replaces several passes over several freshly allocated structures, and the win grows with element size and chain length.",
+    "The transformation vocabulary becomes reusable: a composed stage (transducer, iterator adapter, view) applies to any conforming source and sink instead of being re-fused per pipeline.",
+    "Deliberate boundaries stay visible: the places that genuinely need materialization (sort, group, reuse, inspection) are exactly the places that call a terminal or materializing operation.",
+    "Behaviour-preserving by construction for pure stages: fusion is a representation change, not a semantic change, so the fused and the staged form can be tested against each other.",
+    "Enables fusion of left folds, zips, and concatMaps that simpler map-only fusion systems miss, as demonstrated by stream fusion benchmarks showing 3% average improvement over foldr/build and up to 50% on integer-heavy benchmarks.",
+    "In high-level numeric code (SIMD, vectorized operations), generalized stream fusion can produce code that beats hand-tuned C by enabling bulk memory operations and exploiting SSE/AVX instructions.",
+    "Deforestation reduces GC pressure in latency-sensitive services: eliminating intermediate object chains reduces both allocation cost and subsequent garbage collection pauses."
+  ],
+  "tradeoffs": [
+    "Fusion is only sound for pure, single-consumer stages: a stage whose output is re-read, retained, or relied on for effect ordering must be materialized, which silently reintroduces the intermediates.",
+    "Lazy pipelines defer everything to the terminal operation: a chain without a consumed result does nothing at all (or re-runs from the source on every enumeration), and that failure is invisible in review.",
+    "Failure semantics change: a throwing stage under fusion leaves a different partial-consumption state - and a worse stack trace - than staged evaluation does, so retry, resume and idempotency must be designed deliberately.",
+    "Observability degrades: step-debuggers, profilers and sampled stack traces see an anonymous fused iterator or a compiled loop instead of the named stage that is responsible.",
+    "Compiler-driven fusion is best-effort: rewrite rules depend on inlining and on producer/consumer forms, de-fusion is silent, and small refactors can lose the optimization without any diagnostic.",
+    "Composition machinery has a per-element price: closure calls, iterator state machines or virtual adapters can lose to a single hand-written loop when the per-element work is trivial or the data set is small.",
+    "LLVM loop fusion has no profitability model: it fuses every legal pair unconditionally, regardless of register pressure, cache footprint, or interaction with vectorization - fusion may hurt performance for small loops or increase code size.",
+    "Stream fusion produces Step constructor overhead that requires constructor specialization (SpecConstr) to eliminate; without it, deeply nested list computations can run dramatically worse (e.g., 24% slowdown in paraffins benchmark).",
+    "Fusion across module boundaries is unreliable in GHC: large multi-module programs show mixed results as the compiler misses optimization opportunities at module boundaries.",
+    "Code bloat from aggressive inlining: fusible pipelines require inlining all constituent functions, creating large combined functions that stress the compiler's simplifier and increase compile-time memory usage."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 9,
+    "reliability": 7,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Producer / Source",
+      "responsibility": "Yields elements on demand to the input end of the pipeline (collection cursor, generator, file or network reader, query iterator) and is the only participant that knows where the data comes from."
+    },
+    {
+      "role": "Transforming Stage",
+      "responsibility": "Encodes one transformation as a composable value - map, filter, take, deduplicate - consuming one upstream element and emitting zero or more downstream elements without owning a buffer of its own."
+    },
+    {
+      "role": "Fusion Mechanism",
+      "responsibility": "Merges the stages into a single pass: a composed transducer/reducer function, a lazily chained iterator/view/sequence, or the compiler's fusion rewrite over a producer/consumer pair. Implementations include: foldr/build rules (GHC), stream fusion (Coutts et al.), generalized stream fusion (Mainland et al.), LLVM LoopFusion pass, Lumberhack subtype inference (2024), or manual transducer composition."
+    },
+    {
+      "role": "Consumer / Sink",
+      "responsibility": "The terminal operation (fold, reduce, collect, forEach, find) that drives the pipeline; it is the only participant allowed to own accumulated state and the only place that triggers work."
+    },
+    {
+      "role": "Materialization Boundary",
+      "responsibility": "A deliberate barrier - sort, group, reverse, a second consumer, an inspection hook - that ends a fused segment; it is explicit in the code rather than an accident of the chain."
+    },
+    {
+      "role": "Accumulator",
+      "responsibility": "The single live state cell (running aggregate, current element, small window) that replaces the per-stage intermediate structures."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "persistence-unit",
+    "boundary"
+  ],
+  "use_cases": [
+    "ETL and analytics jobs that filter, project and aggregate over large files, database cursors or object stores, where one intermediate collection per stage would dominate the memory budget.",
+    "Request/response transformation chains in latency-sensitive services, where per-request allocation from staged pipelines is a main source of GC pressure.",
+    "Bounded-memory streaming over generated or unbounded sources - telemetry, log tails, paginated APIs - where the tail can never be materialized and short-circuiting stages (take, find, any) must be able to stop pulling.",
+    "Feature and record preprocessing in data/ML pipelines, where one transformation vocabulary is composed per source and per batch instead of re-implemented per job.",
+    "Hot numeric loops and relational/query execution: expression templates and loop-fusion passes remove arithmetic temporaries, and query planners fuse a chained query plan into one operator pass instead of materializing one result set per operator.",
+    "SIMD vectorized code: generalized stream fusion enables SSE/AVX operations in Haskell by bundling multiple stream representations, allowing high-level compositional code to match hand-vectorized C performance.",
+    "Text processing pipelines: Haskell's stream-fusion rewrite of Data.ByteString.Lazy achieved significant speedups by eliminating intermediate ByteString constructors.",
+    "Parallel collection processing: Clojure reducers use transducer-like decoupling to enable parallel fold without intermediate collections, then apply transducers across cores.",
+    "Async channel pipelines: Clojure core.async channels with transducers process streams without intermediate collections between pipeline stages, enabling efficient producer-consumer flows.",
+    "Apache Flink operator chaining: adjacent stream operators are automatically chained into a single task running in one thread, passing records by reference in-process instead of serializing and shuffling between fused operators, with disableChaining()/startNewChain() as the explicit materialization boundaries.",
+    "Apache Spark SQL whole-stage code generation (Tungsten): a subtree of query operators - scan, filter, project, aggregate - is compiled into one Java function so intermediate rows stay in CPU registers instead of being materialized between operators, approaching hand-written code performance.",
+    "C++20 ranges: std::ranges views (transform_view, filter_view, take_view) compose lazily into adaptor pipelines over any type modeling the view concept, and a single iteration realizes the result without intermediate containers."
+  ],
+  "avoid_when": [
+    "The data set is small or the pipeline is short: an eager chain over a plain array or list is simpler and the intermediate allocations are irrelevant.",
+    "A stage's output must be consumed more than once, inspected or logged: materialize it once at that boundary instead of re-running the fused source (or relying on a memoizing lazy form).",
+    "Stages carry effects whose order or count is observable (audit logging, metrics, I/O, rate limiting): an eager staged loop keeps the effect order obvious and repeatable.",
+    "The language has neither lazy composition nor reliable compiler fusion: one explicit loop is clearer and more predictable than a hand-rolled iterator-adapter framework.",
+    "The work is bound by I/O, network or a database: allocation is not the bottleneck, so fusion adds machinery without moving the metric.",
+    "Atomic operations are involved: LLVM loop fusion conservatively rejects any loop containing atomic load/store, atomicrmw, cmpxchg, or fence instructions, so fusion will silently fail in concurrent contexts.",
+    "Cross-loop def-use chains exist: if the second loop consumes a value produced inside the first loop (even when loop-invariant), LLVM loop fusion rejects the pair, making fusion unreliable for reduction pipelines."
+  ],
+  "language_files": {
+    "generic": "deforestation.generic.json",
+    "c": "deforestation.c.json",
+    "cplusplus": "deforestation.cplusplus.json",
+    "csharp": "deforestation.csharp.json",
+    "go": "deforestation.go.json",
+    "java": "deforestation.java.json",
+    "javascript": "deforestation.javascript.json",
+    "kotlin": "deforestation.kotlin.json",
+    "python": "deforestation.python.json",
+    "ruby": "deforestation.ruby.json",
+    "rust": "deforestation.rust.json",
+    "scala": "deforestation.scala.json",
+    "swift": "deforestation.swift.json",
+    "typescript": "deforestation.typescript.json"
+  },
+  "paradigm": [
+    "functional",
+    "declarative"
+  ],
+  "scope": "value",
+  "provenance": [
+    "functional-catalog"
+  ],
+  "related_patterns": [
+    "transducer",
+    "lazy-collection",
+    "generator",
+    "flyweight",
+    "object-pool",
+    "hylomorphism",
+    "collection-pipeline",
+    "function-composition",
+    "fold-catamorphism"
+  ],
+  "anti_patterns": [
+    "Hand-fusing every pipeline into a monolithic loop 'for performance', destroying the named stages that made the transformation testable and reviewable.",
+    "Wrapping a staged chain in lazy adapters and calling it optimized without measuring: the intermediates shrink but the per-element indirection stays.",
+    "Consuming a lazy pipeline twice (or enumerating the same IEnumerable twice) and paying for a full source pass per consumption while believing the result was cached.",
+    "Fusing stages that carry observable effects, so logging, auditing or metrics get duplicated, reordered or silently dropped when the pipeline short-circuits.",
+    "Depending on a compiler or rewrite-rule fusion that has silently stopped applying, and quoting the old benchmark as justification.",
+    "Building a general transducer/iterator-adapter framework for one or two pipelines - a public abstraction where a local loop would do.",
+    "Enabling LLVM LoopFusion without measuring: fusion is unconditional for legal pairs and may increase register pressure or cache misses for small loops, degrading performance.",
+    "Assuming fusion works across module boundaries in GHC: optimization opportunities are frequently missed when fusible functions cross module interfaces, leading to unexpected performance regressions.",
+    "Fusing recursive accumulator patterns: functions like rev xs ++ map f xs cannot be fused because intermediate thunks get stuck inside recursive accumulator arguments; fusion silently falls back to the original (possibly worse) program."
+  ],
+  "design_principles": [
+    "Composition over accumulation: transform composed functions/stages rather than the collections they would produce.",
+    "Separation of concerns: each stage declares one transformation; single-pass execution is a property of the composed whole, not of any stage.",
+    "Explicit boundaries: materialization is a decision (sort, group, reuse, effect), never a side effect of writing one more stage.",
+    "Referential transparency as a precondition: fusion preserves semantics only for pure stages, so effects belong in the sink or at a deliberate boundary.",
+    "Measure the machine, not the source shape: performance claims belong to benchmarks, because de-fusion is silent.",
+    "Purity by default: fusion systems assume pure functions; introducing observable effects into stages silently breaks fusion, effect ordering, or both.",
+    "Single-consumer semantics: every intermediate is consumed exactly once; multi-consumer pipelines must materialize at the branching point.",
+    "Short-circuit correctness: take/find/any must be able to stop upstream pulling; no stage may pre-fetch the full stream, as fusion would then prevent early termination."
+  ],
+  "best_practices": [
+    "Encode each transformation as a small composable value (adapter, view, step function) and fuse by composition; reserve hand-merged loops for the rare proven hot spot.",
+    "Always terminate the pipeline explicitly (fold, collect, forEach, await) and keep that boundary visible - a lazy chain without a sink is a no-op bug.",
+    "Keep stages pure and push logging, metrics and I/O into the sink or behind an explicit tap/peek boundary, so effect order survives refactoring.",
+    "Materialize once where reuse is required, and treat each such call as the end of a fused segment rather than as an implementation detail.",
+    "Preserve short-circuiting: take/find/any must be able to stop the pull upstream, and no stage may pre-fetch the whole stream.",
+    "Benchmark fused against staged on representative data before adopting fusion, and keep the staged form reachable for debugging.",
+    "Use language-provided fusion idioms: GHC's foldr/build and stream fusion, Clojure transducers, Rust's Iterator adapters, C++ ranges - these are already optimized and tested.",
+    "Avoid creating fusion frameworks for application-specific pipelines: if only one or two pipelines exist, a hand-written loop is clearer, simpler, and equally fast.",
+    "When using LLVM LoopFusion, benchmark with realistic data sizes: fusion may hurt performance for small trip counts due to increased register pressure and lost vectorization opportunities.",
+    "Prefer transducer composition over lazy collection wrapping: transducers compose directly without creating intermediate aggregate types, giving stronger fusion guarantees.",
+    "For tail-recursive accumulators (reverse, append), check that fusion can float out the thunk; if not, fall back to a known-working staged form or an explicit accumulator-based loop."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Wadler, Philip. 'Deforestation: Transforming Programs to Eliminate Trees.' Theoretical Computer Science 73(2):231-248, 1990 (special issue of selected papers from ESOP '88). https://doi.org/10.1007/3-540-19027-9_23",
+    "Gill, Andrew, John Launchbury, and Simon Peyton Jones. 'A Short Cut to Deforestation.' FPCA 1993. https://www.microsoft.com/en-us/research/wp-content/uploads/2016/07/deforestation-short-cut.pdf",
+    "Coutts, Duncan, Roman Leshchinskiy, and Don Stewart. 'Stream Fusion: From Lists to Streams to Nothing at All.' ICFP 2007. https://www.cs.tufts.edu/~nr/cs257/archive/duncan-coutts/stream-fusion.pdf",
+    "Mainland, Geoffrey, Roman Leshchinskiy, and Simon Peyton Jones. 'Haskell Beats C Using Generalized Stream Fusion.' ICFP 2013. https://www.cs.tufts.edu/comp/150FP/archive/simon-peyton-jones/haskell-beats-C.pdf",
+    "Ji, Ruyi, Yuwei Zhao, Nadia Polikarpova, Yingfei Xiong, and Zhenjiang Hu. 'Lumberhack: General-Purpose Deforestation for Call-by-Need and Call-by-Value.' POPL 2025, arXiv:2410.02232. https://arxiv.org/html/2410.02232v2",
+    "Polikarpova, Nadia et al. 'Superfusion: Eliminating Intermediate Data Structures via Inductive Synthesis.' PLDI 2024. https://cseweb.ucsd.edu/~npolikarpova/publications/pldi24-extended.pdf",
+    "Hu, Zhenjiang, Masahiro Tachikawa, and Masato Takeichi. 'A Fusion Algorithm for Inductive Data Structures.' PEPM 2002.",
+    "Barton, Christopher. 'Code Transformations to Augment the Scope of Loop Fusion in a Production Compiler.' MSc Thesis, University of Alberta. https://webdocs.cs.ualberta.ca/~amaral/thesis/ChristopherBartonMSc.pdf",
+    "Hickey, Rich. 'Transducers.' Strange Loop Conference, 2014. https://www.youtube.com/watch?v=6mTbuzafcII",
+    "Cognitect Blog. 'Transducers are Coming.' August 2014. https://www.cognitect.com/blog/2014/8/6/transducers-are-coming",
+    "Clojure Reference. 'Transducers.' https://clojure.org/reference/transducers",
+    "LLVM Project. 'Loop Fusion.' LLVM Documentation. https://llvm.org/docs/LoopFusion.html",
+    "Karpov, Mark. 'GHC optimization and fusion.' 2019. https://markkarpov.com/tutorial/ghc-optimization-and-fusion.html",
+    "Hackage. 'Data.List.Stream.' Stream Fusion package. https://hackage.haskell.org/package/stream-fusion",
+    "Wikipedia. 'Flyweight Pattern.' https://en.wikipedia.org/wiki/Flyweight_pattern",
+    "Wikipedia. 'Object Pool Pattern.' https://en.wikipedia.org/wiki/Object_pool_pattern",
+    "Wadler, Philip. 'Deforestation' topic page (canonical paper collection). University of Edinburgh. https://homepages.inf.ed.ac.uk/wadler/topics/deforestation.html",
+    "Wikipedia. 'Deforestation (computer science).' https://en.wikipedia.org/wiki/Deforestation_(computer_science)",
+    "Apache Flink Documentation. 'Task Operator Chaining' (DataStream API overview). https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/overview/",
+    "Databricks. 'Apache Spark as a Compiler: Joining a Billion Rows per Second on a Laptop' (whole-stage code generation / Tungsten). 2016. https://www.databricks.com/blog/2016-05-23/apache-spark-as-a-compiler-joining-a-billion-rows-per-second-on-a-laptop.html",
+    "cppreference. 'Ranges library (since C++20)' (lazy views compose without intermediate containers). https://cppreference.com/cpp/ranges",
+    "Breitner, Joachim. 'Does list fusion work?' 2015. https://www.joachim-breitner.de/blog/649-Does_list_fusion_work_",
+    "GHC issue #11710. 'Fusion of a simple listArray call is very fragile.' https://gitlab.haskell.org/ghc/ghc/-/issues/11710",
+    "ghc-devs mailing list. 'Make list monad operations fuse' (fragility of rewrite-rule fusion, ticket #9781). November 2014. https://mail.haskell.org/pipermail/ghc-devs/2014-November/007288.html"
+  ],
+  "related_patterns_notes": {
+    "transducer": "Transducers are the language-independent embodiment of the deforestation idea: each transformation becomes a function from reducing-function to reducing-function, composed without creating any intermediate aggregate. Clojure's transducers (Rich Hickey, 2014) are the canonical reference implementation, usable over collections, channels, streams, and observables with zero intermediate allocations; differentiation: Transducers are a specific API idiom for achieving deforestation; deforestation is the broader program transformation principle of which transducers are one realization.",
+    "lazy-collection": "Lazy collections (views, sequences, iterators) defer materialization until a terminal operation, which is a prerequisite for fusion. However, lazy collections alone don't guarantee fusion - they may still allocate per-element wrappers. Deforestation goes further by eliminating intermediate structures entirely at the composition level; differentiation: Lazy collection is a data structure choice; deforestation is a transformation strategy applied to collections or pipelines.",
+    "generator": "Generators produce elements on demand and can be composed into pipelines where each yield is immediately consumed, eliminating full-collection allocation. A well-fused generator pipeline is essentially a hand-written loop with composable stage names; differentiation: Generator is an implementation mechanism; deforestation is the design principle of composing generators without intermediate materialization.",
+    "flyweight": "Flyweight deduplicates intrinsic (shared, immutable) state across many objects that exist simultaneously, reducing memory by sharing. Deforestation eliminates temporal intermediate structures produced and consumed within a single pipeline pass. Both patterns reduce allocation, but flyweight operates on object-space sharing while deforestation operates on time-series elimination within a single transformation chain; differentiation: Flyweight saves memory by sharing across concurrent objects; deforestation saves memory and GC pressure by eliminating sequential intermediate allocations. Flyweight is structural (object space), deforestation is temporal (pipeline time).",
+    "object-pool": "Object pools recycle mutable instances by borrowing and returning, avoiding repeated allocation/destruction costs. Deforestation avoids allocation by never constructing the intermediate object at all. Object pool recycles; deforestation eliminates; differentiation: Object pool recycles; deforestation eliminates the need to allocate in the first place. Pool still requires allocation, just reused. Deforestation requires zero allocation for intermediates.",
+    "loop-fusion": "Loop fusion (e.g., LLVM LoopFusion pass) is the imperative/procedural cousin of deforestation: it merges adjacent loops with identical trip counts into one loop, eliminating intermediate data written to memory between loops. It operates on raw IR rather than algebraic data types; differentiation: Loop fusion operates on imperative loops with memory; deforestation operates on functional pipelines with algebraic data types. Loop fusion requires four legality conditions including no negative-distance dependencies; deforestation requires purity and single-consumer semantics.",
+    "hylomorphism": "A hylomorphism is the composition of an anamorphism (unfold/produce) and a catamorphism (fold/consume). Deforestation specifically targets the case where a hylomorphism allocates its intermediate algebra (the anamorphism output consumed by the catamorphism) and eliminates that allocation by fusing the unfold and fold into a single recursion (the fusion theorem); differentiation: Hylomorphism is a categorical pattern (unfold + fold); deforestation is the optimization that removes the intermediate structure created when a hylomorphism is evaluated naively.",
+    "collection-pipeline": "Collection pipelines are the bread-and-butter use case for deforestation. A collection pipeline of map/filter/fold operations is exactly what deforestation transforms from multi-pass staged into single-pass fused; differentiation: Collection pipeline is the problem domain; deforestation is the solution technique applied to collection pipelines.",
+    "function-composition": "Function composition (f . g) is the mechanism by which stages are combined in a deforestation pipeline. Deforestation extends function composition from the type-level to the allocation-level: composed functions produce no intermediate containers; differentiation: Function composition combines behaviors; deforestation extends composition to also eliminate the intermediate data structures that naive sequential composition would create.",
+    "fold-catamorphism": "Catamorphisms (folds) consume algebraic data structures. Deforestation's foldr/build rule specifically fuses a fold consuming a build (list producer), eliminating the intermediate list. This is the core of GHC's fusion system; differentiation: Fold/catamorphism is the consumer side of deforestation. Deforestation fuses producer/build with consumer/fold to eliminate the intermediate."
+  }
+}

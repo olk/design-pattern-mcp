@@ -1,0 +1,65 @@
+{
+  "support": "library",
+  "idiom_name": "ThreadPoolExecutor / Executors.newFixedThreadPool + BlockingQueue hand-off",
+  "implementation_notes": "java.util.concurrent is the dispatcher: ExecutorService.submit()/execute() performs the hand-off to exactly one pooled thread, and ThreadPoolExecutor makes the queue policy explicit - SynchronousQueue for direct hand-off, LinkedBlockingQueue for a queue that smooths bursts (and makes maximumPoolSize moot), ArrayBlockingQueue for bounded admission with a RejectedExecutionHandler deciding the overload behaviour (Abort, CallerRuns, Discard, DiscardOldest). beforeExecute/afterExecute are the documented tracing seam. Use it when the performers are ordinary platform threads; prefer the virtual-thread variant when the workload is many short-lived, blocking, concurrent tasks.",
+  "code_sketch": "var pool = new ThreadPoolExecutor(\n    8, 8, 0L, TimeUnit.MILLISECONDS,\n    new ArrayBlockingQueue<>(1024),              // bounded queue\n    Thread.ofPlatform().name(\"performer-\", 0).factory(),\n    new ThreadPoolExecutor.CallerRunsPolicy());  // overload: run in the caller\nfor (Message msg : batch) {\n    pool.execute(() -> handle(msg));             // exactly one performer per message\n}\npool.shutdown();\nif (!pool.awaitTermination(30, TimeUnit.SECONDS)) pool.shutdownNow();",
+  "pitfalls": [
+    "An unbounded LinkedBlockingQueue silently makes maximumPoolSize useless (documented behaviour) and turns overload into RAM; rejection cannot happen because the queue never fills.",
+    "Pool threads are non-daemon by default, so a forgotten shutdown()/awaitTermination() keeps the JVM alive and hides shutdown ordering bugs.",
+    "Exceptions thrown by a submitted Runnable vanish unless the Future is inspected; the performer looks healthy while messages fail.",
+    "ThreadLocal state (including MDC and security context) leaks between unrelated messages because pool threads are reused; clear it in beforeExecute/afterExecute.",
+    "DiscardPolicy/DiscardOldestPolicy drop messages by design - acceptable for sampling, wrong for anything the sender believes was processed."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html",
+    "https://openjdk.org/jeps/444"
+  ],
+  "variants": [
+    {
+      "variant_id": "fixed-thread-pool",
+      "name": "Classic pooled platform threads (Java 8+)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "ThreadPoolExecutor / Executors.newFixedThreadPool + BlockingQueue hand-off",
+      "implementation_notes": "java.util.concurrent is the dispatcher: ExecutorService.submit()/execute() performs the hand-off to exactly one pooled thread, and ThreadPoolExecutor makes the queue policy explicit - SynchronousQueue for direct hand-off, LinkedBlockingQueue for a queue that smooths bursts (and makes maximumPoolSize moot), ArrayBlockingQueue for bounded admission with a RejectedExecutionHandler deciding the overload behaviour (Abort, CallerRuns, Discard, DiscardOldest). beforeExecute/afterExecute are the documented tracing seam. Use it when the performers are ordinary platform threads; prefer the virtual-thread variant when the workload is many short-lived, blocking, concurrent tasks.",
+      "code_sketch": "var pool = new ThreadPoolExecutor(\n    8, 8, 0L, TimeUnit.MILLISECONDS,\n    new ArrayBlockingQueue<>(1024),              // bounded queue\n    Thread.ofPlatform().name(\"performer-\", 0).factory(),\n    new ThreadPoolExecutor.CallerRunsPolicy());  // overload: run in the caller\nfor (Message msg : batch) {\n    pool.execute(() -> handle(msg));             // exactly one performer per message\n}\npool.shutdown();\nif (!pool.awaitTermination(30, TimeUnit.SECONDS)) pool.shutdownNow();",
+      "pitfalls": [
+        "An unbounded LinkedBlockingQueue silently makes maximumPoolSize useless (documented behaviour) and turns overload into RAM; rejection cannot happen because the queue never fills.",
+        "Pool threads are non-daemon by default, so a forgotten shutdown()/awaitTermination() keeps the JVM alive and hides shutdown ordering bugs.",
+        "Exceptions thrown by a submitted Runnable vanish unless the Future is inspected; the performer looks healthy while messages fail.",
+        "ThreadLocal state (including MDC and security context) leaks between unrelated messages because pool threads are reused; clear it in beforeExecute/afterExecute.",
+        "DiscardPolicy/DiscardOldestPolicy drop messages by design - acceptable for sampling, wrong for anything the sender believes was processed."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html",
+        "https://openjdk.org/jeps/444"
+      ]
+    },
+    {
+      "variant_id": "virtual-thread-per-task",
+      "name": "One virtual thread per message (JDK 21+)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual threads",
+        "Executors.newVirtualThreadPerTaskExecutor"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + Semaphore for admission control",
+      "implementation_notes": "From JDK 21 the thread-per-message style becomes affordable: Executors.newVirtualThreadPerTaskExecutor() starts a fresh virtual thread per submitted message, so the performer pool disappears and the dispatcher is just the submission loop with the JDK's fork-join scheduler underneath. The JEP is explicit that virtual threads must not be pooled; concurrency limits must be expressed with a different construct such as a Semaphore, because a pool of virtual threads only recreates the scarce-resource model they abolish. Choose it for high-throughput, mostly-blocking workloads; keep the platform-thread pool for CPU-bound work, where the carrier count (available processors) is the real limit.",
+      "code_sketch": "var limit = new Semaphore(512);                 // admission control, not a pool\nThread.ofVirtual().name(\"performer-\", 0).factory();\ntry (var executor = Executors.newVirtualThreadPerTaskExecutor()) {\n    for (Message msg : batch) {\n        limit.acquire();\n        executor.submit(() -> {\n            try { handle(msg); } finally { limit.release(); }\n        });\n    }\n}   // close() waits for the tasks, as with any ExecutorService",
+      "pitfalls": [
+        "Pooling virtual threads defeats their purpose (JEP 444: 'should never be pooled') and reintroduces the concurrency cap the executor was meant to remove.",
+        "A virtual thread pinned inside a synchronized block that blocks on I/O captures its carrier and can starve the scheduler; replace such locks with ReentrantLock for long blocking sections.",
+        "Thread-local caches built for platform threads (one connection per thread) become one resource per message and can exhaust the downstream service.",
+        "Virtual threads have fixed NORM_PRIORITY and are always daemon: code relying on setPriority or on non-daemon semantics must be revisited."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/444"
+      ]
+    }
+  ],
+  "default_variant": "fixed-thread-pool",
+  "pattern": "message-dispatcher",
+  "language": "java",
+  "version": "1.0"
+}

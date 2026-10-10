@@ -1,0 +1,164 @@
+{
+  "category": "workflow-messaging",
+  "name": "routing-slip",
+  "aliases": [
+    "itinerary routing",
+    "itinerary"
+  ],
+  "intent": "Attach the ordered list of processing steps a message must pass through to the message itself, so its route is decided per message by data the message carries instead of by a centrally configured flow, and each step only has to forward the message to the next entry on its slip.",
+  "problem": "A message must traverse a sequence of processing steps whose length and order are not known at design-time and differ per message - one purchase order needs a credit-card validation, another one sent over a VPN does not. Neither extreme works: hard-coding the sequence in every component turns each flow change into a deployment of all components, while a central router must know the whole topology and becomes the component every step has to be registered with.",
+  "context": "Message-oriented integration, ESB or workflow code where a planner can compute the route for a message before the flow starts, where the steps are heterogeneous (different services, teams or transports) and must stay reusable across flows, and where the flow should run without a central orchestrator holding its state - typically long-running, multi-service processes that may be eventually consistent.",
+  "benefits": [
+    "Decentralised routing: no component holds the flow's state, so there is no orchestrator to scale, redeploy or lose - each step reads the slip and forwards the message.",
+    "Per-message routes: adding a customer-specific validation, an extra enrichment or a new approval step is a change in the planner's data, not in any existing step.",
+    "Steps stay ignorant of their successors, so a step can serve several flows and its owners do not have to know who runs next.",
+    "Routing decisions can use anything the planner knows (message type, customer, region, contract) and may differ for every single message, which a static pipeline topology cannot express.",
+    "Progress travels with the message (a cursor or the remaining entries), so an operator, a retry or an audit can see how far the flow got and resume from there.",
+    "Works across heterogeneous transports: the slip names logical steps and each slip-aware router resolves them, so one flow can pass through queues, HTTP endpoints and local calls.",
+    "Combines naturally with compensation: a step can record undo data next to its entry, which yields a loosely coupled transaction across services."
+  ],
+  "tradeoffs": [
+    "The flow has no single home: no component can answer \"where does this message go next\", so understanding and debugging a flow means reconstructing it from many planners and messages - message history or a wire tap becomes mandatory.",
+    "The slip is data that directs processing, so a forged or corrupted itinerary can aim a message at components the sender was never meant to reach; allowed step ids or destination schemes must be validated and whitelisted instead of trusted.",
+    "Step names or endpoint URIs become a wire contract: in-flight messages produced by an older planner can reference steps that were renamed or removed, and every consumer of the slip must keep their meaning stable.",
+    "Itineraries live in message headers, which brokers bound in size; long slips cost bandwidth on every hop and eventually force the itinerary into a claim check or message store.",
+    "The model is linear: branching, parallel fan-out or a next step that depends on an intermediate result cannot be expressed honestly - that is Process Manager (central state) or Dynamic Router (recomputed per hop) territory.",
+    "Failing mid-slip leaves partial side effects, because the pattern provides no atomicity: steps must be idempotent and either retryable or compensatable, and a lost message simply ends the flow unless something watches for stalled slips.",
+    "Late binding couples the slip producer to the routing namespace (queue names, step ids), so topology changes leak into business code that only wanted to describe a process."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 9,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 6,
+    "security": 4,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Itinerary Planner",
+      "responsibility": "Computes the ordered list of steps required for one message from message type, content or configuration, attaches it to the message and sends the message to the first entry."
+    },
+    {
+      "role": "Routing Slip",
+      "responsibility": "The ordered itinerary as it travels with the message, together with whatever progress marker the implementation keeps (a cursor, a slip index, or only the remaining entries)."
+    },
+    {
+      "role": "Slip-Aware Router",
+      "responsibility": "Wrapped around each step or embedded in the dispatcher; after the step returns it reads the slip, advances the progress marker and routes the message to the next entry - the only participant that knows the routing mechanics."
+    },
+    {
+      "role": "Processing Step",
+      "responsibility": "Performs one unit of work on the message (validation, enrichment, reservation, notification) and knows nothing about its successor; must be idempotent because delivery along the slip is not transactional."
+    },
+    {
+      "role": "Message Channel",
+      "responsibility": "Carries the message from one step to the next; a slip whose entries live on different transports is still one logical flow."
+    },
+    {
+      "role": "Compensation Log",
+      "responsibility": "Optional participant that records per-step undo data for completed steps so that a later failure can roll the flow back instead of leaving half-finished business effects."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Order fulfilment where the required steps differ per order and per customer contract: fraud check, address validation, stock reservation, payment, shipping.",
+    "Document and claim processing where the route depends on document type, amount or jurisdiction and new steps are added continuously without touching existing handlers.",
+    "Message-based integration across several services and transports where the flow must keep running without a central orchestration engine: every service forwards the message together with its slip.",
+    "Request-processing middleware in a single process (upload pipeline: virus scan, resize, thumbnail, persist) where the stage list is data of the request and must be visible to operations.",
+    "Distributed transactions with compensation: reserve, charge and ship steps that each register an undo action, so a late failure releases the reservation instead of stranding it.",
+    "Per-tenant data pipelines where each tenant's contract dictates a different sequence of transformations over the same message.",
+    "Apache Camel's Routing Slip EIP carries a per-message, precomputed list of endpoint URIs in the exchange and routes the message through them in order, useful for integration pipelines assembled from reusable endpoints.",
+    "Spring Integration's routing-slip header selects the next output channel for each reply, allowing a message to traverse a channel sequence that varies by message; use a named serializable route strategy when the flow crosses process boundaries.",
+    "MassTransit's Courier routing slips build an itinerary of activities with execution and compensation logs, fitting long-running multi-service transactions where completed activities may need compensating actions."
+  ],
+  "avoid_when": [
+    "The sequence is the same for every message and known at design-time: a static chain (Pipes and Filters, a middleware stack, plain method calls) is simpler and far easier to observe.",
+    "The next step depends on intermediate results, or steps must branch, loop or run in parallel: use Process Manager for central state or Dynamic Router to recompute the next hop per message.",
+    "One component only has to pick among a handful of destinations from payload content: Content-Based Router or Recipient List is the cheaper, more visible answer.",
+    "Producer and consumer share one team and one fixed topology with no per-message variation: the header contract and its versioning cost more than a direct call.",
+    "The workflow needs durable state, timeouts and human tasks with visibility: a workflow engine (Process Manager) holds that state, and a slip cannot compensate for its absence.",
+    "The itinerary would exceed header limits of the transport or must stay hidden from intermediaries: keep the route central or store it externally behind a claim check."
+  ],
+  "language_files": {
+    "generic": "routing-slip.generic.json",
+    "c": "routing-slip.c.json",
+    "cplusplus": "routing-slip.cplusplus.json",
+    "csharp": "routing-slip.csharp.json",
+    "go": "routing-slip.go.json",
+    "java": "routing-slip.java.json",
+    "javascript": "routing-slip.javascript.json",
+    "kotlin": "routing-slip.kotlin.json",
+    "python": "routing-slip.python.json",
+    "ruby": "routing-slip.ruby.json",
+    "rust": "routing-slip.rust.json",
+    "scala": "routing-slip.scala.json",
+    "swift": "routing-slip.swift.json",
+    "typescript": "routing-slip.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "message-router",
+    "content-based-router",
+    "dynamic-router",
+    "process-manager",
+    "pipe-and-filter",
+    "publish-subscribe-channel",
+    "message-history"
+  ],
+  "anti_patterns": [
+    "Serialising a constant, never-varying step list into every message: a static pipeline is dressed up as data routing and pays header plus contract costs for no flexibility.",
+    "Letting a processing step append arbitrary destinations to its own slip: a self-modifying itinerary turns untrusted input into execution control, which is a Dynamic Router without a policy.",
+    "Using routing slips for branching, loops or fan-out that the linear model cannot express, so the flow ends up neither expressible nor observable.",
+    "Treating the slip as a transaction: there is no atomicity and no rollback of completed steps, so failures leave half-finished business effects.",
+    "Shipping internal endpoint names, credentials or the full topology inside messages that leave the trust boundary, exposing the integration landscape to anyone reading the header.",
+    "Appending one entry per historical step until the slip becomes de facto message history and blows the broker's header limits."
+  ],
+  "design_principles": [
+    "Information hiding: the itinerary exposes step identities, not routing mechanics, and steps never learn the topology or their successors.",
+    "Open/closed: new steps and new flows enter through the planner's data and the step registry, without modifying the steps themselves.",
+    "Separation of concerns: route computation (planner), route execution (slip-aware router) and unit of work (step) are distinct responsibilities.",
+    "Composition over a monolithic process: a flow is a composed sequence of small, reusable transformations.",
+    "Data-driven control must be validated: the flow is data, so it must be checked at the boundary (whitelisted steps, bounded length) rather than trusted.",
+    "Failure is a normal path: idempotent steps and explicit compensation replace the transaction the pattern cannot provide."
+  ],
+  "best_practices": [
+    "Compute the itinerary once, up front, and keep it in a dedicated, versioned header field whose format and step naming are a documented contract.",
+    "Validate the slip before dispatching: whitelist step ids or destination schemes, bound the number of entries, and reject malformed itineraries.",
+    "Keep progress in the message - advance a cursor or remove the consumed entry - so retries and restarts resume instead of repeating steps.",
+    "Make every step idempotent and register undo data whenever its effect is not naturally reversible.",
+    "Resolve step ids through a registry rather than hard-coding physical endpoints, so a moved or renamed component does not invalidate in-flight messages.",
+    "Emit a correlation identifier, pair the slip with message history or a wire tap, and monitor for slips that stop advancing, because nothing else tracks the flow.",
+    "Keep itineraries short; store large ones in a message store behind a claim check and carry only a reference."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Routing Slip (Message Routing chapter): attach the itinerary to the message, and each step's router reads the slip and forwards the message to the next listed component.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/RoutingTable.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/ProcessManager.html",
+    "https://camel.apache.org/components/latest/eips/routingSlip-eip.html",
+    "https://masstransit.io/documentation/patterns/routing-slip",
+    "https://learn.microsoft.com/en-us/azure/architecture/patterns/compensating-transaction",
+    "https://camel.apache.org/components/4.22.x/eips/routingSlip-eip.html",
+    "https://masstransit.io/documentation/concepts/routing-slips",
+    "https://docs.spring.io/spring-integration/reference/router/routing-slip.html",
+    "https://camel.apache.org/components/next/eips/process-manager.html"
+  ]
+}

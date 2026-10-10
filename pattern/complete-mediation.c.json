@@ -1,0 +1,60 @@
+{
+  "pattern": "complete-mediation",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "one checked entry point per resource (wrapper discipline)",
+  "implementation_notes": "C has no language-level encapsulation or enforcement, so the pattern is hand-written: one checked entry point per resource - a wrapper that consults the policy before performing the operation - is the portable mediator, and every caller must go through it. Where an in-process wrapper can be circumvented (static linking, direct syscalls, a thread that never saw the wrapper), enforcement is delegated to the kernel instead: openat2() resolve flags (RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_SYMLINKS) move the path check into the open itself so that check and use are one operation, and a seccomp-BPF filter or Landlock ruleset restricts what the process may do at all. Use the wrapper discipline for portable, reviewable code and the kernel mechanisms wherever the threat is code you cannot audit; note that Landlock does not restrict file descriptors opened before the ruleset was enforced, and that seccomp filters are per-thread unless installed with SECCOMP_FILTER_FLAG_TSYNC.",
+  "code_sketch": "/* one checked entry point per resource: nothing else may open the vault */\nint vault_open(const char *path, int flags) {\n    if (!policy_allows(path, flags)) { errno = EACCES; return -1; }\n    struct open_how how = { .flags = (uint64_t)flags,\n                            .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS };\n    return (int)syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof how);\n}\n/* the check and the open are one operation: no faccessat()-then-open() window */",
+  "pitfalls": [
+    "Check-then-use races: faccessat() or stat() followed by open() leaves a window in which the path can be swapped; resolve-flag opens (openat2) or O_PATH handles validated with fstatat() close it, plain path checks do not.",
+    "User-space interposition (LD_PRELOAD, symbol wrapping) is advisory: statically linked code, dlopen()ed libraries and direct syscalls reach the kernel without passing the wrapper.",
+    "Handing out the raw file descriptor after the check gives the caller an unmediated handle; the descriptor is the capability, so it must stay behind the wrapper or be re-checked on use."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man2/openat2.2.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "checked-wrapper",
+      "name": "Checked API layer (portable in-process mediator)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "one checked entry point per resource (wrapper discipline)",
+      "implementation_notes": "C has no language-level encapsulation or enforcement, so the pattern is hand-written: one checked entry point per resource - a wrapper that consults the policy before performing the operation - is the portable mediator, and every caller must go through it. Where an in-process wrapper can be circumvented (static linking, direct syscalls, a thread that never saw the wrapper), enforcement is delegated to the kernel instead: openat2() resolve flags (RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_SYMLINKS) move the path check into the open itself so that check and use are one operation, and a seccomp-BPF filter or Landlock ruleset restricts what the process may do at all. Use the wrapper discipline for portable, reviewable code and the kernel mechanisms wherever the threat is code you cannot audit; note that Landlock does not restrict file descriptors opened before the ruleset was enforced, and that seccomp filters are per-thread unless installed with SECCOMP_FILTER_FLAG_TSYNC.",
+      "code_sketch": "/* one checked entry point per resource: nothing else may open the vault */\nint vault_open(const char *path, int flags) {\n    if (!policy_allows(path, flags)) { errno = EACCES; return -1; }\n    struct open_how how = { .flags = (uint64_t)flags,\n                            .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS };\n    return (int)syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof how);\n}\n/* the check and the open are one operation: no faccessat()-then-open() window */",
+      "pitfalls": [
+        "Check-then-use races: faccessat() or stat() followed by open() leaves a window in which the path can be swapped; resolve-flag opens (openat2) or O_PATH handles validated with fstatat() close it, plain path checks do not.",
+        "User-space interposition (LD_PRELOAD, symbol wrapping) is advisory: statically linked code, dlopen()ed libraries and direct syscalls reach the kernel without passing the wrapper.",
+        "Handing out the raw file descriptor after the check gives the caller an unmediated handle; the descriptor is the capability, so it must stay behind the wrapper or be re-checked on use."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/openat2.2.html"
+      ]
+    },
+    {
+      "variant_id": "kernel-enforced",
+      "name": "Kernel-mediated access (seccomp-BPF allow-list + Landlock ruleset)",
+      "paradigm": "procedural",
+      "min_standard": "C11",
+      "requires_features": [
+        "seccomp-bpf",
+        "landlock"
+      ],
+      "idiom_name": "seccomp(SECCOMP_SET_MODE_FILTER) + landlock_restrict_self()",
+      "implementation_notes": "Kernel-enforced mediation moves the decision below the process boundary, where application code cannot skip it: a seccomp-BPF filter attached with SECCOMP_SET_MODE_FILTER restricts the syscalls a thread may make, and the man page's own advice is to use an allow-list, because a deny-list can be bypassed (unknown syscalls, the __X32_SYSCALL_BIT variant, arguments whose representation changes without changing meaning). Landlock complements it for file hierarchies: any unprivileged process can apply a ruleset to itself and its descendants via landlock_create_ruleset()/landlock_add_rule()/landlock_restrict_self(). Both are coarse-grained compared with a wrapper - they see syscalls, not intent - so they are usually combined with a checked API layer, and their limits (per-thread filters unless TSYNC, descriptors opened before sandboxing) must be stated rather than assumed away.",
+      "code_sketch": "/* allow-list first: deny everything not explicitly permitted */\nstruct sock_filter allow[] = {\n    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),\n    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat2, 1, 0),\n    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),\n    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),\n};\nprctl(PR_SET_NO_NEW_PRIVS, 1);                     /* required before filtering */\nstruct sock_fprog prog = { .len = 4, .filter = allow };\nseccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog);  /* every thread */",
+      "pitfalls": [
+        "A deny-list filter is bypassable: allow only what the process needs, and remember that a syscall policy keyed on nr alone can be evaded with the __X32_SYSCALL_BIT variant or by a new syscall added by a kernel upgrade.",
+        "Filters are per-thread unless SECCOMP_FILTER_FLAG_TSYNC is passed; a worker thread created before the filter keeps the unfiltered syscall table.",
+        "Descriptors, mappings and connections opened before the sandbox exists stay outside it (Landlock documents this for file descriptors), so the enforcement layer must start before any resource is acquired.",
+        "Kernel policies are coarse: they cannot express object-level intent, so they need a checked API layer for decisions about which object and which operation."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/seccomp.2.html",
+        "https://man7.org/linux/man-pages/man7/landlock.7.html"
+      ]
+    }
+  ],
+  "default_variant": "checked-wrapper"
+}

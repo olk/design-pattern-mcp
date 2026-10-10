@@ -1,0 +1,54 @@
+{
+  "pattern": "control-bus",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "ZeroMQ PUB/SUB control subject + std::function dispatch table (cppzmq)",
+  "implementation_notes": "The control bus is a dedicated ZeroMQ PUB socket on the console side and one SUB socket per component subscribed to its own control subject (control/<component>/cmd); commands are length-specified frames decoded into a command struct and dispatched through a table of std::function handlers, while status flows back on control/<component>/status or over a REQ/REP pair when the command must be acknowledged. ZeroMQ supplies the channel and the reconnect behaviour; the command vocabulary, scoping and authorisation (CURVE, ZAP or the broker's ACLs) remain the project's own, which is why the support level is manual rather than library. This is the default because it matches systems that already run a ZeroMQ fabric; when they do not, the sibling gRPC variant reuses the existing toolchain instead.",
+  "code_sketch": "zmq::context_t ctx(1);\nzmq::socket_t sub(ctx, zmq::socket_type::sub);\nsub.set(zmq::sockopt::subscribe, \"control/orders-adapter/cmd\");\nsub.connect(\"tcp://control-bus:5559\");\nstd::unordered_map<std::string, std::function<std::string(const json&)>> handlers{\n    {\"status\", [](const json&) { return snapshot_json(); }},\n    {\"pause\",  [](const json&) { router.pause(); return std::string(\"{\\\"applied\\\":true}\"); }},\n};\nfor (;;) {\n    zmq::message_t topic, payload;\n    sub.recv(topic); sub.recv(payload);\n    const auto cmd = json::parse(payload.to_string());\n    publish_status(handlers.at(cmd[\"op\"])(cmd), cmd[\"id\"]);\n}",
+  "pitfalls": [
+    "PUB/SUB silently drops messages for a subscriber that has not connected yet (the slow-joiner problem): a missed stop command produces no error, so lifecycle commands need a reply path or a status echo.",
+    "Handlers execute on the socket's thread; a blocking handler (drain, reload, synchronous flush) stalls status reporting and makes the component look dead to the console.",
+    "Control and data sockets must not share a context/thread if the data path can saturate it, or management traffic is delayed exactly when the system is busiest."
+  ],
+  "sources": [
+    "https://zguide.zeromq.org/docs/chapter1/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "zmq-control-topic",
+      "name": "ZeroMQ PUB/SUB control topic with a command dispatcher",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "ZeroMQ PUB/SUB control subject + std::function dispatch table (cppzmq)",
+      "implementation_notes": "The control bus is a dedicated ZeroMQ PUB socket on the console side and one SUB socket per component subscribed to its own control subject (control/<component>/cmd); commands are length-specified frames decoded into a command struct and dispatched through a table of std::function handlers, while status flows back on control/<component>/status or over a REQ/REP pair when the command must be acknowledged. ZeroMQ supplies the channel and the reconnect behaviour; the command vocabulary, scoping and authorisation (CURVE, ZAP or the broker's ACLs) remain the project's own, which is why the support level is manual rather than library. This is the default because it matches systems that already run a ZeroMQ fabric; when they do not, the sibling gRPC variant reuses the existing toolchain instead.",
+      "code_sketch": "zmq::context_t ctx(1);\nzmq::socket_t sub(ctx, zmq::socket_type::sub);\nsub.set(zmq::sockopt::subscribe, \"control/orders-adapter/cmd\");\nsub.connect(\"tcp://control-bus:5559\");\nstd::unordered_map<std::string, std::function<std::string(const json&)>> handlers{\n    {\"status\", [](const json&) { return snapshot_json(); }},\n    {\"pause\",  [](const json&) { router.pause(); return std::string(\"{\\\"applied\\\":true}\"); }},\n};\nfor (;;) {\n    zmq::message_t topic, payload;\n    sub.recv(topic); sub.recv(payload);\n    const auto cmd = json::parse(payload.to_string());\n    publish_status(handlers.at(cmd[\"op\"])(cmd), cmd[\"id\"]);\n}",
+      "pitfalls": [
+        "PUB/SUB silently drops messages for a subscriber that has not connected yet (the slow-joiner problem): a missed stop command produces no error, so lifecycle commands need a reply path or a status echo.",
+        "Handlers execute on the socket's thread; a blocking handler (drain, reload, synchronous flush) stalls status reporting and makes the component look dead to the console.",
+        "Control and data sockets must not share a context/thread if the data path can saturate it, or management traffic is delayed exactly when the system is busiest."
+      ],
+      "sources": [
+        "https://zguide.zeromq.org/docs/chapter1/"
+      ]
+    },
+    {
+      "variant_id": "grpc-admin-service",
+      "name": "gRPC admin service with compiled protobuf command contracts",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "gRPC Control service (GetStatus/Suspend/Resume/Reload) generated from a .proto",
+      "implementation_notes": "Instead of a pub/sub control topic the component hosts a small gRPC service generated from a ControlAdmin .proto (GetStatus, Suspend, Resume, Reload), and the console is a generated client, so the command schema is compiled rather than interpreted and mismatches are caught at build time. The trade-off is reach: gRPC is request/response, so fleet-wide commands are sent per component (or via a streaming RPC for continuous status), and the admin service needs its own port, its own interceptor-based authentication and its own deadlines. Choose this variant when gRPC is already the RPC fabric of the system; the pub/sub variant is better for broadcast commands.",
+      "code_sketch": "// control.proto: service Control { rpc Snapshot(Empty) returns (SnapshotReply); rpc Suspend(Reason) returns (Ack); }\nclass ControlImpl final : public Control::Service {\n  grpc::Status Snapshot(grpc::ServerContext*, const Empty*, SnapshotReply* out) override {\n    fill_snapshot(*out); return grpc::Status::OK;\n  }\n  grpc::Status Suspend(grpc::ServerContext*, const Reason* why, Ack* ack) override {\n    router_.suspend(why->text()); ack->set_applied(true); return grpc::Status::OK;\n  }\n};\n// console: Control::Stub stub(channel); stub.Suspend(&reason, &ack);",
+      "pitfalls": [
+        "All service methods can be called from multiple threads at once (the gRPC tutorial warns about this explicitly): command handlers must synchronise on the component's state or run on a serialising executor.",
+        "A suspend command that blocks until the component has drained can exceed the client deadline and be retried, applying the command twice; long operations must be asynchronous with progress reported through the snapshot RPC.",
+        "Sharing the business port, credentials or interceptors with the admin service turns the control plane into part of the public API surface."
+      ],
+      "sources": [
+        "https://grpc.io/docs/languages/cpp/basics/"
+      ]
+    }
+  ],
+  "default_variant": "zmq-control-topic"
+}

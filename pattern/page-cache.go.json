@@ -1,0 +1,18 @@
+{
+  "pattern": "page-cache",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "http.Handler middleware over a mutex-guarded store; http.ServeContent for validators",
+  "implementation_notes": "Go's standard library supplies conditional requests but no response store, so the page cache is a middleware you write: func(next http.Handler) http.Handler derives a key from r.Method + r.URL.RequestURI() + the header axes you vary on, returns the stored bytes on a hit, and on a miss records the downstream handler's writes and stores the result behind a sync.RWMutex (or a ready-made LRU). For pages that can be produced as an io.ReadSeeker - file-backed or pre-generated bodies - http.ServeContent/http.ServeFile already implement If-None-Match, If-Modified-Since and Range handling when given the content and a modtime, so the 200/304 exchange costs no extra code. Nothing in the standard library expires, evicts or purges entries, which is why Go services commonly emit Cache-Control/Vary/ETag and let a CDN or nginx hold the shared cache, keeping only a small in-process cache for hot pages.",
+  "code_sketch": "func pageCache(ttl time.Duration, next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tkey := r.Method + \" \" + r.URL.RequestURI() + \" \" + r.Header.Get(\"Accept-Encoding\")\n\t\tif e, ok := store.get(key); ok && !e.expired() {\n\t\t\tw.Header().Set(\"Cache-Control\", \"public, max-age=60\")\n\t\t\tw.Write(e.body)              // handler, queries and templates skipped\n\t\t\treturn\n\t\t}\n\t\trec := newRecorder(w)            // buffers; does not forward while recording\n\t\tnext.ServeHTTP(rec, r)\n\t\tstore.put(key, rec.body(), ttl)\n\t\trec.flushTo(w)\n\t})\n}",
+  "pitfalls": [
+    "A recording http.ResponseWriter must not forward while it records, and it must re-expose the optional interfaces the downstream handler relies on (http.Flusher, http.Hijacker): a naive wrapper silently breaks streaming, SSE and WebSocket upgrades.",
+    "Keying on the URL alone ignores everything that varies the bytes (gzip versus identity, locale, logged-in user), so a hit can hand one client another client's representation - put the vary axes in the key or in Vary.",
+    "Use sync.RWMutex or an LRU, never a bare map: concurrent map writes panic at runtime, and an unbounded map keyed by query strings is a memory leak waiting for a crawler."
+  ],
+  "sources": [
+    "https://pkg.go.dev/net/http#ServeContent",
+    "https://www.alexedwards.net/blog/making-and-using-middleware"
+  ],
+  "version": "1.0"
+}

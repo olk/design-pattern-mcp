@@ -1,0 +1,77 @@
+{
+  "pattern": "eager-acquisition",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "initialise() called from main + RAII members",
+  "implementation_notes": "The modern default: one initialise() runs from main() (or from the owning component's constructor) and returns an error instead of relying on pre-main magic, while the acquired resources are RAII members, so release happens deterministically on every exit path including exceptions. Reach for std::call_once or a function-local static only when the acquisition can also be entered concurrently from a second entry point: both are specified to initialise exactly once under concurrency, and function-local statics are noted as possibly more efficient than the equivalent std::call_once.",
+  "code_sketch": "struct Services {\n    ConnectionPool pool;                       // RAII: released in ~Services\n    explicit Services(const Config& cfg)\n        : pool(cfg, /*min_idle=*/8) { pool.validate(); }\n};\n\nint main() {\n    Services svc{Config::load()};   // acquired before the first deadline\n    return serve(svc);\n}",
+  "pitfalls": [
+    "Fallible acquisition must stay in main's call tree: an exception escaping a namespace-scope initialiser is not catchable from main and calls std::terminate.",
+    "Warm-up that runs before logging and configuration are wired produces failures nobody can see - order the boot sequence explicitly.",
+    "std::async's default policy may defer the callable, so 'eager' requires launch::async if the work must actually start now."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/call_once",
+    "https://en.cppreference.com/w/cpp/language/storage_duration"
+  ],
+  "variants": [
+    {
+      "variant_id": "explicit-init-raii",
+      "name": "explicit initialise() from main with RAII-owned resources",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "initialise() called from main + RAII members",
+      "implementation_notes": "The modern default: one initialise() runs from main() (or from the owning component's constructor) and returns an error instead of relying on pre-main magic, while the acquired resources are RAII members, so release happens deterministically on every exit path including exceptions. Reach for std::call_once or a function-local static only when the acquisition can also be entered concurrently from a second entry point: both are specified to initialise exactly once under concurrency, and function-local statics are noted as possibly more efficient than the equivalent std::call_once.",
+      "code_sketch": "struct Services {\n    ConnectionPool pool;                       // RAII: released in ~Services\n    explicit Services(const Config& cfg)\n        : pool(cfg, /*min_idle=*/8) { pool.validate(); }\n};\n\nint main() {\n    Services svc{Config::load()};   // acquired before the first deadline\n    return serve(svc);\n}",
+      "pitfalls": [
+        "Fallible acquisition must stay in main's call tree: an exception escaping a namespace-scope initialiser is not catchable from main and calls std::terminate.",
+        "Warm-up that runs before logging and configuration are wired produces failures nobody can see - order the boot sequence explicitly.",
+        "std::async's default policy may defer the callable, so 'eager' requires launch::async if the work must actually start now."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/call_once",
+        "https://en.cppreference.com/w/cpp/language/storage_duration"
+      ]
+    },
+    {
+      "variant_id": "pre-main-static-init",
+      "name": "pre-main static initialisation (classic)",
+      "paradigm": "oo",
+      "min_standard": "C++03",
+      "idiom_name": "objects with static storage duration + construct-on-first-use",
+      "implementation_notes": "The classic realisation: namespace-scope objects acquire during the pre-main phase, so no caller can reach them uninitialised and the pattern needs no explicit call site. The price is the static initialisation order fiasco - order across translation units is unspecified, and GCC documents that the order between C++ static-storage objects and constructor-attribute functions is normally unspecified as well - so anything that depends on another object must use construct-on-first-use (a function-local static) or the non-portable init_priority attribute.",
+      "code_sketch": "struct SysInit {                       // runs before main()\n    SysInit() { pool = Pool::create(cfg); pool->validate(); }\n} sys_init;\n\n// cross-translation-unit safe form:\nPool& pool() { static Pool p = Pool::create(cfg); return p; }",
+      "pitfalls": [
+        "Static initialisation order across translation units is unspecified, so an initialiser that touches another namespace-scope object races the linker.",
+        "An exception escaping a pre-main initialiser terminates the program before main with no handler and usually a poor diagnostic.",
+        "Destruction order is the reverse of construction only within one translation unit, so matching release needs the same ordering discipline."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/storage_duration",
+        "https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html"
+      ]
+    },
+    {
+      "variant_id": "pmr-arena-prewarm",
+      "name": "pre-allocated memory arenas (std::pmr)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++17",
+      "requires_features": [
+        "pmr"
+      ],
+      "idiom_name": "std::pmr::synchronized_pool_resource / monotonic buffers built at start-up",
+      "implementation_notes": "Here the eagerly acquired resource is the allocator itself: build a std::pmr::synchronized_pool_resource (or a monotonic buffer for a request-scoped arena) during start-up and give it to the hot-path containers, so per-request allocation never reaches the global allocator and cannot introduce an unpredictable lock or page-fault cost inside the deadline. Use it when the hot path is allocation-heavy and the memory profile is known; it complements, and does not replace, connection or model warm-up.",
+      "code_sketch": "std::pmr::pool_options opts{/*max_blocks_per_chunk=*/1024,\n                            /*largest_required_pool_block=*/4096};\nstd::pmr::synchronized_pool_resource arena{opts};   // acquired at start-up\n\nint main() {\n    std::pmr::vector<Quote> window{&arena};\n    window.reserve(kTicks);            // no allocator traffic in the loop\n    return run_matching(window);\n}",
+      "pitfalls": [
+        "Memory held by a pool resource is not returned to the OS until the resource dies, so an over-sized pre-warm looks exactly like a leak.",
+        "A monotonic buffer must be reset per scope (never shared across requests) or it grows without bound.",
+        "Mixing containers from different memory resources in one hot path destroys the locality the variant was chosen for."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/synchronized_pool_resource"
+      ]
+    }
+  ],
+  "default_variant": "explicit-init-raii",
+  "version": "1.0"
+}

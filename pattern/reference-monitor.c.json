@@ -1,0 +1,65 @@
+{
+  "pattern": "reference-monitor",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "one small decision unit over a read-only policy table, with one exported entry point per mediated operation",
+  "implementation_notes": "C provides neither encapsulation nor in-process tamper resistance, so the reference monitor is a hand-written unit: one translation unit holding the entire decision logic, a static policy table it only reads, and a single exported function per mediated operation, with the resource's own headers left unpublished so callers cannot construct or mutate it. What makes this a reference monitor rather than a guard is the discipline around it: the unit has no dependencies beyond the policy interface, its public surface is the header and the tests iterate that same list, and every decision returns refusal when it cannot decide. In-process it remains advisory against code linked into the same binary that can call anything it likes, so the tamperproof requirement is met by the deployment - a helper process that owns the resource and speaks a narrow protocol, or the kernel mechanism in the second variant.",
+  "code_sketch": "/* monitor.c - the whole trusted core: read-only rules, no allocation, no libc state */\nstatic const struct rule policy[] = {\n    { ROLE_AUDITOR, ACT_READ,  OBJ_LEDGER, 1 },  /* subject, action, object, allow */\n    { ROLE_AUDITOR, ACT_WRITE, OBJ_LEDGER, 0 },\n};\n\nint monitor_check(uint32_t subject, enum action a, enum object o) {\n    for (size_t i = 0; i < sizeof policy / sizeof *policy; i++)\n        if (policy[i].subject == subject && policy[i].action == a && policy[i].object == o)\n            return policy[i].allow;\n    return 0;                                /* fail closed: unknown triple denied */\n}",
+  "pitfalls": [
+    "Any code linked into the process can call the resource's own functions or resolve them with dlsym(); the discipline holds only while the unchecked headers stay unpublished and the monitor's symbols are the only ones exported (-fvisibility=hidden plus a version script, not a comment).",
+    "The decision and the access must be one operation: faccessat() or stat() followed by open() leaves a window in which the path is swapped, which is why the kernel variant pushes the check into the syscall itself.",
+    "A linear scan over a static table is easy to verify; the moment the monitor grows allocation, locking or a hash table it loses the smallness that justified the design and the exhaustive test along with it.",
+    "Fail-open lookups: an unknown subject/action/object triple, a truncated table or a bad argument must return refusal, and any function that cannot decide must say so instead of assuming a default allow."
+  ],
+  "sources": [
+    "https://csrc.nist.gov/glossary/term/reference_monitor",
+    "https://man7.org/linux/man-pages/man2/openat2.2.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "userspace-core",
+      "name": "Small userspace decision core (portable, exhaustively testable)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "one small decision unit over a read-only policy table, with one exported entry point per mediated operation",
+      "implementation_notes": "C provides neither encapsulation nor in-process tamper resistance, so the reference monitor is a hand-written unit: one translation unit holding the entire decision logic, a static policy table it only reads, and a single exported function per mediated operation, with the resource's own headers left unpublished so callers cannot construct or mutate it. What makes this a reference monitor rather than a guard is the discipline around it: the unit has no dependencies beyond the policy interface, its public surface is the header and the tests iterate that same list, and every decision returns refusal when it cannot decide. In-process it remains advisory against code linked into the same binary that can call anything it likes, so the tamperproof requirement is met by the deployment - a helper process that owns the resource and speaks a narrow protocol, or the kernel mechanism in the second variant.",
+      "code_sketch": "/* monitor.c - the whole trusted core: read-only rules, no allocation, no libc state */\nstatic const struct rule policy[] = {\n    { ROLE_AUDITOR, ACT_READ,  OBJ_LEDGER, 1 },  /* subject, action, object, allow */\n    { ROLE_AUDITOR, ACT_WRITE, OBJ_LEDGER, 0 },\n};\n\nint monitor_check(uint32_t subject, enum action a, enum object o) {\n    for (size_t i = 0; i < sizeof policy / sizeof *policy; i++)\n        if (policy[i].subject == subject && policy[i].action == a && policy[i].object == o)\n            return policy[i].allow;\n    return 0;                                /* fail closed: unknown triple denied */\n}",
+      "pitfalls": [
+        "Any code linked into the process can call the resource's own functions or resolve them with dlsym(); the discipline holds only while the unchecked headers stay unpublished and the monitor's symbols are the only ones exported (-fvisibility=hidden plus a version script, not a comment).",
+        "The decision and the access must be one operation: faccessat() or stat() followed by open() leaves a window in which the path is swapped, which is why the kernel variant pushes the check into the syscall itself.",
+        "A linear scan over a static table is easy to verify; the moment the monitor grows allocation, locking or a hash table it loses the smallness that justified the design and the exhaustive test along with it.",
+        "Fail-open lookups: an unknown subject/action/object triple, a truncated table or a bad argument must return refusal, and any function that cannot decide must say so instead of assuming a default allow."
+      ],
+      "sources": [
+        "https://csrc.nist.gov/glossary/term/reference_monitor",
+        "https://man7.org/linux/man-pages/man2/openat2.2.html"
+      ]
+    },
+    {
+      "variant_id": "kernel-mediated",
+      "name": "Kernel-mediated enforcement (seccomp-BPF allow-list + Landlock ruleset)",
+      "paradigm": "procedural",
+      "min_standard": "C11",
+      "requires_features": [
+        "seccomp-bpf",
+        "landlock"
+      ],
+      "idiom_name": "seccomp(SECCOMP_SET_MODE_FILTER) allow-list + landlock_restrict_self()",
+      "implementation_notes": "Here the monitor is the kernel rather than the program: the process states its policy once and can never widen it, and the code under mediation cannot edit, disable or even inspect the rules. seccomp(2) attaches a BPF filter to a thread, and the man page recommends an allow-list because deny-lists are bypassable - a newly added syscall, the __X32_SYSCALL_BIT variant of a number, an argument whose representation changes without changing meaning. The filter is per-thread unless SECCOMP_FILTER_FLAG_TSYNC is passed, and PR_SET_NO_NEW_PRIVS must be set first so that an unprivileged process cannot install a filter and then execute a set-uid program. Landlock complements it for file hierarchies: landlock_create_ruleset(), landlock_add_rule() and landlock_restrict_self() let any process restrict itself and its descendants, and further rulesets stack as additional layers. Both are coarse - syscalls and paths, not intent - so they decide admission rather than authorization and are normally paired with a small userspace core for object-level rules.",
+      "code_sketch": "/* attach the monitor to the thread, then never run without it */\nprctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);\nstruct sock_fprog prog = { .len = (unsigned short)(sizeof allow / sizeof *allow),\n                           .filter = allow };      /* allow-list, never a deny-list */\nif (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,\n            SECCOMP_FILTER_FLAG_TSYNC, &prog) != 0)\n    abort();                                       /* no monitor, no execution */\n\nint ruleset = syscall(SYS_landlock_create_ruleset, &attr, sizeof attr, 0);\nsyscall(SYS_landlock_add_rule, ruleset, LANDLOCK_RULE_PATH_BENEATH, &rule, 0);\nsyscall(SYS_landlock_restrict_self, ruleset, 0);   /* inherited by every child */",
+      "pitfalls": [
+        "Filters are per-thread: a worker created before the filter, or one that diverges from the filter tree, keeps the unfiltered syscall table unless SECCOMP_FILTER_FLAG_TSYNC synchronises every thread (add SECCOMP_FILTER_FLAG_TSYNC_ESRCH to turn a failed sync into an error instead of a thread id).",
+        "Landlock does not reach files or descriptors opened before the ruleset is enforced: acquire, open and map resources only after the sandbox exists, and close everything that predates it.",
+        "A deny-list filter is a bypass waiting to happen - allow-list what the process needs, remember the __X32_SYSCALL_BIT aliasing, and re-check the policy when a kernel upgrade adds syscalls.",
+        "Kernel mechanisms are coarse: a syscall allow-list cannot express which object the caller may touch, so object-level intent still needs a small userspace core - and the fallibility of that core is exactly what the verifiability requirement is about."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man2/seccomp.2.html",
+        "https://man7.org/linux/man-pages/man7/landlock.7.html",
+        "https://man7.org/linux/man-pages/man2/openat2.2.html"
+      ]
+    }
+  ],
+  "default_variant": "userspace-core"
+}

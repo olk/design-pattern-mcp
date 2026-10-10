@@ -1,0 +1,80 @@
+{
+  "pattern": "master-slave",
+  "language": "java",
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "executor-futures",
+      "name": "ExecutorService + Callable/Future over a fixed thread pool (Java 5)",
+      "paradigm": "oo",
+      "min_standard": "Java5",
+      "idiom_name": "ExecutorService.submit/invokeAll + Callable/Future",
+      "implementation_notes": "Java's classic realization is java.util.concurrent: the master creates a bounded pool (Executors.newFixedThreadPool(n) or newWorkStealingPool) and submits Callable sub-tasks; invokeAll() is the bulk dispatch that waits until every task is done and returns Futures in input order, while submit() plus Future.get() joins individually. Future.get() rethrows a failed task's exception wrapped in ExecutionException, cancel(true) is cooperative (it only interrupts), and the documented memory rule is that actions before submission happen-before the task, which happens-before retrieving the result via Future.get(). Lifecycle is shutdown()/shutdownNow() plus awaitTermination(), or try-with-resources on Java 19+ where ExecutorService is AutoCloseable. Because the classic structure is the API here, prefer it over hand-rolled worker loops.",
+      "code_sketch": "try (var pool = Executors.newFixedThreadPool(workers)) {\n    List<Callable<Double>> jobs = IntStream.range(0, workers)\n        .mapToObj(i -> (Callable<Double>) () -> computePart(i))   // identical workers\n        .toList();\n    List<Future<Double>> parts = pool.invokeAll(jobs);            // dispatch + join\n    double total = 0;\n    for (Future<Double> f : parts) total += f.get();              // combine\n}",
+      "pitfalls": [
+        "A pool sized to the cores with blocking sub-tasks serialises or deadlocks: size it for the workload and give Future.get() a timeout instead of waiting forever on a lost worker.",
+        "invokeAll(..., timeout, unit) cancels only the unfinished futures - the underlying tasks keep running unless they respond to interruption.",
+        "Exceptions inside tasks stay invisible until a join observes them; nothing in the pool reports a failed sub-task that nobody waits on.",
+        "State shared by Callables races: only submission and result retrieval have happens-before edges."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html",
+        "https://openjdk.org/jeps/444"
+      ]
+    },
+    {
+      "variant_id": "completable-future",
+      "name": "CompletableFuture dispatch with allOf and continuation composition (Java 8)",
+      "paradigm": "functional",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.supplyAsync + allOf/thenApply + exceptionally",
+      "implementation_notes": "CompletableFuture turns dispatch and combination into a declarative pipeline: supplyAsync(..., executor) starts each sub-task, allOf(...) is the join that completes when every stage is done, thenApply/streams of join() combine the partials, and exceptionally/handle attach the failure policy to the stage instead of waiting and catching. The trap is the executor default - the *Async methods without an explicit Executor run on ForkJoinPool.commonPool(), which is shared with parallel streams and must not host blocking work - so pass the master's own executor for anything that blocks or is long-running. allOf returns CompletableFuture<Void>, so the partials must be collected from the stage list, and cancellation does not propagate: complete exceptionally or cancel stages explicitly.",
+      "code_sketch": "var pool = Executors.newFixedThreadPool(workers);\nList<CompletableFuture<Double>> parts = IntStream.range(0, workers)\n    .mapToObj(i -> CompletableFuture.supplyAsync(() -> computePart(i), pool))\n    .toList();                                                  // dispatch\nCompletableFuture.allOf(parts.toArray(CompletableFuture[]::new)).join(); // join\ndouble total = parts.stream().mapToDouble(CompletableFuture::join).sum();  // combine",
+      "pitfalls": [
+        "Omitting the executor in *Async methods puts the sub-tasks on ForkJoinPool.commonPool(): blocking work there starves every parallel stream in the JVM.",
+        "allOf's Void result hides the partials and its exceptional completion reports only that some stage failed; inspect each stage or collect with a joinable list.",
+        "Cancelling the composed future does not cancel the running stages, and a stage nobody joined swallows its exception until it is read."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+        "https://openjdk.org/jeps/444"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "One virtual thread per sub-task on Java 21+",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + structured task scope",
+      "implementation_notes": "On Java 21+ the master can afford a thread per sub-task: newVirtualThreadPerTaskExecutor creates a virtual thread for each submitted task and close() (implicit in try-with-resources) waits for them all, which keeps blocking sub-tasks cheap and preserves ordinary sequential composition instead of callback chains. JEP 444 is explicit that virtual threads are cheap and must never be pooled - limiting concurrency is a job for semaphores or a dedicated pool, not a virtual-thread pool - and that blocking while pinned (inside synchronized or a native frame) captures the carrier, so hot synchronized blocks guarding I/O should move to ReentrantLock. Virtual threads add throughput, not speed: CPU-bound work still belongs on a fixed platform-thread pool.",
+      "code_sketch": "try (var master = Executors.newVirtualThreadPerTaskExecutor()) {   // join at close\n    List<Future<Double>> parts = IntStream.range(0, n)\n        .mapToObj(i -> master.submit(() -> computePart(i)))          // one vthread each\n        .toList();\n    double total = 0;\n    for (var f : parts) total += f.get();                            // combine\n}",
+      "pitfalls": [
+        "Pooling virtual threads reintroduces the constraint they remove - and thread-locals or per-task caches become expensive at millions of tasks.",
+        "Pinning: a virtual thread blocking inside synchronized or a native frame captures its carrier; use ReentrantLock around blocking sections on the versions where pinning still occurs.",
+        "No speedup for CPU-bound sub-tasks: a million virtual threads on eight cores still run eight at a time, so fixed pools remain the CPU answer."
+      ],
+      "sources": [
+        "https://openjdk.org/jeps/444",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html"
+      ]
+    }
+  ],
+  "default_variant": "executor-futures",
+  "idiom_name": "ExecutorService.submit/invokeAll + Callable/Future",
+  "implementation_notes": "Java's classic realization is java.util.concurrent: the master creates a bounded pool (Executors.newFixedThreadPool(n) or newWorkStealingPool) and submits Callable sub-tasks; invokeAll() is the bulk dispatch that waits until every task is done and returns Futures in input order, while submit() plus Future.get() joins individually. Future.get() rethrows a failed task's exception wrapped in ExecutionException, cancel(true) is cooperative (it only interrupts), and the documented memory rule is that actions before submission happen-before the task, which happens-before retrieving the result via Future.get(). Lifecycle is shutdown()/shutdownNow() plus awaitTermination(), or try-with-resources on Java 19+ where ExecutorService is AutoCloseable. Because the classic structure is the API here, prefer it over hand-rolled worker loops.",
+  "code_sketch": "try (var pool = Executors.newFixedThreadPool(workers)) {\n    List<Callable<Double>> jobs = IntStream.range(0, workers)\n        .mapToObj(i -> (Callable<Double>) () -> computePart(i))   // identical workers\n        .toList();\n    List<Future<Double>> parts = pool.invokeAll(jobs);            // dispatch + join\n    double total = 0;\n    for (Future<Double> f : parts) total += f.get();              // combine\n}",
+  "pitfalls": [
+    "A pool sized to the cores with blocking sub-tasks serialises or deadlocks: size it for the workload and give Future.get() a timeout instead of waiting forever on a lost worker.",
+    "invokeAll(..., timeout, unit) cancels only the unfinished futures - the underlying tasks keep running unless they respond to interruption.",
+    "Exceptions inside tasks stay invisible until a join observes them; nothing in the pool reports a failed sub-task that nobody waits on.",
+    "State shared by Callables races: only submission and result retrieval have happens-before edges."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html",
+    "https://openjdk.org/jeps/444"
+  ],
+  "version": "1.0"
+}

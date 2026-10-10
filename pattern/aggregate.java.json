@@ -1,0 +1,65 @@
+{
+  "pattern": "aggregate",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "@Entity root + @OneToMany(cascade = ALL, orphanRemoval = true)",
+  "implementation_notes": "The dominant Java realization is a JPA entity root whose parts are mapped `@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)`: the provider cascades persist/merge/remove from the root to the lines and deletes a line that is removed from the collection, so one `persist`/repository call stores the whole cluster - Spring Data states the model directly ('domain types are entities, more specifically aggregates') and expects one repository per aggregate root. Invariants stay in the root's methods, other aggregates are referenced by id (or `@ManyToOne` at most, never fetched for modification), and the `EntityManager`/`@Transactional` boundary is the unit of work.",
+  "code_sketch": "@Entity\npublic class Order {\n    @Id private OrderId id;\n    @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)\n    private List<OrderLine> lines = new ArrayList<>();\n    private long totalCents, creditLimitCents;\n    public void addLine(OrderLine line) {\n        if (totalCents + line.amountCents() > creditLimitCents) throw new LimitExceededException();\n        lines.add(line); totalCents += line.amountCents();\n    }\n    public List<OrderLine> lines() { return List.copyOf(lines); }\n}",
+  "pitfalls": [
+    "Outside a transaction Hibernate returns a detached graph: mutating the root without merging/persisting loses the change, so the application service must own the transaction boundary.",
+    "orphanRemoval fires on element removal, not on replacing the collection instance; assigning a new List to `lines` raises a PersistenceException (or silently orphans rows).",
+    "Lazy collections are the boundary's leak: `order.getLines().add(...)` from a service bypasses addLine, and a lazy load outside the session throws LazyInitializationException.",
+    "equals/hashCode across the mutable root and its children break identity maps and Set membership; key entities on the id only, and never on the collection."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-data/commons/reference/repositories/core-concepts.html",
+    "https://vladmihalcea.com/orphanremoval-jpa-hibernate/",
+    "https://www.baeldung.com/jpa-cascade-remove-vs-orphanremoval"
+  ],
+  "variants": [
+    {
+      "variant_id": "jpa-entity",
+      "name": "JPA entity root with cascade and orphan removal",
+      "paradigm": "oo",
+      "min_standard": "Java11",
+      "requires_features": [
+        "jakarta-persistence"
+      ],
+      "idiom_name": "@Entity root + @OneToMany(cascade = ALL, orphanRemoval = true)",
+      "implementation_notes": "The dominant Java realization is a JPA entity root whose parts are mapped `@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)`: the provider cascades persist/merge/remove from the root to the lines and deletes a line that is removed from the collection, so one `persist`/repository call stores the whole cluster - Spring Data states the model directly ('domain types are entities, more specifically aggregates') and expects one repository per aggregate root. Invariants stay in the root's methods, other aggregates are referenced by id (or `@ManyToOne` at most, never fetched for modification), and the `EntityManager`/`@Transactional` boundary is the unit of work.",
+      "code_sketch": "@Entity\npublic class Order {\n    @Id private OrderId id;\n    @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)\n    private List<OrderLine> lines = new ArrayList<>();\n    private long totalCents, creditLimitCents;\n    public void addLine(OrderLine line) {\n        if (totalCents + line.amountCents() > creditLimitCents) throw new LimitExceededException();\n        lines.add(line); totalCents += line.amountCents();\n    }\n    public List<OrderLine> lines() { return List.copyOf(lines); }\n}",
+      "pitfalls": [
+        "Outside a transaction Hibernate returns a detached graph: mutating the root without merging/persisting loses the change, so the application service must own the transaction boundary.",
+        "orphanRemoval fires on element removal, not on replacing the collection instance; assigning a new List to `lines` raises a PersistenceException (or silently orphans rows).",
+        "Lazy collections are the boundary's leak: `order.getLines().add(...)` from a service bypasses addLine, and a lazy load outside the session throws LazyInitializationException.",
+        "equals/hashCode across the mutable root and its children break identity maps and Set membership; key entities on the id only, and never on the collection."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-data/commons/reference/repositories/core-concepts.html",
+        "https://vladmihalcea.com/orphanremoval-jpa-hibernate/",
+        "https://www.baeldung.com/jpa-cascade-remove-vs-orphanremoval"
+      ]
+    },
+    {
+      "variant_id": "plain-java-unit-of-work",
+      "name": "Framework-free aggregate with an explicit unit of work",
+      "paradigm": "oo",
+      "min_standard": "Java11",
+      "idiom_name": "plain class + repository + JDBC transaction (persistence-ignorant model)",
+      "implementation_notes": "Without JPA the root is a plain class with `private final List<OrderLine> lines` and a `List.copyOf` view, a hand-written repository that loads and saves root plus lines, and an explicit JDBC unit of work (`setAutoCommit(false)` ... `commit()`) per use case. The invariants are enforced exactly as in the JPA variant; what the provider used to do - cascade and orphan delete - is now application code. Choose this when the domain model must not depend on a persistence framework or the store is not relational.",
+      "code_sketch": "public final class Order {                        // no annotations, no framework\n    private final OrderId id;\n    private final List<OrderLine> lines = new ArrayList<>();\n    private long totalCents;\n    private final long creditLimitCents;\n    public void addLine(OrderLine l) {\n        if (totalCents + l.amountCents() > creditLimitCents) throw new LimitExceededException();\n        lines.add(l); totalCents += l.amountCents();\n    }\n    public List<OrderLine> lines() { return List.copyOf(lines); }\n}\n// orderRepository.save(order) writes root + lines inside one JDBC transaction",
+      "pitfalls": [
+        "Nothing enforces the transaction boundary for you: `connection.setAutoCommit(false)` plus a single commit (and rollback on failure) is the unit of work, and forgetting it writes the root and its lines separately.",
+        "`List.copyOf` (Java 10+) is required to stop callers mutating the internal list; returning `lines` directly re-opens the boundary.",
+        "Detached-domain mapping is manual: on load you must rebuild the root through its constructor/methods rather than setting fields, or the invariants never run.",
+        "Concurrency is not handled by the framework any more - add a version column and check it in the repository, or the last writer silently overwrites the cluster."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/jdbc/basics/transactions.html",
+        "https://docs.spring.io/spring-data/commons/reference/repositories/core-concepts.html"
+      ]
+    }
+  ],
+  "default_variant": "jpa-entity",
+  "version": "1.0"
+}

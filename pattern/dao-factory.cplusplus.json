@@ -1,0 +1,69 @@
+{
+  "pattern": "dao-factory",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "abstract DAOFactory classes + concrete factories returning std::unique_ptr DAOs",
+  "implementation_notes": "The catalog form in C++: an abstract DaoFactory with one pure-virtual creation method per DAO kind, concrete factories per store, and products returned as std::unique_ptr to interfaces with virtual destructors, so the store is chosen once at the composition root and clients hold only DAO references. This is the form to write when the store genuinely varies at runtime and product lifetimes are non-trivial; with a single store a constructor call or free function is shorter, and the catalog's own advice is to start with Factory Method and escalate only when a second store appears.",
+  "code_sketch": "struct UserDao {\n    virtual ~UserDao() = default;\n    virtual std::optional<User> find(long id) = 0;\n};\n\nclass DaoFactory {                        // one method per DAO kind\npublic:\n    virtual ~DaoFactory() = default;\n    virtual std::unique_ptr<UserDao> user_dao() = 0;\n};\n\nclass PgDaoFactory final : public DaoFactory {\n    std::unique_ptr<UserDao> user_dao() override;\n};\n// composition root:\nauto dao = PgDaoFactory{pool}.user_dao();",
+  "pitfalls": [
+    "A virtual destructor on the DAO interface is mandatory; deleting through a base pointer without one is undefined behaviour.",
+    "unique_ptr return types push ownership to the client; returning raw pointers or references to factory-owned objects couples DAO lifetime to factory lifetime and breaks at static destruction time."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/memory/unique_ptr"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "abstract-factory-classes",
+      "name": "Abstract DAO factory classes (virtual creators)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "abstract DAOFactory classes + concrete factories returning std::unique_ptr DAOs",
+      "implementation_notes": "The catalog form in C++: an abstract DaoFactory with one pure-virtual creation method per DAO kind, concrete factories per store, and products returned as std::unique_ptr to interfaces with virtual destructors, so the store is chosen once at the composition root and clients hold only DAO references. This is the form to write when the store genuinely varies at runtime and product lifetimes are non-trivial; with a single store a constructor call or free function is shorter, and the catalog's own advice is to start with Factory Method and escalate only when a second store appears.",
+      "code_sketch": "struct UserDao {\n    virtual ~UserDao() = default;\n    virtual std::optional<User> find(long id) = 0;\n};\n\nclass DaoFactory {                        // one method per DAO kind\npublic:\n    virtual ~DaoFactory() = default;\n    virtual std::unique_ptr<UserDao> user_dao() = 0;\n};\n\nclass PgDaoFactory final : public DaoFactory {\n    std::unique_ptr<UserDao> user_dao() override;\n};\n// composition root:\nauto dao = PgDaoFactory{pool}.user_dao();",
+      "pitfalls": [
+        "A virtual destructor on the DAO interface is mandatory; deleting through a base pointer without one is undefined behaviour.",
+        "unique_ptr return types push ownership to the client; returning raw pointers or references to factory-owned objects couples DAO lifetime to factory lifetime and breaks at static destruction time."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/unique_ptr"
+      ]
+    },
+    {
+      "variant_id": "function-registry",
+      "name": "Registry of std::function creators",
+      "paradigm": "functional",
+      "min_standard": "C++17",
+      "idiom_name": "unordered_map<string_view, std::function<unique_ptr<UserDao>(Db&)>> creators",
+      "implementation_notes": "The class hierarchy collapses into a registry of creator functions: a store is added by inserting a lambda, the whole factory becomes data that can be built from configuration, and std::function erases the concrete factory types. The tradeoff is signature uniformity - every creator must share one argument shape (a generic Db handle or a connection-parameter variant), so store-specific construction arguments get erased or pushed into the DAO constructors; a class factory keeps them typed. Prefer the registry when stores are many and similar, the classes when construction differs per store.",
+      "code_sketch": "using UserDaoCreator = std::function<std::unique_ptr<UserDao>(Db&)>;\n\nconst std::unordered_map<std::string_view, UserDaoCreator> CREATORS = {\n    { \"pg\",     [](Db& db) -> std::unique_ptr<UserDao> { return std::make_unique<PgUserDao>(db); } },\n    { \"sqlite\", [](Db& db) -> std::unique_ptr<UserDao> { return std::make_unique<SqliteUserDao>(db); } },\n};\n\nstd::unique_ptr<UserDao> make_user_dao(std::string_view store, Db& db) {\n    auto it = CREATORS.find(store);\n    if (it == CREATORS.end()) throw std::invalid_argument(\"unknown store\");\n    return it->second(db);\n}",
+      "pitfalls": [
+        "Static initialisation order: a namespace-scope registry whose lambdas capture runtime state can be initialised before that state exists; build the registry inside a function and register at startup.",
+        "string_view keys must outlive the map; a key pointing into a temporary config string leaves a dangling view - own the key strings or use std::string.",
+        "Creator functions erase store-specific constructor arguments (pool sizes, endpoints); hiding them in a shared Db handle pushes configuration into the DAO constructors."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/functional/function"
+      ]
+    },
+    {
+      "variant_id": "soci-backend-factory",
+      "name": "SOCI backend selection from the connection string",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "soci::session over a backend_factory registry (backend chosen by URL scheme)",
+      "implementation_notes": "SOCI, a standard C++ database access library, ships a backend_factory per backend and selects the backend from the connection string scheme (for example \"postgresql://dbname=app\"), with dynamic backend loading; DAOs then run against that session. It supplies the store-selection half of the pattern - the factory that hands out the store-appropriate handle and hides the vendor API - while the DAO classes stay hand-written, which is the pragmatic answer when the layer already sits on SOCI and a parallel factory class would only duplicate the backend registry.",
+      "code_sketch": "#include <soci/soci.h>\n\n// backend resolved from the connection string under a backend_factory registry\nsoci::session sql(\"postgresql://dbname=app user=app\");\n\nclass PgUserDao final : public UserDao {\npublic:\n    explicit PgUserDao(soci::session& s) : sql_(s) {}\n    std::optional<User> find(long id) override;\nprivate:\n    soci::session& sql_;\n};\n\nauto make_session(const std::string& url) { return soci::session{url}; }",
+      "pitfalls": [
+        "The session must outlive every DAO borrowing it; a DAO holding a reference to a temporary session dangles immediately.",
+        "Dynamic backend loading requires the backend plugin at run time and a SOCI build with dynamic loading enabled; statically linked backends may need explicit registration.",
+        "A single soci::session is not thread-safe; DAOs shared across threads need a session per thread or a pool."
+      ],
+      "sources": [
+        "https://soci.sourceforge.net/doc/master/backends/"
+      ]
+    }
+  ],
+  "default_variant": "abstract-factory-classes"
+}

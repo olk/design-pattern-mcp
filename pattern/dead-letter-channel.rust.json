@@ -1,0 +1,62 @@
+{
+  "pattern": "dead-letter-channel",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "lapin QueueDeclareOptions + FieldTable(x-dead-letter-exchange), basic_reject(requeue=false)",
+  "implementation_notes": "With lapin the dead-letter channel is declared through the queue's FieldTable: insert x-dead-letter-exchange (and optionally x-dead-letter-routing-key) as AMQP field values while declaring the source queue, then call Channel::basic_reject(delivery_tag, requeue=false) or basic_nack when the handler decides the message is dead; the broker routes it to the DLX on reject, TTL expiry or queue-length overflow. The DLQ consumer reads the x-death header from the delivery properties to recover the original queue and reason. When the application itself republishes dead letters instead of relying on the broker, enable the publisher-confirm extension and await the confirmation, otherwise the hop is best-effort and can lose the record it was meant to preserve.",
+  "code_sketch": "let mut args = FieldTable::default();\nargs.insert(\"x-dead-letter-exchange\".into(), AMQPValue::LongString(\"dlx\".into()));\nchannel\n    .queue_declare(\"orders\", QueueDeclareOptions { durable: true, ..Default::default() }, args)\n    .await?;\n\n// consumer loop:\nif permanent(&error) {\n    channel.basic_reject(delivery.delivery_tag, false).await?;      // requeue=false -> DLX\n} else {\n    channel.basic_nack(delivery.delivery_tag, false, true).await?;  // requeue for a retry\n}",
+  "pitfalls": [
+    "lapin is async and channel operations are ordered: awaiting a reject inside a consumer while another task publishes on the same channel can deadlock - use separate channels or a cloned connection.",
+    "FieldTable values are typed AMQP values, so a Rust &str where LongString is expected fails at declare/publish time, not at compile time.",
+    "Delivery tags are per-channel and reset after recovery: rejecting a tag from before a reconnect closes the channel instead of dead-lettering the message.",
+    "A DLQ with no consumer fails nothing in Rust and produces no error - it simply grows, so monitoring must live outside the type system."
+  ],
+  "sources": [
+    "https://docs.rs/lapin/latest/lapin/struct.Channel.html",
+    "https://docs.rs/lapin/latest/lapin/options/struct.QueueDeclareOptions.html",
+    "https://www.rabbitmq.com/docs/dlx"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "lapin-rabbitmq-dlx",
+      "name": "lapin: dead-letter exchange declared through the queue FieldTable",
+      "paradigm": "declarative",
+      "min_standard": "Rust2021",
+      "idiom_name": "lapin QueueDeclareOptions + FieldTable(x-dead-letter-exchange), basic_reject(requeue=false)",
+      "implementation_notes": "With lapin the dead-letter channel is declared through the queue's FieldTable: insert x-dead-letter-exchange (and optionally x-dead-letter-routing-key) as AMQP field values while declaring the source queue, then call Channel::basic_reject(delivery_tag, requeue=false) or basic_nack when the handler decides the message is dead; the broker routes it to the DLX on reject, TTL expiry or queue-length overflow. The DLQ consumer reads the x-death header from the delivery properties to recover the original queue and reason. When the application itself republishes dead letters instead of relying on the broker, enable the publisher-confirm extension and await the confirmation, otherwise the hop is best-effort and can lose the record it was meant to preserve.",
+      "code_sketch": "let mut args = FieldTable::default();\nargs.insert(\"x-dead-letter-exchange\".into(), AMQPValue::LongString(\"dlx\".into()));\nchannel\n    .queue_declare(\"orders\", QueueDeclareOptions { durable: true, ..Default::default() }, args)\n    .await?;\n\n// consumer loop:\nif permanent(&error) {\n    channel.basic_reject(delivery.delivery_tag, false).await?;      // requeue=false -> DLX\n} else {\n    channel.basic_nack(delivery.delivery_tag, false, true).await?;  // requeue for a retry\n}",
+      "pitfalls": [
+        "lapin is async and channel operations are ordered: awaiting a reject inside a consumer while another task publishes on the same channel can deadlock - use separate channels or a cloned connection.",
+        "FieldTable values are typed AMQP values, so a Rust &str where LongString is expected fails at declare/publish time, not at compile time.",
+        "Delivery tags are per-channel and reset after recovery: rejecting a tag from before a reconnect closes the channel instead of dead-lettering the message.",
+        "A DLQ with no consumer fails nothing in Rust and produces no error - it simply grows, so monitoring must live outside the type system."
+      ],
+      "sources": [
+        "https://docs.rs/lapin/latest/lapin/struct.Channel.html",
+        "https://docs.rs/lapin/latest/lapin/options/struct.QueueDeclareOptions.html",
+        "https://www.rabbitmq.com/docs/dlx"
+      ]
+    },
+    {
+      "variant_id": "rdkafka-dlt-topic",
+      "name": "rdkafka consumer publishing to a <topic>.DLT topic",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "rdkafka StreamConsumer + BaseProducer with error headers, commit after delivery",
+      "implementation_notes": "Kafka has no broker-side dead-lettering, so the Rust realization is explicit: on a permanent processing failure build a dead-letter record - original payload plus headers with source topic, partition, offset, error and attempt count - produce it to <topic>.DLT with rdkafka's BaseProducer, wait for the delivery report, and only then commit the source offset. Committing inside the catch without waiting for that report is what turns the dead-letter hop into a lossy step, because send() only enqueues into the producer's buffer. Keeping the original key on the DLT record preserves per-key ordering inside the dead-letter topic, which matters when a whole key's stream has to be replayed together.",
+      "code_sketch": "match process(&payload) {\n    Ok(_) => consumer.commit_message(&msg, CommitMode::Async)?,\n    Err(e) if permanent(&e) => {\n        let rec = BaseRecord::to(\"orders.DLT\")\n            .key(&msg.key().map(Vec::from).unwrap_or_default())\n            .payload(&payload);                 // headers: OwnedHeaders (topic/offset/error)\n        dlt.send(rec).map_err(|(err, _)| err)?; // enqueue\n        dlt.flush(Duration::from_secs(5))?;     // wait for delivery reports\n        consumer.commit_message(&msg, CommitMode::Async)?;\n    }\n    Err(_) => {}                                // transient: do not commit, retry\n}",
+      "pitfalls": [
+        "Committing before the delivery report arrives makes the dead-letter hop lossy; send() returns as soon as the record is in the producer's queue.",
+        "The DLT topic must exist with enough retention (or auto-creation must be enabled): when the producer's queue fills, records are dropped and only logged.",
+        "Kafka consumption is at-least-once, so a rebalance can redeliver the original after its DLT copy exists - deduplicate DLT records by original topic/partition/offset when replaying.",
+        "The DLT producer needs its own error callback and queue bounds; sharing configuration with the main producer couples dead-letter capacity to business throughput."
+      ],
+      "sources": [
+        "https://docs.rs/rdkafka/latest/rdkafka/consumer/struct.StreamConsumer.html",
+        "https://kafka.apache.org/documentation/"
+      ]
+    }
+  ],
+  "default_variant": "lapin-rabbitmq-dlx"
+}

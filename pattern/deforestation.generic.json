@@ -1,0 +1,36 @@
+{
+  "pattern": "deforestation",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "composed step functions (transducer-style) driven by a single-pass sink, or one hand-written fused loop",
+  "implementation_notes": "Language-neutral form: express each stage as a step function - element in, zero or more elements out, plus optional per-stage state - and compose the step functions instead of composing the data structures. The classical object-oriented realization is one concrete iterator per transformation (a Decorator chain), and the compiler-driven realization is a producer/consumer pair (build/foldr, stream fusion, loop fusion) that the optimizer rewrites. Materialize only at explicit barriers: sort, group, reverse, a second consumer. Where the runtime offers no lazy composition, the neutral fallback is the single hand-written loop - same semantics, same cost. Modern fusion systems include: (1) foldr/build fusion (GHC, based on Gill et al. 1993 'Shortcut Deforestation') using a single foldr/build rule; (2) stream fusion (Coutts et al. 2007) converting recursive list functions to non-recursive Stream steppers that the compiler fuses via inlining, case-of-case, and constructor specialization; (3) generalized stream fusion (Mainland et al. 2013) bundling multiple stream representations for SIMD and bulk memory ops; (4) Lumberhack (Ji et al. 2024) using subtype inference to synthesize fusion strategies for call-by-need and call-by-value, achieving 8.2% average speedup with 1.79x code size increase; (5) LLVM LoopFusion pass (Barton thesis, implemented in llvm/lib/Transforms/Scalar/LoopFuse.cpp) operating on LLVM IR with four legality conditions: structural validity, computable trip count (SCEV), simplified form, and rotated form.",
+  "code_sketch": "# Stage as composable step function\nstage_f :: a -> [b]        # or (emit, a) -> state\npipeline = compose(take(100), filter(pred), map(f))\n# Single pass, driven by the sink:\nstate = sink.initial()\nfor item in source:\n    for out in pipeline(item):\n        state = sink.step(state, out)  # take() must stop the pull\nreturn sink.finish(state)\n\n# GHC foldr/build rule (single rule governs all list fusion):\n# foldr k z (build g)  ==>  g k z\n# where build g = g (:) []\n\n# Stream fusion: map f . map g = unstream . maps f . maps g . stream\n# LLVM LoopFusion: merges adjacent loops with identical trip counts,\n#                  no negative-distance dependencies, control-flow equivalent",
+  "pitfalls": [
+    "Keeping the staged form and adding lazy wrappers that each still hold one element per stage: the structures get smaller but the per-element cost does not.",
+    "Stages with side effects: under lazy composition the effect moves to the terminal operation and its count/order is no longer the one written in the chain.",
+    "Forgetting the terminal operation, so nothing runs - or, on re-enumeration, the whole source pass runs twice.",
+    "Relying on compiler fusion without measuring: de-fusion is silent and small refactors can disable the optimization without diagnostics.",
+    "Fusing atomic or volatile memory accesses: LLVM loop fusion conservatively rejects all atomic operations, so fusion silently fails in concurrent contexts.",
+    "Tail-recursive accumulators: when intermediate functions are stuck inside recursive accumulator parameters (e.g., rev xs ++ map f xs), floating-out is impossible without associativity, leaving intermediate thunks unallocated.",
+    "Over-inlining: aggressive fusion creates large combined functions that increase compile time and peak memory usage, especially with recursive loops (SpecConstr can cause dramatic compile-time growth).",
+    "Wrong move: trusting GHC list fusion after a refactor because the pipeline benchmarked well last quarter -> rewrite rules silently stop matching (inlining changes, let-floating, module boundaries) and the intermediates reappear with no diagnostic -> instead probe the Core on every performance-critical change (list-fusion-probe's fuseThis, ghc-core) and keep the staged fallback reachable.",
+    "Wrong move: assuming fusion holds across every boundary -> nearly identical expressions can compile fused or unfused (GHC issue 11710), and Flink operators separated by a network exchange or disableChaining() serialize and materialize again -> instead inspect the execution plan or generated Core at the exact boundary where fusion is claimed, and measure there.",
+    "Wrong move: relying on the laziness semantics of fused combinators -> GHC's foldr2/zip fusion rules could violate Haskell Report semantics (producing bottom for inputs like zip [1,7,42] (1:8:undefined)), making behavior depend on the optimization level -> instead treat observable laziness differences as a reason to materialize at that point rather than to fuse."
+  ],
+  "sources": [
+    "Wadler, Philip. 'Deforestation: Transforming Programs to Eliminate Trees.' ESOP 1988 / Theoretical Computer Science 73(2):231-248, 1990. https://doi.org/10.1007/3-540-19027-9_23",
+    "Gill, Andrew, John Launchbury, and Simon Peyton Jones. 'A Short Cut to Deforestation.' ACM Conference on Functional Programming and Computer Architecture (FPCA) 1993. https://www.microsoft.com/en-us/research/wp-content/uploads/2016/07/deforestation-short-cut.pdf",
+    "Coutts, Duncan, Roman Leshchinskiy, and Don Stewart. 'Stream Fusion: From Lists to Streams to Nothing at All.' ICFP 2007. https://www.cs.tufts.edu/~nr/cs257/archive/duncan-coutts/stream-fusion.pdf",
+    "Mainland, Geoffrey, Roman Leshchinskiy, and Simon Peyton Jones. 'Haskell Beats C Using Generalized Stream Fusion.' ICFP 2013. https://www.cs.tufts.edu/comp/150FP/archive/simon-peyton-jones/haskell-beats-C.pdf",
+    "Ji, Ruyi, et al. 'Lumberhack: General-Purpose Deforestation for Call-by-Need and Call-by-Value.' arXiv:2410.02232, 2024 (POPL 2025). https://arxiv.org/html/2410.02232v2",
+    "Polikarpova, Nadia, et al. 'Superfusion: Eliminating Intermediate Data Structures via Inductive Synthesis.' PLDI 2024. https://cseweb.ucsd.edu/~npolikarpova/publications/pldi24-extended.pdf",
+    "Hu, Zhenjiang, Masahiro Tachikawa, and Masato Takeichi. 'A Fusion Algorithm for Inductive Data Structures.' Partial Evaluation and Semantics-Based Program Manipulation (PEPM) 2002.",
+    "Barton, Christopher. 'Code Transformations to Augment the Scope of Loop Fusion in a Production Compiler.' MSc Thesis, University of Alberta. https://webdocs.cs.ualberta.ca/~amaral/thesis/ChristopherBartonMSc.pdf",
+    "Hickey, Rich. 'Transducers.' Strange Loop Conference, 2014. https://www.youtube.com/watch?v=6mTbuzafcII",
+    "Hickey, Rich. 'Inside Transducers.' 2015. https://www.youtube.com/watch?v=4KqUvG8HPYo",
+    "Cognitect Blog. 'Transducers are Coming.' August 2014. https://www.cognitect.com/blog/2014/8/6/transducers-are-coming",
+    "Karpov, Mark. 'GHC optimization and fusion.' 2019. https://markkarpov.com/tutorial/ghc-optimization-and-fusion.html",
+    "LLVM Project. 'Loop Fusion.' LLVM Documentation. https://llvm.org/docs/LoopFusion.html"
+  ],
+  "version": "1.0"
+}

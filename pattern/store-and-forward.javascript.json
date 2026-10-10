@@ -1,0 +1,19 @@
+{
+  "pattern": "store-and-forward",
+  "language": "javascript",
+  "support": "manual",
+  "idiom_name": "node:fs spool (writeFile + FileHandle.sync + rename) drained by an async loop",
+  "implementation_notes": "Node supplies the primitives but no durable queue: open a temp file in the spool directory, write the payload (the writeFile/appendFile flush option, Node 21+, or an explicit FileHandle.sync() flushes it to the storage device), close it and rename it into the spool, then drain with a single async loop that deletes a file only after the peer acknowledged. Broker clients cover the hop only - an amqplib ConfirmChannel invokes the publish callback once the broker confirmed the message and waitForConfirms() gives the same barrier - and an in-process array or promise chain is not a store at all. Move the drain loop into a worker thread or a separate process when fsync latency must not block request handling.",
+  "code_sketch": "const fh = await fs.open(path.join(spool, `tmp-${id}`), 'w');\nawait fh.writeFile(payload);\nawait fh.sync();                                     // durable, not just buffered\nawait fh.close();\nawait fs.rename(path.join(spool, `tmp-${id}`), path.join(spool, id));\nfor (const name of await fs.readdir(spool)) {         // single in-flight drain loop\n  try { await deliver(name); await fs.unlink(path.join(spool, name)); }\n  catch (err) { await backoff(); break; }\n}",
+  "pitfalls": [
+    "fs.writeFile resolving means the data reached the kernel, not the disk: without sync()/flush a spool entry can be lost in a crash.",
+    "fs.rename across devices throws EXDEV - the temporary file must live in the spool directory.",
+    "An interval-driven drain overlaps itself when a pass runs long; guard it with a single in-flight flag or serialize the passes.",
+    "Unhandled 'error' events on a channel or connection crash the process (amqplib documents this) and take the undrained spool down with it - reconnection and backpressure must be explicit."
+  ],
+  "sources": [
+    "https://nodejs.org/api/fs.html",
+    "https://amqp-node.github.io/amqplib/channel_api.html"
+  ],
+  "version": "1.0"
+}

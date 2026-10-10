@@ -1,0 +1,188 @@
+{
+  "category": "behavior-selection",
+  "name": "dispatch-table",
+  "aliases": [
+    "function table",
+    "jump table",
+    "method table"
+  ],
+  "intent": "Keep the mapping from a discriminant (opcode, command name, message type, route, key) to the code that handles it in a lookup table, so that choosing the behaviour is a data lookup instead of a branching construct that must be edited for every new case.",
+  "problem": "Selection is written as a growing if/else or switch chain: each new operation edits the same function, the same case list is repeated wherever the operation is chosen, handling code is entangled with selection logic, and the set of supported operations cannot be enumerated, logged, generated, documented or extended at runtime.",
+  "context": "Applies wherever one uniform operation is selected by a key that arrives as data - bytecode and instruction dispatch in interpreters, emulators and VMs, protocol message and RPC method tables, CLI subcommands, HTTP routes, state-machine transitions, file/MIME/payment-method plugin registries. It pays off when the key space is large or open (grown by configuration, by several modules or at runtime), when every handler can share one signature, and when the mapping itself must be introspectable; a small closed set of cases that a compiler can check exhaustively usually prefers pattern matching instead.",
+  "benefits": [
+    "New behaviour is a new entry: the dispatch site is closed for modification and its size no longer grows with the number of cases (open/closed at the level of data).",
+    "The mapping becomes data: it can be iterated, logged, diffed, generated, documented or driven from configuration, none of which is possible with a compiled branch.",
+    "Dispatch cost stops depending on the case count - one hash lookup or one indexed array access replaces comparisons, decision trees or a long else-if cascade.",
+    "Every handler is a separately named, separately testable function or object with one uniform contract, instead of a block of code entangled with the selector.",
+    "Open key spaces become possible: modules, plugins or configuration can register keys the dispatch site never mentions, without recompiling it.",
+    "The mental model transfers across engines - virtual method tables, syscall tables and interpreter opcode loops are all instances, so the same reasoning applies at every layer."
+  ],
+  "tradeoffs": [
+    "Locality is lost: control flow leaves the dispatch site, so a reader must follow both the table construction and the lookup to learn what runs, and grepping a case label no longer finds its callers.",
+    "There is no exhaustiveness and no compile-time coverage: a missing, misspelled or duplicated key fails at runtime (null handler, key-not-found, default arm) instead of at compile time.",
+    "The uniform handler signature flattens the interface: handlers needing different arguments must be adapted through a context object, a closure or an untyped payload, weakening the type checking an ordinary switch arm enjoys.",
+    "Indirect invocation is not free: the call cannot be inlined, each table site is one more unpredictable branch target, and a hash lookup can lose to a compiler-generated jump table over small dense integers.",
+    "Keys that arrive from outside become an attack surface: an unvalidated key selects an unintended handler, and with a computed-goto/jump table an out-of-range index is an arbitrary jump rather than a failed lookup.",
+    "Table lifetime turns into shared state: a globally mutable table brings initialisation-order hazards, hidden coupling between modules that register into it, and test isolation problems.",
+    "Under polymorphic dispatch (multiple types arriving in unpredictable order), all mechanisms degrade similarly as branch misprediction dominates; the structural difference between function pointer, virtual dispatch, and variant shrinks to ~1.3x versus 2.5x under monomorphic dispatch."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 9,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 8,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Key (discriminant)",
+      "responsibility": "The value that selects behaviour: an opcode, command/message name, type tag, route or (state, event) pair. It must be hashable/comparable, and dense small integers when an array table is used."
+    },
+    {
+      "role": "Dispatch Table",
+      "responsibility": "Binds keys to handlers and owns the key space: bounded (indexed array) or unbounded (map), frozen after startup or explicitly synchronised when mutated."
+    },
+    {
+      "role": "Handler",
+      "responsibility": "The uniform callable or object that performs the operation; the only participant that understands the payload."
+    },
+    {
+      "role": "Dispatcher",
+      "responsibility": "Validates the key, looks up the handler, applies the miss policy (raise, fallback, log, ignore) and invokes the handler with the same arguments every time."
+    },
+    {
+      "role": "Fallback handler (optional)",
+      "responsibility": "Explicit policy for unknown keys - unknown-opcode trap, 404, help text, error - so that misses stay visible instead of silently doing nothing."
+    },
+    {
+      "role": "Registrar (optional)",
+      "responsibility": "The place(s) where entries are added: static initialiser, module init, plugin hook or declarative configuration. It determines whether the table is closed at build time or open at runtime."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "object"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Bytecode and instruction dispatch in interpreters, VMs and CPU emulators, where the opcode is either an index into a dense array or a key into a sparse table.",
+    "Protocol and message dispatch: one handler per message/notification type or RPC method, keyed by a type tag or a method name.",
+    "Command routing in CLIs, shells and admin consoles, where the first argument names the command and the table names the handler.",
+    "HTTP routing tables (method and/or path key to controller) and gRPC service method registries.",
+    "Plugin and extension registries: modules register a key (file extension, MIME type, payment method, codec) and the core only ever looks it up.",
+    "State-machine and rule transitions keyed by (state, event) or by an event type, replacing a nested switch over transition cases.",
+    "System-level tables such as syscall tables and interrupt vector tables, where the key is the index of a privilege gateway.",
+    "Embedded systems with keypad/soft-key dispatch, where key meanings change per screen and a 2D function-pointer matrix maps (screen, key) to handlers.",
+    "Timed-task schedulers where an array of function pointers indexed by timer ID dispatches periodic work, allowing new tasks to be added by editing only the table.",
+    "Linux kernel syscall dispatch: the generated sys_call_table array binds syscall numbers to handler entry points, and the entry path bounds-checks and sanitizes the index (array_index_nospec) before the indirect call.",
+    "Git's builtin command table: a static cmd_struct commands[] array binds command names to cmd_foo handlers plus setup flags, looked up by get_builtin and executed by run_builtin; adding a builtin is a table entry per the api-builtin guide.",
+    "Redis command dispatch: the redisCommandTable binds command names to handler function pointers with arity and flags behind a case-insensitive dict lookup, and COMMAND dumps the live table so clients can discover server capabilities."
+  ],
+  "avoid_when": [
+    "The set of cases is small, closed and known at compile time: a switch/match expression is shorter, checked for coverage and needs no registration step or allocation.",
+    "Selection depends on conditions, ranges, guards or a combination of fields rather than equality on one key - that is a predicate, not a table lookup.",
+    "Handlers genuinely need different signatures and the adaptation cost (context objects, casts, thunks) exceeds the branch it would replace.",
+    "The dispatch sits in a hot inner loop and measurement shows the indirect call or hash lookup losing to a dense jump table over small integers.",
+    "There is exactly one call site and no expectation of growth, configuration or runtime registration - the table then adds ceremony with no extensibility dividend.",
+    "The workload is dominated by unpredictable polymorphic dispatch where branch misprediction cost dominates all structural differences between mechanisms."
+  ],
+  "language_files": {
+    "generic": "dispatch-table.generic.json",
+    "c": "dispatch-table.c.json",
+    "cplusplus": "dispatch-table.cplusplus.json",
+    "csharp": "dispatch-table.csharp.json",
+    "go": "dispatch-table.go.json",
+    "java": "dispatch-table.java.json",
+    "javascript": "dispatch-table.javascript.json",
+    "kotlin": "dispatch-table.kotlin.json",
+    "python": "dispatch-table.python.json",
+    "ruby": "dispatch-table.ruby.json",
+    "rust": "dispatch-table.rust.json",
+    "scala": "dispatch-table.scala.json",
+    "swift": "dispatch-table.swift.json",
+    "typescript": "dispatch-table.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "functional",
+    "data-oriented"
+  ],
+  "scope": "module",
+  "provenance": [
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "strategy",
+    "command",
+    "visitor",
+    "interpreter",
+    "factory-kit",
+    "pattern-matching",
+    "tag-dispatching",
+    "state",
+    "double-dispatch"
+  ],
+  "anti_patterns": [
+    "Table as a dumping ground: unrelated helpers are registered until the table is an untyped service locator whose key space has no documented contract.",
+    "Key literals spread across the codebase ('GET', 'get', :get) instead of shared constants, an enum or a typed union - mismatched spellings become silent no-match failures at runtime.",
+    "Dispatching on raw external input without an allowlist, so any key an attacker guesses selects a handler (and, with computed goto, an arbitrary jump target).",
+    "Replacing a two-branch conditional with a table, a registration step and a handler interface - ceremony that hides a decision that was clearer inline.",
+    "Flattening rich handlers into a single untyped payload signature just to fit the table, throwing away the type safety the language would otherwise give.",
+    "Mutating a global table at runtime without coordination: racy registration, order-dependent dispatch and tests that leak registrations into each other.",
+    "Unrolled-switch (Specialization anti-pattern): replicating handler code per-case with copy/paste variations, hiding subtle errors and making maintenance exponentially harder."
+  ],
+  "design_principles": [
+    "Open/closed principle: behaviour is added by adding data (an entry), not by editing the dispatch construct.",
+    "Separation of concerns: the mapping from keys to behaviour, the behaviour itself and the invocation/miss policy are three distinct things.",
+    "Single responsibility: one handler per key, and a dispatcher that only validates, looks up and invokes.",
+    "Make the implicit explicit: the dispatch decision becomes a structure that can be inspected, listed and tested instead of being buried in control flow.",
+    "Fail fast for unknown keys: an explicit fallback keeps misses discoverable rather than silently absorbing them.",
+    "Uniform contract: every handler honours the same signature and error policy, so any entry can be replaced by any other."
+  ],
+  "best_practices": [
+    "Validate the key before dispatch (bounds check for arrays, contains/TryGetValue/getOrDefault for maps) and give the table exactly one documented miss policy.",
+    "Define keys as named constants, an enum or a discriminated union - never as string literals scattered across call sites.",
+    "Freeze the table after startup (const/static, unmodifiable or frozen map, immutable publication) or guard runtime registration with synchronisation and a stated registration protocol.",
+    "Keep the handler signature uniform and narrow; pass a context/request object instead of widening the table's value type to an untyped payload.",
+    "Keep entries discoverable: register next to the handler (module init, per-feature registration) or generate the table from the same declaration that defines the keys.",
+    "Keep the table enumerable and machine-readable so it can power help texts, capability listings, route dumps and conformance tests that every registered key has at least one test.",
+    "Prefer a dense array indexed by opcode when the key space is a small dense integer range and a hash map only when it is sparse or stringly - and measure before optimising the hot loop.",
+    "For polymorphic dispatch with type-mixed workloads, consider batching by type before iterating to recover monomorphic performance within each batch (sort once, then iterate).",
+    "Trust the compiler's switch optimisation: modern GCC (12+) lowers std::visit with a jump table that stays within the same function, making it competitive with raw function pointers on GCC 15+. Measure before hand-writing a jump table.",
+    "For hot dispatch with uneven case distribution, use __builtin_expect or branch-weight metadata to hint the common path rather than restructuring the dispatch mechanism.",
+    "In embedded systems with memory-space qualifiers, ensure the function-pointer array is declared const and placed in ROM to avoid accidental modification and to conserve RAM."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Goldberg, A. & Robson, D., Smalltalk-80: The Language and its Implementation (Addison-Wesley, 1983) - the historical origin of the pattern: the bytecode interpreter dispatches through a 256-way table of routine addresses instead of conditional decoding (as summarized in the Smalltalk-80 implementation history).",
+    "Hölzle, U. & Driesen, K., 'Software and Hardware Techniques for Efficient Polymorphic Calls', University of California, Santa Barbara (TRCS99-24, 1999) - comprehensive study of dispatch table efficiency including compressed dispatch tables, row displacement, multiple row displacement, and hardware branch prediction; shows that 95%+ hit rates are achievable for polymorphic call sites.",
+    "Müller, J. (think-cell), 'A Deep Dive Into Dispatching Techniques', C++Now 2023 - covers call threading, token threading (computed goto), tail-call threading, switch dispatch, and their trade-offs for bytecode interpreters; includes assembly analysis for ARM64.",
+    "Gambhir, S., 'When Dispatch Mechanism Choice Stops Mattering' (2026) - empirical measurement across virtual dispatch, function pointer, std::variant+std::visit, and CRTP under monomorphic, round-robin, and random polymorphic workloads; shows CRTP collapses to function pointer at runtime and that variant (GCC 15+) can be fastest for monomorphic dispatch.",
+    "Sale, A., 'The Implementation of Case Statements in Pascal' (1981) - foundational analysis of when compilers should emit jump tables versus binary search; notes that sparse case ranges should not unconditionally use jump tables.",
+    "Bernstein, R., 'Producing Good Code for the Case Statement' (1985) - detailed analysis of optimal decision-tree dispatch; establishes that binary search is faster than linear search for ≥4 case items and discusses Huffman-search variants for weighted distributions.",
+    "Sayle, R., 'A Superoptimizer Analysis of Multiway Branch Code Generation' - demonstrates that GCC can produce a wide variety of switch implementations (linear search, binary search, jump table, computed goto) and that manually written jump tables often undo compiler optimisations.",
+    "Chen, R., 'Introducing the unrolled-switch anti-pattern' (Microsoft DevBlogs, 2012) - describes how unrolling switch cases into near-identical specialised code hides copy/paste bugs and is an anti-pattern despite seeming like a performance win.",
+    "Bendersky, E., 'Computed goto for efficient dispatch tables' (Eli the Green Place, 2012) - practical guide to computed goto (labels-as-values) for interpreter opcode dispatch; compares performance against switch-based dispatch.",
+    "cipht.net, 'Are Jump Tables Always Fastest?' (2017) - empirical comparison of explicit jump tables vs compiler-generated switch dispatch; demonstrates that jump tables are not universally faster and that branch prediction effects make the answer workload-dependent.",
+    "DEV Community, 'A Dispatcher Refactor Starts With a Finite Branch Table' (2026) - practical workflow for extracting messy dispatch code by first pinning a JSON branch-table oracle, then extracting one case at a time with characterization tests to prevent silent behavior drift.",
+    "Barr Group, 'How to Use C Function Pointers' (barrgroup.com) - embedded-systems guide covering function pointer arrays for keypad dispatch, timed-task scheduling, and interrupt vector tables; emphasises const declarations and prototype safety.",
+    "Wikipedia: Dispatch table - https://en.wikipedia.org/wiki/Dispatch_table",
+    "Wikipedia: Jump table - https://en.m.wikipedia.org/?title=Jump_table",
+    "gcc.gnu.org, 'Labels as Values' - https://gcc.gnu.org/onlinedocs/gcc/Labels-as-Values.html",
+    "cpython/ceval_macros.h - https://github.com/python/cpython/blob/v3.13.5/Python/ceval_macros.h",
+    "Git, 'api-builtin: Implementing new built-in commands' - https://git-scm.com/docs/api-builtin - official guide to registering cmd_foo handlers in git.c's commands[] dispatch table with setup flags (RUN_SETUP, NEED_WORK_TREE, USE_PAGER).",
+    "Linux kernel, arch/x86/entry/syscall_64.c - https://github.com/torvalds/linux/blob/master/arch/x86/entry/syscall_64.c - sys_call_table generated from syscall_64.tbl; the 64-bit entry path bounds-checks the syscall number and sanitizes the index with array_index_nospec before dispatch.",
+    "Redis, src/server.c (v6.0) - https://github.com/redis/redis/blob/6.0/src/server.c - redisCommandTable maps command names to handler pointers with arity and flags; commandTableDictType provides the case-insensitive dict lookup and COMMAND introspects the live table.",
+    "Jacoby, 'Dispatch Tables and doing a LOT of work to stay DRY' (2019) - https://jacoby.github.io/2019-05-30/dispatch-tables-and-doing-a-lot-of-work-to-stay-dry.html - maintainability critique: hand-held entries drift from their functions, and reflection-based dispatch (can()) driven by user input can expose unintended subroutines.",
+    "Nagler, 'Dispatch, Don't Decorate' (2015) - https://www.robnagler.com/2015-08-24/Dispatch-Do-not-Decorate.html - argues a central ROUTES dispatch table over scattered framework decorators: handler-plus-policy tuples make security auditable and decouple business logic from the web framework."
+  ],
+  "related_patterns_notes": {
+    "multi-methods": "multi-methods"
+  }
+}

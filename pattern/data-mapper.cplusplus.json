@@ -1,0 +1,76 @@
+{
+  "pattern": "data-mapper",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "mapper class per aggregate wrapping sqlite3_stmt / PGresult in RAII wrappers",
+  "implementation_notes": "The mainstream C++ answer is still a hand-written mapper: a class per aggregate that owns the connection handle plus RAII wrappers around sqlite3_stmt or libpq results, with find/update methods that bind parameters and build the domain object field by field. std::optional, std::variant and range-based iteration make the translation readable; the domain class itself needs no annotations and no library include. Keep the prepared statements in the mapper (or a statement cache) so the pattern also buys statement reuse.",
+  "code_sketch": "class CustomerMapper {\npublic:\n    explicit CustomerMapper(sqlite3* db) : db_{db} {}\n\n    std::optional<Customer> find(std::int64_t id) {\n        Stmt st{db_, \"SELECT id, name FROM customers WHERE id = ?\"};  // RAII wrapper\n        st.bind(1, id);\n        if (st.step() != SQLITE_ROW) return std::nullopt;\n        return Customer{st.column_int64(0), st.column_text(1)};       // plain domain type\n    }\nprivate:\n    sqlite3* db_;\n};",
+  "pitfalls": [
+    "Wrapping every statement in RAII is not optional: an exception thrown between prepare and finalize leaks the statement and pins the connection's resources.",
+    "sqlite3_column_text returns a pointer valid only until the next step/finalize; copy into std::string inside the mapper or return dangling data.",
+    "Hand-written mappers drift from the schema silently - a column added to the table but not to the mapper leaves a default-constructed field."
+  ],
+  "sources": [
+    "https://www.sqlite.org/c3ref/prepare.html",
+    "https://www.postgresql.org/docs/current/libpq-exec.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "hand-written-mapper",
+      "name": "Hand-written mapper class over sqlite3/libpq (RAII)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "mapper class per aggregate wrapping sqlite3_stmt / PGresult in RAII wrappers",
+      "implementation_notes": "The mainstream C++ answer is still a hand-written mapper: a class per aggregate that owns the connection handle plus RAII wrappers around sqlite3_stmt or libpq results, with find/update methods that bind parameters and build the domain object field by field. std::optional, std::variant and range-based iteration make the translation readable; the domain class itself needs no annotations and no library include. Keep the prepared statements in the mapper (or a statement cache) so the pattern also buys statement reuse.",
+      "code_sketch": "class CustomerMapper {\npublic:\n    explicit CustomerMapper(sqlite3* db) : db_{db} {}\n\n    std::optional<Customer> find(std::int64_t id) {\n        Stmt st{db_, \"SELECT id, name FROM customers WHERE id = ?\"};  // RAII wrapper\n        st.bind(1, id);\n        if (st.step() != SQLITE_ROW) return std::nullopt;\n        return Customer{st.column_int64(0), st.column_text(1)};       // plain domain type\n    }\nprivate:\n    sqlite3* db_;\n};",
+      "pitfalls": [
+        "Wrapping every statement in RAII is not optional: an exception thrown between prepare and finalize leaks the statement and pins the connection's resources.",
+        "sqlite3_column_text returns a pointer valid only until the next step/finalize; copy into std::string inside the mapper or return dangling data.",
+        "Hand-written mappers drift from the schema silently - a column added to the table but not to the mapper leaves a default-constructed field."
+      ],
+      "sources": [
+        "https://www.sqlite.org/c3ref/prepare.html",
+        "https://www.postgresql.org/docs/current/libpq-exec.html"
+      ]
+    },
+    {
+      "variant_id": "odb-pragma-generated",
+      "name": "ODB compiler-generated mapping from #pragma db declarations",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "requires_features": [
+        "code-generator"
+      ],
+      "idiom_name": "ODB #pragma db object/member declarations in a separate header",
+      "implementation_notes": "ODB moves the mapper into a code generator: the compiler reads #pragma db declarations plus a database profile and emits the persistence classes (load, update, erase, query) for your own types. The pragmas can be kept out of the domain header entirely - a separate *-odb.hxx carries them - which makes the mapping non-intrusive in the literal sense; the generated odb::database is the session and odb::transaction is the unit of work. Choose it when the schema is large and predictable and a build-time dependency on the ODB compiler is acceptable.",
+      "code_sketch": "// customer.hxx - domain type, no persistence includes\nclass Customer { public: std::string name() const; private: long id_; std::string name_; };\n\n// customer-odb.hxx - non-intrusive mapping in its own header\n#pragma db object(Customer) table(\"customers\")\n#pragma db member(Customer::id_)   id auto\n#pragma db member(Customer::name_) column(\"name\")\n\n// odb::transaction t{db}; auto c = db.load<Customer>(42); c.rename(\"Ada\"); db.update(c); t.commit();",
+      "pitfalls": [
+        "The generated code is a build dependency: schema or pragma changes require regeneration, so the ODB compiler becomes part of the toolchain and CI image.",
+        "Member pragmas still reference members of the domain type, so a renamed or hidden field is a compile error at generation time rather than at mapper level - keep the *-odb.hxx next to the mapper, never in the domain header.",
+        "Generated mappers assume the default constructor; classes without one need explicit factory/ctor pragmas."
+      ],
+      "sources": [
+        "https://www.codesynthesis.com/products/odb/doc/manual.xhtml"
+      ]
+    },
+    {
+      "variant_id": "sqlite-orm-storage",
+      "name": "sqlite_orm declarative storage bindings (header-only)",
+      "paradigm": "declarative",
+      "min_standard": "C++17",
+      "idiom_name": "sqlite_orm make_storage/make_table/make_column bindings",
+      "implementation_notes": "sqlite_orm is a header-only ORM whose mapping is declared rather than coded: make_storage names the database, make_table the table, and make_column binds each column to a pointer-to-member of the domain struct, so the struct itself stays untouched. get/update/insert on the storage are the mapper operations and the library forms the SQL. It is the pragmatic C++ choice when the store is SQLite and the team wants schema and type checking without a code generator.",
+      "code_sketch": "struct Customer { long id; std::string name; };        // untouched domain type\n\nauto storage = make_storage(\"app.sqlite\",\n    make_table(\"customers\",\n        make_column(\"id\",   &Customer::id, primary_key()),\n        make_column(\"name\", &Customer::name)));          // declarative mapper definition\n\nauto c  = storage.get<Customer>(42);                     // load\nc.name  = \"Ada\";\nstorage.update(c);                                       // save",
+      "pitfalls": [
+        "The storage definition is the mapper: a renamed member fails to compile (good), but a reordered make_column list silently changes the SQL binding order.",
+        "It is an SQLite-only mapper, so the layer cannot be reused if the application later moves to a server database - that step means rewriting the mappers.",
+        "Embedded SQLite allows one writer at a time; concurrent writes need WAL plus a busy timeout or a serialised access policy in the mapper."
+      ],
+      "sources": [
+        "https://github.com/fnc12/sqlite_orm"
+      ]
+    }
+  ],
+  "default_variant": "hand-written-mapper",
+  "version": "1.0"
+}

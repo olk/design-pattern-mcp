@@ -1,0 +1,78 @@
+{
+  "pattern": "divide-and-conquer",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "RecursiveTask/RecursiveAction + ForkJoinPool (work stealing)",
+  "implementation_notes": "java.util.concurrent supplies the whole structure: extend RecursiveTask<V> (or RecursiveAction for void work), split in compute() into two subtasks, fork one and compute the other on the current thread, then join; ForkJoinPool.submit/invoke executes the root and its workers steal from each other's deques, which is what makes recursive decomposition pay off. The framework's own guideline is the cut-off: if the task is small enough, solve it directly with a loop. Parallel streams (Arrays.parallelSort, collection.parallelStream) are the same pool behind a data-parallel API and replace the hand-written recursion whenever the work is expressible as stream operations.",
+  "code_sketch": "class SumTask extends RecursiveTask<Long> {\n    private final long[] a; private final int lo, hi;\n    SumTask(long[] a, int lo, int hi) { this.a = a; this.lo = lo; this.hi = hi; }\n    protected Long compute() {\n        if (hi - lo < 4096) return sumSequential(a, lo, hi);      // base case\n        int mid = (lo + hi) >>> 1;\n        SumTask left = new SumTask(a, lo, mid);\n        left.fork();                                              // fork\n        long right = new SumTask(a, mid, hi).compute();           // work here\n        return left.join() + right;                               // join + combine\n    }\n}",
+  "pitfalls": [
+    "Fork both halves and the current thread has nothing to do before the join; fork one side and compute the other.",
+    "The pool is sized for CPU-bound work: blocking on I/O or a lock inside compute() starves the workers and can stall the whole pool.",
+    "A mutable accumulator shared by forked tasks is a data race; combine the join() results instead."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javase/tutorial/essential/concurrency/forkjoin.html",
+    "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/RecursiveTask.html",
+    "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ForkJoinPool.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "forkjoin-recursive-task",
+      "name": "ForkJoinPool with RecursiveTask",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "RecursiveTask/RecursiveAction + ForkJoinPool (work stealing)",
+      "implementation_notes": "java.util.concurrent supplies the whole structure: extend RecursiveTask<V> (or RecursiveAction for void work), split in compute() into two subtasks, fork one and compute the other on the current thread, then join; ForkJoinPool.submit/invoke executes the root and its workers steal from each other's deques, which is what makes recursive decomposition pay off. The framework's own guideline is the cut-off: if the task is small enough, solve it directly with a loop. Parallel streams (Arrays.parallelSort, collection.parallelStream) are the same pool behind a data-parallel API and replace the hand-written recursion whenever the work is expressible as stream operations.",
+      "code_sketch": "class SumTask extends RecursiveTask<Long> {\n    private final long[] a; private final int lo, hi;\n    SumTask(long[] a, int lo, int hi) { this.a = a; this.lo = lo; this.hi = hi; }\n    protected Long compute() {\n        if (hi - lo < 4096) return sumSequential(a, lo, hi);      // base case\n        int mid = (lo + hi) >>> 1;\n        SumTask left = new SumTask(a, lo, mid);\n        left.fork();                                              // fork\n        long right = new SumTask(a, mid, hi).compute();           // work here\n        return left.join() + right;                               // join + combine\n    }\n}",
+      "pitfalls": [
+        "Fork both halves and the current thread has nothing to do before the join; fork one side and compute the other.",
+        "The pool is sized for CPU-bound work: blocking on I/O or a lock inside compute() starves the workers and can stall the whole pool.",
+        "A mutable accumulator shared by forked tasks is a data race; combine the join() results instead."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/essential/concurrency/forkjoin.html",
+        "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/RecursiveTask.html",
+        "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ForkJoinPool.html"
+      ]
+    },
+    {
+      "variant_id": "completable-future",
+      "name": "CompletableFuture fan-out",
+      "paradigm": "declarative",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.supplyAsync + thenCombine / allOf",
+      "implementation_notes": "The fork/combine pair becomes supplyAsync(fn, pool) returning a CompletableFuture plus thenCombine (two branches) or allOf (n branches) for the join, so the recursion is written as a tree of future combinators instead of RecursiveTask.compute() calls - the executor stays an explicit choice rather than the framework's pool. Choose this lane when the branches have different result types, when the caller must stay non-blocking, or when the decomposition must be composed with other asynchronous work; the classic RecursiveTask still wins when the split/join itself must be tuned, because recursive fork/join through work-stealing deques is exactly what ForkJoinPool optimises.",
+      "code_sketch": "CompletableFuture<Long> solve(long[] a, int lo, int hi) {\n    if (hi - lo < 4096)                                   // base case\n        return CompletableFuture.completedFuture(sumSequential(a, lo, hi));\n    int mid = (lo + hi) >>> 1;\n    return solve(a, lo, mid)\n        .thenCombine(solve(a, mid, hi), Long::sum);        // join + combine\n}",
+      "pitfalls": [
+        "thenCombine runs the combiner on whichever thread completes last: a blocking combiner parks a pool thread.",
+        "Without an explicit executor the async stages run on ForkJoinPool.commonPool(), competing with every parallel stream in the process.",
+        "Exceptions are captured in the future and only surface at join/get: a missing exceptionally/handle leaves failures invisible."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/CompletableFuture.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-thread-tasks",
+      "name": "Virtual threads per task",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + Future.get",
+      "implementation_notes": "Java 21's Executors.newVirtualThreadPerTaskExecutor() starts one virtual thread per submitted task, so each split can be submitted and joined with Future.get without managing a bounded platform-thread pool. Virtual threads exist so that tasks which block (I/O, remote calls, locks) scale to very high numbers - they do not make CPU-bound recursion faster - so this lane is for decompositions whose leaves block, while the ForkJoinPool work-stealing lane stays the default for arithmetic. Note the runtime's pinning rule: inside synchronized blocks or native frames a virtual thread cannot unmount, so a blocking leaf held there consumes its carrier.",
+      "code_sketch": "try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {\n    var lo = pool.submit(() -> solveBlocking(a, 0, mid));     // blocking leaf work\n    var hi = pool.submit(() -> solveBlocking(a, mid, n));\n    return lo.get() + hi.get();                               // join + combine\n}",
+      "pitfalls": [
+        "Virtual threads do not accelerate CPU-bound recursion; use them for blocking leaves, not to replace the fork/join pool.",
+        "Pinning inside synchronized blocks or native frames can exhaust the carrier threads while looking like a hang.",
+        "Per-task creation is cheap but not free: spawning a virtual thread per leaf below the cut-off still costs more than the leaf work."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html"
+      ]
+    }
+  ],
+  "default_variant": "forkjoin-recursive-task",
+  "version": "1.0"
+}

@@ -1,0 +1,250 @@
+{
+  "category": "concurrency-resilience",
+  "name": "active-object",
+  "aliases": [
+    "concurrent object"
+  ],
+  "intent": "Decouple a client's method invocation from servant execution: a proxy turns each call into a Method Request placed on an Activation Queue, a Scheduler runs runnable requests on the servant's serialized execution context, and a Future carries completion or failure back while the servant's state remains confined.",
+  "problem": "Several client threads need ordered access to mutable state, but direct calls either execute on caller threads and require locks or block callers behind slow I/O; ad-hoc locking obscures ordering and admission policy, while a plain thread pool cannot by itself preserve one servant's state confinement.",
+  "context": "Multi-threaded applications and middleware whose service objects have long-running or blocking methods (network I/O, protocol handling, device access), where callers must stay responsive, results are needed only later, and the object's method invocations need ordering, guarding or priority beyond what a plain lock-protected object provides.",
+  "benefits": [
+    "Invocation and execution happen in different threads: clients never block for the duration of the servant's method, and a blocked method (flow-controlled socket, slow device) stalls neither its callers nor other objects.",
+    "The servant's state is touched by exactly one thread, so its methods need no internal locks and cannot data-race; synchronization becomes a scheduling concern instead of mutexes scattered through the code.",
+    "Results arrive as futures: callers can rendezvous later, wait with a timeout, cancel, or compose further work instead of being forced into a synchronous call.",
+    "Scheduling policy (ordering, priorities, guards, admission control) lives behind the scheduler and method-request interfaces and can change without touching clients or the servant.",
+    "Many active objects run concurrently and clients still call them through ordinary strongly-typed methods, so the concurrency architecture is hidden behind the proxy."
+  ],
+  "tradeoffs": [
+    "A method-request type per method plus proxy, activation queue and scheduler loop: noticeably more machinery and allocation than a lock-protected method, and disproportionate for small or short methods.",
+    "Execution is serialized and therefore capped: one slow servant method delays every request queued behind it (head-of-line blocking), so an active object does not parallelize work on its own state.",
+    "Asynchronous failure and lifetime handling: exceptions must be stored in the future, cancellation and shutdown must be plumbed through, and requests can outlive their caller - lost futures, unobserved exceptions and use-after-close become new failure modes.",
+    "Cost per object: a dedicated thread (or reserved worker slot) plus an activation queue; thousands of active objects exhaust threads and memory, and an unbounded queue turns overload into latency and memory exhaustion instead of back-pressure.",
+    "Cross-thread debugging: stack traces are split between client and scheduler, a future rendezvous deadlocks when the servant calls back through its own proxy, and ordering or visibility bugs replace the data races the pattern was meant to remove."
+  ],
+  "quality_attributes": {
+    "testability": 5,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 3,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Proxy",
+      "responsibility": "Presents the object's interface to clients as ordinary strongly-typed method calls; each call is converted into a Method Request, handed to the Scheduler for enqueueing and, for two-way methods, immediately answered with a Future."
+    },
+    {
+      "role": "Method Request",
+      "responsibility": "Carries the context of one invocation - method arguments, the binding to the Servant, the result Future and the code that executes the method - and exposes guard() and call() so the Scheduler can decide when and what to run."
+    },
+    {
+      "role": "Activation Queue",
+      "responsibility": "Bounded buffer of pending Method Requests that decouples the client thread (producer) from the scheduler thread (consumer) and holds requests until their guards are satisfied."
+    },
+    {
+      "role": "Scheduler",
+      "responsibility": "Runs continuously in the same thread as the Servant, dequeues runnable Method Requests, evaluates their guards and dispatches call() on the Servant; owns the queue's policy (ordering, priority, timeouts)."
+    },
+    {
+      "role": "Servant",
+      "responsibility": "Implements the Active Object's behavior and owns its state; its methods run only in the scheduler's thread, contain no synchronization and are unaware that they were invoked asynchronously."
+    },
+    {
+      "role": "Future",
+      "responsibility": "Reserves the result slot of one method invocation and lets the client rendezvous with the outcome later - blocking, polling, timing out or composing - after the Servant has produced it."
+    },
+    {
+      "role": "Guardian Object",
+      "responsibility": "Optional coordinator that manages the lifecycle of an active object — sends the poison pill or sets the stop flag, waits for the scheduler to drain or reject pending requests, and completes all outstanding futures exceptionally so callers are not left hanging indefinitely."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Per-connection message queues and protocol stacks: each connection handler is an active object, so a flow-controlled or blocked link cannot stall the process (the Gateway example in the pattern's originating paper).",
+    "Device and actuator controllers (sensors, printers, PLC links) whose commands must be serialized on one thread while callers continue working.",
+    "Browser and Node.js event-loop components: a single JavaScript agent serializes run-to-completion jobs around a realm's state and keeps asynchronous I/O responsive, an implicit active-object analogue without a separate servant thread.",
+    "Middleware, ORBs and service clients where method calls return futures and execute on a private thread, decoupling callers from network latency.",
+    "Data stores, log writers and caches whose writes must stay ordered while callers avoid paying fsync or network latency.",
+    "Real-time embedded systems: sensor-fusion pipelines and actuator controllers whose commands must be serialized on a dedicated thread while the main loop stays responsive, and where blocking I/O (CAN bus, UART) cannot stall the control loop.",
+    "Scientific data-processing pipelines: stages that ingest, filter and transform streams of measurement data, where each stage is an active object that orders results and shields the caller from disk or network latency during the next acquisition cycle.",
+    "GUI background work: keeping the UI thread responsive while file I/O, network requests, or computation runs in the active object's private thread, with results posted back via futures or callbacks.",
+    "Remote method invocation and distributed object systems: ORB middleware and Microsoft Orleans actors (grains), where each remote object or grain behaves as an active object with async method calls and automatic lifecycle management.",
+    "Medical device integration (Siemens MedCom framework): electronic medical record systems where patient data access must be serialized, error-handled, and decoupled from the UI thread.",
+    "Telecom gateway (Motorola Iridium): satellite communication gateways where each TCP connection is wrapped as an active object so a flow-controlled link cannot stall other connections or the main event loop.",
+    "Audio/video processing pipelines: each processing stage (capture, encode, decode, render) runs as an active object with ordered, non-blocking message passing between stages.",
+    "Blockchain and distributed ledger nodes: each peer or wallet service runs as an active object, serializing network requests and local state updates while remaining responsive to the application layer.",
+    "Rust async applications using Tokio: each Tokio task can implement the active object pattern with an mpsc channel as the activation queue and a oneshot channel for request-response futures, providing data-race-free shared mutable state without Arc<Mutex>.",
+    ".NET dataflow pipeline networks: TPL Dataflow blocks (BufferBlock, ActionBlock, TransformBlock) collectively form a declarative active object network where each block is an isolated processing stage with its own mailbox and scheduler.",
+    "Embedded microcontrollers (C): resource-constrained devices where each active object runs on its own stack with static event allocation, using the QP/C or Active frameworks for event-driven state-machine-based concurrency.",
+    "iOS/macOS Swift applications: Swift actors (introduced in Swift 5.5, language-level since Swift 6) are compiler-enforced active objects where actor-isolated state cannot be accessed concurrently, eliminating data races at compile time.",
+    "Android and Kotlin Multiplatform: Kotlin coroutine actors built from Channel and one consumer coroutine confine mutable state; structured coroutine scopes bind actor lifetime, but do not imply a dedicated thread.",
+    "Akka (JVM/Scala/Kotlin/Java): each ActorRef addresses a state-owning actor processed through a mailbox and dispatcher, with supervision and protocol semantics beyond the minimal Active Object roles.",
+    "Event-driven microservices: each microservice or service instance owns its command queue as an active object, ensuring ordering, back-pressure and fault isolation between services without shared databases.",
+    "C++ Actor Framework (CAF): event-based actors own state behind many-writer/single-reader mailboxes and a cooperative scheduler; detach blocking actors instead of assuming every actor owns a dedicated OS thread."
+  ],
+  "avoid_when": [
+    "Use synchronized methods or a Monitor Object when methods are short and callers can afford synchronous execution: an Active Object's queue, scheduler, and future only add overhead without useful decoupling.",
+    "Use a thread pool, fork-join executor, or parallel collection when work is independent and must run concurrently: one Active Object serializes its servant and creates head-of-line blocking.",
+    "Use a direct synchronous call when the caller must immediately consume the result and no other request can make progress: a Future adds a rendezvous without hiding useful latency.",
+    "Use native actors/channels (Swift actors, Go goroutine plus channel, Kotlin coroutines, Akka, or CAF) when they already provide mailbox, scheduling, and lifecycle semantics: do not re-create equivalent queues and threads.",
+    "Use a shared thread pool when the work is stateless or trivially parallel and ordering does not matter: a state-owning active object would serialize needless work.",
+    "Use a real-time scheduler or priority-thread-pool for hard deadlines: FIFO head-of-line blocking and queue admission delay can miss fixed budgets even when average throughput is adequate."
+  ],
+  "language_files": {
+    "generic": "active-object.generic.json",
+    "c": "active-object.c.json",
+    "cplusplus": "active-object.cplusplus.json",
+    "csharp": "active-object.csharp.json",
+    "go": "active-object.go.json",
+    "java": "active-object.java.json",
+    "javascript": "active-object.javascript.json",
+    "kotlin": "active-object.kotlin.json",
+    "python": "active-object.python.json",
+    "ruby": "active-object.ruby.json",
+    "rust": "active-object.rust.json",
+    "scala": "active-object.scala.json",
+    "swift": "active-object.swift.json",
+    "typescript": "active-object.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "object",
+  "provenance": [
+    "posa2"
+  ],
+  "related_patterns": [
+    "monitor-object",
+    "half-sync-half-async",
+    "future-promise",
+    "producer-consumer",
+    "thread-pool",
+    "two-phase-termination",
+    "guardian-object",
+    "actor",
+    "decorator",
+    "strategy",
+    "observer",
+    "proactor"
+  ],
+  "anti_patterns": [
+    "Fire-and-forget proxy misuse: dropping a two-way Future hides failure and completion while producers continue filling the queue; use an explicit one-way contract or observe/cancel the Future and enforce admission.",
+    "Unbounded activation queue as scalability: when arrival rate exceeds service rate, latency and memory grow without bound; use bounded capacity and a reject, block, drop, or shed policy.",
+    "Self-reentrant proxy wait: calling the proxy or awaiting its Future from the servant's scheduler thread waits for the only executor that can complete it; call servant helpers directly or compose through another active object.",
+    "One active object per request: allocating a scheduler thread and queue for short-lived work exhausts resources and adds churn; use a bounded thread pool or monitor.",
+    "Hand-rolling an Active Object under a runtime actor/channel abstraction: duplicate queues and lifecycle logic create inconsistent semantics and bugs; use the runtime's actor or channel primitive.",
+    "Treating Swift, Kotlin, or Go native primitives as interchangeable with POSA2 Active Object: their executors, cancellation, reentrancy, and mailbox semantics differ; use the native abstraction instead of assuming dedicated threads.",
+    "GIL-blindness in Python: assuming a thread per active object gives parallelism; in CPython (non-free-threaded), only one thread runs bytecode at a time, so CPU-bound active objects serialize despite having distinct threads.",
+    "Coroutine self-deadlock: using co_await on a future that resolves only when the current servant produces a result creates a circular wait; ensure futures are resolved by other servants or external callbacks, not by the same scheduler loop.",
+    "Priority inversion on shared queues: a low-priority request holding a resource needed by a high-priority request can block the scheduler; use priority queue scheduling or avoid shared resources between request types.",
+    "Silent exception loss: storing exceptions in futures that callers never retrieve (.result(), .get(), await) makes failures invisible; document caller obligations and consider logging unobserved exceptions at shutdown.",
+    "Heap allocation pressure: each method request is a heap allocation; in high-frequency scenarios, consider object pooling or stack-allocated requests to reduce GC pressure.",
+    "Cyclic bounded-channel deadlock: actor A bounded-sending to B while B bounded-sends to A creates a deadlock if both queues fill before either processes; use a DAG channel topology or oneshot channels for reply legs.",
+    "Message protocol leakage: exposing message enum variants or internal channel types publicly lets callers bypass the intended API and directly manipulate the servant's concurrency model; keep message types private."
+  ],
+  "design_principles": [
+    "Separation of concerns: method invocation, request scheduling and method execution are distinct responsibilities held by distinct roles.",
+    "Single-threaded execution model for the servant: concurrency is pushed out of the object's state into the scheduler, eliminating internal synchronization.",
+    "Do not block the caller: every call is asynchronous and returns a future, or is explicitly declared one-way.",
+    "Encapsulate the scheduling policy behind the scheduler and method-request interfaces so ordering rules can change without touching clients or the servant.",
+    "Treat the queue as a managed resource: bounding it and defining admission behaviour is part of the design, not an afterthought.",
+    "Result observability: every two-way method returns a future and every failure is stored in it; the caller is responsible for observing the future, and the object's shutdown protocol completes un-observed futures exceptionally.",
+    "Channel topology as DAG: avoid cyclic sending relationships between active objects when using bounded channels; cycles introduce deadlock that bounded-channel backpressure makes worse.",
+    "Prefer structured concurrency: an active object's lifetime should be scoped to its creator's lifetime, preventing orphaned actors whose mailboxes grow indefinitely."
+  ],
+  "best_practices": [
+    "Return a future from every two-way method, and never make the servant block on another request of the same active object.",
+    "Keep the servant free of synchronization primitives; express run-time ordering constraints as method-request guards instead.",
+    "Bound the activation queue and decide up front what happens when it is full: block the producer, reject, drop, or shed work.",
+    "Provide a shutdown protocol (poison pill or two-phase termination) that drains or rejects queued requests, joins the scheduler thread and completes outstanding futures exceptionally.",
+    "Keep per-request state in the method request or the future, never in the servant, so the servant stays single-thread-confined and reusable.",
+    "Measure queue depth and service time; if the queue is chronically full, shard the state or move to a pool instead of raising the bound.",
+    "Tie the thread lifetime to the object lifetime: constructor starts the thread, destructor/disposer sends a poison pill and joins. In C++ use a member Active helper; in C#/Java use IDisposable or try-with-resources. This ensures bounded shutdown rather than daemon-thread termination.",
+    "In Python, be aware of the GIL: only one thread runs Python bytecode at a time. Active objects are most effective for I/O-bound or blocking operations; CPU-bound work in GIL-constrained Python benefits from multiprocessing or ProcessPoolExecutor.",
+    "Use C++20 coroutines (co_await) inside active object servants to yield during blocking I/O without blocking the scheduler thread. The coroutine suspends and the worker picks the next queue item; when I/O completes the coroutine resumes on any thread.",
+    "When the servant must perform multi-step async work (e.g., remote call then process response), prefer coroutines or explicit two-step request guards over blocking the scheduler thread on a synchronous call.",
+    "For Swift, Kotlin, or Go codebases: prefer the language's native actor or channel primitives (Swift actors, Kotlin coroutines/channels, Go goroutines + channels) over hand-rolled Active Object implementations. These provide the scheduler, futures, and lifecycle management built-in.",
+    "Implement guard() conditions as first-class request predicates: the scheduler evaluates guards to determine runnability, enabling priority queues, deadline-based scheduling, and conditional ordering without modifying the servant.",
+    "Measure queue depth and service time in production. If the queue is chronically full, shard state across multiple active objects or migrate to a thread pool rather than blindly increasing the queue bound.",
+    "For high-throughput scenarios, consider lock-free MPSC queues instead of mutex-protected queues to reduce scheduler thread blocking on the enqueue path.",
+    "In Rust with Tokio, separate the actor (state owner + event loop) from the handle (clonable mpsc::Sender wrapper); never spawn inside the struct itself to avoid 'static lifetime requirements and ownership violations.",
+    "Design channel topology as a directed acyclic graph (DAG): avoid cyclic bounded-channel sending relationships; if cycles are unavoidable, use oneshot channels or try_send on at least one leg to break the deadlock window.",
+    "For production Rust actor systems, prefer established frameworks (tokio-actors, aka) over raw tokio::spawn + mpsc: these provide bounded mailboxes, supervision, timers, and natural shutdown out of the box.",
+    "In Swift 6, mark all types crossing actor isolation boundaries as Sendable; non-Sendable types require explicit @Preconcurrency annotations and produce compile-time errors in strict concurrency mode.",
+    "In .NET, compose TPL Dataflow blocks (BufferBlock, ActionBlock, TransformBlock) rather than hand-rolling active object infrastructure: each block is an independently-scheduled active object stage, and linking them with DataflowLinkOptions propagates completion and cancellation automatically.",
+    "For embedded C active objects, prefer static event allocation from fixed memory pools rather than heap allocation: prevents allocation failures and GC pauses in time-critical threads.",
+    "Exploit natural shutdown: when all senders to an mpsc-style channel drop their send handles, the receiver's recv returns None — use this to exit event loops without explicit stop messages for simple actors."
+  ],
+  "version": "1.3",
+  "sources": [
+    "Lavender & Schmidt, 'Active Object: An Object Behavioral Pattern for Concurrent Programming' - in Pattern Languages of Program Design 2 (Addison-Wesley, 1996); defines the six participants (Proxy, Method Request, Activation Queue, Scheduler, Servant, Future) and shows the ACE implementation.",
+    "Schmidt, Stal, Rohnert & Buschmann, Pattern-Oriented Software Architecture Vol. 2: Patterns for Concurrent and Networked Objects (Wiley, 2000) - Active Object in the Concurrency Patterns chapter; contrasts it with Monitor Object, which executes methods in the client's thread.",
+    "https://www.dre.vanderbilt.edu/~schmidt/PDF/Act-Obj.pdf",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/conc-patterns.html",
+    "https://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/pattern-abstracts.html",
+    "Lavender & Schmidt, 'Active Object: An Object Behavioral Pattern for Concurrent Programming' (original TOOLS 1995 conference version), DOI 10.5555/2280390.2280407.",
+    "https://www.dre.vanderbilt.edu/~schmidt/ACE.html — ACE framework overview and original home of the pattern's C++ reference implementation.",
+    "Herb Sutter, 'Prefer Using Active Objects Instead of Naked Threads', Dr Dobb's, 2010 — https://www.dre.vanderbilt.edu/~schmidt/PDF/Sutter-Active-Objects.pdf — ties object lifetime to thread lifetime; C++/C#/Java RAII cleanup idioms.",
+    "Philipp Grandits, 'Active Objects Revisited: A Concurrency Library for Python', TU Wien, 2014 — https://repositum.tuwien.ac.at/bitstream/20.500.12708/8363/2/Grandits%20Philipp%20-%202014%20-%20Active%20objects%20revisited%20a%20concurrency%20library%20for.pdf — modern Python implementation; compares with actor model, HSMs, multi-threaded extensions.",
+    "Ivan Kostruba, 'Modern C++ Features and Proven Concepts: Active Object, External Polymorphism and Coroutines', DEV Community, 2023 — https://dev.to/ivankostruba/modern-c-features-and-proven-concepts-active-object-external-polymorphism-and-coroutines-444l — C++20 coroutine integration with Active Object; co_await inside active object servants.",
+    "Frank S. de Boer et al., 'A Survey of Active Object Languages', ACM Computing Surveys, 2017, DOI 10.1145/3122848 — https://doi.org/10.1145/3122848 — comprehensive taxonomy of actor and active object languages; establishes Isolated Turn principle.",
+    "Ludovic Henrio, Fabrice Huet, Zsolt István, 'Multi-threaded Active Objects', FMCO 2013, DOI 10.1007/978-3-642-38493-6_7 — extends Active Object with multi-threaded execution per activity; method annotations for parallel request execution.",
+    "Frank de Boer, Ferruccio Damiani, Reiner Hähnle, Einar Broch Johnsen, Eduard Kamburjan (eds.), 'Active Object Languages: Current Research Trends', Springer 2024, DOI 10.1007/978-3-031-51060-1 — latest state-of-the-art collection; covers multitier programming, serverless, and formal verification for active object languages; notes that concepts from active objects made their way into Rust, ABS, Akka, JavaScript, and Go.",
+    "Alice Ryhl, 'Actors with Tokio', ryhl.io, 2021 — https://ryhl.io/blog/actors-with-tokio/ — canonical Rust async actor tutorial; split of actor (task) vs handle (clonable mpsc::Sender), bounded channels for backpressure, natural shutdown via channel-close detection.",
+    "barafael, 'More Actors with Tokio', 2025 — https://barafael.github.io/posts/more-actors-with-tokio/ — event loop as consuming method returning Self, testing actors without spawning, DAG channel topology principle, bounded vs unbounded mailboxes.",
+    "Software Patterns Lexicon, 'Actor Model in Rust' — https://softwarepatternslexicon.com/rust/concurrency-and-parallelism-in-rust/the-actor-model-in-rust/ — Send/Sync bounds, message priority via select! biased, oneshot for request-response, tokio::spawn_blocking for CPU work.",
+    "tokio-actors crate documentation — https://docs.rs/tokio-actors/latest/tokio_actors/ — production Rust actor framework with bounded mailboxes (default 64), natural backpressure, supervision hierarchies, typed request/response via ActorHandle::send, and system channel for stop/get_status that bypasses full mailbox.",
+    "Seyed Amir Alavi, 'activecpp: Active Objects for Modern C++' — https://samiralavi.github.io/activecpp/main/ — single-header C++17 with lock-free MPSC queue; millions of msg/sec throughput.",
+    "cloudspaces/pyactive — https://github.com/cloudspaces/pyactive — Python actor implementation using threads and Stackless micro-threads; integrates OO concepts with message-passing concurrency.",
+    "'Active Object Pattern in Python', Software Patterns Lexicon — https://softwarepatternslexicon.com/python/concurrency-patterns/active-object-pattern/ — modern Python using queue.Queue and concurrent.futures.Future; explicit shutdown and exception propagation.",
+    "JS-AK/remote-objects — https://github.com/JS-AK/remote-objects — TypeScript/Node.js actor implementation on worker threads; sticky placement, callbacks, and streams crossing thread boundaries.",
+    "Apple Inc., 'Swift Evolution SE-0306: Actors' — https://github.com/apple/swift-evolution/blob/main/proposals/0306-actors.md — Swift 6 language-level actor model; compiler-enforced data isolation, serial executor as implicit scheduler, reentrancy allows interleaving at await points, task-chain reentrancy as future direction.",
+    "CodeArchaeology, 'Channels, Actors, and Goroutines: The Concurrency Models That Divided Language Design', 2026 — https://codearchaeology.dev/blog/concurrency-models-across-programming-languages/ — comparative analysis of CSP vs actor model vs async/await across Go, Erlang, Swift, Kotlin, Rust; includes concurrency model comparison table with memory footprint and max practical concurrency figures.",
+    "The Code Nomad, 'Active Object: The Retro-Concurrency Pattern That's Still Relevant in C# .NET', 2025 — https://codenomad.nl/2025/12/14/active-object-the-retro-concurrency-pattern-thats-still-relevant-in-c-net/ — modern C# implementation using System.Threading.Channels as the activation queue, IDisposable for lifecycle management, and SharpAndRusty for type-safe error propagation.",
+    "meander-no/active — https://github.com/meander-no/active — portable C active object library for embedded microcontrollers; static event allocation from ROM pools, timed messages (one-shot/periodic), natural actor shutdown via event dispatch.",
+    "Quantum Leaps, 'QP/C Framework' — https://www.state-machine.com/qpc/ — commercial embedded active object / state machine framework; hierarchical state machines as the event processing paradigm inside each active object.",
+    "Microsoft Docs, 'TPL Dataflow' — https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library — .NET System.Threading.Tasks.Dataflow blocks: BufferBlock (async producer-consumer queue), ActionBlock (execution block / active object servant), TransformBlock (input+output execution block); supports bounded capacity, MaxDegreeOfParallelism, and automatic completion propagation via DataflowLinkOptions.",
+    "Stephen Cleary, 'Async Producer/Consumer Queue using Dataflow', 2012 — https://blog.stephencleary.com/2012/11/async-producerconsumer-queue-using.html — TPL Dataflow BufferBlock as async-ready producer-consumer queue; BoundedCapacity for backpressure throttling; multiple consumers via LinkTo with load balancing.",
+    "Akka.io Documentation — https://doc.akka.io/docs/akka/current/ — canonical JVM actor framework; each actor has a private mailbox, dispatcher threads run the scheduler, supervision hierarchies handle failure recovery; closely models POSA-2 Active Object with added distribution.",
+    "Microsoft Orleans Documentation — https://dotnet.github.io/orleans/docs/grains — virtual actor model; grains are location-transparent, single-threaded active objects with automatic persistence and activation management; built on C# async/await with orleans-specific scheduler.",
+    "ProActive Java Library — https://proactive.inria.fr/ — Java implementation of ASP (Active Object Language) calculus; transparent active objects over RMI with automatic asynchronous remote invocation, futures, multi-active objects (multiple threads per activity) and wait-by-necessity on unresolved futures.",
+    "POSA2 official overview of Pattern-Oriented Software Architecture Vol. 2 and its concurrency patterns — http://www.dre.vanderbilt.edu/~schmidt/POSA/POSA2/",
+    "Akka Typed actor documentation — https://doc.akka.io/libraries/akka-core/current/typed/actors.html — typed ActorRefs, one-message-at-a-time state ownership, asynchronous tell, and request/reply protocols.",
+    "Akka mailbox documentation — https://doc.akka.io/libraries/akka-core/current/mailboxes.html — documents the default unbounded mailbox and bounded mailbox requirements, motivating explicit admission and overload policy.",
+    "Kotlin coroutine shared-state and actor guidance — https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html#actors — documents thread confinement and actor-style state isolation.",
+    "C++ Actor Framework actor documentation — https://actor-framework.readthedocs.io/en/latest/core/Actors.html — documents state ownership, many-writer/single-reader mailboxes, cooperative scheduling, and detached actors.",
+    "Erlang gen_server behaviour documentation — https://www.erlang.org/doc/system/gen_server_concepts.html — sibling client/server process with synchronous call, asynchronous cast, serialized state callbacks, and supervision-oriented shutdown.",
+    "MDN JavaScript execution model — https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model — documents agent job queues, run-to-completion, event loops, and the latency cost of long jobs."
+  ],
+  "quality_attributes_note": "simplicity=3 because six roles are required; testability=5 because futures expose state at any point; scalability=7 because additional active objects can be added without changing existing ones.",
+  "related_patterns_notes": {
+    "monitor-object": "protects a passive object's methods with mutual exclusion while execution stays on the caller thread; Active Object queues work on a servant scheduler.",
+    "half-sync-half-async": "separates a synchronous front end from an asynchronous worker layer; Active Object applies that decoupling to one stateful object and exposes a proxy/future.",
+    "future-promise": "represents one eventual result; Active Object uses futures as completion handles for queued method requests.",
+    "producer-consumer": "models flow between queue producers and consumers; Active Object uses an activation queue but also serializes a servant and may guard requests.",
+    "thread-pool": "shares workers across independent tasks; Active Object gives one servant serialized ownership and may use a pool only to host many such objects.",
+    "two-phase-termination": "coordinates orderly shutdown and cleanup; Active Object uses it to stop the scheduler, drain or reject requests, and complete futures.",
+    "guardian-object": "supervises lifecycle and failure of a component; an Active Object's guardian is optional and is not its request scheduler.",
+    "actor": "encapsulates state behind messages, often with supervision or distribution; Active Object presents typed method calls and futures and need not provide actor semantics.",
+    "decorator": "wraps an interface to add behavior; it can decorate a proxy but does not provide scheduling or state confinement.",
+    "strategy": "swaps an algorithm such as a scheduling policy; it does not itself move method execution off the caller.",
+    "observer": "pushes notifications to subscribers; Active Object queues commands and returns per-call completion rather than broadcasting state changes.",
+    "proactor": "dispatches completion handlers for operations initiated asynchronously; Active Object queues method execution, so a proactor may be its I/O front end.",
+    "akka": "provides a production actor runtime with mailboxes, dispatchers, and supervision; it is a richer actor implementation rather than a minimal Active Object recipe.",
+    "orleans": "supplies location-transparent virtual actors with activation and persistence; Active Object is normally local and leaves distribution and lifecycle policy to the application.",
+    "proactive": "implements active objects with futures and remote invocation; unlike the local POSA pattern, it includes distributed deployment and wait-by-necessity.",
+    "tpl-dataflow": "composes bounded processing blocks and links; an ActionBlock can host one servant, but the library models pipelines rather than a typed proxy around one object.",
+    "gen-server": "Erlang's supervised client/server behaviour serializes callbacks in one process and offers call/cast; it is a sibling message-loop abstraction, not a typed proxy/future Active Object."
+  }
+}

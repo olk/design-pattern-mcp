@@ -1,0 +1,78 @@
+{
+  "pattern": "dirty-flag",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "@cached_property plus __dict__.pop as the dirty bit",
+  "implementation_notes": "The standard library supplies the cache: functools.cached_property computes the value on first access and stores it in the instance __dict__, after which the descriptor is bypassed and reads are ordinary attribute lookups - the dirty bit is the absence of the dict key, and the documented invalidation is deleting the attribute. That replaces the classic `self._x = None; if self._x is None:` guard (which cannot cache a legitimate None), provided mutators call `self.__dict__.pop(\"name\", None)` or an invalidate() method. The decorator has no invalidation hook of its own, and since Python 3.12 it has no locking either: concurrent first access can run the getter more than once, so shared instances need an explicit lock around the recomputation.",
+  "code_sketch": "class Report:\n    @cached_property\n    def summary(self) -> Summary:\n        return build_summary(self.rows)          # recomputed after invalidation\n\n    def add_row(self, row) -> None:\n        self.rows.append(row)\n        self.__dict__.pop(\"summary\", None)       # mark dirty",
+  "pitfalls": [
+    "Mutation through a nested object (self.rows.append) cannot be seen by the class, so the invalidation must live in the method that owns the mutation rather than in the attribute.",
+    "Assigning to the attribute shadows the descriptor permanently (the value lands in __dict__ and the property never runs again), which silently disables recomputation.",
+    "cached_property is not thread-safe since 3.12 (the undocumented per-property lock was removed) and requires a mutable instance __dict__ - it raises on __slots__ classes without one.",
+    "The descriptor conflicts with PEP 412 key-sharing, so instances carrying cached properties use more memory than the plain attribute form."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/functools.html#functools.cached_property"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "cached-property-descriptor",
+      "name": "functools.cached_property with deletion as invalidation",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "@cached_property plus __dict__.pop as the dirty bit",
+      "implementation_notes": "The standard library supplies the cache: functools.cached_property computes the value on first access and stores it in the instance __dict__, after which the descriptor is bypassed and reads are ordinary attribute lookups - the dirty bit is the absence of the dict key, and the documented invalidation is deleting the attribute. That replaces the classic `self._x = None; if self._x is None:` guard (which cannot cache a legitimate None), provided mutators call `self.__dict__.pop(\"name\", None)` or an invalidate() method. The decorator has no invalidation hook of its own, and since Python 3.12 it has no locking either: concurrent first access can run the getter more than once, so shared instances need an explicit lock around the recomputation.",
+      "code_sketch": "class Report:\n    @cached_property\n    def summary(self) -> Summary:\n        return build_summary(self.rows)          # recomputed after invalidation\n\n    def add_row(self, row) -> None:\n        self.rows.append(row)\n        self.__dict__.pop(\"summary\", None)       # mark dirty",
+      "pitfalls": [
+        "Mutation through a nested object (self.rows.append) cannot be seen by the class, so the invalidation must live in the method that owns the mutation rather than in the attribute.",
+        "Assigning to the attribute shadows the descriptor permanently (the value lands in __dict__ and the property never runs again), which silently disables recomputation.",
+        "cached_property is not thread-safe since 3.12 (the undocumented per-property lock was removed) and requires a mutable instance __dict__ - it raises on __slots__ classes without one.",
+        "The descriptor conflicts with PEP 412 key-sharing, so instances carrying cached properties use more memory than the plain attribute form."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/functools.html#functools.cached_property"
+      ]
+    },
+    {
+      "variant_id": "none-sentinel-property",
+      "name": "Hand-written property with a None sentinel and dirty bool",
+      "paradigm": "oo",
+      "min_standard": "Python3.0",
+      "idiom_name": "property accessor with an explicit _dirty flag",
+      "implementation_notes": "The fully manual form is a private cache, a _dirty bool and a property that recomputes when dirty - the structure cached_property replaced, and still the right choice when the cache must distinguish 'never computed' from 'computed as None' (a separate bool does this where the sentinel cannot), when the class uses __slots__, or when the invalidation must be observable (a hook, a log, a dependency notification). It is also the only form that composes with an existing locking scheme, because the recomputation is ordinary code the author controls.",
+      "code_sketch": "class Report:\n    _summary = None\n    _dirty = True\n\n    @property\n    def summary(self):\n        if self._dirty:\n            self._summary = build_summary(self.rows)\n            self._dirty = False\n        return self._summary",
+      "pitfalls": [
+        "The class-level defaults become instance attributes on first assignment, so one instance mutating _dirty does not affect the others - but a mutable class-level default (a list) would be shared; keep the cache None.",
+        "A property without a setter raises AttributeError on assignment, so invalidation must go through methods - an accidental external write fails loudly instead of silently desynchronising.",
+        "Two checks are needed at the recompute point (dirty plus a lock) under threads; a bare `if self._dirty` is a race.",
+        "The clearer the flag, the easier it is to forget a mutator: keep one invalidate() method and call it from every mutation path."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/functools.html#functools.cached_property"
+      ]
+    },
+    {
+      "variant_id": "function-cache-clear",
+      "name": "functools.cache / lru_cache with cache_clear()",
+      "paradigm": "functional",
+      "min_standard": "Python3.9",
+      "requires_features": [
+        "functools.cache"
+      ],
+      "idiom_name": "functools.cache (or lru_cache) plus cache_clear for invalidation",
+      "implementation_notes": "When the derived value is a function of arguments rather than of instance state, the callable's argument-keyed cache is the dirty store: functools.cache (3.9) or lru_cache(maxsize=...) memoises results and exposes cache_clear() for invalidation, so the source change is registered by clearing the cache instead of by marking an object. The granularity is coarser than a per-object flag - cache_clear empties everything, there is no per-key invalidation in the stdlib - and the cache is threadsafe but may run the wrapped function more than once when several threads miss the same key concurrently. This variant replaces the per-instance attribute cell for module-level or stateless builders; the per-object form is better when only one object's value is stale.",
+      "code_sketch": "from functools import cache\n\n@cache\ndef tenant_index(tenant_id: str) -> Index:\n    return build_index(tenant_id)      # one build per key\n\ndef on_tenant_changed(tenant_id: str) -> None:\n    tenant_index.cache_clear()         # coarse invalidation (all keys)",
+      "pitfalls": [
+        "cache_clear invalidates every key, so one changed tenant rebuilds all of them; per-key invalidation needs an explicit dict or a library.",
+        "Arguments become strong references: caching methods or large objects keeps them alive (use a per-instance cache or weak references for long-lived processes).",
+        "Unhashable arguments raise TypeError, and defaults/mutable arguments can produce surprising keys that never hit.",
+        "Bounded lru_cache silently evicts entries (recomputation, not staleness), so `maxsize` must be chosen for memory, not for correctness."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/functools.html#functools.cache"
+      ]
+    }
+  ],
+  "default_variant": "cached-property-descriptor"
+}

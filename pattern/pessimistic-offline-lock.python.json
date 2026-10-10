@@ -1,0 +1,56 @@
+{
+  "pattern": "pessimistic-offline-lock",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "select(...).with_for_update(nowait=True, skip_locked=True) inside a session transaction",
+  "implementation_notes": "SQLAlchemy 2.0 makes the pessimistic read explicit: select(LockRecord).where(...).with_for_update(nowait=True, skip_locked=True) emits FOR UPDATE with the backend's NOWAIT/SKIP LOCKED, and the documentation recommends populate_existing() so the identity map cannot return a stale object. The lock ends at commit, so the offline lease is the lock record's owner/timeout columns; with_for_update() is also documented as unsupported and discouraged together with joined eager loading, hence the lock record is loaded in its own query rather than joined to the data it protects.",
+  "code_sketch": "with Session(engine) as session, session.begin():        # short transaction\n    lock = session.execute(\n        select(LockRecord)\n        .where(LockRecord.lockable == key)\n        .with_for_update(nowait=True)\n        .execution_options(populate_existing=True)\n    ).scalar_one_or_none()\n    if lock is None:\n        session.add(LockRecord(lockable=key, owner=session_id))\n    elif lock.owner != session_id:\n        raise Locked(lock.owner)",
+  "pitfalls": [
+    "The identity map can hand back a stale LockRecord even while the row is locked - populate_existing() is what makes the read trustworthy, as the documentation warns.",
+    "with_for_update() combined with joined eager loading locks every involved table and is explicitly not supported/recommended; take the lock in its own query.",
+    "A lock acquired on a session that is then closed or committed is released immediately, so never treat session.begin() as the offline lease."
+  ],
+  "sources": [
+    "https://docs.sqlalchemy.org/en/20/orm/queryguide/query.html",
+    "https://www.postgresql.org/docs/current/explicit-locking.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "sqlalchemy-for-update",
+      "name": "SQLAlchemy SELECT ... FOR UPDATE claim",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "select(...).with_for_update(nowait=True, skip_locked=True) inside a session transaction",
+      "implementation_notes": "SQLAlchemy 2.0 makes the pessimistic read explicit: select(LockRecord).where(...).with_for_update(nowait=True, skip_locked=True) emits FOR UPDATE with the backend's NOWAIT/SKIP LOCKED, and the documentation recommends populate_existing() so the identity map cannot return a stale object. The lock ends at commit, so the offline lease is the lock record's owner/timeout columns; with_for_update() is also documented as unsupported and discouraged together with joined eager loading, hence the lock record is loaded in its own query rather than joined to the data it protects.",
+      "code_sketch": "with Session(engine) as session, session.begin():        # short transaction\n    lock = session.execute(\n        select(LockRecord)\n        .where(LockRecord.lockable == key)\n        .with_for_update(nowait=True)\n        .execution_options(populate_existing=True)\n    ).scalar_one_or_none()\n    if lock is None:\n        session.add(LockRecord(lockable=key, owner=session_id))\n    elif lock.owner != session_id:\n        raise Locked(lock.owner)",
+      "pitfalls": [
+        "The identity map can hand back a stale LockRecord even while the row is locked - populate_existing() is what makes the read trustworthy, as the documentation warns.",
+        "with_for_update() combined with joined eager loading locks every involved table and is explicitly not supported/recommended; take the lock in its own query.",
+        "A lock acquired on a session that is then closed or committed is released immediately, so never treat session.begin() as the offline lease."
+      ],
+      "sources": [
+        "https://docs.sqlalchemy.org/en/20/orm/queryguide/query.html",
+        "https://www.postgresql.org/docs/current/explicit-locking.html"
+      ]
+    },
+    {
+      "variant_id": "postgres-advisory-lock",
+      "name": "PostgreSQL advisory locks as the lease",
+      "paradigm": "oo",
+      "min_standard": "Python3.8",
+      "idiom_name": "pg_advisory_lock / pg_advisory_xact_lock instead of a lock table",
+      "implementation_notes": "On PostgreSQL the lock table can be replaced by advisory locks: pg_advisory_xact_lock releases itself at the end of the claiming transaction, while a session-level pg_advisory_lock survives transactions and is released only explicitly or when the session ends - the closest thing to a server-managed offline lease. The price is that the lease lives on one database connection: the application must pin a connection per editing session and close it on logout, and no business row records who holds what. Choose this variant for short, high-frequency claims; keep the lock table when visibility, timeouts and administrative release matter.",
+      "code_sketch": "con = engine.raw_connection()          # pinned for the whole edit session\ncur = con.cursor()\ncur.execute(\"SELECT pg_advisory_lock(%s)\", (key_hash,))\n# ... requests read and update the aggregate; other sessions block here\ntry:\n    handle_requests(con)\nfinally:\n    cur.execute(\"SELECT pg_advisory_unlock(%s)\", (key_hash,))",
+      "pitfalls": [
+        "Session-level advisory locks ignore transaction semantics: a rollback does not release them, and there is no explicit unlock for the transaction-level variant - mixing the two leaks locks (PostgreSQL documents this asymmetry).",
+        "Advisory locks are invisible in business tables: an administrator cannot delete a stale lock, only find the holding session in pg_locks and terminate it.",
+        "A pooled connection checkout is not a session: if the connection goes back to the pool the lock survives on that connection and blocks whoever gets the same slot next."
+      ],
+      "sources": [
+        "https://www.postgresql.org/docs/current/explicit-locking.html"
+      ]
+    }
+  ],
+  "default_variant": "sqlalchemy-for-update"
+}

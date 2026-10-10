@@ -1,0 +1,63 @@
+{
+  "pattern": "double-buffer",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "arc_swap::ArcSwap<Frame> load/store/swap with Guard-based reads",
+  "implementation_notes": "Ownership makes the classic pair impossible without a lock or an atomic: two `&mut` buffers cannot coexist, so the idiomatic double buffer is two `Arc<Frame>` snapshots and one published reference. `arc_swap::ArcSwap` - 'a container for an Arc that can be changed atomically' - provides `load()` (returning a guard that keeps the loaded frame alive), `store()` and `swap()`; it is the direct analogue of `std::atomic<std::shared_ptr>` from C++. Build the next frame in a locally owned value, publish it as a fresh `Arc`, and let the old one drop when the last guard goes away. When both buffers are owner-side scratch, plain `std::mem::swap` between two owned values is the whole pattern.",
+  "code_sketch": "use arc_swap::ArcSwap;\nuse std::sync::Arc;\n\nlet current = ArcSwap::from_pointee(Frame::default());\n\nlet mut next = Frame::new();            // exclusively owned back buffer\nrender(&mut next);\ncurrent.store(Arc::new(next));          // publish atomically; old Arc is released\nlet frame = current.load();             // guard: whole, still-alive snapshot",
+  "pitfalls": [
+    "Holding a `load()` guard across long work delays reclamation of the previous frames; clone it if the frame must outlive the guard's scope.",
+    "Publishing an `Arc` whose contents are still mutated (`Arc<Mutex<..>>`, `Arc<RefCell<..>>` shared across threads) reintroduces the race the swap was meant to remove.",
+    "`Arc` is shared ownership, not a snapshot copy: readers must not assume the object they loaded is the one the writer is filling next.",
+    "Rust atomics follow the C++20 memory model; hand-rolled `AtomicPtr`/`AtomicUsize` publication moves the acquire/release reasoning and the unsafe reclamation onto you."
+  ],
+  "sources": [
+    "https://docs.rs/arc-swap/latest/arc_swap/",
+    "https://doc.rust-lang.org/std/sync/atomic/index.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "arc-swap-atomic-arc",
+      "name": "ArcSwap snapshot publication",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "arc-swap"
+      ],
+      "idiom_name": "arc_swap::ArcSwap<Frame> load/store/swap with Guard-based reads",
+      "implementation_notes": "Ownership makes the classic pair impossible without a lock or an atomic: two `&mut` buffers cannot coexist, so the idiomatic double buffer is two `Arc<Frame>` snapshots and one published reference. `arc_swap::ArcSwap` - 'a container for an Arc that can be changed atomically' - provides `load()` (returning a guard that keeps the loaded frame alive), `store()` and `swap()`; it is the direct analogue of `std::atomic<std::shared_ptr>` from C++. Build the next frame in a locally owned value, publish it as a fresh `Arc`, and let the old one drop when the last guard goes away. When both buffers are owner-side scratch, plain `std::mem::swap` between two owned values is the whole pattern.",
+      "code_sketch": "use arc_swap::ArcSwap;\nuse std::sync::Arc;\n\nlet current = ArcSwap::from_pointee(Frame::default());\n\nlet mut next = Frame::new();            // exclusively owned back buffer\nrender(&mut next);\ncurrent.store(Arc::new(next));          // publish atomically; old Arc is released\nlet frame = current.load();             // guard: whole, still-alive snapshot",
+      "pitfalls": [
+        "Holding a `load()` guard across long work delays reclamation of the previous frames; clone it if the frame must outlive the guard's scope.",
+        "Publishing an `Arc` whose contents are still mutated (`Arc<Mutex<..>>`, `Arc<RefCell<..>>` shared across threads) reintroduces the race the swap was meant to remove.",
+        "`Arc` is shared ownership, not a snapshot copy: readers must not assume the object they loaded is the one the writer is filling next.",
+        "Rust atomics follow the C++20 memory model; hand-rolled `AtomicPtr`/`AtomicUsize` publication moves the acquire/release reasoning and the unsafe reclamation onto you."
+      ],
+      "sources": [
+        "https://docs.rs/arc-swap/latest/arc_swap/",
+        "https://doc.rust-lang.org/std/sync/atomic/index.html"
+      ]
+    },
+    {
+      "variant_id": "rwlock-pair",
+      "name": "std RwLock<Arc<T>> pair (std-only form)",
+      "paradigm": "oo",
+      "requires_features": [
+        "std"
+      ],
+      "idiom_name": "std::sync::RwLock<Arc<Frame>> + std::mem::replace",
+      "implementation_notes": "A std-only alternative: hold the current frame in `RwLock<Arc<Frame>>`, build the next frame outside the lock, then take the write lock once and `std::mem::replace` the `Arc` - a single pointer swap under the lock - while readers take the read lock and clone the `Arc`, which keeps the old frame alive after the guard drops. No external crate and no unsafe code, at the cost of lock contention on a hot read path; it is the right form when the swap is rare and correctness matters more than the last nanoseconds.",
+      "code_sketch": "use std::sync::{Arc, RwLock};\n\nlet current = RwLock::new(Arc::new(Frame::default()));\n\nlet mut next = Frame::new();\nrender(&mut next);\nlet old = std::mem::replace(&mut *current.write().unwrap(), Arc::new(next));\ndrop(old);                                   // freed once readers are done\nlet frame = Arc::clone(&*current.read().unwrap());",
+      "pitfalls": [
+        "`RwLock` is not reentrant and a panicking writer poisons it, making later `read()`/`write()` calls fail with `PoisonError`.",
+        "Writer starvation is possible with a steady stream of readers on some platforms; do not put the swap in a hot loop.",
+        "Holding the write lock while building the next frame serializes everything - build outside, swap inside.",
+        "Cloning the `Arc` out keeps the old frame alive; storing snapshots indefinitely delays reclamation even though the swap is O(1)."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/sync/struct.RwLock.html"
+      ]
+    }
+  ],
+  "default_variant": "arc-swap-atomic-arc"
+}

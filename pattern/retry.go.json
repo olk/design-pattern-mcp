@@ -1,0 +1,79 @@
+{
+  "pattern": "retry",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "for loop + time.NewTimer + errors.Is classification, cancellable via ctx.Done()",
+  "implementation_notes": "Go's idiom is an explicit loop: call the operation, classify with errors.Is/errors.As against sentinel or typed errors, and wait on a time.Timer inside a select that also watches ctx.Done(), so the delay is cancellable and the request's deadline governs the whole retry. The attempt budget and the delay schedule are plain variables, which keeps the retry visible at the call site and easy to unit-test with an injected clock. The standard library provides none of this - net/http, database/sql and the cloud SDKs either do nothing or expose their own policy - so the manual loop is the baseline every Go retry library wraps, and it is the right choice when the policy is small and the call site should stay dependency-free.",
+  "code_sketch": "for attempt := 1; ; attempt++ {\n    resp, err := client.Do(req)\n    if err == nil { return resp, nil }\n    if !isTransient(err) || attempt >= maxAttempts { return nil, err }\n    timer := time.NewTimer(backoff(attempt))       // capped, jittered\n    select {\n    case <-ctx.Done():\n        timer.Stop()\n        return nil, ctx.Err()\n    case <-timer.C:\n    }\n}",
+  "pitfalls": [
+    "time.Sleep cannot be interrupted: a long final delay keeps the goroutine and the shutdown waiting, so select on ctx.Done() with a timer instead.",
+    "time.After allocates a timer per call that lives until it fires; in a hot retry loop prefer time.NewTimer with Stop().",
+    "Comparing errors with == (or matching message strings) misses wrapped errors: use errors.Is/errors.As, and check net.Error.Timeout() for timeouts.",
+    "Retrying an http.Request whose body was already consumed re-sends an empty body: rebuild the request or rely on GetBody between attempts.",
+    "Failed attempts still hold response bodies and connections; close the body before retrying or the transport pool leaks sockets."
+  ],
+  "sources": [
+    "https://go.dev/blog/context"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "hand-rolled-loop",
+      "name": "Explicit attempt loop with context-aware timer (standard library only)",
+      "paradigm": "procedural",
+      "min_standard": "Go1.22",
+      "idiom_name": "for loop + time.NewTimer + errors.Is classification, cancellable via ctx.Done()",
+      "implementation_notes": "Go's idiom is an explicit loop: call the operation, classify with errors.Is/errors.As against sentinel or typed errors, and wait on a time.Timer inside a select that also watches ctx.Done(), so the delay is cancellable and the request's deadline governs the whole retry. The attempt budget and the delay schedule are plain variables, which keeps the retry visible at the call site and easy to unit-test with an injected clock. The standard library provides none of this - net/http, database/sql and the cloud SDKs either do nothing or expose their own policy - so the manual loop is the baseline every Go retry library wraps, and it is the right choice when the policy is small and the call site should stay dependency-free.",
+      "code_sketch": "for attempt := 1; ; attempt++ {\n    resp, err := client.Do(req)\n    if err == nil { return resp, nil }\n    if !isTransient(err) || attempt >= maxAttempts { return nil, err }\n    timer := time.NewTimer(backoff(attempt))       // capped, jittered\n    select {\n    case <-ctx.Done():\n        timer.Stop()\n        return nil, ctx.Err()\n    case <-timer.C:\n    }\n}",
+      "pitfalls": [
+        "time.Sleep cannot be interrupted: a long final delay keeps the goroutine and the shutdown waiting, so select on ctx.Done() with a timer instead.",
+        "time.After allocates a timer per call that lives until it fires; in a hot retry loop prefer time.NewTimer with Stop().",
+        "Comparing errors with == (or matching message strings) misses wrapped errors: use errors.Is/errors.As, and check net.Error.Timeout() for timeouts.",
+        "Retrying an http.Request whose body was already consumed re-sends an empty body: rebuild the request or rely on GetBody between attempts.",
+        "Failed attempts still hold response bodies and connections; close the body before retrying or the transport pool leaks sockets."
+      ],
+      "sources": [
+        "https://go.dev/blog/context"
+      ]
+    },
+    {
+      "variant_id": "backoff-library",
+      "name": "cenkalti/backoff: Retry(Operation, BackOff) with Permanent errors",
+      "paradigm": "oo",
+      "min_standard": "Go1.22",
+      "idiom_name": "backoff.Retry(op, backoff.NewExponentialBackOff()) + backoff.Permanent(err)",
+      "implementation_notes": "The library splits the pattern into an Operation (func() error) and a BackOff strategy object: Retry(o, b) runs the operation until it succeeds, the strategy reports Stop, or the operation returns a *PermanentError created by backoff.Permanent, and RetryNotify adds a callback that receives each failed attempt with its computed delay for logging. The loop itself lives in the library, so the caller supplies only classification by choosing which error to return, and the exponential strategy carries the cap (MaxElapsedTime, MaxInterval) that a hand-rolled loop usually forgets. Use the context-aware wrapper (backoff.WithContext) so the wait observes cancellation - the plain Retry sleeps on a timer and cannot be interrupted.",
+      "code_sketch": "op := func() error {\n    resp, err := client.Do(req)\n    if err != nil { return err }                        // retryable\n    if resp.StatusCode == http.StatusNotFound { return backoff.Permanent(errNotFound) }\n    return nil\n}\nb := backoff.WithContext(backoff.NewExponentialBackOff(), ctx)\nerr := backoff.Retry(op, b)",
+      "pitfalls": [
+        "Returning a plain error retries until the strategy stops: an unconfigured or hand-built BackOff may have no cap at all, so make the stop condition explicit.",
+        "Permanent() must wrap the real cause, and the caller must unwrap *PermanentError with errors.As - otherwise the original error is lost behind the wrapper.",
+        "A BackOff instance carries mutable state and must not be shared between goroutines; give every retry its own (or use backoff.WithContext per call).",
+        "Returning nil after a non-2xx response silently treats an HTTP error as success; classify the status code inside the operation."
+      ],
+      "sources": [
+        "https://raw.githubusercontent.com/cenkalti/backoff/master/retry.go",
+        "https://github.com/cenkalti/backoff"
+      ]
+    },
+    {
+      "variant_id": "grpc-service-config",
+      "name": "gRPC service-config retryPolicy on the client channel",
+      "paradigm": "declarative",
+      "min_standard": "Go1.22",
+      "idiom_name": "grpc.WithDefaultServiceConfig(retryPolicy JSON) with MaxAttempts/BackoffMultiplier/RetryableStatusCodes",
+      "implementation_notes": "For gRPC clients the policy is declared, not coded: the service config carries a retryPolicy with MaxAttempts, InitialBackoff, MaxBackoff, BackoffMultiplier and RetryableStatusCodes, and the channel's built-in retry logic replays the call when it fails with one of those statuses within the attempt limit; the client applies its own jitter to the backoff and retryThrottling adds a token bucket so a failing backend is not hammered by every client at once. The Go implementation also performs transparent retries for failures that never reached the server application, so some retries happen even with no policy configured - which is exactly why a configured policy should state explicitly what is retryable. Use this form when the dependency is a gRPC service and the policy belongs to client configuration; a local loop remains the tool for everything else.",
+      "code_sketch": "var retryPolicy = `{\"methodConfig\": [{\"name\": [{\"service\": \"grpc.examples.echo.Echo\"}],\n    \"retryPolicy\": {\"MaxAttempts\": 4, \"InitialBackoff\": \".01s\", \"MaxBackoff\": \".01s\",\n                    \"BackoffMultiplier\": 1.0, \"RetryableStatusCodes\": [\"UNAVAILABLE\"]}}]}`\n\nconn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()),\n    grpc.WithDefaultServiceConfig(retryPolicy))",
+      "pitfalls": [
+        "Retry is enabled but there is no default policy: without a retryPolicy only transparent retries occur, so an absent policy is not the same as no retries.",
+        "MaxAttempts counts attempts including the original call (gRPC caps the value), so 1 disables retries and 4 means three extra calls.",
+        "The policy is per method via methodConfig: a wrong service or method name silently leaves the call without retries.",
+        "Retries are transparent to the caller and multiply load: pair the policy with retryThrottling and with attempt-level metrics (grpc.client.attempt.started) before enabling it broadly."
+      ],
+      "sources": [
+        "https://grpc.io/docs/guides/retry/",
+        "https://raw.githubusercontent.com/grpc/grpc-go/master/examples/features/retry/README.md"
+      ]
+    }
+  ],
+  "default_variant": "hand-rolled-loop"
+}

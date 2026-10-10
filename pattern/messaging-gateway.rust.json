@@ -1,0 +1,18 @@
+{
+  "pattern": "messaging-gateway",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "async trait facade + tokio oneshot correlation table",
+  "implementation_notes": "Declare the contract as a trait with async methods and implement it on a struct that owns the broker client (lapin, rdkafka, a redis connection). The method-call illusion is built from two primitives: each call creates a tokio::sync::oneshot channel, stores the Sender in a map keyed by correlation id and awaits the Receiver, while the consumer task routes each reply to the waiting caller; Sender::send is not async, so the consumer can complete a call without awaiting. Nothing generates the facade - no proxies, no annotations - and a framework such as tarpc or tonic only provides a comparable client if you accept its own RPC protocol, so the manual route is the normal one.",
+  "code_sketch": "pub trait InventoryGateway { async fn check_stock(&self, sku: &str)\n    -> Result<Stock, GatewayError>; }                       // caller-facing contract\nimpl InventoryGateway for AmqpInventory {     // owns client + correlation map\n    async fn check_stock(&self, sku: &str) -> Result<Stock, GatewayError> {\n        let (tx, rx) = oneshot::channel();    // reply slot for this call\n        self.publish(sku, self.register(tx).await).await?;\n        match rx.await {                      // task suspends; thread stays free\n            Ok(b) => serde_json::from_slice(&b).map_err(Into::into),\n            Err(_) => Err(GatewayError::NoReply),   // sender dropped: no answer\n        }\n    }\n}",
+  "pitfalls": [
+    "The correlation table is shared mutable state: remove the entry on every exit path (reply, timeout, cancellation) or it grows for the lifetime of the process.",
+    "A dropped Sender makes the Receiver resolve with RecvError, which cannot distinguish 'timeout' from 'connection died'; keep your own deadline with tokio::time::timeout and your own error variant.",
+    "async fn in traits is not object-safe, so a dyn-dispatched gateway needs an explicitly boxed future in the signature - a design decision to make early rather than a later refactor.",
+    "Serialization errors are easy to fold into 'no reply'; a decode failure and a missing answer usually require different reactions at the call site."
+  ],
+  "sources": [
+    "https://docs.rs/tokio/latest/tokio/sync/oneshot/"
+  ],
+  "version": "1.0"
+}

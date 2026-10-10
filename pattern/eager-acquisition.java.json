@@ -1,0 +1,60 @@
+{
+  "pattern": "eager-acquisition",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "static initialisation block + ThreadPoolExecutor.prestartAllCoreThreads()",
+  "implementation_notes": "The JVM initialises a class lazily, at first active use, so eagerness must be requested: do the work in a static initialisation block or an eagerly constructed singleton, in the framework's boot callback, and pre-start worker capacity with ThreadPoolExecutor.prestartAllCoreThreads(), which the JDK documents as starting all core threads so they idly wait for work instead of being created when tasks arrive. The same move for connections is a pool that pre-fills its minimum idle set and can fail fast during start-up, and whatever was warmed must be validated - an idle JDBC connection can be reaped by the database or a middlebox before the first request reaches it.",
+  "code_sketch": "int cores = Runtime.getRuntime().availableProcessors();\nThreadPoolExecutor pool = new ThreadPoolExecutor(cores, cores * 2,\n        60, TimeUnit.SECONDS, new LinkedBlockingQueue<>());\npool.prestartAllCoreThreads();          // workers wait before traffic\nDataSource ds = Warmup.openPool(cfg);   // pre-filled and validated at boot\nif (!Warmup.ping(ds)) throw new IllegalStateException(\"dependency down\");",
+  "pitfalls": [
+    "Class initialisation runs under the JVM's per-class initialisation lock: a long or blocking warm-up inside <clinit> can deadlock with another thread's initialisation and surfaces as ExceptionInInitializerError.",
+    "A failed static initialiser makes the class permanently unusable for that class loader, so retryable boot logic must live outside <clinit>.",
+    "prestartAllCoreThreads combined with a fixed minimum-idle pool over-provisions at scale-down, holding threads and connections nobody uses."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javase/tutorial/java/javaOO/initial.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "explicit-startup-warmup",
+      "name": "explicit start-up warm-up (static init + prestartAllCoreThreads)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "static initialisation block + ThreadPoolExecutor.prestartAllCoreThreads()",
+      "implementation_notes": "The JVM initialises a class lazily, at first active use, so eagerness must be requested: do the work in a static initialisation block or an eagerly constructed singleton, in the framework's boot callback, and pre-start worker capacity with ThreadPoolExecutor.prestartAllCoreThreads(), which the JDK documents as starting all core threads so they idly wait for work instead of being created when tasks arrive. The same move for connections is a pool that pre-fills its minimum idle set and can fail fast during start-up, and whatever was warmed must be validated - an idle JDBC connection can be reaped by the database or a middlebox before the first request reaches it.",
+      "code_sketch": "int cores = Runtime.getRuntime().availableProcessors();\nThreadPoolExecutor pool = new ThreadPoolExecutor(cores, cores * 2,\n        60, TimeUnit.SECONDS, new LinkedBlockingQueue<>());\npool.prestartAllCoreThreads();          // workers wait before traffic\nDataSource ds = Warmup.openPool(cfg);   // pre-filled and validated at boot\nif (!Warmup.ping(ds)) throw new IllegalStateException(\"dependency down\");",
+      "pitfalls": [
+        "Class initialisation runs under the JVM's per-class initialisation lock: a long or blocking warm-up inside <clinit> can deadlock with another thread's initialisation and surfaces as ExceptionInInitializerError.",
+        "A failed static initialiser makes the class permanently unusable for that class loader, so retryable boot logic must live outside <clinit>.",
+        "prestartAllCoreThreads combined with a fixed minimum-idle pool over-provisions at scale-down, holding threads and connections nobody uses."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/java/javaOO/initial.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads-java21",
+      "name": "Java 21 virtual threads: warm only what is scarce",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + pre-filled pools for scarce resources",
+      "implementation_notes": "With virtual threads the classic worker warm-up disappears: the JDK's newVirtualThreadPerTaskExecutor starts a new virtual thread for each task, so there is nothing to pre-start and eager acquisition narrows to what remains genuinely scarce - connections, decoded models, buffers, warm caches - which are still pre-filled and validated at boot. Replace the pre-started core pool with a bounded virtual-thread-per-task executor and keep the acquisition phase for the resources behind it.",
+      "code_sketch": "try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {\n    executor.submit(() -> serve(request));   // thread created per task\n}\n\n// what stays eager:\nvar ds = Warmup.openPool(cfg);               // pre-filled + validated\nvar model = Models.decode(assetPath);        // no decode in the deadline",
+      "pitfalls": [
+        "Carrying the old sizing reflex over - pre-starting hundreds of platform threads - fights the point of virtual threads while still exhausting connection limits.",
+        "Virtual threads do not make blocking I/O free: the resources behind them (pool connections, sessions, file handles) must still be bounded and pre-warmed.",
+        "Virtual threads are not for CPU-bound work, so a warm-up that pins carrier threads gives no benefit and hides the real bottleneck."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html"
+      ]
+    }
+  ],
+  "default_variant": "explicit-startup-warmup",
+  "version": "1.0"
+}

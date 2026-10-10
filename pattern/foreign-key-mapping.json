@@ -1,0 +1,209 @@
+{
+  "category": "persistence-state",
+  "name": "foreign-key-mapping",
+  "aliases": [
+    "foreign key association"
+  ],
+  "intent": "Map an association between objects to a foreign key column in the referencing table: the mapper stores the referenced object's identity key on save and resolves that key back into an object reference (usually through an identity map) on load.",
+  "problem": "Domain objects refer to each other by reference, but the relational schema can only hold key values in columns: something must translate an object reference into the referenced row's key, decide on which side of the relationship the column lives, and turn the stored key back into an object when a row is read.",
+  "context": "Object-relational persistence of a pointer-linked domain model: entities are spread over normalised tables with primary keys and referential constraints, mappers (hand-written or framework-provided) sit between the two worlds, and the association may be single-valued or a collection, optional or mandatory, unidirectional or bidirectional.",
+  "benefits": [
+    "Associations survive the round trip without duplicating the target's state: only the key is persisted, so the referenced object stays in exactly one row.",
+    "The column can carry a real referential constraint, letting the database enforce existence and ON DELETE/ON UPDATE behaviour instead of every caller doing it.",
+    "A single indexed key column is cheap to store, join and filter, so queries can traverse the association without loading the target object.",
+    "Key resolution can be deferred: the mapper can load just the key and fetch the target only when the reference is actually touched.",
+    "The mechanism degenerates predictably: one-to-many moves the key to the many side, many-to-many goes through an association table.",
+    "Keys give the mapper a stable handle for reconciling references: with an identity map, the same row resolves to the same in-memory object everywhere in the session."
+  ],
+  "tradeoffs": [
+    "Save-order coupling: the referenced object's key must exist before the referencing row can be written, so generated keys push insert ordering (or deferred/nullable constraints) into the unit of work, and true reference cycles become awkward.",
+    "Lazy key resolution is what keeps loads cheap, but naive traversal re-queries per reference (the classic N+1 burst), so performance depends on fetch planning rather than on the pattern itself.",
+    "Directional and schema-coupled: exactly one side owns the column, bidirectional navigation requires both sides to be mapped and kept consistent, and column names, nullability and delete rules become mapping knowledge that a schema rename invalidates.",
+    "Referential constraints fight delete-and-reinsert identity strategies: when a row is re-created with a fresh generated key, every foreign key pointing at it must be rewritten by something outside the pattern.",
+    "A collection cannot be stored in a single column, so the pattern covers only single-valued references directly and delegates everything else to Association Table Mapping or Dependent Mapping.",
+    "Deleting or updating the target while references remain raises constraint violations, cascades or nulling, and that decision has to be made in the schema, not in the object graph."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 7,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Referencing object (child)",
+      "responsibility": "Holds the object reference or collection that must survive persistence; it knows only the object it points at, never the key column."
+    },
+    {
+      "role": "Mapper",
+      "responsibility": "Owns the translation: on load it reads the foreign key column and resolves it to the referenced object (directly, lazily or via an identity map); on save it reads the referenced object's identity field and writes it into the column."
+    },
+    {
+      "role": "Referenced object (parent/target)",
+      "responsibility": "Carries the identity field whose value is stored as the foreign key, and represents the row the constraint points at."
+    },
+    {
+      "role": "Identity map",
+      "responsibility": "Guarantees that resolving the same key returns the same in-memory object, so object identity and database identity stay aligned within a session."
+    },
+    {
+      "role": "Unit of work",
+      "responsibility": "Orders inserts and updates so parent keys exist before dependent foreign keys are written, and defers or schedules foreign key updates for cyclic references."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "persistence-unit"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Orders and customers: Order holds a Customer reference persisted as customer_id, with a constraint that keeps orphan orders out of the orders table.",
+    "Self-referential trees: a page's parent reference stored as a nullable parent_id in the same table.",
+    "Bidirectional graphs where one side stores the key and the other side exposes a collection over the same column.",
+    "Partial loading: dashboards list rows while the referenced object is fetched only when a detail view touches the reference.",
+    "Hand-written persistence layers over SQL: C and C++ structs/classes carry the key, and a mapper resolves it explicitly.",
+    "Legacy or externally owned schemas where the key column is unconventionally named or unconstrained, so the mapping must configure column and reference names.",
+    "DDD cross-aggregate references: an Order aggregate holds a CustomerId value (not a Customer reference) and resolves it via repository lookup, keeping aggregate boundaries intact.",
+    "Hierarchical data with self-referential FKs: a tree node stores parent_id; the mapper resolves the parent via identity map and exposes children as a lazy collection.",
+    "Polymorphic association workaround: rather than one FK column pointing at multiple parent tables, use per-parent intersection tables with real FK constraints (the sanctioned pattern for 'one child belongs to one of several parents').",
+    "Soft-delete with FK constraints: a deleted-flag column on the parent combined with RESTRICT/NO ACTION prevents hard deletes until children are archived, while the ORM tracks the soft-delete state separately.",
+    "Read-replica routing: FK resolution through the identity map works identically against a read replica, since the key-based lookup hits the replica and the identity map avoids a join.",
+    "Bulk import with deferred constraint checking: insert all parent and child rows with NO ACTION constraints, then SET CONSTRAINTS ALL DEFERRED and commit — the transaction boundary defers FK checking to the end.",
+    "Django ORM: a ForeignKey field maps to a column named <field>_id holding the related row's primary key; code assigns and navigates model instances while Django's descriptors translate to the key column (db_column overrides the name on legacy schemas).",
+    "Rails Active Record: belongs_to places the key on the declaring table (books.author_id references authors.id); the sanctioned setup is a migration adding the column with t.belongs_to :author, foreign_key: true plus an index, and belongs_to's presence validation covers only writes that go through the model.",
+    "Prisma ORM: relation fields (author: User) have no database column at all — only the relation scalar field (authorId) declared in @relation(fields: [authorId], references: [id]) is the foreign key; relationMode=prisma drops the constraint entirely and emulates referential integrity in the client."
+  ],
+  "avoid_when": [
+    "The aggregate is always read and written as a whole and never queried by parts: store it as a Serialized LOB instead of decomposing it into keys.",
+    "The referenced thing is a value object with no identity of its own: use Embedded Value and put its columns in the owning row.",
+    "The association is many-to-many and you are tempted to add a column per value: use Association Table Mapping (or an explicit join entity).",
+    "The reference is derived at read time or purely presentational: don't persist it at all.",
+    "You only need a point-in-time snapshot of the other object's fields (name, price at purchase): copy those values into the row and keep no live key."
+  ],
+  "language_files": {
+    "generic": "foreign-key-mapping.generic.json",
+    "c": "foreign-key-mapping.c.json",
+    "cplusplus": "foreign-key-mapping.cplusplus.json",
+    "csharp": "foreign-key-mapping.csharp.json",
+    "go": "foreign-key-mapping.go.json",
+    "java": "foreign-key-mapping.java.json",
+    "javascript": "foreign-key-mapping.javascript.json",
+    "kotlin": "foreign-key-mapping.kotlin.json",
+    "python": "foreign-key-mapping.python.json",
+    "ruby": "foreign-key-mapping.ruby.json",
+    "rust": "foreign-key-mapping.rust.json",
+    "scala": "foreign-key-mapping.scala.json",
+    "swift": "foreign-key-mapping.swift.json",
+    "typescript": "foreign-key-mapping.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "declarative"
+  ],
+  "scope": "persistence-unit",
+  "provenance": [
+    "eaa"
+  ],
+  "related_patterns": [
+    "serialized-lob",
+    "embedded-value",
+    "identity-field",
+    "association-table-mapping",
+    "dependent-mapping",
+    "data-mapper",
+    "identity-map",
+    "unit-of-work",
+    "lazy-load",
+    "metadata-mapping"
+  ],
+  "anti_patterns": [
+    "Leaking raw keys through the domain layer: getters return customer_id everywhere, so the object model becomes a thin wrapper over the schema and the reference is never really mapped.",
+    "Trusting client-supplied foreign keys: writing whatever key arrives in the request without checking that the caller may reference that row (existence is not authorization, and sequential ids invite enumeration).",
+    "Mapping only one side of a bidirectional association and assuming the other side follows; the in-memory graph and the schema drift on the next save.",
+    "Loading every reference eagerly 'to be safe', turning key columns into a join explosion and hiding the resulting N+1 behind the mapper.",
+    "Re-keying rows on every save (delete plus insert with a generated key) while other tables hold unconstrained foreign key columns, leaving dangling references behind.",
+    "Hard-coding column names in several places instead of centralising the mapping, so a rename breaks one of them silently.",
+    "Keyless Entry (Karwin): relying on application code instead of a declared foreign key constraint to maintain referential integrity; the database silently accepts orphan rows when the code has a bug.",
+    "Polymorphic Association: using a type-column plus id-column to point a single FK at multiple parent tables — the constraint cannot be declared in SQL and data integrity becomes the application's responsibility.",
+    "Mapping a many-to-many relationship through extra columns on a join table instead of promoting the join to a full entity with two FKs (Association Table Mapping).",
+    "Soft-deleting an entity while a DB-level ON DELETE CASCADE rule is configured: the database hard-deletes children silently, bypassing application-level soft-delete logic.",
+    "Re-keying rows on every save (delete-plus-insert with a generated key) while other tables hold unconstrained foreign key columns, leaving dangling references behind.",
+    "Configuring EAGER fetching on all associations 'to be safe' — the resulting Cartesian product of a multi-table join floods memory and hides the N+1 behind a single (but massive) query.",
+    "Using MATCH FULL on a nullable FK column: under MATCH FULL a row where all FK columns are NULL is allowed, but any partial NULL (some columns set, some not) violates the constraint — a common source of silent data rejection.",
+    "Applying SET NULL on a non-nullable column: the database rejects the constraint declaration, but omitting NOT NULL on the child FK column makes the relationship optional when it should be mandatory."
+  ],
+  "migration_from": [
+    "serialized-lob"
+  ],
+  "migration_to": [
+    "association-table-mapping",
+    "dependent-mapping"
+  ],
+  "design_principles": [
+    "Separation of concerns: domain objects own references, mappers own key columns; persistence knowledge stays out of the domain class.",
+    "Single source of truth for state: only the target's identity is persisted for the reference, so the target's data is never duplicated in the referencing row.",
+    "Referential integrity as an explicit, enforced decision: the schema states the existence rule instead of every caller re-checking it.",
+    "Lazy evaluation: a key is sufficient to identify the target, so loading can be deferred until the reference is used.",
+    "Information hiding: callers navigate objects, not keys; the key column is an implementation detail of the mapping."
+  ],
+  "best_practices": [
+    "Choose the owning side from multiplicity and lifecycle (key on the many side; key on the dependent side for one-to-one) and record that decision in the mapping metadata.",
+    "Give the target a stable identity and never reuse a deleted key; with database-generated keys, let the unit of work flush the parent before writing the child's foreign key.",
+    "Resolve keys through the session's identity map so the same row yields the same object and reference identity matches the database.",
+    "Let the database enforce the relationship: a real foreign key constraint with an explicit ON DELETE that matches the domain's lifecycle, and a nullable column only for genuinely optional references.",
+    "Plan fetching deliberately — lazy for cold references, joined/eager for hot paths — so the N+1 is a decision rather than an accident; prefer selectinload for collections, joinedload for to-one.",
+    "Centralise column, constraint and fetch knowledge in annotations or mapping metadata so schema changes are a one-place edit.",
+    "Track collection changes as a diff instead of rewriting every child row on each save.",
+    "Default all associations to lazy (proxy/select) in the mapping and declare eagerness per query using JOIN FETCH, EntityGraph, Include, or selectinload — never rely on ORM defaults for to-one associations which are EAGER by default in JPA.",
+    "Prefer ORM orphan-removal and cascade delete semantics that match the ON DELETE action declared in the schema; avoid mixing ORM-level cascade with a conflicting DB-level action.",
+    "Apply the DDD rule 'Reference Other Aggregates by Identity' for cross-aggregate references: store the identity key as a value (not a navigable object reference), and look up the target via a repository or domain service.",
+    "For cyclic object graphs, use Lazy Load breakpoints or pre-populate an Identity Map with placeholder objects before loading, to avoid stack overflow on traversal.",
+    "Ensure child-side columns used in FK constraints have corresponding indexes (auto-created by MySQL; explicitly add for PostgreSQL/SQL Server) so parent DELETE/UPDATE does not scan the child table.",
+    "Assert that foreign key enforcement is actually active (PRAGMA foreign_keys=ON for SQLite; InnoDB for MySQL; foreign_key_checks=ON) rather than relying on schema declarations alone.",
+    "Use schema migration tools (Flyway, Liquibase) instead of ORM auto-DDL for composite FK constraints, as ORM schema generation is unreliable for multi-column FK definitions."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Martin Fowler, Patterns of Enterprise Application Architecture (Addison-Wesley, 2002) - Foreign Key Mapping, ch. 12 Object-Relational Structural Patterns, pp. 236-247 (How It Works 236, When to Use It 239, Single-Valued Reference 240, Multitable Find 243, Collection of References 244): https://martinfowler.com/eaaCatalog/foreignKeyMapping.html",
+    "Martin Fowler, EAA Catalog - Foreign Key Mapping: https://martinfowler.com/eaaCatalog/foreignKeyMapping.html",
+    "Martin Fowler, EAA Catalog - Identity Field: https://martinfowler.com/eaaCatalog/identityField.html",
+    "Martin Fowler, EAA Catalog - Association Table Mapping: https://martinfowler.com/eaaCatalog/associationTableMapping.html",
+    "Martin Fowler, EAA Catalog - Dependent Mapping: https://martinfowler.com/eaaCatalog/dependentMapping.html",
+    "Martin Fowler, EAA Catalog - Unit of Work: https://martinfowler.com/eaaCatalog/unitOfWork.html",
+    "Martin Fowler, EAA Catalog - Lazy Load: https://martinfowler.com/eaaCatalog/lazyLoad.html",
+    "Fowler, PoEAA ch. 3 excerpt, Structural Mapping Patterns — Mapping Relationships (representation difference, structure reversal, Identity Map + Foreign Key Mapping round-trip): https://www.informit.com/articles/article.aspx?p=30661&seqNum=4",
+    "Hibernate ORM User Guide, ch. 12 Fetching (prefer LAZY associations, JOIN FETCH, entity graphs, batch fetching): https://docs.hibernate.org/orm/current/userguide/html_single/",
+    "Hibernate ORM 5.2 User Guide, Fetching (N+1 definition, HHH-8776 EAGER cannot be overridden, secondary selects for omitted eager associations): https://docs.hibernate.org/orm/5.2/userguide/html_single/chapters/fetching/Fetching.html",
+    "Vlad Mihalcea — A beginner's guide to Hibernate fetching strategies (JPA default fetch types, manual join fetch, LazyInitializationException, optional @OneToOne LAZY ignored): https://vladmihalcea.com/hibernate-facts-the-importance-of-fetch-strategy/",
+    "Microsoft Learn - EF Core Introduction to relationships (FK properties + navigations, HasForeignKey, cascade deletes): https://learn.microsoft.com/en-us/ef/core/modeling/relationships",
+    "Microsoft Learn - EF Core Efficient Querying (N+1 under lazy loading, avoid lazy loading, cartesian explosion, split queries): https://learn.microsoft.com/en-us/ef/core/performance/efficient-querying",
+    "Microsoft Learn - EF Core Cascade Delete (required-relationship cascade default, DB cascade vs client cascade, SQL Server multiple cascade paths, soft-delete warning): https://learn.microsoft.com/en-us/ef/core/saving/cascade-delete",
+    "SQLAlchemy 2.0 Documentation - Working with ORM Related Objects (FK + relationship, lazy load controversy, N+1, asyncio): https://docs.sqlalchemy.org/en/20/tutorial/orm_related_objects.html",
+    "SQLAlchemy Documentation - Relationship Loading Techniques (lazy/joined/selectin/subquery/raise, raiseload, guidance per multiplicity): https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html",
+    "SQLAlchemy Documentation - Relationships API (lazy, cascade, passive_deletes/passive_updates, post_update, use_alter, back_populates): https://docs.sqlalchemy.org/en/21/orm/relationship_api.html",
+    "PostgreSQL Documentation - 5.5 Constraints, Foreign Keys (referential actions, NO ACTION vs RESTRICT, deferrable, SET NULL/DEFAULT caveats, referencing-column index advice): https://www.postgresql.org/docs/current/ddl-constraints.html",
+    "MySQL Reference Manual - FOREIGN KEY Constraints (NO ACTION=RESTRICT for InnoDB, SET DEFAULT rejected, SET NULL needs nullable, cascade depth 15, foreign_key_checks): https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html",
+    "SQLite Documentation - Foreign Key Support (off by default + PRAGMA, required/suggested indexes, parent-delete child scan, deferred constraints): https://www.sqlite.org/foreignkeys.html",
+    "Microsoft Learn - SQL Server Primary and Foreign Key Constraints (NO ACTION default, cascade actions, multiple cascade paths error 1785, cross-database via triggers): https://learn.microsoft.com/en-us/sql/relational-databases/tables/primary-and-foreign-key-constraints",
+    "Vaughn Vernon, Effective Aggregate Design Part II — Rule: Reference Other Aggregates By Identity (prefer id, not object reference, across aggregate boundaries): https://www.dddcommunity.org/wp-content/uploads/files/pdf_articles/Vernon_2011_2.pdf",
+    "Vaughn Vernon, Implementing Domain-Driven Design — Rule: Reference Other Aggregates by Identity (transaction rule, eventual consistency outside boundary): https://www.informit.com/articles/article.aspx?p=2020371&seqNum=4",
+    "Bill Karwin, SQL Antipatterns — ch. 5 Keyless Entry (Objective: Simplify Database Architecture / Antipattern: Leave Out the Constraints / Solution: Declare Constraints): https://www.oreilly.com/library/view/sql-antipatterns/9781680500073/f_0031.html",
+    "Bill Karwin, SQL Antipatterns — ch. 7 Polymorphic Associations (Antipattern: Use Dual-Purpose Foreign Key / Solution: Simplify the Relationship): https://www.oreilly.com/library/view/sql-antipatterns/9781680500073/f_0043.html",
+    "Bill Karwin, SQL Antipatterns Volume 1 — ch. 26 Foreign Key Mistakes in Standard SQL + ch. 27 Foreign Key Mistakes in MySQL (mini-antipattern enumeration): https://www.pragprog.com/titles/bksap1/sql-antipatterns-volume-1/",
+    "Martin Fowler bliki - DDD Aggregate (cluster of domain objects treated as a unit, references from outside only to the root): https://martinfowler.com/bliki/DDD_Aggregate.html",
+    "Hibernate ORM User Guide - Identity Map guarantee: 'For a particular persistence context, Hibernate guarantees that persistent identity is equivalent to Java identity': https://docs.hibernate.org/stable/orm/javadocs/org/hibernate/Session.html",
+    "Vlad Mihalcea — Knowing flush operation order matters (InsertActionSorter, OrphanRemovalAction, EntityDeleteAction ordering): https://vladmihalcea.com/hibernate-facts-knowing-flush-operations-order-matters/",
+    "Django Documentation - Model Field Reference, Field types (ForeignKey creates a <field>_id column holding the related pk; db_column override; automatic indexing; to_field for non-pk targets): https://docs.djangoproject.com/en/6.1/ref/models/fields/",
+    "Ruby on Rails Guides - Active Record Associations (belongs_to puts the FK on the declaring table, e.g. books.author_id; t.belongs_to :author, foreign_key: true adds the DB constraint; optional: true skips the presence validation): https://guides.rubyonrails.org/association_basics.html",
+    "Prisma Documentation - Relations (relation fields are ORM-level only and map to no column; the relation scalar field, e.g. authorId in @relation(fields: [authorId], references: [id]), is the stored foreign key): https://www.prisma.io/docs/orm/prisma-schema/data-model/relations",
+    "Prisma Documentation - Relation Modes (foreignKeys enforces relations with real DB constraints; prisma mode creates no foreign keys, emulates referential actions in the engine and requires manual @@index on relation fields): https://www.prisma.io/docs/orm/prisma-schema/data-model/relations/relation-mode",
+    "Martin Fowler, bliki - OrmHate (survey of ORM criticism: partial, leaky abstraction over SQL and the impedance mismatch that Foreign Key Mapping exists to bridge): https://www.martinfowler.com/bliki/OrmHate.html",
+    "Yegor 256 - ORM Is an Offensive Anti-Pattern (misuse critique: the ORM tears objects into data envelopes and spreads relational concerns across the application instead of encapsulating them in the mapper): https://www.yegor256.com/2014/12/01/orm-offensive-anti-pattern.html"
+  ]
+}

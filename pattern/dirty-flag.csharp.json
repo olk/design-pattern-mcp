@@ -1,0 +1,84 @@
+{
+  "pattern": "dirty-flag",
+  "language": "csharp",
+  "support": "idiomatic",
+  "idiom_name": "property setter nulls a cached field; the getter recomputes once",
+  "implementation_notes": "The property is the natural choke point: the setter updates the backing field and invalidates the cache, and the getter rebuilds it only when the slot is empty - the classic structure collapses into ordinary property code. A nullable cache field doubles as the dirty flag (null = out of date), which is concise but only safe when the derived value cannot legitimately be null; otherwise keep a separate bool. There is no BCL equivalent for an invalidatable value: System.Lazy<T> and LazyInitializer.EnsureInitialized compute exactly once and cannot be reset, so they replace lazy initialisation, not this pattern.",
+  "code_sketch": "public sealed class Node\n{\n    private double _x;\n    private double? _world;                       // null == dirty\n\n    public double X { get => _x; set { _x = value; _world = null; } }\n\n    public double World => _world ??= ComputeWorld();\n}",
+  "pitfalls": [
+    "`Lazy<T>` cannot be invalidated and caches factory exceptions: wrapping mutable source data in it pins the first computed value (and its first failure) forever.",
+    "Mutation through a contained reference (a List<T> field, a child object) never runs the property setter, so invalidation must live in the method that owns that mutation.",
+    "A nullable cache slot cannot represent a legitimately null derived value; use a separate bool or a sentinel when null is a valid result.",
+    "The recomputation may throw (I/O, parse): if the cache was cleared before the rebuild, a failure leaves the object dirty (good), but a caller that assumed success can observe an exception on a property read."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.windows.uielement.invalidatevisual"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "hand-rolled-bit",
+      "name": "Property setter marks, nullable cache slot recomputes",
+      "paradigm": "oo",
+      "min_standard": "C#1",
+      "idiom_name": "property setter nulls a cached field; the getter recomputes once",
+      "implementation_notes": "The property is the natural choke point: the setter updates the backing field and invalidates the cache, and the getter rebuilds it only when the slot is empty - the classic structure collapses into ordinary property code. A nullable cache field doubles as the dirty flag (null = out of date), which is concise but only safe when the derived value cannot legitimately be null; otherwise keep a separate bool. There is no BCL equivalent for an invalidatable value: System.Lazy<T> and LazyInitializer.EnsureInitialized compute exactly once and cannot be reset, so they replace lazy initialisation, not this pattern.",
+      "code_sketch": "public sealed class Node\n{\n    private double _x;\n    private double? _world;                       // null == dirty\n\n    public double X { get => _x; set { _x = value; _world = null; } }\n\n    public double World => _world ??= ComputeWorld();\n}",
+      "pitfalls": [
+        "`Lazy<T>` cannot be invalidated and caches factory exceptions: wrapping mutable source data in it pins the first computed value (and its first failure) forever.",
+        "Mutation through a contained reference (a List<T> field, a child object) never runs the property setter, so invalidation must live in the method that owns that mutation.",
+        "A nullable cache slot cannot represent a legitimately null derived value; use a separate bool or a sentinel when null is a valid result.",
+        "The recomputation may throw (I/O, parse): if the cache was cleared before the rebuild, a failure leaves the object dirty (good), but a caller that assumed success can observe an exception on a property read."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.windows.uielement.invalidatevisual"
+      ]
+    },
+    {
+      "variant_id": "volatile-publication",
+      "name": "volatile flag with lock-guarded republication",
+      "paradigm": "concurrent",
+      "min_standard": "C#1",
+      "requires_features": [
+        "volatile",
+        "lock"
+      ],
+      "idiom_name": "volatile cache field plus lock in the slow path",
+      "implementation_notes": "For objects shared between threads the flag and the cache must be published in a defined order: a volatile reference field gives the acquire/release pair for the fast read, and the rebuild itself runs under a lock with a second check so only one thread computes. Microsoft's own guidance is that volatile is easy to misuse and that Interlocked, lock or the Volatile class provide clearer and stronger guarantees; use volatile only for the fast-path test and keep the rebuild and the cache assignment inside the critical section. If the value only needs one-shot initialisation, Lazy<T> is the safer replacement.",
+      "code_sketch": "private volatile Node? _cache;\nprivate readonly object _gate = new();\n\npublic Node World => _cache ?? Rebuild();\n\nprivate Node Rebuild()\n{\n    lock (_gate)\n        return _cache ??= BuildWorld();     // re-checked inside the lock\n}",
+      "pitfalls": [
+        "volatile only orders accesses to that field - it gives no atomicity for the recomputation and no mutual exclusion, so the rebuild still needs lock/Interlocked.",
+        "volatile cannot be applied to long/double fields (reads and writes are not guaranteed atomic) and cannot be used for locals.",
+        "Publishing a mutable cache object through a volatile reference does not safely publish its fields; build the value fully (ideally immutable) before the assignment.",
+        "The double-checked form must re-read the field inside the lock and return the local copy, or two threads can rebuild and the second assignment can throw away the first."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/volatile"
+      ]
+    },
+    {
+      "variant_id": "wpf-framework-invalidation",
+      "name": "WPF invalidation (framework-owned dirty flag)",
+      "paradigm": "declarative",
+      "min_standard": "NET3.0",
+      "requires_features": [
+        "WPF dependency properties"
+      ],
+      "idiom_name": "InvalidateVisual / InvalidateProperty instead of a hand-written flag",
+      "implementation_notes": "On WPF the element itself carries the dirty state: InvalidateVisual invalidates the rendering and forces a complete new layout pass, with OnRender called after the layout cycle, and InvalidateProperty/InvalidateMeasure do the same for dependency-property values and arrangement. The framework owns the flag, the recomputation scheduling and the batching, so application code only marks - the classic structure is replaced by a framework call. Microsoft's remark that InvalidateVisual is not generally called from application code is the caveat: framework elements already invalidate themselves when their visual tree or dependency properties change, and calling it by hand is for advanced cases such as a PropertyChangedCallback that influences layout.",
+      "code_sketch": "public double X\n{\n    get => _x;\n    set { _x = value; InvalidateVisual(); }     // framework marks the element dirty\n}\n\nprotected override void OnRender(DrawingContext dc)\n{\n    // runs after the next layout pass; nothing is redrawn while clean\n    dc.DrawEllipse(Brush, Pen, new Point(_x, _y), Radius, Radius);\n}",
+      "pitfalls": [
+        "WPF's dirty machinery is thread-affine: InvalidateVisual and InvalidateProperty must be called on the dispatcher thread, so background computation must publish into a Freezable or marshal before invalidating.",
+        "InvalidateVisual invalidates rendering and arranges a whole layout pass - marking in a hot loop (every mouse move) turns a targeted cache into a layout storm; coalesce the calls.",
+        "Dependency-property callbacks only fire for property changes, not for in-place mutation of a collection or a referenced object, so observable collections and immutable values are the safe shapes.",
+        "A hand-written bool flag next to dependency properties duplicates framework state and is easy to desynchronise; let the element's own dirty state be the single source."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.windows.uielement.invalidatevisual"
+      ]
+    }
+  ],
+  "default_variant": "hand-rolled-bit"
+}

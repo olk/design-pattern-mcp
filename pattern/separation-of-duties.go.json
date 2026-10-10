@@ -1,0 +1,17 @@
+{
+  "pattern": "separation-of-duties",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "middleware-enforced principal in context.Context + conditional atomic write for the distinct-approver transition",
+  "implementation_notes": "Go's standard library has no authorization layer, so the enforcement point is an http.Handler middleware chain: the authenticated principal is placed into the request's context.Context (context.WithValue with an unexported key type, exactly as the official context article shows for request-scoped values) and every handler that performs the decisive step re-reads it from there instead of from the request body. The distinctness rule and the workflow state belong in the domain layer: persist initiated_by/approved_by and make the approving write conditional in a single statement - UPDATE ... WHERE id = $1 AND status = 'initiated' AND initiated_by <> $2, then check the affected row count - so a concurrent self-approval or a double approval cannot slip between a read and a write. For a boundary that survives code in the same process, run the two duties as separate binaries or services with separate OS accounts and credentials; in-process checks are only as strong as the code paths that consult them.",
+  "code_sketch": "type principalKey struct{}\nfunc withPrincipal(ctx context.Context, id string) context.Context {\n    return context.WithValue(ctx, principalKey{}, id)\n}\nfunc handleApprove(w http.ResponseWriter, r *http.Request) {\n    who, _ := r.Context().Value(principalKey{}).(string)   // verified principal, not the body\n    res, err := db.ExecContext(r.Context(),\n        `UPDATE requests SET approved_by = $2\n          WHERE id = $1 AND status = 'initiated' AND initiated_by <> $2`, r.PathValue(\"id\"), who)\n    if err != nil || mustAffected(res) == 0 { http.Error(w, \"not approvable\", http.StatusConflict); return }\n    w.WriteHeader(http.StatusNoContent)\n}",
+  "pitfalls": [
+    "Context values are for request-scoped identity and deadlines, not for smuggling authorization decisions past the middleware; keys must be unexported types to avoid collisions, and the identity must originate from verified authentication.",
+    "A load-compare-save sequence is racy under concurrent approvals and edits; the state and distinctness conditions must live in the same conditional write (or transaction), with the row count checked.",
+    "Middleware is only a boundary while every route is wrapped - a handler registered on a bare mux bypasses the chain - and the default ServeMux has no global interceptor to catch a forgotten route."
+  ],
+  "sources": [
+    "https://go.dev/blog/context"
+  ],
+  "version": "1.0"
+}

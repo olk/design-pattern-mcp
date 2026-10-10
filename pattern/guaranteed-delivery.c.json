@@ -1,0 +1,20 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "spool file: write + fsync + rename, unlink only after the peer's ack",
+  "implementation_notes": "libc offers no durable messaging primitive, so the classic structure is hand-written around the filesystem: write the frame to a temporary file in a per-destination spool directory, fsync() the file, rename() it to its final name and fsync() the directory so the rename is durable too; only then transmit, and unlink the file only after the peer acknowledged. At start-up a recovery pass replays every spool entry that is still present, and the peer deduplicates on the message id carried in the frame. The hand-written form is the only form: POSIX message queues (mq_send) are kernel objects with a fixed depth that do not survive a reboot, so they can be a transport but never the store. Introduce a real client library (librdkafka, librabbitmq, nanomsg) as soon as the guarantee must span hosts or the spool logic starts to grow business rules.",
+  "code_sketch": "int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);\nwrite_all(fd, frame, len);\nif (fsync(fd) != 0) abort();            /* data at rest              */\nclose(fd);\nif (rename(tmp, final) != 0) abort();\nfsync(dirfd);                           /* makes the rename durable  */\nsend_frame(peer, frame, len);\nif (wait_for_ack(peer)) unlink(final);  /* only after the ack        */\n/* recovery: for each remaining spool entry, replay it and dedup on msg id */",
+  "pitfalls": [
+    "fsync() on the file is not enough: without a second fsync() on the directory the rename can be lost in a crash, so the message disappears although the data blocks were written.",
+    "write() may be short and fsync() reports deferred I/O errors (EIO, ENOSPC) only when it is called - ignoring either return value loses data silently.",
+    "POSIX message queues (mq_send) are not persistent across reboot and have a bounded queue depth; blocking mq_send with O_NONBLOCK unset can stall the sender thread indefinitely.",
+    "Never unlink on 'write returned' - the unlink must be gated on the peer's acknowledgement, and the recovering process must be the same code path that sends."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man2/fsync.2.html",
+    "https://man7.org/linux/man-pages/man2/rename.2.html",
+    "https://man7.org/linux/man-pages/man3/mq_send.3.html"
+  ],
+  "version": "1.0"
+}

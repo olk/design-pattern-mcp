@@ -1,0 +1,63 @@
+{
+  "pattern": "scatter-gather",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "Task.WhenAll (wait-for-all) / Task.WhenAny loop (first-best) + CancellationTokenSource(budget)",
+  "implementation_notes": "The BCL absorbs both halves: fan-out is one Task per recipient (an async client call started eagerly), the gather is Task.WhenAll for the wait-for-all policy or a Task.WhenAny loop for the first successful answer, and the deadline is a CancellationTokenSource.CancelAfter token threaded through every call - not a Task.Delay race, which leaves the losing work running with no signal. Partial results are read from the individual tasks (Status/IsCompletedSuccessfully) rather than from the combined task, because awaiting WhenAll surfaces only one failure. This is the right default for in-process fan-out to remote endpoints; the durable variant below is for fan-outs that must survive process restarts.",
+  "code_sketch": "using var cts = new CancellationTokenSource(budget);\nvar tasks = recipients.Select(r => quoteClient.AskAsync(r, cts.Token)).ToArray();\ntry { return PickBest(await Task.WhenAll(tasks)); }\ncatch (Exception) when (tasks.Any(t => t.IsFaulted || t.IsCanceled))\n{\n    var partial = tasks.Where(t => t.IsCompletedSuccessfully).Select(t => t.Result);\n    return PickBest(partial);          // explicit partial-result branch\n}",
+  "pitfalls": [
+    "Awaiting WhenAll rethrows a single exception; the other failures are only visible on the returned task's Exception (AggregateException), so per-recipient diagnostics need the individual tasks.",
+    "WhenAny yields a completed task, not a successful one: loop until the winner is not faulted, or the gather can 'answer' with a failure.",
+    "Cancellation is cooperative: APIs that ignore the token keep running after the deadline, and their results still consume the connection pool."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenany"
+  ],
+  "variants": [
+    {
+      "variant_id": "task-whenall-deadline",
+      "name": "Task.WhenAll/WhenAny with a CancellationTokenSource deadline",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "requires_features": [
+        "System.Threading.Tasks"
+      ],
+      "idiom_name": "Task.WhenAll (wait-for-all) / Task.WhenAny loop (first-best) + CancellationTokenSource(budget)",
+      "implementation_notes": "The BCL absorbs both halves: fan-out is one Task per recipient (an async client call started eagerly), the gather is Task.WhenAll for the wait-for-all policy or a Task.WhenAny loop for the first successful answer, and the deadline is a CancellationTokenSource.CancelAfter token threaded through every call - not a Task.Delay race, which leaves the losing work running with no signal. Partial results are read from the individual tasks (Status/IsCompletedSuccessfully) rather than from the combined task, because awaiting WhenAll surfaces only one failure. This is the right default for in-process fan-out to remote endpoints; the durable variant below is for fan-outs that must survive process restarts.",
+      "code_sketch": "using var cts = new CancellationTokenSource(budget);\nvar tasks = recipients.Select(r => quoteClient.AskAsync(r, cts.Token)).ToArray();\ntry { return PickBest(await Task.WhenAll(tasks)); }\ncatch (Exception) when (tasks.Any(t => t.IsFaulted || t.IsCanceled))\n{\n    var partial = tasks.Where(t => t.IsCompletedSuccessfully).Select(t => t.Result);\n    return PickBest(partial);          // explicit partial-result branch\n}",
+      "pitfalls": [
+        "Awaiting WhenAll rethrows a single exception; the other failures are only visible on the returned task's Exception (AggregateException), so per-recipient diagnostics need the individual tasks.",
+        "WhenAny yields a completed task, not a successful one: loop until the winner is not faulted, or the gather can 'answer' with a failure.",
+        "Cancellation is cooperative: APIs that ignore the token keep running after the deadline, and their results still consume the connection pool."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenany"
+      ]
+    },
+    {
+      "variant_id": "durable-fan-out-fan-in",
+      "name": "Durable Functions orchestrator fan-out/fan-in",
+      "paradigm": "declarative",
+      "min_standard": "C#8",
+      "requires_features": [
+        "Azure Durable Functions / Durable Task SDK",
+        "orchestrator-replay"
+      ],
+      "idiom_name": "orchestrator: N parallel activity calls awaited with Task.WhenAll",
+      "implementation_notes": "In a Durable Functions (or Durable Task SDK) orchestrator the fan-out is N scheduled activity calls and the gather is an awaited Task.WhenAll over the returned tasks, exactly as in the in-process variant - but the runtime persists every completion in the orchestration history, so the gather survives process restarts, can span hours or days, and is observable. The orchestrator body must stay deterministic under replay: deadlines and retries use the durable timer API (CreateTimer) instead of Task.Delay, and per-recipient work stays in activities so that each reply is checkpointed separately.",
+      "code_sketch": "[FunctionName(\"LoanBroker\")]\npublic static async Task<long> Run([OrchestrationTrigger] IDurableOrchestrationContext ctx)\n{\n    var vendors = await ctx.CallActivityAsync<string[]>(\"GetVendors\", null);\n    var quotes = vendors.Select(v => ctx.CallActivityAsync<long>(\"Quote\", v));\n    var all = await Task.WhenAll(quotes);      // fan-in, replay-safe\n    return all.Sum();                          // aggregate\n}",
+      "pitfalls": [
+        "Task.Delay inside an orchestrator is non-deterministic during replay: deadlines and retries must use the durable timer API.",
+        "Fanning out thousands of activities in one orchestrator hits history-size and throughput limits: batch the fan-out or spill to sub-orchestrations.",
+        "Only the orchestrator may aggregate: activities that share mutable state or write to the same external store break the replay contract."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-fan-in-fan-out"
+      ]
+    }
+  ],
+  "default_variant": "task-whenall-deadline",
+  "version": "1.0"
+}

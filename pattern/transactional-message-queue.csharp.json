@@ -1,0 +1,60 @@
+{
+  "pattern": "transactional-message-queue",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "ServiceBusClient.CreateTransactionAsync + ServiceBusTransactionContext",
+  "implementation_notes": "The modern .NET realization groups broker operations: ServiceBusClient.CreateTransactionAsync() returns a ServiceBusTransactionContext that is passed to SendMessageAsync/CompleteMessageAsync and closed by CommitTransactionAsync() or RollbackTransactionAsync(), so a receive-complete-send group is atomic on the broker. It covers Service Bus operations only; making a database write part of the same commit is not possible through this scope, so database-coupled services write an outbox row in the EF Core transaction instead and let a relay publish it, or fall back to the ambient TransactionScope path.",
+  "code_sketch": "await using var client = new ServiceBusClient(connectionString);\nServiceBusSender sender = client.CreateSender(\"orders\");\nServiceBusTransactionContext tx = await client.CreateTransactionAsync();\ntry\n{\n    await sender.SendMessageAsync(new ServiceBusMessage(json), tx);\n    await client.CommitTransactionAsync(tx);      // the send becomes visible only now\n}\ncatch { await client.RollbackTransactionAsync(tx); throw; }",
+  "pitfalls": [
+    "A Service Bus transaction groups broker operations only: wrapping it around a DbContext.SaveChanges call does not make the database write atomic with the send.",
+    "Transactions cannot span namespaces, and settling messages from different entities requires them to live in one namespace; otherwise the commit throws.",
+    "The transaction must be committed or rolled back on every path - an exception between send and commit leaves the broker to time it out."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-transactions",
+    "https://github.com/Azure/azure-sdk-for-net/blob/main/sdk/servicebus/Azure.Messaging.ServiceBus/samples/Sample06_Transactions.md"
+  ],
+  "variants": [
+    {
+      "variant_id": "service-bus-transaction",
+      "name": "Azure Service Bus transaction scope (modern .NET)",
+      "paradigm": "oo",
+      "min_standard": "NET6",
+      "idiom_name": "ServiceBusClient.CreateTransactionAsync + ServiceBusTransactionContext",
+      "implementation_notes": "The modern .NET realization groups broker operations: ServiceBusClient.CreateTransactionAsync() returns a ServiceBusTransactionContext that is passed to SendMessageAsync/CompleteMessageAsync and closed by CommitTransactionAsync() or RollbackTransactionAsync(), so a receive-complete-send group is atomic on the broker. It covers Service Bus operations only; making a database write part of the same commit is not possible through this scope, so database-coupled services write an outbox row in the EF Core transaction instead and let a relay publish it, or fall back to the ambient TransactionScope path.",
+      "code_sketch": "await using var client = new ServiceBusClient(connectionString);\nServiceBusSender sender = client.CreateSender(\"orders\");\nServiceBusTransactionContext tx = await client.CreateTransactionAsync();\ntry\n{\n    await sender.SendMessageAsync(new ServiceBusMessage(json), tx);\n    await client.CommitTransactionAsync(tx);      // the send becomes visible only now\n}\ncatch { await client.RollbackTransactionAsync(tx); throw; }",
+      "pitfalls": [
+        "A Service Bus transaction groups broker operations only: wrapping it around a DbContext.SaveChanges call does not make the database write atomic with the send.",
+        "Transactions cannot span namespaces, and settling messages from different entities requires them to live in one namespace; otherwise the commit throws.",
+        "The transaction must be committed or rolled back on every path - an exception between send and commit leaves the broker to time it out."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-transactions",
+        "https://github.com/Azure/azure-sdk-for-net/blob/main/sdk/servicebus/Azure.Messaging.ServiceBus/samples/Sample06_Transactions.md"
+      ],
+      "requires_features": [
+        "async-await"
+      ]
+    },
+    {
+      "variant_id": "transaction-scope-msmq",
+      "name": "Ambient TransactionScope with a transactional MSMQ queue and an enlisted database",
+      "paradigm": "declarative",
+      "min_standard": "NET45",
+      "idiom_name": "TransactionScope + MessageQueue.Send(..., MessageQueueTransactionType.Automatic)",
+      "implementation_notes": "The classic .NET realization is the only in-language path where the database and the queue share one commit: new TransactionScope() opens an ambient transaction, System.Messaging.MessageQueue.Send with MessageQueueTransactionType.Automatic enlists the transactional queue, SqlConnection.EnlistTransaction(Transaction.Current) enlists the database, and scope.Complete() commits both through the distributed transaction coordinator. Its price is a Windows-only stack (transactional queues, MSMQ and the DTC), automatic promotion to a distributed transaction as soon as the second resource joins, and a legacy API set.",
+      "code_sketch": "using (var scope = new TransactionScope())\n{\n    queue.Send(new Message { Body = order }, MessageQueueTransactionType.Automatic);\n    using var conn = new SqlConnection(cs);\n    conn.Open();\n    conn.EnlistTransaction(Transaction.Current);   // joins the same commit\n    /* INSERT ... */\n    scope.Complete();\n}",
+      "pitfalls": [
+        "MSMQ, transactional queues and the DTC are Windows-only and increasingly legacy, so treat this as an inheritance path rather than a green-field choice.",
+        "Ambient transactions promote to a distributed transaction as soon as a second resource joins, and promotion failures surface as opaque TransactionAbortedException.",
+        "TransactionScope is thread-static: with async/await you must pass TransactionScopeAsyncFlowOption.Enabled or the ambient transaction is lost after the first await."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.transactions.transactionscope",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.messagequeue.transactional"
+      ]
+    }
+  ],
+  "default_variant": "service-bus-transaction",
+  "version": "1.0"
+}

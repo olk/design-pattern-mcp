@@ -1,0 +1,66 @@
+{
+  "pattern": "scatter-gather",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "errgroup.Group (Go/SetLimit/Wait) + context.WithTimeout, results into an index-keyed slice",
+  "implementation_notes": "errgroup.WithContext is the idiomatic fan-out: g.Go starts one goroutine per recipient, and the derived context is cancelled the first time a function returns a non-nil error - which the still-running recipients observe through ctx.Done(). The deadline is context.WithTimeout derived from the caller's context, errgroup.SetLimit bounds the fan-out width, and replies are gathered without locks into a pre-sized slice indexed by recipient. The Aggregator is ordinary code after g.Wait(); nothing in the language replaces the structure, but the standard library primitives plus this small helper make it a few lines.",
+  "code_sketch": "g, ctx := errgroup.WithContext(ctx)\nctx, cancel := context.WithTimeout(ctx, budget)\ndefer cancel()\noffers := make([]Offer, len(recipients))\ng.SetLimit(8)                              // bound the fan-out width\nfor i, r := range recipients {\n    i, r := i, r\n    g.Go(func() error { o, err := ask(ctx, r); offers[i] = o; return err })\n}\n_ = g.Wait()                               // each slot is zero-valued when its recipient failed",
+  "pitfalls": [
+    "One failing recipient cancels the whole group through the derived context: for a partial gather, do not return errors from g.Go (or use a WaitGroup plus an error channel for the failures you want to keep).",
+    "Without SetLimit the fan-out spawns one goroutine and one outbound request per recipient with no bound at all.",
+    "Under a pre-1.22 language version the loop variable is shared by all iterations, so the `i, r := i, r` copies are mandatory.",
+    "A cancelled call returns an error and a zero value: an empty slot must stay distinguishable from a legitimate empty answer."
+  ],
+  "sources": [
+    "https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "https://pkg.go.dev/context"
+  ],
+  "variants": [
+    {
+      "variant_id": "errgroup-context",
+      "name": "errgroup.WithContext + context deadline",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.20",
+      "requires_features": [
+        "golang.org/x/sync/errgroup"
+      ],
+      "idiom_name": "errgroup.Group (Go/SetLimit/Wait) + context.WithTimeout, results into an index-keyed slice",
+      "implementation_notes": "errgroup.WithContext is the idiomatic fan-out: g.Go starts one goroutine per recipient, and the derived context is cancelled the first time a function returns a non-nil error - which the still-running recipients observe through ctx.Done(). The deadline is context.WithTimeout derived from the caller's context, errgroup.SetLimit bounds the fan-out width, and replies are gathered without locks into a pre-sized slice indexed by recipient. The Aggregator is ordinary code after g.Wait(); nothing in the language replaces the structure, but the standard library primitives plus this small helper make it a few lines.",
+      "code_sketch": "g, ctx := errgroup.WithContext(ctx)\nctx, cancel := context.WithTimeout(ctx, budget)\ndefer cancel()\noffers := make([]Offer, len(recipients))\ng.SetLimit(8)                              // bound the fan-out width\nfor i, r := range recipients {\n    i, r := i, r\n    g.Go(func() error { o, err := ask(ctx, r); offers[i] = o; return err })\n}\n_ = g.Wait()                               // each slot is zero-valued when its recipient failed",
+      "pitfalls": [
+        "One failing recipient cancels the whole group through the derived context: for a partial gather, do not return errors from g.Go (or use a WaitGroup plus an error channel for the failures you want to keep).",
+        "Without SetLimit the fan-out spawns one goroutine and one outbound request per recipient with no bound at all.",
+        "Under a pre-1.22 language version the loop variable is shared by all iterations, so the `i, r := i, r` copies are mandatory.",
+        "A cancelled call returns an error and a zero value: an empty slot must stay distinguishable from a legitimate empty answer."
+      ],
+      "sources": [
+        "https://pkg.go.dev/golang.org/x/sync/errgroup",
+        "https://pkg.go.dev/context"
+      ]
+    },
+    {
+      "variant_id": "waitgroup-channel-select",
+      "name": "stdlib-only WaitGroup + reply channel + select deadline",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.22",
+      "requires_features": [
+        "channels",
+        "select"
+      ],
+      "idiom_name": "sync.WaitGroup + buffered reply channel + select on timer/ctx.Done()",
+      "implementation_notes": "The dependency-free form replaces errgroup with channels: every recipient pushes a tagged reply into a buffered channel, and a select loop consumes replies until the expected number arrived, the caller's context is done, or the budget timer fires - the completeness policy is visible in the loop instead of hidden in a helper. Go 1.22 creates loop variables per iteration, so passing the recipient as a parameter is a style choice rather than a correctness requirement. Choose this variant when the gather must tolerate per-recipient failures, when replies should be consumed in completion order, or when x/sync is not available.",
+      "code_sketch": "replies := make(chan tagged, len(recipients))\nvar wg sync.WaitGroup\nfor _, r := range recipients {\n    wg.Add(1)\n    go func(r Recipient) { defer wg.Done(); replies <- tagged{r, ask(ctx, r)} }(r)\n}\ntimer := time.NewTimer(budget); defer timer.Stop()\ngot := make([]Offer, 0, len(recipients))\nfor len(got) < len(recipients) {\n    select {\n    case t := <-replies: if t.err == nil { got = append(got, t.offer) }\n    case <-timer.C: return merge(got)     // deadline: merge what arrived\n    case <-ctx.Done(): return merge(got)\n    }\n}",
+      "pitfalls": [
+        "A reply channel smaller than the recipient count blocks the losers on send once the gather has returned; size the buffer to the recipient count or drain with a non-blocking select.",
+        "time.After allocates a timer that stays armed until it fires; a per-request gather should reuse time.NewTimer and stop it.",
+        "Nothing cancels the in-flight calls when the local timer fires: the budget must be pushed into the requests as a context deadline, or the losers keep occupying resources."
+      ],
+      "sources": [
+        "https://go.dev/doc/go1.22",
+        "https://pkg.go.dev/context"
+      ]
+    }
+  ],
+  "default_variant": "errgroup-context",
+  "version": "1.0"
+}

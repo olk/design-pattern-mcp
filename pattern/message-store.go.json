@@ -1,0 +1,19 @@
+{
+  "pattern": "message-store",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "database/sql prepared INSERT in one writer goroutine + timestamp DELETE",
+  "implementation_notes": "database/sql plus a driver already provides the durable half (transactions, prepared statements, connection pooling), so the pattern reduces to a struct holding one *sql.Stmt and a writer goroutine draining a buffered channel: the classic Store interface and interceptor become a repository and an ordinary background goroutine, and reporting is a read-only query on the same database. Prefer a CGo-free driver such as modernc.org/sqlite so the build stays portable, enable WAL, and keep exactly one writer because SQLite serialises writers and hands SQLITE_BUSY to the loser. Sends into the tap must be non-blocking (select with default, or a bounded buffer whose overflow is counted), and retention is a DELETE on an indexed timestamp column driven by a ticker. The explicit Store abstraction is still justified when several backends or a pluggable reporting schema must be selectable at runtime; otherwise the struct is the whole pattern.",
+  "code_sketch": "type Store struct {\n    db  *sql.DB\n    ins *sql.Stmt\n}\nfunc (s *Store) Run(ctx context.Context, in <-chan Record) {\n    for r := range in {\n        if _, err := s.ins.ExecContext(ctx, r.ID, r.Channel, r.At, r.Body); err != nil {\n            drops.Inc()            // audited side channel: count, never fail the sender\n        }\n    }\n}\n// setup: db.Exec(\"PRAGMA journal_mode=WAL\"); ins, _ = db.Prepare(\"INSERT OR IGNORE ...\")",
+  "pitfalls": [
+    "database/sql pools connections, so several goroutines can hold writers at once and SQLite answers with SQLITE_BUSY; pin the writer to one connection (SetMaxOpenConns(1) on the writer handle) and give reports a separate read-only handle.",
+    "A blocking channel send re-couples the flow to the store; use select with default (or a bounded buffer) and expose the drop counter, because a full channel must never stall delivery.",
+    "*sql.Stmt belongs to the connection that prepared it: a reconnect or a recycled pool entry invalidates it and every later Exec fails until it is re-prepared.",
+    "Scanning a BLOB into a []byte can alias driver-owned memory that the next query reuses; copy the bytes before retaining them in a record."
+  ],
+  "sources": [
+    "https://pkg.go.dev/database/sql",
+    "https://pkg.go.dev/modernc.org/sqlite"
+  ],
+  "version": "1.0"
+}

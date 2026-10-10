@@ -1,0 +1,76 @@
+{
+  "pattern": "idempotent-receiver",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "IdempotentReceiverInterceptor + MetadataStoreSelector",
+  "implementation_notes": "Spring Integration implements the pattern as an AOP advice, IdempotentReceiverInterceptor (since 4.1), applied to MessageHandler.handleMessage() and driven by a MessageSelector: a message the selector rejects is enriched with the duplicateMessage header set to true, and with a discardChannel or throwExceptionOnRejection it never reaches the handler. The shipped selector is MetadataStoreSelector, which takes a MessageProcessor that derives the lookup key plus an optional ConcurrentMetadataStore - RedisMetadataStore and PropertiesPersistingMetadataStore give atomic updates across instances, JdbcMetadataStore keeps state across restarts, and compareValues (a BiPredicate of old and new stored values, since 5.3) allows value-aware acceptance. The framework deliberately leaves the idempotency logic to the application, so the handler's effects must still be committed consistently with this store.",
+  "code_sketch": "@Bean\nIdempotentReceiverInterceptor idempotentReceiver(MetadataStore store) {\n    MetadataStoreSelector selector =\n        new MetadataStoreSelector(m -> m.getHeaders().get(\"idempotencyKey\"));\n    selector.setMetadataStore(store);            // Jdbc/RedisMetadataStore: durable, shared\n    IdempotentReceiverInterceptor interceptor = new IdempotentReceiverInterceptor(selector);\n    interceptor.setDiscardChannel(nullChannel);  // duplicates absorbed, not handled\n    return interceptor;\n}\n\n@ServiceActivator(inputChannel = \"orders\", adviceChain = \"idempotentReceiver\")\npublic void handle(Order order) { handler.applyEffects(order); }",
+  "pitfalls": [
+    "Without discardChannel or throwExceptionOnRejection a rejected message is only marked with the duplicateMessage header and still reaches the handler; configure one of them, or have the handler consult the header.",
+    "The interceptor decides acceptance, not durability: pick a store whose retention covers the broker's redelivery window, and keep the handler's effects consistent with the store by construction.",
+    "MetadataStoreSelector defaults to the timestamp header as the stored value and accepts only unseen keys; with compareValues, a BiPredicate that returns true unconditionally accepts every duplicate."
+  ],
+  "sources": [
+    "https://docs.spring.io/spring-integration/reference/handler-advice/idempotent-receiver.html",
+    "https://docs.spring.io/spring-integration/reference/meta-data-store.html",
+    "https://docs.spring.io/spring-integration/reference/jdbc/metadata-store.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "concurrenthashmap-claim",
+      "name": "Atomic claim with ConcurrentHashMap.putIfAbsent",
+      "paradigm": "concurrent",
+      "implementation_notes": "The JVM's atomic claim primitives are ConcurrentHashMap.putIfAbsent (null return means this thread won) and add() on a concurrent set. Both are per-process, so they serve single-instance, restart-tolerant receivers only; competing consumers or a restart need a durable claim (JPA unique constraint, or a single-row INSERT that fails on conflict). Values should carry an expiry instant so a sweep can enforce the retention window a ConcurrentHashMap does not provide.",
+      "code_sketch": "private final ConcurrentHashMap<String, Instant> seen = new ConcurrentHashMap<>();\n\nboolean claim(Message m) {                 // null => we won, non-null => duplicate\n    return seen.putIfAbsent(m.idempotencyKey(), Instant.now().plus(REDELIVERY_WINDOW)) == null;\n}\n\nvoid onMessage(Message m) {\n    if (!claim(m)) { channel.ack(m); return; }   // duplicate: absorb\n    handler.applyEffects(m);\n    channel.ack(m);\n}",
+      "pitfalls": [
+        "putIfAbsent values need an explicit expiry sweep; otherwise the map is an unbounded memory leak.",
+        "containsKey() followed by put() instead of putIfAbsent reopens the race between competing consumer threads.",
+        "Container-local state loses protection on restart and when the service scales out - the in-JVM claim is not the durable claim."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html"
+      ],
+      "min_standard": "Java8",
+      "idiom_name": "ConcurrentHashMap.putIfAbsent"
+    },
+    {
+      "variant_id": "spring-integration-metadata-store",
+      "name": "Spring Integration IdempotentReceiverInterceptor + MetadataStore",
+      "paradigm": "oo",
+      "implementation_notes": "Spring Integration implements the pattern as an AOP advice, IdempotentReceiverInterceptor (since 4.1), applied to MessageHandler.handleMessage() and driven by a MessageSelector: a message the selector rejects is enriched with the duplicateMessage header set to true, and with a discardChannel or throwExceptionOnRejection it never reaches the handler. The shipped selector is MetadataStoreSelector, which takes a MessageProcessor that derives the lookup key plus an optional ConcurrentMetadataStore - RedisMetadataStore and PropertiesPersistingMetadataStore give atomic updates across instances, JdbcMetadataStore keeps state across restarts, and compareValues (a BiPredicate of old and new stored values, since 5.3) allows value-aware acceptance. The framework deliberately leaves the idempotency logic to the application, so the handler's effects must still be committed consistently with this store.",
+      "code_sketch": "@Bean\nIdempotentReceiverInterceptor idempotentReceiver(MetadataStore store) {\n    MetadataStoreSelector selector =\n        new MetadataStoreSelector(m -> m.getHeaders().get(\"idempotencyKey\"));\n    selector.setMetadataStore(store);            // Jdbc/RedisMetadataStore: durable, shared\n    IdempotentReceiverInterceptor interceptor = new IdempotentReceiverInterceptor(selector);\n    interceptor.setDiscardChannel(nullChannel);  // duplicates absorbed, not handled\n    return interceptor;\n}\n\n@ServiceActivator(inputChannel = \"orders\", adviceChain = \"idempotentReceiver\")\npublic void handle(Order order) { handler.applyEffects(order); }",
+      "pitfalls": [
+        "Without discardChannel or throwExceptionOnRejection a rejected message is only marked with the duplicateMessage header and still reaches the handler; configure one of them, or have the handler consult the header.",
+        "The interceptor decides acceptance, not durability: pick a store whose retention covers the broker's redelivery window, and keep the handler's effects consistent with the store by construction.",
+        "MetadataStoreSelector defaults to the timestamp header as the stored value and accepts only unseen keys; with compareValues, a BiPredicate that returns true unconditionally accepts every duplicate."
+      ],
+      "sources": [
+        "https://docs.spring.io/spring-integration/reference/handler-advice/idempotent-receiver.html",
+        "https://docs.spring.io/spring-integration/reference/meta-data-store.html",
+        "https://docs.spring.io/spring-integration/reference/jdbc/metadata-store.html"
+      ],
+      "min_standard": "Java8",
+      "idiom_name": "IdempotentReceiverInterceptor + MetadataStoreSelector"
+    },
+    {
+      "variant_id": "jpa-unique-constraint-inbox",
+      "name": "Unique-constraint inbox in the business transaction",
+      "paradigm": "oo",
+      "implementation_notes": "The durable, framework-free realization: the idempotency key carries a UNIQUE constraint (inbox table or the business entity itself), the consumer inserts the claim row in the same transaction as the business writes, and the constraint violation is the duplicate signal. On PostgreSQL an `INSERT ... ON CONFLICT DO NOTHING` with an affected-rows check avoids exception-driven control flow; with JPA, DataIntegrityViolationException plays that role. Choose it when deduplication state must survive restarts and be shared by competing instances.",
+      "code_sketch": "@Transactional\npublic void handle(OrderMessage msg) {\n    try {\n        inboxRepo.saveAndFlush(new InboxEntry(msg.idempotencyKey()));  // UNIQUE(key)\n    } catch (DataIntegrityViolationException duplicate) {\n        return;                              // already processed: absorb\n    }\n    orderRepo.save(Order.from(msg));         // same transaction\n}",
+      "pitfalls": [
+        "Catch DataIntegrityViolationException narrowly around the claim insert; around the business writes it hides real integrity failures.",
+        "The pattern needs an atomic claim: a store without a uniqueness constraint (plain Redis GET/SET pair) lets two instances both pass the check.",
+        "The inbox table grows; delete rows older than the redelivery window on a schedule."
+      ],
+      "sources": [
+        "https://www.postgresql.org/docs/current/sql-insert.html",
+        "https://docs.spring.io/spring-integration/reference/handler-advice/idempotent-receiver.html"
+      ],
+      "min_standard": "Java8",
+      "idiom_name": "JPA unique constraint / INSERT ... ON CONFLICT DO NOTHING"
+    }
+  ],
+  "default_variant": "spring-integration-metadata-store"
+}

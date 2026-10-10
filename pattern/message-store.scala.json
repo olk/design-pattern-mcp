@@ -1,0 +1,67 @@
+{
+  "pattern": "message-store",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "sql\"INSERT ...\".update.run through Transactor[IO]",
+  "implementation_notes": "doobie models the store as a pure program: the record is a case class with Read/Write instances, the append is sql\"INSERT INTO msg_store ...\".update.run (a ConnectionIO, a description rather than an effect), and execution happens through a Transactor[IO] built over a connection pool, so the classic Store object becomes a few small composable actions with resource management and retry supplied by cats-effect. The tap is a bounded cats-effect Queue: the delivery code only offers the record (tryOffer) and a single background fiber drains it through the transactor, which is what serialises writers and keeps store failures off the request fiber. Retention is another action - a DELETE by timestamp run on a schedule - and reporting is a query action executed in parallel by readers.",
+  "code_sketch": "final case class StoredMessage(id: String, channel: String, at: Instant, body: String)\n\nval append: Update0 = sql\"INSERT INTO msg_store (id, chan, ts, body)\n    VALUES ($id, $channel, $at, $body)\".update         // ConnectionIO[Int]: not executed yet\n\nval xa: Transactor[IO] = Transactor.fromDriverManager[IO](\n    \"org.sqlite.JDBC\", \"jdbc:sqlite:audit.db\", \"\", \"\", Blocker[IO])\n\n// tap: bounded cats-effect queue, drained by one fiber\n// append.run.transact(xa) - never on the delivery fiber\n// retention: sql\"DELETE FROM msg_store WHERE ts < $cutoff\".update.run.transact(xa)",
+  "pitfalls": [
+    "Running the store action on the request fiber couples business latency to the database; the delivery path should only offer to a bounded Queue (tryOffer) and count the drops.",
+    "A Transactor pool with more than one writer breaks SQLite with SQLITE_BUSY: size the pool to a single connection for the writer and give readers their own.",
+    "Implicit Read/Write derivation follows the case class, so adding or renaming a field silently breaks de-serialisation of old rows unless the payload is stored as an explicit JSON string.",
+    "Fiber failures in the draining fiber are invisible unless surfaced: the queue's failure and drop signals are the store's health metric."
+  ],
+  "sources": [
+    "https://typelevel.org/doobie/",
+    "https://typelevel.org/doobie/docs/03-Connecting.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "doobie-connection-io",
+      "name": "doobie pure-FP store (ConnectionIO through a Transactor)",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "doobie",
+        "cats-effect"
+      ],
+      "idiom_name": "sql\"INSERT ...\".update.run through Transactor[IO]",
+      "implementation_notes": "doobie models the store as a pure program: the record is a case class with Read/Write instances, the append is sql\"INSERT INTO msg_store ...\".update.run (a ConnectionIO, a description rather than an effect), and execution happens through a Transactor[IO] built over a connection pool, so the classic Store object becomes a few small composable actions with resource management and retry supplied by cats-effect. The tap is a bounded cats-effect Queue: the delivery code only offers the record (tryOffer) and a single background fiber drains it through the transactor, which is what serialises writers and keeps store failures off the request fiber. Retention is another action - a DELETE by timestamp run on a schedule - and reporting is a query action executed in parallel by readers.",
+      "code_sketch": "final case class StoredMessage(id: String, channel: String, at: Instant, body: String)\n\nval append: Update0 = sql\"INSERT INTO msg_store (id, chan, ts, body)\n    VALUES ($id, $channel, $at, $body)\".update         // ConnectionIO[Int]: not executed yet\n\nval xa: Transactor[IO] = Transactor.fromDriverManager[IO](\n    \"org.sqlite.JDBC\", \"jdbc:sqlite:audit.db\", \"\", \"\", Blocker[IO])\n\n// tap: bounded cats-effect queue, drained by one fiber\n// append.run.transact(xa) - never on the delivery fiber\n// retention: sql\"DELETE FROM msg_store WHERE ts < $cutoff\".update.run.transact(xa)",
+      "pitfalls": [
+        "Running the store action on the request fiber couples business latency to the database; the delivery path should only offer to a bounded Queue (tryOffer) and count the drops.",
+        "A Transactor pool with more than one writer breaks SQLite with SQLITE_BUSY: size the pool to a single connection for the writer and give readers their own.",
+        "Implicit Read/Write derivation follows the case class, so adding or renaming a field silently breaks de-serialisation of old rows unless the payload is stored as an explicit JSON string.",
+        "Fiber failures in the draining fiber are invisible unless surfaced: the queue's failure and drop signals are the store's health metric."
+      ],
+      "sources": [
+        "https://typelevel.org/doobie/",
+        "https://typelevel.org/doobie/docs/03-Connecting.html"
+      ]
+    },
+    {
+      "variant_id": "slick-lifted-dsl",
+      "name": "Slick lifted table mapping (DBIO actions)",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "slick"
+      ],
+      "idiom_name": "TableQuery[MsgStore] + messages += record inside db.run(...)",
+      "implementation_notes": "Slick's lifted embedding makes the store one more mapped table: a TableQuery[MStored] with typed columns, the append a DBIO action (messages += record), and execution a db.run(append.transactionally) against a Database backed by a JDBC driver, so the classic Store interface is replaced by a table object plus actions that compose into transactions. Choose this variant when the application already speaks Slick and the audit table should share its session and transaction style; choose the doobie variant when the codebase is tagless-final and the store should stay a plain SQL action. Retention is a delete query action run on a schedule, and reporting is any Slick query over the same table.",
+      "code_sketch": "class MsgStore(tag: Tag) extends Table[StoredMessage](tag, \"msg_store\") {\n    def id      = column[String](\"id\", O.PrimaryKey)\n    def channel = column[String](\"chan\")\n    def at      = column[Long](\"ts\")\n    def body    = column[String](\"body\")\n    def * = (id, channel, at, body) <> (StoredMessage.tupled, StoredMessage.unapply)\n}\nval messages = TableQuery[MsgStore]\nval append = messages += record                 // DBIO: lazy until it is run\ndb.run(append.transactionally)                  // one writer connection for the audit store",
+      "pitfalls": [
+        "DBIO actions are values: an append that is built but never run records nothing, and running it outside the intended transaction loses atomicity.",
+        "Slick's AsyncExecutor thread pool is shared; an audit load that saturates it starves business queries, so give the store its own executor or bound the tap.",
+        "SQLite plus connection pooling multiplies writers again (SQLITE_BUSY); one writer connection and WAL remain the configuration.",
+        "Nested transactions without savepoints flatten into the outer transaction, so an audit rollback can undo business work - keep the store's transaction separate."
+      ],
+      "sources": [
+        "https://scala-slick.org/doc/3.5.0/",
+        "https://typelevel.org/doobie/"
+      ]
+    }
+  ],
+  "default_variant": "doobie-connection-io"
+}

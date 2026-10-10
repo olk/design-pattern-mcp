@@ -1,0 +1,20 @@
+{
+  "pattern": "process-manager",
+  "language": "go",
+  "support": "manual",
+  "idiom_name": "struct state + Apply(ctx, Event) decider + database row + context deadlines",
+  "implementation_notes": "Go ships no workflow runtime, so the manager is a small package: a row keyed by the correlation id holds the typed state, an Apply(ctx, Event) method switches on (state, event) to produce the next command, and a sweeper goroutine or scheduled job processes rows whose deadline has passed. context.WithTimeout bounds a single in-process await, but a deadline that must survive a restart belongs in the row as data, not in a context that dies with the process. Hand-rolling is right for short flows inside one service; once the flow must survive deployments and span services, a durable-execution SDK (Temporal Go SDK) provides the same pattern with managed history and timers.",
+  "code_sketch": "func (p *OrderProc) Apply(ctx context.Context, ev Event) error {\n    switch p.State {\n    case AwaitingPayment:\n        if ev.Kind != PaymentOK {\n            return nil                       // stale or duplicate reply\n        }\n        p.State = AwaitingStock\n        return p.outbox.Enqueue(ctx, ReserveStock{CID: p.CorrelationID})\n    case AwaitingStock:\n        p.State = Done\n        return p.outbox.Enqueue(ctx, Ship{CID: p.CorrelationID})\n    default:\n        return fmt.Errorf(\"unhandled state %s\", p.State)\n    }\n}\n\n// deadline sweeper: SELECT ... WHERE due_at < now() FOR UPDATE SKIP LOCKED",
+  "pitfalls": [
+    "State kept in a struct in memory (or a map guarded by a mutex) is lost on deploy; the row must be the only source of truth, and per-instance work must be serialised by a row lock or a keyed goroutine.",
+    "time.After inside a loop allocates a timer per iteration that only fires later; use time.NewTimer/Ticker and Stop it, or better, store deadlines and sweep them.",
+    "Redelivery after a restart is normal, so Apply must be idempotent per event id - otherwise the same reply advances the flow twice.",
+    "Goroutines started per message without a bound or a shutdown path leak when a step blocks, and a process manager that cannot be drained cannot be redeployed safely."
+  ],
+  "sources": [
+    "https://pkg.go.dev/context",
+    "https://pkg.go.dev/time",
+    "https://docs.temporal.io/develop/go"
+  ],
+  "version": "1.0"
+}

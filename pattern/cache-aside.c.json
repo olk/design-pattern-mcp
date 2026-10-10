@@ -1,0 +1,18 @@
+{
+  "pattern": "cache-aside",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-rolled hash table + pthread_rwlock with monotonic-clock TTL",
+  "implementation_notes": "C has no cache in libc: the classic structure - a keyed store with eviction, expiry and a miss loader - is hand-written, typically a fixed-capacity open-addressing or LRU table guarded by a pthread read-write lock, with every entry carrying an absolute deadline taken from a monotonic clock. Production C usually pushes the store out of process (Redis or Memcached through a client such as hiredis) and keeps only the read-check-populate protocol in C, because re-implementing expiry sweeping, eviction and stampede control is where the defects live.",
+  "code_sketch": "int cache_get(cache_t *c, const char *key, char *out, size_t n) {\n    pthread_rwlock_rdlock(&c->lock);\n    entry_t *e = cache_find(c, key);\n    if (e && !expired(e)) { copy_out(e, out, n); pthread_rwlock_unlock(&c->lock); return 0; }\n    pthread_rwlock_unlock(&c->lock);          /* never load while holding the read lock */\n    char *v = source_read(key);               /* source of truth on a miss */\n    pthread_rwlock_wrlock(&c->lock);\n    cache_store(c, key, v, now_plus(c->ttl)); /* populate with an expiry */\n    pthread_rwlock_unlock(&c->lock);\n    return copy_out_value(v, out, n);\n}\n/* write path: source_write(key, v); cache_delete(c, key); */",
+  "pitfalls": [
+    "A pthread read-write lock cannot be upgraded: loading the value while still holding the read lock, or trying to acquire the write lock on the same thread, deadlocks or stalls every reader. Release, load, then take the write lock and re-check before inserting.",
+    "Use CLOCK_MONOTONIC for deadlines; wall-clock expiry breaks whenever the system time is adjusted.",
+    "Storing borrowed pointers without an ownership rule produces use-after-free as soon as a caller frees the value it inserted; the cache must copy or own everything it stores.",
+    "Without a bounded capacity and an eviction rule the table is a memory leak with a lock around it."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_rwlock_rdlock.3p.html"
+  ],
+  "version": "1.0"
+}

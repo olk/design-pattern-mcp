@@ -1,0 +1,197 @@
+{
+  "category": "concurrency-resilience",
+  "name": "thread-confinement",
+  "aliases": [
+    "confinement"
+  ],
+  "intent": "Guarantee thread safety by access design instead of locking: an object is owned by exactly one thread, no reference to it ever escapes, and synchronization for it is therefore unnecessary.",
+  "problem": "A component is not thread-safe, or guarding every access with a lock would cost contention, deadlock risk and reasoning effort. The recurring decision is whether the object can be confined to a single thread for its whole lifetime - and if so, how to arrange state and ownership so that no reference ever reaches another thread.",
+  "context": "Multithreaded programs with per-thread, per-task or single-threaded-subsystem state: UI toolkits whose widgets live on the event-dispatch thread, worker and connection pools reusing non-thread-safe objects, actors and event loops that serialize state behind a mailbox, and frameworks passing request context down a call chain without widening every signature. It applies whenever the object's access pattern - not a lock - can guarantee single-threaded touch, and must be revisited when the runtime stops tying tasks to threads (virtual threads, coroutine dispatchers, work stealing).",
+  "benefits": [
+    "No synchronization on the confined object's path: no mutex, no atomics, no cache-line ping-pong and no lock convoy; the owning thread itself is the serialization mechanism.",
+    "Non-thread-safe components become usable as they are (SimpleDateFormat/NumberFormat, JDBC or socket connections, GUI widgets, lexers, memory arenas) without wrapping them in locks or rewriting them.",
+    "Removes whole failure classes for the confined state: no deadlock, no priority inversion, no visibility or ordering reasoning, because the state is never shared.",
+    "Makes per-thread and per-task caches and scratch buffers cheap (per-thread formatters and buffers, per-worker connection pools, sync.Pool-style sharding) by amortizing setup without contention.",
+    "Supports single-threaded subsystems as a deliberate design - event loops, actor mailboxes, queue-per-object - which are simple and deadlock-free precisely because everything is confined.",
+    "Carries ambient context (transaction, principal, correlation id) through deep call chains without threading an extra parameter through every method."
+  ],
+  "tradeoffs": [
+    "Confinement is a convention, not an enforcement: any escaped reference (a static field, a callback captured on another thread, a value leaked out of a pool) silently turns the design into a data race, and most languages will not diagnose it.",
+    "Thread-bound state fights runtimes that migrate work between threads: thread pools, work-stealing schedulers, virtual threads and coroutine dispatchers move tasks across threads, so per-thread state goes stale, leaks or must be re-scoped per task.",
+    "Lifetime and leak hazards: pooled or long-lived threads retain thread-locals (stale per-request data, classloader leaks in Java), TLS destructors run in unspecified order, and C/POSIX TSD destructor retry loops can even resurrect entries.",
+    "It replicates rather than shares: a single confined object cannot scale across cores, and moving data between threads requires explicit hand-off or copying - latency and serialization cost exactly where the state is hot.",
+    "Ambient thread-local state acts as hidden method parameters: it couples unrelated classes to the framework that populates it, reduces reusability, and breaks when the execution model changes (async, reactive, virtual threads)."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 5,
+    "maintainability": 5,
+    "simplicity": 8,
+    "performance": 9,
+    "reliability": 5,
+    "security": 5,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "Confined Object",
+      "responsibility": "The otherwise non-thread-safe state (object graph, buffer, connection, widget tree) that needs no internal synchronization because only the owner ever touches it."
+    },
+    {
+      "role": "Owner Thread / Execution Context",
+      "responsibility": "The single thread, task or actor allowed to read and write the confined object; it is the serialization point for all of the object's operations."
+    },
+    {
+      "role": "Access Discipline",
+      "responsibility": "The documented (or compiler-checked) rules that keep references from escaping: stack containment, private fields, no capture in callbacks running elsewhere, no publication through shared structures."
+    },
+    {
+      "role": "Hand-off Mechanism",
+      "responsibility": "How requests and data cross between threads without sharing: message queues, channels, ownership transfer or defensive copies - the only sanctioned boundary crossing."
+    },
+    {
+      "role": "Confinement Carrier",
+      "responsibility": "The per-thread or per-task slot (thread-local storage, ThreadLocal, threading.local/contextvars, AsyncLocal, @TaskLocal) that binds an object to the current execution context when stack confinement cannot reach it, together with its cleanup/removal protocol."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit",
+    "message-flow"
+  ],
+  "use_cases": [
+    "GUI toolkits: every widget and model object is touched only from the event-dispatch thread (Swing EDT, Android main looper, Swift @MainActor, JavaScript's event loop), which is why widget code contains no locking.",
+    "Per-worker reuse of heavyweight non-thread-safe objects: a SimpleDateFormat/NumberFormat, a JDBC Connection handed out by a pool, a lexer/parser instance, or a scratch buffer recreated per thread instead of guarded by a lock.",
+    "Frameworks propagating request context (security principal, transaction, trace or correlation id) down the call chain without widening every method signature - thread-scoped (ThreadLocal) or task-scoped (contextvars, AsyncLocalStorage, ScopedValue, @TaskLocal).",
+    "Single-threaded subsystems and actors: mutable state kept inside one event loop, one actor or one queue-per-object so that only messages cross the boundary.",
+    "Parallel batch processing where each worker accumulates into private state and results are merged at the end (per-thread reducers, map/reduce workers).",
+    "Thread-affine native resources: OpenGL/GLib contexts, JNI handles or kernel state that must stay on one OS thread (runtime.LockOSThread, thread-affinity APIs).",
+    "Swift @MainActor for UI-driven apps: all UI state and view models isolated to the main actor at compile time, eliminating UI thread checks entirely.",
+    "Kotlin coroutine single-threaded dispatchers: running a coroutine and all its children on a single thread (Dispatchers.Main, or newSingleThreadContext) to confine mutable state without locks.",
+    "Python asyncio task-local state via contextvars: propagating per-request context across an async call chain without explicit parameter passing, native to asyncio.Task.",
+    "Go goroutine per-connection: each client connection handled by its own goroutine, with all connection state confined to that goroutine's stack and channel-fed from others.",
+    "Rust Send/Sync boundaries: types that opt out of Send or Sync are statically confined to their origin thread, preventing accidental cross-thread leakage.",
+    "Erlang/OTP and Elixir processes: each process owns its heap exclusively - there is no shared mutable state at all between processes, and messages (immutable values and pids, never pointers) delivered to a mailbox are the only crossing, making confinement the runtime's default rather than a discipline.",
+    "Go's sync.Pool: goroutines Get scratch objects (byte buffers, encoders), own them exclusively, then Put them back; Get removes the item and establishes happens-before with its Put, so fmt and per-request handlers reuse expensive buffers across goroutines without locks - ownership transfer, never shared use.",
+    "Android enforces UI thread confinement at runtime: views may only be touched from the main Looper thread, background work is posted back through Handler/Looper, and StrictMode ThreadPolicy (detectNetwork, detectDiskReads, penaltyDeath/penaltyDeathOnNetwork) turns violations into crashes during development instead of silent jank or ANRs."
+  ],
+  "avoid_when": [
+    "The state must be read and written by several threads promptly: use locks, atomics or an immutable snapshot (monitor object, read-write lock, immutability) - confinement cannot cover genuinely shared mutable state.",
+    "The runtime migrates tasks between threads (async/await, virtual threads, coroutine dispatchers, work-stealing pools): prefer task-scoped carriers (scoped values, task locals, coroutine context) over per-thread slots.",
+    "Workers are interchangeable threads of a pool and the state belongs to a logical request: pass it explicitly or scope it to the task; squatting in thread-locals outlives the request and leaks into the next one.",
+    "A local variable or a method parameter already spans the data's lifetime: that is ordinary stack confinement, and introducing a pattern around it is ceremony.",
+    "Copying the data is cheap relative to pinning it to a thread (small immutable messages, structural clones): sharing by value removes the confinement problem entirely.",
+    "Massive concurrency with virtual threads: storing large objects in ThreadLocal can exhaust memory when millions of virtual threads exist; use ScopedValue (immutable, heap-shared) instead.",
+    "Coroutine dispatchers that suspend and resume on different threads: ThreadLocal values set in a coroutine are not guaranteed visible after a suspend/resume cycle without a ThreadContextElement."
+  ],
+  "language_files": {
+    "generic": "thread-confinement.generic.json",
+    "c": "thread-confinement.c.json",
+    "cplusplus": "thread-confinement.cplusplus.json",
+    "csharp": "thread-confinement.csharp.json",
+    "go": "thread-confinement.go.json",
+    "java": "thread-confinement.java.json",
+    "javascript": "thread-confinement.javascript.json",
+    "kotlin": "thread-confinement.kotlin.json",
+    "python": "thread-confinement.python.json",
+    "ruby": "thread-confinement.ruby.json",
+    "rust": "thread-confinement.rust.json",
+    "scala": "thread-confinement.scala.json",
+    "swift": "thread-confinement.swift.json",
+    "typescript": "thread-confinement.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "object",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "thread-local-storage",
+    "immutable-object",
+    "actor",
+    "monitor-object",
+    "thread-pool",
+    "structured-concurrency"
+  ],
+  "anti_patterns": [
+    "Escaped confinement: publishing a thread-confined object into a static field, handing it to another thread's callback, or storing it in a shared cache - the race is silent and language help is rare.",
+    "ThreadLocal as a global-variable license: mutable singletons or hidden method arguments smuggled through per-thread slots, coupling unrelated code to the thread and breaking under async or pooled execution.",
+    "Thread-affine state in a migrating runtime: keeping per-thread caches or context while tasks hop between carrier threads (virtual threads, Dispatchers.Default), so values go stale or vanish across suspension points.",
+    "Leaking pooled per-request data: never removing thread-locals on pooled threads, so the next request sees the previous tenant's context - a correctness and security bug, not just a memory leak.",
+    "ThreadLocal with virtual threads: storing large objects in ThreadLocal in a JVM with millions of virtual threads causes memory exhaustion; ScopedValue was designed precisely for this.",
+    "Coroutine context mutation without ThreadContextElement: updating a ThreadLocal inside a coroutine and expecting the value to survive after a suspend/resume cycle - the change is lost or invisible to sibling coroutines.",
+    "Swift actor reentrancy assumptions: assuming actor-isolated state is stable across an await, when interleaved tasks can mutate it between suspension and resumption.",
+    "Kotlin withContext scope confusion: launching background coroutines inside withContext that outlive the block, causing structured concurrency violations."
+  ],
+  "design_principles": [
+    "Do not share mutable state: the cheapest synchronization is the one you never need (share memory by communicating).",
+    "Encapsulation first: a private, unreachable object is safe by construction; publication is the decision that creates concurrency risk.",
+    "Make the invariant explicit: record the confinement (ownership comment, type, guard annotation), because the constraint otherwise lives only in the developer's head.",
+    "Right scope for the lifetime: stack confinement for locals, task scope for a logical operation, thread scope only for genuinely thread-affine resources.",
+    "Prefer enforcement where the toolchain offers it (ownership and sendability types, actor isolation, structured scopes) over convention where it does not.",
+    "Prefer immutable or copy-on-crossing for data that must reach another thread; reserve live-reference hand-off for high-frequency hot paths where copying cost is prohibitive.",
+    "Prefer ScopedValue or contextvars over ThreadLocal for task-scoped (as opposed to thread-scoped) ambient context, especially with virtual threads or coroutines.",
+    "Choose per-goroutine, per-actor or per-event-loop ownership over shared mutable state whenever the architecture naturally decomposes into isolated units."
+  ],
+  "best_practices": [
+    "Prefer stack or task confinement over thread-local globals: keep state in locals or a task/actor scope, and use per-thread slots only when the state must outlive the call stack.",
+    "Never let a confined reference escape: no static fields, no captures in callbacks scheduled elsewhere, no storing into structures other threads can reach; move a copy or transfer ownership instead.",
+    "Use the carrier that matches the lifetime you actually have (thread_local, ThreadLocal, threading.local or contextvars, ThreadLocal<T> or AsyncLocal<T>, @TaskLocal) and know which ones follow tasks rather than threads.",
+    "Clean per-thread state up when the logical task ends (remove, reset, dispose), especially with pooled threads, and bound the lifetime structurally where the platform can (ScopedValue, structured scopes, using/try-with-resources).",
+    "Document and assert affinity: ownership comments, thread-id assertions in debug builds, static analysis or type-level markers (!Send, actor isolation), so an escape is caught before production.",
+    "When data must cross threads, cross it as a message or a copy; never hand out a live reference as an optimization.",
+    "With virtual threads, prefer ScopedValue (JEP 506) over ThreadLocal for ambient request context: ScopedValue is immutable, heap-shared, and correctly inherited by forked virtual threads in StructuredTaskScope.",
+    "With Kotlin coroutines, use ThreadContextElement (ThreadLocal.asContextElement or CopyableThreadContextElement) to propagate ambient context across suspension points, and avoid mutating ThreadLocal directly inside coroutines.",
+    "With Swift, model UI state as @MainActor classes, use Sendable to mark types safe to cross isolation boundaries, and treat actor reentrancy as normal: re-read state after every await.",
+    "With Python asyncio, prefer contextvars.ContextVar over threading.local for per-task state; use copy_context() and Context.run() to safely offload synchronous work to a thread pool while preserving context.",
+    "With Rust, encode thread confinement via Send/Sync auto-traits: a type confined to one thread should be marked !Send and !Sync (or use PhantomData<*const T>) to make cross-thread transfer a compile error.",
+    "With Go, confine mutable state to a goroutine's stack; use channels for hand-off and avoid sharing pointers to heap objects across goroutines (the race detector catches violations at test time)."
+  ],
+  "version": "1.1",
+  "sources": [
+    "Lea, D., Concurrent Programming in Java: Design Principles and Patterns, 2nd ed. (Addison-Wesley, 1999) - section 2.3 'Confinement' (2.3.1 Confinement Across Methods, 2.3.2 Confinement Within Threads, 2.3.3 Confinement Within Objects, 2.3.4 Confinement Within Groups); the canonical description of using non-sharing to avoid synchronization.",
+    "Goetz, B., Peierls, T., Bloch, J., Bowbeer, J., Holmes, D., Lea, D., Java Concurrency in Practice (Addison-Wesley, 2006) - section 3.3 Thread Confinement: ad-hoc thread confinement, stack confinement and ThreadLocal, with the warning that confinement is a design property enforced only by its implementation (cites CPJ 2.3.2).",
+    "https://gee.cs.oswego.edu/dl/cpj/s2.3.html",
+    "https://gee.cs.oswego.edu/dl/cpj/index.html",
+    "https://openjdk.org/jeps/506 - JEP 506: Scoped Values (Preview) — immutable, lexically-scoped values designed to replace ThreadLocal for virtual threads and structured concurrency, where values are inherited by forked tasks and automatically cleaned up on scope exit.",
+    "https://openjdk.org/jeps/428 - JEP 428: Structured Concurrency (Incubator) — introduces StructuredTaskScope to tie the lifetime of forked virtual threads to a lexical scope, preventing orphaned threads and making thread confinement a structural property rather than a convention.",
+    "https://openjdk.org/jeps/425 - JEP 425: Virtual Threads (Preview) — lightweight threads implemented by the JVM, not OS threads; a virtual thread can be mounted on different carrier threads across suspension points, making per-thread (ThreadLocal) context fragile and ScopedValue the preferred carrier.",
+    "https://docs.oracle.com/en/java/javase/26/core/structured-concurrency.html — Oracle Java 26 documentation on Structured Concurrency: explains StructuredTaskScope hierarchies, fork/join semantics, ScopedValue inheritance, and thread-dump observability.",
+    "https://docs.oracle.com/en/java/javase/23/core/virtual-threads.html — Oracle Java 23 documentation on Virtual Threads: mount/unmount semantics, carrier threads, pinning via synchronized, and the prohibition on pooling virtual threads.",
+    "https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html — Kotlin documentation on shared mutable state and concurrency: thread confinement with newSingleThreadContext, fine-grained vs coarse-grained confinement patterns, and the Mutex alternative to locks.",
+    "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-thread-context-element/ — Kotlin ThreadContextElement interface: defines updateThreadContext/restoreThreadContext contract for coroutine context propagation across suspension points and thread switches.",
+    "https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html — Kotlin coroutine context and dispatchers: Dispatchers.Default, Dispatchers.Main, Dispatchers.Unconfined, context inheritance, and ThreadLocal.asContextElement for bridging thread-local state into coroutine context.",
+    "https://github.com/apple/swift-evolution/blob/main/proposals/0306-actors.md — SE-0306: Actors — Swift's actor model: actor isolation enforced at compile time, Sendable protocol for cross-isolation-boundary safety, reentrancy semantics, and the distinction between actor types and class types.",
+    "https://github.com/apple/swift-migration-guide/blob/main/Guide.docc/DataRaceSafety.md — Swift Concurrency Migration Guide: data isolation, actor isolation domains, @MainActor semantics, cross-isolation boundary rules, and the Sendable protocol; covers the practical application of actors as enforced thread confinement.",
+    "https://github.com/swiftlang/swift-evolution/blob/main/proposals/0414-region-based-isolation.md — SE-0414: Region-Based Isolation — introduces isolation regions to allow non-Sendable values to safely cross isolation boundaries via control-flow-sensitive checking, loosening the restriction that only Sendable types may cross.",
+    "https://doc.rust-lang.org/nomicon/send-and-sync.html — The Rustonomicon: Send and Sync as compile-time thread confinement markers; !Send and !Sync for types that must not leave their thread (raw pointers, thread-affine resources); PhantomData<*const T> for C-library handles; structurally-derived auto-trait semantics.",
+    "https://github.com/microsoft/RustTraining/blob/main/type-driven-correctness-book/src/ch16-send-sync-compile-time-concurrency-proofs.md — Microsoft Rust Training: Send/Sync as zero-cost compile-time concurrency proofs; tables of which stdlib types are Send/Sync and why; PhantomData patterns for thread-confined handles; Mutex<T> restoring Sync.",
+    "https://docs.python.org/3/library/contextvars.html — Python contextvars documentation: ContextVar, Context, copy_context(), Context.run(); natively integrated with asyncio.Task; replaces threading.local for async-code context propagation.",
+    "https://peps.python.org/pep-0567/ — PEP 567: Context Variables — proposal for Python 3.7 contextvars module; motivation: Thread-local storage is insufficient for async tasks running concurrently in the same thread; asyncio.Task copies context at creation and runs each step in that copy.",
+    "https://valarmorghulis.io/tech/202408-the-asyncio-tasks-and-contextvars-in-python/ — Analysis of context consistency across asyncio Task chains: context copies at Task creation, the Python 3.11 context= parameter on create_task, and the Starlette middleware context-bleeding pitfall.",
+    "https://developer.apple.com/videos/play/wwdc2022/110351/ — WWDC 2022 ' Eliminate Data Races Using Swift Concurrency': actors as islands, @MainActor, Sendable protocol, isolation domains, and the difference between thread safety (data race freedom) and isolation.",
+    "https://horstmann.com/presentations/2025/jcon-loom/ — 'Virtual Threads, Scoped Values, Structured Concurrency: When to Use Them, and How' — practical decision guide: ThreadLocal vs ScopedValue with virtual threads, custom Joiner patterns for StructuredTaskScope, ScopedValue propagation in structured scopes.",
+    "https://www.besthub.dev/articles/concurrency-series-finale-virtual-threads-and-structured-concurrency-a9351e6a2f70 — Virtual threads vs thread pools vs reactive: model comparison table; ScopedValue; StructuredTaskScope; pinning via synchronized; Rule 1: do not pool virtual threads; Rule 2: avoid ThreadLocal with virtual threads.",
+    "https://syntblazellc.mintlify.app/swift/attributes/main-actor-attribute — @MainActor as a global actor: static isolation guarantees, MainActor.assumeIsolated for bridging with delegate callbacks, MainActor.precondition for runtime assertions, inheritance semantics.",
+    "https://www.javaspecialists.eu/archive/Issue218-Thread-Confinement.html",
+    "https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html",
+    "https://erlang.org/download/armstrong_thesis_2003.pdf — Joe Armstrong, 'Making Reliable Distributed Systems in the Presence of Software Errors' (2003 doctoral thesis, erlang.org): Erlang processes as self-contained units with unique unforgeable pids, no shared state between processes, and messages restricted to constants and pids - never pointers into another process's data; the canonical statement of confinement-by-isolation as a system default.",
+    "https://pkg.go.dev/sync — Go sync package documentation: sync.Pool is a concurrency-safe pool of temporary objects for reuse across goroutines; Get removes and returns an arbitrary item, Put returns one for later reuse, Put synchronizes before any Get that returns that value, items may be removed at any time, and no relation between Put and Get values may be assumed - documented ownership transfer rather than shared use (fmt's temporary buffer pool is the in-standard-library example).",
+    "https://developer.android.com/reference/android/os/StrictMode.ThreadPolicy.Builder — Android StrictMode.ThreadPolicy.Builder: detect* methods select the violations to watch on a thread and penalty* methods (penaltyLog, penaltyDeath, penaltyDeathOnNetwork) escalate them, penaltyDeath crashing the process - runtime enforcement of the main-thread confinement convention so cross-thread violations surface in development instead of as ANRs in production.",
+    "https://users.soe.ucsc.edu/~cormac/papers/17-ftfjp.pdf — Rhodes, Flanagan, Freund, 'Correctness of Partial Escape Analysis for Multithreading Optimization' (FTfJP 2017): the formal caution behind confinement claims - an object analyzed as 'currently thread-local' may later become thread-shared, partial lock elision based on that evidence is unsound under the Java Memory Model, and eliding race checks for presumed-confined data makes dynamic detectors miss later races.",
+    "https://www.cs.williams.edu/~freund/papers/14-escape-analysis-tr.pdf — Freund et al., 'Using Escape Analysis in Dynamic Data Race Detection': both the payoff and the fragility of the pattern - thread-local (confined) objects cannot race and dominate race-check overhead, but only objects provably not escaped to other threads may be filtered, so confinement's value stands or falls on escape being actually ruled out."
+  ],
+  "related_patterns_notes": {
+    "scoped-values": "scoped-values",
+    "coroutine-context": "coroutine-context",
+    "sendable-protocol": "sendable-protocol"
+  }
+}

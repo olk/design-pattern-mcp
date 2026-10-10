@@ -1,0 +1,73 @@
+{
+  "pattern": "identity-field",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "@Id + @GeneratedValue(strategy = IDENTITY|SEQUENCE) on the key field",
+  "implementation_notes": "JPA/Hibernate owns the identity field: @Id marks the attribute as the primary key, @GeneratedValue selects the generator - IDENTITY lets the database assign the key (the provider reads it back from the INSERT), SEQUENCE pre-allocates from a sequence so the key is known before the statement, TABLE uses the classic key table - and GenerationType.UUID or a UUID attribute with an application-generated value covers the 'key must exist before insert' case. The classic key-generator objects collapse into that annotation plus the provider; use plain JDBC (Statement.RETURN_GENERATED_KEYS with getGeneratedKeys()) when no ORM is wanted. Keep equals/hashCode on the id, and keep entities with an unassigned id out of hash-based collections.",
+  "code_sketch": "@Entity\npublic class Order {\n    @Id\n    @GeneratedValue(strategy = GenerationType.IDENTITY)\n    private Long id;\n\n    public boolean equals(Object o) {\n        return o instanceof Order other\n            && id != null && id.equals(other.id);\n    }\n    // hashCode follows id only\n\n    // mapper: entityManager.persist(order) -> order.getId() != null after flush\n}",
+  "pitfalls": [
+    "With IDENTITY the key is null until the flush and the provider cannot batch inserts (each row needs its own generated key); with SEQUENCE the key is assigned before the insert and batching/reordering stays possible.",
+    "An entity with a null id put into a HashSet or a Map before persisting changes its hash code once the id is assigned, so it becomes unreachable in that collection.",
+    "equals/hashCode over all fields (or over a mutable business field) breaks identity-map lookups as soon as one attribute changes."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javaee/7/api/javax/persistence/GeneratedValue.html",
+    "https://docs.oracle.com/javase/8/docs/api/java/sql/Statement.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "jpa-generated-value",
+      "name": "JPA/Hibernate generated value",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "@Id + @GeneratedValue(strategy = IDENTITY|SEQUENCE) on the key field",
+      "implementation_notes": "JPA/Hibernate owns the identity field: @Id marks the attribute as the primary key, @GeneratedValue selects the generator - IDENTITY lets the database assign the key (the provider reads it back from the INSERT), SEQUENCE pre-allocates from a sequence so the key is known before the statement, TABLE uses the classic key table - and GenerationType.UUID or a UUID attribute with an application-generated value covers the 'key must exist before insert' case. The classic key-generator objects collapse into that annotation plus the provider; use plain JDBC (Statement.RETURN_GENERATED_KEYS with getGeneratedKeys()) when no ORM is wanted. Keep equals/hashCode on the id, and keep entities with an unassigned id out of hash-based collections.",
+      "code_sketch": "@Entity\npublic class Order {\n    @Id\n    @GeneratedValue(strategy = GenerationType.IDENTITY)\n    private Long id;\n\n    public boolean equals(Object o) {\n        return o instanceof Order other\n            && id != null && id.equals(other.id);\n    }\n    // hashCode follows id only\n\n    // mapper: entityManager.persist(order) -> order.getId() != null after flush\n}",
+      "pitfalls": [
+        "With IDENTITY the key is null until the flush and the provider cannot batch inserts (each row needs its own generated key); with SEQUENCE the key is assigned before the insert and batching/reordering stays possible.",
+        "An entity with a null id put into a HashSet or a Map before persisting changes its hash code once the id is assigned, so it becomes unreachable in that collection.",
+        "equals/hashCode over all fields (or over a mutable business field) breaks identity-map lookups as soon as one attribute changes."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javaee/7/api/javax/persistence/GeneratedValue.html",
+        "https://docs.oracle.com/javase/8/docs/api/java/sql/Statement.html"
+      ]
+    },
+    {
+      "variant_id": "jdbc-getgeneratedkeys",
+      "name": "Plain JDBC with RETURN_GENERATED_KEYS",
+      "paradigm": "procedural",
+      "min_standard": "Java8",
+      "idiom_name": "PreparedStatement with Statement.RETURN_GENERATED_KEYS + getGeneratedKeys()",
+      "implementation_notes": "Without an ORM the mapper is hand-written: prepare the INSERT with RETURN_GENERATED_KEYS, execute it, then read the database-assigned key from the returned row and set it on the object; the same value targets every later UPDATE and DELETE. The classic key-generator object is replaced by the JDBC driver plus the identity column. This is the honest choice when a project avoids an ORM or must batch inserts, where a per-row key read-back costs a round trip - in that case prefer a SEQUENCE/key-table pre-allocation or a client-side UUID so keys exist before the batch.",
+      "code_sketch": "try (PreparedStatement ps = conn.prepareStatement(\n        \"INSERT INTO orders(name) VALUES(?)\",\n        Statement.RETURN_GENERATED_KEYS)) {\n    ps.setString(1, o.getName());\n    ps.executeUpdate();\n    try (ResultSet keys = ps.getGeneratedKeys()) {\n        if (keys.next()) o.setId(keys.getLong(1));\n    }\n}",
+      "pitfalls": [
+        "Drivers may return the full row or an empty result depending on column hints; check for an empty ResultSet instead of assuming exactly one column.",
+        "getGeneratedKeys() belongs to the statement that ran the insert - reading it through another pooled connection returns nothing.",
+        "The key is unknown while the statement runs, so a child row referencing the new parent cannot be inserted in the same batch without pre-allocated keys."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/8/docs/api/java/sql/Statement.html"
+      ]
+    },
+    {
+      "variant_id": "client-assigned-uuid",
+      "name": "Application-assigned UUID key",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "UUID.randomUUID() as the identity value",
+      "implementation_notes": "The application is the key generator: the field is initialised with a UUID before the INSERT, the mapper inserts that value explicitly and never reads a key back, so the identity exists before the row does - the classic strategy for object graphs, batch writes, idempotent retries and keys generated at the source. It replaces the database key generator entirely; the cost is a 128-bit key and, with random UUIDs, worse index locality, so prefer a time-ordered variant (UUIDv7/ULID) or a sequence when keys should stay compact or roughly ordered.",
+      "code_sketch": "@Entity\npublic class Order {\n    @Id\n    private UUID id = UUID.randomUUID();   // assigned before the INSERT\n}\n\n// modern providers: @GeneratedValue(strategy = GenerationType.UUID)\n// inserts send the key explicitly; no generated-key read-back",
+      "pitfalls": [
+        "A random (v4) UUID is not time-ordered: on B-tree indexes the inserts scatter, costing page splits and cache locality - UUIDv7/ULID or a sequence keeps locality.",
+        "Storing the key as varchar(36) doubles the index size compared with a native uuid/binary(16) column, and string comparison order is not chronological.",
+        "A client-generated key is only as unique as the generator: a flawed random source or a reused value on a shared table causes silent row collisions."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/8/docs/api/java/util/UUID.html"
+      ]
+    }
+  ],
+  "default_variant": "jpa-generated-value"
+}

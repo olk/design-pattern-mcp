@@ -1,0 +1,23 @@
+{
+  "pattern": "link-transfer",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "libcurl curl_easy_header + curl_url resolver + hand-rolled RFC 8288 Link parser",
+  "implementation_notes": "ISO C has no URI type, HTTP client, or link abstraction, so the link itself is a hand-written struct { char *href; char *rel; } plus an RFC 8288 Appendix B field-value parser over char*; what the C ecosystem supplies is the carrier and the resolver: libcurl's curl_easy_header (since 7.83) hands the application the raw Link: header value of a response (the CURLOPT_HEADERFUNCTION callback is the line-by-line fallback), and the curl_url interface parses the target URI and resolves a relative href against the request URL exactly as RFC 3986 Section 5 requires, with curl_url_get exposing scheme/host for policy checks before the link is dereferenced by a second easy transfer. The consumer's relation dispatch is a plain strcmp loop over the parsed links. This manual form stays justified in C because a full hypermedia client rarely fits embedded or systems footprints; when the payload side (HAL-style _links JSON) is needed instead of the header form, the canonical extension is a C JSON library feeding the same link struct, keeping the RFC 8288 header form for carriers that are not JSON bodies.",
+  "code_sketch": "struct link { char *href; char *rel; };                 /* copied from header data */\nstruct link links[16]; struct curl_header *h;\ncurl_easy_header(easy, \"Link\", 0, CURLH_HEADER, -1, &h);/* carrier: response header */\nsize_t n = parse_link_header(h->value, links, 16);      /* RFC 8288 B.2 parse+copy */\nfor (struct link *l = links; l < links + n; l++) {\n    if (strcmp(l->rel, \"payment\")) continue;            /* consumer: rel dispatch */\n    CURLU *u = curl_url();                              /* resolver */\n    curl_url_set(u, CURLUPART_URL, base, 0);            /* base = request URL */\n    curl_url_set(u, CURLUPART_URL, l->href, 0);         /* RFC 3986 relative resolve */\n    char *abs; curl_url_get(u, CURLUPART_URL, &abs, 0);\n    curl_easy_setopt(follow, CURLOPT_URL, abs);         /* dereference the link */\n    curl_easy_perform(follow);\n    curl_free(abs); curl_url_cleanup(u);                /* curl_free, never free() */\n}",
+  "pitfalls": [
+    "The curl_header struct returned by curl_easy_header is owned by the easy handle: its char* data is clobbered by the next curl_easy_header call on the same handle and freed only at curl_easy_cleanup, so a link list that stores the pointer instead of copying the bytes dangles as soon as the next header is read.",
+    "Every string produced by curl_url_get is allocated by libcurl and must be released with curl_free, never free(); mixing allocators across the library boundary is undefined behavior, and a link-following loop that forgets curl_url_cleanup leaks CURLU handles in long-running daemons.",
+    "Commas inside <...> targets and quoted-string parameters are legal, so a naive strtok(link_hdr, \",\") splits valid link-values; RFC 8288 Appendix B requires quote-aware scanning, rel must not appear more than once per link-value, and a relative target must be resolved against the request URL - any base URI in the body is explicitly not applied.",
+    "curl_global_init must run once before any other libcurl call and is not thread-safe on platforms where curl_version_info lacks the threadsafe feature bit, so calling it from a link-following worker thread races the whole process; easy handles themselves must never be shared between threads.",
+    "Dereferencing a received link is not authorization: check the resolved scheme and host (curl_url_get with CURLUPART_SCHEME/CURLUPART_HOST) against an allowlist before curl_easy_perform, or a crafted rel=\"next\" href turns your client into a pivot against internal services (SSRF)."
+  ],
+  "sources": [
+    "https://curl.se/libcurl/c/curl_easy_header.html",
+    "https://curl.se/libcurl/c/libcurl-url.html",
+    "https://curl.se/libcurl/c/curl_global_init.html",
+    "https://datatracker.ietf.org/doc/html/rfc8288",
+    "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Link"
+  ],
+  "version": "1.0"
+}

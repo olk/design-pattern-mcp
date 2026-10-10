@@ -1,0 +1,61 @@
+{
+  "pattern": "command-processor",
+  "language": "java",
+  "idiom_name": "Runnable/Callable commands, ExecutorService + BlockingQueue, Future results",
+  "implementation_notes": "Java's concurrency API *is* a command processor: Runnable/Callable are the command interface, `ExecutorService.submit()` owns the work queue and the thread policy, `Future` is the per-command outcome/cancellation handle the history layer records, and a `BlockingQueue` becomes an explicit command repository when commands must be inspected, prioritised (PriorityBlockingQueue) or replayed. Undo/redo comes from `javax.swing.undo.UndoManager` for interactive front-ends; application frameworks (Spring's TaskExecutor, Axon's CommandBus/CommandGateway with a handler registry) are the same shape plus a name-to-handler map. Hand-written Command class hierarchies are only justified when commands must be serialised for a persistent log.",
+  "code_sketch": "ExecutorService processor = Executors.newFixedThreadPool(4);\nBlockingQueue<OrderCommand> queue = new LinkedBlockingQueue<>(256);  // bounded repository\nCallable<Receipt> cmd = () -> service.place(orderId, qty);            // command\nFuture<Receipt> f = processor.submit(cmd);       // execution owned by the processor\nhistory.add(cmd);                                // log / undo source\nReceipt r = f.get(2, TimeUnit.SECONDS);          // failure surfaces here, not silently",
+  "pitfalls": [
+    "An unbounded LinkedBlockingQueue in the pool hides overload: producers never block and the executor's queue grows without limit.",
+    "with newFixedThreadPool, an exception thrown by a submitted task is only visible through the Future (or a ThreadFactory that installs an uncaught-exception handler); ignoring the Future silently discards the failure.",
+    "Commands executed on pool threads do not inherit request-scoped state (ThreadLocal, security context, MDC); pass it explicitly inside the command.",
+    "Default (non-virtual) platform threads are a scarce resource: blocking commands can starve the pool unless a bound and a rejection policy are set."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html"
+  ],
+  "support": "library",
+  "variants": [
+    {
+      "variant_id": "executor-service",
+      "name": "ExecutorService + BlockingQueue (classic)",
+      "paradigm": "oo",
+      "min_standard": "Java8",
+      "idiom_name": "Runnable/Callable commands, ExecutorService + BlockingQueue, Future results",
+      "implementation_notes": "Java's concurrency API *is* a command processor: Runnable/Callable are the command interface, `ExecutorService.submit()` owns the work queue and the thread policy, `Future` is the per-command outcome/cancellation handle the history layer records, and a `BlockingQueue` becomes an explicit command repository when commands must be inspected, prioritised (PriorityBlockingQueue) or replayed. Undo/redo comes from `javax.swing.undo.UndoManager` for interactive front-ends; application frameworks (Spring's TaskExecutor, Axon's CommandBus/CommandGateway with a handler registry) are the same shape plus a name-to-handler map. Hand-written Command class hierarchies are only justified when commands must be serialised for a persistent log.",
+      "code_sketch": "ExecutorService processor = Executors.newFixedThreadPool(4);\nBlockingQueue<OrderCommand> queue = new LinkedBlockingQueue<>(256);  // bounded repository\nCallable<Receipt> cmd = () -> service.place(orderId, qty);            // command\nFuture<Receipt> f = processor.submit(cmd);       // execution owned by the processor\nhistory.add(cmd);                                // log / undo source\nReceipt r = f.get(2, TimeUnit.SECONDS);          // failure surfaces here, not silently",
+      "pitfalls": [
+        "An unbounded LinkedBlockingQueue in the pool hides overload: producers never block and the executor's queue grows without limit.",
+        "with newFixedThreadPool, an exception thrown by a submitted task is only visible through the Future (or a ThreadFactory that installs an uncaught-exception handler); ignoring the Future silently discards the failure.",
+        "Commands executed on pool threads do not inherit request-scoped state (ThreadLocal, security context, MDC); pass it explicitly inside the command.",
+        "Default (non-virtual) platform threads are a scarce resource: blocking commands can starve the pool unless a bound and a rejection policy are set."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html"
+      ]
+    },
+    {
+      "variant_id": "virtual-threads",
+      "name": "Virtual-thread-per-task executor (Java 21)",
+      "paradigm": "concurrent",
+      "min_standard": "Java21",
+      "requires_features": [
+        "virtual-threads"
+      ],
+      "idiom_name": "Executors.newVirtualThreadPerTaskExecutor() + StructuredTaskScope",
+      "implementation_notes": "Java 21's virtual threads change the cost model of this pattern: `Executors.newVirtualThreadPerTaskExecutor()` makes a thread per command affordable, so the processor no longer needs a bounded pool to protect platform threads - blocking receivers (JDBC, HTTP, file I/O) merely unmount from the carrier, and `StructuredTaskScope` gives the macro/transaction variant all-or-nothing semantics with guaranteed cancellation. Queueing then exists for ordering, backpressure and durability rather than to cap threads, so an explicit bounded queue in front of the executor remains the right repository.",
+      "code_sketch": "try (var processor = Executors.newVirtualThreadPerTaskExecutor()) {\n    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {\n        for (Command c : queuedCommands) {                 // macro: one unit of work\n            scope.fork(() -> { c.execute(receiver); return null; });\n        }\n        scope.join();                                      // structured, not fire-and-forget\n        scope.throwIfFailed();\n    }\n}   // close() waits for all commands to finish",
+      "pitfalls": [
+        "Virtual threads are not pooled - never keep one in a field or hand it to a pool; create the executor once and let it create threads per task.",
+        "A synchronized block (or a native/foreign call) around blocking I/O pins the virtual thread to its carrier, which quietly restores the old pooling bottleneck.",
+        "A thread-per-command executor removes the thread cap but not the need for a bounded repository: unbounded submission still exhausts downstream resources (connections, file descriptors).",
+        "StructuredTaskScope requires explicit join(); abandoning a scope without joining leaks the forked commands' failure reporting."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html"
+      ]
+    }
+  ],
+  "default_variant": "executor-service",
+  "version": "1.0"
+}

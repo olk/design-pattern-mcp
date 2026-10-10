@@ -1,0 +1,58 @@
+{
+  "pattern": "health-check-endpoint",
+  "language": "c",
+  "support": "manual",
+  "implementation_notes": "The portable variant: a dedicated listener (socket/bind/listen) answered by a polling loop (poll(2)) that accepts one connection at a time (accept(2)) and writes a fixed HTTP response with the status code the decider acts on. The classic structure survives in full - there is no registry and no framework, so the worker updates a single readiness snapshot (an atomic int, or a mutex-protected struct) that the handler serialises. Keep the health port separate from the traffic port so that a saturated worker cannot starve the probe, and give the poll loop a timeout so the readiness snapshot is re-evaluated instead of served stale. C has neither a health subsystem nor an HTTP stack in its standard library, so the classic structure survives almost intact and the two honest realizations are structural opposites: either hand-write a status endpoint (socket/bind/listen plus a poll(2)/accept(2) loop that writes a fixed HTTP response on its own port) or, when systemd or a similar supervisor owns the process lifetime, push a watchdog keep-alive and let the supervisor decide (sd_notify with WATCHDOG=1 for WatchdogSec=). What replaces the framework-provided registry is a single readiness snapshot that the workers publish atomically and the endpoint (or the keep-alive loop) reads. The classic form is justified whenever the process is a C server with its own event loop; for a daemon under a supervisor the watchdog is usually the smaller and more reliable change.",
+  "idiom_name": "poll(2) loop + accept(2) on a health port, status code 200/503",
+  "code_sketch": "static _Atomic int g_ready;                                  /* published by the workers */\n\nvoid *health_loop(void *arg) {\n    int lfd = (int)(intptr_t)arg;                            /* socket/bind/listen, health port */\n    struct pollfd p = { .fd = lfd, .events = POLLIN };\n    for (;;) {\n        if (poll(&p, 1, 1000) <= 0) continue;                /* re-read readiness each second */\n        int c = accept(lfd, NULL, NULL), ok = atomic_load(&g_ready);\n        const char *r = ok ? \"HTTP/1.1 200 OK\\r\\n\\r\\nok\" : \"HTTP/1.1 503\\r\\n\\r\\nnot ready\";\n        if (write(c, r, strlen(r)) < 0) { /* prober gone */ }\n        close(c);\n    }\n}\n",
+  "pitfalls": [
+    "The readiness snapshot is shared across threads: without an atomic or a lock the compiler and the CPU are free to serve a stale flag, and the endpoint reports ready for an instance that already lost its database connection.",
+    "SIGPIPE terminates the whole process when the decider closes the connection before the response is written - ignore it (or use MSG_NOSIGNAL) or the health probe becomes the crash source.",
+    "A blocking accept() with no poll() timeout, or a handler that loops over multiple checks, can miss the decider's deadline and get the instance declared dead while it is healthy."
+  ],
+  "sources": [
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/accept.html",
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/poll.html",
+    "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+  ],
+  "variants": [
+    {
+      "variant_id": "socket-health-handler",
+      "name": "Hand-written status endpoint on a health port (pull)",
+      "paradigm": "procedural",
+      "implementation_notes": "The portable variant: a dedicated listener (socket/bind/listen) answered by a polling loop (poll(2)) that accepts one connection at a time (accept(2)) and writes a fixed HTTP response with the status code the decider acts on. The classic structure survives in full - there is no registry and no framework, so the worker updates a single readiness snapshot (an atomic int, or a mutex-protected struct) that the handler serialises. Keep the health port separate from the traffic port so that a saturated worker cannot starve the probe, and give the poll loop a timeout so the readiness snapshot is re-evaluated instead of served stale. C has neither a health subsystem nor an HTTP stack in its standard library, so the classic structure survives almost intact and the two honest realizations are structural opposites: either hand-write a status endpoint (socket/bind/listen plus a poll(2)/accept(2) loop that writes a fixed HTTP response on its own port) or, when systemd or a similar supervisor owns the process lifetime, push a watchdog keep-alive and let the supervisor decide (sd_notify with WATCHDOG=1 for WatchdogSec=). What replaces the framework-provided registry is a single readiness snapshot that the workers publish atomically and the endpoint (or the keep-alive loop) reads. The classic form is justified whenever the process is a C server with its own event loop; for a daemon under a supervisor the watchdog is usually the smaller and more reliable change.",
+      "min_standard": "C11",
+      "idiom_name": "poll(2) loop + accept(2) on a health port, status code 200/503",
+      "code_sketch": "static _Atomic int g_ready;                                  /* published by the workers */\n\nvoid *health_loop(void *arg) {\n    int lfd = (int)(intptr_t)arg;                            /* socket/bind/listen, health port */\n    struct pollfd p = { .fd = lfd, .events = POLLIN };\n    for (;;) {\n        if (poll(&p, 1, 1000) <= 0) continue;                /* re-read readiness each second */\n        int c = accept(lfd, NULL, NULL), ok = atomic_load(&g_ready);\n        const char *r = ok ? \"HTTP/1.1 200 OK\\r\\n\\r\\nok\" : \"HTTP/1.1 503\\r\\n\\r\\nnot ready\";\n        if (write(c, r, strlen(r)) < 0) { /* prober gone */ }\n        close(c);\n    }\n}\n",
+      "pitfalls": [
+        "The readiness snapshot is shared across threads: without an atomic or a lock the compiler and the CPU are free to serve a stale flag, and the endpoint reports ready for an instance that already lost its database connection.",
+        "SIGPIPE terminates the whole process when the decider closes the connection before the response is written - ignore it (or use MSG_NOSIGNAL) or the health probe becomes the crash source.",
+        "A blocking accept() with no poll() timeout, or a handler that loops over multiple checks, can miss the decider's deadline and get the instance declared dead while it is healthy."
+      ],
+      "sources": [
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/accept.html",
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/poll.html",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+      ]
+    },
+    {
+      "variant_id": "systemd-sd-notify-watchdog",
+      "name": "systemd watchdog keep-alive (push)",
+      "paradigm": "procedural",
+      "implementation_notes": "Where systemd (or a supervisor speaking the same protocol) owns the process lifetime, the health signal can be pushed instead of polled: systemd exports WATCHDOG_USEC when WatchdogSec= is configured, and the process must call sd_notify(0, \"WATCHDOG=1\") at least once per period or the service is treated as hung and the configured action is taken. This replaces the port, the parser and the response writer with one library call driven from the main loop, while READY=1 and STOPPING=1 cover startup completion and drain. Treat it as liveness only: it proves the loop still turns, not that the process can serve requests.",
+      "min_standard": "C99",
+      "idiom_name": "sd_notify(3) WATCHDOG=1 keep-alive for WatchdogSec=",
+      "code_sketch": "#include <systemd/sd-daemon.h>\n\nuint64_t usec = 0;\nsd_watchdog_enabled(0, &usec);   /* owned/watchdog_usec from the environment */\nsd_notify(0, \"READY=1\");        /* startup complete */\nfor (;;) {\n    tick();                      /* one iteration of the real work loop */\n    if (usec > 0) sd_notify(0, \"WATCHDOG=1\");\n}\n/* on shutdown: sd_notify(0, \"STOPPING=1\"); */\n",
+      "pitfalls": [
+        "A ping emitted from a timer or helper thread that is independent of the work loop keeps the unit alive while the process is wedged - the keep-alive must be driven by the same loop that does the work, and it goes silent when that loop is stuck.",
+        "WATCHDOG_USEC is only set when the watchdog is enabled: code that assumes the ping is always armed silently loses its health signal when the unit is deployed without WatchdogSec=.",
+        "Using WATCHDOG=trigger for ordinary request failures converts transient errors into supervisor-initiated restarts; reserve it for detected internal inconsistency."
+      ],
+      "sources": [
+        "https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html"
+      ]
+    }
+  ],
+  "default_variant": "socket-health-handler",
+  "version": "1.0"
+}

@@ -1,0 +1,63 @@
+{
+  "pattern": "claim-check",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "shm_open + ftruncate + mmap(MAP_SHARED), name travels in the message header",
+  "implementation_notes": "Producer and consumer share a POSIX shared-memory object: shm_open creates or opens it by name, ftruncate fixes its length and mmap(MAP_SHARED) maps it, so the payload is written once into memory that both processes can read; the object name is what the message carries. Cleanup belongs to the pattern: shm_unlink removes the name while existing mappings keep working, so the consumer that claims the data must unlink it once it has read it.",
+  "code_sketch": "int fd = shm_open(\"/orders-4471\", O_CREAT | O_RDWR, 0600);\nftruncate(fd, (off_t)(sizeof(hdr) + len));\nvoid *seg = mmap(NULL, sizeof(hdr) + len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\nmemcpy(seg, payload, len);\nmsg.claim_check = \"/orders-4471\";       /* only the name travels */\n/* consumer: shm_open(name, O_RDONLY, 0) -> mmap -> read -> shm_unlink(name) */",
+  "pitfalls": [
+    "The segment length is fixed by ftruncate: a payload that grows later needs a new object (and a new name in the message).",
+    "Shared memory has no access control beyond the file mode and the host-wide name space: any process that can open the name can read the payload, so an opaque name is not a secret.",
+    "shm_unlink only drops the name - a process that already mapped the segment keeps reading it, so \"deleted\" payloads can survive in stragglers.",
+    "Crashing between create and unlink leaves the object in /dev/shm (and in the kernel's limits) for the next run to trip over."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man7/shm_overview.7.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "named-shm",
+      "name": "POSIX shared memory object whose name is the claim check",
+      "paradigm": "procedural",
+      "implementation_notes": "Producer and consumer share a POSIX shared-memory object: shm_open creates or opens it by name, ftruncate fixes its length and mmap(MAP_SHARED) maps it, so the payload is written once into memory that both processes can read; the object name is what the message carries. Cleanup belongs to the pattern: shm_unlink removes the name while existing mappings keep working, so the consumer that claims the data must unlink it once it has read it.",
+      "min_standard": "C99",
+      "requires_features": [
+        "POSIX shared memory objects (shm_open, ftruncate, mmap)"
+      ],
+      "idiom_name": "shm_open + ftruncate + mmap(MAP_SHARED), name travels in the message header",
+      "code_sketch": "int fd = shm_open(\"/orders-4471\", O_CREAT | O_RDWR, 0600);\nftruncate(fd, (off_t)(sizeof(hdr) + len));\nvoid *seg = mmap(NULL, sizeof(hdr) + len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\nmemcpy(seg, payload, len);\nmsg.claim_check = \"/orders-4471\";       /* only the name travels */\n/* consumer: shm_open(name, O_RDONLY, 0) -> mmap -> read -> shm_unlink(name) */",
+      "pitfalls": [
+        "The segment length is fixed by ftruncate: a payload that grows later needs a new object (and a new name in the message).",
+        "Shared memory has no access control beyond the file mode and the host-wide name space: any process that can open the name can read the payload, so an opaque name is not a secret.",
+        "shm_unlink only drops the name - a process that already mapped the segment keeps reading it, so \"deleted\" payloads can survive in stragglers.",
+        "Crashing between create and unlink leaves the object in /dev/shm (and in the kernel's limits) for the next run to trip over."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/shm_overview.7.html"
+      ]
+    },
+    {
+      "variant_id": "scm-rights-fd",
+      "name": "Descriptor passing over an AF_UNIX socket (SCM_RIGHTS)",
+      "paradigm": "procedural",
+      "implementation_notes": "When the two ends already talk over an AF_UNIX socket, the payload can be an ordinary file (or shared-memory object) and the claim check becomes the open file descriptor itself: sendmsg/recvmsg with an SCM_RIGHTS ancillary message transfers a reference to the open file description, which the receiver maps with mmap or reads with pread. The reference is a capability - it disappears when the last descriptor closes - so there is no name that other processes can guess or attach to.",
+      "min_standard": "C99",
+      "requires_features": [
+        "AF_UNIX sockets (sendmsg/recvmsg with SCM_RIGHTS)"
+      ],
+      "idiom_name": "sendmsg/recvmsg with SCM_RIGHTS, the passed descriptor is the claim check",
+      "code_sketch": "int fd = memfd_create(\"order-4471\", 0);          /* or open(tmpfile) */\nwrite(fd, payload, len);\n/* pass the descriptor as ancillary data, not the bytes */\nstruct cmsghdr *c = CMSG_FIRSTHDR(&msg);\nc->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;\nmemcpy(CMSG_DATA(c), &fd, sizeof(fd));\nsendmsg(sock, &msg, 0);\n/* receiver: recvmsg -> fd in CMSG_DATA -> mmap/pread -> close(fd) */",
+      "pitfalls": [
+        "A descriptor survives only as long as some process keeps it open: if the receiver fails to duplicate or hold it, the payload is gone when the sender exits.",
+        "Truncating the ancillary buffer (or never enabling SO_PASSCRED style checks) silently closes excess descriptors, so the failure looks like a missing payload rather than a protocol bug.",
+        "Nothing prevents leaking descriptors: every failed recvmsg path that does not close what it received drains the file-descriptor table.",
+        "FD passing works only between processes on the same host with a Unix-domain socket; a bridged or networked hop cannot carry the capability."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man7/unix.7.html"
+      ]
+    }
+  ],
+  "default_variant": "named-shm"
+}

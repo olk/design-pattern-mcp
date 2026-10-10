@@ -1,0 +1,72 @@
+{
+  "pattern": "service-to-worker",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "Drogon registerHandler + HttpResponse::newHttpViewResponse(template.csp, HttpViewData)",
+  "implementation_notes": "Drogon is the direct C++ analogue: app().registerHandler(\"/orders/{1}\", handler) (or an HttpController class) is the controller/dispatcher, the handler calls the service layer, fills an HttpViewData with {{key}} values and answers with HttpResponse::newHttpViewResponse(\"ShowOrder.csp\", data); the CSP template is the view, and its <%c++ %> blocks plus helper functions cover the view-helper slot. What replaces the classic structure is the framework - routing, handler lifecycle and view lookup are library pieces, so only the worker and the template remain yours; the hand-written controller is justified when the project must stay on a bare HTTP library or needs custom dispatch semantics (see the beast-manual-router variant).",
+  "code_sketch": "app().registerHandler(\"/orders/{1}\",\n    [](const HttpRequestPtr &req,\n       std::function<void(const HttpResponsePtr &)> &&cb) {\n        auto id = req->getParameter(\"1\");\n        auto order = OrderService::instance().find(id);   // worker\n        HttpViewData data;                                // intermediate model\n        data.insert(\"order\", order);\n        cb(HttpResponse::newHttpViewResponse(\"ShowOrder.csp\", data));\n    },\n    { Get });\n",
+  "pitfalls": [
+    "HttpViewData is string-keyed: the template's {{order}} and the handler's data.insert(\"order\", ...) agree only at render time, so a rename degrades to an empty placeholder instead of a compile error.",
+    "Handlers run on Drogon's event loops - a blocking database call inside one stalls every connection served by that loop; use the async client APIs or a separate thread pool.",
+    "Views are enabled/registered explicitly (CSP support at build time, loadView for dynamic cases); a missing template surfaces as a runtime error page, not a build failure."
+  ],
+  "sources": [
+    "https://drogon.org/"
+  ],
+  "variants": [
+    {
+      "variant_id": "drogon-csp",
+      "name": "Drogon HttpController / registerHandler with CSP views",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "Drogon registerHandler + HttpResponse::newHttpViewResponse(template.csp, HttpViewData)",
+      "implementation_notes": "Drogon is the direct C++ analogue: app().registerHandler(\"/orders/{1}\", handler) (or an HttpController class) is the controller/dispatcher, the handler calls the service layer, fills an HttpViewData with {{key}} values and answers with HttpResponse::newHttpViewResponse(\"ShowOrder.csp\", data); the CSP template is the view, and its <%c++ %> blocks plus helper functions cover the view-helper slot. What replaces the classic structure is the framework - routing, handler lifecycle and view lookup are library pieces, so only the worker and the template remain yours; the hand-written controller is justified when the project must stay on a bare HTTP library or needs custom dispatch semantics (see the beast-manual-router variant).",
+      "code_sketch": "app().registerHandler(\"/orders/{1}\",\n    [](const HttpRequestPtr &req,\n       std::function<void(const HttpResponsePtr &)> &&cb) {\n        auto id = req->getParameter(\"1\");\n        auto order = OrderService::instance().find(id);   // worker\n        HttpViewData data;                                // intermediate model\n        data.insert(\"order\", order);\n        cb(HttpResponse::newHttpViewResponse(\"ShowOrder.csp\", data));\n    },\n    { Get });\n",
+      "pitfalls": [
+        "HttpViewData is string-keyed: the template's {{order}} and the handler's data.insert(\"order\", ...) agree only at render time, so a rename degrades to an empty placeholder instead of a compile error.",
+        "Handlers run on Drogon's event loops - a blocking database call inside one stalls every connection served by that loop; use the async client APIs or a separate thread pool.",
+        "Views are enabled/registered explicitly (CSP support at build time, loadView for dynamic cases); a missing template surfaces as a runtime error page, not a build failure."
+      ],
+      "sources": [
+        "https://drogon.org/"
+      ]
+    },
+    {
+      "variant_id": "crow-mustache",
+      "name": "Crow micro-framework with Mustache templates",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "CROW_ROUTE(app, \"/orders/<int>\") + crow::mustache::load(...).render(ctx)",
+      "implementation_notes": "Crow keeps the same shape at a smaller scale: CROW_ROUTE(app, \"/orders/<int>\") registers the worker, which builds a crow::json::wvalue context and returns crow::mustache::load(\"orders/show.html\").render(ctx) - the route table is the dispatcher and the Mustache file is the view. Headers-only and C++11-friendly, so it fits small services and constrained build environments; the classic controller class disappears entirely, which is the point - what remains is worker + template. Choose Drogon instead when the application needs ORM, plugins or an async client stack.",
+      "code_sketch": "CROW_ROUTE(app, \"/orders/<int>\")\n([](int id) {\n    crow::json::wvalue ctx;                       // intermediate model\n    ctx[\"order\"] = OrderService::instance().find(id)->to_json();   // worker\n    return crow::mustache::load(\"orders/show.html\").render(ctx);   // view\n});\napp.port(8080).multithreaded().run();\n",
+      "pitfalls": [
+        "crow::mustache::load resolves against the base path set with crow::mustache::set_base_path - start the binary from another working directory and every view lookup fails at request time.",
+        "The context is a hand-built json::wvalue: a key the template does not expect (or lacks) renders an empty section with no diagnostic.",
+        "Mustache is logic-less by design - loops and partials only - so anything a template used to compute must be precomputed by the worker."
+      ],
+      "sources": [
+        "https://crowcpp.org/master/guides/templating/",
+        "https://crowcpp.org/master/"
+      ]
+    },
+    {
+      "variant_id": "beast-manual-router",
+      "name": "Hand-written dispatcher over a bare HTTP library (Boost.Beast)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::map<target, handler> route table + render(model) step over Boost.Beast",
+      "implementation_notes": "With only an HTTP library under you the pattern is hand-written: a std::map (or vector) of {target -> handler} is the controller/dispatcher, each handler returns a model struct instead of markup, and one render function formats that model into the http::response body. This is the variant to choose when the view is produced by your own code or a template engine you already ship, and when matching policy (versioning, custom path rules, content negotiation) must be yours - you pay for it by implementing what a framework would have provided: matching, error mapping and view lookup.",
+      "code_sketch": "using Handler = std::function<Model(const http::request<http::string_body>&)>;\nconst std::map<std::string, Handler> routes{          // dispatcher\n    {\"/orders\", [](const auto &req) { return orders_index(req); }},\n};\nauto it = routes.find(std::string(target));\nModel model = (it != routes.end()) ? it->second(req) : not_found_model();\nres.result(http::status::ok);\nres.body() = render(model);                           // single render step\nres.prepare_payload();\n",
+      "pitfalls": [
+        "Every route must go through render(); a handler that sets res.body() itself makes the model/template contract unenforceable.",
+        "The map lookup provides no wildcards or parameter binding - order-sensitive prefix matching is easy to get wrong and silently serves the wrong page.",
+        "Beast's request/response objects are consumed by the asynchronous session stack; copy the model out before serialising so no view reads moved-from state."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/libs/beast/doc/html/index.html"
+      ]
+    }
+  ],
+  "default_variant": "drogon-csp",
+  "version": "1.0"
+}

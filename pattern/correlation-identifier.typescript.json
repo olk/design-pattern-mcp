@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "typescript",
+  "support": "idiomatic",
+  "idiom_name": "typed Map<string, {resolve, reject}> + AbortSignal.timeout / AsyncLocalStorage context",
+  "implementation_notes": "TypeScript adds the type discipline this pattern needs rather than new mechanics: a small pending-record interface stored in a Map keyed by the correlation id lets each call be typed to its own reply shape, and the reply router narrows by message id. The runtime work is plain JavaScript - promise, timer, Map - with the deadline as a timer or AbortSignal.timeout(ms) combined through AbortSignal.any for caller-supplied cancellation, and Node's AsyncLocalStorage<CorrelationContext> is how a typed request context (id plus trace fields) is propagated to logs and downstream calls without threading it through every signature. Keeping ids as strings avoids the JSON number-precision trap when the peer is another runtime.",
+  "code_sketch": "interface Pending<T> { resolve(v: T): void; reject(e: Error): void; timer: NodeJS.Timeout; }\nconst pending = new Map<string, Pending<unknown>>();\n\nfunction call<T>(payload: unknown, timeoutMs = 5_000): Promise<T> {\n  return new Promise<T>((resolve, reject) => {\n    const id = randomUUID();\n    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`no reply for ${id}`)); }, timeoutMs);\n    pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });  // register BEFORE send\n    socket.send(JSON.stringify({ id, payload }));\n  });\n}\n\nsocket.on(\"message\", (raw) => {\n  const msg = JSON.parse(raw) as { id: string; payload: unknown };\n  const d = pending.get(msg.id);\n  if (!d) return;                                   // unknown or late id: drop\n  pending.delete(msg.id); clearTimeout(d.timer); d.resolve(msg.payload);\n});",
+  "pitfalls": [
+    "Map<string, Pending<unknown>> erases the reply type, so keep the one unavoidable cast inside a thin typed wrapper per request kind instead of scattering 'as' assertions across call sites.",
+    "Timers hold the event loop open: clear them when the reply arrives and call unref() for long deadlines in library code, or a client with no outstanding replies still prevents process exit.",
+    "A promise whose entry is deleted without being settled hangs its caller forever, so every removal path - timeout, socket close, validation failure - must reject or the caller leaks a suspended promise.",
+    "Correlation ids arriving from the wire are strings (JSON has no 64-bit integer), so never build them as numbers or compare with strict equality against a numeric id."
+  ],
+  "sources": [
+    "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise",
+    "https://nodejs.org/api/async_context.html"
+  ],
+  "version": "1.0"
+}

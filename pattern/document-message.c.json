@@ -1,0 +1,59 @@
+{
+  "pattern": "document-message",
+  "language": "c",
+  "support": "manual",
+  "version": "1.0",
+  "idiom_name": "struct + explicit length/version framing",
+  "implementation_notes": "The document is a C struct whose fields are copied to and from a wire buffer explicitly: fix field order and widths, convert 16/32-bit integers with htons/htonl and ntohs/ntohl from <arpa/inet.h>, prefix the body with a length and a version, and never memcpy a struct image onto the wire because padding and endianness differ per target. Ownership is part of the contract - the decoder allocates the document, the receiver frees it on exactly one path - and every length read from the wire is validated before it indexes or allocates. This is the default C realization because it works with no dependencies and keeps payload sizes minimal on embedded and high-volume paths; where the document is already JSON, cJSON's cJSON_Parse/cJSON_Print tree is the usual shortcut.",
+  "code_sketch": "typedef struct { uint8_t version; uint32_t order_id; uint16_t lines; } order_hdr_t;\n\nsize_t pack_order(uint8_t *buf, size_t cap, const order_t *o) {\n    if (cap < sizeof(order_hdr_t)) return 0;\n    order_hdr_t h = { .version = 3, .order_id = htonl(o->order_id),\n                      .lines = htons(o->lines) };\n    memcpy(buf, &h, sizeof h);\n    return sizeof h;   /* the line bodies are encoded explicitly afterwards */\n}\n\n/* receiver: peek version, validate length, then decode; free once on one path */",
+  "pitfalls": [
+    "Every wire-derived length must be bounded before it is used for allocation or indexing; the classic document-parser bug is a heap overflow behind a plausible header.",
+    "One owner per document, freed exactly once: half-finished decode paths leak, and a borrowed pointer into a message buffer dangles after that buffer is reused.",
+    "Struct padding and alignment make the in-memory layout unusable as a wire format; without htonl/ntohl the same code passes on x86 and corrupts data on a big-endian target."
+  ],
+  "sources": [
+    "https://pubs.opengroup.org/onlinepubs/009696799/functions/htonl.html",
+    "https://github.com/DaveGamble/cJSON"
+  ],
+  "variants": [
+    {
+      "variant_id": "hand-rolled-framing",
+      "name": "Hand-written struct + big-endian framing (classic C)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "idiom_name": "struct + explicit length/version framing",
+      "implementation_notes": "The document is a C struct whose fields are copied to and from a wire buffer explicitly: fix field order and widths, convert 16/32-bit integers with htons/htonl and ntohs/ntohl from <arpa/inet.h>, prefix the body with a length and a version, and never memcpy a struct image onto the wire because padding and endianness differ per target. Ownership is part of the contract - the decoder allocates the document, the receiver frees it on exactly one path - and every length read from the wire is validated before it indexes or allocates. This is the default C realization because it works with no dependencies and keeps payload sizes minimal on embedded and high-volume paths; where the document is already JSON, cJSON's cJSON_Parse/cJSON_Print tree is the usual shortcut.",
+      "code_sketch": "typedef struct { uint8_t version; uint32_t order_id; uint16_t lines; } order_hdr_t;\n\nsize_t pack_order(uint8_t *buf, size_t cap, const order_t *o) {\n    if (cap < sizeof(order_hdr_t)) return 0;\n    order_hdr_t h = { .version = 3, .order_id = htonl(o->order_id),\n                      .lines = htons(o->lines) };\n    memcpy(buf, &h, sizeof h);\n    return sizeof h;   /* the line bodies are encoded explicitly afterwards */\n}\n\n/* receiver: peek version, validate length, then decode; free once on one path */",
+      "pitfalls": [
+        "Every wire-derived length must be bounded before it is used for allocation or indexing; the classic document-parser bug is a heap overflow behind a plausible header.",
+        "One owner per document, freed exactly once: half-finished decode paths leak, and a borrowed pointer into a message buffer dangles after that buffer is reused.",
+        "Struct padding and alignment make the in-memory layout unusable as a wire format; without htonl/ntohl the same code passes on x86 and corrupts data on a big-endian target."
+      ],
+      "sources": [
+        "https://pubs.opengroup.org/onlinepubs/009696799/functions/htonl.html",
+        "https://github.com/DaveGamble/cJSON"
+      ]
+    },
+    {
+      "variant_id": "protobuf-c-codegen",
+      "name": "protobuf-c generated documents",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "code-generation"
+      ],
+      "idiom_name": "protoc --c_out + libprotobuf-c pack/unpack",
+      "implementation_notes": "When the document contract is shared with other languages, the schema lives in a .proto file and protoc --c_out (the protoc-gen-c plugin) generates .pb-c.c/.pb-c.h with a descriptor per message; you pack with protobuf_c_message_pack/pack_to_buffer and unpack with protobuf_c_message_unpack, then free with protobuf_c_message_free_unpacked. The generated headers are not standalone artifacts - they carry version guards against the installed libprotobuf-c - so they must be regenerated as part of the build rather than vendored. Choose this route when field evolution and cross-language contracts outweigh the dependency and codegen cost.",
+      "code_sketch": "#include \"order.pb-c.h\"\n\nOrderShipped *doc = order_shipped__pack(&order, buf, sizeof buf);\nif (!doc) return -1;                       /* serialize */\nOrderShipped *got = order_shipped__unpack(NULL, len, body);\nif (!got) { report_invalid(body, len); return -1; }\nhandle_document(got);                      /* receiver decides */\norder_shipped__free_unpacked(got, NULL);",
+      "pitfalls": [
+        "Generated .pb-c.h files must be rebuilt with the same libprotobuf-c version they are compiled against; vendoring them produces version-guard failures or silent ABI skew.",
+        "protobuf_c_message_unpack allocates the whole document, so the receiver owns the free - forgetting protobuf_c_message_free_unpacked leaks on every message.",
+        "The protoc/protoc-gen-c toolchain becomes a hard build dependency and must be pinned, or the document contract drifts between developers and CI."
+      ],
+      "sources": [
+        "https://github.com/protobuf-c/protobuf-c"
+      ]
+    }
+  ],
+  "default_variant": "hand-rolled-framing"
+}

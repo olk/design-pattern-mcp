@@ -1,0 +1,71 @@
+{
+  "pattern": "guarded-suspension",
+  "language": "java",
+  "support": "native",
+  "idiom_name": "synchronized + while(!pred) wait() ... notifyAll() (intrinsic monitor)",
+  "implementation_notes": "Every Java object is a monitor, so the classic structure is language semantics rather than a library: wait() releases the intrinsic lock and parks the thread in the object's wait set, notifyAll() wakes all of them and each re-acquires the lock before returning. Oracle's Guarded Blocks tutorial requires the wait to sit inside a loop that tests the predicate and notes that a notification does not prove this thread's condition holds; notifyAll is the safe default and notify is only for a large pool of interchangeable waiters. Move to j.u.c Condition when one lock must serve several distinct wait sets, and to BlockingQueue when the guard is literally 'an item is available'.",
+  "code_sketch": "private final Queue<Integer> queue = new ArrayDeque<>();\n\npublic synchronized int take() throws InterruptedException {\n    while (queue.isEmpty()) wait();     // release the lock, wait, re-acquire\n    return queue.poll();                // guarded action on a consistent queue\n}\n\npublic synchronized void put(int v) {\n    queue.add(v);                       // change state first\n    notifyAll();                        // then wake the wait set\n}",
+  "pitfalls": [
+    "Swallowing InterruptedException (or clearing the interrupt without rethrowing) breaks cancellation and shutdown for the whole wait set.",
+    "Calling wait/notify outside synchronized throws IllegalMonitorStateException, and calling wait while holding a second lock invites deadlock.",
+    "notify() wakes an arbitrary waiter: with two predicates on one monitor it can wake a thread whose guard is still false while the thread that could proceed stays parked."
+  ],
+  "sources": [
+    "https://docs.oracle.com/javase/tutorial/essential/concurrency/guardmeth.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Condition.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "intrinsic-wait-notifyall",
+      "name": "Intrinsic monitors: synchronized + wait/notifyAll",
+      "paradigm": "oo",
+      "min_standard": "Java1",
+      "idiom_name": "synchronized + while(!pred) wait() ... notifyAll() (intrinsic monitor)",
+      "implementation_notes": "Every Java object is a monitor, so the classic structure is language semantics rather than a library: wait() releases the intrinsic lock and parks the thread in the object's wait set, notifyAll() wakes all of them and each re-acquires the lock before returning. Oracle's Guarded Blocks tutorial requires the wait to sit inside a loop that tests the predicate and notes that a notification does not prove this thread's condition holds; notifyAll is the safe default and notify is only for a large pool of interchangeable waiters. Move to j.u.c Condition when one lock must serve several distinct wait sets, and to BlockingQueue when the guard is literally 'an item is available'.",
+      "code_sketch": "private final Queue<Integer> queue = new ArrayDeque<>();\n\npublic synchronized int take() throws InterruptedException {\n    while (queue.isEmpty()) wait();     // release the lock, wait, re-acquire\n    return queue.poll();                // guarded action on a consistent queue\n}\n\npublic synchronized void put(int v) {\n    queue.add(v);                       // change state first\n    notifyAll();                        // then wake the wait set\n}",
+      "pitfalls": [
+        "Swallowing InterruptedException (or clearing the interrupt without rethrowing) breaks cancellation and shutdown for the whole wait set.",
+        "Calling wait/notify outside synchronized throws IllegalMonitorStateException, and calling wait while holding a second lock invites deadlock.",
+        "notify() wakes an arbitrary waiter: with two predicates on one monitor it can wake a thread whose guard is still false while the thread that could proceed stays parked."
+      ],
+      "sources": [
+        "https://docs.oracle.com/javase/tutorial/essential/concurrency/guardmeth.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Condition.html"
+      ]
+    },
+    {
+      "variant_id": "condition-await-signal",
+      "name": "java.util.concurrent.locks.Condition (multiple wait sets)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "ReentrantLock.newCondition → await/signalAll",
+      "implementation_notes": "Condition factors the Object monitor methods out into distinct wait sets per lock, which removes the wake-the-wrong-waiter problem of a bounded buffer: one condition for not-empty and one for not-full, each signalled only when its own predicate changes; await atomically releases the associated lock and always returns holding it again, and the JDK documents that spurious wake-ups are permitted so the predicate loop stays mandatory. Choose it over intrinsic monitors when a single lock serves several predicates or when timed/uninterruptible waits are needed.",
+      "code_sketch": "private final ReentrantLock lock = new ReentrantLock();\nprivate final Condition notEmpty = lock.newCondition();\nprivate final Condition notFull  = lock.newCondition();\n\npublic int take() throws InterruptedException {\n    lock.lock();\n    try {\n        while (queue.isEmpty()) notEmpty.await();  // only this wait set\n        int v = queue.poll(); notFull.signal();    // wake the right producer\n        return v;\n    } finally { lock.unlock(); }\n}",
+      "pitfalls": [
+        "A Condition is intrinsically bound to the lock that created it, and the JDK recommends never using one as a monitor object as well.",
+        "signal still permits spurious wake-ups, so the predicate must be re-checked even with a private wait set."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Condition.html"
+      ]
+    },
+    {
+      "variant_id": "blocking-queue-take-put",
+      "name": "java.util.concurrent.BlockingQueue take/put (library guard)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "BlockingQueue.take() / put() (blocking, timed, interruptible)",
+      "implementation_notes": "BlockingQueue packages guarded suspension as a type: take() waits for the queue to become non-empty and put() waits for space, in blocking, timed and interruptible forms, with the happens-before edge documented; the JDK shows the producer-consumer usage and warns that close or shutdown is not intrinsic, so termination needs an end-of-stream marker such as a poison pill. Prefer it whenever the guard is 'items or space available', and keep the monitor or Condition forms for guards that are not queue-shaped.",
+      "code_sketch": "BlockingQueue<Task> q = new ArrayBlockingQueue<>(64);\n\n// consumer thread\nfor (;;) {\n    Task t = q.take();              // waits while the queue is empty\n    if (t == POISON) break;         // end-of-stream marker instead of close()\n    handle(t);\n}\n\n// producer thread\ntry { q.put(task); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }",
+      "pitfalls": [
+        "BlockingQueue has no close/shutdown operation, so a missing poison pill leaves consumers parked forever.",
+        "put() on a full queue blocks the producer: choose a capacity and use offer(timeout) where a stalled producer is a liveness risk."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html"
+      ]
+    }
+  ],
+  "default_variant": "intrinsic-wait-notifyall",
+  "version": "1.0"
+}

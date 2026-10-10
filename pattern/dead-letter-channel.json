@@ -1,0 +1,204 @@
+{
+  "category": "workflow-messaging",
+  "name": "dead-letter-channel",
+  "aliases": [
+    "dead letter queue",
+    "DLQ",
+    "dead-letter-queue",
+    "DLT (dead-letter topic, Kafka/Spring)",
+    "dead-letter subqueue (Azure Service Bus)"
+  ],
+  "intent": "Give messages that the messaging infrastructure cannot deliver - or that a consumer cannot process after its retry budget is spent - a dedicated, durable channel where they can be inspected, diagnosed and later replayed, instead of being silently discarded or redelivered forever.",
+  "problem": "At-least-once delivery means a message that can never be processed - malformed payload, unroutable destination, expired TTL, a handler that keeps rejecting - either loops between redelivery and rejection, blocking everything queued behind it, or is thrown away by the broker when the delivery limit is reached, leaving no trace of what was lost and no way to recover it.",
+  "context": "Asynchronous messaging across a process or system boundary where permanent failures are possible and somebody must be able to account for every message afterwards: broker-hosted queues and topics (AMQP, JMS, SQS, Service Bus), log-based streaming (Kafka, JetStream) and job queues (Sidekiq, BullMQ, Vapor Queues). It applies after the retry policy, not instead of it - the dead-letter channel is the terminal state of a delivery that has already had its chances.",
+  "benefits": [
+    "No silent loss: a message that runs out of attempts or expires is preserved with its payload intact instead of being dropped by the broker's retry limit.",
+    "Poison-message containment: the failing message leaves the working channel, so messages queued behind it keep flowing instead of being stuck behind a head-of-line redelivery loop.",
+    "Diagnosis from evidence: the parked message carries the raw payload plus failure context (dead-letter event history, original destination, reason, timestamps), which is exactly what a post-mortem needs.",
+    "A recovery path back to normal service: once the bug is fixed the parked messages can be replayed, turning an outage into a delay.",
+    "Separation of concerns: retry policy, failure routing and business logic sit in three different places; the handler only has to state that it cannot process this message.",
+    "Measurable failure surface: dead-letter arrivals and depth become an operational metric and an alerting target, which failure logs alone are not."
+  ],
+  "tradeoffs": [
+    "A dead-letter channel nobody services is a graveyard - dead-lettering converts loud loss into invisible loss unless someone monitors, triages and replays.",
+    "There is no automatic reprocessing: replay has to be built and run deliberately, and unless consumers are idempotent, replaying creates duplicates.",
+    "The channel must be bounded: without retention and quota policy a DLQ grows until it hits broker or cloud limits (SQS needs the DLQ retention to cover the redrive window; Azure Service Bus dead letters live in the same entity's subqueue, not in an independently managed one).",
+    "The dead-letter hop itself can lose messages: on non-quorum RabbitMQ queues dead-lettering republishes without publisher confirms, and a missing dead-letter exchange or target queue means the message is dropped silently.",
+    "Configuration is coupled to declaration: hardcoded queue arguments such as x-dead-letter-exchange cannot be changed without redeclaring the queue and redeploying, which is why brokers recommend policies instead.",
+    "Order and metadata lose fidelity: the record leaves its position in the working channel and its headers are rewritten (routing key replaced, death history compressed), so per-key ordering is broken and some original-routing facts survive only in the death history.",
+    "Detection is delayed by design: the incident surfaces when the DLQ is inspected, not when the message fails, and the lag between arrival and awareness is the real MTTR cost.",
+    "Raw payloads accumulate in a long-lived channel that may hold credentials, PII or payment data, so the DLQ inherits the sensitivity of everything that flows through the system.",
+    "Kafka has no native DLQ primitive: dead-letter handling must be implemented at the consumer, Connect, or Streams layer, adding complexity and the risk of the dead-letter hop itself dropping messages if offset management is incorrect.",
+    "NATS JetStream has no built-in DLQ: MaxDeliver reached merely drops the message from the consumer's pending list; a DLQ must be constructed from advisory monitoring and a separate catch-up stream, which is a do-it-yourself pattern.",
+    "Azure Service Bus DLQ lives in the same namespace entity as its parent - it cannot be independently retained, monitored or purged without affecting the parent, unlike independently-provisioned DLQs in SQS or RabbitMQ."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 5,
+    "reliability": 9,
+    "security": 5,
+    "scalability": 8
+  },
+  "participants": [
+    {
+      "role": "Source Channel",
+      "responsibility": "The queue, topic or subscription where the message should have been processed; its delivery attempts, TTL or acknowledgement rules are what run out."
+    },
+    {
+      "role": "Undeliverability Trigger",
+      "responsibility": "The broker policy or consumer error handler that decides the message will not be delivered: retries exhausted, rejected with requeue=false, TTL expired, queue-length limit reached, MaxDeliver exceeded, or no matching route."
+    },
+    {
+      "role": "Dead Letter Channel",
+      "responsibility": "The dedicated channel (queue, topic, subqueue, advisory-catch stream or database-backed failed store) that durably holds the failed message together with its failure metadata."
+    },
+    {
+      "role": "Dead-Letter Handler",
+      "responsibility": "The consumer, administrative tool or operator-facing UI that inspects, classifies, alerts on and replays dead-lettered messages; in many stacks this role is filled by people plus a runbook rather than by code."
+    },
+    {
+      "role": "Message Store",
+      "responsibility": "The durable backing of the dead-letter channel (broker store, database table, object store, advisory stream) that makes the parked messages survive restarts, restarts of the platform and incident response."
+    },
+    {
+      "role": "Operator",
+      "responsibility": "Owns the runbook: alert thresholds, triage, the decision to re-drive, repair or discard, and the audit trail that proves no message vanished."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "Kafka consumer meets a schema-invalid record: the handler catches the processing error and publishes the raw record plus error headers to a dedicated <topic>.DLT topic instead of committing and losing it. Spring Kafka's DefaultErrorHandler with DeadLetterPublishingRecoverer automates this.",
+    "Kafka Connect sink encounters a converter or SMT error: the connector routes the failed record to the DLQ topic (configured via errors.deadletterqueue.topic.name) with __connect.errors.* context headers, while the main pipeline continues.",
+    "Cloud queue consumer (SQS) exceeds its maxReceiveCount: the redrive policy moves the message to the DLQ, and after the fix a queue-level redrive task moves the backlog back to the source queue with configurable velocity.",
+    "JMS or AMQP listener whose message keeps rolling back: after max-delivery-attempts (Artemis, default 10) the broker moves it to the dead-letter address, where support staff inspect the original destination and failure counter.",
+    "NATS JetStream consumer reaches MaxDeliver: no automatic DLQ exists - the server emits a CONSUMER.MAX_DELIVERIES advisory; a DLQ must be built by subscribing to advisories and republishing failed messages to a separate catch-up stream with replay headers.",
+    "Azure Service Bus message exceeds maxDeliveryCount: the broker moves it to the entity's /$DeadLetterQueue subqueue. The DeadLetterReason and DeadLetterDescription headers encode the cause (MaxDeliveryCountExceeded, TTLExpiredException, HeaderSizeExceeded), enabling triage without inspecting the payload.",
+    "Job queue whose task exhausts its retry budget (Sidekiq, BullMQ, Vapor Queues, Celery): the failed job lands in a dead set or failed-jobs store with the exception, ready to be retried or discarded from an operator UI.",
+    "Partner integration where one payload breaks the translator: the raw message is parked as evidence of what was received, and replayed after the mapping fix.",
+    "Regulated or financial flow where every message must be accounted for: the dead-letter channel plus its audit trail is the proof that nothing disappeared during an incident.",
+    "IBM MQ queue manager cannot route a message (unknown queue, stopped channel, transmission-queue overflow): the MCA parks it on SYSTEM.DEAD.LETTER.QUEUE with an MQDLH dead-letter header carrying the reason code; the runmqdlq DLQ handler then applies a user-defined rules table to report, move or discard each message.",
+    "Apache Camel integration route whose processor keeps throwing: errorHandler(deadLetterChannel(\"jms:queue:dead\").maximumRedeliveries(3).redeliveryDelay(5000)) redelivers with backoff and only then moves the exchange to the dead-letter endpoint; useOriginalMessage keeps the pre-route payload so a manual retry re-injects the untouched message.",
+    "ESB proxy (WSO2 Enterprise Integrator) whose endpoint is unreachable: the faultSequence stores the failed message in a message store, and a scheduled message processor retries delivery on a fixed period with a retry cap - the EIP's persist-then-retry reading of the dead letter channel rather than the broker's park-and-page-one."
+  ],
+  "avoid_when": [
+    "The failure is transient: retry with backoff and an idempotent receiver first; dead-letter only what survives the retry budget.",
+    "Nobody will own the channel: without alerts and a documented triage and replay procedure, a DLQ is a slower way to lose messages.",
+    "The payload must not be retained (credentials, regulated data, PII): redact, encrypt or claim-check before parking, or handle the failure without storing the body.",
+    "The dependency itself is down (broker, database, network): dead-lettering needs the same infrastructure and will fail too; use retry, an outbox or guaranteed delivery and repair the dependency.",
+    "Ordering is contractual and unordered replay would break invariants: halting the consumer (poison pill, two-phase termination) or repairing in place beats a side channel.",
+    "Low-volume synchronous flow whose only operational surface is an error log and a manual retry: an extra channel and its runbook cost more than the failure does.",
+    "Kafka stream processing with exactly-once semantics (EOS): dead-lettering involves offset commits that can complicate the transactional boundary; prefer a two-phase commit or a transactional outbox within the same pipeline."
+  ],
+  "language_files": {
+    "generic": "dead-letter-channel.generic.json",
+    "c": "dead-letter-channel.c.json",
+    "cplusplus": "dead-letter-channel.cplusplus.json",
+    "csharp": "dead-letter-channel.csharp.json",
+    "go": "dead-letter-channel.go.json",
+    "java": "dead-letter-channel.java.json",
+    "javascript": "dead-letter-channel.javascript.json",
+    "kotlin": "dead-letter-channel.kotlin.json",
+    "python": "dead-letter-channel.python.json",
+    "ruby": "dead-letter-channel.ruby.json",
+    "rust": "dead-letter-channel.rust.json",
+    "scala": "dead-letter-channel.scala.json",
+    "swift": "dead-letter-channel.swift.json",
+    "typescript": "dead-letter-channel.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "declarative"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "invalid-message-channel",
+    "guaranteed-delivery",
+    "message-expiration",
+    "idempotent-receiver",
+    "retry",
+    "poison-pill",
+    "message-store",
+    "wire-tap",
+    "circuit-breaker",
+    "claim-check"
+  ],
+  "anti_patterns": [
+    "DLQ as graveyard: dead-lettering into a channel nobody consumes, monitors or owns - the failure becomes invisible instead of loud.",
+    "DLQ as a retry queue: routing every transient failure through the dead-letter channel and replaying it on a schedule; retries belong in a retry channel with backoff, dead-lettering is terminal.",
+    "Dead-letter loop: a dead-letter target that dead-letters back into the same source, or a replay job that re-injects the same poison message - RabbitMQ detects a cycle without a rejection and drops the message, so the loop quietly deletes data.",
+    "Metadata amnesia: republishing the payload without the original destination, routing key, attempt count and reason, leaving a channel full of records nothing can be replayed from.",
+    "Unbounded parking: no retention, quota or alert on the dead-letter channel, so it grows until it exhausts broker or cloud storage and takes the working channels down with it.",
+    "Unredacted parking: credentials, tokens or personal data copied verbatim into a long-lived channel whose access control is weaker than the source's.",
+    "Wrong DLQ metric: alerting on NumberOfMessagesSent (messages sent to DLQ) instead of ApproximateNumberOfMessagesVisible (messages visible in DLQ) - the former misses aging accumulation and gives a false sense of clean operation.",
+    "Kafka DLT auto-consumption: leaving Spring Kafka's autoStartDltHandler at its default true, causing DLT messages to immediately re-enter the same failing handler, creating an immediate re-DLQ loop.",
+    "Kafka offset commit before DLT publish: committing the source offset before successfully publishing to the DLT means the message is lost if the DLT publish fails - always write-then-commit.",
+    "NATS MaxDeliver as DLQ: treating JetStream's MaxDeliver as if it were a dead-letter mechanism - it drops the message from pending and emits an advisory; the DLQ must be built from that advisory as a separate pattern."
+  ],
+  "design_principles": [
+    "Separation of concerns: retry policy, failure routing and business processing are three responsibilities that live in three different places.",
+    "Fail-safe defaults: a message that cannot be delivered is preserved, never silently discarded.",
+    "Observability as a design goal: the failure path deserves the same instrumentation as the happy path - arrival events, depth, reason labels and alerts.",
+    "Single responsibility per channel: dead letters get their own channel, retained and keyed for diagnosis, never mixed into the working channel.",
+    "Least privilege and data minimisation: dead-letter content is as sensitive as production traffic and should be readable only by the roles that triage it, and only for as long as needed.",
+    "DLQ as evidence, not as infrastructure: the DLQ is a parking lot for failed deliveries, not a queue to be processed by business logic - keep triage and replay as a separate operational concern."
+  ],
+  "best_practices": [
+    "Bound the retries first (attempt count plus backoff, idempotent receiver) and dead-letter only what survives the budget.",
+    "Preserve the failure context on the parked record: original destination, topic/partition/offset or queue, routing key, timestamps, attempt count, exception class and message.",
+    "Alert on dead-letter arrivals rather than only on queue depth, and give the channel a named owner with a documented triage and re-drive procedure.",
+    "Make consumers idempotent before enabling replay - a replay is a re-delivery and will duplicate non-idempotent side effects.",
+    "Set retention and quota on the dead-letter channel large enough for the redrive window and small enough to bound cost and exposure.",
+    "Prefer broker policies over hardcoded queue arguments where both exist (RabbitMQ), so dead-letter routing can be changed without redeclaring queues and redeploying.",
+    "Use per-destination dead-letter queues where diagnosis and selective replay matter (Artemis auto-created DLQ.<address> queues, ActiveMQ individual dead-letter strategy).",
+    "Redact or encrypt sensitive payloads before parking them, and audit access to the dead-letter channel.",
+    "Replay deliberately after a fix: a controlled batch with rate limits, verification queries and a rollback plan - not a bulk requeue against the still-broken dependency.",
+    "For Kafka: publish to the DLT first, then commit the source offset - never the reverse; and disable DLT auto-consumption unless you have a DLT handler wired up.",
+    "For SQS: set DLQ retention longer than the source queue's retention; use ApproximateNumberOfMessagesVisible and ApproximateAgeOfOldestMessage for alerting, not NumberOfMessagesSent.",
+    "For Azure Service Bus: read DeadLetterReason and DeadLetterDescription on every DLQ message to triage before inspecting the payload; enable dead-lettering on TTL expiry explicitly in code or ARM template.",
+    "For NATS JetStream: treat MaxDeliver advisories as the DLQ signal; build a separate advisory-catch stream and republish failed messages there with stream_seq for targeted replay.",
+    "For RabbitMQ quorum queues: rely on at-least-once dead-lettering via internal publisher confirms; for classic queues, add an explicit publish confirm step before acknowledging the source message.",
+    "Link the DLQ runbook directly in alert messages (one-click access from PagerDuty or Slack) and enrich it with queue-specific context: consumer name, downstream dependencies, known failure modes, typical volume.",
+    "After each DLQ incident, append the root cause and fix to the runbook to build a pattern library for fast 2am triage."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003) - Dead Letter Channel (Messaging Channels chapter).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/DeadLetterChannel.html",
+    "https://www.rabbitmq.com/docs/dlx",
+    "https://artemis.apache.org/components/artemis/documentation/latest/undelivered-messages.html",
+    "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html",
+    "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-configure-dead-letter-queue-redrive.html",
+    "https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-dead-letter-queues",
+    "https://learn.microsoft.com/en-us/azure/well-architected/service-guides/azure-service-bus",
+    "https://docs.spring.io/spring-kafka/reference/retrytopic/dlt-strategies.html",
+    "https://docs.nats.io/learn/jetstream/acknowledgment",
+    "https://docs.confluent.io/cloud/current/connectors/single-message-transforms.html",
+    "https://www.confluent.io/learn/kafka-dead-letter-queue/",
+    "https://floriancourouge.com/en/blog/kafka-dead-letter-queue-error-handling",
+    "https://factorhouse.io/articles/dead-letter-queues-kafka/",
+    "https://factorhouse.io/articles/kafka-dlq-consumer-side/",
+    "https://streamtrace.io/articles/nats-jetstream-dead-letter-queue-implementation/",
+    "https://www.deadqueue.com/blog/sqs-dlq-runbook-oncall",
+    "https://www.deadqueue.com/blog/dlq-monitoring-best-practices",
+    "https://repost.aws/questions/QUqS_YG85LTH2qAOfmxtyh2g/what-are-the-best-practices-for-monitoring-sqs-dead-letter-queues-in-production",
+    "https://www.venerite.com/news/2026/3/4/sqs-dlq-wrong-metric/",
+    "https://kafka.apache.org/23/generated/sink_connector_config.html",
+    "https://www.ibm.com/docs/en/ibm-mq/9.4.x?topic=troubleshooting-dead-letter-queue-considerations",
+    "https://camel.apache.org/components/next/eips/dead-letter-channel.html",
+    "https://systemweakness.com/dlq-is-not-a-strategy-why-failed-jobs-rot-forever-8765e7596f7b"
+  ]
+}

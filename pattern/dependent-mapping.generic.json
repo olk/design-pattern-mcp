@@ -1,0 +1,25 @@
+{
+  "pattern": "dependent-mapping",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "parent mapper owns the child rows: load with the parent, replace the set in one transaction",
+  "implementation_notes": "Give the parent object its own mapper and let that mapper do the dependent's mapping too: load the child rows together with the parent, write them inside the parent's transaction, and delete the rows that are no longer part of the collection (typically by deleting the whole set and re-inserting it). The child gets no mapper, no finder, no repository and no identity field of its own, and no other table may hold a foreign key to it. Express the ownership in the schema as well (foreign key to the parent, ON DELETE CASCADE or the framework's equivalent) so a parent delete cannot leave child rows behind, and keep the parent the only public entry point. Promote the child to a first-class entity with its own mapper the moment it must be referenced from outside the aggregate. Consider making the child immutable — any change is a delete-then-insert — which simplifies the mapper's change-tracking at the cost of a slightly harder-to-use domain model. For large dependent collections, prefer database-level ON DELETE CASCADE over ORM-level cascades so the ORM does not have to load every child into the persistence context before deleting.",
+  "code_sketch": "order = order_mapper.find(order_id)      # parent + children in one load\norder.lines.append(Line(sku, qty))       # mutate the dependent set\norder_mapper.save(order)                 # one transaction:\n                                         #   DELETE FROM line WHERE order_id = ?\n                                         #   INSERT INTO line(...) VALUES ... (new set)\n# no line_mapper, no line_repository, no line.find(...)",
+  "pitfalls": [
+    "A second write path (bulk SQL, an exposed child model, another repository) silently desynchronizes the aggregate — keep exactly one way to write the child rows.",
+    "Replacing the child set destroys row identity: never let another table point at dependent rows.",
+    "The parent mapper must not hand out the child collection for independent saving; the collection accessor stays read-only from outside.",
+    "orphanRemoval + clear() + addAll() in Hibernate triggers a full DELETE of all rows followed by INSERT of all rows, even when only one element changed — use diff-based application instead for large collections.",
+    "CascadeType.REMOVE on @ManyToOne is almost always a bug: it cascades upward from child to a shared parent, not downward — use no cascade or at most {PERSIST, MERGE} on @ManyToOne.",
+    "Database-level ON DELETE CASCADE bypasses ORM lifecycle hooks and persistence context invalidation — ensure your application does not rely on @PreRemove callbacks for children deleted at the DB level.",
+    "SQLAlchemy's Unit of Work flushes INSERT before DELETE when replacing a collection with delete-orphan cascade — a UNIQUE constraint on (parent_id, child_column) will be violated before the DELETE runs. Workaround: flush() between removing old and adding new.",
+    "passive_deletes=True in SQLAlchemy requires the FK constraint to have ON DELETE CASCADE at the DB level; without it, children are silently orphaned.",
+    "Hibernate's CascadeType.REFRESH propagates to all cascaded collections, initializing lazy collections that were never touched — a performance trap on hot update paths.",
+    "A composite primary key of (parent_id, position/index) is the correct identity for the child, not a global surrogate — surrogate keys open the door to multiple write paths.",
+    "Wrong move: reaching for an EF Core owned type when the dependent later needs a query entry point of its own -> there is no DbSet for an owned type and any raw-SQL write path bypasses the owner's change tracking, desynchronizing the aggregate -> instead keep access strictly through the owner's navigation, or promote the dependent to a regular entity the moment independent access is a real requirement.",
+    "Wrong move: putting cascade='all, delete-orphan' on a many-to-one where a child could be reassigned to another parent -> SQLAlchemy requires single_parent=True and deletes the child the moment it is deassociated from the old parent, destroying a row that was meant to move -> instead use delete-orphan only on genuine one-to-many ownership where a child never leaves its parent.",
+    "Wrong move: keeping dependent mapping once the child set has grown large -> every parent load and save rewrites the whole collection and a single child edit costs a full-graph flush -> instead bound the aggregate, use the framework's large-collection tools (SQLAlchemy WriteOnlyCollection, passive_deletes, Hibernate @OrderColumn diffs), or split the child into its own entity when it is no longer small."
+  ],
+  "sources": [],
+  "version": "1.0"
+}

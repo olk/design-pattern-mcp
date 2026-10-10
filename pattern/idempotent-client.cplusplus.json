@@ -1,0 +1,57 @@
+{
+  "pattern": "idempotent-client",
+  "language": "cplusplus",
+  "idiom_name": "hand-rolled keyed client: UUID + replayable request + retry loop over the transport",
+  "implementation_notes": "The pattern is a call-site discipline, so the C++ realization is a small owning wrapper: generate the key once (a UUID from a CSPRNG or a business id), build the immutable request object with it, and hand that request - never a re-minted one - to the retry loop or transport, returning std::optional/std::expected (C++23) so that 'unknown outcome' is a distinct state from 'failed'. Boost.Asio/Beast or libcurl provide the transport and neither mints nor persists a key, so the wrapper also owns the pending-work record (a SQLite table via a thin binding, or an fsync'ed file) that survives a process restart. Choose this form when the transport is plain HTTP without a retry framework; with no library to absorb the structure, the hand-written loop is the honest shape.",
+  "code_sketch": "const std::string key = make_uuid4();          // once per logical operation\nhttp::request<http::string_body> req{http::verb::post, target, 11};\nreq.set(\"Idempotency-Key\", key);\nfor (int attempt = 0; attempt < 3; ++attempt) {\n    auto res = send(req);                      // same request, same key\n    if (res) return *res;                      // std::optional<response>\n    std::this_thread::sleep_for(backoff(attempt));\n}\nreturn std::unexpected(Outcome::Unknown);      // C++23 std::expected",
+  "pitfalls": [
+    "If the key lives in a temporary that is re-created inside the loop, every attempt is a new operation - store it with the pending work, not in the loop body.",
+    "Async senders consume or move the request body, so a moved-from request cannot be replayed; keep a re-issuable factory for the same immutable request.",
+    "std::expected is C++23: before that, the 'unknown' outcome collapses into an empty optional and gets mistaken for 'not committed'."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/utility/expected",
+    "https://grpc.io/docs/guides/retry/"
+  ],
+  "support": "manual",
+  "variants": [
+    {
+      "variant_id": "keyed-http-client",
+      "name": "Keyed HTTP client wrapper (Boost.Asio/libcurl)",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "hand-rolled keyed client: UUID + replayable request + retry loop over the transport",
+      "implementation_notes": "The pattern is a call-site discipline, so the C++ realization is a small owning wrapper: generate the key once (a UUID from a CSPRNG or a business id), build the immutable request object with it, and hand that request - never a re-minted one - to the retry loop or transport, returning std::optional/std::expected (C++23) so that 'unknown outcome' is a distinct state from 'failed'. Boost.Asio/Beast or libcurl provide the transport and neither mints nor persists a key, so the wrapper also owns the pending-work record (a SQLite table via a thin binding, or an fsync'ed file) that survives a process restart. Choose this form when the transport is plain HTTP without a retry framework; with no library to absorb the structure, the hand-written loop is the honest shape.",
+      "code_sketch": "const std::string key = make_uuid4();          // once per logical operation\nhttp::request<http::string_body> req{http::verb::post, target, 11};\nreq.set(\"Idempotency-Key\", key);\nfor (int attempt = 0; attempt < 3; ++attempt) {\n    auto res = send(req);                      // same request, same key\n    if (res) return *res;                      // std::optional<response>\n    std::this_thread::sleep_for(backoff(attempt));\n}\nreturn std::unexpected(Outcome::Unknown);      // C++23 std::expected",
+      "pitfalls": [
+        "If the key lives in a temporary that is re-created inside the loop, every attempt is a new operation - store it with the pending work, not in the loop body.",
+        "Async senders consume or move the request body, so a moved-from request cannot be replayed; keep a re-issuable factory for the same immutable request.",
+        "std::expected is C++23: before that, the 'unknown' outcome collapses into an empty optional and gets mistaken for 'not committed'."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/expected",
+        "https://grpc.io/docs/guides/retry/"
+      ]
+    },
+    {
+      "variant_id": "grpc-retry-policy",
+      "name": "gRPC service-config retry policy with a stable operation id",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "grpc"
+      ],
+      "idiom_name": "gRPC retryPolicy + retryThrottling with a per-call operation id in the message",
+      "implementation_notes": "When the transport is already gRPC, the replay half becomes configuration: a service-config retryPolicy names the retryable status codes, maxAttempts and exponential backoff per method, and retryThrottling adds a client budget that stops one client from amplifying an outage. gRPC replays the call, it does not make it idempotent - the request message must still carry an operation id that the server deduplicates, because the library cannot know whether your handler already committed. Prefer this variant when the gRPC stack and service configuration already exist; keep the hand-rolled wrapper when the operation needs a durable key store on the client side.",
+      "code_sketch": "// service config passed as the \"grpc.service_config\" channel arg:\n// {\"methodConfig\":[{\"name\":[{\"service\":\"payments.Payments\"}],\n//   \"retryPolicy\":{\"maxAttempts\":4,\"initialBackoff\":\"0.1s\",\n//     \"maxBackoff\":\"1s\",\"backoffMultiplier\":2,\n//     \"retryableStatusCodes\":[\"UNAVAILABLE\"]}}]}\nChargeRequest req;                    // identical message on every attempt\nreq.set_operation_id(key);            // the server dedupes on this id\nclient->Charge(req);                  // gRPC replays only matching failures",
+      "pitfalls": [
+        "A retry policy makes gRPC replay the call, so every mutating method needs the operation id in the message; without it the retries are duplicate writes.",
+        "Retry throttling is a client-side budget, not a guarantee that the server is safe: it limits amplification, not duplication."
+      ],
+      "sources": [
+        "https://grpc.io/docs/guides/retry/"
+      ]
+    }
+  ],
+  "default_variant": "keyed-http-client",
+  "version": "1.0"
+}

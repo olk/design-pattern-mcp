@@ -1,0 +1,80 @@
+{
+  "pattern": "update-method",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "abstract base with virtual void update(float dt) over std::vector<std::unique_ptr<Entity>>",
+  "implementation_notes": "C++ spells the classic structure directly: an abstract base declares the hook (virtual void update(float dt) = 0) and the collection is a std::vector of owning pointers; cppreference notes that for a virtual function 'the overriding behavior is preserved even if there is no compile-time information about the actual type of the class', so 'a call to an overridden virtual function would invoke the behavior defined in the derived class'. What replaces the classic structure: nothing - the vtable is the only dispatch needed, the driver is a range-for, and C++ supplies no collection or walk at all. Prefer std::unique_ptr over raw pointers and give the base a virtual destructor; remember that the per-object virtual call plus pointer chasing is the pattern's main cost at scale, which is why the std::variant variant and Data Locality/ECS exist.",
+  "code_sketch": "struct Entity {                                   // the hook\n    virtual ~Entity() = default;\n    virtual void update(float dt) = 0;\n};\nstruct Guard : Entity {\n    float x = 0;\n    void update(float dt) override { x += 20.f * dt; }\n};\n\nstd::vector<std::unique_ptr<Entity>> entities;    // the collection\nfor (auto& e : entities) e->update(dt);           // the driver walk",
+  "pitfalls": [
+    "Forgetting the virtual destructor (or storing entities by value) slices derived state; the base must be polymorphic and objects must be held indirectly.",
+    "Erasing from the vector inside update invalidates iterators and shifts elements, skipping the neighbour; defer removals (mark dead, std::remove_if after the walk).",
+    "Raw pointers in the collection dangle as soon as an owner is destroyed; unique_ptr/shared_ptr make ownership explicit at the cost of one more indirection per object.",
+    "The walk is single-threaded by construction: stepping on several threads needs index-range partitioning, and any shared world state a step touches needs its own synchronisation."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/language/virtual"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "virtual-update",
+      "name": "Abstract base class with a virtual update(float dt)",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "abstract base with virtual void update(float dt) over std::vector<std::unique_ptr<Entity>>",
+      "implementation_notes": "C++ spells the classic structure directly: an abstract base declares the hook (virtual void update(float dt) = 0) and the collection is a std::vector of owning pointers; cppreference notes that for a virtual function 'the overriding behavior is preserved even if there is no compile-time information about the actual type of the class', so 'a call to an overridden virtual function would invoke the behavior defined in the derived class'. What replaces the classic structure: nothing - the vtable is the only dispatch needed, the driver is a range-for, and C++ supplies no collection or walk at all. Prefer std::unique_ptr over raw pointers and give the base a virtual destructor; remember that the per-object virtual call plus pointer chasing is the pattern's main cost at scale, which is why the std::variant variant and Data Locality/ECS exist.",
+      "code_sketch": "struct Entity {                                   // the hook\n    virtual ~Entity() = default;\n    virtual void update(float dt) = 0;\n};\nstruct Guard : Entity {\n    float x = 0;\n    void update(float dt) override { x += 20.f * dt; }\n};\n\nstd::vector<std::unique_ptr<Entity>> entities;    // the collection\nfor (auto& e : entities) e->update(dt);           // the driver walk",
+      "pitfalls": [
+        "Forgetting the virtual destructor (or storing entities by value) slices derived state; the base must be polymorphic and objects must be held indirectly.",
+        "Erasing from the vector inside update invalidates iterators and shifts elements, skipping the neighbour; defer removals (mark dead, std::remove_if after the walk).",
+        "Raw pointers in the collection dangle as soon as an owner is destroyed; unique_ptr/shared_ptr make ownership explicit at the cost of one more indirection per object.",
+        "The walk is single-threaded by construction: stepping on several threads needs index-range partitioning, and any shared world state a step touches needs its own synchronisation."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/language/virtual"
+      ]
+    },
+    {
+      "variant_id": "variant-visit",
+      "name": "std::variant storage with std::visit dispatch (closed kind set)",
+      "paradigm": "data-oriented",
+      "min_standard": "C++17",
+      "requires_features": [
+        "std::variant"
+      ],
+      "idiom_name": "std::vector<std::variant<...>> walked with std::visit",
+      "implementation_notes": "When the set of entity kinds is closed at compile time, keep them as alternatives of one type: std::variant 'represents a type-safe union' and std::visit 'calls the provided functor with the arguments held by one or more variants', so the per-frame step becomes a lambda in a range-for. What replaces the classic structure: the base class disappears - no vptr, no per-entity heap allocation, contiguous storage - while an exhaustive overload set (the overloads/overloaded idiom) turns a forgotten kind into a compile error. The trade is a closed type set and a variant as large as its biggest alternative; std::visit is still implemented as an indirect jump, so the win is allocation and locality rather than the dispatch itself.",
+      "code_sketch": "using Actor = std::variant<Guard, Statue, Particle>;\nstd::vector<Actor> actors;                        // contiguous, no vptr\n\nfor (auto& a : actors)                            // static dispatch per element\n    std::visit([dt](auto& actor) { actor.update(dt); }, a);",
+      "pitfalls": [
+        "Adding a kind means touching every visitor; without an exhaustive-visitor helper the compiler will not flag a forgotten alternative, so add a static_assert fallback branch.",
+        "A variant is as large as its largest alternative and every element pays that size; large alternatives belong behind a pointer.",
+        "std::visit still performs an indirect jump per element in most implementations: it removes allocation and pointer chasing, not the call itself - measure before claiming a win.",
+        "Visitors must compile for every alternative (including const/reference forms); a lambda that only accepts one type breaks the whole program, not just that branch."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/variant",
+        "https://en.cppreference.com/w/cpp/utility/variant/visit2"
+      ]
+    },
+    {
+      "variant_id": "unreal-tick",
+      "name": "Unreal Engine actor and component ticking",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "AActor::Tick(float DeltaSeconds) in engine tick groups",
+      "implementation_notes": "In Unreal the engine owns the collection and the walk: 'Actors and components are ticked once per frame, unless a minimum ticking interval is specified', ticking 'happens according to tick groups' (TG_PrePhysics, TG_DuringPhysics, TG_PostPhysics, TG_PostUpdateWork) and order can be pinned with AddTickPrerequisiteActor/AddTickPrerequisiteComponent; UActorComponent::TickComponent is 'Function called every frame on this ActorComponent', and it 'only executes if the component is registered, and also PrimaryComponentTick.bCanEverTick must be set to true'. What replaces the classic structure: the engine's tick registry replaces the entity list and the driver, so you implement only the per-object step, and tick groups replace the ad-hoc ordering problems of a hand-written collection. Use it inside an Unreal project; the shape does not transfer to engine-free C++, which is what the virtual-update variant is for.",
+      "code_sketch": "void AGuard::Tick(float DeltaSeconds) {              // per-frame step\n    Super::Tick(DeltaSeconds);\n    AddActorWorldOffset(PatrolVelocity * DeltaSeconds);\n}\n// constructor: PrimaryActorTick.bCanEverTick = true;\n// ordering: PrimaryActorTick.TickGroup = TG_PrePhysics; or AddTickPrerequisiteActor(...)",
+      "pitfalls": [
+        "Tick is disabled unless bCanEverTick is set in the constructor; 'it does not tick' is usually a registration mistake, not a logic bug.",
+        "Tick order is not creation order: without tick groups or prerequisites an actor can read stale state from another actor in the same frame, so state the dependency instead of relying on spawn order.",
+        "TickInterval throttles the step but the actor still ticks; time-based logic must use the DeltaSeconds it was actually given rather than assuming a fixed interval.",
+        "Ticking thousands of actors is a known cost: disable ticking for dormant actors (SetActorTickEnabled) or move mass behaviour into systems/jobs."
+      ],
+      "sources": [
+        "https://dev.epicgames.com/documentation/unreal-engine/actor-ticking-in-unreal-engine",
+        "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Runtime/Engine/UActorComponent/TickComponent"
+      ]
+    }
+  ],
+  "default_variant": "virtual-update"
+}

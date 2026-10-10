@@ -1,0 +1,236 @@
+{
+  "category": "workflow-messaging",
+  "name": "careful-buffering",
+  "aliases": [
+    "bounded buffer",
+    "bounded queue"
+  ],
+  "intent": "Bound the amount of work a component may hold between a producer and a consumer, and make the buffer's behaviour at capacity an explicit, tested decision - block, reject, drop the oldest, drop the newest, coalesce or divert - instead of letting an unbounded queue postpone the decision until memory runs out.",
+  "problem": "A producer generates work faster than the consumer drains it (a burst, a stalled dependency, a slow sink), and the queue between them absorbs the difference - until it does not. An unbounded buffer only postpones the reckoning to the out-of-memory killer; a bounded buffer whose full-behaviour was never chosen silently blocks the producer, throws at the worst moment, or drops data nobody counted. The decision the component must make is not whether to buffer but what happens at capacity.",
+  "context": "Anywhere two rates meet through a queue the component owns: in-process work queues in front of a thread pool or event loop, message channels and consumer groups, socket and stream writers, log and telemetry pipelines, and integration endpoints that must survive a slow downstream. It applies whenever the buffer is a local resource whose capacity and failure mode you can choose; when a broker or transport owns the queue, the same decision is configuration (capacity, retention, dead-lettering) rather than new code.",
+  "benefits": [
+    "Memory is bounded by construction: the worst-case footprint is capacity x item size, so a producer burst or a consumer stall cannot grow the process without limit.",
+    "Behaviour at capacity becomes a named, reviewable decision (block, reject, drop-oldest, drop-newest, coalesce, spill) instead of an emergent property discovered during an incident.",
+    "Failure is localised and diagnosable: shed and rejected work happens at one known place, where it can be counted, logged and alerted on rather than surfacing as OOM kills or latency cliffs.",
+    "The same bounded buffer can express back-pressure, load shedding or overflow diversion, so overload policy is a configuration/coding choice rather than a redesign.",
+    "Capacity is a single number owned by the component, tunable without touching producers or consumers.",
+    "It makes queueing delay visible: with a known capacity, the time an item waits is measurable and can be budgeted, and the high-water mark says whether the size is right."
+  ],
+  "tradeoffs": [
+    "Sizing the capacity is a genuine judgement call: too small sheds or blocks work that could have been served, too large hides the overload and turns it into latency for everything already queued.",
+    "Every drop/reject policy loses data by design: if the item mattered, the buffer now needs a durable overflow path (dead letter channel, store-and-forward), which is more infrastructure than an unbounded list.",
+    "Blocking/awaiting policies couple producers to consumer speed; correct as back-pressure, dangerous when the producer is also the thread or task that would free space (self-deadlock).",
+    "The buffer is one shared mutable resource: a lock or hot atomic per operation becomes the contention point of the whole path at high rates, and lock-free variants trade that for their own capacity/order subtleties.",
+    "Silent-drop policies are the hardest to operate: without counters, context and a periodic review of what is being thrown away, the pattern degrades into a data-loss machine.",
+    "A dropped item is still an acknowledgement someone expected: the API must express the refusal (exception, false return, timeout) or the caller assumes success.",
+    "Sizing by feel or habit rather than measurement turns the buffer into a false sense of security: a mis-sized bounded queue at high utilization produces the same latency cliff as an unbounded one, just with a smaller pile.",
+    "Bounded channels alone do not prevent unbounded goroutine accumulation: in Go, the runtime's sendq list is unbounded, so a full channel with many waiting senders retains every goroutine stack in heap memory."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 8,
+    "maintainability": 7,
+    "simplicity": 6,
+    "performance": 7,
+    "reliability": 9,
+    "security": 7,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Producer",
+      "responsibility": "Offers work to the buffer and adopts the configured full-behaviour: block or await, receive a rejection, or have the offer dropped or coalesced."
+    },
+    {
+      "role": "Bounded buffer",
+      "responsibility": "Holds at most capacity items (FIFO, priority or coalescing) and enforces the capacity and admission atomically under concurrent access."
+    },
+    {
+      "role": "Consumer / worker",
+      "responsibility": "Drains the buffer at its own rate; the pattern only works if a consumer eventually removes work - or if the buffer is deliberately lossy."
+    },
+    {
+      "role": "Capacity policy (full-behaviour)",
+      "responsibility": "The strategy or configuration that decides the outcome at capacity: block, fail the producer, drop oldest, drop newest, coalesce, or divert to a second path."
+    },
+    {
+      "role": "Overflow sink",
+      "responsibility": "Where the decision's evidence and consequences go: the caller (exception, false, timeout), a counter/metric, a log, or a durable alternative path (dead letter channel, store-and-forward)."
+    },
+    {
+      "role": "Monitor / watermark",
+      "responsibility": "Exposes depth, high-water mark, drop and rejection counts so capacity sizing and shedding can be checked against reality instead of assumed."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "task-lifetime"
+  ],
+  "use_cases": [
+    "A service's ingress work queue in front of a fixed thread pool: bounded capacity plus a reject-if-busy or run-in-caller policy, so overload is refused at the edge instead of accumulating until the process dies.",
+    "A log or telemetry shipper: a bounded in-memory ring with drop-oldest and a drop counter, the deliberate alternative to unbounded growth when the collector is unreachable.",
+    "An asynchronous pipeline stage (actor mailbox, coroutine channel, reactive stream) that must push back on its upstream instead of buffering without limit.",
+    "A device or broker link with a store-and-forward shim: when the in-memory buffer is full, spill to durable storage rather than block the producer thread.",
+    "A UI or sensor pipeline that conflates: capacity 1 with drop-oldest ('latest value wins') is the honest policy for state that is re-read rather than queued.",
+    "Queue-based load levelling in front of a rate-limited dependency: absorb the burst within a known bound and shed or defer the excess deliberately.",
+    "AI/LLM inference serving pipelines: bounded request queue in front of a GPU batch scheduler where KV cache capacity sets the natural concurrency limit; a queue that exceeds that bound produces requests that time out before they can be served anyway.",
+    "IoT sensor data ingestion with intermittent connectivity: a bounded in-process buffer absorbs the gap when the network is unreachable, sized to bridge the expected reconnection window with drop-oldest for stale readings.",
+    "Game server event processing: player actions buffered through a bounded channel before a world tick; overflow is load-shed (drop-oldest) to keep the physics simulation deterministic within a fixed timestep budget.",
+    "CDN cache invalidation queues: a bounded write-through buffer ahead of origin fetches; at capacity, drop-newest preserves earlier invalidations already propagated to edge nodes rather than stalling new ones.",
+    "RabbitMQ queues declared with x-max-length and x-overflow: drop-head is the documented default, while reject-publish or reject-publish-dlx return a basic.nack to the publisher - the broker's form of the same decision, made in configuration and signalled back to the producer rather than absorbed silently.",
+    "The LMAX Disruptor's pre-allocated ring buffer: capacity is fixed at construction, producers either block in next() or take InsufficientCapacityException from tryNext(), and gating sequences feed consumer progress back into the producer's capacity check.",
+    "A Netty server writing to slow clients: pending outbound bytes above the WriteBufferWaterMark high watermark flip Channel.isWritable() to false, and the application pauses writing until the buffer drains below the low watermark - watermark hysteresis instead of a per-item full policy."
+  ],
+  "avoid_when": [
+    "The queue belongs to a broker or managed transport: configure its capacity, retention and dead-lettering rather than adding a second in-memory buffer in front of it.",
+    "Work must not be lost and the producer cannot be slowed: use durable messaging (guaranteed delivery, transactional outbox, store-and-forward) instead of an in-memory bound that must shed.",
+    "The workload is inherently sequential and the platform already provides the bound with the policy you want (a runtime channel, a sized queue, a stream writer): hand-rolling a second buffer adds nothing.",
+    "The consumer is slow or dead rather than bursty: fix or isolate the consumer (timeout, circuit breaker, scale-out) - a bigger buffer only defers the failure.",
+    "The producer can simply be slowed end to end: propagating back-pressure with no intermediate buffer is simpler and loses nothing.",
+    "The buffer would only ever hold one item of transient state: a plain field, a conflated channel or a size-1 handoff is clearer than a queue with policies."
+  ],
+  "language_files": {
+    "generic": "careful-buffering.generic.json",
+    "c": "careful-buffering.c.json",
+    "cplusplus": "careful-buffering.cplusplus.json",
+    "csharp": "careful-buffering.csharp.json",
+    "go": "careful-buffering.go.json",
+    "java": "careful-buffering.java.json",
+    "javascript": "careful-buffering.javascript.json",
+    "kotlin": "careful-buffering.kotlin.json",
+    "python": "careful-buffering.python.json",
+    "ruby": "careful-buffering.ruby.json",
+    "rust": "careful-buffering.rust.json",
+    "scala": "careful-buffering.scala.json",
+    "swift": "careful-buffering.swift.json",
+    "typescript": "careful-buffering.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "backpressure",
+    "load-leveller",
+    "producer-consumer",
+    "event-queue",
+    "rate-limiting",
+    "dead-letter-channel",
+    "store-and-forward",
+    "retry",
+    "circuit-breaker"
+  ],
+  "anti_patterns": [
+    "Unbounded queue as a safety net: capacity = infinity, so overload appears as an OOM kill instead of a refusal, and the only back-pressure signal is process death.",
+    "Bounded queue with an accidental policy: calling put/send/add on a hot path without deciding which outcome is wanted, so blocking-vs-throwing is chosen by whichever method the author happened to use.",
+    "Drop without evidence: DiscardPolicy/drop-latest behaviour with no counter, log or metric, so the data loss is invisible until someone reconciles totals downstream.",
+    "Growing the buffer instead of the consumer: raising capacity every time latency rises, until queueing delay dominates end-to-end time and the buffer has become an outage amplifier.",
+    "Two conflicting policies in one path: the queue drops the oldest while the producer retries on failure and the dead letter channel re-delivers - the net effect is duplicates and losses nobody can explain.",
+    "A blocking bounded queue shared by unrelated workloads: one slow consumer stops other producers that merely happen to share the buffer.",
+    "Unbounded goroutine fan-out on a channel: spawning go func(msg) { ch <- msg }(msg) for every message, where the channel is unbuffered or the buffer fills in milliseconds; goroutines park on sendq and retain their stacks indefinitely, causing OOM even when the channel itself is bounded.",
+    "Unbounded async task accumulation: using loop.create_task(queue.put(data)) with an unbounded queue or a deferred fire-and-forget task per item; the tasks accumulate in the async runtime's pending task list faster than they complete, exhausting memory even when the queue itself is bounded."
+  ],
+  "design_principles": [
+    "Bound the resource explicitly: memory is finite, so every buffer in the design has a declared capacity and fails visibly rather than growing silently.",
+    "Make policy explicit and substitutable: the full-behaviour is a named strategy (RejectedExecutionHandler, BoundedChannelFullMode, BufferOverflow, OverflowStrategy) rather than an accident of the call used.",
+    "Prefer back-pressure where the producer can be slowed, and an explicit loss or diversion policy where it cannot - never unlimited buffering as the compromise.",
+    "A shed item is an event: keep the drop observable and attributable, because an unmeasured loss is indistinguishable from a bug.",
+    "Keep the queue small enough that queueing delay is not the dominant term of latency (Little's law: items in the system = arrival rate x time in the system).",
+    "Single responsibility: the buffer owns capacity and admission; consumers own throughput; neither should silently compensate for the other.",
+    "Size capacity from measurement, not habit: use Little's law (L = λ × W) with observed arrival rate and acceptable latency budget to derive the required bound, then round up modestly and validate under load."
+  ],
+  "best_practices": [
+    "Choose capacity from a throughput/latency budget and pick exactly one full-policy; write both next to the buffer's declaration so the decision is reviewable.",
+    "Prefer non-blocking offers (offer, try_send, TryWrite, trySend, non_block) in request paths so the refusal reaches the caller, and reserve blocking sends for producers that can afford to wait.",
+    "Count every drop, rejection and timeout with enough context (queue name, reason, routing key or tenant) to attribute the loss, and alert on sustained shedding.",
+    "Divert overflow to a durable path (dead letter channel, store-and-forward, on-disk spool) whenever the item matters; never drop silently into a void.",
+    "Expose the high-water mark as well as the current depth, and tune capacity from it rather than from anecdote.",
+    "Scale or batch the consumer before enlarging the buffer; capacity absorbs transients, not sustained imbalance.",
+    "Test the full path deliberately: fill the buffer in a test, assert the configured outcome and the metric, and verify that shutdown/unavailability is not reported as back-pressure.",
+    "Size the buffer using Little's law: L = λ × W, where L is the required queue depth, λ is the sustained arrival rate, and W is the acceptable queueing delay budget. Validate with load tests at 3-5x normal burst.",
+    "Instrument three metrics continuously: queue depth (qsize), put-wait time (wall-clock time spent inside await put), and unfinished-task count. Depth pinned at maxsize means consumers are the bottleneck; depth at zero means the producer is.",
+    "For asyncio.Queue: start maxsize at roughly 2x consumer concurrency (e.g., 10 consumers → Queue(maxsize=20)), then tune from depth metrics and container memory limit. Total memory ≈ maxsize × avg_item_size.",
+    "In Go: prefer a single long-lived producer goroutine with select-based backoff over unbounded go func fan-out; a bounded buffer is a safety net, not a licence to spawn unlimited senders.",
+    "Use queue age (timestamp of oldest unprocessed item) as the primary SLO signal, not queue size: a queue at 8,000 items is healthy if it drains in seconds and catastrophic if it has been there for an hour.",
+    "Layer a semaphore (concurrency limiter) in front of any downstream resource that can saturate, even when the queue itself is bounded: the queue protects memory, the semaphore protects the dependency.",
+    "Prefer bounded channels in Go as the primary backpressure mechanism; size them from a latency budget (how long can a producer afford to wait when the buffer is full) rather than from expected queue length.",
+    "Run monthly chaos tests that inject 3-5x normal traffic in staging and verify that rate limiting, load shedding, and bounded buffers activate at their configured thresholds."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns (2003), System Management - Dead Letter Channel: what a messaging system does with a message it cannot deliver; the outcome this pattern fixes at the buffer boundary.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/DeadLetterChannel.html",
+    "Dijkstra's bounded-buffer / producer-consumer problem (1965): a finite-capacity buffer forces an explicit producer rule at capacity, the oldest statement of this decision.",
+    "https://en.wikipedia.org/wiki/Producer%E2%80%93consumer_problem",
+    "Java SE 21, ArrayBlockingQueue - documented as 'a classic bounded buffer': put blocks, offer returns false, add throws IllegalStateException when full.",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ArrayBlockingQueue.html",
+    "Kotlin coroutines, BufferOverflow (SUSPEND, DROP_OLDEST, DROP_LATEST) and Channel capacities including CONFLATED, plus onUndeliveredElement for sacrificed items.",
+    "https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.channels/-buffer-overflow/",
+    ".NET, BoundedChannelFullMode (Wait, DropNewest, DropOldest, DropWrite) - the full-behaviour as an enum on a bounded channel.",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.boundedchannelfullmode",
+    "Akka Streams, Buffers and working with rate - .buffer(size, OverflowStrategy.backpressure/dropHead/dropTail/dropNew) and the internal buffers of asynchronous operators.",
+    "https://doc.akka.io/docs/akka/current/stream/stream-rate.html",
+    "Node.js, Stream - highWaterMark, write() returning false, the 'drain' event, and the warning that highWaterMark is a threshold rather than a hard limit.",
+    "https://nodejs.org/api/stream.html",
+    "Mitra, 'Stochastic theory of a fluid model of producers and consumers coupled by a buffer' (Advances in Applied Probability, Cambridge, 2016): formal queueing theory of producers and consumers coupled by a finite buffer with failure/repair rates, deriving the state distribution in equilibrium via spectral expansion.",
+    "https://www.cambridge.org/core/journals/advances-in-applied-probability",
+    "Pandit, Schmitt & Steinmetz, 'Network calculus meets queueing theory - a simulation based approach to bounded queues' (IEEE IWQoS, 2004): merging network calculus bounding techniques with queueing theory to analyse finite-buffer behaviour and dimension buffers for multiplexed traffic.",
+    "https://doi.org/10.1109/iwqos.2004.1309365",
+    "Kumar, Srikant & Kumar, 'Bounding blocking probabilities and throughput in queueing networks with buffer capacity constraints' (IEEE CDC, 1996): linear-programming technique for upper and lower bounds on throughput and blocking probabilities in queueing networks with finite buffers, with computational complexity independent of buffer size.",
+    "https://doi.org/10.1109/cdc.1996.574479",
+    "Ghiassi-Farrokhfal & Ciucu, 'On the Impact of Finite Buffers on Per-Flow Delays in FIFO Queues' (ITC 24, 2024): counter-intuitive result that per-flow delay is non-monotonic in buffer size in high-burstiness regimes; buffer dimensioning becomes insensitive to SLA constraint type in high multiplexing regimes.",
+    "https://archive.itc-conference.org/itc24/uploads/media/ITC24S7P2.pdf",
+    "Miretskiy, Scheinhardt & Mandjes, 'Backpressure-based control protocols: design and computational aspects' (UVA, 2009): Markovian analysis of IEEE 802.3x hop-by-hop backpressure, deriving stability conditions and overflow probability estimates for a two-node tandem queue with downstream congestion signalling.",
+    "https://handle.uba.uva.nl/personal/pure/en/publications/backpressurebased-control-protocols(9f157769-e46d-4680-869e-a9860151bb05).html",
+    "DEV Community, 'Backpressure in Node, or why your queue ate all the memory' (2026): practical walkthrough of unbounded array buffers, write() return value semantics, highWaterMark behaviour, and three explicit drop policies (drop oldest, drop newest, sample) with instrumentation.",
+    "https://dev.to/yaseenyk04/backpressure-in-node-or-why-your-queue-ate-all-the-memory-15p6",
+    "DEV Community, 'Channels Aren't Message Passing — How Parked Goroutines OOM-Killed a Pod' (2026): analysis of Go's hchan struct revealing that sendq is unbounded, explaining how unbounded goroutine fan-out on a full channel causes OOM; fix is single long-lived producer with select-based backoff plus bounded buffer.",
+    "https://dev.to/harrisonsec/channels-arent-message-passing-how-parked-goroutines-oom-killed-a-pod-4ijf",
+    "golang.design, 'Channels and the Engineering of CSP' (Go Under the Hood, 2026): deep dive into Go channel implementation - the hchan struct (ring buffer + mutex + sendq/recvq wait queues), direct handoff optimization, and the critical warning that buffering is not a speed knob but a bounded-wait contract.",
+    "https://golang.design/under-the-hood/en/part3concurrency/ch10chan/model/",
+    "System Design with Sage, 'The backpressure mistake we did not see coming' (Medium, 2026): post-mortem of a 4× traffic spike overwhelming an unbounded LinkedBlockingQueue and Kafka consumer lag; key lesson that Kafka retention, TCP windowing, and Kubernetes HPA are not backpressure; explicit bounded queues + lag-based producer throttling + load shedding are the layered solution.",
+    "https://medium.com/@systemdesignwithsage/the-backpressure-mistake-we-did-not-see-coming-750c4843830d",
+    "DEV Community, 'How a 22-Minute Redis Blip Ate 18 GB of RAM' (2026): post-mortem of asynq zero-backoff retry loop + go-redis v9.17.2 wantConn ticket leak during a 22-minute Redis outage, accumulating ~50 million tickets ≈ 14 GB; key lesson: every queue accepting external work needs a hard capacity limit.",
+    "https://dev.to/ahnafhasan/how-a-22-minute-redis-blip-ate-18-gb-of-ram-54ah",
+    "GitHub, PrefectHQ Prefect Issue #21031: EventsWorker uses unbounded queue causing OOM during server outages - Prefect server downtime causes events to accumulate in an unbounded queue.Queue with no maxsize; fix adds configurable bounded queue with drop-on-full policy.",
+    "https://github.com/PrefectHQ/prefect/issues/21031",
+    "GitHub, vectordotdev/vector Issue #25212: Unbounded in-flight retrying batches cause OOM during sustained downstream failures - retry layer outside concurrency limit causes unbounded FuturesUnorderedCount accumulation; bounded retry attempts and backpressure propagation to topology buffer are the fix.",
+    "https://github.com/vectordotdev/vector/issues/25212",
+    "Async Concurrency, 'Async Queue Management in Python' (2026): detailed guide on asyncio.Queue maxsize, backpressure propagation, join()/task_done() deadlock pitfalls, fan-out/fan-in topologies, three-metric instrumentation (qsize + put-wait time + unfinished count), and sizing maxsize as 2× consumer concurrency.",
+    "https://async-concurrency.com/concurrent-execution-worker-patterns/async-queue-management/",
+    "Tokio, 'Channels' tutorial: bounded vs unbounded mpsc channel semantics, the guarantee that bounded send waits when full (backpressure), and the explicit warning that unbounded queues will eventually fill all available memory.",
+    "https://tokio.rs/tokio/tutorial/channels",
+    "Tokio, tokio::sync::mpsc docs: bounded channel with backpressure - send waits until capacity is available; also documents reserve(), reserve_owned(), and try_send() for fine-grained admission control.",
+    "https://docs.rs/tokio/latest/tokio/sync/mpsc/",
+    "Rust flume crate docs: blazingly fast MPMC channel with bounded, unbounded, and rendezvous variants; async/sync interoperability, and the warning that unbounded channels allocate without bound.",
+    "https://docs.rs/flume/latest/flume/",
+    "Python asyncio.Queue documentation: maxsize parameter (0 = infinite), await put() blocks when full, put_nowait() raises QueueFull, qsize() always accurate in single-threaded async context, shutdown() for graceful drain.",
+    "https://docs.python.org/3/library/asyncio-queue.html",
+    "Hill, 'Three Other Models of Computer System Performance: Bottleneck Analysis, Little's Law, and the M/M/1 Queue' (arXiv, 2019): Little's Law as a tri-directional planning tool (N = A × T), M/M/1 latency-throughput tradeoff curve showing normalized latency = 1/(1 − ρ), and the rule that more buffers are prudent for unscheduled arrival bursts.",
+    "https://arxiv.org/pdf/1901.02926",
+    "Elijah's Notes, 'Latency, Throughput, and Utilization' (2026): practical treatment of Little's Law (L = λ × W), utilization (ρ = λS), the M/M/1 latency curve, finite buffers as converting unbounded delay into loss, and the observation that queue size is a vanity metric while queue age is the signal that does not lie.",
+    "https://notes.elimelt.com/systems/performance/latency-throughput-and-utilization",
+    "RabbitMQ, 'Queue Length Limit': max-length / x-max-length with x-overflow (drop-head, reject-publish, reject-publish-dlx) - the same capacity decision as broker configuration, where publisher confirms carry the refusal back as basic.nack instead of silently consuming memory.",
+    "https://www.rabbitmq.com/docs/maxlength",
+    "LMAX, 'Disruptor: High performance alternative to bounded queues for exchanging data between concurrent threads': a pre-allocated fixed-size ring buffer where the full-behaviour is the claim step itself - next() blocks, tryNext() throws InsufficientCapacityException, and gating sequences make the slowest consumer's progress the bound on producer capacity.",
+    "https://lmax-exchange.github.io/disruptor/disruptor.html",
+    "Netty, WriteBufferWaterMark and ChannelOutboundBuffer API docs: isWritable() becomes false when pending outbound bytes exceed the high watermark and only returns true below the low watermark - pause/resume-write signalling with hysteresis, dependent on MessageSizeEstimator for accurate accounting.",
+    "https://netty.io/4.1/api/io/netty/channel/WriteBufferWaterMark.html",
+    "Nelhage, 'Graceful behavior at capacity' (Made of Bugs, 2023): criticism of the raise-the-queue-limit response to overload - queue length does not increase peak capacity, added latency grows roughly linearly with queue length, and a queue long enough to survive an outage converts every request into a timeout; a healthy queue drains quickly in steady state.",
+    "https://blog.nelhage.com/post/systems-at-capacity/"
+  ],
+  "related_patterns_notes": {
+    "load-shedder": "load-shedder",
+    "throttle": "throttle",
+    "genstage-flow": "genstage-flow",
+    "actor-mailbox": "actor-mailbox"
+  }
+}

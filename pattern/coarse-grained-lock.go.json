@@ -1,0 +1,18 @@
+{
+  "pattern": "coarse-grained-lock",
+  "language": "go",
+  "support": "manual",
+  "implementation_notes": "The standard library gives you transactions (database/sql Tx) but nothing that knows about clusters, so the shared lock is written by hand in one of two shapes. Persistence side: inside tx, take the root's lock with SELECT ... FOR UPDATE or, when the cluster has no row of its own to lock, pg_advisory_xact_lock(clusterID), then read and write every member; the lock dies with the transaction. In-process side: a map[int64]*sync.Mutex (or sync.Map) keyed by the cluster id, held with defer mu.Unlock() for the whole edit - one lock for root and members. Both replace per-member locking; the database variant is the one that spans processes.",
+  "version": "1.0",
+  "idiom_name": "transaction + root-row lock (SELECT ... FOR UPDATE / pg_advisory_xact_lock), or a mutex map per aggregate root",
+  "code_sketch": "func (s *Store) Edit(ctx context.Context, id int64, fn func(*Cluster) error) error {\n\ttx, err := s.db.BeginTx(ctx, nil)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer tx.Rollback()\n\tif _, err = tx.ExecContext(ctx, \"SELECT pg_advisory_xact_lock($1)\", id); err != nil { // root lock\n\t\treturn err\n\t}\n\tc, err := loadCluster(ctx, tx, id) // members need no own locks\n\tif err == nil {\n\t\terr = fn(c)\n\t}\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn tx.Commit()\n}",
+  "pitfalls": [
+    "database/sql connection pools are meant to be concurrency-safe, but a transaction is bound to one connection: every statement of the edit must use tx, and mixing in db calls escapes the lock.",
+    "pg_advisory_xact_lock serializes by the integer/string key you choose, not by the row - a hash collision or a wrong key silently locks a different cluster, so derive the key from the root id explicitly.",
+    "A mutex map grows with the number of clusters seen; without eviction (or a sharded/striped map) it becomes a memory leak in long-running services."
+  ],
+  "sources": [
+    "https://go.dev/doc/database/execute-transactions",
+    "https://www.postgresql.org/docs/current/explicit-locking.html"
+  ]
+}

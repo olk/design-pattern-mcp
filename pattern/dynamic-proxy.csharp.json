@@ -1,0 +1,82 @@
+{
+  "pattern": "dynamic-proxy",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "DispatchProxy.Create<T, TProxy>() + Invoke(MethodInfo, object?[])",
+  "implementation_notes": "The BCL mechanism: derive from DispatchProxy, implement Invoke(MethodInfo, object?[]), and let DispatchProxy.Create<T, TProxy>() emit a proxy type that implements the interface and routes every member to that one method. It is interface-based, so the proxy is typed as the interface and the target's fields are unreachable through it; the generated type is cached per (proxy type, interface) pair. Use it when the interface set is known only at runtime; when it is known at compile time a hand-written decorator stays clearer.",
+  "code_sketch": "class LoggingProxy : DispatchProxy {\n    private IService? _target;\n    public static IService Create(IService target) {\n        var p = Create<IService, LoggingProxy>();\n        ((LoggingProxy)p)._target = target;\n        return p;\n    }\n    protected override object? Invoke(MethodInfo m, object?[]? args) {\n        Console.WriteLine(m.Name);\n        return m.Invoke(_target, args);          // wraps failures in TargetInvocationException\n    }\n}",
+  "pitfalls": [
+    "DispatchProxy emits IL at runtime, so trimming and NativeAOT report it as RequiresDynamicCode - the same design silently stops working when the deployment target changes.",
+    "Only interfaces can be proxied: members the interface does not carry are invisible on the proxy, and method.Invoke wraps target exceptions instead of letting them through.",
+    "Async methods return Task, so an interceptor that does not await them swallows the exception that would have been observed by the caller."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.reflection.dispatchproxy?view=net-9.0",
+    "https://devblogs.microsoft.com/dotnet/migrating-realproxy-usage-to-dispatchproxy/",
+    "https://github.com/dotnet/runtime/blob/main/src/libraries/System.Reflection.DispatchProxy/src/System/Reflection/DispatchProxyGenerator.cs"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "dispatchproxy",
+      "name": "System.Reflection.DispatchProxy (BCL)",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "requires_features": [],
+      "idiom_name": "DispatchProxy.Create<T, TProxy>() + Invoke(MethodInfo, object?[])",
+      "implementation_notes": "The BCL mechanism: derive from DispatchProxy, implement Invoke(MethodInfo, object?[]), and let DispatchProxy.Create<T, TProxy>() emit a proxy type that implements the interface and routes every member to that one method. It is interface-based, so the proxy is typed as the interface and the target's fields are unreachable through it; the generated type is cached per (proxy type, interface) pair. Use it when the interface set is known only at runtime; when it is known at compile time a hand-written decorator stays clearer.",
+      "code_sketch": "class LoggingProxy : DispatchProxy {\n    private IService? _target;\n    public static IService Create(IService target) {\n        var p = Create<IService, LoggingProxy>();\n        ((LoggingProxy)p)._target = target;\n        return p;\n    }\n    protected override object? Invoke(MethodInfo m, object?[]? args) {\n        Console.WriteLine(m.Name);\n        return m.Invoke(_target, args);          // wraps failures in TargetInvocationException\n    }\n}",
+      "pitfalls": [
+        "DispatchProxy emits IL at runtime, so trimming and NativeAOT report it as RequiresDynamicCode - the same design silently stops working when the deployment target changes.",
+        "Only interfaces can be proxied: members the interface does not carry are invisible on the proxy, and method.Invoke wraps target exceptions instead of letting them through.",
+        "Async methods return Task, so an interceptor that does not await them swallows the exception that would have been observed by the caller."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.reflection.dispatchproxy?view=net-9.0",
+        "https://devblogs.microsoft.com/dotnet/migrating-realproxy-usage-to-dispatchproxy/",
+        "https://github.com/dotnet/runtime/blob/main/src/libraries/System.Reflection.DispatchProxy/src/System/Reflection/DispatchProxyGenerator.cs"
+      ]
+    },
+    {
+      "variant_id": "castle-dynamicproxy",
+      "name": "Castle.Core DynamicProxy with an interceptor pipeline",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "requires_features": [],
+      "idiom_name": "ProxyGenerator.CreateInterfaceProxyWithTarget / CreateClassProxy + IInterceptor",
+      "implementation_notes": "Castle.Core's DynamicProxy is the dominant third-party realization: ProxyGenerator emits the proxy type, an IInterceptor chain receives Invocation objects, and two models exist - composition (CreateInterfaceProxyWithTarget, like DispatchProxy) and inheritance (CreateClassProxy, where the proxy derives from the target so internal calls are intercepted too). Choose it when virtual members of a class must be proxied or when interceptor composition is needed; the price is a third-party dependency and the rule that only virtual, non-final members can be overridden.",
+      "code_sketch": "var generator = new ProxyGenerator();                    // reuse: it caches generated types\nvar service = generator.CreateInterfaceProxyWithTarget<IService>(\n    target, new LoggingInterceptor());\n\nclass LoggingInterceptor : IInterceptor {\n    public void Intercept(IInvocation invocation) {\n        Console.WriteLine(invocation.Method.Name);\n        invocation.Proceed();\n    }\n}",
+      "pitfalls": [
+        "A new ProxyGenerator per call bypasses the type cache and leaks dynamic assemblies; the generator must be a long-lived single instance.",
+        "Inheritance proxying only works for virtual, non-final methods on non-sealed classes, and constructor bypass tricks (Objenesis) can skip field initialisation.",
+        "Composition proxies do not intercept calls the target makes on itself, so behaviour added this way misses internal calls."
+      ],
+      "sources": [
+        "https://github.com/castleproject/Core/blob/master/docs/dynamicproxy-introduction.md",
+        "https://github.com/castleproject/Core/blob/master/docs/dynamicproxy.md"
+      ]
+    },
+    {
+      "variant_id": "source-generator-proxy",
+      "name": "build-time generated forwarding type",
+      "paradigm": "oo",
+      "min_standard": "C#10",
+      "requires_features": [
+        "source-generators",
+        "Roslyn"
+      ],
+      "idiom_name": "incremental source generator emitting one forwarding member per interface method",
+      "implementation_notes": "An IIncrementalGenerator (Roslyn) can emit the forwarding type at compile time from the same interface declaration, so no IL is generated at runtime and the result survives trimming, NativeAOT and source-link audits. The cost is a build step and one generated proxy per interface that opts in, plus regenerated code whenever the interface changes - the standard .NET answer when runtime code generation is not allowed.",
+      "code_sketch": "[Generator]\npublic partial class ProxyGenerator : IIncrementalGenerator {\n    public void Initialize(IncrementalGeneratorInitializationContext ctx) {\n        var interfaces = ctx.SyntaxProvider.ForAttributeWithMetadataName(\n            \"App.ProxyForAttribute\", predicate: static (_, _) => true, transform: static (c, _) => c);\n        ctx.RegisterSourceOutput(interfaces, EmitForwarder);   // emits class IServiceProxy : IService\n    }\n}",
+      "pitfalls": [
+        "Generated code drifts when the interface changes but the generator is not re-run in the editor or in CI; the build then fails in generated code the developer never wrote.",
+        "The generated proxy is a compile-time artifact: members the interface gains later only appear after regeneration, so a deployment can carry a stale forwarding surface."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.reflection.dispatchproxy?view=net-9.0",
+        "https://github.com/dotnet/runtime/blob/main/src/libraries/System.Reflection.DispatchProxy/src/System/Reflection/DispatchProxyGenerator.cs"
+      ]
+    }
+  ],
+  "default_variant": "dispatchproxy"
+}

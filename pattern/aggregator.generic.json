@@ -1,0 +1,25 @@
+{
+  "pattern": "aggregator",
+  "language": "generic",
+  "support": "manual",
+  "idiom_name": "stateful correlated collector + completeness policy + merge function",
+  "implementation_notes": "Language-neutral form: keep an aggregation store keyed by correlation id and, for every incoming message, (1) extract the correlation id and expected cardinality, (2) insert the partial result idempotently (keyed by message id so redelivery cannot double-count), (3) evaluate the completeness condition (count reached, deadline passed, score threshold, external event), and (4) atomically claim the completed group so one merge can be published. Make the completeness condition and the merge function pluggable policies, arm a deadline when the first partial is stored, and route incomplete groups to an error channel while releasing their state. If the aggregator can restart or messages can be redelivered, the store must be durable (database, distributed cache, or message-store-backed aggregation), and publication must be transactional or idempotent so a publish failure does not lose the claimed group.",
+  "code_sketch": "on_message(m):\n    cid = m.correlation_id\n    entry = store.open(cid, m.expected)          # correlation strategy\n    entry.add(m)                                 # idempotent: dedupe by message id\n    if complete(entry):                          # count | deadline | score | event\n        group = store.claim(cid)                 # atomically claim once\n        publish(merge(group.parts))              # transactional or idempotent output",
+  "pitfalls": [
+    "Completing on arrival count without de-duplicating: a redelivered partial finishes the aggregate early.",
+    "Forgetting the deadline, so a lost partial pins the store entry forever instead of being reported.",
+    "Merging while the entry is still in the store: a concurrent redelivery can then publish the same aggregate twice.",
+    "No observability: without metrics (in-flight count, completion latency, expiry rate) it is impossible to detect a stuck or slow aggregation until a production incident.",
+    "Persistent store without TTL or size limit: the aggregation table grows unboundedly when partials never complete, eventually causing out-of-memory or database disk exhaustion.",
+    "Silent data loss on expiry: configuring an expiry timeout but discarding partial results instead of emitting a best-effort or diagnostic message means the data is lost with no way to recover or investigate.",
+    "Using a low-cardinality correlation key (e.g., customerId alone) when multiple concurrent workflows share the same key, causing different batches to collide in the same aggregation group.",
+    "Horizontal scaling without correlation affinity: different instances receiving different partials of the same aggregate, producing incomplete or duplicate merged messages.",
+    "Use the expected count as both the correlation contract and the release rule without validation -> stale or forged metadata closes a group early -> validate cardinality from a trusted source and keep correlation, completeness, and merge policies separate.",
+    "Keep correlation entries until every possible late message arrives -> missing messages make the store grow without bound -> enforce TTL and a maximum in-flight-group limit, then route expiry to a diagnostic or best-effort result.",
+    "Append partials in arrival order for an order-sensitive merge -> reordering changes the aggregate on retries or different deliveries -> carry sequence metadata and sort or resequence before merging, or use a commutative/idempotent reducer."
+  ],
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns (2003) — canonical description of Aggregator, Correlation Identifier, Message Sequence, and Broadcast Aggregate."
+  ],
+  "version": "1.0"
+}

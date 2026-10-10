@@ -1,0 +1,220 @@
+{
+  "category": "workflow-messaging",
+  "name": "aggregator",
+  "aliases": [
+    "message-aggregator",
+    "fan-in"
+  ],
+  "intent": "Collect correlated partial messages in a bounded, stateful filter keyed by a correlation id, evaluate an explicit completeness condition, and publish one deterministic aggregate; it is the fan-in step after a fan-out, not the fan-out itself.",
+  "problem": "After a Splitter, Recipient List, or Publish-Subscribe Channel fans out one logical request, its replies arrive as independent messages; downstream billing, ranking, or committing needs one combined result. The replies may be out of order, duplicated, late, or missing, so the design must state which messages belong together, how they combine, and what releases an incomplete group.",
+  "context": "Message-based integration where a Splitter, Recipient List or Publish-Subscribe Channel has already produced correlated partial messages and a later stage needs one message. Applies to asynchronous brokers (consumers keyed by correlation id, aggregation state in a store), in-process concurrency (futures, task groups, promise combinators), and streaming windows; once partials can be lost, reordered, duplicated, or late, the aggregator also needs a correlation strategy, an idempotent store, an explicit release policy, and bounded retention.",
+  "benefits": [
+    "Turns many independent replies into one contractually meaningful message, so downstream stages see a single input instead of N partial ones.",
+    "Decouples producers from the join: senders only supply the correlation id (and expected count), not knowledge of the aggregation logic.",
+    "Makes the completeness condition an explicit, named policy — wait-for-all, time-out, first-best, external event — instead of an accident of arrival order.",
+    "Absorbs asynchrony: partials may arrive out of order on different channels, threads or processes and are still merged deterministically.",
+    "Concentrates de-duplication, expiry and error routing for incomplete groups in one component where they can be observed and tested.",
+    "Enables parallel fan-out: latency becomes the slowest awaited partial plus the merge instead of the sum of partial latencies."
+  ],
+  "tradeoffs": [
+    "Statefulness: partial results must be stored per correlation id until completion or expiry, so the aggregator needs bounded memory or durable storage and becomes the component that loses work when the process restarts.",
+    "\"Wait for all\" is brittle: one lost or delayed partial stalls the whole aggregate, and in loosely coupled asynchronous systems \"missing\" can only be approximated by a timeout, which turns completeness into a timing heuristic.",
+    "Redelivery breaks naive collection: a duplicate partial inflates arrival counts and can complete the aggregate early with the same piece merged twice, so the collector must de-duplicate by message id.",
+    "Latency floor: the merge cannot be published before the completeness condition holds, so the aggregate is at least as slow as its slowest awaited member — fan-out buys parallelism, not speed.",
+    "Evolution coupling: producers and aggregator must agree on the correlation key, expected cardinality and partial schema; changing the fan-out shape breaks the collector silently.",
+    "Order-sensitive merges need more than collection: arrival order is arbitrary, so a non-commutative aggregation algorithm must sort by Message Sequence or delegate ordering to a Resequencer.",
+    "Failure paths multiply: incomplete groups must be routed somewhere (Invalid Message or Dead Letter Channel) and their state released, otherwise partial results leak and are never diagnosed.",
+    "Scaling out requires correlation affinity: all partials of one aggregate must reach the same collector instance, which constrains partitioning and rebalancing."
+  ],
+  "quality_attributes": {
+    "testability": 6,
+    "extensibility": 7,
+    "maintainability": 6,
+    "simplicity": 4,
+    "performance": 6,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 5
+  },
+  "participants": [
+    {
+      "role": "Aggregator (stateful filter)",
+      "responsibility": "Receives correlated partial messages, stores each one, evaluates the completeness condition and triggers the merge; it is a filter sitting between the input channel and the output channel."
+    },
+    {
+      "role": "Partial Result Store",
+      "responsibility": "Holds the partial results keyed by correlation identifier (in-memory map, database row or message store) and releases them atomically on completion or expiry."
+    },
+    {
+      "role": "Correlation Strategy",
+      "responsibility": "Extracts and validates the correlation identifier — and, where known, the expected count — from each incoming message so parts of different aggregates can never mix."
+    },
+    {
+      "role": "Completeness Condition",
+      "responsibility": "Decides when an aggregate is ready to publish: wait-for-all, time-out, first-best, time-out with override, quorum, or an external event."
+    },
+    {
+      "role": "Aggregation Algorithm",
+      "responsibility": "Combines the stored partial results into the single outgoing message, deterministically and idempotently, sorting by sequence number where order matters."
+    },
+    {
+      "role": "Expiry Monitor",
+      "responsibility": "Tracks a deadline per aggregate and fails or releases groups that never complete, routing them to an error channel or emitting a best-so-far result."
+    },
+    {
+      "role": "Output Channel",
+      "responsibility": "Carries the aggregated message — and, on failure, the incomplete group's diagnostic — to the next processing stage."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "object"
+  ],
+  "use_cases": [
+    "Order fulfilment: Split an order into line items, pull each from the warehouse, and bill only when every item has been confirmed, with a timeout routing incomplete groups to an error channel. This is the canonical EIP example: wait-for-all completeness with explicit timeout and dead-letter handling.",
+    "Quote or bid aggregation: Broadcast a request to several vendors and pick the best offer after all replies arrive or after a deadline (time-out with override). The aggregator scores each partial by price, lead time, or a composite metric and emits only the winning bid.",
+    "Scatter-gather request processing: Call several services for the pieces of one response and merge the answers into a single reply to the caller. Widely used in loan broker, insurance quote, and e-commerce pricing scenarios where no single service owns the full answer.",
+    "Stream processing window aggregation: Window or session aggregation (Kafka Streams windowed aggregation, Apache Flink windows) where events are collected per key until the window closes and one aggregate record is emitted. Common in real-time analytics, fraud detection, and IoT sensor fusion.",
+    "Chunked transfer assembly: Collect numbered upload chunks until the last one arrives and reassemble the document, using Message Sequence as the completeness condition. Handles out-of-order arrival and missing chunks via timeout with partial-result-on-timeout.",
+    "Saga coordination: A Process Manager collects confirmations and rejections from participating services before committing or compensating a distributed transaction. The aggregator holds the saga state machine's partial outcomes and emits the compensation trigger when the completeness condition (all replies received or timeout) fires.",
+    "IoT telemetry aggregation: Collect sensor readings per device until a time or count window closes and emit one aggregate reading (mean, max, histogram) for downstream analytics. Reduces network chatter and enables edge pre-processing before cloud transmission.",
+    "ML inference ensemble: Scatter a prediction request to multiple model versions and merge their outputs (averaged probabilities, majority vote, stacking) before returning to the caller. The aggregator must be deterministic — same inputs always produce same outputs — and handle model latency variance with a bounded timeout.",
+    "Multi-factor authentication verification: Run identity factor checks (SMS, email, TOTP, biometric) in parallel and combine the verification result once all factors have been evaluated or the deadline expires. The aggregator enforces a strict all-required policy or a threshold policy depending on the authentication level required.",
+    "Financial trade netting: Aggregate trade confirmations from multiple exchanges or dark pools until end-of-day and emit a net position report for settlement. Uses an external-event completeness condition (market close signal) rather than a simple timeout.",
+    "API gateway composition: An API gateway or BFF receives a client request and fans out to multiple backend microservices in parallel, merges their responses, and returns a single unified payload. Reduces client round-trips, centralises failure handling, and enables graceful degradation with per-service timeouts and circuit breakers.",
+    "Customer 360 view: An event-driven read model service subscribes to domain events (Kafka) and incrementally builds a denormalised Customer 360 view from orders, support tickets, billing events, and CRM data. The view is continuously refreshed and served by a query API, with reconciliation jobs repairing drift.",
+    "Apache Camel Aggregate EIP: Apache Camel correlates exchanges by key, applies an AggregationStrategy, and releases each group by completion size, predicate, inactivity timeout, or an external controller; its AggregationRepository makes the stateful filter explicit.",
+    "Apache Flink keyed window aggregation: Apache Flink groups keyed streams into event- or processing-time windows and applies reduce or aggregate functions when triggers or watermarks close them; allowed lateness and late-data side outputs make late partials explicit instead of waiting forever.",
+    "Kafka Streams windowed reduce: Kafka Streams' KGroupedStream.windowedBy(...).reduce(...) maintains a per-key windowed aggregate in a state store and changelog, providing a durable streaming fan-in for time or session windows instead of a hand-written correlation map."
+  ],
+  "avoid_when": [
+    "Only one message is expected: a plain request-reply consumer is enough and an aggregator is pure overhead.",
+    "The pieces are already available in-process and synchronously joinable (one await over a list of futures, a single database query) — the join is code, not a component.",
+    "The problem is the order of the pieces, not their combination: use a Resequencer, which preserves each message and restores sequence without merging them; an Aggregator changes cardinality and should not be used as an ordering buffer.",
+    "The component only observes or accepts/rejects individual messages: use Publish-Subscribe or a Wire Tap for observation, or a Message Filter for a per-message predicate; an Aggregator retains cross-message state and emits one replacement message.",
+    "You need to define both the fan-out and reply collection as one interaction: use Scatter-Gather; use Aggregator alone when a Splitter, Recipient List, or Publish-Subscribe Channel has already produced the partials.",
+    "The composite payload already exists in storage and a Claim Check reference is enough — fetching it beats reassembling partials.",
+    "A streaming framework already provides windowed aggregation: use the framework operator instead of hand-rolling a collector.",
+    "The fan-out is unbounded or the set of responders is unknown and count-based completion is impossible: use a predicate-based or external-event completeness condition, or reconsider whether aggregation is the right tool."
+  ],
+  "language_files": {
+    "generic": "aggregator.generic.json",
+    "c": "aggregator.c.json",
+    "cplusplus": "aggregator.cplusplus.json",
+    "csharp": "aggregator.csharp.json",
+    "go": "aggregator.go.json",
+    "java": "aggregator.java.json",
+    "javascript": "aggregator.javascript.json",
+    "kotlin": "aggregator.kotlin.json",
+    "python": "aggregator.python.json",
+    "ruby": "aggregator.ruby.json",
+    "rust": "aggregator.rust.json",
+    "scala": "aggregator.scala.json",
+    "swift": "aggregator.swift.json",
+    "typescript": "aggregator.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent",
+    "declarative"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "eip"
+  ],
+  "related_patterns": [
+    "splitter",
+    "resequencer",
+    "scatter-gather",
+    "composed-message-processor",
+    "correlation-identifier",
+    "process-manager",
+    "recipient-list",
+    "message-store"
+  ],
+  "anti_patterns": [
+    "Collector without expiry: Collect without expiry -> missing or late partials leave correlation state forever and bloat the store -> arm a deadline on the first partial and route expired groups to a diagnostic or dead-letter channel. Mitigation: Configure a MessageGroupStoreReaper (Spring Integration) or equivalent TTL scanner in all production aggregator implementations.",
+    "Counting arrivals while ignoring message identity: Count arrivals instead of unique message identities -> retries complete aggregates early and duplicate data is merged -> de-duplicate by message id before incrementing the group count. Mitigation: Track message IDs in a set; only count a partial if its message ID has not been seen before for the same correlation ID.",
+    "Thread-per-aggregate blocking collectors: One thread parked per correlation id caps concurrency at the thread pool size and hides the missing-partial problem until the pool is exhausted. Mitigation: Use non-blocking, event-driven aggregation with async/await or reactive streams. Park no threads; let the event loop drive completion evaluation.",
+    "Buffering whole payloads instead of references: Partial results are retained for the whole aggregation, multiplying memory footprint. Large payloads (e.g., image chunks, PDF pages) can cause OOM. Mitigation: Store a Claim Check reference and keep only the fields the merge actually needs. Serialize to a message store and reference by ID.",
+    "Global mutable aggregation state without correlation affinity: Several aggregator instances share aggregation state without sticky routing, causing lost updates and duplicate publication when instances rebalance. Mitigation: Enforce correlation affinity: route all partials for a given correlation ID to the same aggregator instance (consistent hashing, sticky sessions, or a shared durable store).",
+    "Aggregator with embedded business logic: Put domain rules inside the Aggregator instead of the owning bounded context -> pricing or workflow decisions become coupled and duplicated -> keep the collector thin and delegate business logic to the data-owning service. Mitigation: Keep the aggregator thin: it composes and transforms data, it does not own business rules. Push business logic to the services that own the data.",
+    "Sequential downstream calls: The aggregator makes HTTP or gRPC calls to backends one after another instead of in parallel, turning max(latencies) into sum(latencies) and negating the fan-out benefit. Mitigation: Always launch all downstream calls concurrently (Promise.all, asyncio.gather, CompletableFuture.allOf) and await them together."
+  ],
+  "design_principles": [
+    "Separation of concerns: correlation, completeness and aggregation are three separate policies, not one blob of code.",
+    "Single responsibility: the aggregator is a filter — it stores, decides and merges; it neither produces partials nor processes the aggregate.",
+    "Information hiding: producers know only the correlation contract; store, de-duplication and expiry stay inside the aggregator.",
+    "Idempotence by design: de-duplicate every partial so the aggregate is a function of the set of messages, not of how often they were delivered.",
+    "Fail-fast with bounded state: every aggregate has a deadline, and every deadline releases its state and reports the incomplete group.",
+    "Open/closed principle: completeness conditions and merge algorithms plug in as strategies instead of branching inside the collector.",
+    "Explicit over implicit: partial success must be surfaced to callers, not silently treated as full success.",
+    "Composition over inheritance for merge logic: prefer composing the aggregation algorithm from small, testable functions rather than inheriting from a base aggregator class."
+  ],
+  "best_practices": [
+    "Carry an explicit correlation id — and the expected count where known — on every partial; derive them from the original composite message or from the Splitter. Validate on arrival and reject messages with missing or malformed correlation keys immediately.",
+    "De-duplicate by message id when storing a partial so redelivery is harmless, making the receiver idempotent. Treat duplicate sequence numbers with different payloads as a conflict routed to a dead-letter channel.",
+    "Make the completeness condition a named policy and always arm a deadline when the first partial is stored; treat wait-for-all as a special case that needs an explicit error path for incomplete groups.",
+    "Release the aggregation state in the same critical section that publishes the merged message, so a concurrent redelivery cannot publish twice. Use atomic compare-and-swap or distributed locks when scaling horizontally.",
+    "Bound the number of in-flight aggregates, evict expired ones, and observe store size and incomplete-group counts via metrics and alerting.",
+    "Store large partials by reference (Claim Check) and keep only the fields the merge actually needs, to prevent memory exhaustion from large payloads buffered for long aggregation windows.",
+    "Keep the merge deterministic — sort by sequence number when order affects the result — and side-effect free so it can be retried safely after a publish failure.",
+    "Propagate the correlation id in all log lines and distributed trace spans (traceparent, X-Correlation-ID) so an aggregation can be traced end-to-end across services and broker hops.",
+    "Route incomplete or expired groups to a dedicated dead-letter or error channel; never silently drop them as they represent lost work that must be observable and diagnosable.",
+    "Instrument the aggregator with metrics: in-flight aggregate count, average and p99 completion latency, expiry rate, dead-letter rate, and duplicate detection rate — alert on anomalies above baseline.",
+    "Prefer a persistent aggregation store (Redis, DynamoDB, database, or framework message store) when aggregate groups may outlast process restarts; configure the store with a TTL and maximum capacity to prevent unbounded growth.",
+    "When using a wait-for-all completeness strategy, always configure a fallback (partial-result-on-timeout) so a single lost partial does not stall the aggregate indefinitely and block downstream processing.",
+    "Implement per-service circuit breakers and per-service timeouts in API-gateway aggregation scenarios; one failing backend should not block the entire aggregated response. Return what is available with a completeness metadata field.",
+    "Fan out to all downstream services concurrently in parallel, never sequentially; total latency equals max(partial latencies) not sum(partial latencies).",
+    "Use structured error responses that include a completeness indicator (e.g., _meta.partial, failedSources) so clients can render degraded UIs gracefully instead of failing the entire view.",
+    "When the set of responders is unknown (pub-sub, auction), use a quorum or time-out completeness condition rather than count-based, since the aggregator cannot know how many replies to expect.",
+    "For streaming aggregation (Kafka Streams, Flink), use the framework's built-in window operators rather than hand-rolling a collector; they handle late events, watermark progression, and state store eviction correctly."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Hohpe & Woolf, Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions (2003), Addison-Wesley — canonical description of Aggregator, Correlation Identifier, Message Sequence, and Broadcast Aggregate. https://www.enterpriseintegrationpatterns.com/patterns/messaging/Aggregator.html",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/Aggregator.html — EIP official pattern page with completeness condition strategies (Wait for All, Time Out, First Best, Time Out with Override, External Event) and modern cloud implementations (AWS Loan Broker with Lambda/DynamoDB, GCP Loan Broker with Cloud Functions/Datastore).",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/CorrelationIdentifier.html — EIP Correlation Identifier pattern defining how messages are grouped for aggregation.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/Sequencer.html — EIP Resequencer pattern for ordering partials before aggregation when order matters.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/BroadcastAggregate.html — EIP Broadcast Aggregate pattern describing Scatter-Gather and its relationship to Aggregator.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/DistributionAggregate.html — EIP Composed Message Processor pattern showing how Splitter and Aggregator compose in a full pipeline.",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/ComposedMessagingExample.html — EIP Loan Broker example demonstrating three aggregation implementations (synchronous Web Services, async MSMQ, async TIBCO pub-sub) with channel, addressing, and aggregation strategy trade-offs.",
+    "https://www.enterpriseintegrationpatterns.com/ — Hohpe's modern EIP update page covering microservices, serverless (AWS Step Functions, Lambda, DynamoDB, GCP Cloud Functions/Datastore), and the evolution of integration patterns in cloud-native architectures.",
+    "Spring Integration Reference: Aggregator — covers CorrelationStrategy, ReleaseStrategy, MessageGroupStore, MessageGroupStoreReaper, FluxAggregatorMessageHandler, and XML/Java DSL configuration. https://docs.spring.io/spring-integration/reference/aggregator.html",
+    "Apache Camel Documentation: Aggregate EIP — covers AggregationStrategy, AggregationRepository, completion predicates, pre-completion mode, bean-based aggregation, and integration with Camel DSL. https://camel.apache.org/components/next/eips/aggregate-eip.html",
+    "Apache Camel: Scatter-Gather EIP — describes combining Recipient List (scatter) with Aggregate EIP (gather), custom AggregationStrategy for best-quote selection, and completionTimeout with built-in timeout handling. https://camel.apache.org/components/4.14.x/eips/scatter-gather.html",
+    "Akka Streams Documentation: groupBy operator — covers fan-out via groupBy with reduce-by-key, maxSubstreams, and mergeSubstreams for stream-level aggregation. https://doc.akka.io/libraries/akka-core/current/stream/operators/Source-or-Flow/groupBy.html",
+    "NServiceBus Documentation: Sagas — covers long-running process coordination, correlation, timeouts, and scatter-gather aggregation trade-offs in the NServiceBus programming model. https://docs.particular.net/nservicebus/sagas/",
+    "AWS Step Functions Developer Guide: Map state — covers Inline and Distributed Map modes for fan-out/fan-in, MaxConcurrency up to 10,000 parallel child executions, tolerated failure thresholds, and S3-based item readers for large-scale aggregation. https://docs.aws.amazon.com/step-functions/latest/dg/concepts-amazon-states-language.html",
+    "AWS Step Functions Developer Guide: Distributed Map — covers distributed map for large-scale parallel workloads with up to 10,000 concurrent child workflow executions, S3 item readers for CSV/JSON datasets, and ResultWriter for aggregated output to S3. https://docs.aws.amazon.com/step-functions/latest/dg/state-map-distributed.html",
+    "Azure Architecture Center: Gateway Aggregation pattern — covers reducing client-to-backend round-trips, parallel fan-out, per-service timeouts, circuit breakers, and graceful partial-failure handling in API gateways. https://learn.microsoft.com/en-us/azure/architecture/patterns/gateway-aggregation",
+    "Software Patterns Lexicon: Aggregation and Scatter-Gather — practical discussion of completion policies (wait-for-all, quorum, time budget, partial-after-time-budget), partial failure handling, state tracking, and common mistakes including missing completion policies and undefined timeouts. https://softwarepatternslexicon.com/event-driven-architecture-patterns/integration-patterns/aggregation-scatter-gather/",
+    "Software Patterns Lexicon: Aggregator pattern — covers definition, stateful message handling, condition-based aggregation, composite message creation, and Java/Scala idioms. https://softwarepatternslexicon.com/enterprise-integration-patterns/message-routing/aggregator/",
+    "Software Patterns Lexicon: Java Aggregation and Splitting Patterns — covers four policy model (Correlation, Aggregation, Completion, Expiration strategies), message store comparison (in-memory, relational, Redis, Kafka, framework), duplicate handling, and expiry strategies. https://softwarepatternslexicon.com/java/integration-patterns/aggregation-and-splitting-patterns/",
+    "NILUS Consulting: Fan-Out/Fan-In Aggregation in Microservices — covers request-time vs event-driven vs hybrid aggregation, domain-alignment principles, orchestration policies (timeouts, fallbacks, cache, stale-read tolerance), CQRS separation, materialized view building, and the Strangler Fig migration approach. https://www.nilus.be/blog/fan-outfan-in_aggregation_in_microservices/",
+    "techinterview.org: API Composition Pattern LLD — covers aggregator service design, parallel fetching with asyncio.gather return_exceptions=True, partial failure handling with nullable fields and _errors array, per-service circuit breakers, and response caching with TTL. https://www.techinterview.org/post/3233469072/lld-api-composition/",
+    "Stripe Systems: API Gateway Patterns BFF vs Aggregator — covers aggregator vs BFF trade-offs, NestJS implementation with Promise.all, _meta.partial flag for graceful degradation, timeout hierarchy (critical vs optional services), and Conway's Law alignment. https://www.stripesys.com/blog/api-gateway-patterns-bff",
+    "DevelopersVoice: Gateway Aggregation Pattern in .NET — covers parallel execution, per-service timeouts via HttpClientFactory, circuit breakers with Polly, correlation ID propagation, and anti-patterns (sequential calls, business logic in aggregator). https://developersvoice.com/blog/cloud-design-patterns/gateway-aggregation-pattern/",
+    "ADHDecode: API Gateway Aggregation — covers latency amplification from slowest dependency (max vs sum), partial failure management, gateway becoming a bottleneck, smart timeout hierarchy, and Promise.allSettled for graceful degradation. https://adhdecode.com/api-architecture/api-design-patterns/api-gateway-aggregation/",
+    "API7.ai: API Aggregation in API Gateways — covers REST vs GraphQL aggregation trade-offs, gateway-level vs BFF aggregation, and technology support (Apache APISIX, Kong, NGINX, Envoy). https://api7.ai/learning-center/api-gateway-guide/api-gateway-api-aggregation",
+    "AWS News Blog: Step Functions Dynamic Parallelism (2019) — covers Map state for dynamic fan-out/fan-in, MaxConcurrency configuration, Iterator sub-workflows, and ResultPath for aggregating child execution outputs. https://aws.amazon.com/blogs/aws/new-step-functions-support-for-dynamic-parallelism/",
+    "Yan Cui (AWS Serverless Hero): Fan-out/fan-in serverlessly in 2024 — covers Step Functions Map (Inline vs Distributed), cost comparison vs custom SQS+DynamoDB solution, DynamoDB stream-based custom fan-in with completion counting, and when to choose which approach. https://theburningmonk.com/",
+    "OneUptime: Message Aggregator — covers TypeScript implementation with UUID correlation IDs, timeout handling with timer cleanup, completion strategy interface, and production monitoring (active aggregations, timeout stats). https://oneuptime.com/blog/post/2026-01-30-message-aggregator/view",
+    "Apache Flink DataStream Windows documentation — covers keyed event-/processing-time windows, reduce/aggregate functions, watermarks, allowed lateness, late-data side outputs, and window state removal. https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/",
+    "Apache Kafka Streams KGroupedStream API — documents windowedBy(...) and reduce(...) for time/session window aggregation, materialized state stores, and changelog-backed recovery. https://kafka.apache.org/43/javadoc/org/apache/kafka/streams/kstream/KGroupedStream.html"
+  ],
+  "related_patterns_notes": {
+    "splitter": "The natural inverse: a Splitter breaks one composite message into multiple partials that an Aggregator later recombines. Often used together in a composed-message-processing pipeline.",
+    "resequencer": "Both hold and re-order messages, but a Resequencer preserves individual message identity while an Aggregator merges partials into one output. They can be composed: a Resequencer can run before an Aggregator when order matters for the merge.",
+    "scatter-gather": "A composite pattern that pairs a fan-out (via Recipient List or Publish-Subscribe) with an Aggregator to collect the replies. The Aggregator is the gathering half; Scatter-Gather is the context that motivates it.",
+    "composed-message-processor": "Uses a Splitter to break a composite message, routes sub-messages to their destinations, and uses an Aggregator to reconcile the responses before passing a single validated message to the next step. The aggregator is the re-integration step in the composed message flow.",
+    "correlation-identifier": "The header (or field) that the Aggregator's Correlation Strategy reads to determine which partials belong together. Without a reliable correlation identifier, aggregation cannot function correctly.",
+    "process-manager": "A Process Manager orchestrates multi-step workflows and may use an Aggregator internally to collect step responses before deciding the next action. Sagas often use an aggregator-like pattern to track confirmations across participants. In saga implementations with aggregated confirmations, an Aggregator collects replies from participants to determine whether to commit or compensate. The aggregator enforces the completeness condition for the saga's two-phase completion.",
+    "recipient-list": "Often the fan-out mechanism that precedes an Aggregator in a Scatter-Gather. The Recipient List determines which services receive the request; the Aggregator collects their replies.",
+    "message-store": "The backing store used by the Aggregator to persist partial results. Enables aggregator restarts without losing in-flight state and supports correlation-based recovery after crashes."
+  }
+}

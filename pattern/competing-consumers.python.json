@@ -1,0 +1,77 @@
+{
+  "pattern": "competing-consumers",
+  "language": "python",
+  "support": "library",
+  "idiom_name": "queue.Queue + N worker threads (stdlib)",
+  "implementation_notes": "queue.Queue is a multi-producer, multi-consumer queue whose get() removes an item for exactly one caller, so N daemon-free worker threads looping `item = q.get()` implement the competing-consumer pool directly, with q.task_done()/q.join() for shutdown and maxsize for backpressure. Nothing of the classic structure remains to write - the queue is the arbiter - and the honest limits are elsewhere: threads share the GIL (good for I/O-bound handlers, poor for CPU-bound ones) and the queue dies with the process.",
+  "code_sketch": "import queue, threading\nq = queue.Queue(maxsize=100)\nstop = threading.Event()\n\ndef worker():\n    while not stop.is_set():\n        item = q.get()\n        try: process(item)          # ack after handling (at-least-once)\n        finally: q.task_done()\n\nthreads = [threading.Thread(target=worker) for _ in range(n)]\nfor t in threads: t.start()         # producer: q.put(job); shutdown: stop.set(); q.join()",
+  "pitfalls": [
+    "The GIL means threads add no CPU parallelism: CPU-bound handlers need ProcessPoolExecutor/multiprocessing or a process-based worker (Celery) instead.",
+    "Forgetting q.task_done() (or swallowing exceptions before it) hangs q.join() at shutdown and hides poison messages.",
+    "A queue.Queue with maxsize=0 is unbounded - overload becomes memory growth rather than producer backpressure."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/queue.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "threads-queue",
+      "name": "queue.Queue + N worker threads (stdlib)",
+      "paradigm": "concurrent",
+      "idiom_name": "queue.Queue + N worker threads (stdlib)",
+      "implementation_notes": "queue.Queue is a multi-producer, multi-consumer queue whose get() removes an item for exactly one caller, so N daemon-free worker threads looping `item = q.get()` implement the competing-consumer pool directly, with q.task_done()/q.join() for shutdown and maxsize for backpressure. Nothing of the classic structure remains to write - the queue is the arbiter - and the honest limits are elsewhere: threads share the GIL (good for I/O-bound handlers, poor for CPU-bound ones) and the queue dies with the process.",
+      "code_sketch": "import queue, threading\nq = queue.Queue(maxsize=100)\nstop = threading.Event()\n\ndef worker():\n    while not stop.is_set():\n        item = q.get()\n        try: process(item)          # ack after handling (at-least-once)\n        finally: q.task_done()\n\nthreads = [threading.Thread(target=worker) for _ in range(n)]\nfor t in threads: t.start()         # producer: q.put(job); shutdown: stop.set(); q.join()",
+      "pitfalls": [
+        "The GIL means threads add no CPU parallelism: CPU-bound handlers need ProcessPoolExecutor/multiprocessing or a process-based worker (Celery) instead.",
+        "Forgetting q.task_done() (or swallowing exceptions before it) hangs q.join() at shutdown and hides poison messages.",
+        "A queue.Queue with maxsize=0 is unbounded - overload becomes memory growth rather than producer backpressure."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/queue.html"
+      ]
+    },
+    {
+      "variant_id": "asyncio-queue",
+      "name": "asyncio.Queue + N worker tasks (single event loop)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "asyncio"
+      ],
+      "idiom_name": "asyncio.Queue + N worker tasks (single event loop)",
+      "implementation_notes": "The async form replaces threads with tasks: asyncio.Queue hands each item to exactly one awaiting `await q.get()` coroutine, so N worker tasks compete inside one event loop and thousands of concurrent I/O operations are possible with a handful of workers. What changes versus threads is discipline, not semantics - every handler must stay non-blocking (run_in_executor for sync work) or it stalls the whole pool - and the queue lives in one process/event loop, so multi-core scaling still needs processes or a broker.",
+      "code_sketch": "import asyncio\n\nasync def worker(q):\n    while True:\n        item = await q.get()\n        try: await process(item)     # never block the loop here\n        finally: q.task_done()\n\nasync def main():\n    q = asyncio.Queue(maxsize=100)\n    workers = [asyncio.create_task(worker(q)) for _ in range(n)]\n    ...  # producer: await q.put(job); await q.join(); cancel workers",
+      "pitfalls": [
+        "A blocking call (requests, time.sleep, heavy CPU work) inside a worker freezes every other worker in the loop; use aiohttp/asyncio.sleep and executor offloads.",
+        "Task exceptions are swallowed until awaited: a worker that dies from an exception silently shrinks the pool - collect and supervise the worker tasks.",
+        "The queue is process-local; asyncio alone gives no cross-process or durable competition - that is a broker's job."
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/asyncio-queue.html"
+      ]
+    },
+    {
+      "variant_id": "broker-processes",
+      "name": "Broker-backed worker processes (Celery/RQ/SQS consumers)",
+      "paradigm": "concurrent",
+      "min_standard": "Python3.8",
+      "requires_features": [
+        "Celery"
+      ],
+      "idiom_name": "Broker-backed worker processes (Celery/RQ/SQS consumers)",
+      "implementation_notes": "The deployment form used when availability matters: N worker processes pull from a real durable queue (Celery on Redis/RabbitMQ, RQ, an SQS or Kafka consumer), so competition survives process restarts and spans hosts, and the broker - not an in-process queue - owns acknowledgement and redelivery. The Python code shrinks to the task function; pool size, concurrency and prefetch are deployment settings, and the interesting work moves to idempotency, retry policy and dead-letter configuration.",
+      "code_sketch": "# tasks.py (Celery)\n@app.task(bind=True, max_retries=3, acks_late=True)\ndef send_email(self, user_id):\n    if already_sent(user_id):\n        return                       # idempotent: redelivery is safe\n    send(user_id)\n\n# shell: celery -A tasks worker --concurrency=8\n# start more worker processes/hosts to compete on the same queue",
+      "pitfalls": [
+        "acks_late=True is required for at-least-once processing, but it makes duplicate delivery normal - tasks must be idempotent.",
+        "Prefetch settings let one worker reserve many messages; a long task then starves sibling workers on the same queue.",
+        "An unhandled exception moves the task to retries/failure; without max_retries and a dead-letter path a poison task retries forever."
+      ],
+      "sources": [
+        "https://docs.celeryq.dev/en/stable/userguide/workers.html",
+        "https://www.rabbitmq.com/tutorials/tutorial-two-python"
+      ]
+    }
+  ],
+  "default_variant": "threads-queue"
+}

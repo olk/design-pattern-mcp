@@ -1,0 +1,162 @@
+{
+  "category": "security-verification",
+  "name": "security-context",
+  "aliases": [
+    "principal propagation",
+    "identity propagation"
+  ],
+  "intent": "Carry the authenticated principal and its security attributes with the unit of work - request, thread or task - so guards, audit and domain code can read who is acting without every layer passing an identity parameter, and without the identity leaking into another unit of work.",
+  "problem": "Authentication happens once at the trust boundary (servlet filter, middleware, interceptor, message consumer), while the decisions that need the identity happen far inside the call chain: authorization guards, data-access checks, audit trails, tenant filters. Threading a principal parameter through every intermediate layer pollutes signatures the layers do not care about and is easy to forget on a new path; re-parsing the credential at each layer duplicates verification work and lets two layers disagree about who the caller is; and a process-global or static \"current user\" is shared by concurrent requests, so one user's identity leaks into another's execution.",
+  "context": "Request-serving systems behind a trust boundary - HTTP and RPC servers, message consumers, jobs started from a request - where the identity is established once and consumed many times, where execution units are pooled or move between threads at suspension points (thread pools, event loops, coroutines, tasks), and where a guard deep in the call chain must read the principal without the intermediate layers knowing about it.",
+  "benefits": [
+    "Guards, audit and data-access code read one canonical identity instead of receiving it through every layer, so signatures stay about the domain and a new call path cannot accidentally forget to pass the principal.",
+    "Population and verification happen once at the boundary: the authenticator or middleware writes the context, and every consumer downstream sees the same principal, the same attributes (roles, tenant, authentication method) and the same failure semantics.",
+    "Decision code becomes mechanism-independent: guards depend on the principal abstraction inside the context, not on a credential format, so switching password for OIDC, mTLS or a passkey does not touch them (this is where Subject Descriptor and Authenticator plug in).",
+    "Testability: a guard can be exercised by binding a context explicitly in the test, without standing up the authentication stack, and the same seam makes the identity replaceable in integration tests.",
+    "One explicit lifecycle: the context is bound when the unit of work starts and unbound when it ends, which gives a single place to enforce clearing, propagation policy and audit of who did what.",
+    "Uniform propagation across asynchronous continuations in runtimes that provide it (contextvars, AsyncLocal, CoroutineContext, TaskLocal), so authorization survives suspension points and child tasks instead of silently degrading to unauthenticated."
+  ],
+  "tradeoffs": [
+    "Ambient state hides control flow: a guard's behaviour now depends on a binding that is invisible at the call site, so failures are location-dependent and previously pure functions acquire a hidden input.",
+    "Lifetime bugs turn into security incidents: a holder that is not cleared before the execution unit is reused hands the previous principal to the next request on that pooled thread or event loop, while a context that is not propagated makes guards see unauthenticated - both fail silently unless they are tested explicitly.",
+    "Every runtime loses the context on a different hop: thread-locals do not cross thread pools, ContextVars are copied per task, AsyncLocal stores are per asynchronous control flow, Swift TaskLocal is not inherited by Task.detached, and tokio task locals are not inherited by spawned tasks - each hop needs its own propagation decision.",
+    "Framework lock-in: the holder API is framework-specific (SecurityContextHolder, HttpContext.User, req.auth, Current), so guard code is written against that framework and is hard to lift into another stack or into a shared library.",
+    "In-process only: the context cannot travel between processes, so distributed calls must re-establish the identity from a token or assertion; the pattern solves exactly the in-process half of \"who is acting\".",
+    "Overloading and cost: the context accumulates tenant, trace, locale and feature flags until its security meaning is blurred, and per-request containers plus request-scoped object graphs add allocation and measurable latency."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 7,
+    "maintainability": 7,
+    "simplicity": 5,
+    "performance": 6,
+    "reliability": 5,
+    "security": 8,
+    "scalability": 6
+  },
+  "participants": [
+    {
+      "role": "SecurityContext",
+      "responsibility": "The container: authenticated principal plus the security attributes (roles or scopes, tenant, authentication method) for one unit of work; consumers get a read-only view."
+    },
+    {
+      "role": "Principal (Subject Descriptor)",
+      "responsibility": "The mechanism-independent identity stored in the context, so guards never see a credential format or an identity-store record."
+    },
+    {
+      "role": "Context Populator",
+      "responsibility": "Authenticator, authentication middleware or session loader: establishes and binds the context at the trust boundary after successful verification, and unbinds it when the unit of work ends."
+    },
+    {
+      "role": "Holder",
+      "responsibility": "Carries the context to the point of use according to the runtime - explicit parameter, request object, thread-local, coroutine context element, task-local - and defines which child executions inherit it."
+    },
+    {
+      "role": "Guard",
+      "responsibility": "Policy decision point that reads the context instead of receiving the principal, and treats an absent or empty context as unauthenticated."
+    },
+    {
+      "role": "Audit / Observer",
+      "responsibility": "Reads the same context to record who performed the action, so the audit trail cannot diverge from the authorization decision."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "boundary",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "An HTTP API where an authentication filter stores the principal in the framework holder and method-level authorization annotations plus audit interceptors read it for every request.",
+    "A gRPC or RPC service whose interceptor validates the token and binds the principal to the call context, so handlers and data-access guards read the identity without threading it.",
+    "A message consumer that authenticates or trusts the delivery-level identity once per message and binds a fresh context per delivery, so retries and concurrent deliveries never share a principal.",
+    "A multi-tenant SaaS where the context carries subject and tenant together, letting repository guards enforce tenant isolation on every query.",
+    "An asynchronous pipeline (coroutines or tasks) that must keep the identity across suspension points and hand it to child tasks according to an explicit propagation policy.",
+    "A serverless or short-lived worker that rebuilds the context per invocation from the verified token, so library code invoked deep in the handler still sees a principal.",
+    "Guard tests: binding a context explicitly in a unit test lets the policy be exercised without the production authentication path, and a test with no context asserts the fail-closed behaviour.",
+    "Jakarta EE / Java EE containers: the EJB container establishes a security context per method invocation (SessionContext.getCallerPrincipal / isCallerInRole, unified since Java EE 8 by the injectable SecurityContext), populated from the caller's credential at the boundary and discarded at the invocation boundary - the namesake industrial instance of the pattern, including scoped rebinding for run-as blocks.",
+    "Spring Security: SecurityContextHolder holds the SecurityContext in a ThreadLocal by default and FilterChainProxy clears it after each request; because that binding does not cross executor boundaries, asynchronous work must deliberately choose a context-propagating strategy or wrapped executor - the canonical example of the propagation-decision-per-hop tradeoff."
+  ],
+  "avoid_when": [
+    "Authentication and authorization happen at one call site on one object: pass the principal as an explicit parameter; a container and holder add indirection without any reader to justify it.",
+    "The framework already carries the identity everywhere you need it and you stay on its request object (ASP.NET Core HttpContext.User, Vapor req.auth); reading it where the guard is defined is enough, and a second holder only creates a second source of truth.",
+    "Purely functional or data-oriented code where all context is already an explicit parameter: ambient state fights the architecture and the type checker cannot see it.",
+    "The decision point lives in another process or another team's service: propagate a signed token or assertion (Assertion Builder) instead of an in-memory context.",
+    "A single-threaded, non-concurrent program where the principal is naturally in scope for the whole run: the holder adds a lifetime to reason about for no benefit.",
+    "A framework-provided request-scoped container already covers the need (request-scoped providers, request attributes) and the team cannot maintain the extra clearing and propagation rules."
+  ],
+  "anti_patterns": [
+    "A process-global or static \"current user\" - a mutable module attribute, a settings object, a singleton with a setter - shared by concurrent requests: the classic identity-leak incident.",
+    "A holder that is never cleared on pooled threads or event loops, so a request without credentials inherits the principal of the previous request.",
+    "Two sources of truth: the principal is passed as a parameter and also cached in a holder, and the two drift as the code evolves.",
+    "Trusting the ambient context without checking it: the guard treats a missing context as \"system\" or \"anonymous with rights\" instead of denying.",
+    "Inheriting a context into long-lived pool threads (inheritable thread-locals copied into a thread pool) so that bindings outlive the request that created them.",
+    "Using the security context as a general request bag (locale, trace id, feature flags), which hides the security-relevant fields and blurs the lifetime policy."
+  ],
+  "design_principles": [
+    "Separation of concerns: identification (Authenticator), transport of identity (context and holder), decision (guard) and recording (audit) are distinct responsibilities.",
+    "Single source of truth: exactly one canonical principal per unit of work, written once at the boundary and read everywhere else.",
+    "Explicit lifetime: bind at the boundary, unbind at the end, and treat absence as not authenticated (fail closed, fail-safe defaults).",
+    "Information hiding: the context exposes the identity facts guards need; credentials and session internals stay with the components that own them.",
+    "Complete mediation: every decision reads the same context through the same accessor, so no path can bypass the guard or invent an identity."
+  ],
+  "best_practices": [
+    "Populate the context exactly once, at the authentication boundary, and hand consumers a read-only view; business code must never rebind the principal.",
+    "Unbind deterministically when the unit of work ends (filter, finally block, RAII scoped binder, after-request hook) so pooled threads and event loops never inherit a stale principal.",
+    "Make propagation explicit and tested: document which hops inherit the context (child tasks, continuations) and which do not (detached tasks, spawned threads, new processes) and assert it in tests.",
+    "Treat an absent or empty context as unauthenticated: only the boundary may create a context, and only after verification.",
+    "Keep the context small and security-focused (principal reference, tenant, authentication method); keep credentials out of it and leave tracing or locale in their own carriers.",
+    "Expose one typed accessor (a FromContext function, an unexported context key, a narrowed request type) instead of letting every call site read the raw holder.",
+    "Test the guard with a bound context, with no context, and with a foreign principal, because absence and leakage are the two failure modes that matter."
+  ],
+  "language_files": {
+    "generic": "security-context.generic.json",
+    "c": "security-context.c.json",
+    "cplusplus": "security-context.cplusplus.json",
+    "csharp": "security-context.csharp.json",
+    "go": "security-context.go.json",
+    "java": "security-context.java.json",
+    "javascript": "security-context.javascript.json",
+    "kotlin": "security-context.kotlin.json",
+    "python": "security-context.python.json",
+    "ruby": "security-context.ruby.json",
+    "rust": "security-context.rust.json",
+    "scala": "security-context.scala.json",
+    "swift": "security-context.swift.json",
+    "typescript": "security-context.typescript.json"
+  },
+  "paradigm": [
+    "oo",
+    "concurrent"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "security-patterns"
+  ],
+  "related_patterns": [
+    "authenticator",
+    "subject-descriptor",
+    "secure-session-manager",
+    "reference-monitor",
+    "context-object",
+    "thread-local-storage"
+  ],
+  "sources": [
+    "Schumacher, Fernandez-Buglioni, Hybertson, Buschmann & Sommerlad, Security Patterns: Integrating Security and Systems Engineering (Wiley, 2006; ISBN 978-0-470-85884-4) - Security Context pattern (Identification and Authentication).",
+    "https://docs.spring.io/spring-security/reference/servlet/authentication/architecture.html",
+    "https://docs.python.org/3/library/contextvars.html",
+    "https://go.dev/blog/context",
+    "https://nodejs.org/api/async_context.html",
+    "https://api.rubyonrails.org/classes/ActiveSupport/CurrentAttributes.html",
+    "https://docs.vapor.codes/security/authentication/",
+    "https://jakarta.ee/specifications/security/1.0/apidocs/javax/security/enterprise/securitycontext",
+    "https://docs.oracle.com/cd/E19316-01/819-3669/bnbyn/index.html",
+    "https://docs.spring.io/spring-security/site/docs/current/api/org/springframework/security/core/context/SecurityContextHolder.html",
+    "https://learn.microsoft.com/en-us/aspnet/core/security/authentication/",
+    "https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=103099543"
+  ],
+  "version": "1.1"
+}

@@ -1,0 +1,63 @@
+{
+  "pattern": "fork-join",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "pthread worker pool + per-worker work-stealing deque (C11 atomics)",
+  "implementation_notes": "C has no task abstraction, so the classic realization is hand-written: a fixed pool of pthreads, one double-ended queue per worker, and a recursive split function that pushes child tasks onto the local deque (push/pop at one end) while idle workers steal from the opposite end. Use C11 <stdatomic.h> for the deque indices and pthread_mutex/pthread_cond only for the pool's sleep path; the join is a per-task completion flag that a waiting worker must keep polling while it continues to run or steal other tasks. OpenMP's task/taskgroup constructs are the runtime-provided alternative - the runtime owns the pool, the queues and the stealing - so prefer them whenever the toolchain supports OpenMP.",
+  "code_sketch": "/* classic: one deque per worker; owner LIFO, thieves FIFO */\nstatic void *worker(void *arg) {\n    for (;;) {\n        Task *t = deque_pop(pool->local[tid]);          /* newest first */\n        if (!t) t = deque_steal(pool, other_worker());  /* oldest first */\n        if (!t) break;                                  /* pool drained */\n        run_task(t);     /* split() forks; join() helps until done */\n    }\n}",
+  "pitfalls": [
+    "A worker that blocks in pthread_cond_wait at a join stops stealing; joins must poll or help while waiting or the pool can deadlock.",
+    "The deque needs single-owner push/pop with a one-thief take path; guarding the whole deque with a single mutex serializes the hot path.",
+    "pthread_create per task is not fork/join: thread creation costs orders of magnitude more than the task it runs, so tasks must be pool-local structs."
+  ],
+  "sources": [
+    "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_create.html",
+    "https://www.openmp.org/spec-html/5.0/openmpsu94.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "pthread-work-stealing",
+      "name": "pthread pool with hand-built work-stealing deques",
+      "paradigm": "concurrent",
+      "min_standard": "C11",
+      "requires_features": [
+        "pthreads",
+        "stdatomic"
+      ],
+      "idiom_name": "pthread worker pool + per-worker work-stealing deque (C11 atomics)",
+      "implementation_notes": "C has no task abstraction, so the classic realization is hand-written: a fixed pool of pthreads, one double-ended queue per worker, and a recursive split function that pushes child tasks onto the local deque (push/pop at one end) while idle workers steal from the opposite end. Use C11 <stdatomic.h> for the deque indices and pthread_mutex/pthread_cond only for the pool's sleep path; the join is a per-task completion flag that a waiting worker must keep polling while it continues to run or steal other tasks. OpenMP's task/taskgroup constructs are the runtime-provided alternative - the runtime owns the pool, the queues and the stealing - so prefer them whenever the toolchain supports OpenMP.",
+      "code_sketch": "/* classic: one deque per worker; owner LIFO, thieves FIFO */\nstatic void *worker(void *arg) {\n    for (;;) {\n        Task *t = deque_pop(pool->local[tid]);          /* newest first */\n        if (!t) t = deque_steal(pool, other_worker());  /* oldest first */\n        if (!t) break;                                  /* pool drained */\n        run_task(t);     /* split() forks; join() helps until done */\n    }\n}",
+      "pitfalls": [
+        "A worker that blocks in pthread_cond_wait at a join stops stealing; joins must poll or help while waiting or the pool can deadlock.",
+        "The deque needs single-owner push/pop with a one-thief take path; guarding the whole deque with a single mutex serializes the hot path.",
+        "pthread_create per task is not fork/join: thread creation costs orders of magnitude more than the task it runs, so tasks must be pool-local structs."
+      ],
+      "sources": [
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_create.html",
+        "https://www.openmp.org/spec-html/5.0/openmpsu94.html"
+      ]
+    },
+    {
+      "variant_id": "openmp-tasks",
+      "name": "OpenMP task/taskgroup runtime",
+      "paradigm": "declarative",
+      "min_standard": "OpenMP3.0",
+      "requires_features": [
+        "openmp"
+      ],
+      "idiom_name": "#pragma omp task / taskgroup inside a parallel region",
+      "implementation_notes": "OpenMP 3.0 added tasks precisely for irregular and recursive parallelism: the fork-join team comes from #pragma omp parallel, #pragma omp task generates child tasks, and #pragma omp taskgroup waits for the child tasks of the current task and all their descendants (the join). The runtime's own queues schedule the tasks, so a blockaded leaf does not need hand-written deques. The decomposition stays yours; data-sharing clauses are where correctness lives - variables are shared by default, so leaf results must use reduction/task_reduction or be captured per task.",
+      "code_sketch": "#pragma omp parallel                      /* worker team (fork-join) */\n#pragma omp single nowait\n{\n    #pragma omp taskgroup                 /* join: child tasks + descendants */\n    {\n        #pragma omp task shared(a) in_reduction(+:total)\n        { total += sum(a, lo, mid); }     /* fork */\n        total += sum(a, mid, hi);         /* this task computes the other half */\n    }\n}",
+      "pitfalls": [
+        "Variables are shared by default: results merged from child tasks need reduction/task_reduction (or firstprivate captures) or the leaves race.",
+        "Omitting the enclosing taskgroup lets the parent run past the fork - results are read before the children produced them.",
+        "Nested parallel regions oversubscribe unless nesting is disabled; task granularity still matters because every #pragma omp task carries runtime overhead."
+      ],
+      "sources": [
+        "https://www.openmp.org/spec-html/5.0/openmpsu94.html"
+      ]
+    }
+  ],
+  "default_variant": "pthread-work-stealing",
+  "version": "1.0"
+}

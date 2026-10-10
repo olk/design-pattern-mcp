@@ -1,0 +1,73 @@
+{
+  "pattern": "request-reply",
+  "language": "cplusplus",
+  "support": "library",
+  "idiom_name": "Boost.Asio async_write/async_read + steady_timer deadline",
+  "implementation_notes": "Boost.Asio supplies the machinery but not the bookkeeping: io_context drives completion, async_write/async_read carry the request and the reply, and a steady_timer (monotonic clock) provides the deadline. With one outstanding request per connection the socket pair is the reply channel; with several the application adds the classic request-id -> completion-handler table. The completion handler must be guarded so that read completion and timer expiry can only settle the call once. Prefer this form when the protocol is yours; gRPC or ZeroMQ replace the whole exchange when they fit.",
+  "code_sketch": "boost::asio::steady_timer timer(sock.get_executor());\nauto state = std::make_shared<CallState>();\ntimer.expires_after(std::chrono::seconds(5));\ntimer.async_wait([state](auto ec) {\n    if (!ec) state->fail(Timeout{});     // timer not cancelled: deadline hit\n});\nasio::async_write(sock, asio::buffer(req),\n    [state](auto ec, size_t) { if (!ec) state->read_reply(); });\n// read_reply(): async_read_header/body, then timer.cancel();\n// the operation_aborted timer handler is then a no-op",
+  "pitfalls": [
+    "A cancelled timer's handler still runs with boost::asio::error::operation_aborted, so the request completion must be guarded to settle exactly once.",
+    "The socket, buffers and completion state must outlive the async chain (shared_ptr/shared_from_this); lambdas capturing stack locals are the classic dangling bug.",
+    "Blocking work inside an io_context handler stalls every other completion on that thread, including deadline timers."
+  ],
+  "sources": [
+    "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "boost-asio-timer",
+      "name": "Boost.Asio round trip with a steady_timer deadline",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "idiom_name": "Boost.Asio async_write/async_read + steady_timer deadline",
+      "implementation_notes": "Boost.Asio supplies the machinery but not the bookkeeping: io_context drives completion, async_write/async_read carry the request and the reply, and a steady_timer (monotonic clock) provides the deadline. With one outstanding request per connection the socket pair is the reply channel; with several the application adds the classic request-id -> completion-handler table. The completion handler must be guarded so that read completion and timer expiry can only settle the call once. Prefer this form when the protocol is yours; gRPC or ZeroMQ replace the whole exchange when they fit.",
+      "code_sketch": "boost::asio::steady_timer timer(sock.get_executor());\nauto state = std::make_shared<CallState>();\ntimer.expires_after(std::chrono::seconds(5));\ntimer.async_wait([state](auto ec) {\n    if (!ec) state->fail(Timeout{});     // timer not cancelled: deadline hit\n});\nasio::async_write(sock, asio::buffer(req),\n    [state](auto ec, size_t) { if (!ec) state->read_reply(); });\n// read_reply(): async_read_header/body, then timer.cancel();\n// the operation_aborted timer handler is then a no-op",
+      "pitfalls": [
+        "A cancelled timer's handler still runs with boost::asio::error::operation_aborted, so the request completion must be guarded to settle exactly once.",
+        "The socket, buffers and completion state must outlive the async chain (shared_ptr/shared_from_this); lambdas capturing stack locals are the classic dangling bug.",
+        "Blocking work inside an io_context handler stalls every other completion on that thread, including deadline timers."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/reference/steady_timer.html"
+      ]
+    },
+    {
+      "variant_id": "asio-coroutines-timeout",
+      "name": "Boost.Asio awaitable with a C++20 timer race",
+      "paradigm": "concurrent",
+      "min_standard": "C++20",
+      "requires_features": [
+        "coroutines"
+      ],
+      "idiom_name": "co_await (request || steady_timer) via awaitable_operators",
+      "implementation_notes": "C++20 coroutines let the exchange be written as linear code: the request is an awaitable, the deadline is another awaitable, and Asio's experimental awaitable_operators race them with || so that the loser is cancelled - the reply channel is the coroutine's completion and cancellation is Asio's per-operation cancellation state. Choose it when the toolchain is C++20 and the callback form obscures the timeout logic; the operators are experimental, so pin the Boost version.",
+      "code_sketch": "using namespace boost::asio::experimental::awaitable_operators;\nawaitable<Reply> call(tcp::socket& s, Request req) {\n  steady_timer t(s.get_executor(), std::chrono::seconds(5));\n  auto r = co_await (\n      async_call(s, req, use_awaitable) ||\n      t.async_wait(use_awaitable));\n  if (r.index() == 1) throw Timeout{};   // timer won; request cancelled\n  co_return std::get<0>(r);\n}",
+      "pitfalls": [
+        "awaitable_operators is experimental and has changed between Boost releases - pin the version and re-test on upgrade.",
+        "The losing operation is cancelled, but its side effects on the socket are not rolled back: reset or close the connection before reusing it."
+      ],
+      "sources": [
+        "https://www.boost.org/doc/libs/latest/doc/html/boost_asio/overview/composition/cpp20_coroutines.html"
+      ]
+    },
+    {
+      "variant_id": "grpc-unary-deadline",
+      "name": "gRPC unary call with a propagated deadline",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "generated stub + ClientContext::set_deadline",
+      "implementation_notes": "gRPC makes a unary RPC the unit of request-reply: the generated stub returns the response or a Status, the HTTP/2 stream is the reply channel and the stream itself is the correlation, so no message identifier is needed. ClientContext::set_deadline propagates the deadline to the server and cancels the call on expiry, and the Status carries the domain error. Use it when both ends can adopt protobuf and a service definition; the cost is generated code, a build-system dependency and an IDL workflow.",
+      "code_sketch": "grpc::ClientContext ctx;\nctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));\nQuoteRequest req; req.set_symbol(\"ACME\");\nQuoteReply reply;\ngrpc::Status st = stub->GetQuote(&ctx, req, &reply);\nif (st.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) return Err::Timeout;\nif (!st.ok()) return Err::Remote(st.error_message());\nreturn Ok(reply);",
+      "pitfalls": [
+        "set_deadline takes a system_clock time point, so an NTP adjustment can shorten or extend it, and the server-side handler may keep working unless it observes context cancellation.",
+        "The synchronous API blocks one thread per call; use the async API or a CompletionQueue when call volume is high."
+      ],
+      "sources": [
+        "https://grpc.io/docs/languages/cpp/basics/",
+        "https://grpc.io/docs/what-is-grpc/core-concepts"
+      ]
+    }
+  ],
+  "default_variant": "boost-asio-timer",
+  "version": "1.0"
+}

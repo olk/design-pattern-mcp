@@ -1,0 +1,70 @@
+{
+  "pattern": "cancellation-token",
+  "language": "c",
+  "support": "manual",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "c11-atomic-flag",
+      "name": "C11 atomic flag polled at safe points",
+      "paradigm": "procedural",
+      "min_standard": "C11",
+      "requires_features": [
+        "stdatomic.h",
+        "a wakeup primitive (condition variable, queue or self-pipe)"
+      ],
+      "idiom_name": "atomic_bool token + condition-variable or self-pipe wakeup, checked at safe points",
+      "implementation_notes": "C has no cancellation type, so the token is hand-written: an atomic_bool (C11 <stdatomic.h>) owned by the caller, plus a wakeup primitive - a cnd_t/mtx_t pair, a queue, or a self-pipe - so a waiter blocked in poll/select is woken when the flag flips and re-checks it. The classic object structure (a signal type with registered callbacks and a reason) is exactly what you build here, sized to the need; one flag per operation tree plus a broadcast is the whole mechanism, and the check costs one relaxed atomic load per safe point. Keep the flag in the token struct, never in a global, and document the contract that operations must not linger in uninterruptible syscalls.",
+      "code_sketch": "typedef struct { atomic_bool cancelled; } cancel_token;\n\nstatic bool check_cancelled(const cancel_token *t) {\n    return atomic_load_explicit(&t->cancelled, memory_order_relaxed);\n}\n\nwhile (!check_cancelled(token)) {           /* safe point */\n    if (cnd_timedwait(&work_ready, &m, ts) == thrd_success)\n        process_chunk();                     /* also re-check after the wait */\n}",
+      "pitfalls": [
+        "A plain bool or volatile flag shared across threads is a data race; use atomic_bool/atomic_flag, and from a signal handler only a lock-free atomic or sig_atomic_t (and never cnd_broadcast, which is not async-signal-safe).",
+        "A blocking syscall without a timeout (read, recv, accept, a bare cnd_wait) never reaches a safe point: use poll/select/ppoll with a timeout, timed waits that re-check, or a self-pipe to deliver the wakeup.",
+        "The token must be initialised per operation and its lifetime must cover every user; a flag on the stack that is flipped from another thread after its scope ends is a use-after-free.",
+        "Mixing pthread_cancel into code that also uses a token gives two cancellation systems - deferred cancellation points can fire inside a library and run cleanup handlers at unexpected places."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/c/atomic/atomic_flag",
+        "https://man7.org/linux/man-pages/man3/pthread_setcancelstate.3p.html"
+      ]
+    },
+    {
+      "variant_id": "posix-pthread-cancel",
+      "name": "POSIX deferred cancellation (pthread_cancel)",
+      "paradigm": "procedural",
+      "min_standard": "C99",
+      "requires_features": [
+        "POSIX threads",
+        "pthread_cancel",
+        "pthread_testcancel",
+        "cleanup handlers"
+      ],
+      "idiom_name": "pthread_cancel with PTHREAD_CANCEL_DEFERRED cancellation points",
+      "implementation_notes": "POSIX itself has a cancellation mechanism, but it is attached to the thread, not to an operation: pthread_cancel requests cancellation, PTHREAD_CANCEL_DEFERRED (the default type) delivers it only at cancellation points - functions like read, write, sleep and pthread_testcancel - and cleanup handlers plus pthread_cleanup_push/pop unwind resources. That makes it the POSIX analogue of the pattern for libraries written to be cancel-safe (each thread disables cancelability around critical sections with pthread_setcancelstate and restores it after), and C++-style RAII code that never expects asynchronous exceptions should stay away from it. PTHREAD_CANCEL_ASYNCHRONOUS is forced termination and must not be used around code that touches shared state.",
+      "code_sketch": "/* thread side: cancellation is delivered at deferred points */\npthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);   /* default type: deferred */\nfor (;;) {\n    pthread_testcancel();                 /* explicit cancellation point */\n    chunk = read(fd, buf, sizeof buf);    /* read is also a cancellation point */\n    if (chunk <= 0) break;\n    process(buf, chunk);\n}\n/* requester side */\npthread_cancel(worker);                   /* request, delivered at the next point */",
+      "pitfalls": [
+        "The cancelability state and type live on the thread: a library that enables cancelability while its caller disabled it turns a pending request into cancellation at the wrong place - save and restore the state instead of overwriting it.",
+        "Only functions that are cancel-safe may run inside an asynchronously cancellable thread; even in deferred mode, a cancellation point in the middle of a compound update leaves partial state unless cleanup handlers restore the invariant.",
+        "pthread_cancel returns immediately but the thread may still be running: join and synchronise before freeing anything the thread uses, or conditionally wait for the cancellation to complete.",
+        "There is no reason and no propagation: cancelling a parent thread does not cancel the threads it started - the tree must be cancelled explicitly, which is exactly the bookkeeping a token would centralise."
+      ],
+      "sources": [
+        "https://man7.org/linux/man-pages/man3/pthread_testcancel.3p.html",
+        "https://man7.org/linux/man-pages/man3/pthread_setcancelstate.3p.html"
+      ]
+    }
+  ],
+  "default_variant": "c11-atomic-flag",
+  "idiom_name": "atomic_bool token + condition-variable or self-pipe wakeup, checked at safe points",
+  "implementation_notes": "C has no cancellation type, so the token is hand-written: an atomic_bool (C11 <stdatomic.h>) owned by the caller, plus a wakeup primitive - a cnd_t/mtx_t pair, a queue, or a self-pipe - so a waiter blocked in poll/select is woken when the flag flips and re-checks it. The classic object structure (a signal type with registered callbacks and a reason) is exactly what you build here, sized to the need; one flag per operation tree plus a broadcast is the whole mechanism, and the check costs one relaxed atomic load per safe point. Keep the flag in the token struct, never in a global, and document the contract that operations must not linger in uninterruptible syscalls.",
+  "code_sketch": "typedef struct { atomic_bool cancelled; } cancel_token;\n\nstatic bool check_cancelled(const cancel_token *t) {\n    return atomic_load_explicit(&t->cancelled, memory_order_relaxed);\n}\n\nwhile (!check_cancelled(token)) {           /* safe point */\n    if (cnd_timedwait(&work_ready, &m, ts) == thrd_success)\n        process_chunk();                     /* also re-check after the wait */\n}",
+  "pitfalls": [
+    "A plain bool or volatile flag shared across threads is a data race; use atomic_bool/atomic_flag, and from a signal handler only a lock-free atomic or sig_atomic_t (and never cnd_broadcast, which is not async-signal-safe).",
+    "A blocking syscall without a timeout (read, recv, accept, a bare cnd_wait) never reaches a safe point: use poll/select/ppoll with a timeout, timed waits that re-check, or a self-pipe to deliver the wakeup.",
+    "The token must be initialised per operation and its lifetime must cover every user; a flag on the stack that is flipped from another thread after its scope ends is a use-after-free.",
+    "Mixing pthread_cancel into code that also uses a token gives two cancellation systems - deferred cancellation points can fire inside a library and run cleanup handlers at unexpected places."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/c/atomic/atomic_flag",
+    "https://man7.org/linux/man-pages/man3/pthread_setcancelstate.3p.html"
+  ]
+}

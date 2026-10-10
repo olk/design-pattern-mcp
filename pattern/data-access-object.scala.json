@@ -1,0 +1,57 @@
+{
+  "pattern": "data-access-object",
+  "language": "scala",
+  "support": "library",
+  "idiom_name": "trait CustomerDao with a JDBC implementation returning Option/case classes",
+  "implementation_notes": "Scala's trait gives the DAO the same shape as the Java original and JDBC is reached through Java interop, so the classic form is a trait plus an implementation class holding a DataSource and mapping ResultSet rows into case classes, which are returned as Option/List so no cursor escapes. What replaces hand-written plumbing is the collections library: rows are sequenced into immutable values inside the DAO. Keep this blocking form for thread-based services or when plain JDBC should stay visible; the tagless-final variant below is the usual choice in a functional Scala stack.",
+  "code_sketch": "trait CustomerDao {\n  def find(id: Long): Option[Customer]                      // case class result\n  def add(c: Customer): Either[DaoError, Unit]\n}\nfinal class JdbcCustomerDao(ds: DataSource) extends CustomerDao {\n  def find(id: Long): Option[Customer] = withConnection { conn =>\n    val ps = conn.prepareStatement(\"SELECT id, name FROM customer WHERE id = ?\")\n    ps.setLong(1, id)\n    val rs = ps.executeQuery()\n    if (rs.next()) Some(Customer(rs.getLong(\"id\"), rs.getString(\"name\"))) else None\n  }                                                         // driver errors -> DaoError\n}",
+  "pitfalls": [
+    "Blocking JDBC inside a Future or an effect without a dedicated blocking pool starves the compute pool; either mark the call site or use the tagless-final variant with its own execution context.",
+    "ResultSet is mutable and connection-bound: rows must be sequenced into case classes inside the same connection scope, otherwise the values are lost when the connection returns to the pool.",
+    "Scala's Java collections interop hides nulls from Java APIs: wrap Option around nullable driver reads (rs.getString) instead of trusting them."
+  ],
+  "sources": [
+    "https://typelevel.org/doobie/"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "jdbc-dao-trait",
+      "name": "Blocking JDBC DAO trait with case-class results",
+      "paradigm": "oo",
+      "min_standard": "Scala2.13",
+      "idiom_name": "trait CustomerDao with a JDBC implementation returning Option/case classes",
+      "implementation_notes": "Scala's trait gives the DAO the same shape as the Java original and JDBC is reached through Java interop, so the classic form is a trait plus an implementation class holding a DataSource and mapping ResultSet rows into case classes, which are returned as Option/List so no cursor escapes. What replaces hand-written plumbing is the collections library: rows are sequenced into immutable values inside the DAO. Keep this blocking form for thread-based services or when plain JDBC should stay visible; the tagless-final variant below is the usual choice in a functional Scala stack.",
+      "code_sketch": "trait CustomerDao {\n  def find(id: Long): Option[Customer]                      // case class result\n  def add(c: Customer): Either[DaoError, Unit]\n}\nfinal class JdbcCustomerDao(ds: DataSource) extends CustomerDao {\n  def find(id: Long): Option[Customer] = withConnection { conn =>\n    val ps = conn.prepareStatement(\"SELECT id, name FROM customer WHERE id = ?\")\n    ps.setLong(1, id)\n    val rs = ps.executeQuery()\n    if (rs.next()) Some(Customer(rs.getLong(\"id\"), rs.getString(\"name\"))) else None\n  }                                                         // driver errors -> DaoError\n}",
+      "pitfalls": [
+        "Blocking JDBC inside a Future or an effect without a dedicated blocking pool starves the compute pool; either mark the call site or use the tagless-final variant with its own execution context.",
+        "ResultSet is mutable and connection-bound: rows must be sequenced into case classes inside the same connection scope, otherwise the values are lost when the connection returns to the pool.",
+        "Scala's Java collections interop hides nulls from Java APIs: wrap Option around nullable driver reads (rs.getString) instead of trusting them."
+      ],
+      "sources": [
+        "https://typelevel.org/doobie/"
+      ]
+    },
+    {
+      "variant_id": "doobie-tagless-dao",
+      "name": "Tagless-final DAO described in ConnectionIO with doobie",
+      "paradigm": "functional",
+      "min_standard": "Scala2.13",
+      "requires_features": [
+        "cats-effect",
+        "tagless-final"
+      ],
+      "idiom_name": "sql\"...\".query[Customer].option composed in ConnectionIO, run by transact(xa)",
+      "implementation_notes": "doobie is a pure functional JDBC layer for Scala and Cats, not an ORM: statements are values of type ConnectionIO that are composed purely and executed only by transact(xa) on a Transactor, so the DAO becomes a set of descriptions (or a trait parameterised over F[_]) whose effects are declared rather than performed. Choose it when the application already runs Cats Effect or another Typelevel stack and connection management should be declarative; keep the plain JDBC trait when no effect system is present, because ConnectionIO without the surrounding runtime is just indirection.",
+      "code_sketch": "trait CustomerDao[F[_]] {                                   // tagless-final interface\n  def find(id: Long): F[Option[Customer]]\n}\nval xa = Transactor.fromDriverManager[IO](                  // HikariCP in production\n  \"org.postgresql.Driver\", \"jdbc:postgresql:app\", \"app\", \"secret\", logHandler = None)\n\nclass DoobieCustomerDao extends CustomerDao[ConnectionIO] {\n  def find(id: Long): ConnectionIO[Option[Customer]] =\n    sql\"select id, name from customer where id = $id\".query[Customer].option\n}\n// caller: new DoobieCustomerDao().find(42L).transact(xa)     -- nothing ran before",
+      "pitfalls": [
+        "ConnectionIO must be executed with transact on a Transactor: a DAO method that transacts internally cannot compose with the caller's transaction.",
+        "Transactors and connection pools are cats-effect Resources; blocking with unsafeRunSync inside the DAO (or leaking the Resource) breaks cancellation and pool reuse."
+      ],
+      "sources": [
+        "https://typelevel.org/doobie/"
+      ]
+    }
+  ],
+  "default_variant": "jdbc-dao-trait"
+}

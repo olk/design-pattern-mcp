@@ -1,0 +1,57 @@
+{
+  "pattern": "guardian-object",
+  "language": "go",
+  "version": "1.0",
+  "support": "idiomatic",
+  "idiom_name": "struct with an unexported sync.Mutex and locked methods",
+  "implementation_notes": "Go's direct form keeps the mutex and the state in the same struct, unexported, with methods that `Lock()`/`defer Unlock()` around the invariant; the guarantee that guarded reads see guarded writes comes from the mutex operations themselves (the Go memory model puts `Unlock` before the next `Lock` in the happens-before order), not from field visibility. What replaces the classic structure is the ownership result of that: the mutex is a plain value field of the guarded struct, so it must never be copied (a copied struct copies the mutex and produces two independent guardians over the same data - `go vet` catches it, the compiler does not), and the state should stay unexported with the mutex beside it. The idiomatic alternative is stronger than the lock form and is chosen whenever the operations are coarse: let one goroutine own the state and reach it exclusively through channels, so 'one dedicated object serialises access' becomes 'one dedicated goroutine owns the value'.",
+  "code_sketch": "type Counter struct {\n\tmu    sync.Mutex // unexported: one per guardian\n\ttotal int\n\thits  int        // invariant spans both fields\n}\n\nfunc (c *Counter) Add(delta int) {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock() // released on every path, panic included\n\tc.total += delta\n\tc.hits++\n}",
+  "pitfalls": [
+    "Copying a guardian struct (returning it by value, embedding it, or assigning it to another variable) duplicates the mutex and creates two guardians over one state; guard by pointer and let `go vet` check the copy locks.",
+    "Exported fields with an unexported mutex are a half-guardian: the package's own code can still bypass the lock, and Go has no way to forbid it - keep the state unexported in the same package as the methods.",
+    "Holding the mutex across a channel operation, an HTTP call or a callback deadlocks the goroutine while every other caller queues behind it; the guarded region must stay in-process and short."
+  ],
+  "sources": [
+    "https://go.dev/blog/codelab-share",
+    "https://go.dev/ref/mem"
+  ],
+  "variants": [
+    {
+      "variant_id": "mutex-guarded-struct",
+      "name": "Mutex and state in one struct",
+      "paradigm": "oo",
+      "idiom_name": "struct with an unexported sync.Mutex and locked methods",
+      "implementation_notes": "Go's direct form keeps the mutex and the state in the same struct, unexported, with methods that `Lock()`/`defer Unlock()` around the invariant; the guarantee that guarded reads see guarded writes comes from the mutex operations themselves (the Go memory model puts `Unlock` before the next `Lock` in the happens-before order), not from field visibility. What replaces the classic structure is the ownership result of that: the mutex is a plain value field of the guarded struct, so it must never be copied (a copied struct copies the mutex and produces two independent guardians over the same data - `go vet` catches it, the compiler does not), and the state should stay unexported with the mutex beside it. The idiomatic alternative is stronger than the lock form and is chosen whenever the operations are coarse: let one goroutine own the state and reach it exclusively through channels, so 'one dedicated object serialises access' becomes 'one dedicated goroutine owns the value'.",
+      "code_sketch": "type Counter struct {\n\tmu    sync.Mutex // unexported: one per guardian\n\ttotal int\n\thits  int        // invariant spans both fields\n}\n\nfunc (c *Counter) Add(delta int) {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock() // released on every path, panic included\n\tc.total += delta\n\tc.hits++\n}",
+      "pitfalls": [
+        "Copying a guardian struct (returning it by value, embedding it, or assigning it to another variable) duplicates the mutex and creates two guardians over one state; guard by pointer and let `go vet` check the copy locks.",
+        "Exported fields with an unexported mutex are a half-guardian: the package's own code can still bypass the lock, and Go has no way to forbid it - keep the state unexported in the same package as the methods.",
+        "Holding the mutex across a channel operation, an HTTP call or a callback deadlocks the goroutine while every other caller queues behind it; the guarded region must stay in-process and short."
+      ],
+      "sources": [
+        "https://go.dev/blog/codelab-share",
+        "https://go.dev/ref/mem"
+      ]
+    },
+    {
+      "variant_id": "channel-owned-state",
+      "name": "State owned by one goroutine, commands over channels",
+      "paradigm": "concurrent",
+      "requires_features": [
+        "channels",
+        "goroutines"
+      ],
+      "idiom_name": "single owner goroutine with request/reply channels",
+      "implementation_notes": "Go's own answer to shared mutable state is to not share it: the value lives as a local variable inside one goroutine, and every operation is a message that the owner processes, so the serialisation point is the goroutine's channel instead of a mutex and there is no lock to forget. The blog post that states the idiom contrasts exactly these two implementations - the lock-and-struct version with its lock/unlock pairs versus the channel version that keeps only the essential data - and the memory model backs it: a send on a channel happens before the matching receive. Choose it when operations are coarse, involve I/O or waiting, or when the state is a resource handle; keep the mutex variant for short, read-heavy, synchronous operations, because a channel round trip per read is much more expensive.",
+      "code_sketch": "type request struct {\n\tdelta int\n\treply chan<- int\n}\n\n// state is a local variable: no lock, one owner\nfunc owner(state int, in <-chan request) {\n\tfor r := range in {\n\t\tstate += r.delta\n\t\tr.reply <- state\n\t}\n}",
+      "pitfalls": [
+        "A blocked owner stalls every caller: if the loop awaits something slow, the channel queue grows without bound - bound it or keep the owner's work short.",
+        "Request structs are copied; sending a struct that contains references hands the caller a live view of the state, which reintroduces the sharing the design removed."
+      ],
+      "sources": [
+        "https://go.dev/blog/codelab-share"
+      ]
+    }
+  ],
+  "default_variant": "mutex-guarded-struct"
+}

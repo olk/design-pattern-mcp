@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "swift",
+  "support": "library",
+  "idiom_name": "actor-owned [id: CheckedContinuation] + withCheckedThrowingContinuation",
+  "implementation_notes": "Swift's stdlib has no future; instead withCheckedThrowingContinuation bridges a callback or delegate reply into async/await, and the continuation is stored in a dictionary inside an actor so lookup, removal and resume are serialized without a lock. The caller awaits the continuation and applies its deadline with a task group (a child task that sleeps and throws) or withTaskCancellationHandler, while the transport's delegate or reader task resumes the entry whose id matches. Checked continuations must be resumed exactly once: the runtime halts the process on a double resume and logs a leaked-continuation warning when a path never resumes, which converts the classic late-reply bug into an immediate and visible failure. AsyncThrowingStream is the alternative shape when one request yields a sequence of replies.",
+  "code_sketch": "actor Correlator {\n    private var pending: [String: CheckedContinuation<Reply, Error>] = [:]\n\n    func register(_ id: String, _ continuation: CheckedContinuation<Reply, Error>) {\n        pending[id] = continuation\n    }\n    func resume(_ id: String, with result: Result<Reply, Error>) {\n        guard let continuation = pending.removeValue(forKey: id) else { return }   // late id: drop\n        continuation.resume(with: result)\n    }\n}\n\nlet id = UUID().uuidString\nlet reply: Reply = try await withCheckedThrowingContinuation { continuation in\n    Task { await correlator.register(id, continuation) }   // register BEFORE send\n    transport.send(Request(id: id, body: body))\n}",
+  "pitfalls": [
+    "A checked continuation must be resumed exactly once: resuming twice halts the process, and never resuming leaves the awaiting task suspended forever with a leaked-continuation warning.",
+    "Register the continuation before sending the request - the actor hop in the sketch makes that ordering explicit; otherwise a fast reply finds no entry and is dropped.",
+    "The timeout is manual: a task-group child that sleeps and throws, or a cancellation handler, must also remove the entry, or a later reply resumes a stale continuation and traps.",
+    "Continuations in a plain dictionary are not safe to touch from several threads; keep them in an actor (or behind a Mutex) and resume inside that isolation, or the exactly-once guarantee is lost."
+  ],
+  "sources": [
+    "https://www.hackingwithswift.com/quick-start/concurrency/how-to-use-continuations-to-convert-completion-handlers-into-async-functions",
+    "https://developer.apple.com/videos/play/wwdc2021/10132"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,52 @@
+{
+  "pattern": "message-filter",
+  "language": "csharp",
+  "support": "idiomatic",
+  "idiom_name": "Enumerable.Where with Func<TSource,bool> (System.Linq)",
+  "implementation_notes": "The filter component collapses into LINQ: `messages.Where(IsInteresting)` takes a `Func<TSource,bool>` and evaluates it lazily, so non-matching messages are never handled; query syntax (`where ... select`) compiles to the same call and `List<T>.RemoveAll(Predicate<T>)` is the in-place form for buffered messages. In a consumer loop the predicate is the branch that decides whether to work on the message or to settle and drop it. A dedicated MessageFilter service is still justified when the criterion is configuration (tenant rules, feature flags) or must be swapped per deployment, because a lambda buried in a consumer is neither injectable nor versionable.",
+  "code_sketch": "await foreach (var m in consumer.ReceiveMessagesAsync(ct))\n{\n    if (!IsInteresting(m))            // header/property check, no body parse\n    {\n        await consumer.CompleteMessageAsync(m, ct);   // settle: a drop must not lock the queue\n        Interlocked.Increment(ref dropped);\n        continue;\n    }\n    await HandleAsync(m, ct);\n}\n\nstatic bool IsInteresting(Message m) => m.ApplicationProperties[\"type\"] is \"price\";",
+  "pitfalls": [
+    "Where is deferred: the predicate reruns on every enumeration, so a predicate with side effects (logging, counters) fires repeatedly or, if the query is never enumerated, not at all.",
+    "Dropping a message in a consumer must settle it (Complete/Abandon/DeadLetter); an unsettled message stays locked and is eventually redelivered or dead-lettered.",
+    "LINQ Where on a List<T> allocates a new sequence per pass; RemoveAll mutates in place - choose per feed size and per whether rejects must be observed."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.linq.enumerable.where"
+  ],
+  "variants": [
+    {
+      "variant_id": "linq-where",
+      "name": "LINQ predicate (deferred)",
+      "paradigm": "functional",
+      "idiom_name": "Enumerable.Where with Func<TSource,bool> (System.Linq)",
+      "implementation_notes": "The filter component collapses into LINQ: `messages.Where(IsInteresting)` takes a `Func<TSource,bool>` and evaluates it lazily, so non-matching messages are never handled; query syntax (`where ... select`) compiles to the same call and `List<T>.RemoveAll(Predicate<T>)` is the in-place form for buffered messages. In a consumer loop the predicate is the branch that decides whether to work on the message or to settle and drop it. A dedicated MessageFilter service is still justified when the criterion is configuration (tenant rules, feature flags) or must be swapped per deployment, because a lambda buried in a consumer is neither injectable nor versionable.",
+      "code_sketch": "await foreach (var m in consumer.ReceiveMessagesAsync(ct))\n{\n    if (!IsInteresting(m))            // header/property check, no body parse\n    {\n        await consumer.CompleteMessageAsync(m, ct);   // settle: a drop must not lock the queue\n        Interlocked.Increment(ref dropped);\n        continue;\n    }\n    await HandleAsync(m, ct);\n}\n\nstatic bool IsInteresting(Message m) => m.ApplicationProperties[\"type\"] is \"price\";",
+      "pitfalls": [
+        "Where is deferred: the predicate reruns on every enumeration, so a predicate with side effects (logging, counters) fires repeatedly or, if the query is never enumerated, not at all.",
+        "Dropping a message in a consumer must settle it (Complete/Abandon/DeadLetter); an unsettled message stays locked and is eventually redelivered or dead-lettered.",
+        "LINQ Where on a List<T> allocates a new sequence per pass; RemoveAll mutates in place - choose per feed size and per whether rejects must be observed."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.linq.enumerable.where"
+      ]
+    },
+    {
+      "variant_id": "broker-subscription-filter",
+      "name": "Broker-side subscription rule (Azure Service Bus)",
+      "paradigm": "declarative",
+      "idiom_name": "CorrelationRuleFilter / SqlRuleFilter subscription rules (Azure.Messaging.ServiceBus)",
+      "implementation_notes": "Interest becomes broker configuration: a Service Bus subscription carries named rules whose filter conditions decide which messages it receives - `CorrelationRuleFilter` for property equality (also matching system properties such as Subject, ContentType, CorrelationId) and `SqlRuleFilter` for SQL-like expressions over properties. Non-matching messages are never delivered, so no consumer capacity is spent, and Microsoft's guidance is to prefer correlation filters over SQL filters because complex SQL rules lower subscription and topic throughput; filters evaluate properties only, never the message body. Use it when interest differs per subscriber or tenant; keep the in-code predicate when the criterion needs a deserialised payload.",
+      "code_sketch": "var admin = new ServiceBusAdministrationClient(ns, new DefaultAzureCredential());\nawait admin.CreateRuleAsync(topic, \"widget-prices\", new CreateRuleOptions(\n    \"widgets\", new CorrelationRuleFilter { Subject = \"price\" }));\n// complex criterion, property-only and slower:\n// new SqlRuleFilter(\"color='blue' AND quantity=10\")\n\nawait foreach (var m in consumer.ReceiveMessagesAsync()) Handle(m);   // only the slice arrives",
+      "pitfalls": [
+        "All action-less rules on a subscription are OR-combined, so adding a rule widens what the subscriber receives instead of narrowing it.",
+        "Rule changes are configuration drift: a bad filter silently starves a subscriber and is reviewed separately from the consumer code that depends on it.",
+        "SQL-like rules cost throughput and cannot inspect the body; a body criterion must move into the consumer, which then pays for every message again."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters"
+      ]
+    }
+  ],
+  "default_variant": "linq-where",
+  "version": "1.0"
+}

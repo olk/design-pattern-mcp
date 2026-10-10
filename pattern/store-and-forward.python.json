@@ -1,0 +1,20 @@
+{
+  "pattern": "store-and-forward",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "sqlite3 spool table (WAL, synchronous=FULL) + daemon drain thread",
+  "implementation_notes": "The standard library is enough: keep a spool table in an sqlite3 database, set PRAGMA journal_mode=WAL and PRAGMA synchronous=FULL so a committed INSERT is synced to disk (with NORMAL, WAL commits survive application crashes but not power loss), and treat commit() as the accept point. A daemon thread or an asyncio task selects pending rows, delivers them and deletes a row only after the peer acknowledged; a file spool using os.fsync() with os.replace() is the alternative when sqlite3 is unavailable. Broker clients such as Celery carry the message only once it reached the broker, so a sender-side spool in front of them is still yours to build - the classic structure is justified exactly in that gap.",
+  "code_sketch": "con = sqlite3.connect(\"spool.db\", isolation_level=None)\ncon.execute(\"PRAGMA journal_mode=WAL\")\ncon.execute(\"PRAGMA synchronous=FULL\")     # the commit is the accept point\ncon.execute(\"INSERT INTO spool(payload, created) VALUES (?, ?)\", (blob, time.time()))\n# drainer thread, started at boot as well:\nfor row in con.execute(\"SELECT id, payload FROM spool ORDER BY id\"):\n    try: deliver(row[\"payload\"]); con.execute(\"DELETE FROM spool WHERE id=?\", (row[\"id\"],))\n    except OSError: time.sleep(backoff); break   # row stays for the next pass",
+  "pitfalls": [
+    "synchronous=NORMAL is not power-loss durable in WAL mode: a machine crash rolls back accepted messages even though commit() returned.",
+    "A sqlite3 connection belongs to the thread that created it (check_same_thread); sharing one between sender and drainer without a lock raises or corrupts.",
+    "Daemon threads die silently at interpreter exit, so the spool stops draining while accepts continue - supervise the drainer or use a non-daemon thread with an explicit shutdown.",
+    "Deleting rows before the acknowledgement, or committing the business write and the spool row in separate transactions, re-creates the loss window."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/sqlite3.html",
+    "https://docs.python.org/3/library/os.html",
+    "https://www.sqlite.org/wal.html"
+  ],
+  "version": "1.0"
+}

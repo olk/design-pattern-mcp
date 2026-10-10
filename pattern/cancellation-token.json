@@ -1,0 +1,251 @@
+{
+  "category": "concurrency-resilience",
+  "name": "cancellation-token",
+  "aliases": [
+    "cancellation signal",
+    "cooperative cancellation"
+  ],
+  "intent": "Give a caller-owned operation tree a one-way request to stop: pass a read-only cancellation signal through every cancellable call, observe it at safe points, clean up what was acquired, and report a distinct cancelled outcome without pretending that cooperative cancellation is forced termination.",
+  "problem": "A request handler, background job or UI action starts work that fans out into nested calls, tasks or threads. When the caller disconnects, a deadline expires, the user presses stop or a sibling fails, merely abandoning the result leaves already-started work burning CPU, holding connections and calling dependencies. Force-killing a thread or process can interrupt a critical section and corrupt shared state, while a signal that is not propagated or observed cannot stop the call tree or make its cleanup visible to the joiner.",
+  "context": "Use where work can outlive the caller's interest and the runtime exposes checkpoints, suspension points or interruptible waits: request-scoped servers, workers, UI tasks, stream pipelines and batch loops. The operation owns cleanup, cancellation may race any checkpoint, and the design must state what happens when a request arrives after an irreversible side effect or while a dependency ignores the signal.",
+  "benefits": [
+    "Abandoned work stops voluntarily within one checkpoint instead of running to completion, releasing threads, sockets, locks and dependency capacity as soon as the result loses its value.",
+    "One signal travels the whole call tree: an owning source cancels an entire operation subtree (parent/child tokens, cancel scopes, task groups, context trees) without callers tracking individual operations.",
+    "Safety: nothing is force-killed, so the operation stops at a point it chose and runs its cleanup - shared state and resource ownership stay consistent.",
+    "Failure coupling: an expired deadline, a disconnecting client or a failed sibling can cancel the remaining fan-out instead of leaving redundant work to finish and partially apply effects.",
+    "The cancellation path becomes testable: an already-cancelled signal can be injected into the same code path, making 'stop gracefully' as reproducible as the happy path.",
+    "One contract for heterogeneous triggers: a deadline, a shutdown signal, a user action and a failed sibling all arrive at the operation as the same kind of request."
+  ],
+  "tradeoffs": [
+    "It is a discipline, not a mechanism: any layer that does not forward and observe the signal is uncancellable, so adopting it is an invasive, permanent change to signatures and an ongoing review obligation.",
+    "Cancellation latency is bounded by checkpoint spacing: coarse checks leave a long tail of work after the request has been abandoned, while fine-grained checks cost throughput and add branches to hot loops.",
+    "'Cancelled' must be modelled as a first-class outcome distinct from failure; if it is not, code treats expected stops as errors, retries them, or reports them as successes.",
+    "Composition obscures attribution: with linked or parent-child signals, who cancelled and why is hard to reconstruct unless reasons are propagated, and a source cancelled for one caller's reason stops every listener of that signal.",
+    "Cleanup is a hazard - the stop can arrive while a lock is held or an external call is in flight, so finalizers must be idempotent, non-blocking and short, or the cancelling side blocks with it.",
+    "A signal that is never observed is a silent no-op, and one that is swallowed makes any joiner wait forever; both bugs are invisible in unit tests and surface only under load or shutdown.",
+    "Not all runtimes support the same cancellation primitives: checking a flag, waiting on a handle, throwing an exception, and aborting a task are all different idioms with different cleanup semantics."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 6,
+    "maintainability": 6,
+    "simplicity": 5,
+    "performance": 7,
+    "reliability": 8,
+    "security": 5,
+    "scalability": 7
+  },
+  "participants": [
+    {
+      "role": "Cancellation source (requester)",
+      "responsibility": "The single owner allowed to trigger the request - context cancel func, CancellationTokenSource, AbortController, stop_source, thread or task handle. It decides when to cancel and, where supported, records the reason."
+    },
+    {
+      "role": "Token / signal",
+      "responsibility": "The read-only handle that travels down the call tree. Exposes whether a request has been made, optionally a way to wait or subscribe and the reason; it never lets a receiver trigger cancellation."
+    },
+    {
+      "role": "Operation (listener)",
+      "responsibility": "The task, thread, coroutine or handler that receives the signal, checks it at safe points, stops, releases its resources and reports a cancelled outcome that is distinguishable from failure."
+    },
+    {
+      "role": "Safe point (checkpoint)",
+      "responsibility": "The place where observing the request is safe - a loop iteration, before or after a blocking call, a suspension/await point. Its spacing determines cancellation latency."
+    },
+    {
+      "role": "Propagation structure",
+      "responsibility": "The parent/child relationships that decide which operations inherit a request: child tokens, cancel scopes, task groups, context trees, linked tokens - cancelling a parent covers its subtree without touching siblings."
+    },
+    {
+      "role": "Cancelled outcome and cleanup",
+      "responsibility": "The distinguished result (CancelledError, OperationCanceledException, TaskStatus.Canceled, ctx.Err, Outcome.Canceled) plus the finalization that runs on the way out, so partial effects are undone or completed deterministically."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module",
+    "boundary"
+  ],
+  "unsuitable_scopes": [
+    "value"
+  ],
+  "use_cases": [
+    "Request-scoped server work: the handler gets a request signal that fires when the client disconnects or the deadline expires, cancelling in-flight database, queue and upstream calls instead of pinning worker threads and connections after the caller is gone.",
+    "UI and mobile tasks: navigating away, closing a window or pressing stop cancels the task tree that loads, renders or downloads for that view, and only that view's tokens are affected.",
+    "Graceful shutdown: a supervisor stops accepting work and cancels the token shared by worker loops; every worker stops at its next safe point, flushes and releases resources, and the process exits inside the shutdown budget.",
+    "Fan-out with short-circuit: as soon as one subtask fails, or as soon as any one result suffices (hedged or racing replicas), the scope cancels the siblings instead of waiting for all of them.",
+    "Batch and stream pipelines: a processor subscribes to the pipeline signal and stops consuming and producing when the pipeline is torn down, abandoning the current chunk when the job's deadline elapses.",
+    "Testing and tooling: inject an already-cancelled signal, or one cancelled after N iterations, to exercise the stop path without racing an actual shutdown.",
+    "HTTP client redirect and retry cancellation: when a request is redirected or a lower-level retry budget is exhausted, cancel the in-flight operation so the client can proceed with the next action without waiting for a result that is no longer relevant.",
+    "Health-check abortion: a liveness probe times out or a readiness check fails mid-flight; cancel the in-progress health metric collection so the pod can be restarted or pulled from service without waiting for a hung check.",
+    "GRPC deadline and cancellation propagation: a server receives a client deadline and cancellation token; both must be threaded through every async operation so that an expired deadline or a client disconnect promptly frees server resources.",
+    "LLM request fan-out: multiple model providers are queried in parallel; the first successful response wins and all pending requests are cancelled immediately, avoiding wasted compute on a result that will be discarded.",
+    "Database connection pool eviction: a query timeout or client disconnect cancels the in-flight query, releasing the connection back to the pool before the server's statement timeout fires; the pool's token is derived from the request context so pool eviction and request cancellation share the same stop signal.",
+    "Container orchestrator graceful shutdown: Kubernetes sends SIGTERM and waits the terminationGracePeriodSeconds; the application maps SIGTERM to a cancellation token that is shared by all in-flight request handlers, background workers and health-check loops, giving each the termination budget to drain cleanly.",
+    "Interactive search with typeahead: each keystroke cancels the previous search task and starts a new one; the token for the previous task is cancelled immediately on the next keystroke, preventing stale results from overwriting fresher ones.",
+    "File transfer with resume support: a large upload or download uses chunked transfers; cancelling the transfer sets a flag that causes the next resume attempt to verify which chunks were already received before retransmitting from scratch.",
+    "Event streaming with backpressure: a consumer reading from a message queue or Kafka partition uses the cancellation token to stop reading when the application is shutting down or the consumer group is rebalanced, committing its offset before exiting.",
+    "Machine learning inference pipeline: a batch inference job can be cancelled when a new model version is deployed or the job's priority drops; the cancellation token is checked between batches so that partial results are preserved and the job can resume without reprocessing completed chunks.",
+    "ASP.NET Core's HttpContext.RequestAborted token is passed into HttpClient, database and other long-running operations so a client disconnect or server abort releases work that can no longer contribute to the response.",
+    "Go net/http handlers propagate Request.Context through database/sql QueryContext and RPC calls; cancelling the request context closes the subtree's Done channel so backend goroutines can stop and return their resources.",
+    "Kotlin kotlinx.coroutines Job cancellation follows structured parent-child scopes, so a screen, request or worker scope can cancel its child coroutines while finally blocks release resources and CancellationException remains distinguishable from failure.",
+    "Node.js and browser fetch cancellation: AbortController.signal is passed as { signal } to fetch, EventTarget listeners and streams, so abort() tears down the socket and pending promises; AbortSignal.timeout and AbortSignal.any combine a deadline or several triggers into one signal without polling.",
+    "Database query abortion over a side channel: PostgreSQL's frontend/backend protocol sends a CancelRequest on a separate connection carrying the backend PID and secret key, letting a client that gave up - or an administrator via pg_cancel_backend - abort a running query without killing the session.",
+    "TPL/PLINQ cancellation acknowledgement: a delegate that throws OperationCanceledException carrying the supplied CancellationToken is treated by the Task Parallel Library as a cancellation acknowledgement rather than a fault, so joiners observe a cancelled task instead of an aggregated error."
+  ],
+  "avoid_when": [
+    "A single short call has no inner call tree or abandoned work: use that API's direct timeout/deadline rather than threading a token through every layer.",
+    "You need guaranteed immediate termination of arbitrary or untrusted code (plugins, runaway native code or a stuck foreign call): cooperative listeners can ignore a request, so isolate the work in a process or container and kill that boundary.",
+    "The runtime already owns cancellation in a structured scope, cancel scope or task group: pass its native handle and do not create a second flag beside it.",
+    "CPU-bound work has no natural safe points: first divide it into explicit chunks or isolate it, then cancel between chunks instead of polling a flag in an uninterruptible hot loop.",
+    "Nobody can abandon the result and the process has no graceful-shutdown budget (for example, a short one-shot script): a signal with no trigger is parameter plumbing with no lifecycle value."
+  ],
+  "language_files": {
+    "generic": "cancellation-token.generic.json",
+    "c": "cancellation-token.c.json",
+    "cplusplus": "cancellation-token.cplusplus.json",
+    "csharp": "cancellation-token.csharp.json",
+    "go": "cancellation-token.go.json",
+    "java": "cancellation-token.java.json",
+    "javascript": "cancellation-token.javascript.json",
+    "kotlin": "cancellation-token.kotlin.json",
+    "python": "cancellation-token.python.json",
+    "ruby": "cancellation-token.ruby.json",
+    "rust": "cancellation-token.rust.json",
+    "scala": "cancellation-token.scala.json",
+    "swift": "cancellation-token.swift.json",
+    "typescript": "cancellation-token.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "oo"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "deadline-propagation",
+    "structured-concurrency",
+    "timeout",
+    "two-phase-termination",
+    "poison-pill",
+    "future-promise",
+    "async-method-invocation",
+    "circuit-breaker"
+  ],
+  "anti_patterns": [
+    "Cancel means kill: implementing the request with forced termination (Thread.stop, async signal delivery, pthread cancel-asynchronous) so the operation stops wherever it happens to be and leaves locks held and shared state half-updated.",
+    "Token theatre: accepting a signal in the signature and never observing it, or checking only after the whole operation has run, so callers believe cancellation works while the work completes anyway.",
+    "Swallowing the cancellation signal (catching CancelledError / OperationCanceledException / CancellationException and continuing or returning normally), so the canceller's join never returns and the task reports success.",
+    "A signal as ambient state: a thread-local or global 'shutting down' flag that cancels whatever thread reads it, including unrelated work, and cannot say which operation was asked to stop.",
+    "Reusing a cancelled signal: tokens are one-shot and cannot be reset, so a signal stored on a long-lived object cancels every later operation that sees it instead of only its generation.",
+    "Substituting cancel for a deadline (or a deadline for cancel): a signal nobody triggers lets a lost caller's work run forever, and a timeout without a signal leaves already-started work alive after the wait returns.",
+    "Cancel-then-commit: checking cancellation, then performing an irreversible commit; the commit happens regardless and the cancellation is meaningless, creating the illusion of a clean stop while side effects already fired.",
+    "Blocking forever on a cancelled scope: awaiting a task that swallowed cancellation and returned normally, so the joiner blocks indefinitely while the operation reports success."
+  ],
+  "design_principles": [
+    "Separation of concerns: the requester decides when to cancel, the operation decides how to stop and clean up - the signal is a request, never a directive to terminate.",
+    "Explicit dependencies over ambient state: the signal travels as a parameter, so which operation is cancelled is visible in signatures rather than hidden in thread-local or global state.",
+    "Invariant preservation on every path: stopping happens at a safe point and releases resources through the code's normal scope discipline (RAII, using, defer, finally), so a cancelled operation leaves no partial state.",
+    "Single authority: exactly one owner may trigger a signal; receivers can read it and derive children but never cancel, which prevents accidental cancellation of unrelated work.",
+    "Hierarchical lifetimes (composition): propagation follows the ownership tree - parent to children, scope to task group - so a subtree is cancelled as a unit and siblings are unaffected.",
+    "Distinguish outcomes: a cancelled operation is a third outcome beside success and failure, and modelling it explicitly keeps retries, error handling and telemetry correct.",
+    "Propagate the remaining budget, not a fresh timer: a deadline is an absolute wall-clock time; converting it to a relative timeout at each hop loses track of elapsed time and allows work to overrun the original budget."
+  ],
+  "best_practices": [
+    "Put the signal in every signature that can block or loop, and forward it unchanged to every callee - one layer that drops it breaks the chain for everything below.",
+    "Check at deliberately chosen safe points (loop iterations, before and after blocking calls, at suspension points) using the runtime's idiom, and prefer interruptible waits that re-check over fixed sleeps.",
+    "Never swallow the cancellation signal: clean up, then let the runtime's cancellation signal propagate or return a distinct cancelled outcome, and keep finalizers idempotent, short and non-blocking.",
+    "Keep the trigger with the owner and derive child or linked signals for sub-operations and deadlines instead of broadcasting one signal to unrelated work; propagate a reason where the runtime supports it.",
+    "Treat cancellations as a first-class outcome in tests and telemetry: inject a cancelled signal in tests, count cancels separately from errors, and measure cancellation latency for long loops.",
+    "Release the machinery: dispose cancellation sources and registrations, call the cancel func of derived contexts, and unsubscribe abort listeners, so repeated operations do not leak timers and callbacks.",
+    "Do not do work under a lock or inside a foreign call without an interruptible wait; if a section must not be cancelled, keep the protected region small and documented rather than ignoring the signal globally.",
+    "Know the 'point of no cancellation': if an operation has already started work that cannot be safely undone, let it complete rather than cancelling mid-irreversible-effect; treat a late cancellation request as success.",
+    "In Python asyncio, always await a cancelled task: calling task.cancel() schedules the cancellation but the task may continue running if you never await it, leaking resources; use gather(..., return_exceptions=True) to observe all cancellation results at once.",
+    "Use asyncio.shield() only for critical finalizers that must run even when the surrounding scope is cancelled, and wrap the shielded section in a bounded timeout so shutdown itself cannot hang indefinitely.",
+    "In Python asyncio 3.11+, if you catch CancelledError to perform cleanup, call task.uncancel() before returning so that enclosing TaskGroup and timeout primitives read the cancellation state correctly.",
+    "Distinguish 'cancel the operation', 'cancel the wait', and 'cancel both': cancelling only the wait lets the operation continue in the background and you must still await it to avoid resource leaks.",
+    "Combine a caller's cancellation token with an internal timeout via a linked token source (CreateLinkedTokenSource / CreateLinkedCancellationTokenSource) so that both user intent and infrastructure budgets terminate the same operation with the same code path.",
+    "When cancelling a fan-out of siblings, decide whether to wait for their cleanup before returning: some siblings may need to flush or acknowledge cancellation, and the joiner should budget time for that cleanup.",
+    "Audit hot loops for explicit cancellation checks: a loop that does thousands of iterations without checking is effectively uncancellable; insert a check every N iterations or at natural loop boundaries.",
+    "For GRPC and HTTP servers, thread both the call deadline and a cancellation token through every async operation: the deadline stops the call at the transport layer, but only the cancellation token stops work inside the server.",
+    "Store cancellation tokens as per-call parameters, not as struct fields: a token embedded in a struct implies a shared lifetime that may outlive the individual operation and cancel unrelated later work.",
+    "In Python asyncio, prefer asyncio.timeout() (3.11+) over asyncio.wait_for() for deadline management: timeout() translates CancelledError into TimeoutError at the context boundary rather than in every await, reducing the surface area for swallowed cancellation.",
+    "In Python asyncio 3.11+, after catching CancelledError in a top-level handler, call task.uncancel() before re-raising or returning so that TaskGroup.__exit__ and asyncio.timeout correctly count the cancellation rather than treating it as a suppressible error.",
+    "In C#, always use OperationCanceledException rather than a bare Exception catch when re-throwing after a cancellation check; throw token.ThrowIfCancellationRequested() or catch OperationCanceledException and call PrepareForReentry() before re-throwing to preserve the stack trace.",
+    "In C# CancellationToken, prefer CreateLinkedTokenSource over manual polling loops: linked token sources atomically combine a parent token and a timeout/deadline token so that both signals terminate the same await without races.",
+    "In C++ with std::jthread, prefer interruptible waits (std::condition_variable_any with stop_token) over periodic polling: the condition variable wakes immediately on a stop request rather than waiting for the next poll interval, reducing cancellation latency.",
+    "In JavaScript, always call AbortController.abort() inside a finally block or use a wrapper that guarantees the signal is aborted on both success and failure paths, preventing stale abort signals from corrupting subsequent operations that reuse the same controller.",
+    "In JavaScript, chain signals explicitly: creating a new AbortController per operation and passing its signal into fetch, EventTarget.addEventListener, or ReadableStream ensures each operation gets its own one-shot signal and a parent cancellation only affects operations that explicitly opt in.",
+    "Use structured-concurrency scopes (TaskGroup, scope-based cancel, jthread) to associate cancellation with lexical block boundaries: this ensures that cancellation of a scope cancels all operations started within it as a unit and prevents orphaned background work.",
+    "When combining a deadline (wall-clock expiry) with a cancellation token, convert the absolute deadline into a relative timeout at the outermost layer only and propagate that relative budget as a fresh token inward; converting at every hop loses track of elapsed time and allows work to exceed the original deadline.",
+    "For long-running CPU-bound work, divide the work into explicit chunks and check the cancellation token between chunks: without natural await/yield points, the token is never observed and the operation runs to completion regardless of cancellation requests."
+  ],
+  "version": "1.3",
+  "sources": [
+    "https://docs.python.org/3/library/asyncio-task.html — Python asyncio official docs: Task.cancel(), CancelledError, asyncio.timeout(), shield, TaskGroup.",
+    "https://anyio.readthedocs.io/en/stable/cancellation.html — anyio cancellation guide: CancelScope, level vs edge cancellation, task groups, shield.",
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-token — Microsoft official: CancellationToken, CancellationTokenSource, cooperative cancellation model, linked tokens.",
+    "https://blog.stephencleary.com/2024/09/cancellation-5-propagation.html — Stephen Cleary: cancellation propagation through the call tree.",
+    "https://en.cppreference.com/w/cpp/thread/stop_token — cppreference: std::stop_token, stop_source, stop_callback, stop_requested(), request_stop().",
+    "https://www.modernescpp.com/index.php/cooperative-interruption-of-a-thread-in-c-20 — Rainer Grimm (Modernes C++): cooperative interruption via std::stop_token, std::jthread, stop callbacks.",
+    "https://developer.mozilla.org/en-US/docs/Web/API/AbortController — MDN: AbortController, AbortSignal, abort(), signal; used in fetch, streams, EventTarget.",
+    "https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal — MDN: AbortSignal lifetime, reason, aborted state, timeout pattern.",
+    "Goetz, Peierls, Bloch, Bowbeer, Holmes & Lea, Java Concurrency in Practice (Addison-Wesley, 2006) - Chapter 7, 'Cancellation and Shutdown': cooperative interruption, cancellation policy and task lifecycle.",
+    "https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-in-managed-threads",
+    "https://go.dev/blog/context",
+    "https://openjdk.org/jeps/453",
+    "https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/coalesce-cancellation-tokens-from-timeouts",
+    "https://devblogs.microsoft.com/premier-developer/recommended-patterns-for-cancellationtoken/",
+    "https://blog.stephencleary.com/2024/10/cancellation-6-linking.html",
+    "https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html",
+    "https://tokio.rs/tokio/topics/shutdown",
+    "https://async-concurrency.com/resilience-cancellation-error-handling/cancellation-patterns/",
+    "https://www.toptal.com/dot-net/dotnet-programmer-guide-to-cancellationtoken",
+    "https://vorpus.org/blog/timeouts-and-cancellation-for-humans/",
+    "https://engnotes.dev/blog/structured-concurrency/structured-concurrency-advanced-structured-concurrency-patterns-part-7",
+    "https://github.com/dotnet/AspNetCore.Docs/blob/main/aspnetcore/grpc/deadlines-cancellation.md",
+    "https://learn.clovecodestudio.com/blog/timeouts-deadlines-cancellation-propagation-explained",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.cancellationtoken?view=net-10.0",
+    "https://learn.microsoft.com/en-us/aspnet/core/fundamentals/use-http-context",
+    "https://kotlinlang.org/docs/cancellation-and-timeouts.html",
+    "https://devblogs.microsoft.com/dotnet/net-4-cancellation-framework/",
+    "https://devblogs.microsoft.com/dotnet/cancellation-in-parallel-extensions/",
+    "https://nodejs.org/api/globals.html",
+    "https://www.postgresql.org/docs/19/protocol-flow.html",
+    "https://go.dev/blog/context-and-structs",
+    "https://dev.to/gabrielanhaia/the-5-ways-go-developers-misuse-contextcontext-2gmd",
+    "https://github.com/aio-libs/aiohttp/pull/4080"
+  ],
+  "pitfalls": [
+    "Cancelling the wrong scope or token: using a parent token instead of a child or linked token for a sub-operation means cancelling the parent also cancels unrelated sibling work that shares the parent signal.",
+    "Non-atomic cancellation checks followed by blocking work: checking cancellation, then acquiring a lock or making an I/O call, allows the signal to fire between the check and the blocking call, extending the hold on the resource beyond what the cancellation latency model predicts.",
+    "Ignoring the distinction between 'cancel the operation' and 'cancel the wait': cancelling only the wait while leaving the underlying operation running creates orphaned work that must still be awaited to avoid resource leaks.",
+    "Embedding a cancellation token as a struct or class field: tokens have per-call lifetimes and are one-shot; a struct field implies shared ownership that may outlive the individual operation and cancel unrelated later work.",
+    "Cancelling after an irreversible side effect has already occurred: checking cancellation before committing to a database write, file deletion or network call means the cancellation is moot for that step; the result should be treated as success, not cancellation.",
+    "Propagating cancellation to external systems without idempotency guarantees: a cancelled HTTP request or database call may have succeeded on the server even though the client stopped waiting; the cancelled client must treat this as a potential success and use idempotency keys.",
+    "Forgetting to release cancellation machinery (registrations, callbacks, linked sources): repeated operations that create linked token sources without disposing them leak timers and callbacks, and the accumulated leak can cause shutdown hangs.",
+    "Using a flag-polling approach in tight loops without yielding: checking a volatile bool or Event in a spin loop prevents other threads from making progress and defeats the cooperative nature of the pattern.",
+    "Assuming cancellation is instantaneous: the signal is observed only at safe points, so cancellation latency is bounded by the spacing between checkpoints; a long-running operation without natural await/yield points is effectively uninterpretable.",
+    "Overriding or suppressing cancellation in a library that callers depend on: a library that catches and swallows CancelledError or OperationCanceledException breaks the caller's ability to manage the operation lifecycle, including shutdown and timeout.",
+    "Passing a fresh relative timeout at every hop -> each layer restarts the budget and the request can outlive its deadline -> propagate one absolute deadline or remaining budget and derive cancellation once at the outer boundary.",
+    "Treating an interruptible wait as proof that the operation stopped -> cancelling only the wait leaves detached work mutating state or holding resources -> cancel the underlying operation when possible and always join or await its cleanup before releasing ownership.",
+    "Letting cancellation cleanup call an unbounded dependency -> the cancellation acknowledgement hangs while that dependency is down -> make cleanup idempotent and bounded, and isolate any work that cannot be bounded.",
+    "Wrong move: assume an operation is cancellable because its signature carries a context/token parameter -> the parameter is threaded through every layer while the leaf call blocks in an API that never reads it, so the deadline expires and the work keeps running while the caller believes the wiring is done -> instead: verify the deepest call actually consumes the signal (QueryContext, NewRequestWithContext, signal-aware clients) and prove it by cancelling at the edge and observing the work stop.",
+    "Wrong move: treat sending the cancellation request as proof that the operation stopped -> out-of-band cancels like PostgreSQL's CancelRequest or a client-side abort carry no acknowledgement and may land after the server already committed, so state the canceller assumed was rolled back actually exists -> instead: wait for the operation's own cancelled outcome or a read-back confirmation before retrying or releasing the resource.",
+    "Wrong move: wire transport disconnect reflexively to handler cancellation -> handlers that already committed side effects or launched follow-up work are killed at an arbitrary point and the lost work is invisible -> instead: make cancel-on-disconnect an explicit per-phase policy and shield work that must outlive the connection, as aiohttp's maintainers chose for request handlers."
+  ],
+  "related_patterns_notes": {
+    "deadline-propagation": "carries an absolute time budget through layers; a cancellation token carries a stop request and may be linked to the deadline.",
+    "structured-concurrency": "scopes child lifetimes and usually supplies cancellation automatically; use a token when the request must cross an API or lifecycle boundary.",
+    "timeout": "bounds a wait or operation by elapsed time; cancellation also handles user intent, sibling failure and shutdown before a deadline.",
+    "two-phase-termination": "separates a stop request from cleanup and termination acknowledgement; a token is the request mechanism, not the acknowledgement itself.",
+    "poison-pill": "sends an in-band sentinel through a queue, while a cancellation token signals out-of-band and can cover work that is not currently receiving messages.",
+    "future-promise": "represents an eventual result or completion, whereas a cancellation token asks its producer and callees whether to stop producing it.",
+    "async-method-invocation": "decouples invocation from result retrieval; cancellation can stop the in-flight operation but does not replace the completion protocol.",
+    "hedged-requests": "races redundant operations and normally cancels losing branches once one succeeds; the token supplies that loser-stop signal.",
+    "circuit-breaker": "rejects new calls based on dependency health, while a cancellation token stops a call that has already started.",
+    "actor-supervision": "restarts or stops actors after failures; a cancellation token coordinates the lifetime of one operation subtree without defining actor restart policy."
+  }
+}

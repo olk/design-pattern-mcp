@@ -1,0 +1,177 @@
+{
+  "category": "concurrency-resilience",
+  "name": "lock-free-queue",
+  "aliases": [
+    "non-blocking queue",
+    "lockless queue"
+  ],
+  "intent": "Pass work between concurrent threads through a shared FIFO whose enqueue and dequeue complete with atomic compare-and-swap instead of a mutex, so that a suspended thread cannot block the others and the queue itself stops being the contention bottleneck.",
+  "problem": "A queue is the natural hand-off between producers and consumers, but a mutex-protected queue serialises every merge and drain on one lock: under load the lock becomes the throughput ceiling and its cache line ping-pongs between cores, while a thread preempted or page-faulted while holding it stalls every other producer and consumer - priority inversion and convoying that latency-sensitive or real-time work cannot tolerate. The trigger is a contended hand-off path where compare-and-swap (or LL/SC) is available and the lock's blocking behaviour - not the queue's capacity - is the problem.",
+  "context": "Shared-memory concurrency on multi-core or multi-agent runtimes where several producers and consumers exchange work items through one FIFO and the queue operations are a material fraction of the hot path: thread pools and task runtimes, real-time audio or trading pipelines, telemetry buffers, network receive rings and callback hand-offs. Applies when an atomic read-modify-write primitive exists and removed storage can be reclaimed (garbage collection, hazard pointers, epochs/RCU, a type-stable pool, or a bounded array), and it forces an explicit decision about full and empty behaviour - the structure reports state instead of blocking.",
+  "benefits": [
+    "A thread that is preempted, paged out or killed cannot block anyone else: at least one thread always completes an operation, so there is no held-lock failure mode and no priority inversion.",
+    "Hand-off scales with cores instead of serialising: producers and consumers mostly touch disjoint atomic words (head and tail live on separate cache lines), so throughput keeps rising in the region where one mutex saturates.",
+    "The hot path performs only atomic instructions and plain writes, which makes the pattern usable where taking a lock is forbidden or too slow - async-signal-safe hand-off, real-time threads and kernel-bypass receive paths.",
+    "Bounded ring realizations make the critical path allocation-free and cache-friendly: a fixed array of slots with per-slot sequence numbers removes node allocation and the allocator lock that comes with it.",
+    "Runtime robustness: a stalled thread leaves the structure usable, which is exactly why schedulers, work-stealing runtimes and message-passing runtimes build their internal queues this way."
+  ],
+  "tradeoffs": [
+    "Correctness is subtle in a way a mutex never is: ABA, memory ordering and safe reclamation must all be solved, and leftover bugs surface as rare timing-dependent corruption rather than reproducible failures.",
+    "Unbounded variants cannot apply backpressure - the producer never waits - so overload turns into unbounded memory growth unless a bounded ring and an explicit full policy (fail, drop, overwrite, block) are added.",
+    "Lock-free is neither wait-free nor fair: individual threads can starve, and under heavy contention CAS retries waste work and can lose to a well-tuned mutex, especially when the lock is uncontended.",
+    "Operations do not compose: there is no way to hold the queue across a check-then-act sequence, so invariants spanning two operations or two objects need a different design (a lock, an actor, or a transaction).",
+    "Reclamation machinery costs something: deferred frees consume memory, grace periods consume latency, and calling a general-purpose allocator from the hot path hands the blocking straight back."
+  ],
+  "quality_attributes": {
+    "testability": 3,
+    "extensibility": 4,
+    "maintainability": 3,
+    "simplicity": 2,
+    "performance": 8,
+    "reliability": 6,
+    "security": 3,
+    "scalability": 9
+  },
+  "participants": [
+    {
+      "role": "Producer",
+      "responsibility": "Publishes items with the enqueue operation; in a bounded ring it observes the full condition and applies the agreed policy instead of blocking."
+    },
+    {
+      "role": "Consumer",
+      "responsibility": "Removes items with the dequeue operation and takes ownership of them; in a bounded ring it also publishes the freed slot for reuse."
+    },
+    {
+      "role": "Head/Tail state",
+      "responsibility": "The shared atomic words - head and tail pointers with tags, or push/pop tickets plus per-slot sequence numbers - whose updates are the only contended operations."
+    },
+    {
+      "role": "Node/Slot storage",
+      "responsibility": "The linked nodes or fixed array of slots that hold the items; ownership transfers on dequeue, and the choice of storage decides whether the design allocates at all."
+    },
+    {
+      "role": "Reclamation scheme",
+      "responsibility": "Decides when a removed node may be freed or reused (garbage collector, hazard pointers, epochs/RCU, type-stable pool, or per-slot sequence numbers); without one a node-based lock-free queue is unsound."
+    },
+    {
+      "role": "Backpressure policy",
+      "responsibility": "The bounded variant's rule for a full (and empty) queue - fail fast, drop, overwrite, or sleep/notify - because the structure itself never blocks the caller."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Work distribution inside thread pools, task runtimes and work-stealing schedulers, where a stalled worker must not stall the scheduler (Go run queues, ForkJoinPool, rayon, thread-pool-executor).",
+    "Passing requests between an I/O, network or audio thread and a pool of processing threads, where blocking the producing thread is unacceptable (receive rings, market-data feeds, audio callbacks).",
+    "Telemetry and logging: many threads enqueue records into one buffer drained by a single flusher, usually as a bounded ring so the producing path stays allocation-free.",
+    "Message hand-off between threads or actors in languages without a channel runtime (C, C++, Java), where the queue object is the hand-off contract.",
+    "Real-time and embedded control loops that must not take a lock in the sampling path, typically as a wait-free single-producer/single-consumer ring.",
+    "LMAX Disruptor pattern: single-producer/multi-consumer ring buffer as the core of a financial exchange's event processing pipeline, achieving millions of events per second with deterministic latency.",
+    "Go channel internals: the select/poll mechanism and the underlying ring buffer in the Go runtime's implementation of concurrent channels.",
+    "Rust mpsc channel: the std::sync::mpsc implementation uses a lock-free ring for the synchronous slot and a growing linked list for the asynchronous case.",
+    "Network NIC receive rings: ring buffers between NIC hardware and the driver stack, where DMA descriptors are posted and consumed without OS-level locking.",
+    "Audio DSP graphs: lock-free rings connect processing nodes in real-time audio frameworks (e.g., REAPER SDK, VST3) to avoid blocking the audio thread.",
+    "Java's ConcurrentLinkedQueue: an unbounded, linked-node, non-blocking FIFO for many producers and consumers, suitable when garbage-collected reclamation and unbounded growth are acceptable.",
+    ".NET's ConcurrentQueue<T>: a thread-safe, lock-free FIFO whose Enqueue/TryDequeue operations let an application use the platform queue without custom node reclamation.",
+    "Rust crossbeam_queue: ArrayQueue provides a bounded lock-free MPMC ring while SegQueue provides an unbounded lock-free MPMC queue, making capacity and backpressure an explicit design choice."
+  ],
+  "avoid_when": [
+    "Contention is low or the queue is not the bottleneck: a mutex-protected queue (a Monitor Object) is simpler and typically faster when uncontended.",
+    "Consumers must block when the queue is empty - the ordinary producer-consumer shape: a blocking queue with condition variables, or channels, expresses waiting directly.",
+    "The language exposes no compare-and-swap and no reclamation path (pure Python, Ruby without native extensions): use the stdlib lock-based queue or channels instead of emulating one.",
+    "One producer feeds one consumer: an SPSC ring with two indices and release/acquire stores (or a stdlib ringbuffer) is simpler than general MPMC machinery.",
+    "Throughput is dominated by payload size or downstream work: copying and cache effects dwarf the lock, so removing it buys nothing."
+  ],
+  "language_files": {
+    "generic": "lock-free-queue.generic.json",
+    "c": "lock-free-queue.c.json",
+    "cplusplus": "lock-free-queue.cplusplus.json",
+    "csharp": "lock-free-queue.csharp.json",
+    "go": "lock-free-queue.go.json",
+    "java": "lock-free-queue.java.json",
+    "javascript": "lock-free-queue.javascript.json",
+    "kotlin": "lock-free-queue.kotlin.json",
+    "python": "lock-free-queue.python.json",
+    "ruby": "lock-free-queue.ruby.json",
+    "rust": "lock-free-queue.rust.json",
+    "scala": "lock-free-queue.scala.json",
+    "swift": "lock-free-queue.swift.json",
+    "typescript": "lock-free-queue.typescript.json"
+  },
+  "paradigm": [
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "producer-consumer",
+    "active-object",
+    "half-sync-half-async",
+    "thread-pool",
+    "load-leveller",
+    "guardian-object",
+    "poison-pill"
+  ],
+  "anti_patterns": [
+    "Rewriting a working mutex-protected queue lock-free on the intuition that locks are slow, without a profile showing the lock is the bottleneck.",
+    "Hand-rolled Michael-Scott queues without safe memory reclamation (or without the double-width CAS the algorithm needs): latent use-after-free and ABA instead of a lock.",
+    "Using an unbounded lock-free queue as a mailbox between subsystems, turning overload into unbounded memory growth instead of backpressure.",
+    "Treating lock-free as wait-free and building latency guarantees on the assumption that every thread finishes in bounded steps.",
+    "Allocating and freeing nodes through a general-purpose allocator in the hot path, which hands the blocking straight back to the allocator."
+  ],
+  "design_principles": [
+    "Measure before removing the lock: the simplest correct synchronisation that meets the budget wins (KISS/YAGNI applied to concurrency).",
+    "State the progress guarantee explicitly (wait-free, lock-free, obstruction-free) and which threads may starve.",
+    "Make the memory model explicit: each shared word has a documented ordering - release to publish, acquire to observe - instead of a blanket sequentially-consistent default.",
+    "Prefer bounded and allocation-free designs where the workload allows: bounding removes both the reclamation problem and the unbounded-growth failure mode.",
+    "Do not hand-roll what the platform already ships: standard queues encode years of memory-order and reclamation fixes."
+  ],
+  "best_practices": [
+    "Use the platform queue first (ConcurrentLinkedQueue, ConcurrentQueue, boost::lockfree, crossbeam-queue, std::spsc_queue) and hand-roll only when a profile shows the lock is the bottleneck.",
+    "When hand-rolling, start from a published algorithm (Michael-Scott for MPMC, Vyukov's bounded ring for fixed capacity) and keep the pseudocode next to the code as a correctness reference.",
+    "Pair every node-based queue with a reclamation scheme — hazard pointers (safe for general use), epochs/RCU (low overhead, read-heavy), or a type-stable pool — before it reaches production.",
+    "Pad head, tail, and hot slot metadata onto separate cache lines (typically 64-byte alignment) to eliminate false sharing between producers and consumers.",
+    "Define the full/empty policy and shutdown semantics explicitly: fail, drop, overwrite, block with a CV, poison pill, closed flag, or drain-then-stop — and document which is the default.",
+    "Prefer bounded rings where the workload allows: bounding removes both the reclamation problem and the unbounded-growth failure mode; single-producer/single-consumer rings are wait-free and simpler.",
+    "Use memory_order_relaxed only where you can prove ordering is unnecessary; default to memory_order_seq_cst or explicit acquire/release until the hot path is proven by profiling.",
+    "Verify with the right tools: ThreadSanitizer (TSan) for data races, stress tests with many producers/consumers and injected faults, and model checkers (CDSChecker, GenMC, Relacy) for the memory-order-sensitive core.",
+    "Protect against compiler optimization: use compiler fences or the equivalent volatile atomic operations where the CPU memory model alone does not order the accesses.",
+    "Handle spurious CAS failures gracefully: exponential back-off or pause instructions (x86 pause, ARM yield) reduce contention waste without introducing blocking."
+  ],
+  "version": "1.2",
+  "sources": [
+    "Maged M. Michael & Michael L. Scott, \"Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms\", PODC 1996 (revised in JPDC 1998) — the CAS/LL-SC non-blocking queue algorithm that most modern lock-free queues implement; pseudocode at https://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html.",
+    "Maurice Herlihy & Nir Shavit, The Art of Multiprocessor Programming — the wait-free / lock-free / obstruction-free progress hierarchy and systematic treatment of linearizability, consensus numbers, and the implementation of universal synchronization primitives.",
+    "Dmitry Vyukov, \"Bounded MPMC Queue\" (1024cores.net) — the ticket-based bounded ring with per-slot sequence numbers that achieves wait-free push/pop under single-producer/single-consumer restrictions; basis for boost::lockfree::bounded_ticket_queue and spsc_queue.",
+    "Paul E. McKenney, \"Is Parallel Programming Hard?\" — the definitive RCU reference covering memory ordering, grace-period algorithms, and safe reclamation for lock-free data structures; https://www.kernel.org/doc/html/latest/RCU/.",
+    "Tim Blechmann et al., Boost.Lockfree — https://www.boost.org/doc/libs/master/doc/html/lockfree.html — implements queue (Michael-Scott MPMC), bounded_ticket_queue (Vyukov MPMC), mpsc_weak_queue, spsc_queue (ringbuffer), and spsc_value (triple buffer); covers wait-free vs lock-free configuration via single_producer/single_consumer policy tags.",
+    "Jeff Preshing, \"Memory Reordering Explained\" (preshing.com) — accessible treatment of acquire/release semantics, memory fences, and why relaxed ordering is a data race in disguise for lock-free code.",
+    "Martin Thompson et al., LMAX Disruptor — the high-performance inter-thread messaging pattern that replaced queues with a single-producer/multi-consumer ring buffer; described in \"Disruptor: High Performance Inter-Thread Messaging\" (2011) and https://lmax-exchange.github.io/disruptor/.",
+    "Herb Sutter, \"Effective Concurrency\" columns (Dr. Dobb's Journal) — practical guidance on lock-free design, the danger of composeability, and when to prefer serialized queues over lock-free ones.",
+    "Anthony Williams, C++ Concurrency in Action (2nd ed., 2019) — practical implementation of std::memory_order fences, std::atomic_thread_fence, and the C++20 atomics library used in production lock-free queues.",
+    "Hans Boehm, \"Threads Cannot Be Implemented as a Library\" (PLDI 2005) — clarifies why compiler optimizations can defeat hand-rolled lock-free code unless compiler barriers or proper memory orders are used.",
+    "Maged M. Michael and Michael L. Scott's canonical non-blocking queue pseudocode and origin history — https://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html.",
+    "Oracle Java SE ConcurrentLinkedQueue documentation — describes the unbounded linked-node, non-blocking FIFO used by many concurrent producers and consumers: https://docs.oracle.com/en/java/javase/24/docs/api/java.base/java/util/concurrent/ConcurrentLinkedQueue.html.",
+    "Microsoft Learn ConcurrentQueue<T> documentation — identifies the thread-safe FIFO as lock-free and documents its concurrent enqueue/dequeue API: https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentqueue-1?view=net-9.0.",
+    "Rust crossbeam-queue documentation — documents bounded lock-free ArrayQueue and unbounded lock-free SegQueue, including their capacity tradeoff: https://docs.rs/crossbeam-queue/latest/crossbeam_queue/.",
+    "Are Your Epochs Too Epic? Batch Free Can Be Harmful — analyzes allocator contention and latency spikes caused by large epoch-reclamation batches in lock-free systems: https://arxiv.org/html/2401.11347."
+  ],
+  "related_patterns_notes": {
+    "ring-buffer": "ring-buffer",
+    "spsc-queue": "spsc-queue",
+    "channels": "channels",
+    "disruptor": "disruptor",
+    "message-queue": "message-queue",
+    "actor-model": "actor-model"
+  }
+}

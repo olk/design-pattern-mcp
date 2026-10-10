@@ -1,0 +1,82 @@
+{
+  "pattern": "memoization",
+  "language": "kotlin",
+  "support": "library",
+  "idiom_name": "cache.getOrPut(key) { compute(key) }",
+  "implementation_notes": "The Kotlin standard library's getOrPut on a MutableMap is the whole structure: it returns the bound value or evaluates the lambda, stores it and returns it, so a memo is one private map plus one call. It is not atomic and the map is not synchronized, which makes this the single-owner form (a screen, a parser, a state holder on one dispatcher); for state shared across threads the ConcurrentHashMap variant below or a mutex is required. Because Kotlin collections are Java collections on the JVM, the same key rules apply: stable equals/hashCode, immutable keys, and a preference for primitive or data-class keys over mutable ones.",
+  "code_sketch": "private val cache = mutableMapOf<Key, Report>()\n\nfun report(key: Key): Report = cache.getOrPut(key) { compose(key) }   // compute() runs on a miss\n\nfun invalidate() = cache.clear()",
+  "pitfalls": [
+    "getOrPut is not an atomic operation and mutableMapOf is not synchronized: two threads can both miss and both compute.",
+    "A cache held as an instance property keeps every key and result alive for the lifetime of the object; a companion-object cache keeps them for the process.",
+    "Mutable keys break lookup silently: mutating a data class used as a key after insertion makes the entry unreachable.",
+    "Unbounded growth is invisible in Kotlin - size is only observable if you expose it, so long-lived caches need an explicit bound."
+  ],
+  "sources": [
+    "https://kotlinlang.org/docs/delegated-properties.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "mutable-map-getorput",
+      "name": "mutableMapOf + getOrPut for an argument-keyed memo",
+      "paradigm": "oo",
+      "min_standard": "Kotlin1.0",
+      "idiom_name": "cache.getOrPut(key) { compute(key) }",
+      "implementation_notes": "The Kotlin standard library's getOrPut on a MutableMap is the whole structure: it returns the bound value or evaluates the lambda, stores it and returns it, so a memo is one private map plus one call. It is not atomic and the map is not synchronized, which makes this the single-owner form (a screen, a parser, a state holder on one dispatcher); for state shared across threads the ConcurrentHashMap variant below or a mutex is required. Because Kotlin collections are Java collections on the JVM, the same key rules apply: stable equals/hashCode, immutable keys, and a preference for primitive or data-class keys over mutable ones.",
+      "code_sketch": "private val cache = mutableMapOf<Key, Report>()\n\nfun report(key: Key): Report = cache.getOrPut(key) { compose(key) }   // compute() runs on a miss\n\nfun invalidate() = cache.clear()",
+      "pitfalls": [
+        "getOrPut is not an atomic operation and mutableMapOf is not synchronized: two threads can both miss and both compute.",
+        "A cache held as an instance property keeps every key and result alive for the lifetime of the object; a companion-object cache keeps them for the process.",
+        "Mutable keys break lookup silently: mutating a data class used as a key after insertion makes the entry unreachable.",
+        "Unbounded growth is invisible in Kotlin - size is only observable if you expose it, so long-lived caches need an explicit bound."
+      ],
+      "sources": [
+        "https://kotlinlang.org/docs/delegated-properties.html"
+      ]
+    },
+    {
+      "variant_id": "lazy-delegate",
+      "name": "lazy delegate for a single value",
+      "paradigm": "oo",
+      "min_standard": "Kotlin1.0",
+      "requires_features": [
+        "delegated properties"
+      ],
+      "idiom_name": "val x: X by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { build() }",
+      "implementation_notes": "kotlin.lazy is the nullary case done natively: the first access runs the initializer and remembers the result, subsequent reads return it, and the synchronisation is chosen explicitly - SYNCHRONIZED (the default) computes in one thread while everyone waits, PUBLICATION lets several threads race and keeps the first published value, and NONE drops the guarantees for single-threaded use. The language's own documentation uses the word memoized for local delegated properties, and the delegate can live in a function, a class or a companion object, so the lifetime is a design decision rather than an accident. It has no key, so it does not memoize a function of arguments; the class form of the pattern is justified only when the memo needs keys, a bound or invalidation.",
+      "code_sketch": "val index: Index by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { buildIndex() }\n\n// PUBLICATION: several threads may run the initializer, the first published value wins\n// NONE:         no synchronisation at all - single-threaded or confined state only",
+      "pitfalls": [
+        "Recursive access inside the initializer deadlocks (the thread waits on the value it is initializing); never touch the property from its own lambda.",
+        "LazyThreadSafetyMode.NONE is a silent data race if the property is later reached from another thread.",
+        "The initializer's failure is not remembered consistently - a throwing lambda leaves the delegate uninitialized so the next access retries the failure.",
+        "It memoizes one value, not a function: using it per call (or per request) creates one delegate per instance and no sharing."
+      ],
+      "sources": [
+        "https://kotlinlang.org/docs/delegated-properties.html"
+      ]
+    },
+    {
+      "variant_id": "concurrent-hash-map-compute",
+      "name": "ConcurrentHashMap.computeIfAbsent for shared state (JVM)",
+      "paradigm": "concurrent",
+      "min_standard": "Kotlin1.0",
+      "requires_features": [
+        "JVM"
+      ],
+      "idiom_name": "java.util.concurrent.ConcurrentHashMap<Key, Value>.computeIfAbsent",
+      "implementation_notes": "On the JVM, Kotlin uses java.util.concurrent.ConcurrentHashMap directly, and its computeIfAbsent is the atomic memo: the invocation is atomic and the mapping function runs once per invocation when the key is absent, so concurrent callers share one computation per key. That replaces every synchronized-map or manual double-checked idiom. The inherited Java restrictions apply unchanged: the mapping function must not modify the map (recursive updates that would never complete throw IllegalStateException), the computation should be short because it blocks updates to the same bin, and null values are not allowed. For coroutine-based code the alternative shape is a Mutex plus Deferred per key, which also deduplicates in-flight work rather than only caching finished results.",
+      "code_sketch": "private val cache = java.util.concurrent.ConcurrentHashMap<Key, Report>()\n\nfun report(key: Key): Report = cache.computeIfAbsent(key) { k -> compose(k) }\n\n// coroutine shape for in-flight deduplication: Mutex + map<Key, Deferred<Report>>",
+      "pitfalls": [
+        "The mapping function must not touch the same map: recursing into it throws IllegalStateException rather than computing.",
+        "A long or suspending computation inside computeIfAbsent blocks writers to the bin; never call suspending code from inside the lambda.",
+        "Null values are forbidden, so a nullable result must be wrapped (sealed class, Optional, sentinel).",
+        "Nothing evicts: for request-scoped keys a ConcurrentHashMap memo is a leak, and Kotlin exposes no size-based policy on it."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html",
+        "https://kotlinlang.org/docs/delegated-properties.html"
+      ]
+    }
+  ],
+  "default_variant": "mutable-map-getorput",
+  "version": "1.0"
+}

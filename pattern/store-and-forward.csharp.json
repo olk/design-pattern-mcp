@@ -1,0 +1,66 @@
+{
+  "pattern": "store-and-forward",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "MessageQueue.Send + Message.Recoverable = true",
+  "implementation_notes": "On Windows, Message Queuing is the store: MessageQueue.Send writes to a local queue and the MSMQ service forwards to the destination queue when the route is available, storing the message on disk at every hop - Message.Recoverable documents delivery as guaranteed 'even if a computer crashes while the message is en route', and transactional messages are treated as recoverable automatically. The application side is then a local queue name plus a recoverable message, which is the closest a mainstream runtime comes to the pattern being provided out of the box. The hand-written spool remains justified on .NET Core/.NET 5+ (System.Messaging is not part of modern .NET) or when the peer is not another MSMQ host, where an outbox table with FileStream.Flush(true) - or a service-bus client with durable queues - plays the same role.",
+  "code_sketch": "using var queue = new MessageQueue(@\".\\Private$\\outbound\");\nvar message = new Message(payload) { Recoverable = true, Label = id };\nqueue.Send(message);   // stored locally; MSMQ forwards when the peer is reachable\n// transactional queue: queue.Transactional = true + new MessageQueueTransaction()",
+  "pitfalls": [
+    "Recoverable is false by default: an ordinary message lives in memory and is lost if the machine restarts while the peer is still down.",
+    "System.Messaging is Windows-only and absent from .NET Core/.NET 5+; a cross-platform service must use an outbox table or a broker client instead.",
+    "MessageQueue is IDisposable and depends on the MSMQ service (and the directory service for remote routes); a missing service turns the accept into an exception unless it is handled.",
+    "Only payloads the configured formatter can serialise (XmlMessageFormatter-compatible, [Serializable]) can be sent - an incompatible payload fails at accept time, not at delivery time."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.message.recoverable?view=netframework-4.8.1",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.messagequeue?view=netframework-4.8.1"
+  ],
+  "variants": [
+    {
+      "variant_id": "msmq-recoverable",
+      "name": "MSMQ recoverable message on a local queue (store-and-forward by the OS)",
+      "paradigm": "oo",
+      "min_standard": "C#2",
+      "requires_features": [
+        "System.Messaging"
+      ],
+      "idiom_name": "MessageQueue.Send + Message.Recoverable = true",
+      "implementation_notes": "On Windows, Message Queuing is the store: MessageQueue.Send writes to a local queue and the MSMQ service forwards to the destination queue when the route is available, storing the message on disk at every hop - Message.Recoverable documents delivery as guaranteed 'even if a computer crashes while the message is en route', and transactional messages are treated as recoverable automatically. The application side is then a local queue name plus a recoverable message, which is the closest a mainstream runtime comes to the pattern being provided out of the box. The hand-written spool remains justified on .NET Core/.NET 5+ (System.Messaging is not part of modern .NET) or when the peer is not another MSMQ host, where an outbox table with FileStream.Flush(true) - or a service-bus client with durable queues - plays the same role.",
+      "code_sketch": "using var queue = new MessageQueue(@\".\\Private$\\outbound\");\nvar message = new Message(payload) { Recoverable = true, Label = id };\nqueue.Send(message);   // stored locally; MSMQ forwards when the peer is reachable\n// transactional queue: queue.Transactional = true + new MessageQueueTransaction()",
+      "pitfalls": [
+        "Recoverable is false by default: an ordinary message lives in memory and is lost if the machine restarts while the peer is still down.",
+        "System.Messaging is Windows-only and absent from .NET Core/.NET 5+; a cross-platform service must use an outbox table or a broker client instead.",
+        "MessageQueue is IDisposable and depends on the MSMQ service (and the directory service for remote routes); a missing service turns the accept into an exception unless it is handled.",
+        "Only payloads the configured formatter can serialise (XmlMessageFormatter-compatible, [Serializable]) can be sent - an incompatible payload fails at accept time, not at delivery time."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.message.recoverable?view=netframework-4.8.1",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.messagequeue?view=netframework-4.8.1"
+      ]
+    },
+    {
+      "variant_id": "sqlite-outbox-hosted-service",
+      "name": "Outbox table + hosted background relay (.NET, cross-platform)",
+      "paradigm": "concurrent",
+      "min_standard": "C#10",
+      "requires_features": [
+        "Microsoft.Data.Sqlite",
+        "BackgroundService"
+      ],
+      "idiom_name": "outbox table + IHostedService relay with FileStream.Flush(true)",
+      "implementation_notes": "The portable form writes the message into an outbox table in the same transaction as the business change and lets a BackgroundService/IHostedService relay poll the table, forward, and delete rows only after the peer acknowledged. Use it when the send must be atomic with a database commit or when MSMQ is unavailable; if the store is a file rather than a table, FileStream.Flush(true) is what makes the write durable, since the parameter flushes intermediate OS buffers and not just the managed buffer. This variant is the mainstream .NET answer on Linux, containers and cloud-hosted services.",
+      "code_sketch": "await using var tx = await conn.BeginTransactionAsync();\nawait ApplyBusinessChangeAsync(conn, tx, cmd);\nawait InsertOutboxRowAsync(conn, tx, id, payload);   // same transaction = accept point\nawait tx.CommitAsync();\n// relay hosted service: SELECT pending -> send -> DELETE only after the acknowledgement",
+      "pitfalls": [
+        "FileStream.Flush() without the true argument only clears managed buffers; durability needs Flush(true) or a committed transaction.",
+        "A relay that deletes rows before the acknowledgement, or that runs outside the transaction that inserted them, re-creates the dual-write window the outbox exists to close.",
+        "Several relay instances must claim rows atomically (UPDATE ... OUTPUT, or SKIP LOCKED on SQL Server/PostgreSQL) or they double-send; polling loops also need backoff."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flush?view=net-9.0",
+        "https://learn.microsoft.com/en-us/dotnet/api/system.messaging.message.recoverable?view=netframework-4.8.1"
+      ]
+    }
+  ],
+  "default_variant": "msmq-recoverable",
+  "version": "1.0"
+}

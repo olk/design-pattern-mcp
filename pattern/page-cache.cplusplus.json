@@ -1,0 +1,19 @@
+{
+  "pattern": "page-cache",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "std::unordered_map<std::string, std::shared_ptr<const Page>> under std::shared_mutex (C++17)",
+  "implementation_notes": "The standard library gives no page cache, so the structure is assembled: an unordered_map keyed by method + target + the header axes you vary on, a std::shared_mutex (C++17) so hits take only a shared lock while a miss re-renders under an exclusive one, and an entry holding the finished bytes, an ETag and a steady_clock expiry. Store the key as std::string, never as a string_view into a request buffer - those buffers are reused and dangling views are the standard trap - and keep bodies in std::shared_ptr<const std::string> or copy them out under the lock, because unordered_map rehash and erase invalidate references another thread may be writing. Most C++ HTTP services do not cache in-process at all: a Beast/Asio or framework handler emits Cache-Control/ETag and nginx or Varnish (both C) holds the shared cache, which keeps the header semantics in one place.",
+  "code_sketch": "std::shared_mutex mtx;\nstd::unordered_map<std::string, std::shared_ptr<const Page>> pages;\n\nstd::shared_ptr<const Page> lookup(std::string const& key) {\n    std::shared_lock read(mtx);              // hits do not block each other\n    auto it = pages.find(key);\n    if (it == pages.end() || it->second->expired()) return {};\n    return it->second;                       // keeps the bytes alive past unlock\n}\n// miss: render outside the lock, then\n//   std::unique_lock write(mtx); pages.insert_or_assign(key, page);",
+  "pitfalls": [
+    "Rendering while holding the exclusive lock serialises the whole cache and turns it into the bottleneck it was meant to remove; render outside the lock and insert afterwards.",
+    "unordered_map invalidates iterators and references on rehash: move-assigning a body out of a node while another thread inserts can free the buffer mid-write - hold shared_ptr bodies and copy under the lock.",
+    "std::shared_mutex is neither recursive nor free on every platform; never lock it from the render path, and do not assume shared locking beats a plain std::mutex on a short critical section.",
+    "Keys and bodies grow with query strings: without an entry cap and expiry the table is a memory leak with a traffic-shaped trigger."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/shared_mutex",
+    "https://nginx.org/en/docs/http/ngx_http_proxy_module.html"
+  ],
+  "version": "1.0"
+}

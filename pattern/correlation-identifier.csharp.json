@@ -1,0 +1,19 @@
+{
+  "pattern": "correlation-identifier",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "ConcurrentDictionary<string, TaskCompletionSource<Reply>> + Task.WaitAsync(timeout)",
+  "implementation_notes": "TaskCompletionSource<TResult> is the producer side of a Task that no delegate backs, which is exactly the waiter this pattern needs: the requestor keeps them in a ConcurrentDictionary keyed by the correlation id, the receive loop calls TryRemove and TrySetResult, and the caller awaits the task with a deadline (Task.WaitAsync on .NET 6+, or a CancellationTokenSource with CancelAfter on older targets). On the wire the identifier is a message property, not a payload field: the classic .NET example on MSMQ sets the reply's CorrelationId to the request's Id, so the transport carries the value while the in-process table owns the matching. Use TryRemove as the single-delivery gate instead of a lookup followed by a remove, so a duplicate reply cannot complete twice.",
+  "code_sketch": "private readonly ConcurrentDictionary<string, TaskCompletionSource<Reply>> _pending = new();\n\npublic async Task<Reply> CallAsync(Request request, CancellationToken ct = default) {\n    var id = Guid.NewGuid().ToString(\"N\");\n    var tcs = new TaskCompletionSource<Reply>(TaskCreationOptions.RunContinuationsAsynchronously);\n    _pending[id] = tcs;                                  // register before sending\n    await _transport.SendAsync(request with { CorrelationId = id }, ct);\n    try { return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), ct); }\n    finally { _pending.TryRemove(id, out _); }\n}\n// receive loop:\n// if (_pending.TryRemove(message.CorrelationId, out var t)) t.TrySetResult(message.Payload);",
+  "pitfalls": [
+    "Without TaskCreationOptions.RunContinuationsAsynchronously the awaiting caller's continuation runs inline on the receive/IO thread, which can stall the read loop or deadlock it.",
+    "SetResult/SetException throw when the task is already complete - use TrySetResult with TryRemove so duplicate or late replies are dropped instead of faulting the reader.",
+    "Removing the entry in the timeout path does not stop a concurrent reply from completing shortly before it; decide explicitly whether that completion is discarded or reported, and never let a caller see two outcomes.",
+    "Old transports keep the correlation value in Windows-only System.Messaging types: keep the id generation and the table transport-independent so a move to AMQP or a custom socket only changes the send/receive calls."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1",
+    "https://www.enterpriseintegrationpatterns.com/patterns/messaging/RequestReplyNetExample.html"
+  ],
+  "version": "1.0"
+}

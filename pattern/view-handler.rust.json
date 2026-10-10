@@ -1,0 +1,56 @@
+{
+  "pattern": "view-handler",
+  "language": "rust",
+  "support": "manual",
+  "idiom_name": "HashMap<ViewId, Box<dyn View>> + Rc<RefCell<dyn View>> handles + id-snapshot notification",
+  "implementation_notes": "Rust's ownership model turns the classic registry into an explicit design decision: the handler owns the views (HashMap<ViewId, Box<dyn View>>), so notification borrows each entry mutably in turn and a view that wants to open or close another view must go through the handler again - which means collecting the ids before iterating and never holding the borrow across the call. When several parts of the application need the same view, wrap it as Rc<RefCell<dyn View>> (single-threaded) or Arc<Mutex<..>> (shared across threads), accepting that RefCell panics on re-entrant borrows and that Rc cycles leak unless back-references are Weak. Views stay trait objects behind a small interface (fn update(&mut self, model: &Model)) and the factory is a HashMap<&str, fn(&Model) -> Box<dyn View>>. This is the faithful Rust translation of the pattern, and it is still justified when views must be retained and addressed by handle.",
+  "code_sketch": "pub trait View { fn update(&mut self, model: &Model); fn close(&mut self); }\npub struct Handler { views: HashMap<ViewId, Box<dyn View>>, next: u64 }\nimpl Handler {\n    pub fn open(&mut self, make: fn(&Model) -> Box<dyn View>, m: &Model) -> ViewId {\n        self.next += 1; let id = ViewId(self.next);\n        self.views.insert(id, make(m));            // create + register\n        id                                         // handle, not the view\n    }\n    pub fn close(&mut self, id: ViewId) { if let Some(mut v) = self.views.remove(&id) { v.close() } }\n    pub fn notify(&mut self, m: &Model) {\n        let ids: Vec<ViewId> = self.views.keys().copied().collect();  // no borrow held\n        for id in ids { if let Some(v) = self.views.get_mut(&id) { v.update(m); } }\n    }\n}",
+  "pitfalls": [
+    "RefCell borrows are checked at run time: a view's update that triggers another borrow of the same view (or a Ref held across the call) panics instead of failing to compile.",
+    "Rc/Rc<RefCell<..>> cycles between handler and views leak silently; keep child-to-parent links as Weak and upgrade only for the duration of the call.",
+    "Borrowing the registry mutably while calling update cannot compile, so re-entrant open/close must be queued as commands and applied after the pass.",
+    "Trait objects erase the concrete view type: type-specific view commands need downcast (via Any) or a command enum rather than a cast."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/rc/struct.Rc.html",
+    "https://doc.rust-lang.org/std/cell/struct.RefCell.html"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "retained-view-registry",
+      "name": "Retained view objects in a handler-owned registry",
+      "paradigm": "oo",
+      "idiom_name": "HashMap<ViewId, Box<dyn View>> + Rc<RefCell<dyn View>> handles + id-snapshot notification",
+      "implementation_notes": "Rust's ownership model turns the classic registry into an explicit design decision: the handler owns the views (HashMap<ViewId, Box<dyn View>>), so notification borrows each entry mutably in turn and a view that wants to open or close another view must go through the handler again - which means collecting the ids before iterating and never holding the borrow across the call. When several parts of the application need the same view, wrap it as Rc<RefCell<dyn View>> (single-threaded) or Arc<Mutex<..>> (shared across threads), accepting that RefCell panics on re-entrant borrows and that Rc cycles leak unless back-references are Weak. Views stay trait objects behind a small interface (fn update(&mut self, model: &Model)) and the factory is a HashMap<&str, fn(&Model) -> Box<dyn View>>. This is the faithful Rust translation of the pattern, and it is still justified when views must be retained and addressed by handle.",
+      "code_sketch": "pub trait View { fn update(&mut self, model: &Model); fn close(&mut self); }\npub struct Handler { views: HashMap<ViewId, Box<dyn View>>, next: u64 }\nimpl Handler {\n    pub fn open(&mut self, make: fn(&Model) -> Box<dyn View>, m: &Model) -> ViewId {\n        self.next += 1; let id = ViewId(self.next);\n        self.views.insert(id, make(m));            // create + register\n        id                                         // handle, not the view\n    }\n    pub fn close(&mut self, id: ViewId) { if let Some(mut v) = self.views.remove(&id) { v.close() } }\n    pub fn notify(&mut self, m: &Model) {\n        let ids: Vec<ViewId> = self.views.keys().copied().collect();  // no borrow held\n        for id in ids { if let Some(v) = self.views.get_mut(&id) { v.update(m); } }\n    }\n}",
+      "pitfalls": [
+        "RefCell borrows are checked at run time: a view's update that triggers another borrow of the same view (or a Ref held across the call) panics instead of failing to compile.",
+        "Rc/Rc<RefCell<..>> cycles between handler and views leak silently; keep child-to-parent links as Weak and upgrade only for the duration of the call.",
+        "Borrowing the registry mutably while calling update cannot compile, so re-entrant open/close must be queued as commands and applied after the pass.",
+        "Trait objects erase the concrete view type: type-specific view commands need downcast (via Any) or a command enum rather than a cast."
+      ],
+      "sources": [
+        "https://doc.rust-lang.org/std/rc/struct.Rc.html",
+        "https://doc.rust-lang.org/std/cell/struct.RefCell.html"
+      ]
+    },
+    {
+      "variant_id": "egui-immediate",
+      "name": "egui immediate mode: state drives the frame, no retained views",
+      "paradigm": "declarative",
+      "idiom_name": "app state struct + per-screen show(&mut self, ui) functions",
+      "implementation_notes": "egui deletes the retained half of the pattern: there are no view objects to register, only application state and functions that draw it each frame, so the handler shrinks to the state that decides which screen is current (an enum or a small struct) plus the shared model. Switching is changing that field, and syncing happens because every frame re-reads the model - there is no notification list and no dangling handle, at the cost of recomputing the visible UI (egui's own memory map keeps superficial per-widget state such as scroll offsets by Id, while anything important must live in your own structs). Choose it over a retained registry when the UI is redrawn wholesale anyway and the ownership gymnastics of stored view objects buy nothing.",
+      "code_sketch": "struct App { screen: Screen, model: Model, outline_open: bool }   // the whole handler\n\nimpl eframe::App for App {\n    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {\n        egui::SidePanel::left(\"outline\").show(ctx, |ui| self.show_outline(ui));\n        egui::CentralPanel::default().show(ctx, |ui| match self.screen {\n            Screen::Chart => self.show_chart(ui),     // a view = function of state\n            Screen::Table => self.show_table(ui),\n        });\n    }\n}\n// switching is a plain state assignment: no view object to register, switch or close.",
+      "pitfalls": [
+        "Anything that must survive a frame has to live in the app struct or in egui's Id-keyed memory; a local variable inside a show function is recreated every frame.",
+        "Widget ids are derived from the call structure, so a screen whose draw path changes shape between frames makes scroll and focus state jump - use stable Ids (ui.push_id) for dynamic content.",
+        "Immediate mode re-runs all visible UI code every frame, so heavy work (queries, parsing) inside a show function must be cached or hoisted out of the frame."
+      ],
+      "sources": [
+        "https://docs.rs/egui/latest/egui/struct.Context.html"
+      ]
+    }
+  ],
+  "default_variant": "retained-view-registry"
+}

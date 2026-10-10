@@ -1,0 +1,19 @@
+{
+  "pattern": "process-manager",
+  "language": "swift",
+  "support": "manual",
+  "idiom_name": "enum state + coordinator actor + persisted row (SwiftData/Core Data) + Task deadlines",
+  "implementation_notes": "Swift has no workflow runtime, so the idiomatic shape is an actor per process instance that owns an enum state and drives async steps: the actor serialises replies for one instance without locks, which is exactly the correlation guarantee a process manager needs, while persistence goes through SwiftData/Core Data (or a server-side store the app talks to) after every transition. Deadlines come from racing a reply task against Task.sleep/ContinuousClock in a task group, or from a stored due date that is re-armed on launch. Durable coordination and idempotence remain application code; for short flows that never outlive the process, a plain async function with no persisted state is the simpler and correct choice.",
+  "code_sketch": "actor OrderProcess {\n    private var state: OrderState = .awaitingPayment\n\n    func handle(_ ev: OrderEvent) async throws {\n        switch (state, ev) {\n        case (.awaitingPayment, .paymentOk):\n            state = .awaitingStock                 // update before any await\n            try await outbox.enqueue(.reserveStock(id))\n        case (.awaitingPayment, .timeout):\n            state = .compensating\n            try await outbox.enqueue(.releaseCredit(id))\n        default:\n            break                                  // duplicate or stale reply\n        }\n    }\n}\n// deadline: race the reply task against try await Task.sleep(for: .seconds(3600))",
+  "pitfalls": [
+    "Task.sleep is not a durable timer: after a process restart the deadline is gone, so due dates must be persisted and re-armed at launch or by a background task.",
+    "Actor reentrancy: any await inside handle lets the next reply interleave, so mutate the state before the first suspension point or split the handler into decide and perform phases.",
+    "Unstructured Tasks detach from the instance lifetime; without cancelling them on teardown a restarted coordinator can run old work twice.",
+    "Persisting to SwiftData on the main actor from a background coordinator can deadlock or block; use the appropriate ModelActor/background context for writes."
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/swift/task",
+    "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/"
+  ],
+  "version": "1.0"
+}

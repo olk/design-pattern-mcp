@@ -1,0 +1,86 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "go",
+  "support": "library",
+  "idiom_name": "kgo.NewClient + ProduceSync + kgo.RequiredAcks(kgo.AllISRAcks())",
+  "implementation_notes": "Franz-go writes idempotently unless DisableIdempotentWrite() is set, so the default client already gives the retry-safe producer the pattern needs; kgo.RequiredAcks(kgo.AllISRAcks()) makes the broker wait for every in-sync replica, and ProduceSync returns a per-record result whose error is the only proof that the record is at rest. On the consumer side commit offsets only after the business write, because the committed offset is the acknowledgement. kgo.TransactionalID plus BeginTransaction/EndTransaction extends the boundary over consume-transform-produce; a local spool or outbox is still needed when the business write and the produce must be atomic (see the outbox variant).",
+  "code_sketch": "cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...),\n    kgo.RequiredAcks(kgo.AllISRAcks()),   // idempotent writes are the default\n    kgo.RecordRetries(20))\nif err != nil { return err }\ndefer cl.Close()\nres := cl.ProduceSync(ctx, &kgo.Record{Topic: \"orders\", Key: []byte(id), Value: body})\nif err := res.FirstErr(); err != nil {\n    writeSpool(id, body)                  // the broker did not persist it\n    return err\n}",
+  "pitfalls": [
+    "Produce() returning nil means 'buffered', not 'delivered' - only the promise or the ProduceSync result carries the outcome, and reading them is what makes the guarantee real.",
+    "Ignoring FirstErr loses records silently, and closing the client without Close()/Flush() drops everything still buffered.",
+    "Idempotent production is dropped silently when conflicting options (for example DisableIdempotentWrite) are set, taking duplicate suppression with it.",
+    "Committing a consumer offset before the business write turns the offset commit into an acknowledgement for work that may never have happened."
+  ],
+  "sources": [
+    "https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo"
+  ],
+  "variants": [
+    {
+      "variant_id": "franz-go-idempotent",
+      "name": "franz-go idempotent producer (ProduceSync as the send)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.21",
+      "requires_features": [
+        "franz-go"
+      ],
+      "idiom_name": "kgo.NewClient + ProduceSync + kgo.RequiredAcks(kgo.AllISRAcks())",
+      "implementation_notes": "Franz-go writes idempotently unless DisableIdempotentWrite() is set, so the default client already gives the retry-safe producer the pattern needs; kgo.RequiredAcks(kgo.AllISRAcks()) makes the broker wait for every in-sync replica, and ProduceSync returns a per-record result whose error is the only proof that the record is at rest. On the consumer side commit offsets only after the business write, because the committed offset is the acknowledgement. kgo.TransactionalID plus BeginTransaction/EndTransaction extends the boundary over consume-transform-produce; a local spool or outbox is still needed when the business write and the produce must be atomic (see the outbox variant).",
+      "code_sketch": "cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...),\n    kgo.RequiredAcks(kgo.AllISRAcks()),   // idempotent writes are the default\n    kgo.RecordRetries(20))\nif err != nil { return err }\ndefer cl.Close()\nres := cl.ProduceSync(ctx, &kgo.Record{Topic: \"orders\", Key: []byte(id), Value: body})\nif err := res.FirstErr(); err != nil {\n    writeSpool(id, body)                  // the broker did not persist it\n    return err\n}",
+      "pitfalls": [
+        "Produce() returning nil means 'buffered', not 'delivered' - only the promise or the ProduceSync result carries the outcome, and reading them is what makes the guarantee real.",
+        "Ignoring FirstErr loses records silently, and closing the client without Close()/Flush() drops everything still buffered.",
+        "Idempotent production is dropped silently when conflicting options (for example DisableIdempotentWrite) are set, taking duplicate suppression with it.",
+        "Committing a consumer offset before the business write turns the offset commit into an acknowledgement for work that may never have happened."
+      ],
+      "sources": [
+        "https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo"
+      ]
+    },
+    {
+      "variant_id": "nats-jetstream-dedup",
+      "name": "NATS JetStream publish with Nats-Msg-Id deduplication",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.21",
+      "requires_features": [
+        "nats-jetstream"
+      ],
+      "idiom_name": "jetstream.JetStream.Publish with nats.MsgId and a duplicate window",
+      "implementation_notes": "JetStream makes the stream the store: file storage keeps every published message until the consumer acknowledges it, and the server drops a second message carrying the same Nats-Msg-Id header inside the stream's duplicate window (two minutes by default), so a publisher that retries an unknown outcome does not create a duplicate. Publish returns a PubAck (with Duplicate set when the message was rejected as a duplicate), which is the send-side acknowledgement; consumer-side re-delivery of unacknowledged messages with AckWait is the other half. The window is time-bounded, so application-level dedup is still required for replays that arrive later.",
+      "code_sketch": "js, _ := jetstream.New(nc)\n_, _ = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{\n    Name: \"ORDERS\", Subjects: []string{\"orders.>\"},\n    Storage: jetstream.FileStorage, Duplicates: 10 * time.Minute,\n})\nack, err := js.Publish(ctx, \"orders.created\", body, nats.MsgId(orderID))\nif err != nil { spool(orderID, body) }        // no PubAck -> not stored\n_ = ack.Duplicate                            // broker already had this message",
+      "pitfalls": [
+        "The duplicate window is short by default; a replay after it stores a second copy, so the consumer must still dedup on the business id.",
+        "Without AckWait/redelivery tuning an unacknowledged message is redelivered while the first handler is still running, so handlers must be idempotent.",
+        "nats.MsgId only helps when the id is derived from the business event - a fresh UUID per attempt turns deduplication off.",
+        "A publish that returns an error may still have stored the message; retrying is safe only because of deduplication, not because of the error itself."
+      ],
+      "sources": [
+        "https://docs.nats.io/nats-concepts/jetstream/streams",
+        "https://pkg.go.dev/github.com/nats-io/nats.go/jetstream"
+      ]
+    },
+    {
+      "variant_id": "postgres-outbox",
+      "name": "Transactional outbox in Postgres (SKIP LOCKED dispatcher)",
+      "paradigm": "procedural",
+      "min_standard": "Go1.21",
+      "requires_features": [
+        "postgres"
+      ],
+      "idiom_name": "INSERT into outbox in the business tx + FOR UPDATE SKIP LOCKED poller",
+      "implementation_notes": "When the business state already lives in Postgres, the queue can be a table: insert the message in the same transaction as the state change (so 'write and send' is one atomic commit) and let a dispatcher poll with SELECT ... FOR UPDATE SKIP LOCKED, publishing and deleting only after the broker acknowledged. The database's WAL plays the durable store and the pattern's store-and-forward collapses into one transaction, which is what removes the dual-write gap that the broker-mediated variants leave open. Use it when no broker can join the business transaction; use a broker client variant when throughput per message matters more than transactional atomicity.",
+      "code_sketch": "tx, _ := pool.Begin(ctx)\ntx.Exec(ctx, \"INSERT INTO orders(id, status) VALUES ($1, 'new')\", id)\ntx.Exec(ctx, `INSERT INTO outbox(id, topic, payload) VALUES ($1, $2, $3)`,\n        id, \"orders.created\", body)\ntx.Commit(ctx)                        // state and message commit together\nrows, _ := pool.Query(ctx, `SELECT id, topic, payload FROM outbox\n    ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 10`)\nfor rows.Next() { /* publish; then DELETE ... WHERE id = $1 in the same tx */ }",
+      "pitfalls": [
+        "Publishing outside the transaction that wrote the row reintroduces the gap; the dispatcher and the business write must share the database's atomicity.",
+        "Send and delete in separate transactions duplicate on a crash - that is the at-least-once contract, so the consumer still needs dedup or idempotence.",
+        "SKIP LOCKED needs a covering index and Postgres 9.5+; without them the poller serializes and the outbox becomes the bottleneck.",
+        "The outbox grows without a retention or archive policy, and a stalled dispatcher turns into an unbounded table plus an alert nobody configured."
+      ],
+      "sources": [
+        "https://pkg.go.dev/github.com/jackc/pgx/v5",
+        "https://www.postgresql.org/docs/current/sql-select.html"
+      ]
+    }
+  ],
+  "default_variant": "franz-go-idempotent",
+  "version": "1.0"
+}

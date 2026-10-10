@@ -1,0 +1,71 @@
+{
+  "pattern": "resource-return",
+  "language": "cplusplus",
+  "support": "native",
+  "idiom_name": "factory returns std::unique_ptr (ownership transfer in the return type)",
+  "implementation_notes": "The default realization and this file's summary: a factory returns std::unique_ptr<T> - exclusive ownership in the return type, move-only so ownership cannot be duplicated by accident, no overhead beyond the pointer, with std::make_unique (C++14) closing the raw-new gap. Choose it whenever the client is the single owner, which is the common case; switch to std::shared_ptr<T> when sharing is real (control block plus atomic refcount, and safe deletion through a base without a virtual destructor), and to std::unique_ptr with a custom deleter when the resource is borrowed and the release must hand it back to its owner instead of deleting it. C++11 move semantics make the exclusive form the default recommendation; std::unique_ptr::release()/raw-pointer extraction are the escape hatches to keep out of published interfaces.",
+  "code_sketch": "std::unique_ptr<X> makeX() { return std::make_unique<X>(); }   // ownership in the return type\n\nstruct check_in { Pool* pool; void operator()(Conn* c) const { pool->checkin(c); } };\nstd::unique_ptr<Conn, check_in> borrow(Pool& p) {              // hand-back in the deleter\n    return {p.checkout(), check_in{&p}};\n}",
+  "pitfalls": [
+    "unique_ptr<T> converts implicitly to unique_ptr<B>, and the default deleter then deletes through B - undefined behaviour unless B has a virtual destructor.",
+    "Constructing two owners from one raw pointer, or keeping the raw pointer from release(), produces a double delete or a leak; return the wrapper and keep the raw handle private."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/memory/unique_ptr",
+    "https://www.aristeia.com/Papers/resourceReturnProblem.txt"
+  ],
+  "variants": [
+    {
+      "variant_id": "unique-ptr-return",
+      "name": "Exclusive ownership: factory returns std::unique_ptr",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "factory returns std::unique_ptr (ownership transfer in the return type)",
+      "implementation_notes": "The default realization and this file's summary: a factory returns std::unique_ptr<T> - exclusive ownership in the return type, move-only so ownership cannot be duplicated by accident, no overhead beyond the pointer, with std::make_unique (C++14) closing the raw-new gap. Choose it whenever the client is the single owner, which is the common case; switch to std::shared_ptr<T> when sharing is real (control block plus atomic refcount, and safe deletion through a base without a virtual destructor), and to std::unique_ptr with a custom deleter when the resource is borrowed and the release must hand it back to its owner instead of deleting it. C++11 move semantics make the exclusive form the default recommendation; std::unique_ptr::release()/raw-pointer extraction are the escape hatches to keep out of published interfaces.",
+      "code_sketch": "std::unique_ptr<X> makeX() { return std::make_unique<X>(); }   // ownership in the return type\n\nstruct check_in { Pool* pool; void operator()(Conn* c) const { pool->checkin(c); } };\nstd::unique_ptr<Conn, check_in> borrow(Pool& p) {              // hand-back in the deleter\n    return {p.checkout(), check_in{&p}};\n}",
+      "pitfalls": [
+        "unique_ptr<T> converts implicitly to unique_ptr<B>, and the default deleter then deletes through B - undefined behaviour unless B has a virtual destructor.",
+        "Constructing two owners from one raw pointer, or keeping the raw pointer from release(), produces a double delete or a leak; return the wrapper and keep the raw handle private."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/unique_ptr",
+        "https://www.aristeia.com/Papers/resourceReturnProblem.txt"
+      ]
+    },
+    {
+      "variant_id": "shared-ptr-return",
+      "name": "Shared ownership: factory returns std::shared_ptr",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::shared_ptr return (reference-counted, copyable)",
+      "implementation_notes": "Return std::shared_ptr<T> when the resource must really be shared (caches, observer lists, values stored in several containers) or when deletion through a base pointer must work without a virtual destructor, because the control block remembers the original type and deleter. Cost: a control block, atomic reference counting and a later, less predictable release; keep-alive cycles leak until they are broken. When the deleter hides a hand-back, the last release is what returns the resource to its owner, so the owner observes the return only when the final reference goes away.",
+      "code_sketch": "std::shared_ptr<Session> open(Registry& r, Id id) {\n    if (auto s = r.find(id)) return s;      // hand back the shared instance\n    return r.add(id, std::make_shared<Session>(id));\n}\n\n{\n    auto s = open(registry, id);            // refcount 2 while local\n    s->use();\n}                                            // last owner releases",
+      "pitfalls": [
+        "Reference cycles (objects holding shared_ptr to each other, or a session holding its registry) keep the resource alive and never hand it back; use weak_ptr for back-references.",
+        "shared_ptr pays a control block and atomic traffic per hand-over; defaulting every factory to shared ownership hides the ownership decision instead of making it."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/unique_ptr",
+        "https://www.aristeia.com/Papers/resourceReturnProblem.txt"
+      ]
+    },
+    {
+      "variant_id": "owner-return-deleter",
+      "name": "Custom release policy: unique_ptr with a deleter that hands the resource back",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "std::unique_ptr<T, Deleter> with a pool/owner check-in deleter",
+      "implementation_notes": "When the resource is borrowed from an owner, the deleter - not the client - must perform the hand-back: a function object that calls pool.checkin()/unref()/return-back instead of delete. This is the direct C++ realization of 'handed back rather than closed', and it keeps the destroy path unreachable from client code; the deleter is part of the type, so the return type itself spells out the release policy. The user-defined Handle/Body wrapper from the canonical idiom remains the answer when the release needs a bespoke protocol (custom handle type, shared memory, offset pointers) - unique_ptr supports any NullablePointer handle plus a custom deleter for exactly that case.",
+      "code_sketch": "struct check_in {\n    Pool* pool;\n    void operator()(Conn* c) const { pool->checkin(c); }   // hand back, not delete\n};\nusing Loan = std::unique_ptr<Conn, check_in>;\n\nLoan borrow(Pool& p) { return Loan{p.checkout(), check_in{&p}}; }",
+      "pitfalls": [
+        "A deleter that captures a manager pointer must not outlive that manager: a Loan kept past the pool's destruction turns scope exit into a use-after-free.",
+        "Types mix: Loan and std::unique_ptr<Conn> are incompatible return types even though both own a Conn; the release policy is part of the type, so pick one wrapper per API and stay with it."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/memory/unique_ptr",
+        "https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Resource_Return"
+      ]
+    }
+  ],
+  "default_variant": "unique-ptr-return",
+  "version": "1.0"
+}

@@ -1,0 +1,77 @@
+{
+  "pattern": "lazy-initialization",
+  "language": "swift",
+  "support": "native",
+  "idiom_name": "lazy var property",
+  "implementation_notes": "Swift provides lazy stored properties as language syntax: marking a stored property lazy defers its initial value until the first read (the Swift book's Lazy Stored Properties section is explicit that the value is not calculated until first use), which replaces the optional-marker plus guarded-accessor structure inside a type: the initialiser expression runs on the first read of that instance's property and its result is stored, so the classic isInitialized flag has no counterpart in the language. Note the two distinct guarantees: lazy var is not synchronised, while static let/global let are lazily initialised and atomic, so shared state belongs in the static form or behind an explicit lock/actor.",
+  "code_sketch": "final class DataManager {\n    lazy var importer = DataImporter()      // built on first access\n}\n\nlet manager = DataManager()\n// DataImporter() is constructed here, not in init:\n_ = manager.importer",
+  "pitfalls": [
+    "lazy var is not thread-safe: concurrent first access can run the initialiser more than once and one instance is discarded, and mutable access from several threads is a data race the concurrency checker cannot see.",
+    "Reading the property from inside its own initialiser traps (simultaneous access / exclusivity enforcement on the same storage) instead of deadlocking, and capturing self strongly in the initialiser can create a retain cycle.",
+    "lazy is only available on stored properties of a class/struct (not on let, computed properties or protocol requirements), and a struct copy that has not yet initialised the property initialises its own copy - laziness is per value, not shared."
+  ],
+  "sources": [
+    "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+    "https://github.com/swiftlang/swift-book/blob/main/TSPL.docc/LanguageGuide/Properties.md"
+  ],
+  "variants": [
+    {
+      "variant_id": "lazy-stored-property",
+      "name": "lazy stored property",
+      "paradigm": "oo",
+      "idiom_name": "lazy var property",
+      "implementation_notes": "Swift provides lazy stored properties as language syntax: marking a stored property lazy defers its initial value until the first read (the Swift book's Lazy Stored Properties section is explicit that the value is not calculated until first use), which replaces the optional-marker plus guarded-accessor structure inside a type: the initialiser expression runs on the first read of that instance's property and its result is stored, so the classic isInitialized flag has no counterpart in the language. Note the two distinct guarantees: lazy var is not synchronised, while static let/global let are lazily initialised and atomic, so shared state belongs in the static form or behind an explicit lock/actor.",
+      "code_sketch": "final class DataManager {\n    lazy var importer = DataImporter()      // built on first access\n}\n\nlet manager = DataManager()\n// DataImporter() is constructed here, not in init:\n_ = manager.importer",
+      "pitfalls": [
+        "lazy var is not thread-safe: concurrent first access can run the initialiser more than once and one instance is discarded, and mutable access from several threads is a data race the concurrency checker cannot see.",
+        "Reading the property from inside its own initialiser traps (simultaneous access / exclusivity enforcement on the same storage) instead of deadlocking, and capturing self strongly in the initialiser can create a retain cycle.",
+        "lazy is only available on stored properties of a class/struct (not on let, computed properties or protocol requirements), and a struct copy that has not yet initialised the property initialises its own copy - laziness is per value, not shared."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+        "https://github.com/swiftlang/swift-book/blob/main/TSPL.docc/LanguageGuide/Properties.md"
+      ]
+    },
+    {
+      "variant_id": "static-let-shared",
+      "name": "static let (lazy and atomic by definition)",
+      "paradigm": "declarative",
+      "idiom_name": "static let shared = build()",
+      "implementation_notes": "A static (or global) let is the thread-safe counterpart: Swift initialises it lazily on first access and guarantees a single, atomic initialisation, so a process-wide value needs no lock, no marker and no guard - this is the replacement for the classic 'dispatch_once singleton' and for lazy static state in general. It is the right default for shared infrastructure (registries, formatters, shared clients); the classic hand-written structure survives only where the value must be rebuilt or where the initialisation can fail in a recoverable way, because a static let has no error channel.",
+      "code_sketch": "enum Registry {\n    static let shared = buildRegistry()   // lazy + atomic, once per process\n}\n\n// failing initialisation has no channel:\n// static let config = try! Config.load()   // crashes at first access",
+      "pitfalls": [
+        "A failing static initialiser has nowhere to report: force-try/fatalError inside it aborts the process at an arbitrary first-use point, so fallible initialisation belongs in a throwing function, not in a static let.",
+        "Global/static initialisation order is lazy but still implicit: a static let that depends on another module's static during program start can observe it uninitialised (or trap) in early-boot code paths such as +load-time hooks.",
+        "static let is per module/process, so it is shared mutable state: if the value itself is mutable, the atomicity of the reference does not make the object thread-safe."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+        "https://github.com/swiftlang/swift-book/blob/main/TSPL.docc/LanguageGuide/Properties.md"
+      ]
+    },
+    {
+      "variant_id": "actor-guarded-cell",
+      "name": "Actor- or lock-guarded lazy cell for instance state",
+      "paradigm": "concurrent",
+      "min_standard": "Swift5.5",
+      "requires_features": [
+        "actors",
+        "async/await"
+      ],
+      "idiom_name": "private optional cell behind an actor or a lock",
+      "implementation_notes": "For a lazily built value that must be shared across threads but is not static, Swift's lazy var is not enough: the idiom is an explicit cell (an optional or enum state) reached through the concurrency machinery - an actor's isolated method or a lock - where the initialisation is written by hand but the publication is guaranteed by the runtime. It replaces the lazy modifier wherever thread safety is required and is the standard answer for per-instance caches in async code.",
+      "code_sketch": "actor ImageCache {\n    private var decoded: [Key: Image] = [:]\n\n    func image(for key: Key) async throws -> Image {\n        if let hit = decoded[key] { return hit }        // cheap path\n        let img = try await decode(key)                 // once per key\n        decoded[key] = img\n        return img\n    }\n}",
+      "pitfalls": [
+        "An actor's methods are serialised only on the actor's executor: returning the built value (a reference type) hands it to other actors, so the value itself must be Sendable/safely shared.",
+        "Caching a non-Sendable value or a closure in the cell produces compiler diagnostics under strict concurrency, and silencing them with @unchecked Sendable reintroduces the data race the variant exists to prevent.",
+        "Awaiting inside the accessor means the cell can be observed mid-initialisation by other methods: the actor's isolation only serialises execution, so re-entrant callbacks that await the same key can trigger duplicate builds unless the state machine (loading/in-flight) is modelled explicitly."
+      ],
+      "sources": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/properties/",
+        "https://developer.apple.com/documentation/swift/actor"
+      ]
+    }
+  ],
+  "default_variant": "lazy-stored-property",
+  "version": "1.0"
+}

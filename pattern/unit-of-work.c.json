@@ -1,0 +1,19 @@
+{
+  "pattern": "unit-of-work",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-rolled change set + SQLite BEGIN/COMMIT (sqlite3_exec or prepared statements)",
+  "implementation_notes": "C has no ORM in its standard library, so the unit of work is explicit bookkeeping: keep three collections (new, dirty, removed) of row structs keyed by primary key, and at commit time emit the INSERTs, UPDATEs and DELETEs on one connection inside BEGIN ... COMMIT, then clear the collections. SQLite supplies the transaction machinery - BEGIN/COMMIT/ROLLBACK, and SAVEPOINT/RELEASE for nested scopes - while sqlite3_exec is the convenience form for running the batch and sqlite3_prepare_v2/step/finalize the form to use when statements repeat. The classic role object is still justified whenever several parts of the program touch the same rows (importers, UI handlers, background jobs), because it is the only place that knows what must be written; for one short function a plain BEGIN/COMMIT around direct statements is simpler and should be preferred.",
+  "code_sketch": "static int uow_commit(uow *u, sqlite3 *db) {\n    if (sqlite3_exec(db, \"BEGIN IMMEDIATE\", 0, 0, 0) != SQLITE_OK) return -1;\n    for (size_t i = 0; i < u->n_new;     i++) insert_row(db, u->new_[i]);\n    for (size_t i = 0; i < u->n_dirty;   i++) update_row(db, u->dirty[i]);\n    for (size_t i = 0; i < u->n_removed; i++) delete_row(db, u->removed[i]);\n    if (sqlite3_exec(db, \"COMMIT\", 0, 0, 0) != SQLITE_OK) {\n        sqlite3_exec(db, \"ROLLBACK\", 0, 0, 0);\n        return -1;\n    }\n    uow_reset(u);   /* lists must be cleared, or the next commit re-writes them */\n    return 0;\n}",
+  "pitfalls": [
+    "Nothing in the type system enforces registration: a mutation path that forgets uow_track leaves the row unflushed, so the lists and every write path must be reviewed together.",
+    "sqlite3_exec stops at the first failing statement and skips the rest, and its error text must be freed with sqlite3_free - check the return code instead of assuming the batch ran.",
+    "After a failed COMMIT the in-memory structs still claim to be saved; the rollback path must also reset or discard the change lists.",
+    "All statements of one unit of work must go through the same sqlite3 handle: SQLite serialises writers per connection, and a second handle escapes the transaction."
+  ],
+  "sources": [
+    "https://www.sqlite.org/lang_transaction.html",
+    "https://www.sqlite.org/c3ref/exec.html"
+  ],
+  "version": "1.0"
+}

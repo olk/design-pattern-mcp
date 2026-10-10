@@ -1,0 +1,58 @@
+{
+  "pattern": "interceptor",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "tower::Layer producing a wrapping tower::Service (ServiceBuilder)",
+  "implementation_notes": "Rust's dominant networking stack models interception as a Service transformation rather than a registry: a Layer is a function from a Service to a wrapping Service, ServiceBuilder stacks layers, and each call passes poll_ready then call into the wrapper, which forwards to the inner service to continue the chain - so the Context role is the request type and the Dispatcher role is the builder that fixed the order at compile time. The compiler checks the wiring, which removes the whole class of 'registered but never invoked' bugs at the cost of long generic types; hyper, tonic and warp are built on these traits. A hand-written registration list is still justified for internal event buses where dragging Service generics through unrelated code would be worse than a small map of callbacks.",
+  "code_sketch": "impl<S, B> Service<Request<B>> for Timing<S> where S: Service<Request<B>> {\n    type Response = S::Response;\n    type Error = S::Error;\n    type Future = S::Future;\n    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {\n        self.inner.poll_ready(cx)                   // forward readiness\n    }\n    fn call(&mut self, req: Request<B>) -> Self::Future {\n        metrics::record_start(Instant::now());\n        self.inner.call(req)                        // continue the chain\n    }\n}",
+  "pitfalls": [
+    "poll_ready must be forwarded (and its result respected) before call: skipping it breaks the backpressure contract of the inner service and can surface as stalls under load.",
+    "A Service is cloned by the framework for every connection/request, so shared state must sit behind Arc (and behind Arc<Mutex>/atomics when mutated); per-connection clones silently diverge otherwise.",
+    "A layer that returns without driving the inner future never runs the handler and can deadlock upstream: short-circuit only deliberately, and box the future when the type changes (Box::pin / impl Future).",
+    "Errors and responses travel back through the layers in reverse: a layer that only intercepts the request cannot see the outcome without also mapping the future."
+  ],
+  "sources": [
+    "https://docs.rs/tower/latest/tower/",
+    "https://docs.rs/tonic/latest/tonic/service/trait.Interceptor.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "tower-layer",
+      "name": "tower Service/Layer composition over a ServiceBuilder",
+      "paradigm": "functional",
+      "min_standard": "Rust2021",
+      "idiom_name": "tower::Layer producing a wrapping tower::Service (ServiceBuilder)",
+      "implementation_notes": "Rust's dominant networking stack models interception as a Service transformation rather than a registry: a Layer is a function from a Service to a wrapping Service, ServiceBuilder stacks layers, and each call passes poll_ready then call into the wrapper, which forwards to the inner service to continue the chain - so the Context role is the request type and the Dispatcher role is the builder that fixed the order at compile time. The compiler checks the wiring, which removes the whole class of 'registered but never invoked' bugs at the cost of long generic types; hyper, tonic and warp are built on these traits. A hand-written registration list is still justified for internal event buses where dragging Service generics through unrelated code would be worse than a small map of callbacks.",
+      "code_sketch": "impl<S, B> Service<Request<B>> for Timing<S> where S: Service<Request<B>> {\n    type Response = S::Response;\n    type Error = S::Error;\n    type Future = S::Future;\n    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {\n        self.inner.poll_ready(cx)                   // forward readiness\n    }\n    fn call(&mut self, req: Request<B>) -> Self::Future {\n        metrics::record_start(Instant::now());\n        self.inner.call(req)                        // continue the chain\n    }\n}",
+      "pitfalls": [
+        "poll_ready must be forwarded (and its result respected) before call: skipping it breaks the backpressure contract of the inner service and can surface as stalls under load.",
+        "A Service is cloned by the framework for every connection/request, so shared state must sit behind Arc (and behind Arc<Mutex>/atomics when mutated); per-connection clones silently diverge otherwise.",
+        "A layer that returns without driving the inner future never runs the handler and can deadlock upstream: short-circuit only deliberately, and box the future when the type changes (Box::pin / impl Future).",
+        "Errors and responses travel back through the layers in reverse: a layer that only intercepts the request cannot see the outcome without also mapping the future."
+      ],
+      "sources": [
+        "https://docs.rs/tower/latest/tower/",
+        "https://docs.rs/tonic/latest/tonic/service/trait.Interceptor.html"
+      ]
+    },
+    {
+      "variant_id": "tonic-interceptor",
+      "name": "tonic gRPC Interceptor for request gating",
+      "paradigm": "oo",
+      "idiom_name": "tonic::service::Interceptor (FnMut(Request<()>) -> Result<Request<()>, Status>)",
+      "implementation_notes": "tonic defines a deliberately narrow interceptor trait: any function returning Result<Request<()>, Status> can be used, runs before the request is sent (client side) or dispatched (server side), and may mutate metadata or cancel the call with a Status - the classic veto made explicit in the return type. Its own documentation is candid that this is less flexible than middleware because it cannot act on the response, and recommends tower for logging or anything beyond request gating, so the two variants compose rather than compete: an auth interceptor plus tower layers for the rest.",
+      "code_sketch": "async fn check_token(req: Request<()>) -> Result<Request<()>, Status> {\n    match req.metadata().get(\"authorization\") {\n        Some(t) if valid(t) => Ok(req),\n        _ => Err(Status::unauthenticated(\"missing token\")),   // veto\n    }\n}\n// Server::builder().layer(...).add_service(SvcServer::with_interceptor(svc, check_token))",
+      "pitfalls": [
+        "The interceptor only sees Request<()> (metadata, not the message body) and cannot modify the response - state that must travel with the reply belongs in a tower layer instead.",
+        "Returning Err(Status) cancels the call before the service sees it, so ordering among interceptors decides which error wins; keep exactly one authoritative auth check.",
+        "Metadata mutations are visible to the peer: never copy an incoming token into an outgoing request without stripping the original."
+      ],
+      "sources": [
+        "https://docs.rs/tonic/latest/tonic/service/trait.Interceptor.html",
+        "https://docs.rs/tower/latest/tower/"
+      ]
+    }
+  ],
+  "default_variant": "tower-layer",
+  "version": "1.0"
+}

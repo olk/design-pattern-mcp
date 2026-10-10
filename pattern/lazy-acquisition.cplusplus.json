@@ -1,0 +1,78 @@
+{
+  "pattern": "lazy-acquisition",
+  "language": "cplusplus",
+  "support": "idiomatic",
+  "idiom_name": "function-local static / std::call_once guarded accessor",
+  "implementation_notes": "Modern C++ has the guard built into the language: a function-local static is initialized on the first execution that reaches its declaration, exactly once even when reached from several threads, so `static Resource& r = open();` is already a correct lazy acquisition - cppreference notes this may be more efficient than the equivalent std::call_once. Use std::once_flag/std::call_once when the acquisition is a statement sequence rather than a single initializer, and std::optional<T> when the resource can be released and re-acquired. The classic POSA3 structure (resource proxy plus acquisition policy plus lifecycle manager) earns its keep only when acquisition must be pluggable or release is part of the design; for a single process-wide value the scoped static accessor is the whole pattern.",
+  "code_sketch": "Config& config() {\n    static Config cfg = Config::load(\"app.toml\");   // thread-safe, initialized once (C++11)\n    return cfg;\n}\n// statement-sequence form:\n// static std::once_flag once; std::call_once(once, [] { cfg = Config::load(path); });",
+  "pitfalls": [
+    "A throwing initializer leaves the static uninitialized and the next call retries it - and std::call_once explicitly does not flip the flag when the function throws - so a transiently failing acquisition is re-attempted by later callers with no backoff or record.",
+    "Static locals are destroyed at exit in an order that is undefined across translation units, so another static object's destructor can reach a resource that is already destroyed (the dead-reference problem).",
+    "A function-local static can never be reset or re-acquired; for a resource that must be closed or refreshed, hold std::optional<T> in an owning object and use emplace()/reset() instead.",
+    "Function-local statics in a header-inline function are shared only within one program instance; the same accessor in a DLL/dylib gets its own holder, silently producing one resource per module."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/call_once",
+    "https://en.cppreference.com/w/cpp/language/storage_duration"
+  ],
+  "variants": [
+    {
+      "variant_id": "cpp-scoped-static",
+      "name": "Function-local static / std::call_once accessor",
+      "paradigm": "oo",
+      "min_standard": "C++11",
+      "idiom_name": "function-local static / std::call_once guarded accessor",
+      "implementation_notes": "Modern C++ has the guard built into the language: a function-local static is initialized on the first execution that reaches its declaration, exactly once even when reached from several threads, so `static Resource& r = open();` is already a correct lazy acquisition - cppreference notes this may be more efficient than the equivalent std::call_once. Use std::once_flag/std::call_once when the acquisition is a statement sequence rather than a single initializer, and std::optional<T> when the resource can be released and re-acquired. The classic POSA3 structure (resource proxy plus acquisition policy plus lifecycle manager) earns its keep only when acquisition must be pluggable or release is part of the design; for a single process-wide value the scoped static accessor is the whole pattern.",
+      "code_sketch": "Config& config() {\n    static Config cfg = Config::load(\"app.toml\");   // thread-safe, initialized once (C++11)\n    return cfg;\n}\n// statement-sequence form:\n// static std::once_flag once; std::call_once(once, [] { cfg = Config::load(path); });",
+      "pitfalls": [
+        "A throwing initializer leaves the static uninitialized and the next call retries it - and std::call_once explicitly does not flip the flag when the function throws - so a transiently failing acquisition is re-attempted by later callers with no backoff or record.",
+        "Static locals are destroyed at exit in an order that is undefined across translation units, so another static object's destructor can reach a resource that is already destroyed (the dead-reference problem).",
+        "A function-local static can never be reset or re-acquired; for a resource that must be closed or refreshed, hold std::optional<T> in an owning object and use emplace()/reset() instead.",
+        "Function-local statics in a header-inline function are shared only within one program instance; the same accessor in a DLL/dylib gets its own holder, silently producing one resource per module."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/call_once",
+        "https://en.cppreference.com/w/cpp/language/storage_duration"
+      ]
+    },
+    {
+      "variant_id": "cpp-deferred-async",
+      "name": "Deferred acquisition through std::async",
+      "paradigm": "concurrent",
+      "min_standard": "C++11",
+      "requires_features": [
+        "futures"
+      ],
+      "idiom_name": "std::async(std::launch::deferred) + std::future",
+      "implementation_notes": "With launch::deferred the callable is stored and the standard calls the evaluation lazy: it runs in the thread that first performs a non-timed wait on the returned future, and the shared state then caches the result or the exception forever. That makes the future a resource holder whose acquisition is a function call, which is useful when the acquired value is produced on the calling thread but at a time of the caller's choosing. Choose it over the scoped static when several independent holders are needed or when the result (including failure) must be observable by many callers.",
+      "code_sketch": "std::future<Connection> conn = std::async(std::launch::deferred,\n                                         [] { return dial(endpoint); });\n// nothing acquired yet\nConnection c = conn.get();   // dial runs here, once",
+      "pitfalls": [
+        "A deferred future never runs unless it is waited on: discarding the future silently cancels the acquisition, with no error and no resource.",
+        "The evaluation runs in the waiting thread, so the first caller pays the entire acquisition cost - never wait on it inside a latency-critical path.",
+        "std::async without an explicit policy uses async|deferred, which is implementation-defined: a plain std::async is not a lazy acquisition at all."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/thread/async"
+      ]
+    },
+    {
+      "variant_id": "cpp-optional-holder",
+      "name": "std::optional holder with emplace/reset",
+      "paradigm": "oo",
+      "min_standard": "C++17",
+      "idiom_name": "std::optional<T> holder",
+      "implementation_notes": "std::optional makes the not-yet-acquired state part of the type: an empty optional is the holder before first use, emplace() acquires in place, reset() releases, and has_value()/value() keep the check explicit. Choose it over a scoped static when the resource is re-acquirable (a replaced connection) or owned by an object rather than the process. It is not synchronized: guard shared holders with a mutex or std::call_once exactly as you would a raw pointer.",
+      "code_sketch": "class Session {\n  std::optional<Connection> conn_;\npublic:\n  Connection& connection() {\n    if (!conn_) conn_.emplace(dial(endpoint));   // acquired on first use\n    return *conn_;\n  }\n  void drop() { conn_.reset(); }                  // release, re-acquire later\n};",
+      "pitfalls": [
+        "optional is not synchronized: concurrent first calls can both enter emplace and race - the guard still has to be added.",
+        "emplace() on a non-empty optional destroys the previous value first, so replacing a live resource must be sequenced with its users.",
+        "optional<T> stores the value inline, so a large handle inflates every holder; store a unique_ptr<T> when the resource is big or move-only."
+      ],
+      "sources": [
+        "https://en.cppreference.com/w/cpp/utility/optional"
+      ]
+    }
+  ],
+  "default_variant": "cpp-scoped-static",
+  "version": "1.0"
+}

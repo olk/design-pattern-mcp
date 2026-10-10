@@ -1,0 +1,51 @@
+{
+  "pattern": "coarse-grained-lock",
+  "language": "csharp",
+  "support": "library",
+  "implementation_notes": "Default realization: one concurrency token on the root (SQL Server rowversion via [Timestamp]/IsRowVersion, or IsConcurrencyToken on a GUID/int you bump yourself) and none on the members. EF Core adds the token to the WHERE clause of every UPDATE and DELETE of the root, so a change made anywhere in the cluster since load surfaces as DbUpdateConcurrencyException at SaveChanges. It replaces per-member version columns and per-member locks with one token; choose it when conflicts are rare and the session is short.",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "ef-core-concurrency-token",
+      "name": "EF Core concurrency token on the aggregate root",
+      "paradigm": "oo",
+      "implementation_notes": "Default realization: one concurrency token on the root (SQL Server rowversion via [Timestamp]/IsRowVersion, or IsConcurrencyToken on a GUID/int you bump yourself) and none on the members. EF Core adds the token to the WHERE clause of every UPDATE and DELETE of the root, so a change made anywhere in the cluster since load surfaces as DbUpdateConcurrencyException at SaveChanges. It replaces per-member version columns and per-member locks with one token; choose it when conflicts are rare and the session is short.",
+      "min_standard": "C#8",
+      "idiom_name": "EF Core concurrency token (rowversion / IsConcurrencyToken) on the root entity",
+      "code_sketch": "public class Order {                      // aggregate root\n    public int Id { get; set; }\n    [Timestamp] public byte[] Version { get; set; }\n    public List<OrderLine> Lines { get; set; }\n}\n\nvar root = await db.Orders.Include(o => o.Lines).SingleAsync(o => o.Id == id);\nroot.Lines[0].Qty += 1;       // any member change, one root token\nawait db.SaveChangesAsync();  // DbUpdateConcurrencyException if stale",
+      "pitfalls": [
+        "The exception only fires when SaveChanges writes the root; a member update that does not touch the root row escapes the check - map members so that a cluster change always marks the root modified.",
+        "Retry loops must reload the root; reusing the same tracked entities after a conflict re-sends the same stale token."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/ef/core/saving/concurrency"
+      ]
+    },
+    {
+      "variant_id": "sqlserver-updlock",
+      "name": "pessimistic root lock via raw SQL (UPDLOCK, ROWLOCK)",
+      "paradigm": "declarative",
+      "implementation_notes": "EF Core has no pessimistic lock API, so the pessimistic realization is a raw-SQL query for the root with SQL Server's WITH (UPDLOCK, ROWLOCK) - or its equivalent on other providers - inside an explicit transaction; the update lock is held until the transaction ends, so other writers of that root block. It replaces per-member locking with one root lock and is the choice when a conflict would be expensive or an edit session must not be re-done.",
+      "min_standard": "C#8",
+      "idiom_name": "FromSqlRaw(\"... WITH (UPDLOCK, ROWLOCK) ...\") in an explicit transaction",
+      "code_sketch": "await using var tx = await db.Database.BeginTransactionAsync();\nvar root = await db.Orders\n    .FromSql($\"SELECT * FROM Orders WITH (UPDLOCK, ROWLOCK) WHERE Id = {id}\")\n    .Include(o => o.Lines)\n    .SingleAsync();\nforeach (var line in root.Lines) line.Apply(delta);\nawait db.SaveChangesAsync();\nawait tx.CommitAsync();          // lock released here",
+      "pitfalls": [
+        "FromSql must return the full entity shape or EF Core cannot track it; add the include/join for members in a follow-up query while the transaction is still open.",
+        "UPDLOCK without ROWLOCK may escalate to page or table locks under load, blocking unrelated clusters - check the actual lock mode when clusters are hot."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/sql/t-sql/queries/hints-transact-sql-table"
+      ]
+    }
+  ],
+  "default_variant": "ef-core-concurrency-token",
+  "idiom_name": "EF Core concurrency token (rowversion / IsConcurrencyToken) on the root entity",
+  "code_sketch": "public class Order {                      // aggregate root\n    public int Id { get; set; }\n    [Timestamp] public byte[] Version { get; set; }\n    public List<OrderLine> Lines { get; set; }\n}\n\nvar root = await db.Orders.Include(o => o.Lines).SingleAsync(o => o.Id == id);\nroot.Lines[0].Qty += 1;       // any member change, one root token\nawait db.SaveChangesAsync();  // DbUpdateConcurrencyException if stale",
+  "pitfalls": [
+    "The exception only fires when SaveChanges writes the root; a member update that does not touch the root row escapes the check - map members so that a cluster change always marks the root modified.",
+    "Retry loops must reload the root; reusing the same tracked entities after a conflict re-sends the same stale token."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/ef/core/saving/concurrency"
+  ]
+}

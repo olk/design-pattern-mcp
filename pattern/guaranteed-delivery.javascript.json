@@ -1,0 +1,66 @@
+{
+  "pattern": "guaranteed-delivery",
+  "language": "javascript",
+  "support": "library",
+  "idiom_name": "createConfirmChannel + persistent publish + waitForConfirms + explicit ack",
+  "implementation_notes": "The broker is the store; in Node the pattern is a short configuration protocol in amqplib: createConfirmChannel(), a durable (ideally quorum) queue, publish with { persistent: true, messageId } and await waitForConfirms() - RabbitMQ only confirms a persistent message once it has been persisted to a durable queue. On the consuming side use the consumer callback and call channel.ack(msg) after the business commit, channel.nack(msg, false, true) to requeue on a retryable failure; the messageId makes the inevitable duplicate suppressible downstream.",
+  "code_sketch": "const ch = await conn.createConfirmChannel();\nawait ch.assertQueue(\"orders\", { durable: true, arguments: { \"x-queue-type\": \"quorum\" } });\nch.publish(exchange, \"orders.created\", Buffer.from(payload),\n           { persistent: true, messageId: order.id });\nawait ch.waitForConfirms();            // resolves only after the broker persisted it\nawait ch.consume(\"orders\", async (msg) => {\n  await save(msg);                     // business commit\n  ch.ack(msg);                         // then the delivery ack\n}, { noAck: false });",
+  "pitfalls": [
+    "persistent: true on a non-durable queue, a transient exchange or a classic non-mirrored queue still loses messages at a broker restart.",
+    "waitForConfirms() rejects on a nack or a channel close - swallowing that rejection (or never awaiting it) turns the guarantee off while the code still looks right.",
+    "Acking before the business commit, or crashing between commit and ack, produces loss or duplicates respectively; both are the at-least-once contract, so the handler must be idempotent on messageId.",
+    "Unconfirmed publishes pile up in the client when the broker stalls; without awaiting confirms or backpressure the process runs out of memory instead of applying backpressure."
+  ],
+  "sources": [
+    "https://amqp-node.github.io/amqplib/channel_api.html",
+    "https://www.rabbitmq.com/docs/publishers"
+  ],
+  "variants": [
+    {
+      "variant_id": "amqp-confirm-channel",
+      "name": "RabbitMQ confirm channel with durable quorum queue",
+      "paradigm": "concurrent",
+      "min_standard": "ES2017",
+      "requires_features": [
+        "amqplib"
+      ],
+      "idiom_name": "createConfirmChannel + persistent publish + waitForConfirms + explicit ack",
+      "implementation_notes": "The broker is the store; in Node the pattern is a short configuration protocol in amqplib: createConfirmChannel(), a durable (ideally quorum) queue, publish with { persistent: true, messageId } and await waitForConfirms() - RabbitMQ only confirms a persistent message once it has been persisted to a durable queue. On the consuming side use the consumer callback and call channel.ack(msg) after the business commit, channel.nack(msg, false, true) to requeue on a retryable failure; the messageId makes the inevitable duplicate suppressible downstream.",
+      "code_sketch": "const ch = await conn.createConfirmChannel();\nawait ch.assertQueue(\"orders\", { durable: true, arguments: { \"x-queue-type\": \"quorum\" } });\nch.publish(exchange, \"orders.created\", Buffer.from(payload),\n           { persistent: true, messageId: order.id });\nawait ch.waitForConfirms();            // resolves only after the broker persisted it\nawait ch.consume(\"orders\", async (msg) => {\n  await save(msg);                     // business commit\n  ch.ack(msg);                         // then the delivery ack\n}, { noAck: false });",
+      "pitfalls": [
+        "persistent: true on a non-durable queue, a transient exchange or a classic non-mirrored queue still loses messages at a broker restart.",
+        "waitForConfirms() rejects on a nack or a channel close - swallowing that rejection (or never awaiting it) turns the guarantee off while the code still looks right.",
+        "Acking before the business commit, or crashing between commit and ack, produces loss or duplicates respectively; both are the at-least-once contract, so the handler must be idempotent on messageId.",
+        "Unconfirmed publishes pile up in the client when the broker stalls; without awaiting confirms or backpressure the process runs out of memory instead of applying backpressure."
+      ],
+      "sources": [
+        "https://amqp-node.github.io/amqplib/channel_api.html",
+        "https://www.rabbitmq.com/docs/publishers"
+      ]
+    },
+    {
+      "variant_id": "kafkajs-transaction",
+      "name": "KafkaJS transactional producer",
+      "paradigm": "concurrent",
+      "min_standard": "ES2020",
+      "requires_features": [
+        "kafkajs"
+      ],
+      "idiom_name": "kafka.producer({ transactionalId, idempotent: true }) + transaction()",
+      "implementation_notes": "Kafka's log is the store; KafkaJS exposes the broker transaction protocol as producer.transaction() with send/sendBatch, commit and abort, and transaction.sendOffsets() makes the consumer offset part of the same atomic unit. The required configuration is explicit: a stable transactionalId, idempotent: true and maxInFlightRequests: 1, which is exactly what guarantees exactly-once on the producer side after a retry. Choose it over an AMQP confirm channel when the sink is Kafka and atomicity across topics or between output and offsets matters.",
+      "code_sketch": "const producer = kafka.producer({\n  transactionalId: \"orders-tx-1\", idempotent: true, maxInFlightRequests: 1,\n});\nawait producer.connect();\nconst tx = await producer.transaction();\ntry {\n  await tx.send({ topic: \"orders.out\", messages: [{ key: order.id, value: payload }] });\n  await tx.commit();                   // nothing is visible before this\n} catch (e) { await tx.abort(); }",
+      "pitfalls": [
+        "Forgetting maxInFlightRequests: 1 or idempotent: true while declaring a transactionalId produces a producer that silently is not exactly-once.",
+        "An instance that dies mid-transaction blocks the transactionalId until the broker's transaction timeout expires; every commit/abort path must be wired or the producer stays stuck.",
+        "Consumers must use read_committed isolation, otherwise aborted records are still delivered.",
+        "The transactionalId must be stable per partition-owning instance: a random id per restart loses zombie fencing."
+      ],
+      "sources": [
+        "https://kafka.js.org/docs/transactions",
+        "https://kafka.js.org/docs/producing"
+      ]
+    }
+  ],
+  "default_variant": "amqp-confirm-channel",
+  "version": "1.0"
+}

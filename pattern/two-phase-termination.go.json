@@ -1,0 +1,67 @@
+{
+  "pattern": "two-phase-termination",
+  "language": "go",
+  "support": "idiomatic",
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "context-waitgroup",
+      "name": "context cancellation + WaitGroup completion",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.7",
+      "requires_features": [
+        "context",
+        "sync.WaitGroup or a done channel"
+      ],
+      "idiom_name": "ctx.Done() safe points + WaitGroup.Wait() / done channel",
+      "implementation_notes": "Go has no worker class, so the two phases become two idioms: a context.Context is the latch - Done() closes once for every goroutine that listens (one broadcast, no shared bool), and the worker selects on it at safe points - while sync.WaitGroup.Wait() or a closed done channel is the completion step. Cleanup runs after the select returns, inside the same goroutine, and signal.NotifyContext wires SIGTERM/SIGINT straight into the context. The classic flag form is still justified when the stop must be a plain, allocation-free atomic for very hot loops.",
+      "code_sketch": "type Worker struct {\n    jobs <-chan Job\n    done chan struct{}\n}\n\nfunc (w *Worker) Run(ctx context.Context) {\n    defer close(w.done)              // phase 2 completion signal\n    for {\n        select {\n        case <-ctx.Done():           // phase 1 observed safely\n            w.drainAndRelease()      // flush + release resources\n            return\n        case job := <-w.jobs:\n            w.handle(ctx, job)\n        }\n    }\n}",
+      "pitfalls": [
+        "ctx.Done() is one shared broadcast, not a per-worker acknowledgement: pair it with a per-worker done channel or WaitGroup so the controller can tell when each participant finished cleaning up.",
+        "Returning from main right after cancel() kills goroutines mid-cleanup; wait for the done signals (or the WaitGroup) before exiting.",
+        "A goroutine blocked in a non-context call (time.Sleep, a bare channel send, a driver that ignores context) never sees cancellation - pass the context into every call and use select-based waits.",
+        "context.WithTimeout values must be chosen against the orchestrator's kill window: a drain shorter than reality drops work, a longer one ends in SIGKILL anyway."
+      ],
+      "sources": [
+        "https://pkg.go.dev/context#Context",
+        "https://victoriametrics.com/blog/go-graceful-shutdown/"
+      ]
+    },
+    {
+      "variant_id": "server-drain-shutdown",
+      "name": "stdlib component drain (http.Server.Shutdown / gRPC GracefulStop)",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.8",
+      "requires_features": [
+        "net/http Server.Shutdown",
+        "signal.NotifyContext (Go 1.16) for signal wiring"
+      ],
+      "idiom_name": "http.Server.Shutdown(ctx) / grpc.Server.GracefulStop()",
+      "implementation_notes": "For the standard server components the library ships the pattern: Shutdown stops accepting new connections and closes idle ones (phase 1), then blocks until in-flight handlers return or the context deadline expires (phase 2). The sharp edges are part of the API: use a fresh timeout context (a context derived from the already-cancelled signal context makes Shutdown return immediately), treat http.ErrServerClosed as success, and wait for your own goroutines separately because Shutdown does not track them. This is the variant to bind for service entry points; the context+WaitGroup variant covers the workers inside them.",
+      "code_sketch": "srv := &http.Server{Addr: \":8080\", Handler: mux}\ngo func() { _ = srv.ListenAndServe() }()\n\n<-ctx.Done()                                    // SIGTERM/SIGINT\nshutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)\ndefer cancel()\nif err := srv.Shutdown(shutCtx); err != nil {\n    _ = srv.Close()                             // forced fallback\n}\ns.wg.Wait()                                     // goroutines Shutdown ignores",
+      "pitfalls": [
+        "Deriving the shutdown context from the cancelled signal context expires it instantly, so Shutdown returns without draining anything - always create a fresh WithTimeout.",
+        "Shutdown ignores hijacked connections (WebSockets, long polls) and goroutines you spawned yourself; register them (RegisterOnShutdown, WaitGroup) or they die when main returns.",
+        "ListenAndServe returns http.ErrServerClosed after a clean Shutdown - logging it as fatal hides an orderly stop, and swallowing a real bind error hides a failure."
+      ],
+      "sources": [
+        "https://pkg.go.dev/net/http#Server.Shutdown",
+        "https://pkg.go.dev/os/signal#NotifyContext"
+      ]
+    }
+  ],
+  "default_variant": "context-waitgroup",
+  "idiom_name": "ctx.Done() safe points + WaitGroup.Wait() / done channel",
+  "implementation_notes": "Go has no worker class, so the two phases become two idioms: a context.Context is the latch - Done() closes once for every goroutine that listens (one broadcast, no shared bool), and the worker selects on it at safe points - while sync.WaitGroup.Wait() or a closed done channel is the completion step. Cleanup runs after the select returns, inside the same goroutine, and signal.NotifyContext wires SIGTERM/SIGINT straight into the context. The classic flag form is still justified when the stop must be a plain, allocation-free atomic for very hot loops.",
+  "code_sketch": "type Worker struct {\n    jobs <-chan Job\n    done chan struct{}\n}\n\nfunc (w *Worker) Run(ctx context.Context) {\n    defer close(w.done)              // phase 2 completion signal\n    for {\n        select {\n        case <-ctx.Done():           // phase 1 observed safely\n            w.drainAndRelease()      // flush + release resources\n            return\n        case job := <-w.jobs:\n            w.handle(ctx, job)\n        }\n    }\n}",
+  "pitfalls": [
+    "ctx.Done() is one shared broadcast, not a per-worker acknowledgement: pair it with a per-worker done channel or WaitGroup so the controller can tell when each participant finished cleaning up.",
+    "Returning from main right after cancel() kills goroutines mid-cleanup; wait for the done signals (or the WaitGroup) before exiting.",
+    "A goroutine blocked in a non-context call (time.Sleep, a bare channel send, a driver that ignores context) never sees cancellation - pass the context into every call and use select-based waits.",
+    "context.WithTimeout values must be chosen against the orchestrator's kill window: a drain shorter than reality drops work, a longer one ends in SIGKILL anyway."
+  ],
+  "sources": [
+    "https://pkg.go.dev/context#Context",
+    "https://victoriametrics.com/blog/go-graceful-shutdown/"
+  ]
+}

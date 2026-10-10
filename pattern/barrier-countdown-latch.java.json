@@ -1,0 +1,77 @@
+{
+  "pattern": "barrier-countdown-latch",
+  "language": "java",
+  "support": "library",
+  "idiom_name": "CyclicBarrier(N, action).await() + CountDownLatch.await()/countDown()",
+  "implementation_notes": "java.util.concurrent ships both halves and the CyclicBarrier javadoc's own matrix-decomposition example is the canonical usage: CyclicBarrier(N) trips when all N parties call await(), the optional Runnable runs once per generation inside the last arriving thread (the aggregation hook), await() returns the arrival index so a chosen thread can do phase-local work, and the barrier re-arms itself for the next phase. CountDownLatch is the one-shot gate - countDown() from N producers, await() or await(timeout) in the collector - and it cannot be reset, so a second round needs a new instance. Interruption, timeout or reset breaks the whole barrier all-or-none, surfacing BrokenBarrierException to every waiter.",
+  "code_sketch": "var phase = new CyclicBarrier(n, this::mergePartials);   // action runs once per generation\nfor (int row = 0; row < n; row++) {\n    int r = row;                                     // capture the row for the task\n    pool.execute(() -> {\n        for (int step = 0; step < steps; step++) {\n            compute(r, step);\n            phase.await();        // arrival index: 0 == last arriver\n        }\n    });\n}\nvar done = new CountDownLatch(n);                   // one-shot: no reset()\n// producers: done.countDown();  collector:\nif (!done.await(30, TimeUnit.SECONDS)) abortGroup();",
+  "pitfalls": [
+    "The all-or-none breakage model: if one thread is interrupted, times out or the barrier action throws, every waiting thread gets BrokenBarrierException and the barrier stays broken until reset() - catch it and abort deliberately instead of retrying inside the worker loop.",
+    "CountDownLatch is one-shot: awaiting it twice without re-arming always returns immediately after the first release, and countDown() called more often than N is harmless but signals nothing extra - the counts are not symmetric.",
+    "A latch awaited on the same bounded pool that runs the producers deadlocks under saturation; use a separate collector thread or a timeout that detects the stall.",
+    "A CyclicBarrier action runs in the last arriver's thread and its exception is propagated there while breaking the barrier; expensive or blocking work in the action serializes the phase."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CyclicBarrier.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CountDownLatch.html"
+  ],
+  "version": "1.1",
+  "variants": [
+    {
+      "variant_id": "cyclicbarrier-countdownlatch",
+      "name": "CyclicBarrier and CountDownLatch (java.util.concurrent)",
+      "paradigm": "concurrent",
+      "min_standard": "Java5",
+      "idiom_name": "CyclicBarrier(N, action).await() + CountDownLatch.await()/countDown()",
+      "implementation_notes": "java.util.concurrent ships both halves and the CyclicBarrier javadoc's own matrix-decomposition example is the canonical usage: CyclicBarrier(N) trips when all N parties call await(), the optional Runnable runs once per generation inside the last arriving thread (the aggregation hook), await() returns the arrival index so a chosen thread can do phase-local work, and the barrier re-arms itself for the next phase. CountDownLatch is the one-shot gate - countDown() from N producers, await() or await(timeout) in the collector - and it cannot be reset, so a second round needs a new instance. Interruption, timeout or reset breaks the whole barrier all-or-none, surfacing BrokenBarrierException to every waiter.",
+      "code_sketch": "var phase = new CyclicBarrier(n, this::mergePartials);   // action runs once per generation\nfor (int row = 0; row < n; row++) {\n    int r = row;                                     // capture the row for the task\n    pool.execute(() -> {\n        for (int step = 0; step < steps; step++) {\n            compute(r, step);\n            phase.await();        // arrival index: 0 == last arriver\n        }\n    });\n}\nvar done = new CountDownLatch(n);                   // one-shot: no reset()\n// producers: done.countDown();  collector:\nif (!done.await(30, TimeUnit.SECONDS)) abortGroup();",
+      "pitfalls": [
+        "The all-or-none breakage model: if one thread is interrupted, times out or the barrier action throws, every waiting thread gets BrokenBarrierException and the barrier stays broken until reset() - catch it and abort deliberately instead of retrying inside the worker loop.",
+        "CountDownLatch is one-shot: awaiting it twice without re-arming always returns immediately after the first release, and countDown() called more often than N is harmless but signals nothing extra - the counts are not symmetric.",
+        "A latch awaited on the same bounded pool that runs the producers deadlocks under saturation; use a separate collector thread or a timeout that detects the stall.",
+        "A CyclicBarrier action runs in the last arriver's thread and its exception is propagated there while breaking the barrier; expensive or blocking work in the action serializes the phase."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CyclicBarrier.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CountDownLatch.html"
+      ]
+    },
+    {
+      "variant_id": "phaser-dynamic-parties",
+      "name": "Phaser (dynamic parties, tiered phases)",
+      "paradigm": "concurrent",
+      "min_standard": "Java7",
+      "idiom_name": "Phaser.arriveAndAwaitAdvance() with register/deregister",
+      "implementation_notes": "When the party is not fixed, Phaser replaces CyclicBarrier: parties register() (the constructor can pre-register them), arriveAndAwaitAdvance() blocks the current phase, arriveAndDeregister() retires a participant without stranding the others, and overriding onAdvance(phase, registered) decides when the phaser terminates. Phasers also tier, so many parties can be grouped behind a few parents instead of contending on one barriered counter. Choose it when workers join or leave between phases; keep CyclicBarrier when the party size is genuinely fixed, because its barrier action and arrival-index API is simpler.",
+      "code_sketch": "var phaser = new Phaser(1);               // 1 = the coordinating thread\nfor (int i = 0; i < n; i++) {\n    phaser.register();                  // dynamic membership\n    pool.submit(() -> {\n        for (int step = 0; step < steps; step++) {\n            compute(i, step);\n            phaser.arriveAndAwaitAdvance();\n        }\n        phaser.arriveAndDeregister();   // nobody waits for a retired party\n    });\n}\nphaser.arriveAndDeregister();           // coordinator joins the last phase",
+      "pitfalls": [
+        "A Phaser is not a latch: awaitAdvance(phase) observes one phase, and there is no built-in timeout on the plain arrive/wait calls - use arriveAndAwaitAdvance interleaved with awaitAdvanceInterruptibly when a bounded wait is required.",
+        "Deregistering the last party of a phase advances it for everyone; retiring a worker too early (before its final phase) silently shortens the next phase, and doing it twice throws IllegalStateException.",
+        "Once the phaser terminates, arriveAndAwaitAdvance throws IllegalStateException in every remaining party, so the onAdvance termination condition and the workers' exit condition must be the same predicate."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Phaser.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CyclicBarrier.html"
+      ]
+    },
+    {
+      "variant_id": "completablefuture-allof",
+      "name": "CompletableFuture.allOf (non-blocking latch)",
+      "paradigm": "concurrent",
+      "min_standard": "Java8",
+      "idiom_name": "CompletableFuture.allOf(...).thenRun(...) instead of a blocking latch",
+      "implementation_notes": "When the completions are already futures, the latch becomes composition instead of blocking: allOf(futures) yields a future that completes only when every input completed (exceptionally if any did), thenRun/thenApply chains the continuation without parking a thread, and the fan-in can be bounded with orTimeout or completeOnTimeout. On Java 21+ the same shape composes with virtual threads, so a blocking-style body per task is cheap while the collector still never blocks a platform thread. Keep the classic primitives when threads must rendezvous for a phase; use this form when the pattern is purely 'proceed after N completions'.",
+      "code_sketch": "var futures = shards.stream()\n    .map(s -> CompletableFuture.supplyAsync(() -> process(s), pool))\n    .toArray(CompletableFuture[]::new);\nCompletableFuture<Void> all = CompletableFuture.allOf(futures);\nall.thenRun(this::mergePartials)\n   .orTimeout(30, TimeUnit.SECONDS)      // bound the fan-in\n   .join();                              // only where a result is unavoidable",
+      "pitfalls": [
+        "allOf completes only after every input future completes; if any input failed the result is exceptional, but the other futures keep running: cancel them or bound the pool, otherwise a failed fan-in leaks work.",
+        "join() on the calling thread is still a blocking wait - calling it on a pool thread that the futures themselves need deadlocks; prefer continuations (thenRun/thenApply) and keep join for the boundary.",
+        "orTimeout/completeOnTimeout mutate the future and exist from Java 9; on Java 8 the timeout must be enforced by the caller, and a timed-out allOf leaves its inputs running."
+      ],
+      "sources": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html",
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CountDownLatch.html"
+      ]
+    }
+  ],
+  "default_variant": "cyclicbarrier-countdownlatch"
+}

@@ -1,0 +1,54 @@
+{
+  "pattern": "write-behind",
+  "language": "csharp",
+  "support": "library",
+  "idiom_name": "DbContext ChangeTracker + SaveChangesAsync",
+  "implementation_notes": "EF Core's DbContext is the write-behind unit of work: every queried or attached entity is tracked, property-level changes are recorded in memory, and SQL is generated only when SaveChangesAsync is called, which wraps the whole change set in a single transaction and emits one UPDATE per changed row even if the property was modified repeatedly. Keep the context request-scoped (the docs call it a short-lived unit of work) and call SaveChanges at the boundary you choose.",
+  "code_sketch": "await using var db = new AppDb(contextOptions);\nvar user = await db.Users.SingleAsync(u => u.Id == id);\nuser.Email = email;          // tracked, no SQL yet\nuser.LastSeen = DateTime.UtcNow;   // coalesced into the same UPDATE\nawait db.SaveChangesAsync(); // one transaction at the boundary",
+  "pitfalls": [
+    "A long-lived DbContext grows the change set without bound and serves stale tracked entities - treat it as a unit of work and dispose it.",
+    "Untracked queries (AsNoTracking) return entities whose changes SaveChanges will not see; mixing the two silently drops writes.",
+    "SaveChanges is transactional per call, not per request: multi-step work outside one call can commit partially."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/ef/core/change-tracking/"
+  ],
+  "variants": [
+    {
+      "variant_id": "ef-core-change-tracker",
+      "name": "EF Core change-tracked DbContext (SaveChanges at the boundary)",
+      "paradigm": "oo",
+      "min_standard": "C#8",
+      "idiom_name": "DbContext ChangeTracker + SaveChangesAsync",
+      "implementation_notes": "EF Core's DbContext is the write-behind unit of work: every queried or attached entity is tracked, property-level changes are recorded in memory, and SQL is generated only when SaveChangesAsync is called, which wraps the whole change set in a single transaction and emits one UPDATE per changed row even if the property was modified repeatedly. Keep the context request-scoped (the docs call it a short-lived unit of work) and call SaveChanges at the boundary you choose.",
+      "code_sketch": "await using var db = new AppDb(contextOptions);\nvar user = await db.Users.SingleAsync(u => u.Id == id);\nuser.Email = email;          // tracked, no SQL yet\nuser.LastSeen = DateTime.UtcNow;   // coalesced into the same UPDATE\nawait db.SaveChangesAsync(); // one transaction at the boundary",
+      "pitfalls": [
+        "A long-lived DbContext grows the change set without bound and serves stale tracked entities - treat it as a unit of work and dispose it.",
+        "Untracked queries (AsNoTracking) return entities whose changes SaveChanges will not see; mixing the two silently drops writes.",
+        "SaveChanges is transactional per call, not per request: multi-step work outside one call can commit partially."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/ef/core/change-tracking/"
+      ]
+    },
+    {
+      "variant_id": "channel-hosted-flush",
+      "name": "Bounded Channel + BackgroundService flusher",
+      "paradigm": "concurrent",
+      "min_standard": "C#8",
+      "idiom_name": "System.Threading.Channels bounded queue + IHostedService flush loop",
+      "implementation_notes": "When the store has no change-tracked context (Dapper, raw ADO.NET, or batches that must span requests), build the queue instead: a bounded System.Threading.Channels.Channel<Change> fed by handlers and drained by a BackgroundService, which groups the drained batch by table and writes it in one transaction per group. The channel replaces the hand-rolled buffer and provides the back-pressure decision through BoundedChannelFullMode.",
+      "code_sketch": "var channel = Channel.CreateBounded<Change>(new BoundedChannelOptions(10_000) {\n    FullMode = BoundedChannelFullMode.Wait });\n// producer\nawait channel.Writer.WriteAsync(change, ct);\n// BackgroundService.ExecuteAsync\nawait foreach (var first in channel.Reader.ReadAllAsync(stoppingToken)) {\n    var batch = await DrainAsync(channel.Reader, first, 512, stoppingToken);\n    foreach (var group in batch.GroupBy(c => c.Table))\n        await FlushAsync(group, stoppingToken);   // one transaction per group\n}",
+      "pitfalls": [
+        "Choosing DropWrite/DropOldest as the overflow mode is silent data loss - decide block/reject/spill explicitly and surface the policy.",
+        "StopAsync must drain the channel before exiting, or queued changes are abandoned at shutdown.",
+        "Grouping by table is not enough for referential order: inserts must precede foreign-key dependents in the same batch."
+      ],
+      "sources": [
+        "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels"
+      ]
+    }
+  ],
+  "default_variant": "ef-core-change-tracker",
+  "version": "1.0"
+}

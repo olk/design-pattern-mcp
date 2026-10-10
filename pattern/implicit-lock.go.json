@@ -1,0 +1,60 @@
+{
+  "pattern": "implicit-lock",
+  "language": "go",
+  "support": "idiomatic",
+  "idiom_name": "sync.Mutex / sync.RWMutex with deferred Unlock",
+  "implementation_notes": "Go has no destructors and no block-scoped locks, but defer is the language's scope-exit hook: writing Unlock immediately after Lock means no early return, error path or panic can leak the lock, and Effective Go names unlocking a mutex as the canonical example of defer. Because the scope is the function rather than a block, the discipline is to extract the critical section into its own small method; sync.RWMutex provides the reader/writer split behind the same shape. An explicit Lock/Unlock pair without defer is justified only when the lock must be released before the function returns.",
+  "code_sketch": "type Ledger struct {\n\tmu sync.Mutex\n\tm  map[string]int64\n}\n\nfunc (l *Ledger) Transfer(from, to string, cents int64) {\n\tl.mu.Lock()\n\tdefer l.mu.Unlock()          // released on every return path\n\tl.m[from] -= cents\n\tl.m[to] += cents\n}",
+  "pitfalls": [
+    "The deferred Unlock holds the lock until the whole function returns, so loops, I/O or channel operations inside the guarded function become contention; keep the guarded function tiny.",
+    "Copying a struct that contains a sync.Mutex (or passing it by value) duplicates the lock; mutexes must not be copied after first use, which vet reports for common cases.",
+    "RWMutex readers do not block each other but a writer starves under sustained read traffic; also Lock/Unlock must happen on the same goroutine, while RLock/RUnlock may be split."
+  ],
+  "sources": [
+    "https://go.dev/doc/effective_go",
+    "https://pkg.go.dev/sync"
+  ],
+  "version": "1.0",
+  "variants": [
+    {
+      "variant_id": "defer-unlock",
+      "name": "defer Unlock inside the acquiring function",
+      "paradigm": "procedural",
+      "min_standard": "Go1.0",
+      "idiom_name": "sync.Mutex / sync.RWMutex with deferred Unlock",
+      "implementation_notes": "Go has no destructors and no block-scoped locks, but defer is the language's scope-exit hook: writing Unlock immediately after Lock means no early return, error path or panic can leak the lock, and Effective Go names unlocking a mutex as the canonical example of defer. Because the scope is the function rather than a block, the discipline is to extract the critical section into its own small method; sync.RWMutex provides the reader/writer split behind the same shape. An explicit Lock/Unlock pair without defer is justified only when the lock must be released before the function returns.",
+      "code_sketch": "type Ledger struct {\n\tmu sync.Mutex\n\tm  map[string]int64\n}\n\nfunc (l *Ledger) Transfer(from, to string, cents int64) {\n\tl.mu.Lock()\n\tdefer l.mu.Unlock()          // released on every return path\n\tl.m[from] -= cents\n\tl.m[to] += cents\n}",
+      "pitfalls": [
+        "The deferred Unlock holds the lock until the whole function returns, so loops, I/O or channel operations inside the guarded function become contention; keep the guarded function tiny.",
+        "Copying a struct that contains a sync.Mutex (or passing it by value) duplicates the lock; mutexes must not be copied after first use, which vet reports for common cases.",
+        "RWMutex readers do not block each other but a writer starves under sustained read traffic; also Lock/Unlock must happen on the same goroutine, while RLock/RUnlock may be split."
+      ],
+      "sources": [
+        "https://go.dev/doc/effective_go",
+        "https://pkg.go.dev/sync"
+      ]
+    },
+    {
+      "variant_id": "context-scoped-transactions",
+      "name": "database transaction with context, released by deferred Rollback",
+      "paradigm": "concurrent",
+      "min_standard": "Go1.7",
+      "requires_features": [
+        "context"
+      ],
+      "idiom_name": "db.BeginTx(ctx, opts) + defer tx.Rollback() + tx.Commit()",
+      "implementation_notes": "For data in a database the unit the database locks for is the transaction, and Go makes its lifetime structural the same way: BeginTx starts it, a deferred Rollback is a no-op after Commit and the guaranteed release path if any step fails, and the context carries the request's cancellation and deadline so an abandoned request aborts the transaction and its locks without any lock bookkeeping in the business code. Explicit row locking (SELECT ... FOR UPDATE) remains justified when a specific row must be locked earlier than the first write, for example before an expensive decision.",
+      "code_sketch": "func (s *Store) Move(ctx context.Context, from, to int64, cents int64) error {\n\ttx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer tx.Rollback() // runs on every error path; no-op after Commit\n\tif _, err := tx.ExecContext(ctx, `UPDATE accounts SET balance = balance - $1 WHERE id = $2`, cents, from); err != nil {\n\t\treturn err\n\t}\n\t_, err = tx.ExecContext(ctx, `UPDATE accounts SET balance = balance + $1 WHERE id = $2`, cents, to)\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn tx.Commit()\n}",
+      "pitfalls": [
+        "The deferred Rollback holds database locks until Commit or Rollback returns: never perform network calls between BeginTx and Commit, and keep the transaction inside the request's context lifetime.",
+        "The deferred Rollback may return sql.ErrTxDone after a successful Commit; ignore its error or compare explicitly, and never defer Rollback from a helper that has already committed.",
+        "Isolation level and lock waits are database policy: a serializable transaction that blocks indefinitely is as bad as a forgotten unlock, so set statement/lock timeouts alongside the context deadline."
+      ],
+      "sources": [
+        "https://pkg.go.dev/database/sql",
+        "https://go.dev/doc/effective_go"
+      ]
+    }
+  ],
+  "default_variant": "defer-unlock"
+}

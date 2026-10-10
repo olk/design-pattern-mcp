@@ -1,0 +1,58 @@
+{
+  "pattern": "transactional-message-queue",
+  "language": "rust",
+  "support": "library",
+  "idiom_name": "sqlx Pool::begin() Transaction + outbox row + relay",
+  "implementation_notes": "The async database path is library-provided and safe by construction: sqlx::Pool::begin() (or Connection::begin) returns a Transaction that commits with .commit() and rolls back on drop, so the unit of work is a scoped value; the outbox row is inserted in the same transaction and a relay (a sqlx polling task or a LISTEN/NOTIFY-driven task) publishes committed rows and marks them sent. This is the mainstream Rust answer when the business state lives in a database, because the language and its clients offer no coordinator that can span a database and a broker.",
+  "code_sketch": "let mut tx = pool.begin().await?;\nsqlx::query(\"INSERT INTO orders(id,total) VALUES($1,$2)\")\n    .bind(id).bind(total).execute(&mut *tx).await?;\nsqlx::query(\"INSERT INTO outbox(topic,payload) VALUES($1,$2)\")\n    .bind(\"orders\").bind(&ev).execute(&mut *tx).await?;\ntx.commit().await?;      // dropped without commit => rollback",
+  "pitfalls": [
+    "A Transaction rolls back when dropped, so an early `?` return silently discards the unit of work; make the commit explicit and check its result.",
+    "Transaction borrows the connection and is not freely shareable across tasks: keep the unit of work on one task and pass data, not the transaction, to spawned tasks.",
+    "Reading the row from a second connection before the commit shows nothing, which is easy to misread as a write failure while the transaction is still open."
+  ],
+  "sources": [
+    "https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html"
+  ],
+  "variants": [
+    {
+      "variant_id": "sqlx-outbox",
+      "name": "sqlx scoped transaction (rollback on drop) + outbox row",
+      "paradigm": "concurrent",
+      "min_standard": "Rust2021",
+      "idiom_name": "sqlx Pool::begin() Transaction + outbox row + relay",
+      "implementation_notes": "The async database path is library-provided and safe by construction: sqlx::Pool::begin() (or Connection::begin) returns a Transaction that commits with .commit() and rolls back on drop, so the unit of work is a scoped value; the outbox row is inserted in the same transaction and a relay (a sqlx polling task or a LISTEN/NOTIFY-driven task) publishes committed rows and marks them sent. This is the mainstream Rust answer when the business state lives in a database, because the language and its clients offer no coordinator that can span a database and a broker.",
+      "code_sketch": "let mut tx = pool.begin().await?;\nsqlx::query(\"INSERT INTO orders(id,total) VALUES($1,$2)\")\n    .bind(id).bind(total).execute(&mut *tx).await?;\nsqlx::query(\"INSERT INTO outbox(topic,payload) VALUES($1,$2)\")\n    .bind(\"orders\").bind(&ev).execute(&mut *tx).await?;\ntx.commit().await?;      // dropped without commit => rollback",
+      "pitfalls": [
+        "A Transaction rolls back when dropped, so an early `?` return silently discards the unit of work; make the commit explicit and check its result.",
+        "Transaction borrows the connection and is not freely shareable across tasks: keep the unit of work on one task and pass data, not the transaction, to spawned tasks.",
+        "Reading the row from a second connection before the commit shows nothing, which is easy to misread as a write failure while the transaction is still open."
+      ],
+      "sources": [
+        "https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html"
+      ],
+      "requires_features": [
+        "async-await"
+      ]
+    },
+    {
+      "variant_id": "rdkafka-transactional",
+      "name": "rdkafka transactional producer",
+      "paradigm": "oo",
+      "min_standard": "Rust2021",
+      "idiom_name": "rdkafka Producer::init_transactions / begin_transaction / send_offsets_to_transaction / commit_transaction",
+      "implementation_notes": "The broker-side realization through rust-rdkafka: after creating the producer you call init_transactions(), then begin_transaction(), send records (and send_offsets_to_transaction for consumed offsets), and finish with commit_transaction() or abort_transaction(); the crate is a safe wrapper over librdkafka and needs a librdkafka of a recent release. Use it for consume-transform-produce pipelines or when the business state lives in the cluster; it does not span a database, so a database-coupled service still writes an outbox row.",
+      "code_sketch": "let producer: FutureProducer =\n    ClientConfig::new().set(\"transactional.id\", \"orders-0\").create()?;\nproducer.init_transactions(Duration::from_secs(10))?;\nproducer.begin_transaction()?;\nproducer.send(record).await?;\nproducer.commit_transaction(Duration::from_secs(10))?;   // or abort_transaction",
+      "pitfalls": [
+        "Only one transaction may be open per producer at a time, and the producer must not be shared across threads while a transaction is in flight.",
+        "The transactional id must be stable and unique per processor so the broker can fence zombies; a random id disables that protection.",
+        "Sends inside a transaction are not visible to consumers that read uncommitted data, so consumer configuration is part of the design."
+      ],
+      "sources": [
+        "https://docs.rs/rdkafka/latest/rdkafka/producer/index.html",
+        "https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ],
+  "default_variant": "sqlx-outbox",
+  "version": "1.0"
+}
