@@ -1,0 +1,19 @@
+{
+  "pattern": "circular-buffer",
+  "language": "c",
+  "support": "manual",
+  "implementation_notes": "In C the ring is a struct with a fixed array (or a malloc'd one, but in firmware it is static), two size_t indices and a mask, and the operations are the acquire/release pairs. The portability story is that C11 gives you atomic_int for the indices and atomic_load_explicit/atomic_store_explicit with memory_order_acquire and memory_order_release, which is exactly the SPSC scheme; on older toolchains the __atomic_* builtins or __sync_synchronize serve. A plain volatile is NOT sufficient - volatile gives visibility but not ordering between the item write and the index publish, which is the bug that makes a naive volatile ring occasionally read garbage. Padding the indices onto separate cache lines uses alignas or explicit padding fields. The kernel's own circular-buffers documentation is the reference implementation for exactly this shape.",
+  "idiom_name": "static array + size_t head/tail masked with (size-1), C11 atomic acquire/release on the indices",
+  "code_sketch": "#include <stdatomic.h>\n#include <stddef.h>\n#include <stdint.h>\n\n#define RB_SIZE 256                       /* power of two: the wrap is a mask */\n#define RB_MASK (RB_SIZE - 1)\n\ntypedef struct {\n    _Alignas(64) atomic_uint head;         /* producer-owned, padded to its own line */\n    _Alignas(64) atomic_uint tail;         /* consumer-owned, on a different line  */\n    uint32_t buf[RB_SIZE];                 /* the fixed array: no allocation */\n    atomic_uint overrun;                   /* drops detected, so loss is observable */\n} ring_t;\n\nstatic inline void rb_push(ring_t *r, uint32_t v) {\n    uint32_t h = atomic_load_explicit(&r->head, memory_order_relaxed);\n    if (h == atomic_load_explicit(&r->tail, memory_order_acquire)) {\n        /* full: capacity policy - overwrite the oldest, and count the loss */\n        atomic_fetch_add_explicit(&r->overrun, 1, memory_order_relaxed);\n        atomic_store_explicit(&r->tail, (h + 1) & RB_MASK, memory_order_relaxed);\n    }\n    r->buf[h] = v;                         /* item first ... */\n    atomic_store_explicit(&r->head, (h + 1) & RB_MASK, memory_order_release); /* ... then publish */\n}\n\nstatic inline int rb_pop(ring_t *r, uint32_t *out) {\n    uint32_t t = atomic_load_explicit(&r->tail, memory_order_relaxed);\n    if (t == atomic_load_explicit(&r->head, memory_order_acquire)) return 0;  /* empty */\n    *out = r->buf[t];                      /* acquire on head: the item IS written */\n    atomic_store_explicit(&r->tail, (t + 1) & RB_MASK, memory_order_relaxed);\n    return 1;\n}\n/* NOTE: `volatile` is NOT a substitute: it gives visibility, not the ordering\n   between the item write and the head publish that the ring's correctness needs. */",
+  "pitfalls": [
+    "Using volatile for the indices: it gives visibility but not the acquire/release ordering between the item and the index - the classic bug that passes every test.",
+    "head == tail is ambiguous; this version wastes one slot (full) and uses a relaxed tail load to disambiguate.",
+    "The indices must be on separate cache lines (_Alignas(64)) or the ping-pong makes it slower than a mutex.",
+    "In firmware the array is static (no malloc); in hosted C a malloc'd array must be allocated once and never resized, which defeats the point if you grow it."
+  ],
+  "sources": [
+    "https://docs.kernel.org/core-api/circular-buffers.html",
+    "https://en.cppreference.com/w/c/atomic/memory_order"
+  ],
+  "version": "1.0"
+}

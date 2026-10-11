@@ -1,6 +1,6 @@
 ---
 name: design-pattern-mcp
-description: Selects design patterns for a described system via the design-pattern-mcp MCP server. Covers 438 patterns across 9 categories (creational, structural, behavioural, architectural, integration, deployment, reliability, security, observability). Per-decision-part retrieval instead of domain-slug matching. Triggers on: select design patterns for X, which patterns handle concurrency/event-driven/retry/deadlock, improve testability of my code, which patterns are best for Python microservices.
+description: Selects design patterns for a described system via the design-pattern-mcp MCP server. Covers 486 patterns across 9 categories (domain-modeling, construction-composition, behavior-selection, interaction-boundary, workflow-messaging, persistence-state, concurrency-resilience, security-verification, specialized-components). Per-decision-part retrieval instead of domain-slug matching. Triggers on: select design patterns for X, which patterns handle concurrency/event-driven/retry/deadlock, improve testability of my code, which patterns are best for Python microservices.
 ---
 
 # design-pattern-mcp

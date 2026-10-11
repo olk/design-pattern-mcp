@@ -1,0 +1,20 @@
+{
+  "pattern": "channels",
+  "language": "cplusplus",
+  "support": "manual",
+  "implementation_notes": "C++20's std::atomic::wait and notify_one/notify_all give the primitives a channel needs - an atomic flag plus a condition-variable-like wait - and libstdc++'s std::counting_semaphore plus std::latch are related. The portable construction is a bounded blocking queue over std::mutex and std::condition_variable with the same two-predicates design as the C version. A hand-rolled channel (a struct with a mutex, a deque, a closed flag, and a wait-for-item method) is idiomatic C++ because the language gives you exactly the pieces. For an SPSC channel with no blocking, a ring with two std::atomic<size_t> indices (acquire/release) is the zero-allocation form. Note the lost-wakeup hazard with atomic::wait: if the value changes between the load and the wait, the waiter sleeps - so the state must be an explicit sequence or generation counter, not a bare flag, or a notification is missed.",
+  "idiom_name": "bounded queue over std::mutex + std::condition_variable (two predicates), or an SPSC ring with two atomic<size_t> indices",
+  "code_sketch": "#include <mutex>\n#include <condition_variable>\n#include <deque>\n#include <optional>\n\ntemplate <class T>\nclass chan {                         // the portable Go-style channel\n    std::mutex m_; std::condition_variable not_empty_, not_full_;\n    std::deque<T> q_; size_t cap_; bool closed_ = false;\npublic:\n    explicit chan(size_t cap) : cap_(cap) {}\n\n    void send(T v) {\n        std::unique_lock lk(m_);\n        not_full_.wait(lk, [&]{ return q_.size() < cap_ || closed_; });  // predicate, not a bare wait\n        if (closed_) return;                       // send-after-close: no-op\n        q_.push_back(std::move(v));\n        lk.unlock(); not_empty_.notify_one();\n    }\n    std::optional<T> recv() {          // nullopt = closed and drained\n        std::unique_lock lk(m_);\n        not_empty_.wait(lk, [&]{ return !q_.empty() || closed_; });\n        if (q_.empty()) return std::nullopt;\n        T v = std::move(q_.front()); q_.pop_front();\n        lk.unlock(); not_full_.notify_one();\n        return v;\n    }\n    void close() {                     // the SENDER closes\n        { std::lock_guard lk(m_); closed_ = true; }\n        not_empty_.notify_all(); not_full_.notify_all();   // wake EVERY waiter\n    }\n};\n// SPSC with no blocking: a ring with two atomic<size_t> indices (acquire/release).\n// With std::atomic::wait (C++20), wait on a GENERATION counter, not a bare flag -\n// otherwise a change between the load and the wait is missed (lost wakeup).",
+  "pitfalls": [
+    "Wait on a predicate (an atomic::wait on a bare flag can miss a change between the load and the wait - a lost wakeup); use a generation counter or a condition_variable with a predicate.",
+    "notify_all on close, not notify_one, or waiting receivers are not woken.",
+    "Sending on a closed channel must be a defined no-op or an error; an unchecked send-after-close is a use-after-free of the contract.",
+    "A hand-rolled channel with an unbounded internal deque is not a bounded channel - the capacity (and the backpressure) is the point.",
+    "std::atomic::wait/notify are C++20; on C++17 use condition_variable (which is also harder to get the predicate right with)."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/condition_variable",
+    "https://en.cppreference.com/w/cpp/atomic/atomic/wait"
+  ],
+  "version": "1.0"
+}

@@ -1,0 +1,20 @@
+{
+  "pattern": "software-transactional-memory",
+  "language": "python",
+  "support": "manual",
+  "idiom_name": "threading.Lock with a transactional helper",
+  "implementation_notes": "Python has no STM, and the GIL is routinely mistaken for one: it serialises bytecode execution, not compound operations, so `if self.balances[a] < n: self.balances[a] -= n` is still a read-modify-write that another thread can interleave. The two honest realisations are (1) a `threading.Lock` around the whole composite operation, which is the correct default because critical sections in Python are short, and (2) a version-stamped snapshot plus retry loop for lock-free reads. What makes (2) feasible here is that Python's reference semantics give you cheap snapshots of *containers you do not mutate in place*: hold the transactional state in a dict, copy it inside the block (`snapshot = dict(self.state)`), mutate the copy, and publish it with a compare-and-swap under `threading.Lock` held only for the swap. That is a per-object-lock commit rather than a whole-operation lock, and it is the closest Python comes to STM's deferred write set. Do not reach for `greenlet`-based STM libraries in production code; the lock-holding cost is trivially small compared with the difficulty of reasoning about re-executed blocks under the GIL.",
+  "code_sketch": "class Txn:\n    \"\"\"Snapshot a dict, mutate the copy, publish atomically. Block must be pure.\"\"\"\n    def __init__(self, state: dict):\n        self._state = state\n        self._snap: dict | None = None\n    def __enter__(self):\n        self._snap = dict(self._state)        # cheap: int/str values, shallow copy\n        return self._snap\n    def __exit__(self, *exc):\n        if exc[0] is not None:               # abort: discard the snapshot\n            return False\n        with self._state_lock:                # commit is the only locked step\n            if self._state != self._committed_snapshot:\n                raise Conflict()              # caller re-runs the whole block\n            self._state.update(self._snap)\n        return False\n\n# usage:\n# for _ in range(retries):\n#     try:\n#         with Txn(balances) as st:\n#             st['a'] -= 10; st['b'] += 10      # no I/O here\n#         break\n#     except Conflict:\n#         continue",
+  "pitfalls": [
+    "Trusting the GIL: it does not make `if x then decrement` atomic, and a comment claiming otherwise is the most common Python concurrency bug.",
+    "Reading a method without rebinding it (`d.append(x)` instead of `d = d + [x]`) mutates the shared dict, so the snapshot and the live state are the same object.",
+    "Copying a dict whose values are mutable lists, giving a shallow snapshot and silently sharing the lists between snapshot and live state.",
+    "Doing I/O inside the with-block, which the retry will repeat.",
+    "Holding self._state_lock for the whole block instead of only for the commit, which collapses the pattern back into an ordinary mutex."
+  ],
+  "sources": [
+    "https://docs.python.org/3/library/threading.html#lock-objects",
+    "https://docs.python.org/3/reference/datamodel.html#object.__enter__"
+  ],
+  "version": "1.0"
+}

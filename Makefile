@@ -11,7 +11,7 @@
 	check-lint check-static-typing check-deadcode check-depcheck check-all check \
 	test-unit test-oracles test-mutations regen-mutmut-baseline test-all \
 	verify-fizz verify-fizz-simulation verify-fizz-garden regen-fizz-traces \
-	verify-ledger verify-cross-consistency verify-all \
+	verify-ledger verify-cross-consistency verify-patterns verify-all \
 	health client client-async \
 	benchmark-selfcheck benchmark-offline benchmark-live benchmark-e2e benchmark-compare \
 	benchmark-sidecars-up benchmark-draft \
@@ -209,6 +209,10 @@ verify-ledger: ## L8: property-ID ledger consistency (verify/fizz/README.md <-> 
 # run). Findings are leads to triage, not failures.
 verify-cross-consistency: ## L8: NL-Doc/docstring consistency over the decision modules (advisory)
 	@$(UV) run python scripts/cross_consistency.py
+
+# ajv-cli is an npm toolchain (not uv-managed): needs `npm install -g ajv-cli`.
+verify-patterns: ## Verify pattern/*.json against docs/pattern-schema.json via ajv-cli
+	bash scripts/verify-patterns.sh
 
 # Nightly aggregator over the formal/audit verify-* targets.
 verify-all: ## Run every verify-* target (nightly entry point)

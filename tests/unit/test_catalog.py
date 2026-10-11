@@ -1,6 +1,6 @@
 """§2.3 — catalog join, integrity gate and canonical order.
 
-Positive path: the real 438-record catalog must load, join 14 entries per record (generic first,
+Positive path: the real 486-record catalog must load, join 14 entries per record (generic first,
 then the concrete languages in enum order) and expose a canonical order derived from the catalog
 document. Negative path: every layout-V8 violation must fail the gate with ``ERR_CATALOG_INVALID``.
 """
@@ -45,7 +45,7 @@ def test_join_order_and_identity(tmp_path: Path) -> None:
 
 def test_real_catalog_loads_and_is_ordered(catalog) -> None:
     """The shipped catalog passes the gate and nearly every record carries a catalog order index."""
-    assert len(catalog.records) == 438
+    assert len(catalog.records) == 486
     assert len(catalog.order) >= 430
     assert catalog.enums.languages == LANGUAGES
     # section 1 row order vs section 8 row order (the §8.1 tie-break chain starts with catalog order)

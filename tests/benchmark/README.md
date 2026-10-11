@@ -58,7 +58,7 @@ silently and the manifest's `reasoning_health` records exactly which tool was un
 **Offline mode is not a quality instrument.** Its Stage-C hits are derived from the scenario's own
 label pool (acceptable primaries first, then acceptable supporting patterns) and the request
 language vetoes are applied when the pool is built, so its hit rate is a fixture property. What it
-does prove is that the whole pipeline executes against the real 438-record catalog, that the
+does prove is that the whole pipeline executes against the real 486-record catalog, that the
 metric code consumes real `AnalysisResult`/`PipelineResult` objects, and that the two-arm compare
 workflow runs on two complete run directories. The runner *asserts* fixture integrity after every
 offline run: every non-flipped scenario must hit and every flipped scenario must miss — a

@@ -154,7 +154,7 @@ class LiveExecutor:
         """Build the live wiring exactly like ``DesignPatternServer._initialize``, then wrap it.
 
         The dense-cache precondition is checked up front: without a warm cache the index build
-        re-embeds 438 documents through the CPU sidecar (~15-20 min), which is never what a
+        re-embeds 486 documents through the CPU sidecar (~15-20 min), which is never what a
         latency comparison wants. ``DESIGN_PATTERN_DENSE_CACHE_MODE=off`` opts into that.
         """
         if config.dense_cache.mode != "off" and not cfg.dense_cache_ready(config.dense_cache.path):

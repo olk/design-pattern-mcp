@@ -1,0 +1,20 @@
+{
+  "pattern": "channels",
+  "language": "c",
+  "support": "manual",
+  "implementation_notes": "C has no channels, and the two honest forms are (1) a bounded blocking queue built on a mutex and two condition variables - one for 'not empty' and one for 'not full' - which gives rendezvous and bounded-buffer semantics with proper signalling and is the correct portable construction, and (2) a lock-free SPSC ring for a producer/consumer with no blocking, where the channels' 'happens-before' is supplied by acquire/release on the head/tail indices. A condition-variable queue is the right default: it handles spurious wakeups (always re-check the predicate in a while loop, not an if), multiple waiters, and clean close (broadcast on close to wake every waiter). Writing a channel over an unbounded list and hoping is the wrong answer - it re-implements this catalog's producer-consumer pattern badly.",
+  "idiom_name": "bounded queue over mutex + two condition variables (not-empty, not-full), or a lock-free SPSC ring",
+  "code_sketch": "#include <pthread.h>\n#include <stdlib.h>\n#include <stdbool.h>\n\ntypedef struct { void *items; size_t cap, head, tail, count; bool closed;\n                 pthread_mutex_t m;\n                 pthread_cond_t  not_empty;   /* waiters: 'something to read' */\n                 pthread_cond_t  not_full;    /* waiters: 'room to write' */\n               } chan_t;   /* the two condvars are what a Go channel actually is */\n\nvoid chan_send(chan_t *c, void *v) {\n    pthread_mutex_lock(&c->m);\n    while (c->count == c->cap && !c->closed)   /* while, not if: spurious wakeups */\n        pthread_cond_wait(&c->not_full, &c->m);\n    if (c->closed) { pthread_mutex_unlock(&c->m); return; }   /* send-after-close */\n    c->items[c->head] = v;\n    c->head = (c->head + 1) % c->cap;\n    c->count++;\n    pthread_cond_signal(&c->not_empty);         /* wake a reader */\n    pthread_mutex_unlock(&c->m);\n}\n\nvoid chan_recv(chan_t *c, void *out) {   /* false when closed and drained */\n    pthread_mutex_lock(&c->m);\n    while (c->count == 0 && !c->closed)\n        pthread_cond_wait(&c->not_empty, &c->m);\n    if (c->count == 0) { pthread_mutex_unlock(&c->m); return false; }\n    *out = c->items[c->tail];\n    c->tail = (c->tail + 1) % c->cap;\n    c->count--;\n    pthread_cond_signal(&c->not_full);\n    pthread_mutex_unlock(&c->m);\n}\n\nvoid chan_close(chan_t *c) {              /* the SENDER closes: broadcast wakes all */\n    pthread_mutex_lock(&c->m); c->closed = true;\n    pthread_cond_broadcast(&c->not_empty);  /* broadcast, not signal: wake every reader */\n    pthread_mutex_broadcast(&c->not_full);\n    pthread_mutex_unlock(&c->m);\n}\n/* select == timed wait or poll; there is no built-in. Use a timed wait or a\n   dedicated 'done' flag. For SPSC with no blocking, use a lock-free ring. */",
+  "pitfalls": [
+    "Use `while`, not `if`, around pthread_cond_wait: spurious wakeups are permitted and an if silently proceeds on a spurious wakeup.",
+    "Closing must broadcast (not signal) on both condvars, or waiting receivers are not woken and the close is not observed.",
+    "There is no select: implement it as a timed wait or poll, or keep a 'done' flag checked under the same mutex.",
+    "For a lock-free SPSC ring, the happens-before comes from acquire/release on the indices, not from the channel semantics - and it must be a ring, not a list.",
+    "Destroying a chan_t with waiters still blocked is undefined behaviour - broadcast and join every thread before destroying the condvars."
+  ],
+  "sources": [
+    "https://man7.org/linux/man-pages/man3/pthread_cond_wait.3p.html",
+    "https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/synch.html"
+  ],
+  "version": "1.0"
+}

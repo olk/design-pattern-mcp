@@ -1,6 +1,6 @@
 """Shared pytest fixtures: real-catalog access, config, synthetic layout-V8 record builders.
 
-The catalog fixture is session-scoped: loading the 438-record catalog (join + integrity gate +
+The catalog fixture is session-scoped: loading the 486-record catalog (join + integrity gate +
 canonical-order parse) takes a few seconds and the data is read-only in tests.
 """
 

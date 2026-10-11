@@ -1,0 +1,207 @@
+{
+  "category": "concurrency-resilience",
+  "name": "cpu-atomic-operation",
+  "aliases": [
+    "atomic instruction",
+    "compare-and-swap",
+    "CAS",
+    "memory ordering",
+    "read-modify-write primitive",
+    "LL/SC"
+  ],
+  "intent": "Express a multi-step mutation of shared state as one indivisible read-modify-write performed by the processor, with an explicit memory-ordering constraint saying how far the compiler and CPU may move the surrounding accesses - so correctness under concurrency rests on a documented guarantee rather than on hope.",
+  "problem": "Shared state must be read, decided on and written back as a unit, and ordinary loads and stores are not indivisible: a read-modify-write compiled as three instructions can be interleaved between them, and even a single instruction can be reordered with respect to other threads' accesses because the compiler and the CPU both reorder. Using a plain variable or a plain field therefore produces lost updates and visibility bugs that appear rarely, on other hardware, under load. The fix requires knowing which guarantees a platform actually provides - atomically, ordered, or neither.",
+  "context": "Applies wherever concurrent code shares mutable state whose value depends on more than one field, or where a flag must be published together with the data it describes: reference-counted lifetimes, lock-free stacks and queues, lazy initialisation flags, statistics counters, interrupt-safe flags, state machines with several fields forming an invariant, and the substrate beneath every lock-free structure and software transactional memory. The decision is which ordering each access needs - relaxed, acquire, release, sequentially consistent - and it is the point at which a program's concurrency correctness is decided, since the same code is a data race under one ordering and correct under another.",
+  "benefits": [
+    "Indivisibility by hardware guarantee: the read, the decision and the write become one operation that no other thread can interleave into, which is stronger than any user-space lock it replaces.",
+    "Non-blocking progress: a thread that loses a CAS retries or falls back, but no thread ever parks, so a preempted or stalled thread cannot stop the others - the property that makes lock-free structures possible.",
+    "Explicit and checkable ordering: naming the memory order documents the required happens-before relationship, and the compiler rejects the mistakes (a release load, a weaker failure order) that produce rare hardware-dependent bugs.",
+    "Composite updates become safe: two fields that must change together can be updated as one operation, removing the torn-state class of bug entirely.",
+    "The substrate for everything else: lock-free queues, hazard pointers, transactional memory, spinlocks, seqlocks and concurrent map implementations are all built on atomic read-modify-write, so choosing the right primitive is a prerequisite rather than an optimisation.",
+    "Cheap where the platform supports it: on x86 a locked read-modify-write is a single instruction, and on weakly-ordered architectures an acquire or release fence is a few extra instructions - usually far cheaper than acquiring a mutex for the same critical section."
+  ],
+  "tradeoffs": [
+    "Ordering that is strong enough is easy and ordering that is right is hard: the default (sequentially consistent) is correct but expensive on weak architectures, and a release/acquire downgrade that is too aggressive produces bugs that pass every test and fail in production.",
+    "Correctness becomes a whole-program property. The happens-before relation holds only when every participating access participates, so one plain field touched inside an atomic section silently removes the guarantee and no compiler will warn.",
+    "Lock-free algorithms are notoriously hard to verify: they rely on helping, descriptors and careful memory orders, and the failure modes (lost updates, double-free, torn pointers) are exactly the ones that reproduce once in a million runs.",
+    "Memory-ordering mistakes are the hardest concurrency bugs to find because they are invisible in review, absent under ThreadSanitizer's happens-before analysis unless the access is genuinely non-atomic, and manifest only on hardware with weaker ordering than the developer's.",
+    "Unbounded retry loops turn contention into a livelock or a spin-wait that burns a core; backoff is not an optimisation but a correctness requirement for fairness.",
+    "Portability is uneven: some types have no lock-free atomic form on some platforms and silently become a mutex-backed operation, turning an intended lock-free structure into a blocking one with no compile-time warning.",
+    "Lock-freedom is not wait-freedom, so an individual operation can starve; only the system-level guarantee (some thread makes progress) is typically obtained.",
+    "The abstraction is verbose and repetitive at every call site, and the acquire-release discipline around the critical section is easy to get subtly wrong in review."
+  ],
+  "quality_attributes": {
+    "testability": 4,
+    "extensibility": 8,
+    "maintainability": 5,
+    "simplicity": 4,
+    "performance": 9,
+    "reliability": 9,
+    "security": 7,
+    "scalability": 9,
+    "type_safety": 7,
+    "observability": 4
+  },
+  "quality_attributes_note": "Performance and scalability are the reason to use atomics at all - a locked instruction is orders of magnitude cheaper than a mutex round trip. Testability and observability are low because a memory-ordering bug is not a test failure: it is a program that passes every test and fails on other hardware, and the race detector only sees non-atomic accesses.",
+  "participants": [
+    {
+      "role": "Atomic location (atomic<T> / AtomicUsize / AtomicReference)",
+      "responsibility": "The memory word whose read-modify-write is indivisible, carrying the platform's lock-free implementation.",
+      "notes": "Must be naturally aligned; a misaligned or too-large type may not be lock-free."
+    },
+    {
+      "role": "Atomic operation (CAS / fetch_add / exchange)",
+      "responsibility": "The indivisible primitive: compare-and-swap replaces the value only if it still matches the expected one, and returns whether it did.",
+      "notes": "fetch_add and exchange need no comparison and are the cheapest."
+    },
+    {
+      "role": "Memory order (relaxed / acquire / release / acq_rel / seq_cst)",
+      "responsibility": "Declares how far this access may be reordered with respect to others, and thereby which happens-before edges exist.",
+      "notes": "The single most consequential decision in concurrent code, and the one hardest to review."
+    },
+    {
+      "role": "Retry loop",
+      "responsibility": "Re-reads and tries again when the CAS fails, because another thread won - the CAS is the lock, the loop is the retry.",
+      "notes": "Needs backoff; unbounded spinning under contention is a livelock."
+    },
+    {
+      "role": "Fence (atomic_thread_fence / mfence / dmb)",
+      "responsibility": "Applies acquire or release ordering to surrounding ordinary accesses when the atomic operation itself does not need the stronger order.",
+      "notes": "Cheaper than ordering every access, but placement is subtle and platform-specific."
+    },
+    {
+      "role": "Publication protocol (release store / acquire load pair)",
+      "responsibility": "Ensures data written before a flag is visible to a thread that observes the flag.",
+      "notes": "The pattern that makes immutable snapshots safely publishable without a lock."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "message-flow",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Lock-free stacks and queues: the head/tail pointer update is a CAS, and the retry loop is what makes the structure progress without blocking.",
+    "Reference counting: an atomic increment/decrement decides whether an object is destroyed, and the ordering is what prevents a use-after-free when the count reaches zero.",
+    "Lazy initialisation with a published flag: a release store of the constructed value paired with an acquire load of the flag, instead of double-checked locking with a plain field.",
+    "Statistics and metrics counters: fetch_add with relaxed ordering, the common case where only the count matters and no data is published.",
+    "Interrupt and signal flags shared between an ISR and the main loop: an atomic store with release, read with acquire, so the ISR's data is visible before the flag is observed.",
+    "Memory-ordering publication of immutable state: a reader that acquires a version counter sees a fully constructed snapshot, with no lock on the read path.",
+    "Hazard pointers and epoch-based reclamation: the whole reclamation protocol is a CAS loop publishing and clearing a hazard record.",
+    "Seqlocks: an odd sequence counter tells readers the data is being written, and the acquire load on the counter is what makes retrying safe.",
+    "The commit step of software transactional memory, where read and write sets are installed and validated with acquire/release and CAS."
+  ],
+  "avoid_when": [
+    "A mutex is already the right tool and contention is not the bottleneck: a lock is easier to review, blocks rather than spins, and on a low-contention path costs about the same as a locked instruction.",
+    "The state is confined to one thread or one core - thread confinement removes the problem entirely and is the cheapest possible answer.",
+    "The invariant spans many fields and the update is not naturally one read-modify-write: use a lock, a double-buffer with an atomic swap, or an immutable snapshot plus an atomic pointer.",
+    "A higher-level abstraction already provides it: a BlockingQueue, a concurrent map, or a channel gives correctness without anyone reasoning about memory order.",
+    "The platform lacks a lock-free atomic for the type: check is_lock_free, because a silently mutex-backed atomic reintroduces blocking and hides the fact that the design's progress guarantee does not hold.",
+    "Blocking work must happen while holding the state: an atomic cannot make an I/O call atomic, and holding a spin lock across a syscall is a disaster on a preemptive scheduler.",
+    "You cannot state the required ordering: if nobody can say which happens-before edge the code needs, the code should not be using atomics - the pattern's value is entirely in the correctness argument."
+  ],
+  "pitfalls": [
+    "The torn-invariant bug: two fields updated by two separate atomics, each individually correct, so a reader can see the intermediate state. The update must be one operation, or published as an immutable snapshot.",
+    "Ordering that is too weak: a relaxed access to what is meant to publish data, which works on x86 and fails on ARM - the classic portability bug that only appears on the developer's weaker-ordered hardware in production.",
+    "The failure-order mistake: the failure memory order of a CAS may not be stronger than the success order and may not be acquire/release when the success order was, and the compiler enforces this - read the diagnostic rather than working around it.",
+    "compare_exchange_weak in a loop with a recomputed expectation: weak CAS may fail spuriously, so the loop must re-read the value each iteration rather than retrying with a stale expectation.",
+    "Spinning without backoff: under contention a retry loop burns a core and can livelock, because the loser never gets scheduled while the winner keeps winning. Add a pause/yield and exponential backoff.",
+    "A plain field read inside an atomic critical section: it participates in no happens-before relation, so the atomic discipline is silently void for that access.",
+    "Unaligned or too-wide atomics: an atomic wider than the platform supports is not lock-free and may be emulated, so the intended progress guarantee does not hold.",
+    "Assuming a fence is as strong as an ordering on the access: an acquire fence after a relaxed load is close, but the exact rules are subtle and mixing them is how subtle bugs are made."
+  ],
+  "paradigm": [
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "value",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "lock-free-programming",
+    "lock-free-queue",
+    "software-transactional-memory",
+    "double-checked-locking",
+    "read-write-lock",
+    "copy-and-swap",
+    "thread-confinement",
+    "scope-guard",
+    "data-locality",
+    "immutability",
+    "immutable-object",
+    "dirty-flag",
+    "copy-on-write"
+  ],
+  "related_patterns_notes": {
+    "lock-free-programming": "The application on top of the substrate. cpu-atomic-operation is the single indivisible instruction and its ordering contract; lock-free-programming is the discipline of building multi-step non-blocking algorithms (progress guarantees, ABA, reclamation, helping) out of them. One is a machine primitive, the other is a method.",
+    "lock-free-queue": "The best-known consumer. The Michael-Scott queue is CAS and a retry loop at each of head and tail, plus a memory-management scheme for the removed node - which is exactly why this record names hazard pointers and epoch reclamation as the things built on top.",
+    "software-transactional-memory": "Records a read set and a write set and installs a transaction descriptor with a multi-word CAS; the atomic operation is what makes the commit atomic and the validation meaningful.",
+    "double-checked-locking": "Historically implemented with a plain field and a volatile flag, which is broken because the object's construction writes are not ordered against the flag read. The correct version uses atomics on both, or a static initialiser.",
+    "copy-and-swap": "Note the two different senses of the same words: this catalog's copy-and-swap is the exception-safety idiom (build a temporary, commit with operations that cannot fail), not the CPU primitive. They are unrelated patterns that happen to share a name.",
+    "thread-confinement": "The best optimisation: if no reference to the state escapes the owning thread, there is nothing to make atomic. Confinement eliminates the problem rather than solving it.",
+    "read-write-lock": "A mutex family with its own atomic substrate and its own problem (writer starvation). Reach for atomics directly when the critical section is a few instructions, and for a read-write lock when it is not.",
+    "immutability": "The complementary strategy. With immutable data the only shared write is a pointer store, which needs one release store and one acquire load - and everything else can be relaxed or non-atomic.",
+    "scope-guard": "The RAII wrapper that must be used for every lock or fence whose release must happen on every path, including unwinding; the atomics record's release ordering is what a correctly-ordered scope guard establishes.",
+    "dirty-flag": "A dirty flag is a plain boolean set when state changes and cleared when saved. Written that way it is a data race, and the correct version makes the flag an atomic store with release ordering so a reader that observes it also observes the data it describes - the publication protocol this record describes, in its most common concrete form.",
+    "copy-on-write": "The strategy that minimises how many atomics a program needs. With copy-on-write, the only shared write is a pointer store, so one release store and one acquire load carry the whole update and everything the old value contained needs no synchronisation at all."
+  },
+  "anti_patterns": [
+    "Using relaxed ordering for an access that publishes data, because it worked on the development machine's strongly-ordered architecture.",
+    "Building a multi-field invariant out of several individually atomic updates, on the assumption that atomic means transaction.",
+    "Retrying a failed CAS in a tight loop with no backoff, turning contention into a livelock that burns a core.",
+    "Using a strong ordering everywhere for convenience, paying the fence cost on every access and obscuring which orderings the algorithm actually depends on.",
+    "Handing an atomic to a type the platform does not implement lock-free and assuming the progress guarantee - check is_lock_free rather than assume.",
+    "Holding a spin lock across a syscall, a page fault or an allocation, so a preemption becomes a system-wide stall.",
+    "A plain (non-atomic) read of a field inside an atomic critical section, silently removing the happens-before edge the protocol needed.",
+    "Mixing an acquire-release protocol with a plain-field fast path that reads the same data - the fast path is the bug, and it is the one that is faster."
+  ],
+  "design_principles": [
+    "Name the ordering: the memory order is a specification of the happens-before edge, not a tuning knob. If you cannot say which edge it establishes, do not weaken it.",
+    "One indivisible operation per invariant: if the update must be seen as a unit, it must be one read-modify-write or one atomic publication of an immutable value.",
+    "Prefer publication to mutation: write the data first, then release-publish the pointer, so readers need only acquire and the rest of the code can stay plain.",
+    "Progress is a design goal: choose retry with backoff over parking, and prefer the strongest guarantee you can actually implement.",
+    "Readiness is not invisibility: verify the platform supports the operation lock-free before relying on the guarantee."
+  ],
+  "best_practices": [
+    "Start at sequentially consistent and weaken only with a written reason; downgrading is a mechanical change but proving it correct is not.",
+    "Keep the acquire-release pair symmetric: a release store paired with an acquire load, both naming the same variable, and document the edge in a comment.",
+    "Add pause/yield or exponential backoff to every CAS retry loop, and bound it if fairness matters.",
+    "Check is_lock_free for the type in question at the sizes you use, and assert it in a test if the progress guarantee matters.",
+    "Publish immutable state and store only the pointer, so the read path is a single acquire load and the payload needs no synchronisation at all.",
+    "Run tests under ThreadSanitizer and on a weakly-ordered target (ARM) - TSan catches non-atomic accesses, not ordering mistakes, and the ordering mistakes only show on the other architecture.",
+    "Document the progress guarantee the algorithm claims (lock-free, wait-free, obstruction-free) in the type or module header, because the difference is invisible at the call site.",
+    "Keep atomics out of the layer that does not need them: confine state where you can, and let one layer own the synchronisation.",
+    "Never hold a spin lock across a syscall, allocation, or anything that can block or be preempted.",
+    "When a field must be published with data, publish the data pointer first and the flag second; the reverse order publishes a half-built object."
+  ],
+  "sources": [
+    "cppreference.com, 'std::memory_order' - the normative meaning of relaxed, consume, acquire, release, acq_rel and seq_cst, the release-acquire synchronises-with relation, the release sequence, and the note that sequential consistency is invalidated by weaker orderings. https://cppreference.dev/w/cpp/atomic/memory_order",
+    "LLVM, 'Atomic Instructions and Concurrency Guide' - how the orderings map to IR and to machine instructions, the six levels of atomicity, the fence semantics, and the per-architecture codegen (x86 MOV/XCHG/LOCK CMPXCHG/MFENCE versus ARM LDREX/STREX with barriers). https://llvm.org/docs/Atomics.html",
+    "David Herlihy and Nathaniel Lin (The Rustonomicon), 'Atomics' - the acquire-release and relaxed disciplines with a worked spinlock, the happens-before reasoning, and the explicit warning that sequential consistency is the right choice when you are not yet confident about the weaker orderings. https://doc.rust-lang.org/nomicon/atomics.html",
+    "Boehm and Adve, 'Foundations of the C++ Concurrency Memory Model' (PLDI 2008), as cited by the Go memory model - the release/acquire framework that the C11, C++11, Java, Rust and Swift models all inherit. https://go.dev/ref/mem",
+    "Timothy Chan and Tomer shalom, 'Scalable FIFO Channels for Programming via Communicating Sequential Processes' (Euro-Par 2019) - the practical consequence of atomics in a real primitive: how relaxed operations, fences and descriptors are combined to build a non-blocking channel on which a progress guarantee can still be claimed. https://dl.acm.org/doi/10.1007/978-3-030-29400-7_23"
+  ],
+  "language_files": {
+    "generic": "cpu-atomic-operation.generic.json",
+    "c": "cpu-atomic-operation.c.json",
+    "cplusplus": "cpu-atomic-operation.cplusplus.json",
+    "csharp": "cpu-atomic-operation.csharp.json",
+    "go": "cpu-atomic-operation.go.json",
+    "java": "cpu-atomic-operation.java.json",
+    "javascript": "cpu-atomic-operation.javascript.json",
+    "kotlin": "cpu-atomic-operation.kotlin.json",
+    "python": "cpu-atomic-operation.python.json",
+    "ruby": "cpu-atomic-operation.ruby.json",
+    "rust": "cpu-atomic-operation.rust.json",
+    "scala": "cpu-atomic-operation.scala.json",
+    "swift": "cpu-atomic-operation.swift.json",
+    "typescript": "cpu-atomic-operation.typescript.json"
+  },
+  "version": "1.0"
+}

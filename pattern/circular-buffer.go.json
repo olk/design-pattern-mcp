@@ -1,0 +1,19 @@
+{
+  "pattern": "circular-buffer",
+  "language": "go",
+  "support": "library",
+  "implementation_notes": "Go has no ring buffer in the standard library, and the idiomatic answer for a queue is a channel - which is internally a ring buffer with two wait queues (the runtime's hchan has a ring buffer dataqsiz with sendx/recvx indices and two wait queues). So in most Go programs the runtime already provides the circular buffer and you should use a buffered channel. Where a hand-written ring is right is a fixed-size, no-chunk, allocation-free hot path (an audio ring, a lock-free SPSC queue where a channel's channel-send overhead and per-send function call is too heavy). Go's garbage collector also makes the 'no allocation' benefit less compelling than in C, and a buffered channel allocates its buffer once at make(chan T, n) and never grows. For a true SPSC ring, the two indices as uint64 atomics with acquire/release, padded, is the construction.",
+  "idiom_name": "buffered channel (the runtime's own ring buffer) for most cases; hand-written uint64 SPSC ring for a fixed, allocation-free hot path",
+  "code_sketch": "// Go's default: a buffered channel IS a ring buffer (hchan: dataqsiz, sendx,\n// recvx) plus wait queues. This is what almost every Go program should use:\nch := make(chan Job, 256)   // fixed capacity, allocated once, never grows\n\n// Hand-written SPSC ring for a fixed, allocation-free hot path (e.g. audio):\ntype ring struct {\n    buf   [1024]float32        // power of two; a static array, no allocation\n    mask  uint64\n    _     [64]byte             // pad head away from tail (different cache lines)\n    head  atomic.Uint64        // producer-owned\n    _     [64]byte\n    tail  atomic.Uint64        // consumer-owned\n}\nfunc (r *ring) push(v float32) bool {\n    h := r.head.Load()\n    if h - r.tail.Load() == 1024 { return false }\n    r.buf[h & r.mask] = v\n    r.head.Store(h + 1)        // sequentially consistent in Go: publishes the item\n    return true\n}",
+  "pitfalls": [
+    "In Go, atomics are all sequentially consistent (no acquire/release), so the ring's ordering is stronger than needed - correct but slightly costlier than the C/Rust form.",
+    "A buffered channel is the runtime's ring buffer already; hand-rolling one to 'save the channel overhead' is only justified on a measured hot path, because a channel send is a function call plus a lock.",
+    "The pad fields between head and tail are needed on a cache-coherent machine or the ping-pong dominates; without them the 'lock-free' ring is slower than the channel it replaced.",
+    "Go's GC means 'no allocation after construction' matters less than in C, and make(chan T, n) already allocates its buffer once - so a hand-written ring's main win is the absent channel-send overhead, not the allocation."
+  ],
+  "sources": [
+    "https://go.googlesource.com/go/+/refs/heads/master/src/runtime/chan.go",
+    "https://pkg.go.dev/sync/atomic"
+  ],
+  "version": "1.0"
+}

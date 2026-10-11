@@ -43,7 +43,7 @@ Stage flow (§-numbers are normative in docs/implementation-guide.md):
 
 The decisive architectural fact: **the only model-dependent inputs to selection are (a) the A+B brief/parts decomposition (prose) and (b) the per-part 8-axis weight vector.** Everything from the fused candidate pool onward — scoring, vetoes, selection, composition, language binding, fallbacks, loop bookkeeping — is pure arithmetic over catalog data (guide §15: only the four LLM call kinds are nondeterministic). The reasoning layer's traces are prompt context only; on any failure the pipeline degrades silently to the in-prompt scaffold (pipeline.py:1333-1347) and selection is unchanged.
 
-Catalog: 438 main records + 6132 per-language files (6570 total, `pattern/`), each record's retrieval document = name+aliases+intent+problem+context+use_cases (~3.5-4.8 kB sampled, `src/patterns/loader.py:209-214`).
+Catalog (at analysis time, 2026-09): 438 main records + 6132 per-language files (6570 total, `pattern/`); current catalog is 486 records, each record's retrieval document = name+aliases+intent+problem+context+use_cases (~3.5-4.8 kB sampled, `src/patterns/loader.py:209-214`).
 
 ## 2. Where the wall-clock goes
 
@@ -84,7 +84,7 @@ What Jev cannot do: generate prose. It cannot write the A+B brief/part descripti
 | J5 | Reasoning-layer gate: "does this phase need pre-LLM deliberation?" | noul per phase; "no" → return empty NON-degraded trace (copying the disabled-phase shape at reasoning/client.py:291-294, which consumes no cache slot and no generator call) | **GO, Stage 1** — not selection-affecting (traces are prompt context; degradation contract already permits empty) → provable now with latency + degradation proofs only. Clearest early win |
 | J6 | Loop early-stop via quality score | score on attempt quality | **REJECT** — redundant: deterministic `min_quality_score=50` early stop already exists (pipeline.py:1614-1619) |
 | J7 | Skip LLM generation when deterministic materialization suffices | noul per application | **REJECT for now** — changes user-visible output content; benchmark-gated at best, and G is not the dominant cost |
-| — | Whole-corpus pattern choice | choice over 438 patterns | **IMPOSSIBLE** — 438 > 255 option cap; and it would make Jev the selection authority, violating §15 |
+| — | Whole-corpus pattern choice (at analysis time: 438 patterns; 486 now) | choice over 438 patterns | **IMPOSSIBLE** — 438 > 255 option cap; and it would make Jev the selection authority, violating §15 |
 | — | Replace A+B / G / H with Jev | — | **REJECT** — prose generation required by contract; Jev is prose-free by construction |
 
 Provider-neutral seam: every Jev use sits behind one `DecisionModelProtocol` (httpx client, pinned model, configurable `base_url` + `model` + api key), so hosted TypeSafe Jev, a local `/v1/systemone`-compatible server (Kev, Von, Rizzo Flow — §5), or a fine-tuned self-hosted model (Laya, Von, NanoJev — §5) are provider impl changes, not architecture changes. Which provider to prefer is decided in §5.

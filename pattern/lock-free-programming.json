@@ -1,0 +1,211 @@
+{
+  "category": "concurrency-resilience",
+  "name": "lock-free-programming",
+  "aliases": [
+    "non-blocking algorithms",
+    "lockless programming",
+    "wait-free",
+    "obstruction-free"
+  ],
+  "intent": "Build a shared-state algorithm whose operations are composed from indivisible atomic read-modify-write operations and a retry loop, such that the system as a whole always makes progress - no thread ever waits on another, so a preempted, stalled or crashed thread cannot prevent anyone from finishing.",
+  "problem": "A mutex serialises access, and serialisation costs in three ways that get worse with scale: throughput is capped by the lock's critical section, a thread preempted or page-faulted while holding the lock stalls every other thread (convoying and priority inversion), and a thread that crashes holding the lock deadlocks the system permanently. Real systems hit exactly this - a UI thread that hangs on a lock held by a background thread doing a disk read, a trading system whose latency spikes on every GC pause inside a critical section, a kernel object whose lock is held across a context switch. Locks are fine; the point is that some components cannot afford them.",
+  "context": "Applies where latency and availability must not depend on any other thread: real-time and trading systems, media and audio pipelines with hard deadlines, kernel schedulers and interrupt handlers, lock-free queues and maps under high contention, systems that must survive a thread fault, and any structure where a blocking wait would convert a slow operation into a stall. It is a discipline rather than a data structure - the queue, the stack, the map and the memory-reclamation scheme each apply it - and it requires a hardware atomic read-modify-write, a reclamation scheme for removed nodes, and a progress argument that is written down and verified.",
+  "benefits": [
+    "Progress is unconditional: at least one thread always makes progress, so the system degrades in latency rather than halting. A thread that is preempted, descheduled, page-faulted or killed does not stop the others - the failure mode a mutex cannot avoid.",
+    "No lock convoying or priority inversion: there is no owner to block behind, so a low-priority thread cannot be starved by a high-priority one holding a lock, and a thread in a syscall cannot stall the pool.",
+    "Throughput scales with cores: operations on disjoint keys proceed fully in parallel, and contention produces retries (wasted work) rather than waiting (idle time) - wasted work parallelises, waiting does not.",
+    "Fault tolerance: because there is no lock to be held by a dying thread, the structure survives thread failure and arbitrary delays, which Maged and Michael's hazard-pointer results demonstrate experimentally.",
+    "Composability: non-blocking structures compose - a lock-free queue feeding a lock-free map, each with its own progress argument - and the composition preserves the system-level guarantee.",
+    "The reclamation problem gets a real answer: hazard pointers and epoch-based reclamation give lock-free memory management, which was historically the reason lock-free structures could not be used in practice."
+  ],
+  "tradeoffs": [
+    "Correctness is research-grade. The algorithms rely on subtle invariants, helping protocols and precise memory orders, and the canonical implementations took years of bug reports to stabilise; hand-rolling one is not a reasonable engineering plan.",
+    "Memory reclamation is the hard part, not the queue. Removing a node from a lock-free structure while another thread is reading it is the ABA problem, and every solution (hazard pointers, epochs, RCU, a type-stable pool, a GC) has real cost in lookup, storage or memory.",
+    "Lock-freedom is not wait-freedom: an individual operation can starve indefinitely while the system progresses. Hard real-time deadlines need wait-free structures, which are much harder and usually slower.",
+    "Retries waste work. Under high contention a CAS loop can spin or fail repeatedly, so throughput collapses while CPU is saturated - a different failure shape from a lock, and one that looks like 'the CPU is busy but nothing happens'.",
+    "Cache-line contention is the actual bottleneck, not the lock: an atomic on a shared cache line ping-pongs between cores and costs far more than the instruction, so a 'lock-free' counter can be slower than a mutex that batches updates.",
+    "The algorithms are fragile under compiler and hardware change: a reordering the model does not permit, or an architecture with weaker ordering than the developer's, exposes bugs that pass every test.",
+    "Verification is expensive: correctness needs model checking or careful reasoning plus exhaustive interleaving exploration (loom, CDSChecker), because a bug in this territory reproduces once in millions of runs.",
+    "Memory ordering must be right at every access, and an over-strengthened ordering is both slower and harder to justify in review - so the code carries a burden the mutex version never had."
+  ],
+  "quality_attributes": {
+    "testability": 4,
+    "extensibility": 7,
+    "maintainability": 3,
+    "simplicity": 2,
+    "performance": 9,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 9,
+    "type_safety": 6,
+    "observability": 4
+  },
+  "quality_attributes_note": "Scalability and performance are the reason to pay the cost. Maintainability and simplicity are low because the algorithms are subtle and the reclamation scheme is a second, independent hard problem. Testability is low because unit tests almost never catch a memory-ordering or reclamation bug - model checking and stress testing on weak memory are the only tools that do.",
+  "participants": [
+    {
+      "role": "Atomic primitive (CAS / fetch-add / exchange)",
+      "responsibility": "The indivisible read-modify-write on which every step of every operation is built.",
+      "notes": "A lock-free algorithm is a sequence of these plus a retry loop; remove them and the property is gone."
+    },
+    {
+      "role": "CAS retry loop with backoff",
+      "responsibility": "Re-reads the shared state and retries when another thread won the race; the retry, not the primitive, is what makes progress.",
+      "notes": "Needs a pause/yield and often exponential backoff, or it livelocks under contention."
+    },
+    {
+      "role": "Linearisation point",
+      "responsibility": "The single instant in an operation at which it takes effect; identified in the specification so the operation can be proved correct.",
+      "notes": "Naming it is how you check an implementation against the intended semantics."
+    },
+    {
+      "role": "Helping protocol (descriptor-based)",
+      "responsibility": "When a thread stalls mid-operation, another thread completes it on its behalf using the descriptor it installed.",
+      "notes": "What turns 'a thread that might never finish' into a system that still progresses."
+    },
+    {
+      "role": "Memory reclamation scheme (hazard pointers / epochs / RCU / GC)",
+      "responsibility": "Decides when a removed node may be freed so no thread is reading it, solving ABA as a side effect.",
+      "notes": "The hardest and most commonly underestimated part of a real implementation."
+    },
+    {
+      "role": "Contention manager / fairness policy",
+      "responsibility": "Resolves who wins when many threads compete, so retries do not livelock and no thread starves forever.",
+      "notes": "Backoff plus, in some designs, age-based priority."
+    },
+    {
+      "role": "Progress guarantee (lock-free / wait-free / obstruction-free)",
+      "responsibility": "The stated property of the algorithm - the system always progresses, every operation completes, or a transaction completes if left alone - which is the thing being claimed.",
+      "notes": "Must be written down; an unstated guarantee is not a guarantee."
+    }
+  ],
+  "suitable_scopes": [
+    "object",
+    "module",
+    "message-flow"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Lock-free queues and deques as the hand-off between producers and consumers where a stalled producer must not stop the consumers - Michael and Scott's algorithm is the reference implementation.",
+    "Real-time and trading pipelines with hard deadlines, where a GC pause or a thread descheduled inside a lock would exceed the deadline and latency spikes are the failure.",
+    "Kernel and operating-system data structures - scheduler run queues, slab allocators, file descriptor tables - where a thread holding a lock cannot be preempted and a fault would be unrecoverable.",
+    "Audio and media frame pipelines, where a single dropped frame is unacceptable and no thread may wait on another.",
+    "Concurrent hash maps under high write contention, where the map is the contention point and a lock around it caps throughput.",
+    "Memory allocators in multithreaded programs, where a global allocator lock is one of the most contended sites in a modern runtime.",
+    "Interrupt handlers and signal handlers sharing state with normal code, where taking a lock in interrupt context is forbidden and a lock-free flag is the only option.",
+    "Systems that must tolerate thread failure: because no lock can be held by a dying thread, the structure keeps working when a worker is killed, which the hazard-pointer experiments demonstrate explicitly.",
+    "Free-list and pool allocation for reference counting, where the decrement-and-test and the reclamation must both be non-blocking."
+  ],
+  "avoid_when": [
+    "A lock works and contention is not the bottleneck - a mutex has a fast uncontended path and is vastly easier to review; lock-freedom is a solution to a problem you may not have.",
+    "The critical section is large or does I/O: lock-freedom does not help when the work itself is blocking, and a spin-wait across a syscall is pathological.",
+    "You need wait-freedom (every operation bounded) - lock-free algorithms can starve an individual thread, and meeting a hard deadline requires a wait-free design that is much harder and usually slower.",
+    "You would be writing the algorithm from scratch - use a published, reviewed implementation (Michael and Scott, Fraser, or a concurrent-collections library) rather than inventing one.",
+    "The memory reclamation problem has no acceptable answer in your environment: without a GC, hazard pointers, epochs or a type-stable pool, removed nodes cannot be safely freed and the structure is unusable.",
+    "Cache-line contention dominates anyway - if every operation touches the same word, the atomic ping-pongs and a lock with batching wins; fix the locality first.",
+    "The team cannot run model checking or stress tests on weak memory: the bugs in this territory are invisible to ordinary testing and need loom, CDSChecker or a weak-architecture target to surface.",
+    "The language or runtime gives you safe concurrent collections (Java's ConcurrentHashMap, C#'s ConcurrentDictionary, Rust's crossbeam, Go's channels) - use them; the progress guarantee is already provided and audited."
+  ],
+  "pitfalls": [
+    "Ignoring memory reclamation: the queue is correct until a removed node is freed while another thread still holds a pointer to it, which is an ABA bug and a use-after-free.",
+    "Confusing lock-free with wait-free: a system can make progress overall while one thread's operation retries forever, which fails a per-operation deadline.",
+    "A retry loop with no backoff: under contention the losers spin, burning CPU and delivering no throughput, and can livelock if the winner keeps winning.",
+    "Testing only on x86: the memory-ordering bugs are invisible on a strongly-ordered architecture and appear on ARM, which is exactly where the developer's code will run in production.",
+    "Treating an atomic as a faster mutex: on a contended cache line the ping-pong can cost more than acquiring a lock, especially for a simple counter where LongAdder or per-thread batching is correct.",
+    "A missing helping protocol: if an operation can be left half-done by a stalled thread, the structure hangs until that thread returns, which is blocking in all but name - descriptors and helping are what prevent it.",
+    "Fairness omitted entirely: one thread can be starved indefinitely, which is acceptable for a cache and not for a scheduler or an allocator.",
+    "Writing the algorithm from a blog post: the published implementations have a decade of bug reports behind them and a fresh implementation has none."
+  ],
+  "paradigm": [
+    "concurrent",
+    "data-oriented"
+  ],
+  "scope": "module",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "cpu-atomic-operation",
+    "lock-free-queue",
+    "software-transactional-memory",
+    "read-write-lock",
+    "scoped-locking",
+    "lockable-object",
+    "double-checked-locking",
+    "thread-confinement",
+    "object-pool",
+    "copy-on-write",
+    "optimistic-offline-lock",
+    "singleflight",
+    "coroutines",
+    "channels"
+  ],
+  "related_patterns_notes": {
+    "cpu-atomic-operation": "The substrate. cpu-atomic-operation is one indivisible read-modify-write and its ordering contract; lock-free-programming is the multi-step method of composing them into an algorithm with a system-level progress guarantee. Neither is useful alone: the primitive has no guarantee, the method has no primitive.",
+    "lock-free-queue": "The flagship instance. The Michael-Scott queue is the canonical non-blocking structure, and its record explicitly hands memory management to hazard pointers, epochs, a type-stable pool or a GC - which is this record's hardest sub-problem.",
+    "software-transactional-memory": "Shares the technique (descriptors, helping, CAS loops) and the goal (non-blocking progress) but is a programming model for composing arbitrary operations with isolation, not a data structure. The STM literature measures the instrumentation overhead of the alternative approach explicitly.",
+    "thread-confinement": "The strongest optimisation and the one that removes the problem entirely: if no reference to the state escapes its owning thread, there is nothing to make non-blocking. Confinement beats every algorithm here.",
+    "read-write-lock": "The blocking alternative with better read throughput; it remains the right choice whenever the critical section is large or does I/O, which is most code.",
+    "scoped-locking": "RAII and defer-based lock management - the discipline this record replaces when the algorithm is non-blocking, and the correct tool everywhere else.",
+    "double-checked-locking": "Historically a broken idiom that tried to get lock-freedom on the read path with a plain field; it survives only when both the flag and the data use the acquire/release protocol this catalog's cpu-atomic-operation describes.",
+    "object-pool": "Recycling is one reclamation strategy for a non-blocking structure - reuse nodes instead of freeing them, which sidesteps ABA but bounds the pool and retains memory.",
+    "copy-on-write": "The escape from fine-grained synchronisation: if the update publishes a new immutable version with one atomic pointer store, the read path needs no atomic at all and the write path never contends with a reader.",
+    "coroutines": "A different answer to latency: cooperative coroutines eliminate blocking wait but not the contention on shared state - the non-atomic CPU work still needs the same primitives, and the event loop itself is a structured-concurrency pattern.",
+    "intrusive-reference-counting": "Reference counting is where lock-freedom is hardest and most valuable: the atomic decrement-and-test decides whether an object is destroyed, and the release ordering is what prevents a use-after-free when the count reaches zero. An intrusive reference count embedded in the object avoids a second indirection on the hot path."
+  },
+  "anti_patterns": [
+    "Using an atomic because it 'feels faster' than a lock without measuring contention - on an uncontended path the two are comparable and the lock is far easier to review.",
+    "Applying lock-free design to a counter, where LongAdder, per-thread striping or a sampled metric solves it with no atomic at all on the hot path.",
+    "Writing a CAS loop with no backoff, converting contention into a livelock that presents as 'the CPU is pegged but throughput is zero'.",
+    "Ignoring ABA because the language has a garbage collector - a GC reclaims unreachable nodes, but a node still referenced by a stalled thread can be reused by the allocator, and the ABA window is exactly there.",
+    "Claiming wait-freedom for a lock-free algorithm, then missing a deadline because one thread starved - the two properties are not interchangeable.",
+    "Testing exclusively on x86 and a single run, so memory-ordering and reclamation bugs ship to weakly-ordered hardware.",
+    "Hand-rolling a queue from a blog post instead of using a reviewed implementation that has survived years of reports.",
+    "Spinning while holding a spinlock across a syscall or an allocation, converting a non-blocking design into a system-wide stall on preemption."
+  ],
+  "design_principles": [
+    "State the guarantee: lock-free, wait-free or obstruction-free is a claim about the system, and it must be written down and justified.",
+    "Non-blocking beats fast: a structure whose latency never depends on another thread is a different kind of service from a faster one that can stall.",
+    "Reclamation is part of the algorithm: ABA and use-after-free are not cleanup issues, they are correctness issues with a design.",
+    "Optimise locality before synchronisation: a cache-line ping-pong costs more than the lock it replaced, so fix the data layout first.",
+    "Measure the contention, not the primitive: the design should follow the measured contention profile, and if there is none, a mutex is the answer."
+  ],
+  "best_practices": [
+    "Start from a published, reviewed implementation (Michael and Scott's queue, Fraser's work, or a mature concurrent-collections library) rather than writing an algorithm from scratch.",
+    "Verify with a model checker (loom in Rust, CDSChecker, or Relacy) - exhaustively exploring interleavings of a small protocol is the only realistic way to find the ordering bug.",
+    "Test on a weakly ordered architecture (ARM), not just x86; every memory-ordering mistake the pattern's tradeoffs describe is invisible on x86.",
+    "Add exponential backoff with a pause instruction to every retry loop and bound the retries if fairness matters.",
+    "Choose the reclamation scheme explicitly and document it - hazard pointers for reuse-heavy general structures, epochs for throughput, a GC or type-stable pool when the environment provides one.",
+    "Install a descriptor and implement helping so no operation can be left half-done by a stalled thread; that is what converts 'lock-free' from a claim into a property.",
+    "Strip the atomics to the contended minimum: batch counters, shard by thread, and prefer publishing an immutable snapshot over a fine-grained update.",
+    "Keep the progress guarantee in the type or module documentation, because the difference between lock-free and wait-free is invisible at the call site.",
+    "Bound the critical work: non-blocking progress over a large computation buys nothing - the computation still takes the same time and holds its snapshot longer."
+  ],
+  "sources": [
+    "Michael and Scott, 'Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms' (PODC 1996) - the canonical lock-free queue, the CAS-based enqueue/dequeue, and the explicit statement that memory management is delegated to a type-preserving allocator or to hazard pointers / epoch-based reclamation. https://dl.acm.org/doi/10.1145/248052.248106",
+    "Michael and Scott, 'Fast Concurrent Queue Algorithms' (Rochester pseudocode) - the reference pseudocode and the note that the non-blocking queue requires a universal CAS or LL/SC primitive and a reclamation scheme. https://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html",
+    "Maged M. Michael, 'Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects' (IEEE TPDS 2004) - the lock-free reclamation method that removes the ABA problem with single-word instructions, and the experimental result that lock-free structures with hazard pointers match lock-based ones when idle and outperform them under contention. https://dlnext.acm.org/doi/10.1109/TPDS.2004.8",
+    "David Herlihy and Maurice Herlihy, 'Lock-Free Programming' (and the broader literature on progress guarantees) - the wait-free > lock-free > obstruction-free hierarchy, and the contention-management analysis quoted in the Clojure STM benchmarking work. https://dl.acm.org/doi/10.1109/TPDS.2004.8",
+    "Sean Kanal, 'Benchmarking Contention Management Strategies in Clojure's Software Transactional Memory Implementation' (AAU) - the explicit statement of the wait-free / lock-free / obstruction-free hierarchy and that contention management is required to avoid livelock, which is this record's fairness point. https://projekter.aau.dk/projekter/files/32587755/report.pdf",
+    "Junjie Guo / Wikipedia, 'Non-blocking algorithm' and Michael's follow-ups on lock-free memory management - the ABA problem's origin and the per-thread reference-count solution for acyclic structures. https://dl.acm.org/doi/10.1145/571825.571829"
+  ],
+  "language_files": {
+    "generic": "lock-free-programming.generic.json",
+    "c": "lock-free-programming.c.json",
+    "cplusplus": "lock-free-programming.cplusplus.json",
+    "csharp": "lock-free-programming.csharp.json",
+    "go": "lock-free-programming.go.json",
+    "java": "lock-free-programming.java.json",
+    "javascript": "lock-free-programming.javascript.json",
+    "kotlin": "lock-free-programming.kotlin.json",
+    "python": "lock-free-programming.python.json",
+    "ruby": "lock-free-programming.ruby.json",
+    "rust": "lock-free-programming.rust.json",
+    "scala": "lock-free-programming.scala.json",
+    "swift": "lock-free-programming.swift.json",
+    "typescript": "lock-free-programming.typescript.json"
+  },
+  "version": "1.0"
+}

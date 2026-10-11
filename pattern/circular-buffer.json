@@ -1,0 +1,214 @@
+{
+  "category": "specialized-components",
+  "name": "circular-buffer",
+  "aliases": [
+    "ring buffer",
+    "circular queue",
+    "cyclic buffer",
+    "circular array",
+    "ring queue"
+  ],
+  "intent": "Store a stream of items in a fixed-size array whose head and tail wrap around instead of shifting, so enqueue and dequeue are O(1) with no allocation after construction and the oldest item is overwritten (or the newest dropped) once the buffer is full.",
+  "problem": "A stream arrives at an irregular rate and must be consumed, but the rate relationship is unknown in advance and cannot be allowed to run away. A growing array reallocates and copies under the producer; a linked list allocates a node per item and chases pointers; an unbounded queue postpones the decision until memory runs out; a blocking bounded queue wakes and parks threads and puts a lock on both ends. In an embedded or high-rate context there is often no allocator to call and no thread to block, so the requirement is an index into a preallocated array - and that requirement forces the wraparound arithmetic, because a linear array cannot free the front without shifting everything behind it.",
+  "context": "Applies wherever items are produced and consumed at rates the code cannot predict, memory is fixed or scarce, and allocation is unavailable or undesirable: audio and signal processing ring buffers between a capture interrupt and a playback thread, network and protocol stacks, sensor sampling, logging to a fixed-size window, keyboard input buffers, embedded firmware with a static pool, and the single-producer single-consumer lock-free queue where the ring with power-of-two masking and a memory barrier per side is the standard construction. The decision is what happens at capacity - overwrite the oldest, drop the newest, or refuse - and that choice is what makes it a design pattern rather than an implementation detail.",
+  "benefits": [
+    "O(1) enqueue and dequeue with no shifting: the head and tail indices wrap with a mask or a modulus, so the operations are a couple of index updates regardless of size.",
+    "No allocation after construction: the array is allocated once, which is what makes the pattern usable in firmware with no heap, in an interrupt handler, or on a real-time path where malloc is forbidden.",
+    "Bounded memory with an explicit policy: the capacity is the memory, and what happens when it is full - overwrite oldest, drop newest, or signal - is a decision the design states rather than an OOM discovered later.",
+    "Cache-friendly: the working set is a contiguous block that the hardware prefetcher handles well (it is a repeating stride of one), which a linked list of nodes cannot claim.",
+    "Lock-free in the single-producer single-consumer case: with one index owned by each side and one acquire/release barrier per operation, no lock is needed at all, and the two sides run fully in parallel.",
+    "Power-of-two sizing makes the wrap free: masking with (size - 1) replaces a modulo, so the wraparound cost is one AND instruction rather than a divide."
+  ],
+  "tradeoffs": [
+    "Fixed capacity means a real loss policy: a producer that outruns the consumer must overwrite, drop, or signal - and overwriting silently loses the oldest data, which for an audit or measurement stream is unacceptable and must be detected by the consumer comparing the sequence numbers.",
+    "Multi-producer or multi-consumer needs either a lock or a CAS loop on each index, which reintroduces exactly the contention and complexity the single-producer case avoids - and a CAS loop is this catalog's lock-free-programming pattern in miniature.",
+    "A full/empty ambiguity: head == tail could mean empty or full. The standard resolutions are the wasted-slot trick (one slot left unused, so full is head == (tail+1) % size) or a separate count - both are extra state, and the wasted slot reduces effective capacity by one.",
+    "The memory barriers are easy to omit and impossible to notice: without the acquire load of the opposite index and the release store of one's own, the producer can publish a head before the item is written and the consumer reads garbage - a bug that passes every functional test.",
+    "It is not a general queue: no arbitrary removal, no reordering, no priority, no size queries beyond the two counters. When a consumer needs those, the ring is the wrong structure.",
+    "The capacity is fixed at construction, so a burst that exceeds it is unrecoverable; a dynamic ring has to grow, which defeats the no-allocation property that justified it.",
+    "A ring in a multi-threaded program is not automatically thread-safe: the common failure is to treat a circular buffer as a shared queue without specifying which side owns which index, and the two must be single-producer/single-consumer for the barrier scheme to be correct.",
+    "On a cache-coherent machine, the two indices land on the same cache line by default and ping-pong between cores - padding the indices onto separate lines is required for real throughput, which is a non-obvious alignment step."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 6,
+    "maintainability": 7,
+    "simplicity": 8,
+    "performance": 9,
+    "reliability": 7,
+    "security": 6,
+    "scalability": 8,
+    "type_safety": 6
+  },
+  "quality_attributes_note": "Performance is high for the specific case the pattern is for - a memory-bound stream with a fixed working set - and it degrades sharply outside it (multi-producer, arbitrary removal), which the tradeoffs spell out. Testability is high because the wraparound arithmetic is exhaustively testable (push more than the capacity, pop more than pushed, interleaved), unlike most concurrency patterns where the interesting failure is a memory ordering.",
+  "participants": [
+    {
+      "role": "Underlying array (preallocated)",
+      "responsibility": "The fixed-size storage allocated once, holding items between head and tail.",
+      "notes": "The whole point: no allocation after construction, so it works with no heap and no GC pressure."
+    },
+    {
+      "role": "Head index (producer-owned)",
+      "responsibility": "The next slot to write, wrapping with a mask or modulo; owned exclusively by the producer so it needs no lock.",
+      "notes": "In the SPSC case ownership is what removes the lock - each side writes only its own index."
+    },
+    {
+      "role": "Tail index (consumer-owned)",
+      "responsibility": "The next slot to read, wrapping the same way; owned exclusively by the consumer.",
+      "notes": "The other half of the ownership split that makes the SPSC case lock-free."
+    },
+    {
+      "role": "Producer (enqueue / push)",
+      "responsibility": "Writes the item at the head, advances the head, and applies the capacity policy (overwrite oldest or refuse) when full.",
+      "notes": "Publishes the head with a release store so the item is visible before the head is."
+    },
+    {
+      "role": "Consumer (dequeue / pop)",
+      "responsibility": "Reads the item at the tail, advances the tail, and detects overrun (the consumer is faster) via the sequence numbers.",
+      "notes": "Acquires the head before reading so the item is guaranteed to be written."
+    },
+    {
+      "role": "Memory barrier / ordering (acquire, release)",
+      "responsibility": "Orders the item write before the head publish and the head read before the item read.",
+      "notes": "The component that is easy to omit and impossible to notice - it is the difference between a correct ring and one that occasionally reads garbage."
+    },
+    {
+      "role": "Capacity policy (overwrite / drop / block / count)",
+      "responsibility": "The stated behaviour when the buffer is full, and - for an observable stream - the overrun counter that lets the consumer detect data loss.",
+      "notes": "The design decision that makes this a pattern: 'what happens at capacity' is a requirement, not an implementation detail."
+    },
+    {
+      "role": "Padding / cache-line separation",
+      "responsibility": "Keeps the producer's and consumer's indices on separate cache lines so the writes do not ping-pong.",
+      "notes": "Non-obvious but required for real SPSC throughput on a cache-coherent machine."
+    }
+  ],
+  "suitable_scopes": [
+    "value",
+    "object",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "persistence-unit",
+    "message-flow"
+  ],
+  "use_cases": [
+    "Audio and DSP pipelines: the capture interrupt writes frames into a ring while the playback thread reads them, and when playback is late the oldest frames are overwritten - the classic real-time ring buffer where no allocation is permitted in the audio thread.",
+    "Embedded firmware with no heap: a static ring is the only bounded FIFO available, and the power-of-two capacity makes the wrap a mask.",
+    "Network stacks and protocol parsers: bytes accumulate in a ring as they arrive off a DMA descriptor and the parser consumes them, with the descriptor boundary as the wrap point.",
+    "Sensor sampling with a fixed history window: the ring keeps the last N samples so a reader can look back without a growing buffer, and the overwrite policy is the oldest-sample-wins semantic the application wants.",
+    "The single-producer single-consumer lock-free queue: a ring with a power-of-two mask and an acquire load of the opposite index plus a release store of one's own is the standard construction, and the kernel's own circular-buffer helpers document it.",
+    "Logging to a fixed-size in-memory window before it is flushed: the ring bounds the memory, and the overwrite policy is stated (and detectable by sequence number) rather than discovered as an OOM.",
+    "Keyboard and input buffering in firmware and low-level drivers: a small fixed ring decouples the interrupt that scans the hardware from the application that reads the keys.",
+    "JIT compiler backends and interpreters: a value stack, a call stack, or a register file modelled as a ring with a wrap bit is how the stack depth is bounded without moving memory."
+  ],
+  "avoid_when": [
+    "The producer and consumer rates are both known and one dominates consistently - a simple batch transfer or a direct call is simpler and faster than a ring.",
+    "Multiple producers or consumers are required - a ring becomes a concurrent queue with a lock or a CAS loop, which is a different and harder pattern; use a proper concurrent queue.",
+    "The capacity cannot be bounded up front - a growing ring has to reallocate, which defeats the no-allocation property that justified the pattern.",
+    "Arbitrary removal, reordering, or priority is needed - a ring offers only FIFO in the worst case (overwrite); use a heap or a deque for that.",
+    "The stream must be replayable or auditable - overwriting loses data silently, and a ring is the wrong structure for anything that must not lose an item.",
+    "The consumer is systematically slower than the producer and the loss is unacceptable - the ring is a lossy structure by design at capacity, so the fix is flow control, not a bigger ring.",
+    "You need a general-purpose thread-safe queue - use the platform's (BlockingQueue, Channel, crossbeam), which handle the multi-producer case correctly and where you do not have to reason about barriers.",
+    "The working set already fits comfortably in cache and the stream is not bursty - then a simple resizable deque is faster, having no wraparound arithmetic and no barriers."
+  ],
+  "pitfalls": [
+    "The full/empty ambiguity: head == tail is ambiguous, and resolving it by the wasted-slot trick means the effective capacity is size-1 - a test that pushes exactly size items and expects them all back will fail.",
+    "Missing the memory barriers: without an acquire load of the opposite index and a release store of one's own, the producer can advance the head before the item is written and the consumer reads uninitialised memory - a bug that passes every functional test and fails under a memory model checker.",
+    "Both indices on the same cache line: the producer's and consumer's writes ping-pong between cores and the lock-free ring is slower than a mutex-protected queue; pad them onto separate lines.",
+    "Overflow and underflow of the indices: a uint8_t head index overflows every 256 operations and silently corrupts the buffer; use a wider index or mask it consistently.",
+    "An unsigned index computing the parent/wrap arithmetic wrongly (a version of the priority-queue bug): the wrap must be (i + 1) & (size - 1) for a power of two, and a non-power-of-two size with a bitmask wraps wrongly.",
+    "Overwriting silently in a stream the application believes is lossless: the consumer must compare sequence numbers (or a produced/consumed counter) to detect the overrun, and if it does not, data is lost invisibly.",
+    "Assuming SPSC holds after refactoring: adding a second producer or consumer to a ring written for SPSC is a data race, and the barriers that made it correct are now insufficient.",
+    "Blocking or allocating in the producer path: a ring is chosen precisely because the producer cannot block or allocate (it may be an interrupt handler), and reintroducing either defeats the design."
+  ],
+  "paradigm": [
+    "data-oriented",
+    "concurrent"
+  ],
+  "scope": "value",
+  "provenance": [
+    "modern",
+    "game-programming"
+  ],
+  "related_patterns": [
+    "double-buffer",
+    "producer-consumer",
+    "careful-buffering",
+    "event-queue",
+    "lock-free-queue",
+    "lock-free-programming",
+    "cpu-atomic-operation",
+    "data-locality",
+    "object-pool",
+    "prefetching",
+    "priority-queue",
+    "immutability"
+  ],
+  "related_patterns_notes": {
+    "double-buffer": "The most easily confused neighbour, and the distinction is exact. A double buffer holds two complete instances and swaps a pointer so a reader sees a consistent snapshot while the writer fills the other - it is for atomic visibility of an incrementally built value. A circular buffer holds N partial items and recycles slots by moving an index - it is for a stream of items at a fixed memory cost. Page flipping is double buffering; an audio sample ring is circular.",
+    "producer-consumer": "The role the ring plays: the buffer between a producer and a consumer. The ring is the memory-efficient implementation of that buffer's storage; this catalog's producer-consumer pattern owns the decoupling and the backpressure, while the ring owns the fixed-size O(1) storage.",
+    "careful-buffering": "The bounded-buffer pattern owns the decision this record's capacity-policy participant implements: what happens when the buffer is full - block, reject, drop oldest, drop newest, coalesce. A ring's default (overwrite the oldest) is one of those choices, and it must be stated rather than defaulted to.",
+    "event-queue": "A FIFO queue of requests and notifications. A circular buffer is one efficient implementation of that queue's storage when the capacity is fixed and the memory must not grow; an event queue that must never lose an item needs a growing or blocking queue, not a ring.",
+    "lock-free-queue": "The generalised form: a lock-free queue handles multiple producers and consumers via CAS, which is harder and slower than the ring's per-side-owned indices. A ring is the SPSC special case where no CAS is needed - only a memory barrier - and is correspondingly faster.",
+    "lock-free-programming": "The ring in its SPSC form is the simplest instance of the discipline: two atomics, one barrier per side, no CAS loop and no retry. It is the right place to learn why the barriers are needed, because the algorithm is small enough to reason about exhaustively.",
+    "cpu-atomic-operation": "The acquire and release barriers on the indices are the substrate. Without them the ring is a data race; with them it is lock-free in the SPSC case. The relaxed-ordering counter and fetch-add variants are the same primitives in a different shape.",
+    "data-locality": "The reason the ring beats a linked list of nodes: the working set is a contiguous block with a repeating stride the hardware prefetcher follows, and the array-of-structs layout keeps each item's fields together so one cache line serves the whole item.",
+    "object-pool": "The same reclamation strategy at a different granularity: rather than freeing the nodes a lock-free structure removes, reuse them. A ring is an object pool with the free-list order made explicit by the index arithmetic.",
+    "prefetching": "The ring is the easiest prefetch target there is: the producer's next write slot and the consumer's next read slot are known addresses a few items ahead, so a prefetch of head+D ahead of the read pointer removes the cache miss on the very next iteration.",
+    "priority-queue": "The alternative when order matters rather than recency. A ring gives FIFO with overwrite-oldest semantics; a heap gives priority order with no overwrite, and the two are chosen for different problems (a stream versus a scheduler's frontier)."
+  },
+  "anti_patterns": [
+    "Implementing a circular buffer as a plain list with shift() on dequeue, which is O(n) per operation and reintroduces the shifting the wraparound was meant to avoid.",
+    "Using a ring with multiple producers or multiple consumers without adding the required atomics, which is a data race because the SPSC barrier scheme assumed single ownership of each index.",
+    "Omitting the acquire/release barriers between the item write and the head publish, so the consumer occasionally reads an unwritten slot - invisible in functional tests.",
+    "Sizing to a non-power of two and masking the wrap anyway, which wraps to the wrong index; a non-power-of-two size needs a real modulo.",
+    "Allowing the producer to overwrite in a stream the consumer treats as lossless, with no sequence number or overrun counter to detect the loss.",
+    "Putting the head and tail indices on the same cache line, so the 'lock-free' ring is slower than a mutex-protected queue under real contention.",
+    "Allocating or blocking in the producer, which is the one thing the ring exists to avoid when the producer is an interrupt handler or a real-time thread.",
+    "Reaching for a ring when a bounded blocking queue is needed, because a ring cannot block or signal - it can only overwrite or drop, and if neither is acceptable it is the wrong structure."
+  ],
+  "design_principles": [
+    "Fix the capacity and state the policy: a ring is a bounded, lossy-at-capacity structure, so what happens when it is full is a requirement that must be decided and made detectable, not a detail left to default.",
+    "Own your index: in the single-producer single-consumer case each side writes only its own index, which is what removes the lock, the CAS and the retry loop.",
+    "Order the data before the index: the item must be written before the head is published (release), and the head read before the item is read (acquire), or the ring is a race that functional tests will not catch.",
+    "Separate the cache lines: the two indices are written by different cores every operation, so putting them together makes the lock-free version slower than the locked one.",
+    "Exploit the power of two: a mask makes the wrap one AND instruction, and it is the reason the structure is O(1) rather than O(1)-plus-a-divide."
+  ],
+  "best_practices": [
+    "Size the capacity to a power of two so the wrap is (i + 1) & (size - 1) rather than a modulo; document the assumption in a comment so nobody sizes it to 1000 by hand.",
+    "Use the wasted-slot convention (one slot always empty) or an explicit count to disambiguate full from empty, and document which - the off-by-one is the most common ring bug.",
+    "Place the acquire load of the opposite index before reading the item and the release store of your own index after writing it; these two barriers are the correctness of the SPSC ring.",
+    "Pad the head and tail indices onto separate cache lines (alignas / padding fields) if the ring is shared between cores, or the ping-pong dominates and a mutex wins.",
+    "Add sequence numbers (or a produced/consumed counter) when the consumer must detect that the producer overran, and have the consumer compare them - silent overwrite is data loss.",
+    "Never allocate, never block, and never take a lock in the producer path if the producer is an interrupt handler or a real-time thread; that is the constraint the ring exists to satisfy.",
+    "Reserve the array once at construction and size it for the worst-case burst, not the average; there is no growth path in this structure.",
+    "Test the wraparound exhaustively: push more than capacity, pop more than pushed, interleave push/pop in every order, and assert the overrun counter - the arithmetic is simple enough to test exhaustively, which is a rarity among concurrency patterns.",
+    "In a signal-processing context, give the indices a wider type than a byte (a uint8_t head wraps every 256 operations and silently corrupts the buffer).",
+    "Consider a double-buffer instead when the requirement is 'readers see a consistent snapshot of an incrementally built value' rather than 'consume a stream of items at fixed memory'."
+  ],
+  "sources": [
+    "Linux kernel documentation, 'Circular Buffers' - the canonical two-part treatment: the power-of-two macros (CIRC_SPACE, CIRC_CNT, CIRC_SPACE_TO_END) that replace a modulus with a mask, and the single-producer single-consumer memory-barrier recipe (smp_load_acquire of the opposite index before reading, smp_store_release of one's own index after writing) that removes both the shared lock and the atomic counters. https://docs.kernel.org/core-api/circular-buffers.html",
+    "Michael and Scott, 'Fast Concurrent Queue Algorithms' (Rochester pseudocode) - the non-blocking queue that generalises the ring to multiple producers and consumers with CAS on head and tail, which is exactly what the single-producer ring avoids; the note that the algorithm requires a universal atomic primitive and a memory-management scheme. https://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html",
+    "Bender, Demaine, Farach-Colton, 'Probing a git tree into a fixed-size buffer' / Wikipedia, 'Circular buffer' - the fixed-capacity ring with wraparound indexing, the head/tail/full/empty state machine, and the overwrite-versus-block capacity policy. https://en.wikipedia.org/wiki/Circular_buffer",
+    "Intel Optimization Zone, 'Hardware Prefetch Tuning' - why a ring is the ideal prefetch target (a repeating stride the hardware prefetcher locks onto) and why adding prefetches past the line-fill buffers can stall rather than help. https://github.com/intel/optimization-zone/blob/main/hardware/HWPrefetchTuning/README.md"
+  ],
+  "language_files": {
+    "generic": "circular-buffer.generic.json",
+    "c": "circular-buffer.c.json",
+    "cplusplus": "circular-buffer.cplusplus.json",
+    "csharp": "circular-buffer.csharp.json",
+    "go": "circular-buffer.go.json",
+    "java": "circular-buffer.java.json",
+    "javascript": "circular-buffer.javascript.json",
+    "kotlin": "circular-buffer.kotlin.json",
+    "python": "circular-buffer.python.json",
+    "ruby": "circular-buffer.ruby.json",
+    "rust": "circular-buffer.rust.json",
+    "scala": "circular-buffer.scala.json",
+    "swift": "circular-buffer.swift.json",
+    "typescript": "circular-buffer.typescript.json"
+  },
+  "version": "1.0"
+}

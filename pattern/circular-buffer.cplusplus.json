@@ -1,0 +1,20 @@
+{
+  "pattern": "circular-buffer",
+  "language": "cplusplus",
+  "support": "manual",
+  "implementation_notes": "C++20 gives std::atomic<T>::wait and notify_one/notify_all, which turn the spin-wait on head/tail into a blocking wait - useful when the ring is the generalisation of a blocking bounded queue. But the high-performance answer is a hand-written SPSC ring with std::atomic indices (acquire/release) and no virtual dispatch, often using a power-of-two mask and alignas on the indices. boost::circular_buffer is the general-purpose library version (dynamic, thread-safe with an optional locking policy, with iterator invalidation documented) and is the right choice when the ring must be resizable or when arbitrary iteration is needed; the hand-written one is for a fixed-size, allocation-free, real-time path. Note that std::atomic's wait requires a value-change notification, so a naive index-wait ring can miss a transition - the classic lost-wakeup in a ring-based queue.",
+  "idiom_name": "hand-written SPSC ring with std::atomic indices (or boost::circular_buffer for the general dynamic case)",
+  "code_sketch": "#include <atomic>\n#include <cstddef>\n#include <memory>\n\ntemplate <class T, std::size_t N>   // N must be a power of two\nclass SpscRing {\n    static_assert((N & (N - 1)) == 0, \"capacity must be a power of two\");\n    T buf_[N];\n    alignas(64) std::atomic<unsigned> head_{0};   // producer-owned, own cache line\n    alignas(64) std::atomic<unsigned> tail_{0};   // consumer-owned, own cache line\npublic:\n    // push: write the item, THEN publish the head with release.\n    bool push(T v) {\n        const auto h = head_.load(std::memory_order_relaxed);\n        const auto t = tail_.load(std::memory_order_acquire);\n        if (h - t == N) return false;                   // full: policy is 'refuse'\n        buf_[h & (N - 1)] = v;\n        head_.store(h + 1, std::memory_order_release);  // release: item before head\n        return true;\n    }\n    bool pop(T& out) {\n        const auto t = tail_.load(std::memory_order_relaxed);\n        const auto h = head_.load(std::memory_order_acquire);\n        if (h == t) return false;                       // empty\n        out = buf_[t & (N - 1)];\n        tail_.store(t + 1, std::memory_order_relaxed);\n        return true;\n    }\n};\n// boost::circular_buffer is the general (dynamic, optionally locking) alternative.",
+  "pitfalls": [
+    "head - tail == N as the full test assumes indices wrap only modulo N; with a power-of-two mask and monotonic counters this is correct, but a reader who masks head itself will break it.",
+    "The head must be published with release AFTER the item write, and the tail must be acquired BEFORE the item read - reversing either is the classic bug.",
+    "alignas(64) on each index: they are written by different cores every operation and sharing a line makes the lock-free ring slower than a mutex.",
+    "std::atomic::wait can lose a notification if the value changed between the load and the wait - a fixed-size ring is usually simpler without wait/notify than with it.",
+    "boost::circular_buffer invalidates iterators on resize and its thread-safety is opt-in via a locking policy - read the docs before using it as a drop-in."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/atomic/atomic",
+    "https://www.boost.org/doc/libs/release/libs/circular_buffer/doc/index.html"
+  ],
+  "version": "1.0"
+}

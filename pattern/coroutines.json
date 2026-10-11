@@ -1,0 +1,212 @@
+{
+  "category": "concurrency-resilience",
+  "name": "coroutines",
+  "aliases": [
+    "suspendable computation",
+    "stackful coroutine",
+    "stackless coroutine",
+    "fiber",
+    "green thread",
+    "async/await runtime"
+  ],
+  "intent": "Let a function suspend partway through, keeping its own state, and resume it later - possibly from a different thread or after an arbitrary delay - so long sequences of asynchronous waits are written as straight-line code instead of nested callbacks.",
+  "problem": "Waiting for I/O is not computation, but a thread blocked on a read is a thread that costs a stack, a kernel entry and a scheduler slot while doing nothing. At scale that is unaffordable, so asynchronous work moves to callbacks and the linear control flow of the program is destroyed: a request handler that must fetch a user, then their orders, then each order's items becomes three nested callbacks, the early-return path becomes a callback that must remember to skip the rest, and try/except no longer spans the sequence. The alternatives all cost something - a thread per request, or a callback pyramid that no one can read or debug.",
+  "context": "Applies wherever a computation is a long sequence of waits - a request handler issuing hundreds of service calls, a producer consuming from several sockets, a consumer streaming rows from a database while writing them out, a UI that awaits several loads concurrently, a game loop that awaits input and animation. It is the mechanism behind async/await, Kotlin's suspend functions, C#'s Task-based async, Python's asyncio coroutines, JavaScript's Promise chains, and Go's goroutines. The decision is stackful versus stackless - and that choice determines whether suspending can happen at any call depth or only in a function that was declared suspend, which is the 'function colouring' problem the Go ecosystem's design was built to avoid.",
+  "benefits": [
+    "Straight-line code for asynchronous work: await points read as sequential statements, and try/except, loops and early returns work across the whole sequence instead of being flattened into nested callbacks.",
+    "Low cost per pending operation: a suspended coroutine holds only its state, so hundreds of thousands of them cost far less than the equivalent threads, and the memory scales with the work in flight rather than with the concurrency.",
+    "Composing waits becomes ordinary composition: 'do these four things concurrently and wait for all' is a combinator (gather/all/future), not four callbacks with a counter.",
+    "Cancellation and timeouts are structural rather than bolted on: the cancellation signal or the timer suspends the coroutine, and the unwinding runs the same cleanup code a return would.",
+    "The scheduler decides the concurrency: thousands of coroutines multiplexed on a small thread pool get automatic load balancing, because a coroutine that blocks on I/O frees its thread to run another.",
+    "Stackful coroutines avoid function colouring: an ordinary non-suspend function deep in a call stack can suspend without the whole chain being declared async, which is exactly why Go's goroutines and Java virtual threads are stackful."
+  ],
+  "tradeoffs": [
+    "Stackless coroutines propagate the 'async' colour up the call chain: a suspend function that calls a suspend function must itself be suspend, the standard library must keep a blocking and an async version of each I/O call, and the two cannot be freely interchanged - which is the 'function colouring' problem and its cost in API surface and confusion.",
+    "The suspension points are implicit control flow: an await is a possible resumption, so the code between two awaits is not ordinary code - a `try` around it, a callback inside it, or a shared mutable variable all become subtle to reason about.",
+    "A coroutine that blocks a thread (a synchronous read inside a suspend function) defeats the whole point and can deadlock a bounded dispatcher when every thread is blocked on work that needs a thread - the classic Dispatchers.IO starvation.",
+    "Debugging is harder: the stack trace of a coroutine shows the resumption path, not the logical call chain, and a cancelled coroutine disappears from a thread dump entirely; 'the coroutine is just gone' is a distinctive failure mode.",
+    "Cancellation is cooperative and therefore leaky: a suspend function that ignores the cancellation signal, or a cleanup in a finally that itself suspends forever, keeps the work and its resources alive after cancellation.",
+    "The context switches have a cost: every resumption is a scheduler operation, so a coroutine that suspends millions of times for cheap work is slower than the equivalent blocking loop.",
+    "Stackful coroutines are more expensive to create (an independent stack, often kilobytes) and to reason about than stackless ones, and switching between them (a stackful coroutine awaiting a stackless callback) can reintroduce stack growth or pinning.",
+    "Structured-ness is not free: an un-awaited coroutine launched into the global scope is a leak that outlives its request, and the discipline (structured concurrency) has to be imposed deliberately because the language lets you opt out."
+  ],
+  "quality_attributes": {
+    "testability": 7,
+    "extensibility": 8,
+    "maintainability": 8,
+    "simplicity": 7,
+    "performance": 8,
+    "reliability": 8,
+    "security": 6,
+    "scalability": 10,
+    "type_safety": 7,
+    "observability": 4
+  },
+  "quality_attributes_note": "Scalability is the reason the pattern exists - thousands or millions of in-flight operations on a few threads - and it is the only axis where it decisively beats the thread-per-request alternative. Observability is the weak point: a suspended coroutine has no thread, so it does not appear in a thread dump, and its stack trace shows the resumption path rather than the logical call chain.",
+  "participants": [
+    {
+      "role": "Coroutine body (suspend function / async function / task)",
+      "responsibility": "The straight-line code with suspension points; its locals live across a suspension in the coroutine's state.",
+      "notes": "Between two suspension points it is ordinary code; across them it is not."
+    },
+    {
+      "role": "Suspension point (await / yield / park)",
+      "responsibility": "Saves the execution state and returns control to the scheduler until the awaited event completes.",
+      "notes": "The stackless form must re-enter at exactly this point, which is why the compiler generates the state machine."
+    },
+    {
+      "role": "Coroutine state (continuation / frame)",
+      "responsibility": "The saved locals, the resume point, and the operands needed to continue - heap-allocated in the stackless form, an independent stack in the stackful form.",
+      "notes": "This is what a suspended coroutine costs in memory, and why stackful ones are heavier."
+    },
+    {
+      "role": "Scheduler / event loop / dispatcher",
+      "responsibility": "Decides which suspended coroutine to resume and on which thread, and owns the multiplexing of many coroutines onto few threads.",
+      "notes": "Its policy (fairness, thread pool sizing, work-stealing) is where the throughput comes from."
+    },
+    {
+      "role": "Completion handle (Future / Task / Job / DeferredChannel)",
+      "responsibility": "The awaitable value that represents 'the result of this coroutine', combinable with other handles (all, race, timeout).",
+      "notes": "Turning a coroutine into a combinable handle is what makes concurrent composition ordinary code."
+    },
+    {
+      "role": "Cancellation signal (scope / Job / Context / token)",
+      "responsibility": "Signals that the work should stop, so every suspension point can unwind rather than being abandoned.",
+      "notes": "It is cooperative: it only takes effect at a suspension point that checks it."
+    },
+    {
+      "role": "Dispatcher / thread pool",
+      "responsibility": "The threads coroutines run on; a blocking call inside a coroutine occupies one of them.",
+      "notes": "Mismatching the dispatcher (CPU work on the I/O pool, or a blocking read on a single-thread pool) is the characteristic deadlock."
+    }
+  ],
+  "suitable_scopes": [
+    "task-lifetime",
+    "module"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "boundary",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Request handlers that fan out to dozens of downstream services: each await reads as a sequential statement, and the whole handler is one function with ordinary try/catch around it.",
+    "Database access: a query's rows are streamed to the client as they arrive rather than buffered, so a large result does not have to fit in memory.",
+    "Concurrent fan-out: 'issue these N calls and use whichever finishes first' (a hedged request, a timeout race) is a combinator over completion handles rather than callback bookkeeping.",
+    "Producer/consumer pipelines where each stage suspends on a queue and thousands of items are in flight on a few threads.",
+    "GUI responsiveness: a UI thread runs the event loop and the coroutines, so a long sequence of loads suspends instead of freezing the window.",
+    "Go goroutines: stackful coroutines with a growable stack, which is why any Go function can block at any depth and why there is no async keyword and no async/sync split in the standard library.",
+    "Java virtual threads (Loom): stackful continuations mounted on carrier platform threads, giving thread-like code with carrier-thread scalability.",
+    "Compilers and interpreters written in a host language: a parser or evaluator can yield at a suspension point and be driven step by step, which is how resumable parsing is implemented.",
+    "Generators and async iteration: a coroutine that yields each element is exactly a producer whose consumer pulls one item at a time."
+  ],
+  "avoid_when": [
+    "The work is not actually concurrent - a coroutine that never suspends (or suspends only to compute) is slower than a plain function and adds a scheduling hop per await.",
+    "The concurrency is CPU-bound: coroutines multiplex I/O waits, not CPU work; for that, use real threads or processes.",
+    "A synchronous library is required and there is no blocking-bridge - a coroutine blocked on a synchronous call occupies a thread and can deadlock a bounded dispatcher; find or write a suspending version.",
+    "The sequence is short (two or three operations) - the callback or future chain is not worse and has fewer moving parts.",
+    "You need a real thread's identity, thread-local state or preemption semantics - a coroutine migrates between threads and has no stable identity unless you arrange for one.",
+    "Deeply recursive algorithms that need the native stack: a stackful coroutine has its own bounded stack, and a runaway recursion inside it still overflows that stack.",
+    "The runtime's coroutine model does not fit the language's control flow - for example, blocking code in a single-threaded event-loop language with no way to yield to it.",
+    "There is no cancellation discipline available and the operation is long: an un-cancellable coroutine outlives its request and is exactly the leak this pattern is meant to avoid."
+  ],
+  "pitfalls": [
+    "Blocking a dispatcher thread: a synchronous read, a CPU-heavy loop, or a Mutex held across an await occupies a pool thread and can deadlock a bounded pool where every thread is waiting for work that needs a thread.",
+    "Forgetting the async colour propagates: in a stackless runtime, calling a suspend function from a non-suspend one is a compile error precisely because the caller must be able to suspend - do not work around it by blocking.",
+    "Launching into the global scope: an un-awaited coroutine outlives its request, leaks its resources, and is invisible to cancellation - always give it a scope.",
+    "Swallowing cancellation: a broad catch that treats CancellationException as an ordinary error leaves the coroutine running after it was cancelled, and the leak is hard to see.",
+    "Suspending inside a finally or a cleanup path: a suspending cleanup that is itself cancelled deadlocks, and a cleanup that never completes leaks the resource the cancellation was supposed to release.",
+    "Assuming the coroutine's thread: a coroutine resumes on whatever thread completes its await, so thread-local state (a transaction, a security context, a database session) is not automatically carried across a suspension - that is why scoped context propagation exists.",
+    "Deep recursion inside a stackful coroutine: the coroutine's own stack is bounded and a runaway recursion overflows it just as it would a thread stack.",
+    "Millions of suspensions in a tight loop: every await is a scheduler round trip, so a coroutine that suspends on a non-blocking operation in a hot loop is slower than the blocking equivalent."
+  ],
+  "paradigm": [
+    "concurrent",
+    "functional"
+  ],
+  "scope": "task-lifetime",
+  "provenance": [
+    "modern",
+    "language-idiom"
+  ],
+  "related_patterns": [
+    "structured-concurrency",
+    "generator",
+    "active-object",
+    "future-promise",
+    "cancellation-token",
+    "actor",
+    "channels",
+    "thread-pool",
+    "event-driven-consumer",
+    "proactor",
+    "reactor",
+    "asynchronous-completion-token",
+    "trampoline",
+    "lock-free-programming"
+  ],
+  "related_patterns_notes": {
+    "structured-concurrency": "The lifetime discipline, not the mechanism. Coroutines are how a computation suspends; structured concurrency is the rule that its children cannot outlive it and that failure or cancellation propagates to the whole tree. The two are designed together - a coroutine launched into a global scope breaks the discipline, which is why every serious runtime pairs the two.",
+    "generator": "A coroutine restricted to producing a sequence: it suspends only to yield the next element and resumes on the consumer's request. The general coroutine can suspend for any reason (I/O, a timer, another coroutine) and resume on a different thread; a generator's resumption is always the pull. Same suspension machinery, much narrower purpose.",
+    "active-object": "The actor variant of the same idea - a proxy turns a call into a request placed on an activation queue and the servant runs it on a serialized context, which is the 'one coroutine per object' form. Coroutines are the general mechanism; active-object is a specific architecture built on it.",
+    "future-promise": "A future is the handle a coroutine completes; the coroutine is the work that produces it. Composing coroutines through handles (all, race, timeout) is what makes concurrent fan-out ordinary code rather than callback nesting.",
+    "cancellation-token": "The mechanism a coroutine's suspension points check to unwind. Cancellation is cooperative and only effective at a suspension point, which is exactly why a coroutine that never suspends cannot be cancelled - the token alone is not enough.",
+    "actor": "An actor is often implemented as a coroutine per actor with a mailbox, processing one message per turn. The coroutine provides the cheap serialised turn; the actor provides the isolation discipline.",
+    "channels": "The hand-off primitive: a coroutine suspends on a channel send when the buffer is full and on a receive when it is empty, so the channel is what makes a producer and a consumer suspend rather than spin. Go's goroutines plus channels is the pairing the pattern's history produced.",
+    "thread-pool": "The other way to multiplex work onto few threads. Coroutines suspend voluntarily (only at suspension points); pool threads block. Coroutines are for I/O-bound waits, threads for CPU-bound work, and mixing them without a size separation is the classic deadlock.",
+    "trampoline": "The driver loop underneath a stackless runtime: the scheduler interprets the state machine's steps in a loop rather than recursing, which is why a chain of awaited operations does not grow the stack."
+  },
+  "anti_patterns": [
+    "Blocking inside a coroutine: a synchronous read or a CPU-bound loop occupies a dispatcher thread and deadlocks a bounded pool under load.",
+    "Launching into the global scope and dropping the handle, so the work outlives the request and is invisible to cancellation.",
+    "Catching CancellationException as an ordinary error and swallowing it, so a cancelled coroutine keeps running and its resources are never released.",
+    "Treating a coroutine's thread as stable and using thread-local state (a transaction, a security context) across a suspension, without an explicit context propagation mechanism.",
+    "Awaiting in a tight loop to 'avoid blocking' - millions of scheduler round trips are slower than the blocking equivalent for cheap operations.",
+    "Suspending inside a finally block, where a cancelled cleanup deadlocks and an uncancellable cleanup leaks the resource cancellation was meant to release.",
+    "Wrapping every coroutine in a try/catch that logs and continues, turning cancellation and real failures into the same silent log line and hiding the failure.",
+    "Using one event-loop thread for CPU-bound coroutines and blocking I/O, so a single slow operation stalls everything multiplexed onto it."
+  ],
+  "design_principles": [
+    "Suspend only at points that can actually wait: every suspension is a resumption point, and code between them should stay pure so it can be reasoned about (and tested) as ordinary code.",
+    "Never block the carrier: a coroutine's thread belongs to the pool, and occupying it with a synchronous operation converts a scalability mechanism into a deadlock.",
+    "Own the lifetime: a coroutine belongs to a scope, and the scope's cancellation, its failure and its exit must reach it - an un-scoped coroutine is a leak.",
+    "Let cancellation propagate: treat it as a control signal, not an error, and make every resource-holding path unwind through it.",
+    "Choose stackful or stackless deliberately: stackful removes the function-colouring problem and costs memory per instance; stackless is cheap and forces the colour to propagate."
+  ],
+  "best_practices": [
+    "Give every coroutine a scope (a structured scope / Job / Context) and never launch into the global scope; the scope is what makes cancellation and cleanup reach the work.",
+    "Do not block inside a coroutine: use the suspending I/O API, or isolate the blocking call in a bounded dispatcher dedicated to blocking work (Dispatchers.IO / a fixed blocking pool).",
+    "Keep CPU-bound work off the event-loop dispatcher: dispatch it to a pool sized to the cores, so it does not starve the I/O loop.",
+    "Propagate context explicitly across a suspension if the work needs a transaction, a security principal or a database session - a coroutine resumes on a different thread and thread-locals do not travel.",
+    "Make cancellation cooperative and observable: check the cancellation signal at suspension points and in long loops, and log cancellation distinctly from failure.",
+    "Keep the code between two suspension points pure and side-effect-free, so it can be tested as ordinary code and reasoned about without modelling the scheduler.",
+    "Prefer stackful (Go-style) where the language offers it: it removes the function-colouring problem and lets any function suspend at any depth without an async keyword.",
+    "Bound the concurrency: a coroutine per request with no limit is still a scalability problem if each holds a connection; cap in-flight work explicitly.",
+    "Test cancellation paths explicitly - a test that cancels mid-sequence and asserts the cleanup ran is the test that catches the leak this pattern's tradeoffs describe.",
+    "Use structured concurrency for concurrent fan-out (a scope with N children) rather than launching N coroutines and awaiting them all, so a failure in one cancels the rest."
+  ],
+  "sources": [
+    "golang.design, 'The MPG Model and the Units of Concurrent Scheduling' - the stackful-versus-stackless and symmetric-versus-asymmetric taxonomy, the 'function-coling problem' (a function that wants to suspend internally must itself be async, and the colour spreads up the call chain), and the table placing Go goroutines and Java virtual threads as stackful and Kotlin coroutines as stackless CPS state machines. https://golang.design/under-the-hood/en/part3concurrency/ch09sched/mpg/",
+    "cppreference.com, 'Coroutines (C++20)' - the normative definition (a coroutine can suspend and be resumed, storing the resume state separately from the stack), the promise/handle/state triple, and the await_suspend protocol including returning a coroutine_handle for symmetric transfer. https://en.cppreference.com/cpp/language/coroutines",
+    "WG21, 'P2583R1: Symmetric Transfer and Sender Composition' - the stack-growth analysis of coroutine chains (O(N) frames without symmetric transfer, O(1) with it) and the interaction with the sender/receiver model, which is the current state of the art for composable asynchronous code in C++. https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2026/p2583r1",
+    "Kotlin documentation, 'Coroutines overview' and 'suspend functions' - structured concurrency as the organising principle, the scope that bounds a coroutine's lifetime, and the compile-time transformation of a suspend function into a continuation-passing state machine. https://kotlinlang.org/docs/coroutines-overview.html",
+    "Moura and Ierusalimschy, 'Lua 5.3 reference manual / coroutines' and the Go runtime's chan.go - the stackful asymmetric lineage (Lua's coroutine.resume/yield) that the goroutine descends from, with the runtime suspending a whole Go stack at any call depth via a saved register set. https://go.googlesource.com/go/+/refs/heads/master/src/runtime/chan.go"
+  ],
+  "language_files": {
+    "generic": "coroutines.generic.json",
+    "c": "coroutines.c.json",
+    "cplusplus": "coroutines.cplusplus.json",
+    "csharp": "coroutines.csharp.json",
+    "go": "coroutines.go.json",
+    "java": "coroutines.java.json",
+    "javascript": "coroutines.javascript.json",
+    "kotlin": "coroutines.kotlin.json",
+    "python": "coroutines.python.json",
+    "ruby": "coroutines.ruby.json",
+    "rust": "coroutines.rust.json",
+    "scala": "coroutines.scala.json",
+    "swift": "coroutines.swift.json",
+    "typescript": "coroutines.typescript.json"
+  },
+  "version": "1.0"
+}

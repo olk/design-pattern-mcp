@@ -1,0 +1,205 @@
+{
+  "category": "specialized-components",
+  "name": "prefetching",
+  "aliases": [
+    "software prefetch",
+    "read-ahead",
+    "cache prefetch",
+    "spatial prefetch",
+    "temporal prefetch"
+  ],
+  "intent": "Issue the load or the request for data before the code actually needs it, so the memory latency is overlapped with useful work instead of being paid as a stall on the critical path - turning a serial chain of dependent misses into parallel ones.",
+  "problem": "The hardware prefetcher only recognises simple, regular access patterns (strides, contiguous runs) and it looks several cache lines ahead along one stream. Real workloads break it: pointer-chasing in a tree or graph, an index lookup whose node is in memory, a second access pattern interleaved with the first, a random offset into a large array. Each such miss stalls the core for the full latency - hundreds of cycles for DRAM - and the stall cannot be hidden because the very next instruction needs the value. Issuing the load earlier, to an address the program already knows, is the only way to convert that serial latency into memory-level parallelism.",
+  "context": "Applies where a memory access's address is computable well before the access is issued and the data is genuinely about to be used: pointer-chasing in a B+tree or a linked structure, hash-table probing, matrix and graph traversal with known strides, streaming over a mapped file, prefaulting pages before touching them, and the next element of a work queue. It also covers the OS-level analogues - readahead for sequential file I/O, madvise hints, and posix_fadvise - and the branch-prediction analogue of telling the processor which way a branch will go. It does not apply when the address is genuinely unknown at that point, when the data will not be used (speculative prefetch wastes bandwidth and pollutes the cache), or when the bottleneck is compute rather than memory.",
+  "benefits": [
+    "Latency hiding rather than latency reduction: the miss still costs the same, but it is issued far enough ahead that the memory system fetches it in parallel with other work, so the stall is amortised to near zero.",
+    "Memory-level parallelism: several independent misses can be in flight at once (limited only by the fill buffers), which is the one way to raise throughput on a latency-bound workload - more cores do not help a single dependent chain.",
+    "It composes with layout rather than replacing it: prefetching fixes the accesses that data-locality cannot arrange into a regular pattern, so the two techniques are complementary rather than alternatives.",
+    "Applies below the application: page-faulting a region up front removes the storm of minor faults from the middle of a latency-sensitive section, and readahead turns random small reads into large sequential ones.",
+    "Little code: a prefetch hint is a single statement, and the benefit is measured directly in stall cycles - so it is one of the highest ratio of payoff to effort optimisations available.",
+    "Where there are no spare cycles to hide the latency - tight dependency chains, SIMD loops, hard real-time sections - prefetching is the only remaining lever, because the hardware cannot do it."
+  ],
+  "tradeoffs": [
+    "It is a hint with no guarantee: the processor may ignore it, may drop it when the fill buffers are full, and may evict a line that would have been useful, so the same code can help or hurt on different microarchitectures.",
+    "Prefetching data that is never used is pure waste: it consumes bandwidth, occupies a fill buffer, and pollutes the cache with lines that evict useful ones. This is the failure mode of speculative prefetching.",
+    "Aggressive prefetching can push the system past the memory bandwidth knee, where added load increases latency for everyone rather than hiding it - the reason production prefetchers are throttled by queue occupancy.",
+    "Placement is the whole problem: issued too close to the use, the line has not arrived; issued too far ahead, it is evicted before use; and in a branchy loop the wrong path's addresses get prefetched.",
+    "The instruction inhibits vectorisation: putting prefetches inside an inner loop stops the compiler from vectorising it, so the prefetch must sometimes be hoisted or the loop restructured.",
+    "The access must be addressable ahead of time, which rules out the common case of 'load a pointer, follow it': the code must be able to name the address before dereferencing, which often means reading the pointer first and prefetching the target - a two-phase pattern that adds a load.",
+    "Different CPUs implement the locality hints differently - T2 prefetching to L1 on one part and to L3 on another - so a tuned locality level can be wrong on the next part, and prefetching reliability (strong versus weak) varies.",
+    "It is invisible in the source's meaning: a prefetch statement is a statement about performance that a reviewer cannot verify, and removing it as 'noise' silently costs the latency it was hiding."
+  ],
+  "quality_attributes": {
+    "testability": 3,
+    "extensibility": 6,
+    "maintainability": 5,
+    "simplicity": 6,
+    "performance": 10,
+    "reliability": 6,
+    "security": 5,
+    "scalability": 7,
+    "observability": 3
+  },
+  "quality_attributes_note": "Performance is the entire point, and the score is 10 because on a latency-bound loop prefetching is the difference between stalling and streaming. Testability and observability are the lowest of any pattern in this batch: a prefetch is a hint with no observable contract, so its effect shows only in counters (cache-miss and stall-cycle events) that must be measured with a profiler on specific hardware.",
+  "participants": [
+    {
+      "role": "Prefetch hint (instruction / intrinsic)",
+      "responsibility": "Asks the cache to begin fetching a given address, with a read/write flag and a locality level.",
+      "notes": "A hint: the processor may ignore it entirely."
+    },
+    {
+      "role": "Locality hint (L1 / L2 / L3 / non-temporal)",
+      "responsibility": "Says how long the line will be reused, which maps to a specific cache level and eviction policy.",
+      "notes": "Interpretations differ between CPUs - T2 reaches L1 on one part and L3 on another."
+    },
+    {
+      "role": "Accessor (the consumer)",
+      "responsibility": "The load that will actually use the prefetched line; the prefetch is only useful if this access happens.",
+      "notes": "The distance between the prefetch and this load is the tuning parameter."
+    },
+    {
+      "role": "Fill buffer / miss queue",
+      "responsibility": "The finite hardware resource tracking in-flight fetches; a full queue drops the prefetch or stalls the core.",
+      "notes": "This is why prefetching too much is worse than prefetching too little."
+    },
+    {
+      "role": "Address derivator (software)",
+      "responsibility": "Computes the address far enough ahead to make the prefetch worthwhile, often requiring a separate read of the pointer that will be dereferenced.",
+      "notes": "The real work in the pattern: the prefetch is trivial, the address computation is not."
+    },
+    {
+      "role": "Page / readahead hint (madvise, fadvise)",
+      "responsibility": "The OS-level analogue - tell the kernel a range will be accessed soon so pages are faulted in or read ahead.",
+      "notes": "Faults, not cache misses, are the latency to hide at this level."
+    },
+    {
+      "role": "Branch hint (__builtin_expect, likely)",
+      "responsibility": "The prediction analogue: tell the processor which path is likely so the pipeline speculates correctly.",
+      "notes": "A hint too, with the same property of being ignorable."
+    }
+  ],
+  "suitable_scopes": [
+    "module",
+    "value"
+  ],
+  "unsuitable_scopes": [
+    "boundary",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "B+tree and hash index traversal: prefetching the node that the just-read pointer points to overlaps the DRAM latency of the next level with the comparison work of the current one.",
+    "Matrix and image processing: the address of row i+1 is known from the stride, so a prefetch one or two rows ahead streams the data while the current row computes.",
+    "Sequential file I/O: posix_fadvise(POSIX_FADV_WILLNEED) or readahead turns many small reads into large sequential ones, and the kernel's own readahead is what makes streaming fast.",
+    "Page prefaulting: madvise(MADV_WILLNEED) or touching every page of a region up front removes a storm of minor faults from a latency-sensitive section - the classic reason to prefault before a benchmark or a GC pause.",
+    "Streaming over a mapped file with a known stride, where the hardware prefetcher may not engage (large strides, or an access pattern it does not lock onto).",
+    "Hash table probing: the bucket address is computable from the key before the load, so a prefetch removes the dominant miss in an open-addressed table.",
+    "Tight SIMD and dependency-chain loops where the hardware prefetcher cannot help because the access is indirect - prefetch is the only lever, and it may need to be hoisted out of the loop to preserve vectorisation.",
+    "Coroutine- or task-based traversal that interleaves several independent traversals, so each one's misses overlap the others' compute - the pattern the B+tree research uses to hide latency without changing the algorithm.",
+    "Branch prediction hints (__builtin_expect, [[likely]]): telling the processor the common path removes a misprediction penalty, which on modern CPUs is comparable to a cache miss."
+  ],
+  "avoid_when": [
+    "The access pattern is already regular and contiguous - the hardware prefetcher handles strides and sequential runs better than any hand-placed hint, and manual prefetching usually makes it worse.",
+    "The data will not be used - a prefetch that is never followed is wasted bandwidth and a cache pollute, and speculative prefetching that overshoots the fill buffers actively hurts.",
+    "The address is not known ahead of time - prefetching a pointer requires first loading the pointer, and if even that is dependent, there is nothing to prefetch.",
+    "The bottleneck is compute, not memory - a prefetch cannot make arithmetic faster, and the extra instruction competes for issue slots.",
+    "The loop can be vectorised but the prefetch is inside it - the hint inhibits vectorisation; hoist the prefetch or restructure before giving up the wider type.",
+    "The system is already at the memory bandwidth knee - adding prefetch traffic increases DRAM latency for every other consumer; measure aggregate bandwidth before adding more.",
+    "The code is portable and the win is unmeasured - locality hints are not portable across microarchitectures, so an unmeasured prefetch is a maintenance liability.",
+    "The working set already fits in cache - prefetching a cached line is a wasted instruction and can evict the lines that were actually hot."
+  ],
+  "pitfalls": [
+    "Too close: a prefetch issued immediately before the load does not arrive in time, and the stall is paid anyway plus the instruction's cost.",
+    "Too far ahead: the line arrives, is evicted by the intervening streaming traffic, and the load misses again - worse than not prefetching.",
+    "The wrong-path prefetch in a branchy loop: the addresses on the untaken branch are fetched, polluting the cache and consuming bandwidth for data never used.",
+    "Fill-buffer saturation: issuing more concurrent prefetches than there are line-fill buffers causes drops or stalls, and the strongest-reliability CPUs turn that into a stall with no benefit - the research recommends capping speculative prefetches to roughly the fill-buffer size.",
+    "Prefetching inside an inner loop and killing vectorisation: the compiler cannot vectorise a loop containing a prefetch, so the prefetch must sometimes be lifted out of the loop.",
+    "Assuming the locality level is portable: T0, T1 and T2 map to different cache levels on different vendors, so a tuned T2 may prefetch to L3 on one part and L1 on another.",
+    "Forgetting the prefetch is a hint: a compiler is free to eliminate a prefetch it considers redundant, so a prefetch that a later optimisation removes takes the win with it.",
+    "The OS analogue applied too broadly: madvise(MADV_WILLNEED) on a large range can be expensive, can return ENOMEM, and does not guarantee the pages are resident - it is advice, not a guarantee."
+  ],
+  "paradigm": [
+    "data-oriented",
+    "procedural"
+  ],
+  "scope": "module",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "data-locality",
+    "caching",
+    "page-cache",
+    "copy-on-write",
+    "object-pool",
+    "double-buffer",
+    "circular-buffer",
+    "cache-aside",
+    "inline-functions",
+    "lazy-collection",
+    "lock-free-programming",
+    "immutable-object"
+  ],
+  "related_patterns_notes": {
+    "data-locality": "The primary partner and the technique that comes first. Data-locality arranges memory so the hardware prefetcher and the cache can work; prefetching is for the accesses that arrangement cannot fix - indirect, pointer-chasing, or irregular. The order matters: layout first, prefetch second.",
+    "caching": "Caching avoids the access; prefetching hides its latency. They are not alternatives - a prefetch into a cache that already holds the line is wasted, and a cache miss that is prefetchable is a latency that need not be paid.",
+    "page-cache": "The OS-level instance of the same idea: the kernel caches file pages and readahead is its prefetch, which is why sequential file reads are fast and random ones are slow.",
+    "copy-on-write": "A write-path variant: writing a fresh copy touches new cache lines, and prefetching the destination (or using non-temporal hints) avoids a read-for-ownership that would otherwise evict useful lines.",
+    "object-pool": "Objects reused from a pool tend to be cache-resident, which is itself a form of prefetching by construction - the reuse pattern gives the hardware what it needs.",
+    "double-buffer": "The overlap technique at a higher level: while one buffer is being filled from memory, the other is being computed on, so the latency is hidden by parallelism rather than by an explicit hint.",
+    "circular-buffer": "The classic prefetch target: a ring buffer's next write slot is a known address, so a producer prefetches it while the consumer reads the current slot.",
+    "inline-functions": "A compiler-level cousin with the same spirit: the toolchain decides where to place the code, and both are cases of giving the processor information it cannot infer. They also interact - inlining exposes the address computation that makes a prefetch possible.",
+    "lazy-collection": "Deferred access means the address is not known when the element is requested, which rules out prefetching; the two techniques pull in opposite directions and choosing between them is a real design decision.",
+    "immutable-object": "Immutable data is the cheapest thing to prefetch against, because a published immutable snapshot is a single pointer read that the release/acquire pair orders against the payload - there is no partially-built object for a prefetch to race."
+  },
+  "anti_patterns": [
+    "Sprinkling prefetches through a loop that the hardware prefetcher already handles, adding instructions and cache pressure for nothing.",
+    "Prefetching speculatively far ahead of the use, filling the line-fill buffers and evicting lines that were actually needed.",
+    "Placing a prefetch inside an inner loop that could otherwise be vectorised, trading a wider type for a hint that the hardware does not need.",
+    "Prefetching a line that is already cached, on the assumption that a hint cannot hurt - it is an instruction that competes for issue slots.",
+    "Assuming the prefetch is a guarantee: the compiler may eliminate it and the CPU may drop it, so removing one as cleanup can silently cost the latency it was hiding.",
+    "Applying madvise(MADV_WILLNEED) to a huge range and getting ENOMEM or paying a long synchronous fault-in, on a system with a bandwidth knee already reached.",
+    "Adding prefetch traffic to a system whose memory subsystem is the bottleneck, making the latency worse for every consumer including the one being helped.",
+    "Treating a tuned locality level (T0/T1/T2) as portable across microarchitectures, when the mapping differs per vendor and per generation."
+  ],
+  "design_principles": [
+    "Hide latency, do not reduce it: the goal is memory-level parallelism, so the prefetch must be far enough ahead that the fetch overlaps real work.",
+    "Fix layout first: prefetching is the remedy for what data-locality cannot regularise, not a substitute for arranging the data well.",
+    "Hint, do not command: the prefetch has no contract, so measure it on the target hardware and prefer the fewest hints that deliver the win.",
+    "Bound the speculation: prefetch only what is about to be used, and only as much as the fill buffers can track, or the hint becomes a stall."
+  ],
+  "best_practices": [
+    "Measure first: use hardware performance counters (cache-miss rate, stall cycles) to confirm the workload is memory-latency-bound before adding any prefetch.",
+    "Tune the distance empirically on the target part: too close and it does not arrive, too far and it is evicted - the sweet spot is typically a few hundred cycles of independent work.",
+    "Use the lowest locality level that still keeps the data (L3 for a single use, L1 for a value reused in a tight loop, non-temporal for streaming) and verify the mapping on your microarchitecture.",
+    "Hoist prefetches out of a vectorisable inner loop, or restructure, so the hint does not cost you the wider type.",
+    "For pointer-chasing, split the access: load the pointer, then prefetch the target, then do independent work, then dereference - this is the pattern that actually hides the latency.",
+    "Cap speculative prefetching to roughly the number of line-fill buffers; on strong-reliability CPUs, over-subscribing them causes stalls with no benefit.",
+    "Prefault a region before a latency-sensitive section (touch every page, or madvise(MADV_WILLNEED)) and measure the fault-in cost separately from the steady state.",
+    "Add a branch hint ([[likely]], __builtin_expect) only where a misprediction penalty is measurably on the profile - it is the same kind of hint with the same portability caveat.",
+    "Record the measurement next to each prefetch in the code, so the next person can tell whether it still earns its place on this hardware."
+  ],
+  "sources": [
+    "Arm Compiler Developer and Reference Guide, 'Prefetching with __builtin_prefetch' - the syntax (addr, read/write, locality 0-3), the mapping of locality levels to L1/L2/L3, and the explicit warning that prefetch instructions inhibit vectorisation when placed inside inner loops. https://developer.arm.com/documentation/101458/2404/Optimize/Prefetching-with---builtin-prefetch",
+    "Mahling et al., 'Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its Reliability on High Latency Memory' (HPI, DaMoN 2025) - the measured differences between prefetch locality semantics across seven CPUs, the strong-versus-weak prefetching-reliability distinction, the fill-buffer (line-fill-buffer / miss-address-buffer) model, and the recommendation to cap speculative prefetching to the fill-buffer size. https://hpi.de/oldsite/fileadmin/user_upload/fachgebiete/rabl/publications/2025/Mahling-DaMoN25-Prefetching.pdf",
+    "Intel Optimization Zone, 'Hardware Prefetch Tuning' - the hardware prefetcher's pattern-locking behaviour, the cost of prefetching too much (cache thrashing and the DDR bandwidth knee), and the prefetch throttlers that reduce aggressiveness as the uncore queue fills. https://github.com/intel/optimization-zone/blob/main/hardware/HWPrefetchTuning/README.md",
+    "Linux manual page, 'madvise(2)' - the OS-level analogue: MADV_SEQUENTIAL, MADV_RANDOM, MADV_WILLNEED and MADV_DONTNEED, the statement that the advice influences performance but not semantics (except MADV_DONTNEED), and the error conditions (ENOMEM for MADV_WILLNEED). https://www.man7.org/linux/man-pages/man2/madvise.2.html",
+    "Liakopoulos, 'Compiler techniques for software prefetching based on co-routines' - the pattern of generating a coroutine that prefetches a delinquent load's target and then suspends so the memory access overlaps the rest of the diamond, with the measured cache-miss rates that motivate targeting only the loads with a high L1 miss rate. https://exa.ai/library/publication/y4xp6yqnhxq"
+  ],
+  "language_files": {
+    "generic": "prefetching.generic.json",
+    "c": "prefetching.c.json",
+    "cplusplus": "prefetching.cplusplus.json",
+    "csharp": "prefetching.csharp.json",
+    "go": "prefetching.go.json",
+    "java": "prefetching.java.json",
+    "javascript": "prefetching.javascript.json",
+    "kotlin": "prefetching.kotlin.json",
+    "python": "prefetching.python.json",
+    "ruby": "prefetching.ruby.json",
+    "rust": "prefetching.rust.json",
+    "scala": "prefetching.scala.json",
+    "swift": "prefetching.swift.json",
+    "typescript": "prefetching.typescript.json"
+  },
+  "version": "1.0"
+}

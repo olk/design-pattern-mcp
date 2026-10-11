@@ -1,0 +1,20 @@
+{
+  "pattern": "circular-buffer",
+  "language": "csharp",
+  "support": "library",
+  "implementation_notes": "There is no circular buffer in the BCL, so this is either a hand-written class (a T[] with two indices, using Interlocked for the acquire/release on the indices) or a bounded BlockingCollection/Channel if blocking is acceptable. For a high-throughput SPSC ring, the hand-written version with Interlocked.Read/Write and a power-of-two mask plus padding ([StructLayout(LayoutKind.Sequential)] with explicit padding fields or a layout that puts the indices on separate lines) is the way; .NET's memory model guarantees release on a Volatile.Write and acquire on a Volatile.Read, and Interlocked gives the full fence when needed. For the general case System.Threading.Channels.Channel<T> (bounded capacity) is a better fit because it handles multiple producers and consumers, blocking, and cancellation correctly. Avoid Array.Resize for a 'growing ring' - that reallocates and copies, which is the copying the ring exists to avoid.",
+  "idiom_name": "hand-written SPSC ring with Interlocked/Volatile indices; Channel<T> (bounded) for the general blocking case",
+  "code_sketch": "using System.Threading;\n\npublic sealed class SpscRing<T> {\n    private readonly T[] buf;\n    private readonly int mask;\n    private long head;   // producer-owned (padded onto its own cache line)\n    private long tail;   // consumer-owned\n\n    public SpscRing(int capacityPow2) {         // must be a power of two\n        if ((capacityPow2 & (capacityPow2 - 1)) != 0) throw new ArgumentException(\"pow2\");\n        buf = new T[capacityPow2]; mask = capacityPow2 - 1;\n    }\n\n    public bool TryPush(T v) {\n        long h = Volatile.Read(ref head);\n        long t = Volatile.Read(ref tail);\n        if (h - t == buf.Length) return false;         // full\n        buf[h & mask] = v;\n        Volatile.Write(ref head, h + 1);               // release: item before head\n        return true;\n    }\n    public bool TryPop(out T v) {\n        long t = Volatile.Read(ref tail);\n        long h = Volatile.Read(ref head);              // acquire: item IS written\n        if (h == t) { v = default!; return false; }\n        v = buf[t & mask];\n        Volatile.Write(ref tail, t + 1);\n        return true;\n    }\n}\n// For multiple producers/consumers or blocking, use Channel<T> with a bound.",
+  "pitfalls": [
+    "Volatile.Read/Write give visibility and the acquire/release ordering, but they are NOT a read-modify-write - never do head++ on a plain field and assume Volatile saves it.",
+    "head - tail == Capacity as the full test is only correct with monotonic long counters; masking head itself breaks it.",
+    "The head and tail must be on separate cache lines (padding) or the ping-pong dominates and a lock is faster.",
+    "Array.Resize is not a growing ring - it reallocates and copies, which is the copying the ring removes.",
+    "For MPMC or blocking, use Channel<T> (bounded) rather than adapting this SPSC class, which is only correct for one producer and one consumer."
+  ],
+  "sources": [
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.volatile",
+    "https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channel"
+  ],
+  "version": "1.0"
+}

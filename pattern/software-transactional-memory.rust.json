@@ -1,0 +1,22 @@
+{
+  "pattern": "software-transactional-memory",
+  "language": "rust",
+  "support": "discouraged",
+  "idiom_name": "AtomicPtr / ArcSwap retry loop",
+  "implementation_notes": "The borrow checker eliminates the data races that motivate STM, which makes an STM in Rust close to redundant: you cannot alias a `&mut` across threads, so the classic shared-mutable-cell problem is a compile error rather than a runtime one. What survives is logical concurrency - two owners coordinating through an `Arc` - and there the pattern you want is a lock-free publish loop, not an STM: hold the state behind an `Arc<State>`, compute a new `State`, and install it with a compare-and-swap on an `AtomicPtr` (or an `ArcSwap` for an atomic Arc swap), retrying the whole computation on failure. That is STM's validate-then-act and automatic re-execution, implemented directly, with no read-set machinery because the compiler has already guaranteed there are no unsynchronised aliasing reads. For blocking-style coordination use `std::sync::Mutex`/`RwLock`; for queue-like work use `crossbeam-channel` or `crossbeam`'s epoch-based reclamation so the queue itself never holds a lock. `loom` is the tool for proving the retry loop correct: model the CAS under it and the interleavings get explored for you. A full STM library is the wrong dependency here.",
+  "alternative": "compare-and-swap retry loop on AtomicPtr / ArcSwap for lock-free publish; std::sync::Mutex for blocking coordination; crossbeam-channel for message passing; loom for verifying interleavings",
+  "code_sketch": "use std::sync::atomic::{AtomicPtr, Ordering};\nuse std::sync::Arc;\n\nstruct State { version: u64, balances: Vec<i64> }\n\nfn transfer(head: &AtomicPtr<State>, from: usize, to: usize, amt: i64) -> bool {\n    loop {\n        // SAFETY: the pointer was published by a previous store and is never freed\n        // while a reader holds it (epoch/deferred reclamation required).\n        let cur = unsafe { &*head.load(Ordering::Acquire) };\n        let mut next = State { version: cur.version, balances: cur.balances.clone() };\n        if next.balances[from] < amt { return false }\n        next.balances[from] -= amt; next.balances[to] += amt; next.version += 1;\n\n        // whole block replays if anyone committed first\n        match head.compare_exchange(cur as *const State as *mut State,\n                                    Box::into_raw(Box::new(next)),\n                                    Ordering::AcqRel, Ordering::Acquire) {\n            Ok(_) => return true,\n            Err(_) => continue,      // lost the race: re-read and recompute\n        }\n    }\n}",
+  "pitfalls": [
+    "Leaking the loser Box on a failed compare_exchange: the returned pointer must be reconstructed and dropped, or every conflict is a memory leak.",
+    "Retrying with the stale snapshot after a failed CAS - the loop must re-read and recompute, not re-attempt.",
+    "Assuming AcqRel alone keeps the pointed-to State alive; it does not, and use-after-free here is a memory-safety bug, not a race.",
+    "Assuming loom proves the production build: loom explores the model, and any step it does not model (allocation, syscalls, the real allocator) is unverified.",
+    "Adding an STM crate for a problem Arc + Mutex already solves cleanly, trading a compile-time guarantee for a runtime one."
+  ],
+  "sources": [
+    "https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html",
+    "https://docs.rs/loom/latest/loom/",
+    "https://docs.rs/crossbeam/latest/crossbeam/"
+  ],
+  "version": "1.0"
+}

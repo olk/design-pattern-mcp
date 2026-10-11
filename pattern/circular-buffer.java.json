@@ -1,0 +1,19 @@
+{
+  "pattern": "circular-buffer",
+  "language": "java",
+  "support": "library",
+  "implementation_notes": "Java has no ring buffer in the JDK, and the concurrency story is that ArrayBlockingQueue is the general bounded queue (lock-based, FIFO, fixed capacity) and Disruptor is the high-performance ring for multiple producers and consumers. For a hand-written SPSC ring, the indices are AtomicLong (or VarHandle long fields) with the acquire/release pattern, padded via inheritance or @Contended (with -XX:-RestrictContended for application classes). ArrayDeque is a growable circular array and is the answer for a single-threaded ring that can resize; PriorityBlockingQueue is for priority. The choice: ArrayDeque for a single-threaded ring that may need to grow, ArrayBlockingQueue for a bounded blocking MPMC queue, and a hand-written SPSC ring (or Disruptor) for a measured high-throughput path. As in every managed language, the JIT can eliminate much of the overhead, so measure before hand-rolling.",
+  "idiom_name": "ArrayDeque (single-threaded, growable) / ArrayBlockingQueue (bounded, blocking) / hand-written SPSC ring with padded VarHandle indices",
+  "code_sketch": "import java.util.concurrent.atomic.AtomicLong;\n\n// JDK options, in order of effort:\n// 1. ArrayDeque: a growable circular array, single-threaded.\nDeque<Long> dq = new ArrayDeque<>(capacity);\n// 2. ArrayBlockingQueue: bounded, FIFO, blocking, multi-producer/consumer.\nBlockingQueue<Long> bq = new ArrayBlockingQueue<>(256);\n\n// 3. hand-written SPSC ring for a measured hot path (indices padded apart):\nclass SpscRing {\n    private final long[] buf; private final long mask;\n    private final AtomicLong head = new AtomicLong();   // producer-owned\n    private final AtomicLong tail = new AtomicLong();   // consumer-owned\n    boolean push(long v) {\n        long h = head.get();\n        if (h - tail.get() == buf.length) return false;   // full\n        buf[(int) (h & mask)] = v;\n        head.lazySet(h + 1);                                // release\n        return true;\n    }\n    boolean pop() {\n        long t = tail.get();\n        if (head.get() == t) return false;                 // acquire\n        // ... read buf[(int)(t & mask)] ...\n        tail.lazySet(t + 1);\n        return true;\n    }\n}",
+  "pitfalls": [
+    "ArrayDeque is not thread-safe; ArrayBlockingQueue is bounded and blocking but takes a lock on every operation, which is the contention the ring avoids.",
+    "AtomicLong.lazySet is a release store and get() is a full volatile read - mixing them up (e.g. lazySet for a read) breaks the ordering.",
+    "The head and tail AtomicLongs are separate objects and may share a cache line; for a real SPSC ring pad them (inheritance or -XX:-RestrictContended @Contended).",
+    "On a 32-bit JVM, a long field is not atomic - use AtomicLong or ensure 64-bit atomics (the same caveat as the atomics pattern)."
+  ],
+  "sources": [
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/ArrayDeque.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ArrayBlockingQueue.html"
+  ],
+  "version": "1.0"
+}

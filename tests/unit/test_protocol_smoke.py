@@ -209,7 +209,7 @@ async def test_catalog_tools_over_mcp(config_path: str, scripted_llm: ScriptedLL
     async with server._mcp.lifespan(), Client(server._mcp) as client:
         listing = await client.call_tool("list_design_patterns", {})
         entries = listing.data
-        assert len(entries) == 438
+        assert len(entries) == 486
         assert all(
             {"name", "category", "description"} <= set(entry) and entry["name"] for entry in entries
         )

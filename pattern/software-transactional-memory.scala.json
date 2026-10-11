@@ -1,0 +1,20 @@
+{
+  "pattern": "software-transactional-memory",
+  "language": "scala",
+  "support": "manual",
+  "idiom_name": "AtomicReference CAS loop over a case-class state",
+  "implementation_notes": "Scala has no STM in its standard library today, and the honest realisation is the same validate-then-act loop as everywhere else, expressed well because of the language's shape: a `case class` state gives you structural equality for free (so conflict detection is one `==` against the observed snapshot) and a `copy` method that produces the next state without mutating anything, which is exactly STM's deferred write set. Put that state behind an `AtomicReference`, read it once, `copy` it, compute, and `compareAndSet`. Scala's real strength here is that immutability is the default idiom, so the precondition STM cares about most - cheap, safe snapshots - is met without effort. Where higher-level concurrency structure is needed, Scala's idiom is Akka-style actors, which achieve mutual exclusion by confinement and are the honest answer for the majority of cases; an STM or a CAS loop is for the residual cases where state must genuinely be shared rather than owned. Scala's match types and sealed traits also make a hand-rolled transaction result (`TransactionResult[T]`) pleasant to express, which matters because the retry decision has to be explicit rather than hidden in an exception.",
+  "code_sketch": "import java.util.concurrent.atomic.AtomicReference\n\nfinal case class Balances(version: Long, map: Map[String, Long])\n\nsealed trait TxResult[+A]; case class TxOk[A](value: A) extends TxResult[A]\ncase class TxConflict() extends TxResult[Nothing]\n\nfinal class Txn(state: AtomicReference[Balances]) {\n  def run[A](body: Balances => A): TxResult[A] = {\n    val cur = state.get()                 // one read = the snapshot\n    body(cur) match {\n      case TxConflict() => TxConflict()   // block says it cannot proceed: replay\n      case result =>\n        val next = cur.copy(version = cur.version + 1)\n        if (state.compareAndSet(cur, next)) TxOk(result) else TxConflict()\n    }\n  }\n}",
+  "pitfalls": [
+    "Using a mutable collection inside the case class, so the snapshot reference silently changes and conflict detection compares the same object to itself.",
+    "Copying the state with the same version and then compare_and_set-ing it: publishing an identical snapshot makes the commit meaningless.",
+    "Returning an exception for a conflict instead of a value, which forces every caller into a try/catch and makes the retry invisible in the type.",
+    "Blocking inside the body (a Future.await), which holds the window open for every conflicting transaction.",
+    "Using an actor when state is genuinely shared and large: actor messages copy the state on send, which is worse than an STM snapshot for big structures."
+  ],
+  "sources": [
+    "https://www.scala-lang.org/api/current/scala/collection/immutable/Map.html",
+    "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html"
+  ],
+  "version": "1.0"
+}

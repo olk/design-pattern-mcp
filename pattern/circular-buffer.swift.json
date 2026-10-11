@@ -1,0 +1,20 @@
+{
+  "pattern": "circular-buffer",
+  "language": "swift",
+  "support": "library",
+  "implementation_notes": "Swift has no ring buffer in the Foundation/stdlib; for a fixed, allocation-free numeric ring (audio frames via AVAudioEngine's tap, a telemetry ring) the construction is a fixed [Float] or UnsafeMutablePointer plus two indices, with the indices as ManagedAtomic from swift-atomics when the ring is shared across threads (the audio render callback and the main thread are different threads, so the ring genuinely needs atomics and a real-time-safe implementation - no allocation, no locks in the render callback). DispatchQueue and DispatchSemaphore are the higher-level blocking alternative if the producer can wait. For a bounded, blocking, multi-producer ring, a DispatchQueue-based or an OSAllocatedUnfairLock-guarded array is more appropriate. The ring's real-time constraint (the audio callback must never allocate or lock) is what makes the hand-written array the right answer on Apple platforms.",
+  "idiom_name": "fixed [Float]/UnsafeMutablePointer ring with ManagedAtomic indices (swift-atomics); DispatchQueue/Semaphore as the blocking alternative",
+  "code_sketch": "import Atomics\n\n// A real-time ring for an audio render callback: no allocation, no locks.\nfinal class AudioRing {\n    private let buf: UnsafeMutablePointer<Float>   // preallocated once\n    private let capacity: Int                      // a power of two\n    private let mask: Int\n    private let head = ManagedAtomic<Int>(0)       // producer (render thread)\n    private let tail = ManagedAtomic<Int>(0)       // consumer (main thread)\n\n    // push (render callback): write, then release-store the head.\n    func push(_ v: Float) -> Bool {\n        let h = head.load(ordering: .relaxed)\n        if h &- tail.load(ordering: .acquiring) == capacity { return false }  // full\n        buf[h & mask] = v\n        head.store(h &+ 1, ordering: .releasing)     // release: item before head\n        return true\n    }\n    // ... pop mirrors it: acquire the head, read, release the tail ...\n    deinit { buf.deallocate() }\n}",
+  "pitfalls": [
+    "The audio render callback runs on a real-time thread: it must not allocate, take a lock, or block - so the ring is preallocated and lock-free, and a DispatchQueue or semaphore in that path is a priority-inversion bug.",
+    "ManagedAtomic is from the swift-atomics package, not the stdlib; the ring's indices need real atomics because the render and main threads are different threads.",
+    "Ordering is unchecked in swift-atomics: .relaxed on the release store (or .acquiring on the publish) compiles and fails on ARM.",
+    "The capacity must be a power of two for the mask; the indices must use wrapping arithmetic (&+, &-) so they do not trap at Int.max."
+  ],
+  "alternative": "A DispatchQueue with a bounded backing buffer, or os_unfair_lock around a fixed array, when the producer can block",
+  "sources": [
+    "https://github.com/apple/swift-atomics",
+    "https://developer.apple.com/documentation/avfaudio/avaudiotap"
+  ],
+  "version": "1.0"
+}

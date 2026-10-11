@@ -6,7 +6,7 @@ hits are read from the scenario's own label, so its hit rate is a fixture proper
 measurement of the pipeline (``README.md`` "Offline mode"). What it does prove, end to end and
 through the real pipeline:
 
-- every stage of ``DesignPipeline.run_design`` executes against a real 438-record catalog
+- every stage of ``DesignPipeline.run_design`` executes against a real 486-record catalog
   (Stage A/B repair, weights, vetoes, scoring, §8 selection, GENERATE, EVALUATE, the G–H loop);
 - every metric the harness reports is computed from real ``AnalysisResult``/``PipelineResult``
   objects rather than synthetic fixtures (the formulas themselves are pinned by ``selfcheck``);

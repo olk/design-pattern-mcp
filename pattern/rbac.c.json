@@ -1,0 +1,21 @@
+{
+  "pattern": "rbac",
+  "language": "c",
+  "support": "manual",
+  "idiom_name": "hand-rolled role/permission tables behind one rbac_allow(subject, action, object) decision function; Open Policy Agent sidecar for policy-as-data",
+  "implementation_notes": "C has no authorization framework, so both the decision data and the decision function are hand-written. Fittingly for the classic RBAC0 shape, roles are often a bitmask over a fixed role enum (the subject's roles are the OR of role bits, a permission is the mask a role must carry) or, past the word width, a table of (subject, role) and (role, permission) rows. Either way route every protected operation through one decision function wrapped in a single guard so no call site evaluates rules itself, take the subject's roles from server-side session state and never from a request field, and deny on an unknown role, a null table or a failed lookup. Where policy values churn faster than the binary, the idiomatic modern shape is an Open Policy Agent sidecar: the guard POSTs {roles, action, resource} and enforces OPA's allow/deny JSON, keeping the decision in Rego data while the mediation seam stays in C - at the cost of a network call per decision, so cache with a bounded TTL and fail closed on timeout. nginx's auth_request module is the server-side realization of the same 'centralize the decision, delegate the enforcement' split.",
+  "code_sketch": "typedef enum { ROLE_VIEWER = 1u<<0, ROLE_EDITOR = 1u<<1, ROLE_PAUSER = 1u<<2, ROLE_ADMIN = 1u<<3 } role_t;\n\n/* single decision point: every rule lives here */\nint rbac_allow(unsigned subject_roles, unsigned required, unsigned denied) {\n    if (subject_roles == 0) return 0;                 /* deny by default  */\n    if (subject_roles & denied) return 0;             /* SoD exclusion    */\n    return (subject_roles & required) == required;\n}\n\nif (!rbac_allow(session->roles, ROLE_PAUSER, ROLE_ADMIN)) return respond_403(req);",
+  "pitfalls": [
+    "A bitmask silently caps the role vocabulary at the width of the integer type; past 32/64 roles switch to (subject, role) rows or an OPA decision service before a new role wraps or vanishes.",
+    "Mutable role state in a global or session struct shared across threads needs a lock; a read racing a grant/revoke write decides against a half-updated mask.",
+    "Resolving the subject from a header, cookie or query parameter the session never verified makes the decision forgeable; source roles from server-side session state only.",
+    "A NULL policy table, a failed row lookup or a failed OPA HTTP call must resolve to deny - fail-open error handling turns a missing rule into access.",
+    "String-comparing role names with strcmp in the hot path is both a timing signal and an allocation trap; intern or hash role names once at load time."
+  ],
+  "sources": [
+    "https://www.openpolicyagent.org/docs/latest/",
+    "https://nginx.org/en/docs/http/ngx_http_auth_request_module.html",
+    "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+  ],
+  "version": "1.0"
+}

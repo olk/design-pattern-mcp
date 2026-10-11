@@ -1,0 +1,220 @@
+{
+  "category": "workflow-messaging",
+  "name": "channels",
+  "aliases": [
+    "go channel",
+    "CSP channel",
+    "mailbox",
+    "typed channel",
+    "asynchronous queue",
+    "rendezvous"
+  ],
+  "intent": "Give concurrent tasks a typed, buffered hand-off point - a channel - whose send and receive are operations that transfer ownership of a value between them, with blocking, capacity, closing and selection as the channel's contract rather than ad-hoc coordination between sender and receiver.",
+  "problem": "Two tasks must exchange data but neither should know the other's identity, timing or failure. Shared memory forces both to lock, and the lock says nothing about which data is being protected. Callbacks invert the dependency and couple the caller to the callee's timing. A queue without a contract does not help either: an unbounded one postpones the failure to OOM, and one with no close or select rule leaves every consumer unable to tell 'nothing yet' from 'nothing ever', which is the bug that turns a graceful shutdown into a hang.",
+  "context": "Applies wherever independently scheduled tasks - coroutines, goroutines, threads, OS processes - must hand work or results to each other without knowing each other: pipeline stages, request/reply with a callback channel, fan-out to workers with a shared queue, timer and cancellation signals, and the request-reply pattern itself (a channel for the reply is what makes a synchronous API awaitable). The four decisions that define a channel's behaviour are its capacity (rendezvous, bounded, unbounded, conflated), its multiplicity (SPSC, MPSC, MPMC), its close semantics (who may close, what happens on send after close, what a receive after close yields), and whether it supports select (waiting on several operations at once). A channel with these four decisions explicit is a design; a queue without them is an accident waiting for production traffic.",
+  "benefits": [
+    "The data transfer and the synchronisation are the same operation: a send on a channel carries a happens-before edge to the matching receive, so the sender must not also protect the data with a lock.",
+    "Ownership transfers explicitly: the value belongs to the channel, so exactly one task can be working on it - which removes an entire class of shared-state races that a lock only papers over.",
+    "Buffering decouples timing without unbounded risk: a bounded channel applies backpressure by blocking the sender when full, so a burst is absorbed by the capacity and a fast producer is slowed rather than allowed to exhaust memory.",
+    "Rendezvous is an option: an unbuffered channel makes sender and receiver meet, so it is a synchronisation point (a barrier or a handoff) as well as a data channel - the idiomatic way to express 'do not get ahead of me'.",
+    "Select makes multiplexing and timeout composable: waiting on several channel operations at once, with a default for the non-blocking case and a timer channel for the timeout, turns 'which of these happens first' into one expression instead of nested polling.",
+    "Closing gives an unambiguous termination: a closed channel yields the remaining buffered values and then a zero value forever, so a consumer's 'for range' ends instead of blocking on a value that will never arrive.",
+    "It scales to very many senders and receivers: MPMC channels are the standard hand-off in a worker pool, and the runtime's implementation (a ring buffer with two wait queues) is why a channel is cheap enough to use per-pipeline-stage."
+  ],
+  "tradeoffs": [
+    "Blocking semantics are a foot-gun in a single-threaded runtime: a blocking send or receive on an unbuffered channel with no counterpart parks the whole thread, so a channel handed to the wrong task deadlocks rather than failing.",
+    "Unbuffered channels serialise: an unbuffered channel is a rendezvous, so producer and consumer are coupled in time and the pipeline throughput is bounded by the slower of the two, which is sometimes exactly what you want and often is not.",
+    "Close is asymmetric and easy to misuse: send-on-closed panics, double-close panics, and close-on-nil panics, so only the sender (or a coordinator after a WaitGroup) may close - a rule that must be documented and enforced by convention.",
+    "Channel operations are not free: a send is a lock, a queue push and a possible goroutine wakeup in the runtime, so a channel-per-item for sub-microsecond work is measurably slower than a direct call, and the channel pattern's own guidance is to use channels for ownership transfer and a mutex for shared state.",
+    "Channel-per-pair does not scale: a chatty design that creates a channel per request pays the allocation and the scheduling per message; a worker pool with one shared channel is the scalable shape and loses the per-peer identity.",
+    "Select in a loop is a polling idiom and can starve: Go's select picks a random ready case, so a loop over a select with a fast case can spin; select is for multiplexing rare events, not for a hot loop.",
+    "The channel type constrains multiplicity: a channel declared for one producer and one consumer (with directional types) breaks at compile time if a second sender is added, which is a benefit - until the code is restructured and the directionality assumption is silently lost in a refactor.",
+    "Buffering choice is a policy decision that is easy to get wrong: a conflated channel (keep only the latest) silently drops updates for anything that is not a 'latest value wins' stream, and an unbounded channel converts a backpressure problem into an OOM."
+  ],
+  "quality_attributes": {
+    "testability": 8,
+    "extensibility": 8,
+    "maintainability": 8,
+    "simplicity": 7,
+    "performance": 7,
+    "reliability": 9,
+    "security": 7,
+    "scalability": 9,
+    "type_safety": 9
+  },
+  "quality_attributes_note": "Reliability and type safety are the highest: the channel's contract (capacity, multiplicity, close, select) is explicit and, in a typed language, enforced - the compiler rejects a send on a receive-only channel and a close of a closed one panics loudly rather than corrupting silently. Performance is mid because a channel operation is a lock plus a queue push plus a possible wakeup, which is correct and predictable but not the fastest hand-off for very fine-grained work.",
+  "participants": [
+    {
+      "role": "Channel (typed handle)",
+      "responsibility": "The named, typed hand-off point both sides agree on; it holds the buffer, the element type, and the wait queues for blocked senders and receivers.",
+      "notes": "It is the only thing the two sides share, and it carries the contract."
+    },
+    {
+      "role": "Sender",
+      "responsibility": "Sends values into the channel; blocks when the buffer is full (or waits for a rendezvous), and is the only party allowed to close.",
+      "notes": "Blocking is how backpressure is applied; the sender's rate is bounded by the capacity."
+    },
+    {
+      "role": "Receiver",
+      "responsibility": "Receives values from the channel; blocks when it is empty, and terminates when the channel is closed and drained.",
+      "notes": "'Empty' and 'closed-and-drained' are distinguished by the ok flag or the zero value - that distinction is the termination contract."
+    },
+    {
+      "role": "Buffer (capacity policy)",
+      "responsibility": "Holds pending values between send and receive; its capacity (rendezvous / bounded / conflated / unbounded) determines whether the sender blocks and therefore how bursts are absorbed.",
+      "notes": "The backpressure mechanism, and the first of the four decisions that define the channel."
+    },
+    {
+      "role": "Close / termination signal",
+      "responsibility": "Signals that no more values will be sent, so a receiver's range-loop ends instead of blocking forever.",
+      "notes": "Asymmetric by design: send-after-close panics, so only the sender (or a coordinator) closes."
+    },
+    {
+      "role": "Select / multiplexer",
+      "responsibility": "Waits on several channel operations at once and proceeds with whichever is ready, with an optional default for the non-blocking case.",
+      "notes": "This is what makes timeouts, cancellation and fan-in composable rather than nested polling."
+    },
+    {
+      "role": "Wait queue (blocked parties)",
+      "responsibility": "The runtime's bookkeeping of senders and receivers parked on the channel, woken when the other side makes them runnable.",
+      "notes": "This is where the channel's blocking behaviour is implemented, and why a channel is a scheduler object."
+    },
+    {
+      "role": "Deadlock detector (where present)",
+      "responsibility": "Detects that every goroutine is blocked on a channel and reports it rather than hanging.",
+      "notes": "Go's runtime reports 'all goroutines are asleep - deadlock!' only when ALL are blocked; a partial deadlock still hangs."
+    }
+  ],
+  "suitable_scopes": [
+    "message-flow",
+    "module",
+    "task-lifetime"
+  ],
+  "unsuitable_scopes": [
+    "value",
+    "persistence-unit"
+  ],
+  "use_cases": [
+    "Pipeline stages: each stage reads from its input channel and writes to its output channel, so stages are independent and the backpressure of a bounded channel propagates through the whole pipeline.",
+    "Request/reply: a function takes a reply channel and returns immediately, so a synchronous-looking API becomes an asynchronous one - this is the request-reply pattern and the reply channel is what makes it work.",
+    "Worker pools: one shared MPMC channel carries tasks to N workers, which is the scalable hand-off; a channel per worker would serialise the work distribution.",
+    "Cancellation and timeouts: a context's Done channel is received in a select alongside the work channel, so 'abort or complete' is one expression and every blocking operation is cancellable.",
+    "Fan-in and fan-out with select: a multiplexer goroutine that selects over several input channels merges them, which is the structured way to merge concurrent sources.",
+    "Signals and events in an event-driven system: the loop receives from a channel of events rather than polling, so the 'no events yet' state is a block instead of a spin.",
+    "Bounded queues as backpressure: a channel of capacity N between a fast producer and a slow consumer makes the producer wait when N is reached, which is the whole point of the buffer's capacity.",
+    "Go's goroutines plus channels as the canonical structured concurrency pairing: the channel is how a goroutine says what it is for, and it makes the data dependency explicit instead of hidden in shared memory."
+  ],
+  "avoid_when": [
+    "The work is a direct synchronous call between two known functions - a channel adds allocation, scheduling and a blocking contract for nothing, and the direct call is faster and clearer.",
+    "Both sides are on one thread of a single-threaded runtime and one might block with no counterpart - a blocking channel operation deadlocks the loop; use a defer (deferred callback) for same-thread callbacks instead.",
+    "The two sides share mutable state that many readers touch - a mutex on the shared state is faster and clearer than routing every access through a channel (the Go guidance: channels for transferring ownership, mutexes for shared state).",
+    "The item is tiny and the rate is very high - a channel send is a lock plus a queue push; at microsecond granularity the direct call or a lock-free queue wins.",
+    "The consumer needs priority or ordering beyond FIFO - a channel is FIFO; use a priority queue or a dedicated channel per priority.",
+    "The work must survive a crash and be delivered later - an in-memory channel's contents are lost when the process dies; use a durable queue or a broker.",
+    "The multiplicity does not match the declared shape - a channel typed for SPSC with a second producer is a data race, not a performance problem.",
+    "There is no termination story - a channel that is never closed leaves every consumer blocked forever, which is the classic goroutine leak and the reason 'close is the sender's job' must be a documented rule."
+  ],
+  "pitfalls": [
+    "Never closing a channel: every consumer's range-loop blocks forever after the producer exits - the classic goroutine leak and the reason 'close is the sender's job' is a documented invariant.",
+    "Closing from the receiver, or from two senders: send-on-closed and double-close both panic, so with multiple senders a coordinator that waits for all of them must close.",
+    "Sending on a nil channel blocks forever (and a receive on nil too) - which is the idiomatic way to disable a select case in a loop, and an unreviewed footgun everywhere else.",
+    "A blocking send on an unbuffered channel in a single-threaded runtime deadlocks the whole loop: the sender parks waiting for a receiver that can never run because the thread is parked.",
+    "A blocking receive on an empty channel with no sender blocks the receiver forever; the receiver must either be guaranteed a sender or select with a default/cancellation case.",
+    "Conflated channels silently drop intermediate values: any stream that is not 'latest value wins' (e.g. an order book, an audit log) loses data with no error.",
+    "Using channels as a substitute for a mutex on shared state: every read becomes a channel round trip and the channel becomes a slower mutex; use a mutex for shared state and a channel for ownership transfer.",
+    "Leaking goroutines on a blocking channel operation: a goroutine that sends to a channel nobody reads (or receives from one nobody writes to or closes) lives forever; always pair a blocking channel operation with a cancellation or Done case."
+  ],
+  "paradigm": [
+    "concurrent"
+  ],
+  "scope": "message-flow",
+  "provenance": [
+    "modern"
+  ],
+  "related_patterns": [
+    "coroutines",
+    "point-to-point-channel",
+    "datatype-channel",
+    "publish-subscribe-channel",
+    "producer-consumer",
+    "event-queue",
+    "future-promise",
+    "request-reply",
+    "backpressure",
+    "cancellation-token",
+    "structured-concurrency",
+    "half-sync-half-async",
+    "actor",
+    "competing-consumers",
+    "dead-letter-channel",
+    "pipeline"
+  ],
+  "related_patterns_notes": {
+    "point-to-point-channel": "The messaging-topology record: 'deliver each message to exactly one consumer'. This record is the in-process primitive that provides it. A channel IS point-to-point by construction (one receiver takes each value), but the pattern here is about the primitive's four contracts (capacity, multiplicity, close, select) and its synchronisation and ownership-transfer semantics, not about the delivery topology across a broker.",
+    "datatype-channel": "The record for binding a channel's identity to one message type as the routing contract ('the channel's identity is the type contract'). This record covers the in-process typed hand-off and its blocking/capacity semantics; datatype-channel is the enterprise-messaging routing convention where one channel per type lets a receiver know what it got. They are complementary: this is the mechanism, that is the topology.",
+    "producer-consumer": "The general pattern this realises for hand-off: a buffer between producers and consumers. A channel is the in-process, typed, blocking implementation of that buffer, and its bounded capacity is exactly the backpressure that producer-consumer requires.",
+    "coroutines": "The two are designed together and are almost always used as a pair: a coroutine suspends on a channel send (when full) or receive (when empty), so the channel is what makes a coroutine block productively instead of spinning, and the coroutine is what makes a channel cheap (no thread per blocked party).",
+    "future-promise": "A reply channel is a future: the caller holds the receiving end and the executor holds the sending end. The distinction is that a future is a single result and a channel is a stream, and that a future's completion is a single event while a channel's is a close.",
+    "backpressure": "The reason a channel's capacity matters: a bounded channel makes the sender block when full, which is the demand/readiness signal propagating upstream. An unbounded channel removes the backpressure and turns a slow consumer into a memory leak - the tradeoff backpressure makes explicit.",
+    "request-reply": "The reply channel is the pattern's core: a function takes a channel for the reply and returns immediately, so an asynchronous call presents a synchronous interface. The channel carries the result back to whoever is waiting.",
+    "event-queue": "The FIFO work-queue form. A channel is the in-process hand-off; an event-queue is the pattern of reifying requests as queued events so the sender returns immediately and the receiver drains at its own cadence. A channel of events is that pattern's mechanism.",
+    "cancellation-token": "A token's Done channel is received in a select alongside the work channel, so cancellation composes with the hand-off. This is why 'every blocking channel operation is paired with a Done case' is the rule that prevents goroutine leaks.",
+    "competing-consumers": "Several workers sharing one channel is exactly competing consumers: throughput scales with the number of consumers and a failed one's unacknowledged work goes to a survivor. A channel is the primitive that pattern needs.",
+    "structured-concurrency": "The lifetime discipline that makes channels safe: a coroutine's scope cancels it, and its channel operations are cancelled with it. An un-scoped goroutine blocked on a channel is the leak structured concurrency prevents.",
+    "pipeline": "The shape a chain of channels forms: stage i reads from channel i and writes to channel i+1, and a bounded channel between them makes backpressure propagate through the whole chain."
+  },
+  "anti_patterns": [
+    "Never closing a channel, so every consumer blocks forever after the producer exits - the classic goroutine leak.",
+    "Closing from the receiver or from two senders: send-on-closed and double-close panic; with multiple senders a coordinator that waits for all of them must close.",
+    "Using a channel as a slower mutex for shared state: a channel per read/write is a slower, harder-to-read critical section; use a mutex for shared state and a channel for ownership transfer.",
+    "Blocking a single-threaded runtime's event loop on an unbuffered channel with no counterpart, which parks the whole loop and deadlocks it.",
+    "An unbounded channel between a fast producer and a slow consumer, converting a backpressure problem into an out-of-memory problem.",
+    "A conflated channel for a stream that is not 'latest value wins' (an audit log, an order book), silently dropping values with no error.",
+    "Creating a channel per request in a chatty design, paying allocation and scheduling per message instead of using a worker pool with a shared channel.",
+    "Sending on a nil channel (which blocks forever) outside the one idiom where it is intended - disabling a select case.",
+    "Polling in a loop with a select on a fast channel, spinning a CPU because select picks a ready case at random; select is for multiplexing rare events, not a hot loop."
+  ],
+  "design_principles": [
+    "Make the four contracts explicit: capacity, multiplicity, close and select are the decisions that define a channel, and each should be a deliberate choice rather than a default.",
+    "Transfer ownership, do not share state: the value belongs to the channel and to exactly one task at a time, which is why the channel's synchronisation is enough and no lock is needed on the payload.",
+    "The sender closes: closing is asymmetric by design, so it belongs to the side that knows when production ends - or to a coordinator that waits for all senders.",
+    "Every blocking operation is cancellable: a send or receive that can block must have a way out (a Done case, a timeout, or a guarantee of a counterpart), or it is a leak waiting for a shutdown.",
+    "Bound the buffer, and let it push back: capacity is the mechanism that turns an overload into a slowdown rather than an outage."
+  ],
+  "best_practices": [
+    "Decide and document the four contracts before writing the code: capacity (rendezvous/bounded/unbounded/conflated), multiplicity, close rules, and whether select is needed.",
+    "Only the sender closes, and with multiple senders a coordinator (after a WaitGroup) closes - send-on-closed and double-close both panic.",
+    "Pair every blocking channel operation with a cancellation or timeout case (a select with ctx.Done() or a timer channel), so no goroutine can be stranded on shutdown.",
+    "Use a bounded channel between a fast producer and a slow consumer, sized to absorb a realistic burst; an unbounded channel is an OOM with a delay.",
+    "Use channels to transfer ownership and a mutex for genuinely shared state - routing every shared read through a channel turns the channel into a slower mutex.",
+    "Take a worker pool with one shared MPMC channel for fan-out, not a channel per worker (which serialises distribution) or a channel per request (which pays allocation per message).",
+    "In Go, exploit the directional types (chan<- T for a sender, <-chan T for a receiver) so the compiler enforces the multiplicity contract at the API boundary.",
+    "Use select for multiplexing rare events, timeouts and cancellation - not as a polling loop, where a fast ready case spins because select picks randomly among ready cases.",
+    "Never send on a nil channel outside the select-disabling idiom, and document the nil-channel case if it appears, because it blocks forever.",
+    "Use unbuffered channels (rendezvous) only when the synchronisation is the point (a barrier, a strict handoff); otherwise use a small buffer to decouple timing."
+  ],
+  "sources": [
+    "Go memory model (go.dev/ref/mem) - the normative statement that 'a send on a channel is synchronized before the completion of the corresponding receive', and the buffered-channel rule (the kth receive is synchronized before the k+Cth send), which is the happens-before edge that makes a channel both a data transfer and a synchronisation. https://go.dev/ref/mem",
+    "The Go runtime's src/runtime/chan.go - the implementation: an hchan holding a circular buffer (dataqsiz, sendx/recvx), a closed flag, and two wait queues (sendq/recvq); the direct-handoff path for an unbuffered send; and select's two-pass algorithm (shuffle to a random poll order, lock channels in address order, poll, else enqueue on every queue). https://go.googlesource.com/go/+/refs/heads/master/src/runtime/chan.go",
+    "Kotlin documentation, 'Channels' and the Channel API - suspending send/receive instead of blocking, the capacity policies (RENDEZVOUS, CONFLATED, BUFFERED, UNLIMITED), the BufferOverflow strategies (SUSPEND, DROP_OLDEST, DROP_LATEST), prompt cancellation, and onUndeliveredElement for releasing a resource whose delivery was cancelled. https://kotlinlang.org/docs/channels.html",
+    "Koval et al., 'Fast and Scalable Channels in Kotlin Coroutines' (PPoPP 2023) - the design of a modern channel as a logically-infinite array with two atomic counters and a third for the buffer end, and the buffer-expansion and interruption states, showing what a channel implementation actually has to solve. https://nikitakoval.org/publications/ppopp23-channels.pdf",
+    "Koval, Alistarh, Elizarov, 'Lock-Free Channels for Programming via CSP' (Euro-Par 2019) - the progress guarantee of channel operations and why a lock-free channel is non-trivial, with implementations for Go and Kotlin. https://dl.acm.org/doi/10.1007/978-3-030-29400-7_23"
+  ],
+  "language_files": {
+    "generic": "channels.generic.json",
+    "c": "channels.c.json",
+    "cplusplus": "channels.cplusplus.json",
+    "csharp": "channels.csharp.json",
+    "go": "channels.go.json",
+    "java": "channels.java.json",
+    "javascript": "channels.javascript.json",
+    "kotlin": "channels.kotlin.json",
+    "python": "channels.python.json",
+    "ruby": "channels.ruby.json",
+    "rust": "channels.rust.json",
+    "scala": "channels.scala.json",
+    "swift": "channels.swift.json",
+    "typescript": "channels.typescript.json"
+  },
+  "version": "1.0"
+}

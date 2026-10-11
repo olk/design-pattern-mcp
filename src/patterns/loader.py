@@ -1,6 +1,6 @@
 """PatternLoader loading, join (§2.3 rule 4) and integrity gate (§2.3 rule 5).
 
-The catalog is the decision vocabulary of the whole pipeline: 438 ``DesignPattern`` records stored
+The catalog is the decision vocabulary of the whole pipeline: 486 ``DesignPattern`` records stored
 in layout V8 — a language-neutral main record ``pattern/<name>.json`` plus 14 colocated realization
 files (``<name>.generic.json`` and one per concrete language), joined in memory into a single
 record whose ``language_implementations`` mapping is ordered ``generic`` first, then the concrete
@@ -217,7 +217,7 @@ class JoinedPattern:
     def capsule_text(self) -> str:
         """Compact rerank text (§14 ``rerank_text: capsule``): name, intent, problem, first two use cases.
 
-        Roughly a third of ``document_text`` on the 438-record catalog; ranking
+        Roughly a third of ``document_text`` on the 486-record catalog; ranking
         equivalence with the full text is NOT guaranteed (measured divergence,
         §6 step 4) — opt-in only.
         """

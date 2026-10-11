@@ -1,0 +1,21 @@
+{
+  "pattern": "software-transactional-memory",
+  "language": "ruby",
+  "support": "discouraged",
+  "idiom_name": "frozen copy-on-write state published under a Mutex",
+  "implementation_notes": "Ruby's GVL protects the interpreter, not your compound operation, so the same tearing hazard exists; what Ruby supplies instead is a very cheap snapshot. `dup` / `freeze` / `Hash#merge` produce a new object rather than mutating in place, which means a transaction can copy the shared state, compute against the copy, and publish it under a `Mutex` in one atomic reference swap. That is STM's deferred-write-set shape in idiomatic Ruby, and `Hash#merge!` on the copy is safe precisely because the copy is yours. Ruby's real preference, though, is not to share mutable state at all: a `Queue` with a single owner thread, or simply not sharing, removes the pattern's reason to exist. Reach for the transactional helper only where several threads must see the same object - and then keep the shared state to a single frozen Hash, because a Ruby object graph is cheap to copy only until someone nests a mutable object inside it.",
+  "code_sketch": "require 'thread'\n\nclass Txn\n  Conflict = Class.new(StandardError)\n\n  def initialize(state, lock)\n    @state, @lock = state, lock\n  end\n\n  # yield a mutable copy; nothing the block does touches the live hash\n  def commit\n    snapshot = @state.dup          # shallow copy: values must be immutable\n    yield snapshot                 # block MUST be side-effect free\n    @lock.synchronize do\n      raise Conflict unless @state == snapshot.merge(snapshot)\n      @state.replace(snapshot)     # single publish, under the lock\n    end\n  end\nend\n\n# usage: Txn.new(balances, @lock).commit { |st| st['a'] -= 10; st['b'] += 10 }",
+  "pitfalls": [
+    "dup is shallow: a nested array or hash in the state is shared between snapshot and live object, so the block's nested mutation is not deferred.",
+    "Storing non-immutable values (Time, custom objects with internal state) in the transactional hash and assuming they were snapshotted.",
+    "Using replace on the live hash while another thread holds a reference to the old one, producing a split view where two readers see different states.",
+    "Retrying the block without bounding it, so a contended key livelocks the retrying thread.",
+    "Assuming the GVL makes `h[k] += 1` atomic; it does not, because the read and the write are separate bytecode runs that can be preempted between them."
+  ],
+  "sources": [
+    "https://ruby-doc.org/3.2/oop.html",
+    "https://ruby-doc.org/3.2/classes/Mutex.html"
+  ],
+  "version": "1.0",
+  "alternative": "A Mutex around a shared value that is replaced rather than mutated (Mutex#synchronize), or a Queue for ownership transfer between threads - both are correct on every Ruby implementation including JRuby and TruffleRuby, where the GVL argument does not apply."
+}

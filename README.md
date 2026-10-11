@@ -3,7 +3,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
-An MCP (Model Context Protocol) server that provides design-pattern selection expertise to AI coding agents. Given a free-text description of a system, it analyses the problem, retrieves matching design patterns (from **438 built-in patterns, each realized in 13 concrete languages plus a generic binding**), generates a concrete design with a primary pattern, supporting patterns, participants, interactions, implementation steps, and language-bound variants, and evaluates it against eight design-level quality axes (testability, extensibility, maintainability, simplicity, performance, reliability, security, scalability). The pipeline (analyze → weights ∥ retrieval → generate → evaluate → bounded refine) and its wire contract are specified in [docs/implementation-guide.md](docs/implementation-guide.md).
+An MCP (Model Context Protocol) server that provides design-pattern selection expertise to AI coding agents. Given a free-text description of a system, it analyses the problem, retrieves matching design patterns (from **486 built-in patterns, each realized in 13 concrete languages plus a generic binding**), generates a concrete design with a primary pattern, supporting patterns, participants, interactions, implementation steps, and language-bound variants, and evaluates it against eight design-level quality axes (testability, extensibility, maintainability, simplicity, performance, reliability, security, scalability). The pipeline (analyze → weights ∥ retrieval → generate → evaluate → bounded refine) and its wire contract are specified in [docs/implementation-guide.md](docs/implementation-guide.md).
 
 ---
 
@@ -207,7 +207,7 @@ Call select_design_patterns with:
                → Redis geo-enrich → InfluxDB + S3 sink. At-least-once, backpressure."
   language: "python"
 
-Call list_design_patterns()                       # all 438 patterns
+Call list_design_patterns()                       # all 486 patterns
 Call list_design_patterns(category="workflow-messaging")
 Call get_design_pattern(name="process-manager")
 ```
@@ -315,7 +315,7 @@ Clients that only support the tools protocol (no native `prompts/list` or `promp
 ### Via MCP tools (recommended — works in all clients)
 
 ```
-list_design_patterns()                                        # all 438 patterns
+list_design_patterns()                                        # all 486 patterns
 list_design_patterns(category="concurrency-resilience")       # filter by category
 get_design_pattern(name="acceptor-connector")                 # full pattern JSON
 ```
@@ -332,15 +332,15 @@ Groups every pattern's language realizations by language, then pattern — the r
 
 ### What one pattern record contains
 
-The loader (`src/patterns/loader.py`) joins each record from **14 files**: one generic entry plus one per concrete language (13 languages: C, C++, C#, Go, Java, JavaScript, Kotlin, Python, Ruby, Rust, Scala, Swift, TypeScript). Each language binding carries `support` (`native` / `idiomatic` / `discouraged`), `idiom_name`, `implementation_notes`, an optional `code_sketch`, `pitfalls`, and — for `discouraged` support — a required `alternative`. Language bindings can declare `variants[]` (per-language realizations, 4,924 across the catalog) with a `default_variant`. Each record also declares `related_patterns` (loader-resolvable canonical names only) and `related_patterns_notes` (per-link prose distinctions).
+The loader (`src/patterns/loader.py`) joins each record from **14 files**: one generic entry plus one per concrete language (13 languages: C, C++, C#, Go, Java, JavaScript, Kotlin, Python, Ruby, Rust, Scala, Swift, TypeScript). Each language binding carries `support` (`native` / `idiomatic` / `discouraged`), `idiom_name`, `implementation_notes`, an optional `code_sketch`, `pitfalls`, and — for `discouraged` support — a required `alternative`. Language bindings can declare `variants[]` (per-language realizations, 4,953 across the catalog) with a `default_variant`. Each record also declares `related_patterns` (loader-resolvable canonical names only) and `related_patterns_notes` (per-link prose distinctions).
 
-Alias resolution is built in: the loader turns **841 raw alias entries → 827 distinct after case-folding → 816 indexed alias mappings**, dropping ambiguous aliases (an alias that is itself another record's name or claimed by two records; the `ambiguous_aliases` health field lists them), so `get_design_pattern(name="circuit-breaker")` and its alias spellings resolve to the same record. Startup fails fast when the catalog's enums drift from `docs/pattern-schema.json` (`assert_enums_in_sync`).
+Alias resolution is built in: the loader turns **993 raw alias entries → 978 distinct after case-folding → 966 indexed alias mappings**, dropping ambiguous aliases (an alias that is itself another record's name or claimed by two records; the `ambiguous_aliases` health field lists them), so `get_design_pattern(name="circuit-breaker")` and its alias spellings resolve to the same record. Startup fails fast when the catalog's enums drift from `docs/pattern-schema.json` (`assert_enums_in_sync`).
 
 ---
 
 ## Working Together with architecture-pattern-mcp
 
-This server answers *how each unit is coded* (design patterns); the sibling [architecture-pattern-mcp](https://github.com/olk/architecture-pattern-mcp) answers *which system shape to build* (architecture). An **architecture pattern** structures the whole system — its components, their relationships, and its API/data/event contracts (e.g. `event-driven`, `pipe-and-filter`, `microservices`, chosen from the sibling's 40-pattern catalog). A **design pattern** solves one recurring implementation problem inside a single component — its participants, interactions, and language-bound code (e.g. `observer`, `process-manager`, `circuit-breaker`, chosen from the 438-pattern catalog above with 13 language bindings each).
+This server answers *how each unit is coded* (design patterns); the sibling [architecture-pattern-mcp](https://github.com/olk/architecture-pattern-mcp) answers *which system shape to build* (architecture). An **architecture pattern** structures the whole system — its components, their relationships, and its API/data/event contracts (e.g. `event-driven`, `pipe-and-filter`, `microservices`, chosen from the sibling's 40-pattern catalog). A **design pattern** solves one recurring implementation problem inside a single component — its participants, interactions, and language-bound code (e.g. `observer`, `process-manager`, `circuit-breaker`, chosen from the 486-pattern catalog above with 13 language bindings each).
 
 Recommended order — macro first, micro second:
 

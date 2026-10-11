@@ -71,7 +71,7 @@ reproducibility here is a caching decision, not a tuning decision.
 | Sampling | `temperature=0.1`, no `seed`; `top_p`/`top_k` configured but never reach the provider (§5) |
 
 | Reasoning layer | `REASONING_ENABLED=true`, 2 thoughts for each of analyze/weights/generate/evaluate |
-| Catalog | 438 main records / 6132 language entries, identical across all runs |
+| Catalog | 438 main records / 6132 language entries at run time (2026-09; current catalog is 486 records), identical across all runs |
 
 Eight observations, all in the same server process. Runs A–D precede the container replacement at
 08:38:49 local and rest on opportunistically collected traffic. Runs E–H were all issued after
@@ -303,7 +303,7 @@ the production `score_candidates` + `select_for_part`:
 
 | Probe | Result |
 |---|---|
-| Whole catalog at one blend value, all 35 styles + `None` (438 candidates × 36 conditions) | **0** primary changes; the leader's category identical in every distinct-affinity style |
+| Whole catalog at run time (438 candidates) at one blend value, all 35 styles + `None` (438 candidates × 36 conditions) | **0** primary changes; the leader's category identical in every distinct-affinity style |
 | Run C `gateway-schema-validation` (`intercepting-validator` security-verification vs `tolerant-reader` interaction-boundary) | **14/35** styles flip the primary |
 | Run D `dispatch-routing-extensibility` (`content-based-router` workflow-messaging vs `content-based-serializer` interaction-boundary) | **11/35** |
 | Run C `worker-per-type-extensibility` | **6/35** |

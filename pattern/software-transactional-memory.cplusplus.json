@@ -1,0 +1,20 @@
+{
+  "pattern": "software-transactional-memory",
+  "language": "cplusplus",
+  "support": "manual",
+  "idiom_name": "RAII transaction object with shared_mutex commit",
+  "implementation_notes": "C++ has no standard-library STM but it has everything the snapshot half needs: cheap moves, `std::shared_ptr<const T>` handles that make 'changed' a pointer comparison, and RAII to scope a transaction object. The realisation that fits the language is a `transaction` class constructed at the top of the block, which records read-set entries as `shared_ptr<const T>` plus its observed value in a vector, buffers writes, and in its destructor (or an explicit `commit()`) validates and publishes - with RAII guaranteeing the abort-on-unwind behaviour that C must do by hand. Use `std::atomic<std::shared_ptr<T>>` (C++20) or a `std::mutex` held only for the swap to make commit a single step. What C++ does not give you is the key property of the original formulation: memory transactions. Intel TSX / IBM's hardware transactional memory are CPU features with a start/commit instruction pair, and they are not portable, are disabled on many parts, and abort silently on any out-of-transaction call - including most I/O - so treating them as a drop-in for software STM is a portability and debugging trap. C++20's atomic wait/notify and the compare_exchange loop remain the honest portable forms.",
+  "code_sketch": "class txn {\n  std::vector<std::pair<std::shared_ptr<const Cell>, Cell>> readset;\n  std::vector<std::pair<std::shared_ptr<Cell>, Cell>>        writeset;\npublic:\n  Cell& read(const std::shared_ptr<const Cell>& c) {\n    readset.emplace_back(c, *c);                 // snapshot for undo + conflict\n    return *c;\n  }\n  void write(const std::shared_ptr<Cell>& c, Cell v) { writeset.emplace_back(c, std::move(v)); }\n  bool commit() {                                // validate, then publish as one step\n    for (auto& [c, seen] : readset)\n      if (c->version != seen.version) return false;   // caller replays the block\n    for (auto& [c, v] : writeset) { v.version = c->version + 1; c->store(v); }\n    return true;\n  }\n  ~txn() { /* uncommitted writes are simply dropped */ }\n};",
+  "pitfalls": [
+    "Copying the transaction object would duplicate the read set and silently break undo ordering; make it non-copyable.",
+    "Committing one location at a time breaks atomicity - another thread observes a half-applied transaction between two stores.",
+    "Using a plain `shared_ptr<Cell>` (mutable target) forces a deep copy for the snapshot; use `shared_ptr<const Cell>` and replace the whole node so the undo is just keeping the old pointer.",
+    "Reading `*c` without registering it in the read set, which is the single easiest way to lose conflict detection and is not caught by the compiler.",
+    "Hardware transactional memory (Intel TSX) aborts on any call that might touch non-transactional memory, including most I/O and libc; the resulting abort storms are far harder to diagnose than lock contention."
+  ],
+  "sources": [
+    "https://en.cppreference.com/w/cpp/thread/mutex",
+    "https://intel.github.io/sgx/tdx-sdk/_tdx_api_page_rdts.html"
+  ],
+  "version": "1.0"
+}
