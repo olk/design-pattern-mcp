@@ -2,6 +2,7 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+[![M8ven Score](https://m8ven.ai/badge/mcp/olk-design-pattern-mcp-njyc2vv=0bd9bbb0ae6db22b3afee2ea3a58f4fc)](https://m8ven.ai/mcp/olk-design-pattern-mcp-njyc2v?s=readme)
 
 An MCP (Model Context Protocol) server that provides design-pattern selection expertise to AI coding agents. Given a free-text description of a system, it analyses the problem, retrieves matching design patterns (from **486 built-in patterns, each realized in 13 concrete languages plus a generic binding**), generates a concrete design with a primary pattern, supporting patterns, participants, interactions, implementation steps, and language-bound variants, and evaluates it against eight design-level quality axes (testability, extensibility, maintainability, simplicity, performance, reliability, security, scalability). The pipeline (analyze → weights ∥ retrieval → generate → evaluate → bounded refine) and its wire contract are specified in [docs/implementation-guide.md](docs/implementation-guide.md).
 
