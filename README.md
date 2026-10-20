@@ -1,5 +1,6 @@
 # design-pattern-mcp
 
+[![CI](https://img.shields.io/github/actions/workflow/status/olk/design-pattern-mcp/ci.yml?branch=main)](https://github.com/olk/design-pattern-mcp/actions)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 [![M8ven Score](https://m8ven.ai/badge/mcp/olk/design-pattern-mcp)](https://m8ven.ai/mcp/olk/design-pattern-mcp?s=readme)
