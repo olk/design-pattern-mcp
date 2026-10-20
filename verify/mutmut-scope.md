@@ -16,9 +16,8 @@
 ## Why a narrow scope
 
 The mutation surface is the decision logic — the code where a silent bug is a
-kill-class bug — never the whole tree (testing-strategies §3.4: "the critical
-5-10%, never the tree"). A module enters scope only when all four checklist
-rows hold; it leaves scope only through a row edit here.
+kill-class bug — never the whole tree. A module enters scope only when all four
+checklist rows hold; it leaves scope only through a row edit here.
 
 > The file previously carried a "Tier A/B/C + R5" scheme ported from the
 > sibling architecture-pattern server, and every row cited modules or
@@ -75,8 +74,8 @@ rows hold; it leaves scope only through a row edit here.
 | Module | Candidate functions | Why deferred |
 |---|---|---|
 | `src/config.py` | the four `_check_*` model validators (weight-sum `1e-3`/`0.05` tolerances, floor ≤ `2/60`) | boundary logic is a good mutmut target, but the file is 564 lines of Pydantic models — mutating field defaults and `Field` wiring would flood the run with equivalents; needs `# pragma: no mutate` support verification first (3.7 pragma semantics unverified) and dedicated boundary tests. Boundary tolerance IS covered meanwhile by the garden's `boundary-tolerance` class (M-27..M-31). |
-| `src/tools/analyze.py` / `src/tools/design.py` / `src/tools/evaluate.py` / `src/tools/generate.py` | tool handlers | dedicated test files exist (11/20/17/15 tests) and handlers carry real formatting/error-wrapping decisions, but the tests mock the pipeline — expect survivor noise; ~1 600 LOC would grow the mutant surface by ~4x. Add as a dedicated PR AFTER the first nightly run reports wall-clock for the current scope (job cap: 180 min). |
-| `src/tools/get_design_status.py` | status mapping handler | its tests live in `test_server.py`, which is not in the mutation test selection (and pulling in all of test_server drags server wiring into every slice). Needs a dedicated handler test file first. |
+| `src/tools/analyze.py` / `src/tools/design.py` / `src/tools/evaluate.py` / `src/tools/generate.py` | tool handlers | dedicated handler tests exist (`test_analyze.py` 3, `test_generate.py` 10, `test_evaluate.py` 4; no `test_design.py`) and handlers carry real formatting/error-wrapping decisions, but the tests mock the pipeline — expect survivor noise; ~1 600 LOC would grow the mutant surface by ~4x. Add as a dedicated PR AFTER the first nightly run reports wall-clock for the current scope (job cap: 300 min per `verification.yml`). |
+| `src/tools/get_design_status.py` | status mapping handler | covered via `tests/unit/test_protocol_smoke.py` + `test_server_logging.py` (no dedicated `test_server.py` exists); pulling a full server test module into the slice would drag server wiring into every slice. Needs a dedicated handler test file first. |
 | `src/tools/patterns.py` | list/get pattern handlers | thin loader delegation; `src/patterns/loader.py` itself is already in scope. |
 | `src/reasoning/config.py` | `get_strategy`, command validation | mostly declarative pydantic; the tested decisions (defaults, override parsing) are pinned via `test_reasoning_client.py` but the model-default bulk would be equivalent noise. Revisit together with the `src/config.py` pragma work. |
 | `src/agent.py`, `src/reasoning/client.py`, `src/reasoning/prompts.py`, `src/reasoning/tools.py`, `src/errors.py`, `src/tools/_adapters.py`, `src/design_validation.py`, `src/patterns/embedder.py`, `src/patterns/safe_tei_rerank.py` | see the *Model-checked* table below | these modules are in `do_not_mutate` because another verification layer already owns their decisions; they are **not** awaiting sign-off. A row here means "excluded pending scope sign-off", which is a different claim — the *Model-checked* table is the truthful one for them. |
@@ -207,8 +206,8 @@ missing kill, or (b) a true equivalent — record it in
 
 Current per-module ratios are read from the committed
 `verify/mutmut-baseline.json` after each regen. That baseline (regenerated at commit
-`b6bb0a9` on 2026-10-07, after the DesignPipeline→Workflow conversion) records
-6325 mutants / 3855 killed / 2444 survived — overall kill ratio 0.609. The weakest
+`923eec5`, per `run.git_commit` in the JSON) records
+6328 mutants / 3862 killed / 2440 survived — overall kill ratio 0.610. The weakest
 ratios in scope are `src/validation.py` (0.54), `src/design_normalization.py`
 (0.57), `src/pipeline.py` (0.58) and `src/patterns/dense_cache.py` (0.59).
 Cluster-by-cluster dispositions live in `verify/mutmut-equivalents.md`.

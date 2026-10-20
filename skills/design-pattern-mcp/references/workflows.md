@@ -16,6 +16,6 @@ Set `timeout: 0` in `~/.omp/agent/mcp.json` for `design-pattern-mcp`, then use `
 
 ## Catalog → generate
 
-1. `list_design_patterns({"category": "concurrency"})`
+1. `list_design_patterns({"category": "concurrency-resilience"})`
 2. `get_design_pattern({"name": "producer-consumer"})`
 3. `generate_design({"description": "...", "selected_patterns": ["producer-consumer"]})`

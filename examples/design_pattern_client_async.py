@@ -40,7 +40,7 @@ Usage:
     $ make client-async
 
 Requires:
-    - MCP server running on http://localhost:8060/mcp (default; raw server: 8050)
+    - MCP server running on http://localhost:8062/mcp (default; raw server: 8050)
     - No LLM credentials are needed for deterministic retrieval, but a complete
       job result does require a functioning generator: the E12 path settles the
       job as failed instead of fabricating a full design.
@@ -58,7 +58,7 @@ import time
 from fastmcp import Client  # type: ignore[attr-defined]
 from fastmcp.exceptions import ClientError, McpError, ToolError
 
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8060/mcp")
+SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8062/mcp")
 
 POLL_EVERY = int(os.environ.get("DESIGN_PATTERN_CLIENT_POLL_SECONDS", "15"))
 
@@ -87,16 +87,16 @@ def _request_shutdown(signum: int, frame: object) -> None:  # noqa: ARG001
     SHUTDOWN["interrupted"] = True
 
 
-
 def print_startup_hint() -> None:
     """Print the server-startup guidance — only for transport/protocol failures."""
     print(
         f"\nIs the MCP server running?\n"
-        f"  Start it with:  make docker-up   (dev stack, port 8060)\n"
+        f"  Start it with:  make docker-up   (dev stack, port 8062)\n"
         f"                  python -m src.main   (local, port 8050)\n"
         f"  Expected URL:   {SERVER_URL}",
         file=sys.stderr,
     )
+
 
 async def poll_until_terminal(client: Client, job_id: str) -> int:
     """Poll ``get_design_status`` until the job settles; return the process exit code."""
@@ -115,9 +115,7 @@ async def poll_until_terminal(client: Client, job_id: str) -> int:
 
         if status == "completed":
             print("\n=== Design result ===", file=sys.stderr)
-            result_json = json.dumps(
-                status_data.get("result") if status_data.get("result") else {}, indent=2
-            )
+            result_json = json.dumps(status_data.get("result") if status_data.get("result") else {}, indent=2)
             print(result_json)
             return 0
 

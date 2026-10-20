@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-NL-Doc cross-consistency gate — mechanical subset (testing-strategies.md
-§3.9, L8).
-
+NL-Doc cross-consistency gate — mechanical subset (L8).
 Evidence base: VLP (arXiv 2607.02333) — validating an intermediate artifact
 beats direct code review 84% vs 40%; the docstring-as-NL-Doc discipline is
 promoted from convention to a machine-checked step.
@@ -83,9 +81,7 @@ def _public_functions(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunction
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--strict", action="store_true", help="exit 1 when divergence exceeds 10%"
-    )
+    parser.add_argument("--strict", action="store_true", help="exit 1 when divergence exceeds 10%")
     args = parser.parse_args()
 
     model = _checker_identity()

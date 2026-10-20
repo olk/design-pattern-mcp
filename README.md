@@ -601,12 +601,12 @@ export DESIGN_PATTERN_PROMPT_STABLE_PREFIX=true
 
 | Layer | What | Where |
 |---|---|---|
-| L1 | Unit tests (388) | `tests/unit/` |
-| L2 | Hypothesis property oracles (110) | `tests/verification/` |
+| L1 | Unit tests (388 collected, 359 test functions) | `tests/unit/` |
+| L2 | Hypothesis property oracles (15 in `test_config_properties.py`; 115 verification tests collected total) | `tests/verification/` |
 | L3 | Spec gardens (FG-* mutants) | `verify/`, `make verify-fizz-garden` |
 | L4 | Exhaustive FizzBee models (7 specs: jobs runner/protocol, pipeline control, design loop, reasoning retry, TEI fallback, retrieval fusion) | `verify/fizz/`, `make verify-fizz` |
-| — | Mutation ratchet (`mutmut` baseline; new survivors fail the gate) | `verify/mutmut-baseline.json`, `make test-mutations` |
-| — | Ledger + cross-consistency (fizz ↔ tests ↔ docs) | `make verify-ledger`, `make verify-cross-consistency` |
+| — | Mutation ratchet (`mutmut` baseline; new survivors fail `make test-mutations`, advisory in nightly CI) | `verify/mutmut-baseline.json`, `make test-mutations` |
+| — | Ledger (gating) + cross-consistency (advisory NL-doc triage) | `make verify-ledger`, `make verify-cross-consistency` |
 
 Every `.fizz` assertion must kill at least one spec-garden mutant or carry a `# spec-explains:` justification; a change to a decision module updates the matching `.fizz` model in the same PR. The normative pipeline spec is [docs/implementation-guide.md](docs/implementation-guide.md) (§-numbered, mirrored in German as `docs/selektions-process-de.md`); the wire contract of the tool result is `docs/result-schema.json`, the catalog record contract is `docs/pattern-schema.json`.
 
@@ -666,7 +666,7 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 | `make check-deadcode` / `make check-depcheck` | vulture / deptry |
 | `make check-all` | All four check gates |
 | `make test-unit` | Unit tests (`tests/unit/`) |
-| `make test-oracles` | Executable oracles: L1 canary, L2 property oracles, trace replay |
+| `make test-oracles` | Executable oracles: L1 canary, L2 property oracles, spec-garden replay (`test_fizz_garden`); `test_fizz_traces`/`test_fizz_conformance` planned, not landed |
 | `make test-mutations` | mutmut ratchet against `verify/mutmut-baseline.json` |
 | `make verify-fizz` | Exhaustive FizzBee model checks (L4) |
 | `make verify-ledger` / `make verify-cross-consistency` | Ledger + NL-doc consistency gates |

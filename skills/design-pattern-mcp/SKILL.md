@@ -79,8 +79,10 @@ Existing code/design to score?
 
 4. **Cancel** — `write xd://mcp__design_pattern_local_cancel_design` with `{"job_id": "..."}`
 
-## Result interpretation
+## Result interpretation (`DesignResult` — see `docs/result-schema.json`)
 
-- `overall_score` (0–100): ≥ 75 strong, 50–74 workable, < 50 means the pipeline regenerated
-- `findings[]`: critical issues keyed by type (selection_defect, design_quality, coverage)
-- `part_selections`: per-decision-part chosen pattern + scores
+- `overview.score` (0–1, blended selection quality): dominant pattern, supporting
+  patterns, principles, reasoning in `overview`
+- `applications[]`: one entry per decision part (participants, interactions,
+  implementation steps, code sketch, language binding with `bound_variant`)
+- `quality_attributes`, `test_strategy`, `risks[]`: evaluation axes and follow-ups

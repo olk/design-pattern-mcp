@@ -89,7 +89,7 @@ check-all: ## Run every check-* gate (CI entry point)
 test-unit: install ## Run unit tests with uv (tests/unit/)
 	$(UV) run pytest tests/unit/ -v
 
-test-oracles: install ## Run executable oracles (tests/verification/): L1 canary, L2 PBT oracles, trace replay
+test-oracles: install ## Run executable oracles (tests/verification/): L1 canary, L2 PBT oracles, spec-garden replay
 	$(UV) run pytest tests/verification/ -v
 
 # Hypothesis isolation: the gate re-runs the same tests under many executors;
@@ -210,17 +210,18 @@ verify-ledger: ## L8: property-ID ledger consistency (verify/fizz/README.md <-> 
 verify-cross-consistency: ## L8: NL-Doc/docstring consistency over the decision modules (advisory)
 	@$(UV) run python scripts/cross_consistency.py
 
-# ajv-cli is an npm toolchain (not uv-managed): needs `npm install -g ajv-cli`.
-verify-patterns: ## Verify pattern/*.json against docs/pattern-schema.json via ajv-cli
-	bash scripts/verify-patterns.sh
+# Pattern files validate with the uv-managed jsonschema checker (no npm needed).
+verify-patterns: ## Verify pattern/*.json against docs/pattern-schema.json
+	@$(UV) run python scripts/validate_patterns.py
 
 # Nightly aggregator over the formal/audit verify-* targets.
 verify-all: ## Run every verify-* target (nightly entry point)
-	@echo "==> [1/5] verify-fizz";              $(MAKE) --no-print-directory verify-fizz
-	@echo "==> [2/5] verify-fizz-simulation";   $(MAKE) --no-print-directory verify-fizz-simulation
-	@echo "==> [3/5] verify-fizz-garden";       $(MAKE) --no-print-directory verify-fizz-garden
-	@echo "==> [4/5] verify-ledger";            $(MAKE) --no-print-directory verify-ledger
-	@echo "==> [5/5] verify-cross-consistency"; $(MAKE) --no-print-directory verify-cross-consistency
+	@echo "==> [1/6] verify-fizz";              $(MAKE) --no-print-directory verify-fizz
+	@echo "==> [2/6] verify-fizz-simulation";   $(MAKE) --no-print-directory verify-fizz-simulation
+	@echo "==> [3/6] verify-fizz-garden";       $(MAKE) --no-print-directory verify-fizz-garden
+	@echo "==> [4/6] verify-ledger";            $(MAKE) --no-print-directory verify-ledger
+	@echo "==> [5/6] verify-cross-consistency"; $(MAKE) --no-print-directory verify-cross-consistency
+	@echo "==> [6/6] verify-patterns";          $(MAKE) --no-print-directory verify-patterns
 
 ##@ Demo
 health: ## Run the offline readiness check (prints OK)
@@ -329,7 +330,7 @@ docker-publish-tei: docker-build-tei ## Push both TEI images to Docker Hub + GHC
 docker-publish-all: docker-publish docker-publish-tei ## Build and push all three images
 
 # File target, not phony: the cache is expensive (one TEI round-trip per
-# embedder batch, ~15 min for the 438-record catalog on CPU) and is only rebuilt
+# embedder batch, ~15 min for the 486-record catalog on CPU) and is only rebuilt
 # when the artifact is gone — `embed-cache` is the explicit force path.
 # The image prerequisites are ORDER-ONLY on purpose: they are phony (always
 # "remade"), so ordinary prerequisites would mark this target out of date on

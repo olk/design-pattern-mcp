@@ -6,7 +6,7 @@
 # the spec directory (compiled .json ASTs and out/ graphs are written there
 # and discarded), then apply the gate verdict for the given mode.
 #
-# Isolation rationale (docs/make_rules.md #verify-fizz): the compiled .json
+# Isolation rationale (#verify-fizz in the Makefile): the compiled .json
 # artifacts and out/ run dirs are shared mutable state when fizz runs against
 # verify/fizz/ directly — concurrent gate runs can clobber each other's
 # compilation and an aborted run can leave stale artifacts. A private temp

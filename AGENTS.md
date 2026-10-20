@@ -29,9 +29,12 @@
   mutant and appear in the `verify/fizz/README.md` ledger.
 - Every `.fizz` `always` / `always eventually` assertion must kill at least one spec-garden
   mutant or carry a `# spec-explains:` justification — vacuous assertions are rejected.
-- The executable layers (L1 unit tests, L2 Hypothesis oracles, L3 gardens, L4 FizzBee, L6 DST)
-  are the verification authority; a change to a decision module (see
-  `verify/mutmut-scope.md`) must keep `tests/unit/` and `tests/verification/` green.
+- The executable layers (L1 unit tests, L2 Hypothesis oracles, L3 gardens,
+  L4 FizzBee) are the verification authority; a change to a decision module
+  (see `verify/mutmut-scope.md`) must keep `tests/unit/` and
+  `tests/verification/` green. L6 DST is planned, not landed (no DST module
+  exists yet); the L4 conformance replay (`test_fizz_conformance.py`) is likewise
+  planned — the FG-15 `killed-elsewhere` credit is pending until it lands.
 - L3 scope changes (any edit to `[tool.mutmut]` in `pyproject.toml`) must update the
   `verify/mutmut-scope.md` ledger row in the same commit. `make test-mutations` enforces a
   ratchet against the committed `verify/mutmut-baseline.json` (new survivors and kill-ratio

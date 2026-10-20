@@ -24,9 +24,9 @@
 | Model | Abstracts | Assertions |
 |---|---|---|
 | `jobs_protocol.fizz` | caller view of the job store protocol (`src/tools/jobs.py`: create/submit, set_running, guarded terminal UPDATEs) with symmetric crashing clients | J-1, J-2 (guard structure), J-3, J-4, FC-1, FC-2 |
-| `jobs_runner.fizz` | the background task lifecycle + cancel tool (`src/tools/submit_design_design.py::_run_job`, `src/tools/cancel_design_design.py`): W0-1 checkpoints, terminal-write races, task-map bookkeeping, whole-run deadline expiry (`EnvDeadline` → `set_failed`) | J-1 (kill authority), RUN-1, RUN-3, RUN-4, RUN-5, C-1 |
+| `jobs_runner.fizz` | the background task lifecycle + cancel tool (`src/tools/submit_design_job.py:109::_run_job`, `src/tools/cancel_design.py`): W0-1 checkpoints, terminal-write races, task-map bookkeeping, whole-run deadline expiry (`EnvDeadline` → `set_failed`) | J-1 (kill authority), RUN-1, RUN-3, RUN-4, RUN-5, C-1 |
 | `pipeline_control.fizz` | pipeline stage machine (`src/pipeline.py` stage order + design_loop attempts) vs an unreliable LLM environment and the whole-run deadline; Stage D's single batched weight call is abstracted by the same `LlmCall` environment (stage/attempt order unchanged). **2026-09-25:** header note documents (a) the Stage C/D `asyncio.gather` overlap (join precedes the deterministic selection loop) and (b) GENERATE's bounded-concurrent batch fan-out (`generation_max_concurrency`, batch-order concatenation) | P-1, FP-2, FP-3, FP-4, FP-5, FP-6, FP-7, FP-8 |
-| `design_loop.fizz` | `DesignPipeline.design_loop` triage decisions (`src/pipeline.py:1015`): best-score guard, early stop, cancel checkpoint, malformed-continue, wire-schema escalation abort (the DIV-2..5 gate's consequence) | DL-2, DL-3, DL-4, DL-5, DL-6 |
+| `design_loop.fizz` | `DesignPipeline.design_loop` triage decisions (`src/pipeline.py:1941`): best-score guard, early stop, cancel checkpoint, malformed-continue, wire-schema escalation abort (the DIV-2..5 gate's consequence) | DL-2, DL-3, DL-4, DL-5, DL-6 |
 | `reasoning_retry.fizz` | reasoning-client timeout/retry discipline (`src/reasoning/client.py`: wait_for budget deadline, silent degradation; `_run_cached`: LRU + single-flight). **2026-09-25:** header note documents L5 persistent clients — per-tool cached `Client` in `ReasoningClient._clients`, connect bounded by `spawn_timeout_seconds`, respawn on any call failure, `close()` shuts the pool down | E5F-1, E5F-2, E5F-3, E5F-4 |
 | `tei_fallback.fizz` | TEI reranker verdict discipline (`src/patterns/safe_tei_rerank.py`) + the retrieval rerank-error path (`src/patterns/retriever.py`) | TEI-1, RET-1 |
 | `retrieval_fusion.fizz` | retrieval resolution + fallback decision (`src/patterns/retriever.py` resolve/floor/tag tail). **2026-09-25:** header note documents `retrieve_many` (L1 batching) — N `PartQuery`s share one embed round trip / one FAISS search, per-part REAL/FALLBACK discipline unchanged | FUS-1, FUS-2, FUS-3 |
@@ -67,11 +67,11 @@
 | `DL-3` | Once cancellation is observed no further attempt starts | `always` | `design_loop.fizz::DL3_CancelFreezesAttempts` (FG-29 must violate) | n/a | planned (not built) | planned (not built) |
 | `DL-4` | A malformed attempt retries, never ends the loop early | `always` | `design_loop.fizz::DL4_MalformedContinues` (FG-30 must violate) | n/a | planned (not built) | planned (not built) |
 | `DL-5` | Early stop only fires at/above the quality threshold | `always` | `design_loop.fizz::DL5_EarlyStopThreshold` (FG-31 must violate) | n/a | planned (not built) | planned (not built) |
-| `DL-6` | A wire-schema integrity rejection (DIV-2..5 gate) that survives the internal generate retries aborts the loop — never scored, never retried | `always` | `design_loop.fizz::DL6_ValidationEscalationAborts` (FG-34 must violate) | n/a | n/a — recovery (rejection at the wire schema + correction-prompt retry) is pinned by L1 planned (not built)`tests/schemas/test_schemas.py::TestDesignDesignResponseIntegrity`, `test_validation.py` | planned |
+| `DL-6` | A wire-schema integrity rejection (DIV-2..5 gate) that survives the internal generate retries aborts the loop — never scored, never retried | `always` | `design_loop.fizz::DL6_ValidationEscalationAborts` (FG-34 must violate) | n/a | n/a — recovery pinned by L1 `test_validation.py` | planned |
 | `J-1..J-4 (stateful)` | Shadow-automaton agreement over generated RULE sequences (superset sample of the J-oracle list replay) | n/a | n/a | n/a | planned (not built) | planned (not built) |
 | `N-1..N-4` | normalization idempotence (N-1) and dedup/coverage/subset (N-2..N-4) | n/a | n/a — pure decision logic, no interleavings; pinned by the L2 Hypothesis oracle, not a `.fizz` model | n/a (no static contract) | planned (not built) | planned (not built) |
 
-## Spec garden (vacuity authority for model assertions, testing-strategies §3.4)
+## Spec garden (vacuity authority for model assertions — the L3 garden layer)
 
 Every `always` assertion must kill at least one spec-garden mutant or carry
 a `# spec-explains:` justification (AGENTS.md rule). The Python-side garden
@@ -107,7 +107,7 @@ change.
 | FG-12 | *retired* — "Submit sets RUNNING directly" killed nothing after the budget/jid changes (cancel from RUNNING is legal, J-1 untouched); the direct-RUNNING class is covered by FG-02 in jobs_runner |
 | FG-13 | `jobs_protocol`: drop the progress fairness on `Cancel`/`Complete`/`Fail` (the FC-liveness-assumption flip) | `FC1_NoStuckRunning` (without a fair response action the stutter-only schedule counts) |
 | FG-14 | `jobs_runner`: drop the done-callback finish cleanup (`active`/`active_count` never cleared) | `RUN3_TaskMapInvariant` |
-| FG-15 | `jobs_protocol` / `jobs_runner`: Cancel acks without the store write | *retargeted 2026-09-11* — no `.fizz` flip fires any more: with globally unique jids a client's inflight never points at a terminal job, so Cancel's guarded `Trans` always lands before the ack (validated on both specs, incl. the runner's raced-path flip, which is dead under atomic actions). FC2/C1 carry `# spec-explains:` tripwire justifications; the ack-without-landed-write bug class is killed on the REAL code by the L4 conformance vacuity plant (`test_fizz_conformance.py::_CancelNeverLandsStore`) |
+| FG-15 | `jobs_protocol` / `jobs_runner`: Cancel acks without the store write | *retargeted 2026-09-11* — no `.fizz` flip fires any more: with globally unique jids a client's inflight never points at a terminal job, so Cancel's guarded `Trans` always lands before the ack (validated on both specs, incl. the runner's raced-path flip, which is dead under atomic actions). FC2/C1 carry `# spec-explains:` tripwire justifications. The ack-without-landed-write bug class is `killed-elsewhere` **pending**: `scripts/fizz_traces.py` can emit the corpus, but `tests/verification/test_fizz_conformance.py` (with the `_CancelNeverLandsStore` vacuity plant) was never written — land the replay harness to make the kill real. |
 | FG-16 | `pipeline_control`: drop `fair` on `RunFinish` | `FP5_EventualOutcome` (stutter-only schedules keep `outcome == None`) |
 | FG-17 | `pipeline_control`: unbounded `RetryTick` (drop `MAX_TICKS`; validated at max_actions 60 — at the suite bound the tick dimension dominates the graph) | `FP5_EventualOutcome` (fair tick self-loop) |
 | FG-19 | `jobs_runner`: unbounded `StoreTick` (drop `MAX_STUCK`; validated at max_actions 40 — at the suite bound the stuck dimension dominates) | `RUN4_NoStuckRunning` (fair tick self-loop) |
@@ -191,13 +191,16 @@ The frozen counterexample replayed against the real implementation lives in
 `tests/verification/test_fizz_traces.py` and runs in every
 `make test-oracles` pass regardless of tool availability.
 
-**Status (2026-10-07):** `test_fizz_traces.py` does not exist — the frozen
-replay harness was never landed. The same applies to the conformance replay
-below: `scripts/fizz_traces.py` exists, but no corpus JSON is checked in
-(`tests/verification/fizz_corpus/` is empty) and
-`test_fizz_conformance.py` was never written. `make regen-fizz-traces`
+**Status (2026-10-20):** the frozen-replay harness was never landed. The same
+applies to the conformance replay below: `scripts/fizz_traces.py` exists, two
+corpus JSONs are tracked (`tests/verification/fizz_corpus/jobs_protocol.json`,
+`retrieval_fusion.json`), but `test_fizz_traces.py` and
+`test_fizz_conformance.py` were never written. `make regen-fizz-traces`
 regenerates the graphs when the fizz toolchain is available; the replay
-harness itself remains unbuilt work.
+harness itself remains unbuilt work. Until it lands, FG-15's
+`killed-elsewhere` credit and the vacuity plants named below
+(`_CancelNeverLandsStore`, `_StaleClockStore`, `_ErrorSwallowingReranker`)
+have no executing test — treat them as planned, not proven.
 
 ## Conformance corpus (L4 model→code replay — planned, not landed)
 

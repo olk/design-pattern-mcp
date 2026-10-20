@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """
-Property-ID ledger consistency check (testing-strategies.md §3.9, L8; fizzbee
-plan §3.4/§5.3).
+Property-ID ledger consistency check (L8).
 
 The verify/fizz/README.md ledger is the single mapping between the .fizz
 models, the Hypothesis oracles, and the conformance tests.
@@ -85,9 +84,7 @@ def main() -> int:
         for prop_id in ids:
             referenced.add(prop_id)
             if prop_id not in rows:
-                failures.append(
-                    f"UNMAPPED: {prop_id} referenced in {path} has no ledger row"
-                )
+                failures.append(f"UNMAPPED: {prop_id} referenced in {path} has no ledger row")
 
     for prop_id, row in sorted(rows.items()):
         lowered = row.lower()
@@ -98,8 +95,7 @@ def main() -> int:
         appears = any(prop_id in ids for ids in artifacts.values())
         if not appears and not deferred:
             failures.append(
-                f"DANGLING: ledger row {prop_id} references no existing artifact "
-                "and is not marked planned/n/a"
+                f"DANGLING: ledger row {prop_id} references no existing artifact and is not marked planned/n/a"
             )
         cited = set(re.findall(r"`(test_[\w./-]+?\.py)(?:::[\w*.-]+)?`", row))
         cited |= {p.split("::")[0] for p in re.findall(r"`(tests/[\w./-]+\.py)`", row)}
@@ -123,10 +119,7 @@ def main() -> int:
         print(f"\nLedger rows: {len(rows)}; artifact references: {len(referenced)}")
         return 1
 
-    print(
-        f"ledger consistent: {len(rows)} rows, "
-        f"{len(referenced)} referenced IDs, {len(artifacts)} artifacts checked"
-    )
+    print(f"ledger consistent: {len(rows)} rows, {len(referenced)} referenced IDs, {len(artifacts)} artifacts checked")
     return 0
 
 
