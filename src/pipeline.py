@@ -107,6 +107,7 @@ from src.style_affinity import affinity_for
 from src.variants import bind_entry, select_variant, variant_summaries
 
 if TYPE_CHECKING:  # pragma: no cover - type-only import (reasoning.client pulls fastmcp)
+    from src.decisions.client import DecisionModelClient
     from src.reasoning.client import ReasoningClient
 
 logger = logging.getLogger(__name__)
@@ -258,8 +259,7 @@ class PipelineDone(StopEvent):
         """Return the carried payload, asserting its type for the caller's mode."""
         payload = self._get_result()
         assert isinstance(payload, payload_type), (
-            f"PipelineDone(mode={self._mode!r}) carries "
-            f"{type(payload).__name__}, expected {payload_type.__name__}"
+            f"PipelineDone(mode={self._mode!r}) carries {type(payload).__name__}, expected {payload_type.__name__}"
         )
         return payload
 
@@ -373,15 +373,41 @@ def resolve_style(submitted: str | None) -> str | None:
 #: The architecture server's published style enum (§10.1 table keys; the affinity table is the SSOT).
 _STYLE_ENUM: frozenset[str] = frozenset(
     {
-        "event-driven", "broker", "enterprise-service-bus", "event-sourcing",
-        "command-query-responsibility-segregation", "saga", "microservices",
-        "service-oriented-architecture", "hexagonal", "layered-monolith", "modular-monolith",
-        "monolithic", "pipe-and-filter", "model-view-controller", "presentation-abstraction-control",
-        "microkernel-plugin", "reflection-architecture", "reactive-architecture", "actor-based",
-        "half-sync-half-async", "task-control-architecture", "serverless", "edge-computing",
-        "space-based", "data-mesh", "lambda-architecture", "kappa-architecture", "api-gateway",
-        "backend-for-frontend", "service-mesh", "rule-based-system", "aiml-centric",
-        "blockchain-based", "hybrid-cloud", "multi-cloud",
+        "event-driven",
+        "broker",
+        "enterprise-service-bus",
+        "event-sourcing",
+        "command-query-responsibility-segregation",
+        "saga",
+        "microservices",
+        "service-oriented-architecture",
+        "hexagonal",
+        "layered-monolith",
+        "modular-monolith",
+        "monolithic",
+        "pipe-and-filter",
+        "model-view-controller",
+        "presentation-abstraction-control",
+        "microkernel-plugin",
+        "reflection-architecture",
+        "reactive-architecture",
+        "actor-based",
+        "half-sync-half-async",
+        "task-control-architecture",
+        "serverless",
+        "edge-computing",
+        "space-based",
+        "data-mesh",
+        "lambda-architecture",
+        "kappa-architecture",
+        "api-gateway",
+        "backend-for-frontend",
+        "service-mesh",
+        "rule-based-system",
+        "aiml-centric",
+        "blockchain-based",
+        "hybrid-cloud",
+        "multi-cloud",
     }
 )
 
@@ -457,13 +483,14 @@ async def extract_part_weights_batch(
             prior = _normalized_prior(brief.quality_attributes)
             if prior:
                 raw = {
-                    axis: 0.7 * raw.get(axis, 0.0) + 0.3 * prior.get(axis, raw.get(axis, 0.0))
-                    for axis in QUALITY_AXES
+                    axis: 0.7 * raw.get(axis, 0.0) + 0.3 * prior.get(axis, raw.get(axis, 0.0)) for axis in QUALITY_AXES
                 }
                 source = "llm+architecture_prior"
         normalized = _max_normalize(raw)
         alpha = config.scoring.weight_smoothing_alpha
-        smoothed = {axis: alpha * normalized.get(axis, 0.0) + (1.0 - alpha) / len(QUALITY_AXES) for axis in QUALITY_AXES}
+        smoothed = {
+            axis: alpha * normalized.get(axis, 0.0) + (1.0 - alpha) / len(QUALITY_AXES) for axis in QUALITY_AXES
+        }
         logger.info(
             "Part weights extracted",
             extra={
@@ -548,9 +575,7 @@ def apply_vetoes(
         entry = record.entry(language)
         if entry is not None and entry.support == "discouraged":
             alternative = entry.alternative or "a supported alternative"
-            ledger.append(
-                f"{record.name} considered but discouraged in {entry.language}; use {alternative}"
-            )
+            ledger.append(f"{record.name} considered but discouraged in {entry.language}; use {alternative}")
             vetoed += 1
             logger.info(
                 "Language discouragement veto",
@@ -600,12 +625,9 @@ def score_candidates(
             analysis = 10.0 * config.scoring.missing_axis_default
         fusion_normalized = fusion.get(record.name, 0.0)
         blended = (
-            config.scoring.analysis_blend_weight * analysis
-            + config.scoring.fusion_blend_weight * fusion_normalized
+            config.scoring.analysis_blend_weight * analysis + config.scoring.fusion_blend_weight * fusion_normalized
         )
-        adjustments = _adjustments(
-            record, part, brief, language=brief.language, affinity=affinity, config=config
-        )
+        adjustments = _adjustments(record, part, brief, language=brief.language, affinity=affinity, config=config)
         fit = blended + sum(entry.delta for entry in adjustments)
         fit = max(0.0, min(100.0, fit))
         annotated.append(
@@ -715,9 +737,7 @@ def select_for_part(
         weights_source=weights_source,
     )
     if not ordered_candidates:
-        return _fallback_selection(
-            selection, "no candidate survived retrieval and the veto pre-filters (E5)", catalog
-        )
+        return _fallback_selection(selection, "no candidate survived retrieval and the veto pre-filters (E5)", catalog)
     leader = ordered_candidates[0]
     gate = (
         leader.fit_score >= config.selection.primary_score_threshold
@@ -747,7 +767,11 @@ def select_for_part(
                 "leader": leader.name,
                 "leader_fit": round(leader.fit_score, 4),
                 "contenders": [
-                    {"pattern": c.name, "fit_score": round(c.fit_score, 4), "delta": round(leader.fit_score - c.fit_score, 4)}
+                    {
+                        "pattern": c.name,
+                        "fit_score": round(c.fit_score, 4),
+                        "delta": round(leader.fit_score - c.fit_score, 4),
+                    }
                     for c in contenders
                 ],
             },
@@ -838,9 +862,7 @@ def _choose_supporting(
     return chosen
 
 
-def _fallback_selection(
-    selection: PartSelection, reason: str, catalog: PatternLoader
-) -> PartSelection:
+def _fallback_selection(selection: PartSelection, reason: str, catalog: PatternLoader) -> PartSelection:
     """§10.3/E5/E6 fallback primary, or the E7 structured failure for ``specialized-components``."""
     category = selection.part.category_hypothesis
     top_three = [
@@ -865,9 +887,7 @@ def _fallback_selection(
     fallback_record = catalog.get_by_name(fallback_name)
     selection.primary = fallback_name
     fallback_category = (
-        fallback_record.category
-        if fallback_record is not None
-        else category or "construction-composition"
+        fallback_record.category if fallback_record is not None else category or "construction-composition"
     )
     selection.primary_category = as_category(fallback_category)
     selection.is_fallback = True
@@ -904,9 +924,7 @@ def bind_language_entry(
 ) -> LanguageBinding:
     """§8.4: bind the effective language entry (else generic) and exactly one variant."""
     entry = bind_entry(record, language)
-    variant = select_variant(
-        entry, focus=focus, paradigm=paradigm, technology_tokens=list(technology_tokens)
-    )
+    variant = select_variant(entry, focus=focus, paradigm=paradigm, technology_tokens=list(technology_tokens))
     if variant is None:
         return LanguageBinding(
             language=as_language(entry.language),
@@ -928,9 +946,7 @@ def bind_language_entry(
     )
 
 
-def catalog_slice(
-    record: JoinedPattern, binding: LanguageBinding, *, limit: int = 3
-) -> CatalogSlice:
+def catalog_slice(record: JoinedPattern, binding: LanguageBinding, *, limit: int = 3) -> CatalogSlice:
     """The per-application catalog context handed to GENERATE (§11 item 1)."""
     return CatalogSlice(
         pattern=record.name,
@@ -940,7 +956,9 @@ def catalog_slice(
         context=record.context,
         benefits=list(record.benefits[:limit]),
         tradeoffs=list(record.tradeoffs[:limit]),
-        participants=[ParticipantSpec(role=role, responsibility=responsibility) for role, responsibility in record.participants],
+        participants=[
+            ParticipantSpec(role=role, responsibility=responsibility) for role, responsibility in record.participants
+        ],
         avoid_when=list(record.avoid_when[:limit]),
         best_practices=list(record.best_practices[:limit]),
         test_notes=first_sentence(" ".join(record.benefits), 200),
@@ -1041,14 +1059,14 @@ def _elect_dominant(scored: Sequence[PartSelection]) -> PartSelection:
     return sorted(scored, key=key)[0]
 
 
-def _application_seed(
-    selection: PartSelection, pattern: str, *, role: str | None, is_primary: bool
-) -> ApplicationSeed:
+def _application_seed(selection: PartSelection, pattern: str, *, role: str | None, is_primary: bool) -> ApplicationSeed:
     """§9 rule 3: one seed per selected (part, pattern) pair."""
     return ApplicationSeed(
         id=f"{selection.part.id}--{pattern}" if not is_primary else f"{selection.part.id}-{pattern}",
         pattern=pattern,
-        category=as_category(str((selection.primary_category if is_primary else None) or _category_of(selection, pattern))),
+        category=as_category(
+            str((selection.primary_category if is_primary else None) or _category_of(selection, pattern))
+        ),
         part_id=selection.part.id,
         part_statement=selection.part.statement,
         constraints=list(selection.part.constraints),
@@ -1066,9 +1084,7 @@ def _category_of(selection: PartSelection, pattern: str) -> str:
     return str(selection.part.category_hypothesis or "construction-composition")
 
 
-def _map_components(
-    application: ApplicationSeed, selection: PartSelection, index: dict[str, str]
-) -> None:
+def _map_components(application: ApplicationSeed, selection: PartSelection, index: dict[str, str]) -> None:
     """Map brief components named by the part onto the application (interaction seeding, §9 rule 5)."""
     for ref in selection.part.component_refs:
         index.setdefault(kebab(ref), application.id)
@@ -1076,9 +1092,7 @@ def _map_components(
         index.setdefault(kebab(component), application.id)
 
 
-def _supporting_union(
-    scored: Sequence[PartSelection], config: ServerConfig
-) -> list[SupportingPattern]:
+def _supporting_union(scored: Sequence[PartSelection], config: ServerConfig) -> list[SupportingPattern]:
     """§9 rule 2: union of all parts' supporting sets, deduped by name, capped by fit desc."""
     flattened: list[SupportingChoice] = [choice for selection in scored for choice in selection.supporting]
     flattened.sort(key=lambda choice: (-choice.fit_score, choice.pattern))
@@ -1131,10 +1145,13 @@ def _reasoning(
         f"{len(selections)} decision part(s) decomposed; dominant part: {composed.dominant_part_id}.",
     ]
     for selection in selections:
-        primary = ", ".join(
-            f"{candidate.name} (blend {candidate.retrieval_score:.4f}, fit {candidate.fit_score:.1f})"
-            for candidate in selection.candidates[:3]
-        ) or "none"
+        primary = (
+            ", ".join(
+                f"{candidate.name} (blend {candidate.retrieval_score:.4f}, fit {candidate.fit_score:.1f})"
+                for candidate in selection.candidates[:3]
+            )
+            or "none"
+        )
         flags: list[str] = []
         if selection.is_fallback:
             flags.append(f"fallback primary ({selection.fallback_reason})")
@@ -1287,7 +1304,9 @@ def assemble_result(
                 id=application_seed.id,
                 pattern=application_seed.pattern,
                 category=application_seed.category,
-                name=truncate(generated.name.strip() or _default_application_name(application_seed), MAX_APPLICATION_NAME),
+                name=truncate(
+                    generated.name.strip() or _default_application_name(application_seed), MAX_APPLICATION_NAME
+                ),
                 problem=generated.problem.strip() or _default_problem(application_seed),
                 solution=generated.solution.strip(),
                 participants=[
@@ -1303,9 +1322,7 @@ def assemble_result(
                         **{
                             "from": interaction.from_.strip() or "client",
                             "to": interaction.to.strip() or "participant",
-                            "description": interaction.description.strip()
-                            or interaction.to.strip()
-                            or "collaboration",
+                            "description": interaction.description.strip() or interaction.to.strip() or "collaboration",
                         }
                     )
                     for interaction in generated.interactions
@@ -1392,9 +1409,7 @@ def _aggregate_quality_attributes(
     return {axis: round(value / counted, 2) for axis, value in totals.items()}
 
 
-def _test_strategy(
-    applications: Sequence[PatternApplication], brief: DesignBrief
-) -> TestStrategy:
+def _test_strategy(applications: Sequence[PatternApplication], brief: DesignBrief) -> TestStrategy:
     """§11 item 1 test_notes/seams: participants give the injection points, weights the emphasis."""
     seams: list[str] = []
     for application in applications:
@@ -1411,9 +1426,7 @@ def _test_strategy(
     return TestStrategy(approach=approach, test_seams=seams[:10])
 
 
-def _risks(
-    applications: Sequence[PatternApplication], catalog: PatternLoader, config: ServerConfig
-) -> list[Risk]:
+def _risks(applications: Sequence[PatternApplication], catalog: PatternLoader, config: ServerConfig) -> list[Risk]:
     """Risks from the applied patterns' own tradeoffs/avoid_when text (catalog-grounded, capped)."""
     risks: list[Risk] = []
     for application in applications:
@@ -1457,6 +1470,7 @@ class DesignPipeline(Workflow):
         llm: LLMClientProtocol,
         guard: AntiScopeGuard | None = None,
         reasoning: ReasoningClient | None = None,
+        decision_client: DecisionModelClient | None = None,
     ) -> None:
         # Internal whole-run budget (§14): fires strictly inside the outer
         # ``run_with_deadline`` backstop and cancels the in-flight step cleanly
@@ -1467,6 +1481,7 @@ class DesignPipeline(Workflow):
         self._index = index
         self._llm = llm
         self._reasoning = reasoning
+        self._decision_client = decision_client
         self._guard = (
             guard
             if guard is not None
@@ -1528,7 +1543,6 @@ class DesignPipeline(Workflow):
         )
         return render_reasoning_context(trace, max_chars=self._config.reasoning.max_injected_chars)
 
-
     # -- Workflow steps and public phase API ---------------------------------------
 
     @step
@@ -1569,9 +1583,7 @@ class DesignPipeline(Workflow):
         return SelectionReady(analysis=state.current_analysis, attempt=1)
 
     @step
-    async def analyze_step(
-        self, ctx: Context, ev: AnalysisReady
-    ) -> PipelineDone | SelectionReady:
+    async def analyze_step(self, ctx: Context, ev: AnalysisReady) -> PipelineDone | SelectionReady:
         """ANALYZE phase (§1–§8): intake, decomposition repair, per-part retrieval and selection."""
         text = validate_description(ev.description)
         effective_language = resolve_language(ev.language, self._catalog.enums.languages)
@@ -1596,6 +1608,7 @@ class DesignPipeline(Workflow):
         )
         analyze_reasoning = await self._reasoning_block("analyze", {"description": text})
         brief, parts = await self._stage_a_b(text, hints, analyze_reasoning)
+        brief = await self._apply_decision_style(text, hints.architecture_style, brief)
         if not parts:
             parts = [synthesize_construction_part(brief, text)]
         _check_cancelled(ev.cancellation, "stage B")
@@ -1690,9 +1703,7 @@ class DesignPipeline(Workflow):
         return Generated(analysis=analysis, result=result, attempt=ev.attempt)
 
     @step
-    async def evaluate_step(
-        self, ev: Generated | EvaluateEntry
-    ) -> Evaluated | PipelineDone:
+    async def evaluate_step(self, ev: Generated | EvaluateEntry) -> Evaluated | PipelineDone:
         """EVALUATE phase (§11 item 2): score the attempt against the decision parts.
 
         The ``evaluate`` mode enters via ``EvaluateEntry`` (a foreign result plus its
@@ -1724,14 +1735,10 @@ class DesignPipeline(Workflow):
         evaluation = await self._llm.evaluate(
             ev.result, ev.analysis.decision_parts, reasoning_context=reasoning_context
         )
-        return Evaluated(
-            analysis=ev.analysis, result=ev.result, evaluation=evaluation, attempt=ev.attempt
-        )
+        return Evaluated(analysis=ev.analysis, result=ev.result, evaluation=evaluation, attempt=ev.attempt)
 
     @step
-    async def refine_step(
-        self, ctx: Context, ev: Evaluated | AttemptFailed
-    ) -> PipelineDone | SelectionReady:
+    async def refine_step(self, ctx: Context, ev: Evaluated | AttemptFailed) -> PipelineDone | SelectionReady:
         """§11 loop tail: best retention, early stop, one-shot reselection, E12 terminal raise."""
         state = cast(_RunState, (await ctx.store.get("run", _RunState())))
         max_tries = self._config.loop.max_tries
@@ -1803,9 +1810,7 @@ class DesignPipeline(Workflow):
                 state.current_selections, state.sticky, brief=state.entry_analysis.design_brief
             )
             assert state.current_analysis is not None
-            state.current_analysis = state.entry_analysis.model_copy(
-                update={"selections": state.current_selections}
-            )
+            state.current_analysis = state.entry_analysis.model_copy(update={"selections": state.current_selections})
             logger.info("Reselection ledger", extra={"excluded": sorted(state.sticky)})
         if ev.attempt >= max_tries:
             return PipelineDone(result=self._finish(state), mode=state.mode)
@@ -1830,9 +1835,7 @@ class DesignPipeline(Workflow):
             + (f"score {entry.get('score')}" if entry.get("status") == "valid" else f"error {entry.get('error')}")
             for entry in state.attempts_log
         ]
-        best.overview.reasoning = (
-            f"{header}\n" + "\n".join(findings) + "\n" + best.overview.reasoning
-        )
+        best.overview.reasoning = f"{header}\n" + "\n".join(findings) + "\n" + best.overview.reasoning
         logger.info(
             "Selection run completed",
             extra={
@@ -1917,22 +1920,16 @@ class DesignPipeline(Workflow):
     ) -> DesignResult:
         """GENERATE phase (§9–§11 item 1): compose the selection and materialize its applications."""
         try:
-            handler = self.run(
-                start_event=DesignStart(mode="generate", analysis=analysis, cancellation=cancellation)
-            )
+            handler = self.run(start_event=DesignStart(mode="generate", analysis=analysis, cancellation=cancellation))
             done = cast(PipelineDone, await handler)
             return done.payload_as(DesignResult)
         except WorkflowTimeoutError as exc:
             raise TimeoutError(str(exc)) from exc
 
-    async def evaluate(
-        self, result: DesignResult, parts: Sequence[DecisionPart]
-    ) -> DesignEvaluation:
+    async def evaluate(self, result: DesignResult, parts: Sequence[DecisionPart]) -> DesignEvaluation:
         """EVALUATE phase (§11 item 2): score ``result`` against the decision parts."""
         try:
-            handler = self.run(
-                start_event=DesignStart(mode="evaluate", result=result, parts=list(parts))
-            )
+            handler = self.run(start_event=DesignStart(mode="evaluate", result=result, parts=list(parts)))
             done = cast(PipelineDone, await handler)
             return done.payload_as(DesignEvaluation)
         except WorkflowTimeoutError as exc:
@@ -1944,9 +1941,7 @@ class DesignPipeline(Workflow):
         """§11: GENERATE → validate → EVALUATE ≤ ``max_tries``, best attempt retained."""
         try:
             handler = self.run(
-                start_event=DesignStart(
-                    mode="design_loop", analysis=analysis, cancellation=cancellation
-                )
+                start_event=DesignStart(mode="design_loop", analysis=analysis, cancellation=cancellation)
             )
             done = cast(PipelineDone, await handler)
             return done.payload_as(PipelineResult)
@@ -1964,9 +1959,7 @@ class DesignPipeline(Workflow):
             config=self._config,
         )
 
-    async def _generate_in_batches(
-        self, seed: GenerationSeed, *, reasoning_context: str
-    ) -> RawGeneration:
+    async def _generate_in_batches(self, seed: GenerationSeed, *, reasoning_context: str) -> RawGeneration:
         """GENERATE in bounded-concurrent batches (§11 item 1, ``generation_batch_size``).
 
         One provider call carries at most ``generation_batch_size`` applications and only the
@@ -1984,10 +1977,7 @@ class DesignPipeline(Workflow):
             return await self._llm.generate(seed, reasoning_context=reasoning_context)
         batch_size = self._config.generator.config.generation_batch_size
         max_concurrency = self._config.generator.config.generation_max_concurrency
-        chunks = [
-            applications[start : start + batch_size]
-            for start in range(0, len(applications), batch_size)
-        ]
+        chunks = [applications[start : start + batch_size] for start in range(0, len(applications), batch_size)]
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def _run_batch(index: int, chunk: list[ApplicationSeed]) -> list[RawApplication]:
@@ -2022,10 +2012,7 @@ class DesignPipeline(Workflow):
                 raw = await self._llm.generate(batch_seed, reasoning_context=reasoning_context)
             return raw.applications
 
-        tasks = [
-            asyncio.create_task(_run_batch(index, chunk))
-            for index, chunk in enumerate(chunks)
-        ]
+        tasks = [asyncio.create_task(_run_batch(index, chunk)) for index, chunk in enumerate(chunks)]
         collected: list[RawApplication] = []
         try:
             for part in await asyncio.gather(*tasks):
@@ -2074,9 +2061,7 @@ class DesignPipeline(Workflow):
             design=best,
             evaluation=evaluation,
             attempts=max(attempts, 1),
-            final_pattern=self._compose(
-                analysis.model_copy(update={"selections": selections})
-            ).primary,
+            final_pattern=self._compose(analysis.model_copy(update={"selections": selections})).primary,
             quality_metrics=QualityMetrics(**_aggregate_quality_attributes(best.applications, self._catalog)),
             final_quality_score=max(score, 0.0),
             matched_categories=categories,
@@ -2092,9 +2077,7 @@ class DesignPipeline(Workflow):
         """§4/§5: the combined brief+parts call, its deterministic repair and the anti-scope guard."""
         raw: RawBriefAndParts | None
         try:
-            raw = await self._llm.extract_brief_and_parts(
-                text, hints, reasoning_context=reasoning_context
-            )
+            raw = await self._llm.extract_brief_and_parts(text, hints, reasoning_context=reasoning_context)
         except DesignPatternError as exc:
             logger.warning(
                 "Brief/parts extraction failed; falling back to a minimal single-part brief (E3)",
@@ -2148,12 +2131,36 @@ class DesignPipeline(Workflow):
         logger.info(
             "Decomposition repaired",
             extra={
-                "parts": [{"id": p.id, "scope": p.scope, "category": p.category_hypothesis, "priority": p.priority} for p in kept],
+                "parts": [
+                    {"id": p.id, "scope": p.scope, "category": p.category_hypothesis, "priority": p.priority}
+                    for p in kept
+                ],
                 "components": component_names,
                 "constraints": brief.constraints,
             },
         )
         return brief, kept
+
+    async def _apply_decision_style(self, description: str, hint: str | None, brief: DesignBrief) -> DesignBrief:
+        """Ch2 substitution: a confident decision-model choice overrides the LLM-sampled style.
+
+        Caller hint wins (design_normalization.py:115 already applied it); the decision
+        model never runs then. ``none``-wins or below-floor confidence also keeps the
+        LLM style — override-on-confident-answer only, so the two error modes stay
+        decoupled. Any client failure degrades invisibly to the LLM style.
+        """
+        if hint is not None or self._decision_client is None:
+            return brief
+        decision = await self._decision_client.choose_style(description)
+        if decision is None or decision.style is None:
+            return brief
+        if decision.confidence < self._config.decisions.style_confidence_floor:
+            return brief
+        logger.info(
+            "Architecture style resolved by decision model",
+            extra={"source": "decision_model", "style": decision.style, "confidence": decision.confidence},
+        )
+        return brief.model_copy(update={"architecture_style": decision.style})
 
     # -- Stage C/D/E --------------------------------------------------------------
 
@@ -2299,9 +2306,7 @@ class DesignPipeline(Workflow):
                 config=self._config,
                 veto_ledger=selection.veto_ledger,
                 fallback_reason=(
-                    "reselection exclusions left no eligible candidate (sticky exclusions)"
-                    if not remaining
-                    else None
+                    "reselection exclusions left no eligible candidate (sticky exclusions)" if not remaining else None
                 ),
                 weights=selection.weights,
                 weights_source=selection.weights_source,
@@ -2309,6 +2314,7 @@ class DesignPipeline(Workflow):
         if not sticky:
             return selections
         return updated
+
 
 def _check_cancelled(cancellation: CancellationToken | None, boundary: str) -> None:
     """E11: stop at the next stage boundary once cancellation was requested."""

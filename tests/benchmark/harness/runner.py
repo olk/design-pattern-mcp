@@ -11,6 +11,7 @@ measures boundaries it owns (the per-scenario wall clock) and stages the proxies
 
 from __future__ import annotations
 
+import os
 import platform
 import sys
 from collections.abc import Sequence
@@ -25,6 +26,7 @@ from src.patterns.loader import PatternLoader
 from src.patterns.retriever import RetrievalIndex
 from src.patterns.safe_tei_rerank import build_reranker
 from src.pipeline import DesignPipeline
+from src.decisions.client import DecisionModelClient
 from src.reasoning.client import ReasoningClient
 from src.schemas import AnalysisResult, PipelineResult
 
@@ -73,7 +75,9 @@ class ScenarioExecutor(Protocol):
         """Mode-specific provenance block for the manifest."""
         ...
 
-    async def run(self, scenario: cfg.Scenario) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
+    async def run(
+        self, scenario: cfg.Scenario
+    ) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
         """Execute ``scenario``; return (analysis, pipeline result, stage slice, provenance)."""
         ...
 
@@ -112,14 +116,12 @@ class OfflineExecutor:
             ),
         }
 
-    async def run(self, scenario: cfg.Scenario) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
+    async def run(
+        self, scenario: cfg.Scenario
+    ) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
         """Run one scenario through the real pipeline over the scenario's scripted pool."""
-        script: OfflineScript = build_script(
-            scenario, self._catalog, flip=scenario.scenario_id in self._flips
-        )
-        pipeline = build_offline_pipeline(
-            script, config=self._config, catalog=self._catalog, recorder=self._recorder
-        )
+        script: OfflineScript = build_script(scenario, self._catalog, flip=scenario.scenario_id in self._flips)
+        pipeline = build_offline_pipeline(script, config=self._config, catalog=self._catalog, recorder=self._recorder)
         analysis, result, slice_records = await _execute_pipeline(pipeline, scenario, self._recorder)
         return analysis, result, slice_records, {"script": script.describe()}
 
@@ -148,9 +150,7 @@ class LiveExecutor:
         self.recorder = recorder
 
     @classmethod
-    async def create(
-        cls, *, config: ServerConfig, catalog: PatternLoader, recorder: StageRecorder
-    ) -> LiveExecutor:
+    async def create(cls, *, config: ServerConfig, catalog: PatternLoader, recorder: StageRecorder) -> LiveExecutor:
         """Build the live wiring exactly like ``DesignPatternServer._initialize``, then wrap it.
 
         The dense-cache precondition is checked up front: without a warm cache the index build
@@ -193,6 +193,9 @@ class LiveExecutor:
                 if reasoning_inner is not None
                 else None
             ),
+            decision_client=DecisionModelClient(config.decisions)
+            if config.decisions.enabled and os.environ.get(config.decisions.api_key_env)
+            else None,
         )
         pipeline.validate()
         return cls(
@@ -211,17 +214,26 @@ class LiveExecutor:
                 "index": self._index_source,
                 "llm": f"{type(self._pipeline._llm).__name__} over {self._config.generator.provider}:{self._config.generator.config.model}",
                 "reasoning": (
-                    "ReasoningClient (enabled)" if self._config.reasoning.enabled else "disabled via REASONING_ENABLED=false"
+                    "ReasoningClient (enabled)"
+                    if self._config.reasoning.enabled
+                    else "disabled via REASONING_ENABLED=false"
+                ),
+                "decisions": (
+                    f"DecisionModelClient ({self._config.decisions.model})"
+                    if self._pipeline._decision_client is not None
+                    else f"unconfigured ({self._config.decisions.api_key_env} unset)"
+                    if self._config.decisions.enabled
+                    else "disabled via DESIGN_PATTERN_DECISIONS_ENABLED=false"
                 ),
             },
             "reasoning_health": self._reasoning_health,
         }
 
-    async def run(self, scenario: cfg.Scenario) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
+    async def run(
+        self, scenario: cfg.Scenario
+    ) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
         """Run one scenario in-process; failures propagate (no silent degradation)."""
-        analysis, result, slice_records = await _execute_pipeline(
-            self._pipeline, scenario, self._recorder
-        )
+        analysis, result, slice_records = await _execute_pipeline(self._pipeline, scenario, self._recorder)
         return analysis, result, slice_records, {}
 
 
@@ -299,9 +311,7 @@ async def _run_benchmark(options: RunOptions) -> dict[str, Any]:
     log_capture.install()  # Step-0b: capture per-call LLM seam data from the src.* loggers
     executor: ScenarioExecutor
     if options.mode == "offline":
-        executor = OfflineExecutor(
-            config=config, catalog=catalog, recorder=recorder, flips=frozenset(options.flips)
-        )
+        executor = OfflineExecutor(config=config, catalog=catalog, recorder=recorder, flips=frozenset(options.flips))
     else:
         executor = await LiveExecutor.create(config=config, catalog=catalog, recorder=recorder)
 
@@ -424,9 +434,7 @@ def _residual_note(residual: float) -> str | None:
     )
 
 
-def _quality_block(
-    analysis: AnalysisResult, result: PipelineResult, scenario: cfg.Scenario
-) -> dict[str, Any]:
+def _quality_block(analysis: AnalysisResult, result: PipelineResult, scenario: cfg.Scenario) -> dict[str, Any]:
     """Every quality metric for one scenario (plan §4)."""
     fallback = scoring.is_fallback(analysis, result)
     final_pattern = scoring.final_pattern_of(analysis, result)
@@ -711,11 +719,11 @@ def render_report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
     lines: list[str] = [f"# Benchmark run {summary['run_id']}", ""]
     lines.append(
         f"- mode: `{summary['mode']}` · split `{summary['selection']['split']}` · "
-         f"limit `{summary['selection']['limit']}` · repeats `{summary['selection']['repeats']}`"
+        f"limit `{summary['selection']['limit']}` · repeats `{summary['selection']['repeats']}`"
     )
     lines.append(
         f"- scenarios: {manifest['counts']['records']} records "
-         f"(train {manifest['counts']['train']} / holdout {manifest['counts']['holdout']})"
+        f"(train {manifest['counts']['train']} / holdout {manifest['counts']['holdout']})"
     )
     lines += [
         f"- corpus: `{summary['scenario_file']['path']}` sha256 `{summary['scenario_file']['sha256'][:16]}…`",
@@ -730,9 +738,7 @@ def render_report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
     for name in ("overall", "train", "holdout"):
         block = quality[name]
         wilson = block["hit_rate_wilson"]
-        wilson_text = (
-            f"[{wilson['low']:.3f}, {wilson['high']:.3f}]" if wilson["low"] is not None else "null"
-        )
+        wilson_text = f"[{wilson['low']:.3f}, {wilson['high']:.3f}]" if wilson["low"] is not None else "null"
         lines.append(
             f"| {name} | {block['scenarios']} | {_pct(block['hit_rate'])} | {wilson_text} | {_int_or_null(block['fallbacks'])} | "
             f"{_num(block['recall_at_3']['mean'])} | {_num(block['recall_at_5']['mean'])} | "
@@ -753,9 +759,7 @@ def render_report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
         "| stage | calls | failures | total ms | p50 ms | p95 ms | ops |",
         "|---|---|---|---|---|---|---|",
     ]
-    for stage, entry in sorted(
-        latency["stages"].items(), key=lambda item: _stage_order(item[0], item[1])
-    ):
+    for stage, entry in sorted(latency["stages"].items(), key=lambda item: _stage_order(item[0], item[1])):
         lines.append(
             f"| `{stage}` | {entry['count']} | {entry['failures']} | {entry['total_ms']:.1f} | "
             f"{_ms(entry['p50_ms'])} | {_ms(entry['p95_ms'])} | "
@@ -763,9 +767,7 @@ def render_report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
         )
     lines += ["", "## Calibration (train split, monitoring only)", ""]
     calibration = summary["calibration"]
-    lines.append(
-        f"- Brier: {_num(calibration['brier'])} · ECE (10 bins): {_num(calibration['ece'])}"
-    )
+    lines.append(f"- Brier: {_num(calibration['brier'])} · ECE (10 bins): {_num(calibration['ece'])}")
     lines += ["", "| bin | range | n | avg score | accuracy | gap |", "|---|---|---|---|---|---|"]
     for entry in calibration["bins"]:
         if not entry["count"]:

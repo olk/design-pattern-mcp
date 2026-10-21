@@ -49,10 +49,27 @@ from src.patterns.safe_tei_rerank import LexicalReranker, build_reranker
 from src.tools import create_all_tools
 from src.reasoning import ReasoningConfig
 from src.reasoning.client import ReasoningClient
+from src.decisions.client import DecisionModelClient
 
 ERROR_SERVER_INIT = "ERR_013"
 
 logger = logging.getLogger(__name__)
+
+
+def _decisions_status(config: ServerConfig) -> str:
+    """Offline decisions (JEV) status string; pure, no network call.
+
+    Shared by the ``--health`` report and the startup log line: ``disabled`` when
+    the master switch is off, ``unconfigured`` when enabled but the API key env
+    var is unset, else ``ok (model=...)``. A set-but-unreachable key still
+    reports ``ok`` here — reachability surfaces per-call as degrade.
+    """
+    decisions = config.decisions
+    if not decisions.enabled:
+        return "disabled"
+    if not os.environ.get(decisions.api_key_env):
+        return f"unconfigured ({decisions.api_key_env} unset)"
+    return f"ok (model={decisions.model})"
 
 
 def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None:
@@ -85,10 +102,29 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
         class JSONFormatter(logging.Formatter):
             _STANDARD_ATTRS: ClassVar[frozenset[str]] = frozenset(
                 {
-                    "name", "msg", "args", "levelname", "levelno", "pathname", "filename", "module",
-                    "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs",
-                    "relativeCreated", "thread", "threadName", "processName", "process", "taskName",
-                    "message", "asctime",
+                    "name",
+                    "msg",
+                    "args",
+                    "levelname",
+                    "levelno",
+                    "pathname",
+                    "filename",
+                    "module",
+                    "exc_info",
+                    "exc_text",
+                    "stack_info",
+                    "lineno",
+                    "funcName",
+                    "created",
+                    "msecs",
+                    "relativeCreated",
+                    "thread",
+                    "threadName",
+                    "processName",
+                    "process",
+                    "taskName",
+                    "message",
+                    "asctime",
                 }
             )
 
@@ -108,21 +144,25 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
 
         stderr_handler.setFormatter(JSONFormatter())
     else:
-        stderr_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
+        stderr_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 
     root_logger.addHandler(stderr_handler)
 
 
 _PROMPTS_AS_TOOLS_HINTS: dict[str, ToolAnnotations] = {
     "list_prompts": ToolAnnotations(
-        title="List Prompts", read_only_hint=True, destructive_hint=False,
-        idempotent_hint=True, open_world_hint=False,
+        title="List Prompts",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     "get_prompt": ToolAnnotations(
-        title="Get Prompt", read_only_hint=True, destructive_hint=False,
-        idempotent_hint=True, open_world_hint=False,
+        title="Get Prompt",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
 }
 
@@ -138,9 +178,7 @@ class AnnotatedPromptsAsTools(PromptsAsTools):
         result = await super().list_tools(tools)
         return [_with_prompts_as_tools_annotations(tool) for tool in result]
 
-    async def get_tool(
-        self, name: str, call_next: GetToolNext, *, version: VersionSpec | None = None
-    ) -> Tool | None:
+    async def get_tool(self, name: str, call_next: GetToolNext, *, version: VersionSpec | None = None) -> Tool | None:
         tool = await super().get_tool(name, call_next, version=version)
         return _with_prompts_as_tools_annotations(tool) if tool else None
 
@@ -217,6 +255,8 @@ class DesignPatternServer:
         # exist from construction (otherwise startup dies with AttributeError).
         self._reasoning_client: ReasoningClient | None = None
         self._reasoning_health: dict[str, str] = {}
+        self._decision_client: DecisionModelClient | None = None
+        self._decisions_status: str = "disabled"
 
     # -- startup ------------------------------------------------------------------
 
@@ -229,16 +269,8 @@ class DesignPatternServer:
             self._catalog = load_catalog(pattern_dir, docs_dir)
             self._variants = VariantsResource(self._catalog)
 
-            embedder = (
-                OfflineHashEmbedder()
-                if self._offline
-                else build_embedder(self._config.embedder)
-            )
-            reranker = (
-                LexicalReranker()
-                if self._offline
-                else build_reranker(self._config.reranker)
-            )
+            embedder = OfflineHashEmbedder() if self._offline else build_embedder(self._config.embedder)
+            reranker = LexicalReranker() if self._offline else build_reranker(self._config.reranker)
             self._index = await RetrievalIndex.build(
                 self._catalog,
                 embedder,
@@ -288,6 +320,11 @@ class DesignPatternServer:
                 )
                 self._pipeline._reasoning = self._reasoning_client
 
+            self._decisions_status = self._decisions_health()
+            if self._decisions_status.startswith("ok"):
+                self._decision_client = DecisionModelClient(self._config.decisions)
+                self._pipeline._decision_client = self._decision_client
+
             JobsStore.configure(str(Path(self._config.jobs.db_path).expanduser()))
             await JobsStore.get_instance()
 
@@ -305,7 +342,6 @@ class DesignPatternServer:
             )
             raise
 
-
     def _build_reasoning_client(self) -> ReasoningClient | None:
         """Build the ReasoningClient from config (None when disabled).
 
@@ -321,9 +357,7 @@ class DesignPatternServer:
             raise RuntimeError("DesignAgent not initialized — cannot build ReasoningClient")
         return ReasoningClient(reasoning_config, self._llm)  # type: ignore[arg-type]  # runtime is DesignAgent
 
-    async def _check_reasoning_health(
-        self, client: ReasoningClient, fail_fast: bool
-    ) -> None:
+    async def _check_reasoning_health(self, client: ReasoningClient, fail_fast: bool) -> None:
         """LOUD startup health check for the reasoning MCP tools.
 
         Per-call behaviour stays silently degrading, but startup must not:
@@ -347,12 +381,19 @@ class DesignPatternServer:
                         ),
                     },
                 )
-        if fail_fast and any(
-            s != "ok" for s in self._reasoning_health.values()
-        ):
-            raise RuntimeError(
-                f"Reasoning MCP failed its health check (fail_fast=true): {self._reasoning_health}"
-            )
+        if fail_fast and any(s != "ok" for s in self._reasoning_health.values()):
+            raise RuntimeError(f"Reasoning MCP failed its health check (fail_fast=true): {self._reasoning_health}")
+
+    def _decisions_health(self) -> str:
+        """Log the offline decisions (JEV) status; never raises (fail_fast=false)."""
+        status = _decisions_status(self._config)
+        if status == "disabled":
+            logger.info("Decision model disabled")
+        elif status.startswith("unconfigured"):
+            logger.error("Decision model enabled but unconfigured: %s", status)
+        else:
+            logger.info("Decision model ready: %s", status)
+        return status
 
     async def _cleanup(self) -> None:
         """Tear down resources; always called from the lifespan finally block."""
@@ -371,6 +412,9 @@ class DesignPatternServer:
             if self._reasoning_client:
                 await self._reasoning_client.close()
                 logger.debug("Cleaned up ReasoningClient")
+            if self._decision_client:
+                await self._decision_client.close()
+                logger.debug("Cleaned up DecisionModelClient")
             self._tools.clear()
             logger.info("Server resources cleanup completed")
         except Exception as exc:
@@ -406,6 +450,8 @@ class DesignPatternServer:
                 "variants": self._variants,
                 "reasoning_client": self._reasoning_client,
                 "reasoning_health": self._reasoning_health,
+                "decision_client": self._decision_client,
+                "decisions_status": self._decisions_status,
             }
         finally:
             logger.info("Shutting down DesignPatternServer lifespan")
@@ -476,13 +522,9 @@ class DesignPatternServer:
         if transport == "stdio":
             await self._mcp.run_async(transport="stdio")
         elif transport == "streamable-http":
-            await self._mcp.run_async(
-                transport="streamable-http", host=self._config.host, port=self._config.port
-            )
+            await self._mcp.run_async(transport="streamable-http", host=self._config.host, port=self._config.port)
         else:
-            raise ValueError(
-                f"Invalid transport value: {transport!r}. Must be one of: 'stdio', 'streamable-http'."
-            )
+            raise ValueError(f"Invalid transport value: {transport!r}. Must be one of: 'stdio', 'streamable-http'.")
 
 
 async def health_check(config_path: str | None = None) -> dict[str, Any]:
@@ -491,10 +533,14 @@ async def health_check(config_path: str | None = None) -> dict[str, Any]:
     Uses the deterministic offline embedder/reranker, so the check never touches the network.
     """
     server = DesignPatternServer(config_path, offline=True)
-    report: dict[str, Any] = {"config": "ok", "catalog": "ok", "variants": "ok", "index": "ok"}
-    catalog = load_catalog(
-        Path(server._config.paths.pattern_directory), Path(server._config.paths.docs_directory)
-    )
+    report: dict[str, Any] = {
+        "config": "ok",
+        "catalog": "ok",
+        "variants": "ok",
+        "index": "ok",
+        "decisions": _decisions_status(server._config),
+    }
+    catalog = load_catalog(Path(server._config.paths.pattern_directory), Path(server._config.paths.docs_directory))
     variants = VariantsResource(catalog)
     index = await RetrievalIndex.build(
         catalog,
@@ -527,9 +573,7 @@ async def server_main(
     offline: bool = False,
 ) -> None:
     """Entry point: resolve config, construct the server, run it; exit(1) on startup failure."""
-    resolved_config = (
-        os.environ.get("DESIGN_PATTERN_CONFIG_PATH") or config_path or ConfigManager.DEFAULT_CONFIG_PATH
-    )
+    resolved_config = os.environ.get("DESIGN_PATTERN_CONFIG_PATH") or config_path or ConfigManager.DEFAULT_CONFIG_PATH
     resolved_config = os.path.abspath(os.path.expanduser(resolved_config))
 
     try:

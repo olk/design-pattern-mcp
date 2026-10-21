@@ -43,9 +43,26 @@ class TestDefaults:
             "reasoning_max_total_steps",
             "reasoning_phases",
             "generator_timeout_seconds",
+            "decisions_enabled",
+            "decisions_model",
+            "decisions_style_confidence_floor",
         ):
             assert key in snapshot
 
+    def test_decisions_defaults(self) -> None:
+        decisions = ServerConfig.model_validate({}).decisions
+        assert decisions.enabled is False
+        assert decisions.model == "jev-1.13-free"
+        assert decisions.base_url == "https://opencode.ai/inference/systemone/v1"
+        assert decisions.api_key_env == "OPENCODE_API_KEY"
+        assert decisions.style_confidence_floor == 0.5
+        assert decisions.timeout_seconds == 5.0
+
+    def test_decisions_snapshot_values(self) -> None:
+        snapshot = ServerConfig.model_validate({}).effective_parameters()
+        assert snapshot["decisions_enabled"] is False
+        assert snapshot["decisions_model"] == "jev-1.13-free"
+        assert snapshot["decisions_style_confidence_floor"] == 0.5
 
     def test_dense_cache_defaults(self) -> None:
         cache = ServerConfig.model_validate({}).dense_cache
@@ -148,7 +165,6 @@ class TestDefaults:
             ServerConfig.model_validate(payload)
 
 
-
 class TestValidation:
     def test_unknown_top_level_key_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -215,18 +231,14 @@ class TestRepositoryConfig:
     def test_repository_config_ships_the_provider_reliability_placeholders(self) -> None:
         raw = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
         generator = raw["generator"]["config"]
-        assert generator["generation_batch_size"] == (
-            "{env:DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE:-5}"
-        )
+        assert generator["generation_batch_size"] == ("{env:DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE:-5}")
         assert generator["circuit_breaker_failure_threshold"] == (
             "{env:DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}"
         )
         assert generator["circuit_breaker_cooldown_seconds"] == (
             "{env:DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS:-60.0}"
         )
-        assert raw["tasks"]["deadline_seconds"] == (
-            "{env:DESIGN_PATTERN_TASKS_DEADLINE_SECONDS:-1800.0}"
-        )
+        assert raw["tasks"]["deadline_seconds"] == ("{env:DESIGN_PATTERN_TASKS_DEADLINE_SECONDS:-1800.0}")
 
     @pytest.mark.parametrize(
         "variable",

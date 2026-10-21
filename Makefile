@@ -387,7 +387,7 @@ BENCH_EMBED_URL    ?= http://127.0.0.1:18081/v1
 BENCH_RERANK_URL   ?= http://127.0.0.1:18082
 BENCH_RUN_ARGS     := $(if $(OUT),--out $(OUT),) $(if $(RUN_ID),--run-id $(RUN_ID),) \
 	$(if $(LIMIT),--limit $(LIMIT),) $(if $(SPLIT),--split $(SPLIT),) $(if $(REPEAT),--repeat $(REPEAT),) \
-	$(if $(NO_WARMUP),--no-warmup,)
+	$(if $(NO_WARMUP),--no-warmup,) $(if $(LOG_LEVEL),--log-level $(LOG_LEVEL),)
 
 benchmark-selfcheck: ## Benchmark: hand-computed anchors for every metric formula (no network)
 	$(UV) run python -m tests.benchmark.harness.selfcheck

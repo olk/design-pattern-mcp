@@ -237,7 +237,9 @@ class ValidationConfig(BaseModel):
     """Self-healing structured-output retry policy (§4 rule 1)."""
 
     max_retries: int = Field(
-        default=1, ge=0, le=10,
+        default=1,
+        ge=0,
+        le=10,
         description="Repair attempts after a failed structured call (initial call excluded).",
     )
     retry_on_fail: bool = Field(
@@ -256,7 +258,8 @@ class ValidationConfig(BaseModel):
         ),
     )
     truncation_boost_max_completion_tokens: int = Field(
-        default=65536, ge=1024,
+        default=65536,
+        ge=1024,
         description="Completion budget of the boost rerun (MiniMax M2.x recommended cap).",
     )
 
@@ -271,11 +274,14 @@ class TasksConfig(BaseModel):
         description="Emit progress notifications from a parallel coroutine during long tool calls.",
     )
     heartbeat_interval_seconds: int = Field(
-        default=30, ge=5, le=600,
+        default=30,
+        ge=5,
+        le=600,
         description="Heartbeat interval in seconds; must be shorter than the client's idle timeout.",
     )
     deadline_seconds: float = Field(
-        default=1800.0, gt=0.0,
+        default=1800.0,
+        gt=0.0,
         description="Complete execution budget for one tool call / job run (ERR_014 on expiry).",
     )
 
@@ -293,6 +299,40 @@ class PromptConfig(BaseModel):
             "legacy order. Behavior-neutral for the wire contract: prompt CONTENT is identical, "
             "only its ordering changes."
         ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DecisionsConfig(BaseModel):
+    """Decision-model (JEV) integration configuration. Opt-in: default off."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch. Opt in via DESIGN_PATTERN_DECISIONS_ENABLED=true.",
+    )
+    base_url: str = Field(
+        default="https://opencode.ai/inference/systemone/v1",
+        description="Decision-model provider host; /systemone appended.",
+    )
+    model: str = Field(
+        default="jev-1.13-free",
+        description="Pinned model (OpenCode free tier, limited-time); jev-1.13 is the paid pin.",
+    )
+    api_key_env: str = Field(
+        default="OPENCODE_API_KEY",
+        description="Env var holding the OpenCode Console API key (Go/Go Plus).",
+    )
+    style_confidence_floor: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Minimum choice confidence to override the LLM-extracted style.",
+    )
+    timeout_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="Per-call timeout; expiry degrades to the LLM style.",
     )
 
     model_config = {"extra": "forbid"}
@@ -320,6 +360,7 @@ class ServerConfig(BaseModel):
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     prompts: PromptConfig = Field(default_factory=PromptConfig)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
+    decisions: DecisionsConfig = Field(default_factory=DecisionsConfig)
     litellm_log_level: str = Field(
         default="WARNING",
         description="Log level applied to the LiteLLM/httpx/openai loggers (they are noisy at INFO).",
@@ -371,13 +412,12 @@ class ServerConfig(BaseModel):
             },
             "generator_timeout_seconds": self.generator.config.timeout_seconds,
             "generator_generation_batch_size": self.generator.config.generation_batch_size,
-            "generator_circuit_breaker_failure_threshold": (
-                self.generator.config.circuit_breaker_failure_threshold
-            ),
-            "generator_circuit_breaker_cooldown_seconds": (
-                self.generator.config.circuit_breaker_cooldown_seconds
-            ),
+            "generator_circuit_breaker_failure_threshold": (self.generator.config.circuit_breaker_failure_threshold),
+            "generator_circuit_breaker_cooldown_seconds": (self.generator.config.circuit_breaker_cooldown_seconds),
             "tasks_deadline_seconds": self.tasks.deadline_seconds,
+            "decisions_enabled": self.decisions.enabled,
+            "decisions_model": self.decisions.model,
+            "decisions_style_confidence_floor": self.decisions.style_confidence_floor,
         }
 
 
