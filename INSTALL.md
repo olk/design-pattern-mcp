@@ -18,12 +18,10 @@ deep-dive).
 | TEI embedder | `olkowa/pattern-tei-embed` | Qwen3-Embedding-0.6B sidecar; required for retrieval |
 | TEI reranker | `olkowa/pattern-tei-rerank` | Reranker sidecar (`gte-reranker-modernbert-base`); required for retrieval |
 
-Tags: `latest` plus a pinned release tag per image — the MCP server releases
-independently of the TEI sidecars (the TEI images change rarely and are shared
-with the sibling `architecture-pattern-mcp` server), so the pins differ: the
-MCP pin is the version in `pyproject.toml` (resolved via grep in A1/B1),
-TEI embed/rerank `1.1.1`. Use Docker Hub. Images are **linux/amd64
-only**; on arm64 hosts build locally instead: `make docker-build-all`.
+Tags: `latest` plus a pinned release tag per image — TEI embed/rerank `1.1.1`
+(the TEI images change rarely and are shared with the sibling
+`architecture-pattern-mcp` server). Use Docker Hub. Images are
+**linux/amd64 only**; on arm64 hosts build locally instead: `make docker-build-all`.
 
 Pick exactly ONE path:
 
