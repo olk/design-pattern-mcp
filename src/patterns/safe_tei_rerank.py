@@ -140,6 +140,6 @@ def build_reranker(config: RerankerConfig) -> RerankerProtocol:
         raise DesignPatternError(
             ERROR_RETRIEVAL_UNAVAILABLE,
             "reranker base_url is empty — the mandatory cross-encoder pass cannot start",
-            hint="set DESIGN_PATTERN_RERANKER_BASE_URL or config/config.json reranker.config.base_url",
+            hint="set RERANKER_BASE_URL or config/config.json reranker.config.base_url",
         )
     return TEIReranker(config)

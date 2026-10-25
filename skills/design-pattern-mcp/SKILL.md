@@ -36,7 +36,7 @@ Device prefix = server name lowercased with `-` → `_` (`design-pattern-mcp` �
 
 ### 3. Job ids are the only durable handle
 
-`submit_design_job` returns a `job_id` persisted in SQLite (`~/.config/design-pattern-mcp/jobs.db`, override `DESIGN_PATTERN_JOBS_DB`). Keep the `job_id` — write it to a scratch file.
+`submit_design_job` returns a `job_id` persisted in SQLite (`~/.config/design-pattern-mcp/jobs.db`, override `JOBS_DB`). Keep the `job_id` — write it to a scratch file.
 
 ## Entry-point decision guide
 

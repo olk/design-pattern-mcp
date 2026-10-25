@@ -444,7 +444,7 @@ async def resolve_dense_vectors(  # noqa: PLR0911, PLR0912 - one branch per guar
             raise DesignPatternError(
                 ERROR_RETRIEVAL_UNAVAILABLE,
                 f"dense cache required but unusable ({manifest_reason})",
-                hint="run `make embed-cache` (or set DESIGN_PATTERN_DENSE_CACHE_MODE=auto)",
+                hint="run `make embed-cache` (or set DENSE_CACHE_MODE=auto)",
             )
         return await _embed_and_maybe_store(
             config=config,

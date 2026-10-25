@@ -134,7 +134,8 @@ zero deltas count neither as wins nor losses, `n` is the non-zero count, and the
 ## A/B protocol and the pre-registered decision rule
 
 Both arms run the **same scenario file**; every manifest pins the corpus sha256, the git HEAD +
-worktree hash, the masked `DESIGN_PATTERN_*`/`REASONING_*` environment and the effective
+worktree hash, the masked deployment environment (`REASONING_*` plus every config
+`{env:...}` name) and the effective
 `ServerConfig`. `compare` refuses two runs whose corpus hashes differ (`--allow-mismatch`
 overrides, with a warning) and refuses cross-mode pairs outright; config/env drift is warned on.
 

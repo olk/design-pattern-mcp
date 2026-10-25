@@ -199,6 +199,6 @@ def build_embedder(config: EmbedderConfig) -> EmbedderProtocol:
         raise DesignPatternError(
             ERROR_RETRIEVAL_UNAVAILABLE,
             "embedder base_url is empty — the dense leg cannot start",
-            hint="set DESIGN_PATTERN_EMBEDDER_BASE_URL or config/config.json embedder.config.base_url",
+            hint="set EMBEDDER_BASE_URL or config/config.json embedder.config.base_url",
         )
     return TEIEmbedder(config)

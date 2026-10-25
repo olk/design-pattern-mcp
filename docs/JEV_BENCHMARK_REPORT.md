@@ -3,7 +3,7 @@
 Date: 2026-10-20/21 · Mode: `benchmark-live` (in-process, Stage-0 harness) ·
 Corpus: `tests/benchmark/scenarios/seed.json`, holdout split (6 scenarios × REPEAT=3 = 18 records/arm) ·
 Generator: `minimax/MiniMax-M2.7` · Decision model: `jev-1.13-free` via OpenCode SystemOne ·
-Verdict: **`candidate-loss` — keep `DESIGN_PATTERN_DECISIONS_ENABLED=false`**
+Verdict: **`candidate-loss` — keep `DECISIONS_ENABLED=false`**
 
 ## 1. What was tested
 
@@ -17,7 +17,7 @@ Arms (same corpus, split, repeats; `benchmark-sidecars-up` first):
 
 | Arm | Dir | Flag | Run |
 |---|---|---|---|
-| Baseline (no JEV) | `benchmarks/live-nojev2` | `DESIGN_PATTERN_DECISIONS_ENABLED=false` | `live-20261020-173400` |
+| Baseline (no JEV) | `benchmarks/live-nojev2` | `DECISIONS_ENABLED=false` | `live-20261020-173400` |
 | Candidate (JEV) | `benchmarks/live-jev2` | `=true` | `live-20261020-191306` |
 
 Follow-up: `benchmarks/live-sv-jev` (`live-20261021-051648`, LIMIT=6 whole holdout,
@@ -101,8 +101,8 @@ no style-affinity fingerprint.
 Actionable notes:
 
 - The dev stack is JEV-**on** by default: `docker/docker-compose.yml:100` defaults
-  `DESIGN_PATTERN_DECISIONS_ENABLED` to `true` (only `config/config.json` defaults false,
-  which compose overrides). Set `DESIGN_PATTERN_DECISIONS_ENABLED=false` in the compose
+  `DECISIONS_ENABLED` to `true` (only `config/config.json` defaults false,
+  which compose overrides). Set `DECISIONS_ENABLED=false` in the compose
   env, or flip that default.
 - A future A/B needs a corpus where JEV styles intersect candidate categories (so the
   override actually bites), per-call style logging (`LOG_LEVEL=info`), and more distinct

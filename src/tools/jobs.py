@@ -6,7 +6,7 @@ guarded by ``UPDATE ... WHERE id = ? AND status IN (...)`` so that terminal-stat
 immutability and cancel-only-from-pending/running hold atomically inside SQLite.
 
 The DB path is re-evaluated on every call (house invariant 10): env
-``DESIGN_PATTERN_JOBS_DB`` wins, then the module-level override set by
+``JOBS_DB`` wins, then the module-level override set by
 :meth:`JobsStore.configure` (the server sets it from ``ServerConfig.jobs.db_path``),
 then the user-level default ``~/.config/design-pattern-mcp/jobs.db``.
 """
@@ -29,11 +29,11 @@ _DEFAULT_DB_PATH = "~/.config/design-pattern-mcp/jobs.db"
 def _get_db_path() -> str:
     """Return the effective DB path, re-evaluated on every call for test isolation.
 
-    Precedence: env ``DESIGN_PATTERN_JOBS_DB``, then the module-level override set by
+    Precedence: env ``JOBS_DB``, then the module-level override set by
     :meth:`JobsStore.configure`, then the user-level default.
     """
     return os.environ.get(
-        "DESIGN_PATTERN_JOBS_DB",
+        "JOBS_DB",
         os.path.expanduser(JobsStore._configured_db_path or _DEFAULT_DB_PATH),
     )
 
@@ -61,7 +61,7 @@ class JobsStore:
     _db: aiosqlite.Connection | None = None
     _lock: asyncio.Lock = asyncio.Lock()
     # Module-level override set by configure(); consulted by _get_db_path when the
-    # DESIGN_PATTERN_JOBS_DB env var is unset. Class attribute rather than a module
+    # JOBS_DB env var is unset. Class attribute rather than a module
     # global so configure() needs no ``global`` statement.
     _configured_db_path: str | None = None
 
@@ -87,7 +87,7 @@ class JobsStore:
     def configure(cls, db_path: str) -> None:
         """Set the module-level DB-path override (the server wires ServerConfig.jobs.db_path).
 
-        Takes effect only when the ``DESIGN_PATTERN_JOBS_DB`` env var is unset;
+        Takes effect only when the ``JOBS_DB`` env var is unset;
         call before :meth:`get_instance` (or after :meth:`reset_for_test`).
         """
         cls._configured_db_path = db_path
@@ -96,7 +96,7 @@ class JobsStore:
     async def reset_for_test(cls) -> None:
         """Test helper: close the current connection, delete the DB file, drop the singleton.
 
-        Use together with a temporarily overridden ``DESIGN_PATTERN_JOBS_DB`` env var
+        Use together with a temporarily overridden ``JOBS_DB`` env var
         to point the store at a per-test temporary directory.
         """
         # Close via the instance attribute (see get_instance): cls._db is a

@@ -727,6 +727,6 @@ def test_main_build_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_main_build_fails_without_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("DESIGN_PATTERN_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("CONFIG_PATH", raising=False)
     rc = main(["build", "--out", str(tmp_path / "cache"), "--config", str(tmp_path / "missing.json")])
     assert rc == 1

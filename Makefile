@@ -205,7 +205,7 @@ verify-ledger: ## L8: property-ID ledger consistency (verify/fizz/README.md <-> 
 	@$(UV) run python scripts/verify_ledger.py
 
 # Advisory NL-Doc cross-consistency gate (mechanical subset; the LLM comparison
-# activates via DESIGN_PATTERN_CONSISTENCY_MODEL, checker identity pinned per
+# activates via DESIGN_CONSISTENCY_MODEL, checker identity pinned per
 # run). Findings are leads to triage, not failures.
 verify-cross-consistency: ## L8: NL-Doc/docstring consistency over the decision modules (advisory)
 	@$(UV) run python scripts/cross_consistency.py
@@ -228,10 +228,10 @@ health: ## Run the offline readiness check (prints OK)
 	@$(UV) run python -m src --health
 
 client: ## Run the MCP client demo (blocking select_design_patterns)
-	@DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client.py
+	@CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client.py
 
 client-async: ## Run the async job trio demo (submit_design_job + get_design_status)
-	@DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client_async.py
+	@CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client_async.py
 
 ##@ Docker
 # The dense cache is a BUILD INPUT of the server image (Dockerfile COPYs
@@ -345,8 +345,8 @@ $(DENSE_CACHE_MANIFEST) $(DENSE_CACHE_VECTORS) &: | docker-build-tei-embed docke
 	@mkdir -p $(DENSE_CACHE_DIR)
 	$(COMPOSE) run --rm --no-deps -T \
 		-v "$(CURDIR)/$(DENSE_CACHE_DIR):/out" \
-		-e DESIGN_PATTERN_EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) \
-		-e DESIGN_PATTERN_EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) \
+		-e EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) \
+		-e EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) \
 		--entrypoint python design-pattern-mcp \
 		-m src.patterns.dense_cache build --out /out
 	@ls -l $(DENSE_CACHE_DIR)
@@ -403,7 +403,7 @@ benchmark-sidecars-up: ## Benchmark: publish the TEI sidecars on loopback (addit
 
 # Provider defaults mirror docker/docker-compose.yml's dev stack (MiniMax + the key from
 # MINIMAXAI_API_KEY), so an in-process live arm talks to the same generator as the containerized
-# stack; any DESIGN_PATTERN_GENERATOR_* value already in the environment wins.
+# stack; any GENERATOR_* value already in the environment wins.
 #
 # Reasoning servers: the config default points at the Docker-embedded entry points, which do not
 # exist on a workstation, so the recipe points REASONING_*_CMD at the globally installed npm
@@ -416,15 +416,15 @@ benchmark-live: ## Benchmark: in-process live run with full stage attribution
 			export REASONING_SHANNONTHINKING_CMD="[\"node\", \"$$root/server-shannon-thinking/dist/index.js\"]"; \
 			export REASONING_CODE_REASONING_CMD="[\"node\", \"$$root/@mettamatt/code-reasoning/dist/index.js\"]"; \
 		fi; \
-		export DESIGN_PATTERN_GENERATOR_PROVIDER="$${DESIGN_PATTERN_GENERATOR_PROVIDER:-minimax}"; \
-		export DESIGN_PATTERN_GENERATOR_MODEL="$${DESIGN_PATTERN_GENERATOR_MODEL:-minimax/MiniMax-M2.7}"; \
-		export DESIGN_PATTERN_GENERATOR_BASE_URL="$${DESIGN_PATTERN_GENERATOR_BASE_URL:-https://api.minimax.io/v1}"; \
-		export DESIGN_PATTERN_GENERATOR_API_KEY="$${DESIGN_PATTERN_GENERATOR_API_KEY:-$${MINIMAXAI_API_KEY:-}}"; \
-		export DESIGN_PATTERN_GENERATOR_TIMEOUT_SECONDS="$${DESIGN_PATTERN_GENERATOR_TIMEOUT_SECONDS:-300.0}"; \
-		export DESIGN_PATTERN_EMBEDDER_BASE_URL="$(BENCH_EMBED_URL)"; \
-		export DESIGN_PATTERN_EMBEDDER_API_KEY="$${DESIGN_PATTERN_EMBEDDER_API_KEY:-tei-noauth}"; \
-		export DESIGN_PATTERN_RERANKER_BASE_URL="$(BENCH_RERANK_URL)"; \
-		export DESIGN_PATTERN_DENSE_CACHE_PATH="$(CURDIR)/data/dense-cache"; \
+		export GENERATOR_PROVIDER="$${GENERATOR_PROVIDER:-minimax}"; \
+		export GENERATOR_MODEL="$${GENERATOR_MODEL:-minimax/MiniMax-M2.7}"; \
+		export GENERATOR_BASE_URL="$${GENERATOR_BASE_URL:-https://api.minimax.io/v1}"; \
+		export GENERATOR_API_KEY="$${GENERATOR_API_KEY:-$${MINIMAXAI_API_KEY:-}}"; \
+		export GENERATOR_TIMEOUT_SECONDS="$${GENERATOR_TIMEOUT_SECONDS:-300.0}"; \
+		export EMBEDDER_BASE_URL="$(BENCH_EMBED_URL)"; \
+		export EMBEDDER_API_KEY="$${EMBEDDER_API_KEY:-tei-noauth}"; \
+		export RERANKER_BASE_URL="$(BENCH_RERANK_URL)"; \
+		export DENSE_CACHE_PATH="$(CURDIR)/data/dense-cache"; \
 		exec $(UV) run python -m tests.benchmark.harness.main --mode live \
 			--scenarios $(BENCH_SCENARIOS) $(BENCH_RUN_ARGS)'
 

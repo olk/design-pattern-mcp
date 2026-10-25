@@ -545,7 +545,7 @@ def load_catalog(pattern_dir: Path, docs_dir: Path) -> PatternLoader:
         raise DesignPatternError(
             ERROR_CATALOG_INVALID,
             f"pattern directory not found: {pattern_dir}",
-            hint="point DESIGN_PATTERN_PATTERN_DIRECTORY at the catalog directory",
+            hint="point PATTERN_DIRECTORY at the catalog directory",
         )
     enums = load_schema_enums(docs_dir)
     assert_enums_in_sync(enums)

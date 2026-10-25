@@ -15,7 +15,7 @@ from src.tools.jobs import JobStatus, JobsStore
 
 async def _fresh_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> JobsStore:
     """Point the store at a per-test DB and return a fresh singleton."""
-    monkeypatch.setenv("DESIGN_PATTERN_JOBS_DB", str(tmp_path / "jobs.db"))
+    monkeypatch.setenv("JOBS_DB", str(tmp_path / "jobs.db"))
     await JobsStore.reset_for_test()
     return await JobsStore.get_instance()
 
@@ -142,7 +142,7 @@ async def test_get_job_unknown_id_returns_none(monkeypatch, tmp_path):
 
 async def test_reset_for_test_removes_db_file(monkeypatch, tmp_path):
     db_file = tmp_path / "jobs.db"
-    monkeypatch.setenv("DESIGN_PATTERN_JOBS_DB", str(db_file))
+    monkeypatch.setenv("JOBS_DB", str(db_file))
     await JobsStore.reset_for_test()
 
     store = await JobsStore.get_instance()
@@ -159,7 +159,7 @@ async def test_reset_for_test_removes_db_file(monkeypatch, tmp_path):
 
 async def test_configure_is_used_when_env_unset(monkeypatch, tmp_path):
     db_file = tmp_path / "configured" / "jobs.db"
-    monkeypatch.delenv("DESIGN_PATTERN_JOBS_DB", raising=False)
+    monkeypatch.delenv("JOBS_DB", raising=False)
     await JobsStore.reset_for_test()
     JobsStore.configure(str(db_file))
     try:

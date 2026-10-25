@@ -76,7 +76,7 @@ def tasks_config() -> TasksConfig:
 @pytest.fixture(autouse=True)
 def jobs_isolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate JobsStore to a per-test SQLite file (house invariant 10)."""
-    monkeypatch.setenv("DESIGN_PATTERN_JOBS_DB", str(tmp_path / "jobs.db"))
+    monkeypatch.setenv("JOBS_DB", str(tmp_path / "jobs.db"))
 
 
 @pytest.fixture(autouse=True)

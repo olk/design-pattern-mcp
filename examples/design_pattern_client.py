@@ -40,7 +40,7 @@ Usage:
     $ make client
 
 Or pipe the JSON output:
-    $ DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp \
+    $ CLIENT_URL=http://localhost:8822/mcp \
         uv run python examples/design_pattern_client.py 2>/dev/null | jq '.applications[0]'
 
 Requires:
@@ -61,7 +61,7 @@ from typing import Any
 from fastmcp import Client  # type: ignore[attr-defined]
 from fastmcp.exceptions import ClientError, McpError, ToolError
 
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
+SERVER_URL = os.environ.get("CLIENT_URL", "http://localhost:8822/mcp")
 
 DESCRIPTION = """
 Implement an event-driven IoT ingestion service in Python. The API gateway

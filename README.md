@@ -56,7 +56,7 @@ make client           # blocking select_design_patterns call
 make client-async     # same run via the background job trio
 ```
 
-Server starts on **streamable-http** at `http://localhost:8822/mcp` (dev compose maps host `8822` → container `8050`). `make client` targets `http://localhost:8822/mcp`; override with `DESIGN_PATTERN_CLIENT_URL`.
+Server starts on **streamable-http** at `http://localhost:8822/mcp` (dev compose maps host `8822` → container `8050`). `make client` targets `http://localhost:8822/mcp`; override with `CLIENT_URL`.
 
 ---
 
@@ -88,14 +88,14 @@ uv pip install -e .
 
 # Run as stdio subprocess — pass the API key via env
 claude mcp add design-patterns \
-  -e DESIGN_PATTERN_GENERATOR_PROVIDER=minimax \
-  -e DESIGN_PATTERN_GENERATOR_MODEL=minimax/MiniMax-M2.7 \
-  -e DESIGN_PATTERN_GENERATOR_BASE_URL=https://api.minimax.io/v1 \
-  -e DESIGN_PATTERN_GENERATOR_API_KEY=your_key \
+  -e GENERATOR_PROVIDER=minimax \
+  -e GENERATOR_MODEL=minimax/MiniMax-M2.7 \
+  -e GENERATOR_BASE_URL=https://api.minimax.io/v1 \
+  -e GENERATOR_API_KEY=your_key \
   -- design-pattern-mcp --transport stdio
 ```
 
-Stdio mode needs the TEI endpoints reachable (default `http://design-pattern-tei-embed:8080` and the reranker URL from `config/config.json`) — either run the compose stack's sidecars or set `DESIGN_PATTERN_EMBEDDER_BASE_URL` / `DESIGN_PATTERN_RERANKER_BASE_URL` to your own. For a no-network smoke run, start with `--offline` (deterministic lexical-only retrieval instead of TEI).
+Stdio mode needs the TEI endpoints reachable (default `http://design-pattern-tei-embed:8080` and the reranker URL from `config/config.json`) — either run the compose stack's sidecars or set `EMBEDDER_BASE_URL` / `RERANKER_BASE_URL` to your own. For a no-network smoke run, start with `--offline` (deterministic lexical-only retrieval instead of TEI).
 
 ### OpenCode
 
@@ -139,17 +139,17 @@ command = "design-pattern-mcp"
 args = ["--transport", "stdio"]
 
 [mcp_servers.design-patterns.env]
-DESIGN_PATTERN_GENERATOR_PROVIDER = "minimax"
-DESIGN_PATTERN_GENERATOR_MODEL = "minimax/MiniMax-M2.7"
-DESIGN_PATTERN_GENERATOR_BASE_URL = "https://api.minimax.io/v1"
-DESIGN_PATTERN_GENERATOR_API_KEY = "your_key"
+GENERATOR_PROVIDER = "minimax"
+GENERATOR_MODEL = "minimax/MiniMax-M2.7"
+GENERATOR_BASE_URL = "https://api.minimax.io/v1"
+GENERATOR_API_KEY = "your_key"
 ```
 
 Or via CLI:
 
 ```bash
 codex mcp add design-patterns \
-  -e DESIGN_PATTERN_GENERATOR_API_KEY=your_key \
+  -e GENERATOR_API_KEY=your_key \
   -- design-pattern-mcp --transport stdio
 ```
 
@@ -176,7 +176,7 @@ cp -r skills/design-pattern-mcp ~/.omp/agent/skills/
 The skill then tells the agent:
 
 - Which entry point fits OMP's 30 s deadline: the async job trio by default; `select_design_patterns` (full pipeline) takes 2–10 min
-- That `job_id` is the only durable handle — persist it (SQLite job store, `DESIGN_PATTERN_JOBS_DB`)
+- That `job_id` is the only durable handle — persist it (SQLite job store, `JOBS_DB`)
 - How to phrase `description` (component names + responsibilities + constraints), and `language`, `paradigm`, `focus` as separate structured arguments
 - How to interpret `overview.score` (0–100), `findings[]`, and per-part selections
 
@@ -279,7 +279,7 @@ make client-async       # Terminal 2
 
 | Tool | Description |
 |---|---|
-| `select_design_patterns` | Full pipeline (analyze → weights ∥ retrieval → generate → evaluate → refine, `DESIGN_PATTERN_LOOP_MAX_TRIES` attempts). *Long-running (2–10 min). Heartbeat-defended.* |
+| `select_design_patterns` | Full pipeline (analyze → weights ∥ retrieval → generate → evaluate → refine, `LOOP_MAX_TRIES` attempts). *Long-running (2–10 min). Heartbeat-defended.* |
 | `analyze_design` | Requirements analysis only: decision-part decomposition, style/category recommendations. *Long-running (~1 min).* |
 | `generate_design` | Generate a design from explicitly named patterns. *Long-running (~1 min).* |
 | `evaluate_design` | Score an existing design JSON against the eight quality axes. *Long-running (~30 s).* |
@@ -389,9 +389,8 @@ Two operational consequences: an **existing** volume shadows a newer baked snaps
 after an image rebuild, and the fingerprint guards then force exactly one re-embed — so
 after a catalogue- or model-changing rebuild delete the volume first
 (`docker volume rm design-pattern-mcp-dev-dense-cache`) and let `up -d` re-seed it.
-And the compose stacks read the short knob `DENSE_CACHE_MODE` (`off` disables the cache
-entirely) — `DESIGN_PATTERN_DENSE_CACHE_MODE` is the container/host-run variable that
-the compose interpolation overwrites. Details:
+And `DENSE_CACHE_MODE=off` disables the cache entirely — the compose stacks forward the
+host value into the container, and a host run reads it directly. Details:
 [Dense embedding cache](#dense-embedding-cache-restart-durable-retrieval).
 
 ### Local Development (uv)
@@ -403,14 +402,14 @@ the compose interpolation overwrites. Details:
 make install
 
 # Configure — the shipped wire config with {env:...} placeholders
-export DESIGN_PATTERN_GENERATOR_PROVIDER=minimax
-export DESIGN_PATTERN_GENERATOR_MODEL=minimax/MiniMax-M2.7
-export DESIGN_PATTERN_GENERATOR_BASE_URL=https://api.minimax.io/v1
-export DESIGN_PATTERN_GENERATOR_API_KEY=your_key
+export GENERATOR_PROVIDER=minimax
+export GENERATOR_MODEL=minimax/MiniMax-M2.7
+export GENERATOR_BASE_URL=https://api.minimax.io/v1
+export GENERATOR_API_KEY=your_key
 # Dense cache (host runs): the image default /app/data/dense-cache does not exist
 # on a workstation, so point it at the gitignored repo snapshot. `make embed-cache`
 # fills it; otherwise the first start embeds once and writes it (later starts warm).
-export DESIGN_PATTERN_DENSE_CACHE_PATH="$PWD/data/dense-cache"
+export DENSE_CACHE_PATH="$PWD/data/dense-cache"
 
 # Run the server
 uv run design-pattern-mcp --transport stdio               # for Claude Code / Codex
@@ -426,7 +425,7 @@ The TEI sidecars are required for full retrieval quality: a dense leg (Qwen3-Emb
 
 **GPU TEI:** the shipped sidecars are CPU images (`cpu-1.9`). On a host with a TEI-CUDA-supported NVIDIA GPU (compute capability ≥ 7.5) plus the NVIDIA container toolkit, `make docker-build-tei-embed-gpu` builds the embed sidecar on the CUDA base (`ghcr.io/huggingface/text-embeddings-inference:cuda-1.9`) and `make docker-up-gpu` starts the dev stack with `docker/docker-compose.gpu.yml` (reserves 1 GPU). The override covers the embed sidecar only — the reranker stays on CPU. On GPU a small positive `WARMUP_TOKENS` warms kernels at startup instead of skipping the pass.
 
-**Already-running embedder/reranker:** when embedding and reranking endpoints already run on other servers, point the MCP server at them via `DESIGN_PATTERN_EMBEDDER_BASE_URL` (OpenAI-compatible route, `http://<host>:8080/v1`) plus `DESIGN_PATTERN_RERANKER_BASE_URL` (`http://<host>:8080`) and skip the sidecars. The embedder forwards `DESIGN_PATTERN_EMBEDDER_MODEL` (default `openai//data/embedding-model`) and `DESIGN_PATTERN_EMBEDDER_API_KEY` through LiteLLM — provider/model syntax is documented in the [LiteLLM embedding docs](https://docs.litellm.ai/docs/embedding/supported_embedding). The reranker is **not** a LiteLLM client — it POSTs `{base_url}/rerank` directly (`src/patterns/safe_tei_rerank.py`), so `DESIGN_PATTERN_RERANKER_MODEL` (default `Alibaba-NLP/gte-reranker-modernbert-base`) is a TEI model name, not a LiteLLM model string. A remote embedder serving a different model invalidates the baked dense cache — regenerate it with `make embed-cache` so vectors match the serving model.
+**Already-running embedder/reranker:** when embedding and reranking endpoints already run on other servers, point the MCP server at them via `EMBEDDER_BASE_URL` (OpenAI-compatible route, `http://<host>:8080/v1`) plus `RERANKER_BASE_URL` (`http://<host>:8080`) and skip the sidecars. The embedder forwards `EMBEDDER_MODEL` (default `openai//data/embedding-model`) and `EMBEDDER_API_KEY` through LiteLLM — provider/model syntax is documented in the [LiteLLM embedding docs](https://docs.litellm.ai/docs/embedding/supported_embedding). The reranker is **not** a LiteLLM client — it POSTs `{base_url}/rerank` directly (`src/patterns/safe_tei_rerank.py`), so `RERANKER_MODEL` (default `Alibaba-NLP/gte-reranker-modernbert-base`) is a TEI model name, not a LiteLLM model string. A remote embedder serving a different model invalidates the baked dense cache — regenerate it with `make embed-cache` so vectors match the serving model.
 
 ---
 
@@ -434,37 +433,37 @@ The TEI sidecars are required for full retrieval quality: a dense leg (Qwen3-Emb
 
 ### config.json
 
-The server reads `config/config.json` relative to the repo (override with `--config-path` or `DESIGN_PATTERN_CONFIG_PATH`). Every value is a `{env:VAR:-default}` placeholder that expands at load time, so the shipped file doubles as the env-var reference. The schema (abridged):
+The server reads `config/config.json` relative to the repo (override with `--config-path` or `CONFIG_PATH`). Every value is a `{env:VAR:-default}` placeholder that expands at load time, so the shipped file doubles as the env-var reference. The schema (abridged):
 
 ```json
 {
-  "logging_level": "{env:DESIGN_PATTERN_LOGGING_LEVEL:-INFO}",
-  "transport": "{env:DESIGN_PATTERN_TRANSPORT:-stdio}",
-  "host": "{env:DESIGN_PATTERN_HOST:-0.0.0.0}",
-  "port": "{env:DESIGN_PATTERN_PORT:-8050}",
+  "logging_level": "{env:LOGGING_LEVEL:-INFO}",
+  "transport": "{env:TRANSPORT:-stdio}",
+  "host": "{env:HOST:-0.0.0.0}",
+  "port": "{env:PORT:-8050}",
   "generator": {
-    "provider": "{env:DESIGN_PATTERN_GENERATOR_PROVIDER:-openai}",
+    "provider": "{env:GENERATOR_PROVIDER:-openai}",
     "config": {
-      "model": "{env:DESIGN_PATTERN_GENERATOR_MODEL:-gpt-4o-mini}",
-      "base_url": "{env:DESIGN_PATTERN_GENERATOR_BASE_URL:-https://api.openai.com/v1}",
-      "api_key": "{env:DESIGN_PATTERN_GENERATOR_API_KEY:-}",
-      "temperature": "{env:DESIGN_PATTERN_GENERATOR_TEMPERATURE:-0.1}",
-      "timeout_seconds": "{env:DESIGN_PATTERN_GENERATOR_TIMEOUT_SECONDS:-120.0}",
-      "generation_batch_size": "{env:DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE:-5}",
-      "generation_max_concurrency": "{env:DESIGN_PATTERN_GENERATION_MAX_CONCURRENCY:-2}",
-      "circuit_breaker_failure_threshold": "{env:DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}",
-      "circuit_breaker_cooldown_seconds": "{env:DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS:-60.0}"
+      "model": "{env:GENERATOR_MODEL:-gpt-4o-mini}",
+      "base_url": "{env:GENERATOR_BASE_URL:-https://api.openai.com/v1}",
+      "api_key": "{env:GENERATOR_API_KEY:-}",
+      "temperature": "{env:GENERATOR_TEMPERATURE:-0.1}",
+      "timeout_seconds": "{env:GENERATOR_TIMEOUT_SECONDS:-120.0}",
+      "generation_batch_size": "{env:GENERATOR_GENERATION_BATCH_SIZE:-5}",
+      "generation_max_concurrency": "{env:GENERATION_MAX_CONCURRENCY:-2}",
+      "circuit_breaker_failure_threshold": "{env:GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}",
+      "circuit_breaker_cooldown_seconds": "{env:GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS:-60.0}"
     }
   },
-  "embedder":  { "provider": "{env:DESIGN_PATTERN_EMBEDDER_PROVIDER:-tei}", "config": { "base_url": "{env:DESIGN_PATTERN_EMBEDDER_BASE_URL:-http://design-pattern-tei-embed:8080}" } },
-  "retrieval": { "bm25_weight": "{env:DESIGN_PATTERN_RETRIEVAL_BM25_WEIGHT:-0.3}", "dense_weight": "{env:DESIGN_PATTERN_RETRIEVAL_DENSE_WEIGHT:-0.7}", "max_concurrent_parts": "{env:DESIGN_PATTERN_RETRIEVAL_MAX_CONCURRENT_PARTS:-1}" },
-  "reranker":  { "rerank_text": "{env:DESIGN_PATTERN_RERANK_TEXT:-full}", "rerank_top_n": "{env:DESIGN_PATTERN_RERANK_TOP_N:-10}" },
+  "embedder":  { "provider": "{env:EMBEDDER_PROVIDER:-tei}", "config": { "base_url": "{env:EMBEDDER_BASE_URL:-http://design-pattern-tei-embed:8080}" } },
+  "retrieval": { "bm25_weight": "{env:RETRIEVAL_BM25_WEIGHT:-0.3}", "dense_weight": "{env:RETRIEVAL_DENSE_WEIGHT:-0.7}", "max_concurrent_parts": "{env:RETRIEVAL_MAX_CONCURRENT_PARTS:-1}" },
+  "reranker":  { "rerank_text": "{env:RERANK_TEXT:-full}", "rerank_top_n": "{env:RERANK_TOP_N:-10}" },
   "reasoning": { "enabled": "{env:REASONING_ENABLED:-true}", "per_phase": { "analyze": { "enabled": "{env:REASONING_ANALYZE_ENABLED:-true}" }, "weights": { "enabled": "{env:REASONING_WEIGHTS_ENABLED:-true}" }, "generate": { "enabled": "{env:REASONING_GENERATE_ENABLED:-true}" }, "evaluate": { "enabled": "{env:REASONING_EVALUATE_ENABLED:-true}" } }, "max_injected_chars": "{env:REASONING_MAX_INJECTED_CHARS:-}" },
-  "validation": { "max_retries": "{env:DESIGN_PATTERN_VALIDATION_MAX_RETRIES:-1}", "retry_on_fail": "{env:DESIGN_PATTERN_VALIDATION_RETRY_ON_FAIL:-true}", "truncation_rerun": "{env:DESIGN_PATTERN_VALIDATION_TRUNCATION_RERUN:-repair}", "truncation_boost_max_completion_tokens": "{env:DESIGN_PATTERN_VALIDATION_TRUNCATION_BOOST_TOKENS:-65536}" },
-  "prompts": { "stable_prefix_first": "{env:DESIGN_PATTERN_PROMPT_STABLE_PREFIX:-false}" },
-  "loop":  { "max_tries": "{env:DESIGN_PATTERN_LOOP_MAX_TRIES:-2}", "min_quality_score": "{env:DESIGN_PATTERN_LOOP_MIN_QUALITY_SCORE:-50}" },
-  "tasks": { "deadline_seconds": "{env:DESIGN_PATTERN_TASKS_DEADLINE_SECONDS:-1800.0}", "heartbeat_enabled": "{env:DESIGN_PATTERN_TASKS_HEARTBEAT_ENABLED:-true}", "heartbeat_interval_seconds": "{env:DESIGN_PATTERN_TASKS_HEARTBEAT_INTERVAL_SECONDS:-30}" },
-  "jobs":  { "db_path": "{env:DESIGN_PATTERN_JOBS_DB:-~/.config/design-pattern-mcp/jobs.db}" }
+  "validation": { "max_retries": "{env:VALIDATION_MAX_RETRIES:-1}", "retry_on_fail": "{env:VALIDATION_RETRY_ON_FAIL:-true}", "truncation_rerun": "{env:VALIDATION_TRUNCATION_RERUN:-repair}", "truncation_boost_max_completion_tokens": "{env:VALIDATION_TRUNCATION_BOOST_TOKENS:-65536}" },
+  "prompts": { "stable_prefix_first": "{env:PROMPT_STABLE_PREFIX:-false}" },
+  "loop":  { "max_tries": "{env:LOOP_MAX_TRIES:-2}", "min_quality_score": "{env:LOOP_MIN_QUALITY_SCORE:-50}" },
+  "tasks": { "deadline_seconds": "{env:TASKS_DEADLINE_SECONDS:-1800.0}", "heartbeat_enabled": "{env:TASKS_HEARTBEAT_ENABLED:-true}", "heartbeat_interval_seconds": "{env:TASKS_HEARTBEAT_INTERVAL_SECONDS:-30}" },
+  "jobs":  { "db_path": "{env:JOBS_DB:-~/.config/design-pattern-mcp/jobs.db}" }
 }
 ```
 
@@ -474,10 +473,10 @@ The generator LLM is accessed through the **LlamaIndex LiteLLM integration**. Al
 
 | Config / env | Dev-stack default |
 |---|---|
-| `DESIGN_PATTERN_GENERATOR_PROVIDER` | `minimax` |
-| `DESIGN_PATTERN_GENERATOR_MODEL` | `minimax/MiniMax-M2.7` |
-| `DESIGN_PATTERN_GENERATOR_BASE_URL` | `https://api.minimax.io/v1` |
-| `DESIGN_PATTERN_GENERATOR_API_KEY` | falls back to `MINIMAXAI_API_KEY` (host env or `.env`) |
+| `GENERATOR_PROVIDER` | `minimax` |
+| `GENERATOR_MODEL` | `minimax/MiniMax-M2.7` |
+| `GENERATOR_BASE_URL` | `https://api.minimax.io/v1` |
+| `GENERATOR_API_KEY` | falls back to `MINIMAXAI_API_KEY` (host env or `.env`) |
 
 Provider list and syntax: [LiteLLM Providers documentation](https://docs.litellm.ai/docs/providers). `temperature`, `top_p`, `top_k`, `timeout_seconds`, and the circuit-breaker knobs map to the corresponding LiteLLM/provider parameters.
 
@@ -487,9 +486,9 @@ Provider list and syntax: [LiteLLM Providers documentation](https://docs.litellm
 `write=true` (Pydantic defaults *and* `config/config.json`; both compose stacks set the
 same values explicitly), and the serving path always passes the cache — the container
 stacks need no cache configuration at all, and a host run needs exactly one export
-(`DESIGN_PATTERN_DENSE_CACHE_PATH`, see the Local Development block). It is switched off
-only deliberately: `DENSE_CACHE_MODE=off` in a compose stack,
-`DESIGN_PATTERN_DENSE_CACHE_MODE=off` on a host run, `mode=off` in a config file, the
+(`DENSE_CACHE_PATH`, see the Local Development block). It is switched off
+only deliberately: `DENSE_CACHE_MODE=off` (compose stack or host run), `mode=off` in a
+config file, the
 `--offline`/`--health` paths (deterministic embedder, no cache), and the benchmark
 compose override (cold-start measurement).
 `tests/unit/test_config.py::test_dense_cache_defaults` and
@@ -500,11 +499,11 @@ The dense retrieval leg is one FAISS index over every catalog record (486 record
 manifest and reloaded on the next start, so a restart costs **one probe embedding**
 instead of a full corpus pass (~19 min on the CPU TEI sidecar).
 
-- **Path**: `DESIGN_PATTERN_DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image).
+- **Path**: `DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image).
   Contents: `manifest.json` (the commit marker) + `vectors.npy`. A directory without a
   usable manifest is an ordinary miss; `mode=require` turns a miss into a startup
   error (`ERR_008`), `mode=off` skips the cache read entirely.
-- **Written** immediately after a cold embed (`DESIGN_PATTERN_DENSE_CACHE_WRITE=true`),
+- **Written** immediately after a cold embed (`DENSE_CACHE_WRITE=true`),
   so the snapshot is on disk before any later startup step can fail. The vectors file is
   written before the manifest, so a crash mid-write leaves a directory the next start
   treats as a miss.
@@ -515,8 +514,8 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
   one keeps its own, so after a catalogue- or model-changing rebuild delete it
   (`docker volume rm <name>`) before `up -d`, otherwise the guards force one re-embed
   (~19 min) and rewrite the volume. A genuinely cold cache needs a cache-less image
-  (`make docker-build-nocache`) or `mode=off` — `DENSE_CACHE_MODE=off` in the compose
-  stacks, `DESIGN_PATTERN_DENSE_CACHE_MODE=off` on host runs.
+  (`make docker-build-nocache`) or `mode=off` — `DENSE_CACHE_MODE=off` covers both the
+  compose stacks and host runs.
 - **Rebuilt automatically** when the embedding function changes (model string, text
   instruction, declared `model_repo`/`onnx_variant`), when the catalog changes (record
   count, name order or any `document_text` — `corpus_sha256`), when `vectors.npy` is
@@ -536,9 +535,9 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
 - **Single writer**: no locking. Run one server process per cache directory (dev and
   systemd stacks use separate volumes; the benchmark harness pins its own disposable
   `data/dense-cache` and refuses a cold cache unless `mode=off`).
-- **Host runs** (`uv run python -m src.main`) must point `DESIGN_PATTERN_DENSE_CACHE_PATH`
+- **Host runs** (`uv run python -m src.main`) must point `DENSE_CACHE_PATH`
   at a writable directory — the shipped default `/app/data/dense-cache` only exists in
-  the image. Either `export DESIGN_PATTERN_DENSE_CACHE_PATH=$PWD/data/dense-cache` so a
+  the image. Either `export DENSE_CACHE_PATH=$PWD/data/dense-cache` so a
   `make embed-cache` snapshot is reused, or point it at
   `~/.config/design-pattern-mcp/dense-cache` and let the first start write it.
 
@@ -546,26 +545,26 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
 
 | Variable | Default | Description |
 |---|---|---|
-| `DESIGN_PATTERN_GENERATOR_API_KEY` | *(required)* | Generator API key (dev stack falls back to `MINIMAXAI_API_KEY`) |
-| `DESIGN_PATTERN_GENERATOR_PROVIDER` | `openai` | LiteLLM provider prefix (`minimax`, `openai`, `anthropic`, `openrouter`, …) |
-| `DESIGN_PATTERN_GENERATOR_MODEL` | `gpt-4o-mini` | Model name; `minimax/MiniMax-M2.7` is the measured dev-stack default |
-| `DESIGN_PATTERN_GENERATOR_BASE_URL` | `https://api.openai.com/v1` | API base URL (LiteLLM `api_base`) |
-| `DESIGN_PATTERN_GENERATOR_TEMPERATURE` | `0.1` | Sampling temperature |
-| `DESIGN_PATTERN_GENERATOR_TIMEOUT_SECONDS` | `120.0` | Bounds ONE HTTP request to the model |
-| `DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE` | `5` | Patterns per GENERATE batch |
-| `DESIGN_PATTERN_GENERATION_MAX_CONCURRENCY` | `2` | GENERATE batches in flight at once |
-| `DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive qualifying provider failures (timeout, connection, 408/429/5xx, empty response) opening the circuit; auth/configuration 4xx never count |
-| `DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `60.0` | Open-state window before one half-open probe |
-| `DESIGN_PATTERN_EMBEDDER_BASE_URL` | `http://design-pattern-tei-embed:8080` | TEI embedder endpoint |
-| `DESIGN_PATTERN_EMBEDDER_BATCH_SIZE` | `16` | Embedding batch size |
-| `DESIGN_PATTERN_DENSE_CACHE_PATH` | `/app/data/dense-cache` (image) | Dense-leg snapshot directory (`manifest.json` + `vectors.npy`): reloaded on restart with zero corpus embed calls, rebuilt on any embedder/corpus/probe change. Host runs override it with a writable path |
-| `DESIGN_PATTERN_DENSE_CACHE_MODE` | `auto` | `auto` (a miss re-embeds), `require` (a miss raises `ERR_008` at startup), `off` (the cache is never read or written). The compose stacks set it from `DENSE_CACHE_MODE` — use the short name there |
-| `DESIGN_PATTERN_DENSE_CACHE_WRITE` | `true` | Persist a re-embedded corpus (best-effort — a failed write logs `Dense cache write failed` and the run keeps its vectors) |
-| `DESIGN_PATTERN_RETRIEVAL_DENSE_WEIGHT` | `0.7` | Dense-leg fusion weight (must sum with `..._BM25_WEIGHT` to 1.0 ± 1e-3 — config-validated; a leg below 0.05 logs a warning) |
-| `DESIGN_PATTERN_RETRIEVAL_BM25_WEIGHT` | `0.3` | BM25-leg fusion weight |
-| `DESIGN_PATTERN_RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the CPU TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
-| `DESIGN_PATTERN_RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
-| `DESIGN_PATTERN_RERANK_TOP_N` | `10` | Rerank top N |
+| `GENERATOR_API_KEY` | *(required)* | Generator API key (dev stack falls back to `MINIMAXAI_API_KEY`) |
+| `GENERATOR_PROVIDER` | `openai` | LiteLLM provider prefix (`minimax`, `openai`, `anthropic`, `openrouter`, …) |
+| `GENERATOR_MODEL` | `gpt-4o-mini` | Model name; `minimax/MiniMax-M2.7` is the measured dev-stack default |
+| `GENERATOR_BASE_URL` | `https://api.openai.com/v1` | API base URL (LiteLLM `api_base`) |
+| `GENERATOR_TEMPERATURE` | `0.1` | Sampling temperature |
+| `GENERATOR_TIMEOUT_SECONDS` | `120.0` | Bounds ONE HTTP request to the model |
+| `GENERATOR_GENERATION_BATCH_SIZE` | `5` | Patterns per GENERATE batch |
+| `GENERATION_MAX_CONCURRENCY` | `2` | GENERATE batches in flight at once |
+| `GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive qualifying provider failures (timeout, connection, 408/429/5xx, empty response) opening the circuit; auth/configuration 4xx never count |
+| `GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `60.0` | Open-state window before one half-open probe |
+| `EMBEDDER_BASE_URL` | `http://design-pattern-tei-embed:8080` | TEI embedder endpoint |
+| `EMBEDDER_BATCH_SIZE` | `16` | Embedding batch size |
+| `DENSE_CACHE_PATH` | `/app/data/dense-cache` (image) | Dense-leg snapshot directory (`manifest.json` + `vectors.npy`): reloaded on restart with zero corpus embed calls, rebuilt on any embedder/corpus/probe change. Host runs override it with a writable path |
+| `DENSE_CACHE_MODE` | `auto` | `auto` (a miss re-embeds), `require` (a miss raises `ERR_008` at startup), `off` (the cache is never read or written) |
+| `DENSE_CACHE_WRITE` | `true` | Persist a re-embedded corpus (best-effort — a failed write logs `Dense cache write failed` and the run keeps its vectors) |
+| `RETRIEVAL_DENSE_WEIGHT` | `0.7` | Dense-leg fusion weight (must sum with `..._BM25_WEIGHT` to 1.0 ± 1e-3 — config-validated; a leg below 0.05 logs a warning) |
+| `RETRIEVAL_BM25_WEIGHT` | `0.3` | BM25-leg fusion weight |
+| `RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the CPU TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
+| `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
+| `RERANK_TOP_N` | `10` | Rerank top N |
 | `REASONING_ENABLED` | `true` | Master switch for the pre-LLM reasoning layer |
 | `REASONING_{ANALYZE,WEIGHTS,GENERATE,EVALUATE}_ENABLED` | `true` | Per-phase reasoning switches; a disabled phase contributes an empty reasoning context (no generator call, no subprocess, no cache entry), while an *outage* in an enabled phase degrades silently to the in-prompt scaffold |
 | `REASONING_{...}_THOUGHTS` | `2` / phase | Reasoning steps before each phase's main call |
@@ -574,20 +573,20 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
 | `REASONING_MAX_INJECTED_CHARS` | uncapped | Cap on the rendered reasoning trace injected into downstream prompts; overflow is cut and marked `(reasoning trace truncated at N chars)` (measured latency lever) |
 | `REASONING_FAIL_FAST` | `false` | Fail server startup when a reasoning tool is unreachable (default: degrade, log ERROR) |
 | `REASONING_QUIET_STDERR` | `true` | Silence reasoning-subprocess stderr; set `false` to debug spawn failures |
-| `DESIGN_PATTERN_VALIDATION_MAX_RETRIES` | `1` | Structured-output repair budget (model-output failures only — provider errors are re-raised, never repair-prompted) |
-| `DESIGN_PATTERN_VALIDATION_TRUNCATION_RERUN` | `repair` | Truncation handling: `repair` (default), `boost` (truncation-first: one rerun with the boost cap, no repair into the same ceiling), `off` |
-| `DESIGN_PATTERN_VALIDATION_TRUNCATION_BOOST_TOKENS` | `65536` | `max_completion_tokens` of the boost rerun (MiniMax M2.x recommended cap) |
-| `DESIGN_PATTERN_PROMPT_STABLE_PREFIX` | `false` | Reorder each operation's user prompt so the static response-contract block leads and per-run payload trails (MiniMax passive prompt-cache optimization; content-identical either way) |
-| `DESIGN_PATTERN_LOOP_MAX_TRIES` | `2` | Design-loop GENERATE→EVALUATE attempts |
-| `DESIGN_PATTERN_LOOP_MIN_QUALITY_SCORE` | `50.0` | Early-stop score threshold |
-| `DESIGN_PATTERN_TASKS_DEADLINE_SECONDS` | `1800.0` | Whole-run budget for one tool call / job; on expiry the run ends with `ERR_014` (the pipeline's internal llama-index Workflow timeout is 0.9× this) |
-| `DESIGN_PATTERN_TASKS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Progress-notification interval (keep below the client's idle timeout) |
-| `DESIGN_PATTERN_JOBS_DB` | `~/.config/design-pattern-mcp/jobs.db` | SQLite path for the async job trio |
-| `DESIGN_PATTERN_PATTERN_DIRECTORY` | `pattern/` | Pattern files directory |
-| `DESIGN_PATTERN_LOGGING_LEVEL` | `INFO` | `DEBUG` captures every reasoning thought + per-step tool response |
-| `DESIGN_PATTERN_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
-| `DESIGN_PATTERN_PORT` | `8050` | HTTP bind port (container `8050`; dev host `8822`, systemd host `8812`) |
-| `DESIGN_PATTERN_CONFIG_PATH` | `config/config.json` | Config file path |
+| `VALIDATION_MAX_RETRIES` | `1` | Structured-output repair budget (model-output failures only — provider errors are re-raised, never repair-prompted) |
+| `VALIDATION_TRUNCATION_RERUN` | `repair` | Truncation handling: `repair` (default), `boost` (truncation-first: one rerun with the boost cap, no repair into the same ceiling), `off` |
+| `VALIDATION_TRUNCATION_BOOST_TOKENS` | `65536` | `max_completion_tokens` of the boost rerun (MiniMax M2.x recommended cap) |
+| `PROMPT_STABLE_PREFIX` | `false` | Reorder each operation's user prompt so the static response-contract block leads and per-run payload trails (MiniMax passive prompt-cache optimization; content-identical either way) |
+| `LOOP_MAX_TRIES` | `2` | Design-loop GENERATE→EVALUATE attempts |
+| `LOOP_MIN_QUALITY_SCORE` | `50.0` | Early-stop score threshold |
+| `TASKS_DEADLINE_SECONDS` | `1800.0` | Whole-run budget for one tool call / job; on expiry the run ends with `ERR_014` (the pipeline's internal llama-index Workflow timeout is 0.9× this) |
+| `TASKS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Progress-notification interval (keep below the client's idle timeout) |
+| `JOBS_DB` | `~/.config/design-pattern-mcp/jobs.db` | SQLite path for the async job trio |
+| `PATTERN_DIRECTORY` | `pattern/` | Pattern files directory |
+| `LOGGING_LEVEL` | `INFO` | `DEBUG` captures every reasoning thought + per-step tool response |
+| `TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
+| `PORT` | `8050` | HTTP bind port (container `8050`; dev host `8822`, systemd host `8812`) |
+| `CONFIG_PATH` | `config/config.json` | Config file path |
 
 ### CLI flags
 
@@ -621,20 +620,20 @@ Latency note: a full run issues 8 reasoning tool calls (2 per phase) as serial s
 
 ## Long-running tools & timeouts
 
-`select_design_patterns` runs a multi-stage pipeline that **takes minutes per call**. This is inherent to the workload: the generator LLM processes the fused retrieval candidates, per-part quality weights, and the full output of every previous stage, and produces a large, strictly structured JSON document one token at a time. The design loop repeats generate → evaluate up to `DESIGN_PATTERN_LOOP_MAX_TRIES` times.
+`select_design_patterns` runs a multi-stage pipeline that **takes minutes per call**. This is inherent to the workload: the generator LLM processes the fused retrieval candidates, per-part quality weights, and the full output of every previous stage, and produces a large, strictly structured JSON document one token at a time. The design loop repeats generate → evaluate up to `LOOP_MAX_TRIES` times.
 
 ### Four bounds govern a run — do not confuse them
 
 | Bound | Default | Scope |
 |---|---|---|
-| `DESIGN_PATTERN_GENERATOR_TIMEOUT_SECONDS` | 120 s | ONE HTTP request to the model |
-| `DESIGN_PATTERN_VALIDATION_MAX_RETRIES` | 1 | Repair re-issues exactly one call, and only for model-output failures |
-| `DESIGN_PATTERN_LOOP_MAX_TRIES` | 2 | GENERATE→EVALUATE design-loop attempts |
-| `DESIGN_PATTERN_TASKS_DEADLINE_SECONDS` | 1800 s | The whole run; expiry cancels in-flight work and ends with `ERR_014` |
+| `GENERATOR_TIMEOUT_SECONDS` | 120 s | ONE HTTP request to the model |
+| `VALIDATION_MAX_RETRIES` | 1 | Repair re-issues exactly one call, and only for model-output failures |
+| `LOOP_MAX_TRIES` | 2 | GENERATE→EVALUATE design-loop attempts |
+| `TASKS_DEADLINE_SECONDS` | 1800 s | The whole run; expiry cancels in-flight work and ends with `ERR_014` |
 
 ### The heartbeat defence (applied by default)
 
-Every long-running tool emits `progress` notifications from a parallel coroutine every 30 seconds (`DESIGN_PATTERN_TASKS_HEARTBEAT_INTERVAL_SECONDS`). Clients whose idle timers reset on any received data stay alive for the full pipeline duration.
+Every long-running tool emits `progress` notifications from a parallel coroutine every 30 seconds (`TASKS_HEARTBEAT_INTERVAL_SECONDS`). Clients whose idle timers reset on any received data stay alive for the full pipeline duration.
 
 > **TS-SDK clients (Claude Desktop, Cursor) do not reset their timeout on progress notifications.**
 
@@ -646,7 +645,7 @@ get_design_status(job_id)                       → {status, result | error}
 cancel_design(job_id)                           → best-effort, next stage boundary
 ```
 
-`submit_design_job` returns a `job_id` in milliseconds; the pipeline runs in a background task and the store is SQLite (`DESIGN_PATTERN_JOBS_DB`). Poll every 10–30 seconds. **This is the fix that works for TS-SDK clients.**
+`submit_design_job` returns a `job_id` in milliseconds; the pipeline runs in a background task and the store is SQLite (`JOBS_DB`). Poll every 10–30 seconds. **This is the fix that works for TS-SDK clients.**
 
 ### Bypassing client timeouts entirely: `make client`
 
@@ -676,9 +675,9 @@ This repo treats selection quality and pipeline latency as measured properties, 
 The code levers are shipped as opt-in env configuration, not defaults: the cumulative win claim passed the preregistered gate against `base-fresh` (holdout p95 410.9 → 297.5 s = 27.6 % ≥ 15 %, overall 13/18 ≥ floor), but the attribution comparison against `cfg-reasoning` recorded a candidate-loss (+12.5 % < 15 %), so defaults stay behavior-neutral. To opt in:
 
 ```bash
-export DESIGN_PATTERN_VALIDATION_TRUNCATION_RERUN=boost
+export VALIDATION_TRUNCATION_RERUN=boost
 export REASONING_MAX_INJECTED_CHARS=4000
-export DESIGN_PATTERN_PROMPT_STABLE_PREFIX=true
+export PROMPT_STABLE_PREFIX=true
 ```
 
 **Verification layers** (the repo's differentiator):
@@ -712,22 +711,22 @@ Index warm-up refuses server start when the embedder is unreachable (fail-fast r
 docker compose -f docker/docker-compose.yml logs design-pattern-tei-embed
 ```
 
-Local non-Docker runs must point `DESIGN_PATTERN_EMBEDDER_BASE_URL` / `DESIGN_PATTERN_RERANKER_BASE_URL` at reachable endpoints — or start with `--offline`.
+Local non-Docker runs must point `EMBEDDER_BASE_URL` / `RERANKER_BASE_URL` at reachable endpoints — or start with `--offline`.
 
 ### LLM provider errors (502 / 401)
 
-- Confirm `DESIGN_PATTERN_GENERATOR_API_KEY` (or `MINIMAXAI_API_KEY` on the dev stack) is set and not expired
-- Verify `DESIGN_PATTERN_GENERATOR_BASE_URL` matches your provider's endpoint
+- Confirm `GENERATOR_API_KEY` (or `MINIMAXAI_API_KEY` on the dev stack) is set and not expired
+- Verify `GENERATOR_BASE_URL` matches your provider's endpoint
 - After 3 consecutive transport failures the circuit opens for 60 s (`..._CIRCUIT_BREAKER_*` knobs); auth/configuration 4xx never count toward it
 
 ### `ERR_012` / `ERR_014`
 
 - `ERR_012` = cancelled (via `cancel_design` or a client disconnect at the next stage boundary)
-- `ERR_014` = whole-run deadline exceeded (`DESIGN_PATTERN_TASKS_DEADLINE_SECONDS`); raise it explicitly for legitimately longer runs — the in-flight provider coroutine is cancelled, partial results are discarded
+- `ERR_014` = whole-run deadline exceeded (`TASKS_DEADLINE_SECONDS`); raise it explicitly for legitimately longer runs — the in-flight provider coroutine is cancelled, partial results are discarded
 
 ### Reranker 429s
 
-One full-text rerank request already saturates the CPU TEI sidecar's 16,384-token inference buffer (`MAX_BATCH_TOKENS=8192` interacts with request packing; measured 2026-09-25): a cap-2 `retrieve_many` leg fails outright with HTTP 429 "Model is overloaded". Keep `DESIGN_PATTERN_RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default); the server-side invariant also keeps `dense_top_k + bm25_top_k` ≤ the sidecar's `MAX_CLIENT_BATCH_SIZE` (48).
+One full-text rerank request already saturates the CPU TEI sidecar's 16,384-token inference buffer (`MAX_BATCH_TOKENS=8192` interacts with request packing; measured 2026-09-25): a cap-2 `retrieve_many` leg fails outright with HTTP 429 "Model is overloaded". Keep `RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default); the server-side invariant also keeps `dense_top_k + bm25_top_k` ≤ the sidecar's `MAX_CLIENT_BATCH_SIZE` (48).
 
 ### Pattern JSON files not loading
 

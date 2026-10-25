@@ -62,7 +62,7 @@ RUN --mount=type=cache,target=/root/.npm \
 # NOTE: the embedder's default api_key is "" (config.json) — fine with the
 # --offline deterministic embedder (the HEALTHCHECK path), but litellm's OpenAI
 # SDK route needs a non-empty credential string against the TEI sidecar; the
-# compose stack sets DESIGN_PATTERN_EMBEDDER_API_KEY accordingly.
+# compose stack sets EMBEDDER_API_KEY accordingly.
 
 # ---- Production stage ------------------------------------------------------
 FROM python:3.12-slim-bookworm AS production

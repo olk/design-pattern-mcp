@@ -36,7 +36,7 @@ Usage:
     $ make docker-up
 
     # Terminal 2: run the client
-    $ DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp \
+    $ CLIENT_URL=http://localhost:8822/mcp \
         uv run python examples/design_phase_client.py
 
 Requires:
@@ -55,7 +55,7 @@ from typing import Any
 
 from fastmcp import Client  # type: ignore[attr-defined]
 
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
+SERVER_URL = os.environ.get("CLIENT_URL", "http://localhost:8822/mcp")
 
 DESCRIPTION = """
 Implement an event-driven IoT ingestion service in TypeScript. The API gateway

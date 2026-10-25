@@ -155,14 +155,14 @@ class LiveExecutor:
 
         The dense-cache precondition is checked up front: without a warm cache the index build
         re-embeds 486 documents through the CPU sidecar (~15-20 min), which is never what a
-        latency comparison wants. ``DESIGN_PATTERN_DENSE_CACHE_MODE=off`` opts into that.
+        latency comparison wants. ``DENSE_CACHE_MODE=off`` opts into that.
         """
         if config.dense_cache.mode != "off" and not cfg.dense_cache_ready(config.dense_cache.path):
             raise RuntimeError(
                 f"dense cache not ready at {config.dense_cache.path!r} "
                 "(manifest.json + vectors.npy missing): run `make dense-cache`, point "
-                "DESIGN_PATTERN_DENSE_CACHE_PATH at a warm cache, or set "
-                "DESIGN_PATTERN_DENSE_CACHE_MODE=off to re-embed at start"
+                "DENSE_CACHE_PATH at a warm cache, or set "
+                "DENSE_CACHE_MODE=off to re-embed at start"
             )
         embedder = EmbedderTimingProxy(build_embedder(config.embedder), recorder)
         reranker = RerankerTimingProxy(build_reranker(config.reranker), recorder)
@@ -223,7 +223,7 @@ class LiveExecutor:
                     if self._pipeline._decision_client is not None
                     else f"unconfigured ({self._config.decisions.api_key_env} unset)"
                     if self._config.decisions.enabled
-                    else "disabled via DESIGN_PATTERN_DECISIONS_ENABLED=false"
+                    else "disabled via DECISIONS_ENABLED=false"
                 ),
             },
             "reasoning_health": self._reasoning_health,

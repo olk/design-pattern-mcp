@@ -1,13 +1,15 @@
 """Harness configuration: server config load, scenario corpus load, run provenance (plan §4).
 
 The harness never mutates the repository configuration: it loads ``config/config.json`` through
-the production :class:`ConfigManager` (honoring ``DESIGN_PATTERN_CONFIG_PATH``), applies the
+the production :class:`ConfigManager` (honoring ``CONFIG_PATH``), applies the
 documented per-mode overrides only, and pins the effective ``ServerConfig`` into every run
 manifest so two arms can be compared for configuration drift (plan §6, "provider drift").
 
 Secrets never enter a manifest: :func:`mask_secrets` strips every value behind a
 key/token/secret/password/credential-shaped name, and :func:`masked_env_snapshot` records only
-the ``DESIGN_PATTERN_*``/``REASONING_*`` environment the deployment actually reads.
+the environment the deployment actually reads — every name ``config/config.json`` declares
+through a ``{env:...}`` placeholder, the ``REASONING_*`` namespace, and the provider keys in
+``_ENV_EXTRA_KEYS``.
 """
 
 from __future__ import annotations
@@ -44,8 +46,26 @@ MODES: tuple[str, ...] = ("offline", "live", "e2e")
 SPLITS: tuple[str, ...] = ("train", "holdout")
 
 _SECRET_KEY_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
-_ENV_PREFIXES: tuple[str, ...] = ("DESIGN_PATTERN_", "REASONING_")
-_ENV_EXTRA_KEYS: tuple[str, ...] = ("MINIMAXAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+#: Namespace whose every name belongs to the deployment regardless of the config file.
+_ENV_PREFIXES: tuple[str, ...] = ("REASONING_",)
+#: Deployment-read names that bypass the ``{env:...}`` placeholders for discovery.
+_ENV_EXTRA_KEYS: tuple[str, ...] = (
+    "CONFIG_PATH",
+    "JOBS_DB",
+    "MINIMAXAI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+_CONFIG_ENV_RE = re.compile(r"\{env:([A-Z_][A-Z0-9_]*)")
+
+
+def deployment_env_names() -> frozenset[str]:
+    """Env names the deployment reads: config ``{env:...}`` placeholders plus ``_ENV_EXTRA_KEYS``."""
+    try:
+        raw = resolve_config_path().read_text(encoding="utf-8")
+    except OSError:
+        return frozenset(_ENV_EXTRA_KEYS)
+    return frozenset(_CONFIG_ENV_RE.findall(raw)) | frozenset(_ENV_EXTRA_KEYS)
 
 
 def utc_now_iso() -> str:
@@ -97,8 +117,9 @@ def mask_secrets(value: Any) -> Any:
 def masked_env_snapshot() -> dict[str, str]:
     """The deployment-relevant environment, secrets masked (drift attribution between arms)."""
     snapshot: dict[str, str] = {}
+    names = deployment_env_names()
     for key in sorted(os.environ):
-        if key.startswith(_ENV_PREFIXES) or key in _ENV_EXTRA_KEYS:
+        if key.startswith(_ENV_PREFIXES) or key in names:
             value = os.environ[key]
             snapshot[key] = f"***{'set' if value else 'empty'}***" if _SECRET_KEY_RE.search(key) else value
     return snapshot
@@ -138,8 +159,8 @@ def git_snapshot() -> dict[str, Any]:
 
 
 def resolve_config_path() -> Path:
-    """``DESIGN_PATTERN_CONFIG_PATH`` > repository ``config/config.json`` (never cwd-relative)."""
-    configured = os.environ.get("DESIGN_PATTERN_CONFIG_PATH", "").strip()
+    """``CONFIG_PATH`` > repository ``config/config.json`` (never cwd-relative)."""
+    configured = os.environ.get("CONFIG_PATH", "").strip()
     if configured:
         return Path(configured).expanduser()
     return REPO_ROOT / "config" / "config.json"
@@ -157,7 +178,11 @@ def load_server_config(mode: str) -> ServerConfig:
     raw = ConfigManager.load_config(str(resolve_config_path()))
     if mode == "offline":
         raw = dict(raw)
-        raw["selection"] = {**raw.get("selection", {}), "primary_score_threshold": 0.0, "supporting_score_threshold": 0.0}
+        raw["selection"] = {
+            **raw.get("selection", {}),
+            "primary_score_threshold": 0.0,
+            "supporting_score_threshold": 0.0,
+        }
         raw["retrieval"] = {**raw.get("retrieval", {}), "min_fusion_score": 0.0}
     return ServerConfig.model_validate(raw)
 
@@ -264,7 +289,9 @@ def load_scenarios(path: Path, catalog: PatternLoader | None = None) -> list[Sce
     for index, entry in enumerate(entries):
         errors = sorted(validator.iter_errors(entry), key=lambda error: list(error.absolute_path))
         if errors:
-            details = "; ".join(f"{'/'.join(str(part) for part in error.absolute_path)}: {error.message}" for error in errors)
+            details = "; ".join(
+                f"{'/'.join(str(part) for part in error.absolute_path)}: {error.message}" for error in errors
+            )
             raise ValueError(f"{path}: scenario #{index} violates scenario.schema.json: {details}")
         scenario = _scenario_from_entry(entry, path)
         if scenario.scenario_id in seen_ids:
@@ -358,9 +385,7 @@ def _assert_labels_resolvable(scenario: Scenario, catalog: PatternLoader) -> Non
         )
 
 
-def select_scenarios(
-    scenarios: list[Scenario], *, split: str, limit: int | None
-) -> list[Scenario]:
+def select_scenarios(scenarios: list[Scenario], *, split: str, limit: int | None) -> list[Scenario]:
     """Filter by ``split`` (``train``/``holdout``/``all``) preserving corpus order, then cut."""
     if split not in (*SPLITS, "all"):
         raise ValueError(f"unknown split {split!r}; expected one of {(*SPLITS, 'all')}")

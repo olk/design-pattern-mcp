@@ -1,6 +1,6 @@
 """Black-box e2e runner: the running compose stack through a fastmcp client (plan §9).
 
-Mirrors ``examples/design_pattern_client.py`` (``DESIGN_PATTERN_CLIENT_URL``, default
+Mirrors ``examples/design_pattern_client.py`` (``CLIENT_URL``, default
 ``http://localhost:8822/mcp``) and calls ``select_design_patterns`` once per scenario. This mode
 measures what a real deployment costs *in total* against the real stack, and nothing else:
 
@@ -35,7 +35,7 @@ from .probes import percentile_fields, stage_table
 from .runner import render_report
 
 #: MCP server URL of the compose stack (same default as the demo client).
-DEFAULT_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
+DEFAULT_URL = os.environ.get("CLIENT_URL", "http://localhost:8822/mcp")
 
 #: The tool under test (wire name).
 TOOL_NAME = "select_design_patterns"

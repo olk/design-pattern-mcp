@@ -29,7 +29,7 @@ the client cannot hold a long HTTP request open (proxies, short timeouts):
 submit returns immediately with a job_id.
 
 Poll cadence and Ctrl+C behavior: the script polls every
-DESIGN_PATTERN_CLIENT_POLL_SECONDS (default 15); Ctrl+C during the wait
+CLIENT_POLL_SECONDS (default 15); Ctrl+C during the wait
 cancels the job server-side via cancel_design before exiting.
 
 Usage:
@@ -58,9 +58,9 @@ import time
 from fastmcp import Client  # type: ignore[attr-defined]
 from fastmcp.exceptions import ClientError, McpError, ToolError
 
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
+SERVER_URL = os.environ.get("CLIENT_URL", "http://localhost:8822/mcp")
 
-POLL_EVERY = int(os.environ.get("DESIGN_PATTERN_CLIENT_POLL_SECONDS", "15"))
+POLL_EVERY = int(os.environ.get("CLIENT_POLL_SECONDS", "15"))
 
 DESCRIPTION = """
 Implement an event-driven IoT ingestion service in Kotlin. The API gateway

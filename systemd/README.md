@@ -49,7 +49,7 @@ sudo install -m 644 ~/.config/design-pattern-mcp/config.json \
 sudo install -o root -g docker -m 640 /dev/null /etc/design-pattern-mcp/.env
 sudo $EDITOR /etc/design-pattern-mcp/.env
 # File contents:
-#   DESIGN_PATTERN_GENERATOR_API_KEY=sk-...
+#   GENERATOR_API_KEY=sk-...
 #   COMPOSE_PROJECT_NAME=dpml-systemd
 
 # 5. Install the unit file.

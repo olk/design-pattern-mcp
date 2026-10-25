@@ -231,22 +231,22 @@ class TestRepositoryConfig:
     def test_repository_config_ships_the_provider_reliability_placeholders(self) -> None:
         raw = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
         generator = raw["generator"]["config"]
-        assert generator["generation_batch_size"] == ("{env:DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE:-5}")
+        assert generator["generation_batch_size"] == ("{env:GENERATOR_GENERATION_BATCH_SIZE:-5}")
         assert generator["circuit_breaker_failure_threshold"] == (
-            "{env:DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}"
+            "{env:GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}"
         )
         assert generator["circuit_breaker_cooldown_seconds"] == (
-            "{env:DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS:-60.0}"
+            "{env:GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS:-60.0}"
         )
-        assert raw["tasks"]["deadline_seconds"] == ("{env:DESIGN_PATTERN_TASKS_DEADLINE_SECONDS:-1800.0}")
+        assert raw["tasks"]["deadline_seconds"] == ("{env:TASKS_DEADLINE_SECONDS:-1800.0}")
 
     @pytest.mark.parametrize(
         "variable",
         [
-            "DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE",
-            "DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
-            "DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
-            "DESIGN_PATTERN_TASKS_DEADLINE_SECONDS",
+            "GENERATOR_GENERATION_BATCH_SIZE",
+            "GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+            "TASKS_DEADLINE_SECONDS",
         ],
     )
     def test_provider_reliability_env_placeholders_resolve(
@@ -272,10 +272,10 @@ class TestRepositoryConfig:
         prod = (REPO_ROOT / "systemd" / "docker-compose.yml").read_text(encoding="utf-8")
 
         for name in (
-            "DESIGN_PATTERN_GENERATOR_GENERATION_BATCH_SIZE",
-            "DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
-            "DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
-            "DESIGN_PATTERN_TASKS_DEADLINE_SECONDS",
+            "GENERATOR_GENERATION_BATCH_SIZE",
+            "GENERATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            "GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+            "TASKS_DEADLINE_SECONDS",
         ):
             assert name in dev, name
             assert name in prod, name

@@ -226,7 +226,7 @@ class PathsConfig(BaseModel):
 
 
 class JobsConfig(BaseModel):
-    """Job-store location; ``DESIGN_PATTERN_JOBS_DB`` overrides it at runtime."""
+    """Job-store location; ``JOBS_DB`` overrides it at runtime."""
 
     db_path: str = Field(default="~/.config/design-pattern-mcp/jobs.db")
 
@@ -309,7 +309,7 @@ class DecisionsConfig(BaseModel):
 
     enabled: bool = Field(
         default=False,
-        description="Master switch. Opt in via DESIGN_PATTERN_DECISIONS_ENABLED=true.",
+        description="Master switch. Opt in via DECISIONS_ENABLED=true.",
     )
     base_url: str = Field(
         default="https://opencode.ai/inference/systemone/v1",
@@ -430,10 +430,10 @@ class ConfigManager:
 
     @classmethod
     def load_config(cls, config_path: str | None = None) -> dict[str, Any]:
-        """Resolve DESIGN_PATTERN_CONFIG_PATH env > argument > DEFAULT_CONFIG_PATH, expand, return."""
+        """Resolve CONFIG_PATH env > argument > DEFAULT_CONFIG_PATH, expand, return."""
         load_dotenv()
         resolved = os.path.expanduser(
-            os.environ.get("DESIGN_PATTERN_CONFIG_PATH") or config_path or cls.DEFAULT_CONFIG_PATH
+            os.environ.get("CONFIG_PATH") or config_path or cls.DEFAULT_CONFIG_PATH
         )
         try:
             with open(resolved, encoding="utf-8") as fh:

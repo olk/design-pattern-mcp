@@ -30,7 +30,7 @@ def _package_version() -> str:
 @click.option(
     "--config-path",
     default=None,
-    help="Path to the config file (default: config/config.json; env DESIGN_PATTERN_CONFIG_PATH)",
+    help="Path to the config file (default: config/config.json; env CONFIG_PATH)",
 )
 @click.option(
     "--transport",

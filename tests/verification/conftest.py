@@ -43,14 +43,14 @@ async def jobs_store(tmp_path, monkeypatch):
     never bleed state between tests.
     """
     db = tmp_path / "jobs.db"
-    monkeypatch.setenv("DESIGN_PATTERN_JOBS_DB", str(db))
+    monkeypatch.setenv("JOBS_DB", str(db))
     await JobsStore.reset_for_test()
     yield await JobsStore.get_instance()
     await JobsStore.reset_for_test()
-    monkeypatch.delenv("DESIGN_PATTERN_JOBS_DB", raising=False)
+    monkeypatch.delenv("JOBS_DB", raising=False)
 
 
 @pytest.fixture
 def jobs_db_path() -> str:
     """Absolute path of the current test's jobs DB file (E4 persistence checks)."""
-    return os.environ["DESIGN_PATTERN_JOBS_DB"]
+    return os.environ["JOBS_DB"]

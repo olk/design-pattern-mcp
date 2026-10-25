@@ -346,7 +346,7 @@ class DesignPatternServer:
         """Build the ReasoningClient from config (None when disabled).
 
         Thoughts are authored with the generator's own LLM (the same
-        LiteLLM instance behind DESIGN_PATTERN_GENERATOR_*); there is no
+        LiteLLM instance behind GENERATOR_*); there is no
         separate reasoning model.
         """
         reasoning_config: ReasoningConfig = self._config.reasoning
@@ -573,7 +573,7 @@ async def server_main(
     offline: bool = False,
 ) -> None:
     """Entry point: resolve config, construct the server, run it; exit(1) on startup failure."""
-    resolved_config = os.environ.get("DESIGN_PATTERN_CONFIG_PATH") or config_path or ConfigManager.DEFAULT_CONFIG_PATH
+    resolved_config = os.environ.get("CONFIG_PATH") or config_path or ConfigManager.DEFAULT_CONFIG_PATH
     resolved_config = os.path.abspath(os.path.expanduser(resolved_config))
 
     try:

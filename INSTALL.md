@@ -248,14 +248,13 @@ docker compose -p dpml-systemd -f /etc/design-pattern-mcp/docker-compose.yml log
 **On by default**: `dense_cache.mode=auto` with `write=true` (Pydantic defaults,
 `config/config.json`, and both compose stacks) — the serving path always passes the
 cache, so neither deployment path has to enable anything (host `uv run` needs the
-`DESIGN_PATTERN_DENSE_CACHE_PATH` export shown in the README's Local Development block,
+`DENSE_CACHE_PATH` export shown in the README's Local Development block,
 because the image default does not exist on a workstation). Off switches:
-`DENSE_CACHE_MODE=off` in a stack's env, `DESIGN_PATTERN_DENSE_CACHE_MODE=off` on a host
-run, `mode: off` in a config file.
+`DENSE_CACHE_MODE=off` (compose stack or host run), `mode: off` in a config file.
 
 The dense retrieval leg embeds one `document_text` per catalog record (486) at startup
 (~19 min on the CPU TEI sidecar). That matrix is snapshotted to
-`DESIGN_PATTERN_DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image) as
+`DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image) as
 `manifest.json` + `vectors.npy` and reloaded on the next start, so a restart costs one
 probe embedding instead of a full corpus pass.
 
@@ -273,9 +272,8 @@ probe embedding instead of a full corpus pass.
   `design-pattern-mcp-dev-dense-cache`, or `docker compose down -v`) — otherwise the
   fingerprint guards force one re-embed (~19 min) and rewrite the volume. For a
   genuinely cold cache use a cache-less image (`make docker-build-nocache`) or switch
-  the cache off: `DENSE_CACHE_MODE=off` in the stack's env (the compose interpolation
-  overwrites `DESIGN_PATTERN_DENSE_CACHE_MODE`, so the long name only works on host
-  runs / bare `docker run`). A bare `docker run` gets no volume; pass
+  the cache off: `DENSE_CACHE_MODE=off` in the stack's env (compose forwards the host
+  value; a host run reads the same name). A bare `docker run` gets no volume; pass
   `-v <your-cache-volume>:/app/data/dense-cache` to keep the cache — a new volume name
   is a separate, cold cache (one re-embed), the two stack volumes are the shared ones.
 - **Invalidated automatically** by a changed embedding function (model string, text
@@ -314,15 +312,15 @@ probe embedding instead of a full corpus pass.
 ## Switching the generator LLM
 
 Both compose files hardcode the MiniMax generator env block. To use another
-LiteLLM provider, edit the four `DESIGN_PATTERN_GENERATOR_*` lines in the
+LiteLLM provider, edit the four `GENERATOR_*` lines in the
 installed compose file — Path A: `docker/docker-compose.yml`; Path B:
 `/etc/design-pattern-mcp/docker-compose.yml` — e.g. for OpenAI:
 
 ```yaml
-      - DESIGN_PATTERN_GENERATOR_PROVIDER=openai
-      - DESIGN_PATTERN_GENERATOR_MODEL=openai/gpt-4o-mini      # LiteLLM syntax: provider/model
-      - DESIGN_PATTERN_GENERATOR_BASE_URL=https://api.openai.com/v1
-      - DESIGN_PATTERN_GENERATOR_API_KEY=${OPENAI_API_KEY}
+      - GENERATOR_PROVIDER=openai
+      - GENERATOR_MODEL=openai/gpt-4o-mini      # LiteLLM syntax: provider/model
+      - GENERATOR_BASE_URL=https://api.openai.com/v1
+      - GENERATOR_API_KEY=${OPENAI_API_KEY}
 ```
 
 then put `OPENAI_API_KEY=sk-...` in the env file (`docker/.env` resp.
@@ -340,12 +338,12 @@ B: `sudo systemctl restart design-pattern-mcp`). Full provider list:
 | MCP container unhealthy; logs show TEI connection errors | TEI still cold-starting (start_period 120 s) — recheck health after ~2 min; if persistent, verify B0 (Path B) or the dev sidecars (Path A). |
 | MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build-all` (bakes the cache). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
 | Dense cache seems missing on the host although the log shows a cache hit | Expected — the logged path is the *in-container* view of the named volume. Inspect `docker exec <container> ls -l /app/data/dense-cache`, or `docker volume inspect --format '{{.Mountpoint}}' design-pattern-mcp-dev-dense-cache` (resp. `-systemd-`); verify the mount with `docker inspect -f '{{json .Mounts}}' <container>`. |
-| Log shows `Dense cache write failed` but startup continues | By design (best-effort write-back): the cache directory is read-only/root-owned or full. Fix ownership or point `DESIGN_PATTERN_DENSE_CACHE_PATH` at a writable directory; the run keeps the vectors it just embedded. |
-| Container healthy but design tool calls fail with 401/502, or every LLM call returns `ERR_009` | Generator API key wrong/missing in the env file, or provider env block mismatched — see generator section. |
+| Log shows `Dense cache write failed` but startup continues | By design (best-effort write-back): the cache directory is read-only/root-owned or full. Fix ownership or point `DENSE_CACHE_PATH` at a writable directory; the run keeps the vectors it just embedded. |
+| Container healthy but design tool calls fail with 401/502, or every LLM call returns `ERR_009` | Generator API key wrong/missing in the env file, or provider env block mismatched — see generator section. An env file written for an older release still uses the removed `DESIGN_PATTERN_` prefix (`DESIGN_PATTERN_GENERATOR_API_KEY`, `DESIGN_PATTERN_DENSE_CACHE_MODE`, …): strip it from every key, and reinstall `config/config.json` in the same step — its `{env:...}` placeholders carry the variable names. |
 | Tool calls rejected for ~60 s after 3 transport failures | Circuit breaker open (`..._CIRCUIT_BREAKER_*` knobs); check the provider key/endpoint, then wait out the cooldown. |
 | Unit fails reading environment file | `/etc/design-pattern-mcp/.env` missing or unreadable: recreate per B2 (`root:docker 640`, user in `docker` group). |
 | `start request repeated too quickly` | Earlier start failed; inspect `journalctl -u design-pattern-mcp -n 50`, fix, then `systemctl reset-failed design-pattern-mcp` and start again. |
-| Reranker HTTP 429 "Model is overloaded" | One full-text rerank request already saturates the CPU sidecar's token buffer — keep `DESIGN_PATTERN_RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default). |
+| Reranker HTTP 429 "Model is overloaded" | One full-text rerank request already saturates the CPU sidecar's token buffer — keep `RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default). |
 | Image pull fails for `${VERSION}`/`${TEI_VERSION}` | Tag not published; check tags endpoints (A1 comment) and use `latest`. |
 
 ## Uninstall

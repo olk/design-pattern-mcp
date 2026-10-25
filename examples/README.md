@@ -44,12 +44,12 @@ Edit these constants at the top of `examples/design_pattern_client.py`
 (the async client has the same knobs):
 
 ```python
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
+SERVER_URL = os.environ.get("CLIENT_URL", "http://localhost:8822/mcp")
 DESCRIPTION = "..."     # your own system description
 LANGUAGE = "python"     # generic|c|cplusplus|csharp|go|java|javascript|kotlin|python|ruby|rust|scala|swift|typescript
 ```
 
-The async poll cadence: `DESIGN_PATTERN_CLIENT_POLL_SECONDS` (default 15).
+The async poll cadence: `CLIENT_POLL_SECONDS` (default 15).
 Ctrl+C during the poll wait cancels the job server-side before exiting.
 
 ## Server configuration

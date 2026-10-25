@@ -47,7 +47,7 @@ async def run_with_deadline[T](
             ERROR_DEADLINE_EXCEEDED,
             f"{operation} exceeded the {deadline_seconds:g}s execution deadline",
             hint=(
-                "raise DESIGN_PATTERN_TASKS_DEADLINE_SECONDS for legitimately longer runs; "
+                "raise TASKS_DEADLINE_SECONDS for legitimately longer runs; "
                 "a healthy run finishes well inside the default budget"
             ),
             extra={"operation": operation, "deadline_seconds": deadline_seconds},
