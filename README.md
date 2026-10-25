@@ -648,7 +648,7 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 ### Pattern JSON files not loading
 
 - Records are joined from 14 files per pattern (`pattern/<name>.generic.json` + 13 `<language>.json`); the generic file is required
-- Validate a record against `docs/pattern-schema.json` (`scripts/validate_patterns.py`)
+- Validate the catalog with `./scripts/verify-patterns.sh` (both schemas plus the ajv-inexpressible variant checks; map agreement/orphans are enforced by the startup gate)
 - Startup fails on enum drift from the schema (`assert_enums_in_sync`) — that is intentional; fix the data, not the guard
 
 ---

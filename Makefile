@@ -210,9 +210,9 @@ verify-ledger: ## L8: property-ID ledger consistency (verify/fizz/README.md <-> 
 verify-cross-consistency: ## L8: NL-Doc/docstring consistency over the decision modules (advisory)
 	@$(UV) run python scripts/cross_consistency.py
 
-# Pattern files validate with the uv-managed jsonschema checker (no npm needed).
-verify-patterns: ## Verify pattern/*.json against docs/pattern-schema.json
-	@$(UV) run python scripts/validate_patterns.py
+# ajv-cli is an npm toolchain (not uv-managed): needs `npm install -g ajv-cli`.
+verify-patterns: ## Verify pattern/*.json against docs/pattern-schema.json + language schema via ajv-cli
+	bash scripts/verify-patterns.sh
 
 # Nightly aggregator over the formal/audit verify-* targets.
 verify-all: ## Run every verify-* target (nightly entry point)

@@ -605,7 +605,7 @@ def _raise_if_problems(problems: list[str]) -> None:
         raise DesignPatternError(
             ERROR_CATALOG_INVALID,
             f"{len(problems)} catalog integrity violation(s): " + "; ".join(problems[:10]),
-            hint="run `python3 -B scripts/validate_patterns.py` for the full report",
+            hint="run `scripts/verify-patterns.sh` for schema + variant diagnostics",
         )
 
 
