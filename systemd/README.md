@@ -51,7 +51,6 @@ sudo $EDITOR /etc/design-pattern-mcp/.env
 # File contents:
 #   DESIGN_PATTERN_GENERATOR_API_KEY=sk-...
 #   COMPOSE_PROJECT_NAME=dpml-systemd
-#   MCP_HOST_PORT=8062
 
 # 5. Install the unit file.
 sudo install -m 644 systemd/design-pattern-mcp.service \
@@ -67,7 +66,10 @@ sudo systemctl enable --now design-pattern-mcp.service
 ```bash
 systemctl status design-pattern-mcp
 journalctl -u design-pattern-mcp -n 50
-curl -fsS http://localhost:8062/health
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8812/mcp" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0.0.0"}},"id":1}'   # 200
 ```
 
 ## Updating

@@ -111,4 +111,4 @@ def test_docstrings_state_the_generator_requirement(client: ModuleType) -> None:
 
 def test_default_url_is_unchanged(client: ModuleType) -> None:
     """The Makefile targets and the documented default port stay as shipped."""
-    assert client.SERVER_URL == "http://localhost:8062/mcp"
+    assert client.SERVER_URL == "http://localhost:8822/mcp"

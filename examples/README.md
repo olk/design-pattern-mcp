@@ -12,7 +12,7 @@ background job trio (`submit_design_job` + `get_design_status` +
 
 ```bash
 make docker-up
-# Server reachable on http://localhost:8060/mcp
+# Server reachable on http://localhost:8822/mcp
 ```
 
 (or a local server: `python -m src.main` → http://0.0.0.0:8050/mcp)
@@ -44,7 +44,7 @@ Edit these constants at the top of `examples/design_pattern_client.py`
 (the async client has the same knobs):
 
 ```python
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8060/mcp")
+SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
 DESCRIPTION = "..."     # your own system description
 LANGUAGE = "python"     # generic|c|cplusplus|csharp|go|java|javascript|kotlin|python|ruby|rust|scala|swift|typescript
 ```

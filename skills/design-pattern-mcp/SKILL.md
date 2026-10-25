@@ -13,7 +13,7 @@ Design-pattern selection pipeline exposed by the `design-pattern-mcp` MCP server
 
 OMP applies one MCP request deadline, resolved as: `OMP_MCP_TIMEOUT_MS` env → `~/.omp/agent/mcp.json` `timeout` field (ms) → **30 000 ms default**.
 
-`design-pattern-mcp` has no `timeout` entry in `~/.omp/agent/mcp.json`, so the 30 s deadline applies. Measured against `http://localhost:8062/mcp`:
+`design-pattern-mcp` has no `timeout` entry in `~/.omp/agent/mcp.json`, so the 30 s deadline applies. Measured against `http://localhost:8822/mcp`:
 
 | Call | Latency |
 |------|---------|

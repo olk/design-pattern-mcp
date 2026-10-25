@@ -56,7 +56,7 @@ make client           # blocking select_design_patterns call
 make client-async     # same run via the background job trio
 ```
 
-Server starts on **streamable-http** at `http://localhost:8062/mcp` (dev compose maps host `MCP_HOST_PORT:-8062` → container `MCP_CONTAINER_PORT:-8052`). `make client` targets `http://localhost:8062/mcp`; override with `DESIGN_PATTERN_CLIENT_URL`.
+Server starts on **streamable-http** at `http://localhost:8822/mcp` (dev compose maps host `8822` → container `8050`). `make client` targets `http://localhost:8822/mcp`; override with `DESIGN_PATTERN_CLIENT_URL`.
 
 ---
 
@@ -65,16 +65,16 @@ Server starts on **streamable-http** at `http://localhost:8062/mcp` (dev compose
 To have an AI coding agent install the Docker stack from prebuilt images (no local build), point it at **[INSTALL.md](INSTALL.md)** — the non-interactive agent runbook (copy-paste commands, expected outputs, verification probes).
 
 ```text
-Clone this repo, then follow INSTALL.md Path A (compose stack, port 8062).
+Clone this repo, then follow INSTALL.md Path A (compose stack, port 8822).
 My generator API key is: sk-...
 ```
 
 Pick one path in `INSTALL.md`:
 
-- **Path A — Compose stack** (`:8062`): evaluating / developing, no sudo needed. Own TEI sidecar copies.
-- **Path B — systemd stack** (`:8062`): persistent host service, starts at boot, needs `sudo`. Uses the shared `pattern-tei-infra` TEI stack.
+- **Path A — Compose stack** (`:8822`): evaluating / developing, no sudo needed. Own TEI sidecar copies.
+- **Path B — systemd stack** (`:8812`): persistent host service, starts at boot, needs `sudo`. Uses the shared `pattern-tei-infra` TEI stack.
 
-The agent needs a repo clone, Docker ≥ v2.20 with group membership, ~8 GB free, a `MINIMAXAI_API_KEY` (or another provider per `INSTALL.md#switching-the-generator-llm`), and linux/amd64 (on arm64 it builds locally via `make docker-build-all`). Both paths default to host port 8062 — set `MCP_HOST_PORT` in one env file to run both at once. After install, continue with [Connect Your Agent](#-connect-your-agent) below.
+The agent needs a repo clone, Docker ≥ v2.20 with group membership, ~8 GB free, a `MINIMAXAI_API_KEY` (or another provider per `INSTALL.md#switching-the-generator-llm`), and linux/amd64 (on arm64 it builds locally via `make docker-build-all`). Dev and systemd stacks run concurrently on their default host ports (8822 vs 8812). After install, continue with [Connect Your Agent](#-connect-your-agent) below.
 
 ---
 
@@ -116,7 +116,7 @@ uv run design-pattern-mcp --transport streamable-http --port 8050
   "mcp": {
     "design-patterns": {
       "type": "remote",
-      "url": "http://localhost:8062/mcp"
+      "url": "http://localhost:8822/mcp"
     }
   }
 }
@@ -238,7 +238,7 @@ In Python (via the MCP client API — see `examples/design_pattern_client_async.
 import asyncio
 from fastmcp import Client
 
-SERVER = "http://localhost:8062/mcp"
+SERVER = "http://localhost:8822/mcp"
 POLL_EVERY = 15  # seconds
 
 async def main():
@@ -362,7 +362,7 @@ Recommended order — macro first, micro second:
 
 Concrete handoff on the IoT example: the sibling emits the `pipe-and-filter` architecture (Kafka source → JSON parser filter → geolocation enricher → InfluxDB/S3 sinks, with at-least-once delivery and backpressure in the contracts). The geolocation enricher's cache-miss path then comes here via `select_design_patterns` ("cache-aside enrichment with Redis fallback, Python") — e.g. a `circuit-breaker` + `retry` design with participants, `implementation_steps`, and a Python `code_sketch` — which the architecture-level component contract references but never implements.
 
-Run both servers side by side (dev host ports `:8060` architecture, `:8062` design-pattern; systemd `:8050` / `:8062`). They are independent — either order works for exploration — but architecture-first keeps component boundaries stable while this server fills in the internals.
+Run both servers side by side (dev host ports `:8060` architecture, `:8822` design-pattern; systemd `:8050` / `:8812`). They are independent — either order works for exploration — but architecture-first keeps component boundaries stable while this server fills in the internals.
 
 ## Install Alternatives
 
@@ -502,7 +502,7 @@ Provider list and syntax: [LiteLLM Providers documentation](https://docs.litellm
 | `DESIGN_PATTERN_PATTERN_DIRECTORY` | `pattern/` | Pattern files directory |
 | `DESIGN_PATTERN_LOGGING_LEVEL` | `INFO` | `DEBUG` captures every reasoning thought + per-step tool response |
 | `DESIGN_PATTERN_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
-| `DESIGN_PATTERN_PORT` | `8050` | HTTP bind port (dev compose maps host `8062` → container) |
+| `DESIGN_PATTERN_PORT` | `8050` | HTTP bind port (container `8050`; dev host `8822`, systemd host `8812`) |
 | `DESIGN_PATTERN_CONFIG_PATH` | `config/config.json` | Config file path |
 
 ### CLI flags
@@ -674,7 +674,7 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 | `make embed-cache` | Force-regenerate `data/dense-cache/` |
 | `make docker-build-all` | Build all three images (dense cache baked in) |
 | `make docker-up` / `make docker-down` | Start / stop the dev stack |
-| `make client` / `make client-async` | Demo clients against `http://localhost:8062/mcp` |
+| `make client` / `make client-async` | Demo clients against `http://localhost:8822/mcp` |
 | `make docker-publish` | Push the server image to Docker Hub + GHCR (+ git tag) |
 
 **Development workflow:**
@@ -754,7 +754,7 @@ The server can run as a systemd service on any systemd-based Linux host. It star
 | File | Purpose |
 |---|---|
 | `systemd/design-pattern-mcp.service` | The systemd unit |
-| `systemd/docker-compose.yml` | Production compose variant (no `build:`, absolute paths, container port 8062) |
+| `systemd/docker-compose.yml` | Production compose variant (no `build:`, absolute paths, container port 8050) |
 | `systemd/README.md` | Full runbook: install, verify, troubleshooting |
 
 The production compose is the deployment variant of the dev file: pre-built images only, absolute paths, deployable to `/etc/design-pattern-mcp/`. The TEI sidecars live in the shared [pattern-tei-infra](https://github.com/olk/pattern-tei-infra) stack; this stack joins its Docker network and reaches them by DNS name. Start the service only after the shared TEI infra is `active (running)`.

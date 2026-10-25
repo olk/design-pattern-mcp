@@ -40,11 +40,11 @@ Usage:
     $ make client
 
 Or pipe the JSON output:
-    $ DESIGN_PATTERN_CLIENT_URL=http://localhost:8062/mcp \
+    $ DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp \
         uv run python examples/design_pattern_client.py 2>/dev/null | jq '.applications[0]'
 
 Requires:
-    - MCP server running on http://localhost:8062/mcp (default; raw server: 8050)
+    - MCP server running on http://localhost:8822/mcp (default; raw server: 8050)
     - No LLM credentials are needed for deterministic retrieval, but a complete
       select_design_patterns result does require a functioning generator: the
       E12 path reports the provider failure instead of fabricating a full design.
@@ -61,7 +61,7 @@ from typing import Any
 from fastmcp import Client  # type: ignore[attr-defined]
 from fastmcp.exceptions import ClientError, McpError, ToolError
 
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8062/mcp")
+SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
 
 DESCRIPTION = """
 Implement an event-driven IoT ingestion service in Python. The API gateway
@@ -113,7 +113,7 @@ def print_startup_hint() -> None:
     """Print the server-startup guidance — only for transport/protocol failures."""
     print(
         f"\nIs the MCP server running?\n"
-        f"  Start it with:  make docker-up   (dev stack, port 8062)\n"
+        f"  Start it with:  make docker-up   (dev stack, port 8822)\n"
         f"                  python -m src.main   (local, port 8050)\n"
         f"  Expected URL:   {SERVER_URL}",
         file=sys.stderr,

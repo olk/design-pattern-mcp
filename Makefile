@@ -228,10 +228,10 @@ health: ## Run the offline readiness check (prints OK)
 	@$(UV) run python -m src --health
 
 client: ## Run the MCP client demo (blocking select_design_patterns)
-	@DESIGN_PATTERN_CLIENT_URL=http://localhost:8062/mcp $(UV) run python examples/design_pattern_client.py
+	@DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client.py
 
 client-async: ## Run the async job trio demo (submit_design_job + get_design_status)
-	@DESIGN_PATTERN_CLIENT_URL=http://localhost:8062/mcp $(UV) run python examples/design_pattern_client_async.py
+	@DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client_async.py
 
 ##@ Docker
 # The dense cache is a BUILD INPUT of the server image (Dockerfile COPYs

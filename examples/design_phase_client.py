@@ -36,11 +36,11 @@ Usage:
     $ make docker-up
 
     # Terminal 2: run the client
-    $ DESIGN_PATTERN_CLIENT_URL=http://localhost:8062/mcp \
+    $ DESIGN_PATTERN_CLIENT_URL=http://localhost:8822/mcp \
         uv run python examples/design_phase_client.py
 
 Requires:
-    - MCP server running on http://localhost:8062/mcp (default)
+    - MCP server running on http://localhost:8822/mcp (default)
     - No LLM credentials needed: with an unset generator key the pipeline
       answers from the deterministic retrieval fallbacks.
 """
@@ -55,7 +55,7 @@ from typing import Any
 
 from fastmcp import Client  # type: ignore[attr-defined]
 
-SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8062/mcp")
+SERVER_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
 
 DESCRIPTION = """
 Implement an event-driven IoT ingestion service in TypeScript. The API gateway

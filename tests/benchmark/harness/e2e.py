@@ -1,7 +1,7 @@
 """Black-box e2e runner: the running compose stack through a fastmcp client (plan §9).
 
 Mirrors ``examples/design_pattern_client.py`` (``DESIGN_PATTERN_CLIENT_URL``, default
-``http://localhost:8062/mcp``) and calls ``select_design_patterns`` once per scenario. This mode
+``http://localhost:8822/mcp``) and calls ``select_design_patterns`` once per scenario. This mode
 measures what a real deployment costs *in total* against the real stack, and nothing else:
 
 - latency: wall clock per call (no stage attribution — the seams are on the far side)
@@ -35,7 +35,7 @@ from .probes import percentile_fields, stage_table
 from .runner import render_report
 
 #: MCP server URL of the compose stack (same default as the demo client).
-DEFAULT_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8062/mcp")
+DEFAULT_URL = os.environ.get("DESIGN_PATTERN_CLIENT_URL", "http://localhost:8822/mcp")
 
 #: The tool under test (wire name).
 TOOL_NAME = "select_design_patterns"
@@ -118,9 +118,7 @@ async def _call_tool_once(client: Client, scenario: cfg.Scenario) -> dict[str, A
         return {"payload": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
-async def _run_scenario(
-    client: Client, scenario: cfg.Scenario, *, repeat: int, warmup: bool
-) -> dict[str, Any]:
+async def _run_scenario(client: Client, scenario: cfg.Scenario, *, repeat: int, warmup: bool) -> dict[str, Any]:
     """Time one scenario call and build its record."""
     started_ns = time.perf_counter_ns()
     outcome = await _call_tool_once(client, scenario)
@@ -180,14 +178,36 @@ async def run_e2e(options: E2EOptions) -> dict[str, Any]:
         ),
         f"{len(errors)} of {len(records)} calls failed",
     ]
-    summary = _summary(records, options=options, paths=paths, run_id=run_id, started_at=started_at, notes=notes,
-                       warmup_record=warmup_record, catalog=catalog)
-    manifest = _manifest(options=options, config=config, catalog=catalog, records=records, run_id=run_id,
-                         started_at=started_at, notes=notes, warmup_record=warmup_record)
+    summary = _summary(
+        records,
+        options=options,
+        paths=paths,
+        run_id=run_id,
+        started_at=started_at,
+        notes=notes,
+        warmup_record=warmup_record,
+        catalog=catalog,
+    )
+    manifest = _manifest(
+        options=options,
+        config=config,
+        catalog=catalog,
+        records=records,
+        run_id=run_id,
+        started_at=started_at,
+        notes=notes,
+        warmup_record=warmup_record,
+    )
     cfg.write_json(paths.manifest, manifest)
     cfg.write_json(paths.summary, summary)
     paths.report.write_text(render_report(summary, manifest), encoding="utf-8")
-    return {"run_id": run_id, "run_dir": str(paths.root), "records": len(records), "summary": summary, "manifest": manifest}
+    return {
+        "run_id": run_id,
+        "run_dir": str(paths.root),
+        "records": len(records),
+        "summary": summary,
+        "manifest": manifest,
+    }
 
 
 def _summary(
@@ -335,8 +355,9 @@ def _manifest(
 
 def build_parser() -> argparse.ArgumentParser:
     """CLI of the black-box runner."""
-    parser = argparse.ArgumentParser(prog="tests.benchmark.harness.e2e",
-                                     description="Run the black-box e2e arm against a running MCP server.")
+    parser = argparse.ArgumentParser(
+        prog="tests.benchmark.harness.e2e", description="Run the black-box e2e arm against a running MCP server."
+    )
     parser.add_argument("--url", default=DEFAULT_URL, help=f"MCP endpoint (default: {DEFAULT_URL})")
     parser.add_argument("--scenarios", type=Path, default=cfg.DEFAULT_SCENARIOS)
     parser.add_argument("--split", choices=(*cfg.SPLITS, "all"), default="all")
@@ -345,9 +366,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--call-timeout-seconds", type=float, default=None,
-                        help="per-request timeout in seconds (default: no client-side timeout; "
-                             "live requests take 300-800 s on the CPU tier)")
+    parser.add_argument(
+        "--call-timeout-seconds",
+        type=float,
+        default=None,
+        help="per-request timeout in seconds (default: no client-side timeout; "
+        "live requests take 300-800 s on the CPU tier)",
+    )
     parser.add_argument("--log-level", default="warning")
     return parser
 
