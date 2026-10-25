@@ -89,6 +89,16 @@ COPY --from=build --chown=1000:1000 /app/docs ./docs
 COPY --from=build --chown=1000:1000 /app/config ./config
 COPY --from=build --chown=1000:1000 /app/data ./data
 
+# The dense-cache directory is the mount point of both compose stacks' named
+# volume. Docker seeds a FRESH volume from this directory and copies its
+# ownership, which is what makes write-back work without a chown step — so the
+# --chown above is a runtime contract, not an image nicety. Assert it: a
+# root-owned directory would make every cache write fail (logged as
+# `Dense cache write failed`), costing a full re-embed on every restart.
+RUN test "$(stat -c '%u:%g' /app/data)" = "1000:1000" && \
+  test "$(stat -c '%u:%g' /app/data/dense-cache)" = "1000:1000" && \
+  echo "Dense-cache mount point owned by 1000:1000"
+
 # Embedded reasoning MCP packages: node binary from the same image the packages
 # were installed under (no apt nodejs version mismatch), plus the global
 # node_modules tree. Entry points are invoked by absolute path — no NODE_PATH.

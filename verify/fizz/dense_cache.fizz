@@ -1,0 +1,181 @@
+---
+# dense_cache.fizz — dense-embedding cache reuse vs rebuild (EMB-1..EMB-4).
+deadlock_detection: true
+options:
+  max_actions: 60
+  max_concurrent_actions: 2
+---
+
+# Assertions: EMB-1 (liveness), EMB-2, EMB-3, EMB-4 — ledger rows in
+# verify/fizz/README.md.
+#
+# Scope: the model abstracts dense_cache.mode = auto|off. mode=require is NOT
+# modelled — there a miss raises ERR_008 and the server refuses to start, so
+# EMB-1 ("every start ends with a dense leg") does not apply; that refusal is
+# pinned by the L1 tests tests/unit/test_dense_cache.py::test_resolve_require_*.
+#
+# Element→code map (ledger: verify/fizz/README.md):
+#   role Cache ↔ resolve_dense_vectors (src/patterns/dense_cache.py) as called
+#     from RetrievalIndex._build_dense (src/patterns/retriever.py) on every
+#     start:
+#       Observe     ↔ the guard chain evaluated against the cached manifest:
+#                     mode=off, absent/invalid manifest, fingerprint change,
+#                     corpus change, probe unreachable (modelled as the
+#                     mismatch case), vectors unusable. The observation is
+#                     nondeterministic — it is whatever the PREVIOUS run left
+#                     on disk (a cold start sees nothing).
+#       LoadHit     ↔ manifest + vectors accepted: load_vectors returns the
+#                     persisted matrix, zero corpus text-embedding calls (the
+#                     single probe embedding is the fixed cost on both paths
+#                     and is not modelled).
+#       BuildMiss   ↔ _embed_and_maybe_store: embed every document (cold path).
+#       PersistOk   ↔ _write_back: vectors.npy first, then manifest.json.
+#       PersistFail ↔ _write_back raising or returning a write reason — logged,
+#                     never propagated (best-effort write-back).
+#   Ghosts: manifest/probe (what the cache directory says), dense
+#   (index._faiss_index is populated this start), embed_calls (corpus texts
+#   embedded this start), persist_failed.
+
+role Cache:
+    action Init:
+        # NONE / OFF / HIT / MISS_ABSENT / MISS_FP / MISS_CORPUS / MISS_PROBE /
+        # MISS_VECTORS
+        self.case = "NONE"
+        self.cache_mode = "AUTO"       # ghost: configured dense_cache.mode
+        self.manifest = "NONE"         # ghost: ABSENT / STALE_FP / STALE_CORPUS / VALID
+        self.probe = "NONE"            # ghost: MATCH / MISMATCH
+        self.loaded = False
+        self.built = False
+        self.dense = False             # ghost: the FAISS index exists after this start
+        self.embed_calls = 0           # ghost: corpus texts embedded this start
+        self.persisted = False
+        self.persist_failed = False
+
+    atomic func Off():
+        # dense_cache.mode=off: the cache is neither read nor written (§2.2)
+        self.case = "OFF"
+        self.cache_mode = "OFF"
+        self.manifest = "NONE"
+        self.probe = "NONE"
+
+    atomic func Hit():
+        self.case = "HIT"
+        self.manifest = "VALID"
+        self.probe = "MATCH"
+
+    atomic func MissAbsent():
+        # no manifest yet (first start, or a pre-cache deployment)
+        self.case = "MISS_ABSENT"
+        self.manifest = "ABSENT"
+        self.probe = "MATCH"
+
+    atomic func MissFingerprint():
+        # model string, text instruction, name order or record count changed
+        self.case = "MISS_FP"
+        self.manifest = "STALE_FP"
+        self.probe = "MATCH"
+
+    atomic func MissCorpus():
+        # a document_text edit shifts corpus_sha256
+        self.case = "MISS_CORPUS"
+        self.manifest = "STALE_CORPUS"
+        self.probe = "MATCH"
+
+    atomic func MissProbe():
+        # fingerprint and corpus match, but the served model changed behind an
+        # unchanged configuration (a redeployed TEI sidecar): the probe cosine
+        # drops below dense_cache.probe_min_cosine
+        self.case = "MISS_PROBE"
+        self.manifest = "VALID"
+        self.probe = "MISMATCH"
+
+    atomic func MissVectors():
+        # manifest + probe valid, vectors.npy absent, wrong shape or off-norm
+        self.case = "MISS_VECTORS"
+        self.manifest = "VALID"
+        self.probe = "MATCH"
+
+    atomic fair action Observe:
+        # one server start: the cache state is inherited, not chosen — the
+        # nondeterministic input of the model.
+        require self.case == "NONE"
+        oneof:
+            self.Off()
+            self.Hit()
+            self.MissAbsent()
+            self.MissFingerprint()
+            self.MissCorpus()
+            self.MissProbe()
+            self.MissVectors()
+
+    atomic fair action LoadHit:
+        require self.case == "HIT"
+        require self.loaded == False and self.built == False
+        self.loaded = True
+        self.dense = True
+
+    atomic fair action BuildMiss:
+        require self.case != "NONE" and self.case != "HIT"
+        require self.loaded == False and self.built == False
+        self.built = True
+        self.dense = True
+        self.embed_calls = 1
+
+    atomic action PersistOk:
+        require self.built == True and self.cache_mode != "OFF"
+        require self.persisted == False and self.persist_failed == False
+        self.persisted = True
+
+    atomic action PersistFail:
+        # the write raises (read-only or full cache directory, probe flake
+        # during write-back): the run continues with the vectors it just
+        # embedded
+        require self.built == True and self.cache_mode != "OFF"
+        require self.persisted == False and self.persist_failed == False
+        self.persist_failed = True
+
+    action Idle:
+        require self.dense == True
+        pass
+
+action Init:
+    cache = Cache()
+
+action Idle:
+    require cache.dense == True
+    pass
+
+# ---- assertions (ledger §3.4) ----
+
+always eventually assertion EMB1_StartEndsWithDenseLeg:
+    # Every start ends with a dense leg: a hit loads the persisted vectors,
+    # every miss embeds the corpus — no path may return leaving the FAISS
+    # index unbuilt (FG-37: restricting the build to the hit path must
+    # violate — a miss start stalls with no dense leg).
+    return cache.dense == True
+
+always assertion EMB2_HitEmbedsNothing:
+    # A cache hit reuses the persisted matrix: zero corpus text-embedding
+    # calls — the entire point of the snapshot (FG-38: a load that re-embeds
+    # the corpus must violate).
+    if cache.loaded == True:
+        return cache.embed_calls == 0
+    return True
+
+always assertion EMB3_ProbeMismatchRebuilds:
+    # A probe mismatch means a different model sits behind an unchanged
+    # configuration, so its vectors are NOT reusable: the probe-mismatch
+    # observation must take the build path (FG-39: letting it load must
+    # violate — silent retrieval corruption from foreign vectors).
+    if cache.probe == "MISMATCH":
+        return cache.loaded == False
+    return True
+
+always assertion EMB4_WriteFailureKeepsVectors:
+    # Write-back is best-effort: a failed snapshot write disables the cache for
+    # the run, it never discards the freshly embedded vectors (FG-40: a persist
+    # failure that clears the dense index must violate — a read-only volume
+    # would take the server down with it).
+    if cache.persist_failed == True:
+        return cache.dense == True
+    return True

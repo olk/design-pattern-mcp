@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -77,15 +79,9 @@ def test_digests_are_byte_pinned() -> None:
     names = ["alpha", "beta", "gamma"]
     texts = [f"{name} description text for retrieval" for name in names]
     assert names_digest(names) == "f3220283d05d1ff2ae350cfe9e0e367cb5aef46e10efb203c8a53c678e2218c8"
-    assert corpus_digest(names, texts) == (
-        "7fa9fdaf2a9e246cbdd988aa12566084be2dc4da9b1f9b894de91ce486cc7163"
-    )
-    assert instruction_digest("") == (
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    )
-    assert instruction_digest("doc: ") == (
-        "31125b93db9d507557bfa5f3ba8d50a887fe4fde3142c093c5893fac54311172"
-    )
+    assert corpus_digest(names, texts) == ("7fa9fdaf2a9e246cbdd988aa12566084be2dc4da9b1f9b894de91ce486cc7163")
+    assert instruction_digest("") == ("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert instruction_digest("doc: ") == ("31125b93db9d507557bfa5f3ba8d50a887fe4fde3142c093c5893fac54311172")
 
 
 def test_names_digest_matches_joined_order() -> None:
@@ -123,10 +119,7 @@ def _seed_cache(tmp_path: Path, *, embedder: OfflineHashEmbedder) -> tuple[list[
     """Pre-populate a cache directory with one OfflineHashEmbedder-shaped run."""
     names, doc_texts = _names_doc_texts()
     vectors = asyncio.run(embedder.embed_documents(doc_texts))
-    normalized = [
-        (np.asarray(v, dtype=np.float32) / max(np.linalg.norm(v), 1e-12)).tolist()
-        for v in vectors
-    ]
+    normalized = [(np.asarray(v, dtype=np.float32) / max(np.linalg.norm(v), 1e-12)).tolist() for v in vectors]
     probe = asyncio.run(embedder.embed_documents([PROBE_TEXT]))[0]
     manifest = build_manifest(
         names=names,
@@ -349,9 +342,7 @@ def test_resolve_misses_on_corpus_text_change(tmp_path: Path) -> None:
     assert manifest.corpus_sha256 == corpus_digest(names, mutated)
 
 
-def test_resolve_reports_the_record_count_reason_first(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_resolve_reports_the_record_count_reason_first(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """A *shrunk* catalog must report the record-count reason, not fall through to
     the name digest: ``!=`` and ``<`` disagree only when the cached count is the
     larger one, so this direction is the one that pins the check's operator."""
@@ -419,9 +410,7 @@ def test_resolve_misses_on_negated_probe_vector(tmp_path: Path, caplog: pytest.L
         )
     assert status == "embedded"
     miss_reasons = [
-        record.__dict__.get("reason", "")
-        for record in caplog.records
-        if record.name == "src.patterns.dense_cache"
+        record.__dict__.get("reason", "") for record in caplog.records if record.name == "src.patterns.dense_cache"
     ]
     assert any(reason.startswith("cache-miss:probe-cosine-") for reason in miss_reasons)
 
@@ -446,9 +435,7 @@ def test_resolve_accepts_probe_at_exactly_the_threshold(tmp_path: Path) -> None:
     embedder = OfflineHashEmbedder()
     probe = asyncio.run(embedder.embed_documents([manifest.probe_text]))[0]
     exact = probe_cosine(probe, manifest.probe_vector)
-    exact_config = DenseCacheConfig(
-        path=str(tmp_path), mode="require", write=False, probe_min_cosine=exact
-    )
+    exact_config = DenseCacheConfig(path=str(tmp_path), mode="require", write=False, probe_min_cosine=exact)
     _, status = asyncio.run(
         resolve_dense_vectors(
             config=exact_config,
@@ -503,7 +490,9 @@ def test_resolve_uses_declared_identity_when_provided(tmp_path: Path) -> None:
             embedder=OfflineHashEmbedder(),
             names=names,
             doc_texts=doc_texts,
-            identity=_identity(model="openai/test", model_repo="onnx-community/Qwen3-Embedding-0.6B-ONNX", onnx_variant="fp32"),
+            identity=_identity(
+                model="openai/test", model_repo="onnx-community/Qwen3-Embedding-0.6B-ONNX", onnx_variant="fp32"
+            ),
         )
     )
     manifest, _ = load_manifest(tmp_path)
@@ -537,13 +526,154 @@ def test_resolve_rejects_model_repo_mismatch(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# main() entry point — argument parsing, success + failure paths
+# log contract: every cache decision names the directory it read or wrote
 # --------------------------------------------------------------------------------------
 
 
-def test_main_build_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _dense_cache_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.name == "src.patterns.dense_cache"]
+
+
+def test_hit_and_write_lines_name_the_cache_directory(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Cold start logs the written snapshot, warm start the hit — both with the path."""
+    config = DenseCacheConfig(path=str(tmp_path), mode="auto", write=True)
+    names, doc_texts = _names_doc_texts()
+
+    with caplog.at_level("INFO", logger="src.patterns.dense_cache"):
+        asyncio.run(
+            resolve_dense_vectors(
+                config=config,
+                embedder=OfflineHashEmbedder(),
+                names=names,
+                doc_texts=doc_texts,
+                identity=_identity(),
+            )
+        )
+        warm_vectors, warm_status = asyncio.run(
+            resolve_dense_vectors(
+                config=config,
+                embedder=OfflineHashEmbedder(),
+                names=names,
+                doc_texts=doc_texts,
+                identity=_identity(),
+            )
+        )
+
+    assert warm_status == "cache-hit"
+    assert len(warm_vectors) == len(names)
+    written = [record for record in _dense_cache_logs(caplog) if record.getMessage() == "Dense cache written"]
+    hit = [record for record in _dense_cache_logs(caplog) if record.getMessage() == "Dense cache hit"]
+    assert written, "a successful write-back must be visible in the log"
+    assert written[0].path == str(tmp_path)  # type: ignore[attr-defined]
+    assert written[0].records == len(names)  # type: ignore[attr-defined]
+    assert hit, "a cache hit must be visible in the log"
+    assert hit[0].path == str(tmp_path)  # type: ignore[attr-defined]
+    assert hit[0].records == len(names)  # type: ignore[attr-defined]
+
+
+def test_miss_and_disabled_lines_name_the_cache_directory(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A miss and a disabled cache both report the path an operator would inspect."""
+    names, doc_texts = _names_doc_texts()
+    miss_dir = tmp_path / "miss"
+    off_dir = tmp_path / "off"
+
+    with caplog.at_level("INFO", logger="src.patterns.dense_cache"):
+        asyncio.run(
+            resolve_dense_vectors(
+                config=DenseCacheConfig(path=str(miss_dir), mode="auto", write=False),
+                embedder=OfflineHashEmbedder(),
+                names=names,
+                doc_texts=doc_texts,
+                identity=_identity(),
+            )
+        )
+        asyncio.run(
+            resolve_dense_vectors(
+                config=DenseCacheConfig(path=str(off_dir), mode="off"),
+                embedder=OfflineHashEmbedder(),
+                names=names,
+                doc_texts=doc_texts,
+                identity=_identity(),
+            )
+        )
+
+    miss = [record for record in _dense_cache_logs(caplog) if record.getMessage() == "Dense cache miss"]
+    disabled = [record for record in _dense_cache_logs(caplog) if record.getMessage() == "Dense cache disabled"]
+    assert miss and miss[0].path == str(miss_dir)  # type: ignore[attr-defined]
+    assert disabled and disabled[0].path == str(off_dir)  # type: ignore[attr-defined]
+    assert disabled[0].mode == "off"  # type: ignore[attr-defined]
+    assert not off_dir.exists(), "mode=off must never touch the cache directory"
+
+
+# --------------------------------------------------------------------------------------
+# write-back is best-effort: a cache failure never costs this start its vectors
+# --------------------------------------------------------------------------------------
+
+
+class _ProbeFailingEmbedder(OfflineHashEmbedder):
+    """Offline embedder whose probe call fails (a TEI flake during write-back)."""
+
+    async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        if list(texts) == [PROBE_TEXT]:
+            raise OSError("probe endpoint dropped")
+        return await super().embed_documents(texts)
+
+
+def test_resolve_store_exception_keeps_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """An exception escaping ``store_cache`` never propagates: the vectors are already built."""
+    config = DenseCacheConfig(path=str(tmp_path), mode="auto", write=True)
+    names, doc_texts = _names_doc_texts()
+    expected = asyncio.run(OfflineHashEmbedder().embed_documents(doc_texts))
+
+    def exploding_store(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("numpy blew up")
+
+    monkeypatch.setattr("src.patterns.dense_cache.store_cache", exploding_store)
+    with caplog.at_level("WARNING", logger="src.patterns.dense_cache"):
+        vectors, status = asyncio.run(
+            resolve_dense_vectors(
+                config=config,
+                embedder=OfflineHashEmbedder(),
+                names=names,
+                doc_texts=doc_texts,
+                identity=_identity(),
+            )
+        )
+
+    assert status == "embedded"
+    assert vectors == expected
+    assert not (tmp_path / MANIFEST_NAME).exists()
+    assert "Dense cache write failed" in caplog.text
+
+
+def test_resolve_probe_failure_during_write_back_keeps_vectors(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing probe embed (write-back only) still returns the freshly embedded corpus."""
+    config = DenseCacheConfig(path=str(tmp_path), mode="auto", write=True)
+    names, doc_texts = _names_doc_texts()
+    expected = asyncio.run(OfflineHashEmbedder().embed_documents(doc_texts))
+
+    with caplog.at_level("WARNING", logger="src.patterns.dense_cache"):
+        vectors, status = asyncio.run(
+            resolve_dense_vectors(
+                config=config,
+                embedder=_ProbeFailingEmbedder(),
+                names=names,
+                doc_texts=doc_texts,
+                identity=_identity(),
+            )
+        )
+
+    assert status == "embedded"
+    assert vectors == expected
+    assert not (tmp_path / MANIFEST_NAME).exists()
+    assert "Dense cache write failed" in caplog.text
+
+
+def test_main_build_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``main(['build'])`` writes a manifest + vectors when given a stub config.
 
     The build path uses ``build_embedder`` to construct the embedder; we swap it

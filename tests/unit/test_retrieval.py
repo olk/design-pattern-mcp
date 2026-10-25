@@ -18,9 +18,17 @@ import httpx
 import pytest
 
 from src.patterns.loader import PatternLoader, JoinedPattern, LanguageEntry, SchemaEnums
-from src.config import DenseCacheConfig, EmbedderConfig, EmbedderInnerConfig, RetrievalConfig, RerankerConfig, RerankerInnerConfig
+from src.config import (
+    DenseCacheConfig,
+    EmbedderConfig,
+    EmbedderInnerConfig,
+    RetrievalConfig,
+    RerankerConfig,
+    RerankerInnerConfig,
+)
 from src.errors import ERROR_RETRIEVAL_UNAVAILABLE, DesignPatternError
 from src.patterns.embedder import EmbedderIdentity, OfflineHashEmbedder, TEIEmbedder, build_embedder
+from src.patterns.dense_cache import PROBE_TEXT
 from src.patterns.retriever import PartQuery, RetrievalIndex
 from src.patterns.safe_tei_rerank import LexicalReranker, TEIReranker, build_reranker
 
@@ -65,13 +73,9 @@ def _catalog(records: list[JoinedPattern]) -> PatternLoader:
         records={record.name: record for record in records},
         order={record.name: position for position, record in enumerate(records)},
         subgroups={},
-        alias_map={
-            alias.lower(): record.name for record in records for alias in record.aliases
-        },
+        alias_map={alias.lower(): record.name for record in records for alias in record.aliases},
         ambiguous_aliases=(),
-        enums=SchemaEnums(
-            categories=(), scopes=(), languages=(), support_levels=(), paradigms=(), provenances=()
-        ),
+        enums=SchemaEnums(categories=(), scopes=(), languages=(), support_levels=(), paradigms=(), provenances=()),
     )
 
 
@@ -133,9 +137,7 @@ def _retrieval_config(
         overrides["dense_top_k"] = dense_top_k
     if bm25_top_k is not None:
         overrides["bm25_top_k"] = bm25_top_k
-    return RetrievalConfig(
-        dense_weight=0.7, bm25_weight=0.3, rrf_k=RRF_K, min_fusion_score=0.0, **overrides
-    )
+    return RetrievalConfig(dense_weight=0.7, bm25_weight=0.3, rrf_k=RRF_K, min_fusion_score=0.0, **overrides)
 
 
 _SINGLETON_QUERY = "Share global configuration state through a single instance access point"
@@ -147,11 +149,12 @@ async def _build_multi(
     *,
     dense_cache: DenseCacheConfig | None = None,
     identity: EmbedderIdentity | None = None,
+    embedder: OfflineHashEmbedder | None = None,
 ) -> RetrievalIndex:
     """Index over the hand-made catalog with the deterministic offline implementations."""
     return await RetrievalIndex.build(
         _catalog(records if records is not None else _records()),
-        OfflineHashEmbedder(),
+        embedder if embedder is not None else OfflineHashEmbedder(),
         LexicalReranker(),
         _retrieval_config(),
         rerank_top_n,
@@ -201,9 +204,7 @@ async def test_result_length_capped_by_rerank_top_n_and_limit() -> None:
     index = await _build_multi(rerank_top_n=3)
     default_hits = await index.retrieve(statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime")
     assert len(default_hits) == 3
-    limited_hits = await index.retrieve(
-        statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime", limit=2
-    )
+    limited_hits = await index.retrieve(statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime", limit=2)
     assert len(limited_hits) == 2
     scores = [hit.retrieval_score for hit in limited_hits]
     assert scores == sorted(scores, reverse=True)
@@ -253,11 +254,13 @@ class _ExplodingReranker:
 
 
 async def test_single_candidate_pool_skips_reranker() -> None:
-    records = [_record("timeout", "Bound the waiting time of a remote call", "Remote calls may hang", "Networks", ("resilience",))]
+    records = [
+        _record(
+            "timeout", "Bound the waiting time of a remote call", "Remote calls may hang", "Networks", ("resilience",)
+        )
+    ]
     reranker = _ExplodingReranker()
-    index = await RetrievalIndex.build(
-        _catalog(records), OfflineHashEmbedder(), reranker, _retrieval_config(), 5
-    )
+    index = await RetrievalIndex.build(_catalog(records), OfflineHashEmbedder(), reranker, _retrieval_config(), 5)
     hits = await index.retrieve(statement="Remote calls may hang", constraints=(), scope="task-lifetime")
     assert len(hits) == 1
     hit = hits[0]
@@ -450,12 +453,17 @@ async def test_embed_queries_matches_n_single_queries() -> None:
 
 
 class _CountingEmbedder(OfflineHashEmbedder):
-    """Offline embedder recording how often each query path was taken."""
+    """Offline embedder recording each query path and every embedded document text."""
 
     def __init__(self) -> None:
         super().__init__()
         self.embed_query_calls = 0
         self.embed_queries_calls = 0
+        self.embedded_texts: list[str] = []
+
+    async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        self.embedded_texts.extend(texts)
+        return await super().embed_documents(texts)
 
     async def embed_query(self, text: str) -> list[float]:
         self.embed_query_calls += 1
@@ -469,9 +477,7 @@ class _CountingEmbedder(OfflineHashEmbedder):
 async def test_retrieve_many_matches_sequential_retrieve_with_one_embed_call() -> None:
     """N parts get identical hits from one batched embed round trip (§6, L1)."""
     embedder = _CountingEmbedder()
-    index = await RetrievalIndex.build(
-        _catalog(_records()), embedder, LexicalReranker(), _retrieval_config(), 3
-    )
+    index = await RetrievalIndex.build(_catalog(_records()), embedder, LexicalReranker(), _retrieval_config(), 3)
     queries = [
         PartQuery(statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime"),
         PartQuery(statement="Remote calls may hang", constraints=(), scope="task-lifetime"),
@@ -484,12 +490,8 @@ async def test_retrieve_many_matches_sequential_retrieve_with_one_embed_call() -
         await index.retrieve(statement=query.statement, constraints=query.constraints, scope=query.scope)
         for query in queries
     ]
-    assert [
-        [(hit.name, hit.fused_rank, hit.rerank_rank, hit.retrieval_score) for hit in hits]
-        for hits in batched
-    ] == [
-        [(hit.name, hit.fused_rank, hit.rerank_rank, hit.retrieval_score) for hit in hits]
-        for hits in sequential
+    assert [[(hit.name, hit.fused_rank, hit.rerank_rank, hit.retrieval_score) for hit in hits] for hits in batched] == [
+        [(hit.name, hit.fused_rank, hit.rerank_rank, hit.retrieval_score) for hit in hits] for hits in sequential
     ]
 
 
@@ -521,10 +523,7 @@ async def test_retrieve_many_bounds_concurrent_part_tails() -> None:
             3,
         )
         index._part_semaphore = asyncio.Semaphore(cap)
-        queries = [
-            PartQuery(statement=record.intent, constraints=(), scope="")
-            for record in _records()
-        ]
+        queries = [PartQuery(statement=record.intent, constraints=(), scope="") for record in _records()]
         hits = await index.retrieve_many(queries)
         assert len(hits) == len(queries)
         assert peak <= cap, f"cap {cap}: observed {peak} concurrent rerank legs"
@@ -554,11 +553,7 @@ async def test_retrieval_falls_back_to_embedded_when_no_cache_configured(
     assert index._dense_identity is None
     with caplog.at_level("INFO", logger="src.patterns.retriever"):
         await index._build_dense(tuple(index._doc_texts))
-    sources = [
-        getattr(record, "source", None)
-        for record in caplog.records
-        if record.name == "src.patterns.retriever"
-    ]
+    sources = [getattr(record, "source", None) for record in caplog.records if record.name == "src.patterns.retriever"]
     assert "embedded" in sources
 
 
@@ -582,9 +577,7 @@ async def test_retrieval_ignores_cache_when_identity_is_absent(
     assert not (tmp_path / "manifest.json").exists()
 
 
-async def test_dense_cache_hit_on_second_build(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_dense_cache_hit_on_second_build(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     config = DenseCacheConfig(path=str(tmp_path), mode="auto", write=True)
     identity = EmbedderIdentity(model="offline-hash")
 
@@ -592,36 +585,51 @@ async def test_dense_cache_hit_on_second_build(
         index_first = await _build_multi(dense_cache=config, identity=identity)
     # First build had no manifest → embedded (warm-up write-back).
     sources_first = [
-        getattr(record, "source", None)
-        for record in caplog.records
-        if record.name == "src.patterns.retriever"
+        getattr(record, "source", None) for record in caplog.records if record.name == "src.patterns.retriever"
     ]
     assert "embedded" in sources_first
 
     with caplog.at_level("INFO", logger="src.patterns.retriever"):
         index_second = await _build_multi(dense_cache=config, identity=identity)
     sources_second = [
-        getattr(record, "source", None)
-        for record in caplog.records
-        if record.name == "src.patterns.retriever"
+        getattr(record, "source", None) for record in caplog.records if record.name == "src.patterns.retriever"
     ]
     assert "cache-hit" in sources_second
 
     # Same hits for the same query, with scores within 1e-9.
-    hits_first = await index_first.retrieve(
-        statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime"
-    )
-    hits_second = await index_second.retrieve(
-        statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime"
-    )
+    hits_first = await index_first.retrieve(statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime")
+    hits_second = await index_second.retrieve(statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime")
     assert [hit.name for hit in hits_first] == [hit.name for hit in hits_second]
     for got, expected in zip(hits_first, hits_second, strict=True):
         assert abs(got.retrieval_score - expected.retrieval_score) < 1e-9
 
 
-async def test_dense_cache_misses_for_a_different_catalog(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_warm_start_embeds_only_the_probe_text(tmp_path: Path) -> None:
+    """A restart with a valid snapshot re-embeds NOTHING but the probe text.
+
+    This is the cache's entire purpose: the corpus vectors come off disk, so the
+    embedder sees exactly one text (the probe, which confirms the served model
+    still matches the snapshot) and no pattern document.
+    """
+    config = DenseCacheConfig(path=str(tmp_path), mode="auto", write=True)
+    identity = EmbedderIdentity(model="offline-hash")
+
+    cold = _CountingEmbedder()
+    index_cold = await _build_multi(dense_cache=config, identity=identity, embedder=cold)
+    corpus_texts = set(index_cold._doc_texts)
+    # Cold start: the whole corpus plus one probe embed for the write-back manifest.
+    assert corpus_texts <= set(cold.embedded_texts)
+    assert [text for text in cold.embedded_texts if text == PROBE_TEXT] == [PROBE_TEXT]
+
+    warm = _CountingEmbedder()
+    index_warm = await _build_multi(dense_cache=config, identity=identity, embedder=warm)
+    assert warm.embedded_texts == [PROBE_TEXT]  # zero corpus embed calls
+
+    hits = await index_warm.retrieve(statement=_SINGLETON_QUERY, constraints=(), scope="process-lifetime")
+    assert "singleton" in [hit.name for hit in hits]
+
+
+async def test_dense_cache_misses_for_a_different_catalog(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     config = DenseCacheConfig(path=str(tmp_path), mode="auto", write=True)
     identity = EmbedderIdentity(model="offline-hash")
 
@@ -646,16 +654,10 @@ async def test_dense_cache_misses_for_a_different_catalog(
             dense_cache=config,
             identity=identity,
         )
-    sources = [
-        getattr(record, "source", None)
-        for record in caplog.records
-        if record.name == "src.patterns.retriever"
-    ]
+    sources = [getattr(record, "source", None) for record in caplog.records if record.name == "src.patterns.retriever"]
     assert "embedded" in sources
 
-    hits = await index_other.retrieve(
-        statement="Unique vocab word: zymurgy quokka", constraints=(), scope=""
-    )
+    hits = await index_other.retrieve(statement="Unique vocab word: zymurgy quokka", constraints=(), scope="")
     assert any(hit.name == "only" for hit in hits)
 
 

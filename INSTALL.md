@@ -243,6 +243,74 @@ journalctl -u design-pattern-mcp -n 50
 docker compose -p dpml-systemd -f /etc/design-pattern-mcp/docker-compose.yml logs -f
 ```
 
+## Dense-embedding cache (restart durability)
+
+**On by default**: `dense_cache.mode=auto` with `write=true` (Pydantic defaults,
+`config/config.json`, and both compose stacks) — the serving path always passes the
+cache, so neither deployment path has to enable anything (host `uv run` needs the
+`DESIGN_PATTERN_DENSE_CACHE_PATH` export shown in the README's Local Development block,
+because the image default does not exist on a workstation). Off switches:
+`DENSE_CACHE_MODE=off` in a stack's env, `DESIGN_PATTERN_DENSE_CACHE_MODE=off` on a host
+run, `mode: off` in a config file.
+
+The dense retrieval leg embeds one `document_text` per catalog record (486) at startup
+(~19 min on the CPU TEI sidecar). That matrix is snapshotted to
+`DESIGN_PATTERN_DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image) as
+`manifest.json` + `vectors.npy` and reloaded on the next start, so a restart costs one
+probe embedding instead of a full corpus pass.
+
+- **Every stack mounts a NAMED volume there** —
+  `design-pattern-mcp-dev-dense-cache` (Path A) /
+  `design-pattern-mcp-systemd-dense-cache` (Path B). The snapshot then survives image
+  upgrades, container recreation and `docker compose down`; `make docker-down` keeps it.
+  It is deliberately not inside the config bind mount, so a config re-install cannot
+  take it with it.
+- **A fresh volume is seeded from the image's baked snapshot** (Docker copies the image
+  directory into an empty named volume once), so a *first* install of a re-pulled image
+  starts warm. An **existing** volume keeps its own snapshot: after a rebuild that
+  changes the catalogue or the model, delete it first
+  (`docker volume rm design-pattern-mcp-systemd-dense-cache` resp.
+  `design-pattern-mcp-dev-dense-cache`, or `docker compose down -v`) — otherwise the
+  fingerprint guards force one re-embed (~19 min) and rewrite the volume. For a
+  genuinely cold cache use a cache-less image (`make docker-build-nocache`) or switch
+  the cache off: `DENSE_CACHE_MODE=off` in the stack's env (the compose interpolation
+  overwrites `DESIGN_PATTERN_DENSE_CACHE_MODE`, so the long name only works on host
+  runs / bare `docker run`). A bare `docker run` gets no volume; pass
+  `-v <your-cache-volume>:/app/data/dense-cache` to keep the cache — a new volume name
+  is a separate, cold cache (one re-embed), the two stack volumes are the shared ones.
+- **Invalidated automatically** by a changed embedding function (model string, text
+  instruction, declared `model_repo`/`onnx_variant`), a changed catalog (record count,
+  name order, any `document_text`), an absent/shape-invalid/off-norm `vectors.npy`, or a
+  probe-vector mismatch (a redeployed TEI sidecar serving a different model behind an
+  unchanged config). Each change costs exactly one re-embed — the write-back stores a
+  snapshot with the new identity, so the next restart hits (a snapshot baked by an older
+  release misses once for the same reason). Every decision is logged with the directory
+  it used: `Dense cache hit` (`path`, `records`, `mode`), `Dense cache miss` (`reason`,
+  `path`), `Dense cache written` (`path`, `records`, `dimension`),
+  `Dense cache disabled` (`mode`, `path`), `Dense cache write failed` (`path`,
+  `reason`), plus the retriever's summary `Dense vectors resolved` (`source`,
+  `documents`).
+- **Writability**: `/app/data` is copied `1000:1000` in the image and the volume inherits
+  that ownership — a fresh volume is writable without a chown step. A root-owned
+  read-only directory logs `Dense cache write failed` and the server runs cacheless;
+  write-back never fails the start.
+- **Single writer**: no locking — run one server process per cache directory (dev and
+  systemd use separate volumes).
+- **Upgrading from a pre-volume deployment**: the older compose file has no mount — the
+  cache then lives in the container layer and dies with the container. Re-install the
+  compose file for your path — Path B:
+  `sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/` (B2);
+  Path A: `make docker-build` — then recreate the container
+  (`docker compose up -d` / `sudo systemctl reload design-pattern-mcp`). Path B runs
+  compose from `/etc`, so without that install the deployed stack keeps the old
+  container-layer cache and gains nothing. The first start after that re-embeds once and
+  writes into the volume; later restarts are warm.
+- **Inspect**: the logged path is the *in-container* view. Use
+  `docker exec <container> ls -l /app/data/dense-cache`, or
+  `docker volume inspect --format '{{.Mountpoint}}' design-pattern-mcp-dev-dense-cache`
+  (resp. `-systemd-`) for the host side, and
+  `docker inspect -f '{{json .Mounts}}' <container>` to verify the mount.
+
 ## Switching the generator LLM
 
 Both compose files hardcode the MiniMax generator env block. To use another
@@ -270,7 +338,9 @@ B: `sudo systemctl restart design-pattern-mcp`). Full provider list:
 | `docker image inspect design-pattern-mcp:latest` failed (unit start) | B1 retag step missed or used a different tag. |
 | `network pattern-tei-shared not found` | TEI infra not running: `sudo systemctl start pattern-tei-infra.service`. |
 | MCP container unhealthy; logs show TEI connection errors | TEI still cold-starting (start_period 120 s) — recheck health after ~2 min; if persistent, verify B0 (Path B) or the dev sidecars (Path A). |
-| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build-all` (bakes the cache). |
+| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build-all` (bakes the cache). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
+| Dense cache seems missing on the host although the log shows a cache hit | Expected — the logged path is the *in-container* view of the named volume. Inspect `docker exec <container> ls -l /app/data/dense-cache`, or `docker volume inspect --format '{{.Mountpoint}}' design-pattern-mcp-dev-dense-cache` (resp. `-systemd-`); verify the mount with `docker inspect -f '{{json .Mounts}}' <container>`. |
+| Log shows `Dense cache write failed` but startup continues | By design (best-effort write-back): the cache directory is read-only/root-owned or full. Fix ownership or point `DESIGN_PATTERN_DENSE_CACHE_PATH` at a writable directory; the run keeps the vectors it just embedded. |
 | Container healthy but design tool calls fail with 401/502, or every LLM call returns `ERR_009` | Generator API key wrong/missing in the env file, or provider env block mismatched — see generator section. |
 | Tool calls rejected for ~60 s after 3 transport failures | Circuit breaker open (`..._CIRCUIT_BREAKER_*` knobs); check the provider key/endpoint, then wait out the cooldown. |
 | Unit fails reading environment file | `/etc/design-pattern-mcp/.env` missing or unreadable: recreate per B2 (`root:docker 640`, user in `docker` group). |
@@ -296,4 +366,7 @@ sudo systemctl daemon-reload
 # Path A
 docker compose --env-file docker/.env -f docker/docker-compose.yml down
 rm docker/.env
+
+# Dense-cache volumes (both paths) — keeps ~2 MB of vectors per stack
+docker volume rm design-pattern-mcp-dev-dense-cache design-pattern-mcp-systemd-dense-cache 2>/dev/null || true
 ```

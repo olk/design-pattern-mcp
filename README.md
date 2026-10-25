@@ -378,6 +378,22 @@ MINIMAXAI_API_KEY=your_key make docker-up
 
 First `docker-build-all` generates the FAISS dense cache (`data/dense-cache/`) via the TEI embed sidecar and bakes it into the server image; `make docker-build-nocache` skips that (first startup then embeds the corpus, ~19 min).
 
+Both compose stacks back that cache directory with a **named Docker volume**
+(`design-pattern-mcp-dev-dense-cache` / `design-pattern-mcp-systemd-dense-cache`,
+mounted at `/app/data/dense-cache`). A fresh volume is seeded from the image's baked
+snapshot, and every later write-back lands in the volume — so a restarted or recreated
+container reloads the vectors instead of re-embedding the catalog (one probe embedding
+instead of ~486 document embeddings). `docker compose down` keeps the volume.
+
+Two operational consequences: an **existing** volume shadows a newer baked snapshot
+after an image rebuild, and the fingerprint guards then force exactly one re-embed — so
+after a catalogue- or model-changing rebuild delete the volume first
+(`docker volume rm design-pattern-mcp-dev-dense-cache`) and let `up -d` re-seed it.
+And the compose stacks read the short knob `DENSE_CACHE_MODE` (`off` disables the cache
+entirely) — `DESIGN_PATTERN_DENSE_CACHE_MODE` is the container/host-run variable that
+the compose interpolation overwrites. Details:
+[Dense embedding cache](#dense-embedding-cache-restart-durable-retrieval).
+
 ### Local Development (uv)
 
 **Prerequisites:** Python 3.12+, [uv](https://github.com/astral-sh/uv)
@@ -391,6 +407,10 @@ export DESIGN_PATTERN_GENERATOR_PROVIDER=minimax
 export DESIGN_PATTERN_GENERATOR_MODEL=minimax/MiniMax-M2.7
 export DESIGN_PATTERN_GENERATOR_BASE_URL=https://api.minimax.io/v1
 export DESIGN_PATTERN_GENERATOR_API_KEY=your_key
+# Dense cache (host runs): the image default /app/data/dense-cache does not exist
+# on a workstation, so point it at the gitignored repo snapshot. `make embed-cache`
+# fills it; otherwise the first start embeds once and writes it (later starts warm).
+export DESIGN_PATTERN_DENSE_CACHE_PATH="$PWD/data/dense-cache"
 
 # Run the server
 uv run design-pattern-mcp --transport stdio               # for Claude Code / Codex
@@ -461,6 +481,67 @@ The generator LLM is accessed through the **LlamaIndex LiteLLM integration**. Al
 
 Provider list and syntax: [LiteLLM Providers documentation](https://docs.litellm.ai/docs/providers). `temperature`, `top_p`, `top_k`, `timeout_seconds`, and the circuit-breaker knobs map to the corresponding LiteLLM/provider parameters.
 
+### Dense embedding cache (restart-durable retrieval)
+
+**On by default.** The shipped configuration resolves to `dense_cache.mode=auto` with
+`write=true` (Pydantic defaults *and* `config/config.json`; both compose stacks set the
+same values explicitly), and the serving path always passes the cache — the container
+stacks need no cache configuration at all, and a host run needs exactly one export
+(`DESIGN_PATTERN_DENSE_CACHE_PATH`, see the Local Development block). It is switched off
+only deliberately: `DENSE_CACHE_MODE=off` in a compose stack,
+`DESIGN_PATTERN_DENSE_CACHE_MODE=off` on a host run, `mode=off` in a config file, the
+`--offline`/`--health` paths (deterministic embedder, no cache), and the benchmark
+compose override (cold-start measurement).
+`tests/unit/test_config.py::test_dense_cache_defaults` and
+`::test_shipped_config_validates` pin the defaults.
+
+The dense retrieval leg is one FAISS index over every catalog record (486 records → 486
+`document_text` embeddings at startup). That matrix is snapshotted to disk next to a
+manifest and reloaded on the next start, so a restart costs **one probe embedding**
+instead of a full corpus pass (~19 min on the CPU TEI sidecar).
+
+- **Path**: `DESIGN_PATTERN_DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image).
+  Contents: `manifest.json` (the commit marker) + `vectors.npy`. A directory without a
+  usable manifest is an ordinary miss; `mode=require` turns a miss into a startup
+  error (`ERR_008`), `mode=off` skips the cache read entirely.
+- **Written** immediately after a cold embed (`DESIGN_PATTERN_DENSE_CACHE_WRITE=true`),
+  so the snapshot is on disk before any later startup step can fail. The vectors file is
+  written before the manifest, so a crash mid-write leaves a directory the next start
+  treats as a miss.
+- **Containers persist it in a named volume**
+  (`design-pattern-mcp-dev-dense-cache` / `design-pattern-mcp-systemd-dense-cache`) —
+  the snapshot then survives container recreation, `docker compose down` and image
+  upgrades. A **fresh** volume is seeded from the image's baked snapshot; an **existing**
+  one keeps its own, so after a catalogue- or model-changing rebuild delete it
+  (`docker volume rm <name>`) before `up -d`, otherwise the guards force one re-embed
+  (~19 min) and rewrite the volume. A genuinely cold cache needs a cache-less image
+  (`make docker-build-nocache`) or `mode=off` — `DENSE_CACHE_MODE=off` in the compose
+  stacks, `DESIGN_PATTERN_DENSE_CACHE_MODE=off` on host runs.
+- **Rebuilt automatically** when the embedding function changes (model string, text
+  instruction, declared `model_repo`/`onnx_variant`), when the catalog changes (record
+  count, name order or any `document_text` — `corpus_sha256`), when `vectors.npy` is
+  absent/shape-invalid/off-norm, or when a probe vector shows a *different model behind
+  an unchanged configuration* (a redeployed TEI sidecar; cosine below
+  `dense_cache.probe_min_cosine`). Each such change costs exactly one re-embed: the
+  rebuilt snapshot is written back with the new identity, so the next restart hits again
+  (a cache baked by an older release, e.g. without `EMBED_MODEL_REPO`, misses once for
+  the same reason). Every decision is logged with the directory it used (JSON logger
+  fields in the compose stacks): `Dense cache hit` (`path`, `records`, `mode`),
+  `Dense cache miss` (`reason`, `path`), `Dense cache written` (`path`, `records`,
+  `dimension`), `Dense cache disabled` (`mode`, `path`), `Dense cache write failed`
+  (`path`, `reason`) — plus the retriever's summary `Dense vectors resolved`
+  (`source` = `cache-hit` / `embedded` / `disabled`, `documents`).
+- **Best-effort writes**: a read-only or full cache directory logs `Dense cache write
+  failed` and the run keeps the vectors it just embedded — the cache never fails a start.
+- **Single writer**: no locking. Run one server process per cache directory (dev and
+  systemd stacks use separate volumes; the benchmark harness pins its own disposable
+  `data/dense-cache` and refuses a cold cache unless `mode=off`).
+- **Host runs** (`uv run python -m src.main`) must point `DESIGN_PATTERN_DENSE_CACHE_PATH`
+  at a writable directory — the shipped default `/app/data/dense-cache` only exists in
+  the image. Either `export DESIGN_PATTERN_DENSE_CACHE_PATH=$PWD/data/dense-cache` so a
+  `make embed-cache` snapshot is reused, or point it at
+  `~/.config/design-pattern-mcp/dense-cache` and let the first start write it.
+
 ### Key environment variables
 
 | Variable | Default | Description |
@@ -477,6 +558,9 @@ Provider list and syntax: [LiteLLM Providers documentation](https://docs.litellm
 | `DESIGN_PATTERN_GENERATOR_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `60.0` | Open-state window before one half-open probe |
 | `DESIGN_PATTERN_EMBEDDER_BASE_URL` | `http://design-pattern-tei-embed:8080` | TEI embedder endpoint |
 | `DESIGN_PATTERN_EMBEDDER_BATCH_SIZE` | `16` | Embedding batch size |
+| `DESIGN_PATTERN_DENSE_CACHE_PATH` | `/app/data/dense-cache` (image) | Dense-leg snapshot directory (`manifest.json` + `vectors.npy`): reloaded on restart with zero corpus embed calls, rebuilt on any embedder/corpus/probe change. Host runs override it with a writable path |
+| `DESIGN_PATTERN_DENSE_CACHE_MODE` | `auto` | `auto` (a miss re-embeds), `require` (a miss raises `ERR_008` at startup), `off` (the cache is never read or written). The compose stacks set it from `DENSE_CACHE_MODE` — use the short name there |
+| `DESIGN_PATTERN_DENSE_CACHE_WRITE` | `true` | Persist a re-embedded corpus (best-effort — a failed write logs `Dense cache write failed` and the run keeps its vectors) |
 | `DESIGN_PATTERN_RETRIEVAL_DENSE_WEIGHT` | `0.7` | Dense-leg fusion weight (must sum with `..._BM25_WEIGHT` to 1.0 ± 1e-3 — config-validated; a leg below 0.05 logs a warning) |
 | `DESIGN_PATTERN_RETRIEVAL_BM25_WEIGHT` | `0.3` | BM25-leg fusion weight |
 | `DESIGN_PATTERN_RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the CPU TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
@@ -601,10 +685,10 @@ export DESIGN_PATTERN_PROMPT_STABLE_PREFIX=true
 
 | Layer | What | Where |
 |---|---|---|
-| L1 | Unit tests (388 collected, 359 test functions) | `tests/unit/` |
+| L1 | Unit tests (418 collected, 362 test functions) | `tests/unit/` |
 | L2 | Hypothesis property oracles (15 in `test_config_properties.py`; 115 verification tests collected total) | `tests/verification/` |
 | L3 | Spec gardens (FG-* mutants) | `verify/`, `make verify-fizz-garden` |
-| L4 | Exhaustive FizzBee models (7 specs: jobs runner/protocol, pipeline control, design loop, reasoning retry, TEI fallback, retrieval fusion) | `verify/fizz/`, `make verify-fizz` |
+| L4 | Exhaustive FizzBee models (8 specs: jobs runner/protocol, pipeline control, design loop, reasoning retry, TEI fallback, retrieval fusion, dense cache) | `verify/fizz/`, `make verify-fizz` |
 | — | Mutation ratchet (`mutmut` baseline; new survivors fail `make test-mutations`, advisory in nightly CI) | `verify/mutmut-baseline.json`, `make test-mutations` |
 | — | Ledger (gating) + cross-consistency (advisory NL-doc triage) | `make verify-ledger`, `make verify-cross-consistency` |
 

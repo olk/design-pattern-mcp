@@ -1,7 +1,8 @@
 """Precomputed dense-embedding cache (§2.2): manifest + vectors + two-layer fingerprint.
 
-The cache lets a normal cold start pay one probe HTTP request instead of 55 sequential
-TEI ``/v1/embeddings`` calls. Two independent guards decide whether to reuse a cache entry:
+The cache lets a normal cold start pay one probe HTTP request instead of a full
+embedding pass over the catalog. Two independent guards decide whether to reuse a cache
+entry:
 
 1. **Metadata fingerprint** — ``names`` ordering, ``corpus_sha256``, ``embedder_model``,
    ``text_instruction_sha256``, and (when the caller declares an identity) ``model_repo``
@@ -15,6 +16,19 @@ raises ``DesignPatternError(ERR_008)``. The cache is OFF by default for ``--heal
 (``OfflineHashEmbedder``) and ON by default for the serving path; ``mode=off`` skips
 the cache read entirely. A miss with ``mode=auto`` re-embeds and overwrites the cache
 when ``write`` is enabled.
+
+**Restart durability.** With ``write`` enabled the re-embedded corpus is persisted in
+the same call, so the next start reloads the vectors (zero corpus embed calls) instead
+of recomputing them. Both compose stacks mount a named volume over the path, so the
+snapshot survives container recreation and image upgrades. Write-back is best-effort:
+``_write_back`` swallows every failure into a warning and the run keeps the vectors it
+just embedded — a read-only or full cache directory costs the NEXT start a re-embed,
+never this one its startup.
+
+**Log contract.** Every decision names the directory it used: ``Dense cache hit``
+(``path``/``records``/``mode``), ``Dense cache miss`` (``reason``/``path``),
+``Dense cache written`` (``path``/``records``/``dimension``), ``Dense cache disabled``
+(``mode``/``path``), ``Dense cache write failed`` (``path``/``reason``).
 
 The cache builder (``python -m src.patterns.dense_cache build --out /out``) writes
 ``vectors.npy`` first and ``manifest.json`` second so a partial run never leaves a
@@ -172,9 +186,7 @@ def load_manifest(cache_dir: Path) -> tuple[DenseCacheManifest | None, str]:
     return manifest, "ok"
 
 
-def load_vectors(
-    cache_dir: Path, manifest: DenseCacheManifest
-) -> tuple[list[list[float]] | None, str]:
+def load_vectors(cache_dir: Path, manifest: DenseCacheManifest) -> tuple[list[list[float]] | None, str]:
     """Load ``vectors.npy`` and validate shape + unit norm; (vectors, "ok") or (None, reason)."""
     path = cache_dir / VECTORS_NAME
     if not path.exists():
@@ -291,22 +303,14 @@ def _metadata_fingerprint_match(  # noqa: PLR0911 - one return per mismatch reas
     return None  # corpus_sha256 check uses the caller-supplied doc_texts; see resolve_dense_vectors
 
 
-def _corpus_fingerprint_match(
-    manifest: DenseCacheManifest, names: Sequence[str], doc_texts: Sequence[str]
-) -> bool:
+def _corpus_fingerprint_match(manifest: DenseCacheManifest, names: Sequence[str], doc_texts: Sequence[str]) -> bool:
     """True iff ``manifest.corpus_sha256 == corpus_digest(names, doc_texts)``."""
     return manifest.corpus_sha256 == corpus_digest(names, doc_texts)
 
 
-async def _probe_embed(
-    embedder: EmbedderProtocol, text: str, timeout_seconds: float
-) -> list[float]:
+async def _probe_embed(embedder: EmbedderProtocol, text: str, timeout_seconds: float) -> list[float]:
     """Embed ``text`` with a hard timeout; raises ``asyncio.TimeoutError`` on overrun."""
-    return (
-        await asyncio.wait_for(
-            embedder.embed_documents([text]), timeout=timeout_seconds
-        )
-    )[0]
+    return (await asyncio.wait_for(embedder.embed_documents([text]), timeout=timeout_seconds))[0]
 
 
 def _tei_info_url(embedder_config: EmbedderConfig) -> str:
@@ -345,6 +349,56 @@ def _resolve_tei_info(embedder: EmbedderProtocol) -> dict[str, str]:
     return _fetch_tei_info(_tei_info_url(config))
 
 
+async def _write_back(
+    *,
+    config: DenseCacheConfig,
+    embedder: EmbedderProtocol,
+    names: Sequence[str],
+    doc_texts: Sequence[str],
+    identity: EmbedderIdentity,
+    vectors: Sequence[Sequence[float]],
+) -> None:
+    """Persist a freshly embedded corpus; every failure degrades to a warning.
+
+    Write-back is best-effort by contract: the caller already holds the
+    embedded vectors, so a read-only/full cache directory or a flaky probe call
+    costs the NEXT start a re-embed — never THIS one its dense leg, and never
+    the server its startup (the mirror of ``load_*`` returning a miss reason
+    instead of raising).
+    """
+    try:
+        probe_vector = (await embedder.embed_documents([PROBE_TEXT]))[0]
+        manifest = build_manifest(
+            names=names,
+            doc_texts=doc_texts,
+            identity=identity,
+            dimension=len(vectors[0]) if vectors else 0,
+            probe_vector=probe_vector,
+            tei_info=_resolve_tei_info(embedder),
+        )
+        store_reason = store_cache(Path(config.path), manifest, vectors)
+    except Exception as exc:  # provider/disk failure: the embedded vectors stay authoritative
+        logger.warning(
+            "Dense cache write failed",
+            extra={"path": config.path, "reason": f"{exc.__class__.__name__}: {exc}"},
+        )
+        return
+    if store_reason is not None:
+        logger.warning(
+            "Dense cache write failed",
+            extra={"path": config.path, "reason": store_reason},
+        )
+        return
+    logger.info(
+        "Dense cache written",
+        extra={
+            "path": config.path,
+            "records": len(names),
+            "dimension": len(vectors[0]) if vectors else 0,
+        },
+    )
+
+
 async def _embed_and_maybe_store(
     *,
     config: DenseCacheConfig,
@@ -356,24 +410,17 @@ async def _embed_and_maybe_store(
 ) -> tuple[list[list[float]], str]:
     """Re-embed the corpus (and the probe), optionally store the cache, return vectors."""
     if miss_reason is not None:
-        logger.info("Dense cache miss", extra={"reason": miss_reason})
+        logger.info("Dense cache miss", extra={"reason": miss_reason, "path": config.path})
     vectors = await embedder.embed_documents(list(doc_texts))
     if config.write:
-        probe_vector = (await embedder.embed_documents([PROBE_TEXT]))[0]
-        manifest = build_manifest(
+        await _write_back(
+            config=config,
+            embedder=embedder,
             names=names,
             doc_texts=doc_texts,
             identity=identity,
-            dimension=len(vectors[0]) if vectors else 0,
-            probe_vector=probe_vector,
-            tei_info=_resolve_tei_info(embedder),
+            vectors=vectors,
         )
-        store_reason = store_cache(Path(config.path), manifest, vectors)
-        if store_reason is not None:
-            logger.warning(
-                "Dense cache write failed",
-                extra={"path": config.path, "reason": store_reason},
-            )
     return vectors, "embedded"
 
 
@@ -387,6 +434,7 @@ async def resolve_dense_vectors(  # noqa: PLR0911, PLR0912 - one branch per guar
 ) -> tuple[list[list[float]], str]:
     """Cache-aware loader for the dense-leg corpus (returns vectors and a status label)."""
     if config.mode == "off":
+        logger.info("Dense cache disabled", extra={"mode": config.mode, "path": config.path})
         return await embedder.embed_documents(list(doc_texts)), "disabled"
 
     cache_dir = Path(config.path)
@@ -442,9 +490,7 @@ async def resolve_dense_vectors(  # noqa: PLR0911, PLR0912 - one branch per guar
         )
 
     try:
-        probe_vector = await _probe_embed(
-            embedder, manifest.probe_text, config.probe_timeout_seconds
-        )
+        probe_vector = await _probe_embed(embedder, manifest.probe_text, config.probe_timeout_seconds)
     except (TimeoutError, OSError) as exc:
         if config.mode == "require":
             raise DesignPatternError(
@@ -494,6 +540,10 @@ async def resolve_dense_vectors(  # noqa: PLR0911, PLR0912 - one branch per guar
             identity=identity,
             miss_reason=f"cache-miss:{vector_reason}",
         )
+    logger.info(
+        "Dense cache hit",
+        extra={"path": str(cache_dir), "records": manifest.record_count, "mode": config.mode},
+    )
     return vectors, "cache-hit"
 
 
@@ -504,9 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Precompute the dense-embedding cache for design-pattern-mcp.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    build_cmd = sub.add_parser(
-        "build", help="Embed the catalog and write the cache directory."
-    )
+    build_cmd = sub.add_parser("build", help="Embed the catalog and write the cache directory.")
     build_cmd.add_argument("--out", required=True, help="Output directory (e.g. data/dense-cache).")
     build_cmd.add_argument(
         "--config",
