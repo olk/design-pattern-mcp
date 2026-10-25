@@ -763,11 +763,12 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 **Development workflow:**
 
 ```bash
-make install            # first-time setup
-make check-all          # before pushing
-make test-unit          # behavioral oracle
-uv run mypy --strict    # src/ is strict; must exit 0
-make docker-up          # after image-affecting changes
+make install               # first-time setup
+uv run pre-commit install  # First-time setup: commit hook
+make check-all             # before pushing
+make test-unit             # behavioral oracle
+uv run mypy --strict       # src/ is strict; must exit 0
+make docker-up             # after image-affecting changes
 ```
 
 Ground rules (from `AGENTS.md`): `src/` is mypy-strict; schema changes change `docs/implementation-guide.md` + the schema + the code in the same commit; pipeline control-flow changes update the matching FizzBee model in the same PR.
