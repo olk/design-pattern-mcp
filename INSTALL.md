@@ -167,9 +167,9 @@ sudo systemctl enable --now pattern-tei-infra.service
 docker inspect -f '{{.Name}} {{.State.Health.Status}}' pattern-tei-embed pattern-tei-rerank
 ```
 
-Note: this stack is shared with the sibling `architecture-pattern-mcp` (and
-`agent-pattern-mcp`) servers. If it is already installed and running on the
-host, skip B0 entirely.
+Note: this stack is shared with the sibling `architecture-pattern-mcp`,
+`agent-pattern-mcp`, and `blockchain-pattern-mcp` servers. If any of them
+has it already installed and running on the host, skip B0 entirely.
 
 ### B1 — MCP image under the local name the unit checks
 
