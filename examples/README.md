@@ -5,7 +5,9 @@ calls one tool with an event-driven ingestion service description, then
 pretty-prints the JSON result:
 
 - `analyze_design` (default) — ANALYZE phase only: repaired brief, decision
-  parts, per-part selections. Fast; no design generated.
+  parts, per-part selections. Fast; no design generated — follow with
+  `generate_design` (as `design_phase_client.py` does) to get the applications
+  before implementing.
 - `select_design_patterns` (`--tool design`) — full design artifact: analyze
   → generate → evaluate → refine. Long-running (minutes).
 

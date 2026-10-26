@@ -8,9 +8,13 @@ analyze_design → brief + decision parts + per-part selections
 
 1. `analyze_design({"description": "...", "language": "python"})` — costs the ANALYZE phase only,
    no generation or evaluation
-2. Implement from `decision_parts[]` + `selections[]` (primary, supporting, alternatives, vetoes,
-   weights); `selected_patterns` lists the deduplicated primaries
-3. Want the generated applications after all? `generate_design({"analysis": <payload>})`
+2. `generate_design({"analysis": <payload>})` — materializes the bound applications for the
+   selection: participants mapped to your components, `implementation_steps`, `code_sketch`, one
+   bound language variant per pattern. The selection alone carries none of this — implement from
+   the applications, not from the pattern names.
+3. Familiar pattern and no generation wanted? `get_design_pattern({"name": <primary>})` returns
+   the full record — participants, language bindings, pitfalls — to implement from;
+   `selected_patterns` lists the deduplicated primaries.
 
 ## Job trio (OMP default)
 

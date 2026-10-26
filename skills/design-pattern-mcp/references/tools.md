@@ -23,8 +23,10 @@ ledger, weights); no `applications[]`.
 **Args:** `{"description": "...", "architecture_style"?: str, "language"?: str, "paradigm"?: str, "focus"?: str}`
 
 **Returns:** `AnalysisResult` (`design_brief`, `decision_parts[]`, `selections{}`)
-plus `selected_patterns` (deduplicated primaries) and `categories`; feed it to
-`generate_design` to materialize the applications.
+plus `selected_patterns` (deduplicated primaries) and `categories`. The selection carries no
+implementation material: call `generate_design` with this payload to materialize the
+applications (participants, steps, code sketches, bound variants) before implementing;
+`get_design_pattern` returns the catalog record when generation is not wanted.
 
 ### `generate_design`
 Materialize applications from a prior `analyze_design` payload or explicit

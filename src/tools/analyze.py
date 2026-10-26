@@ -59,10 +59,16 @@ class AnalyzeDesignTool:
             "analysis-only path for coding agents that write the code themselves. Returns the "
             "repaired design brief, the decision parts with their scope/category hypothesis, and "
             "one selection per part (primary pattern, supporting patterns with roles, ranked "
-            "alternatives, veto ledger, quality-attribute weights) without generating applications "
-            "or evaluating them. Use select_design_patterns when the caller wants the generated "
-            "design; feed this payload into generate_design to materialize the applications without "
-            "re-running the analysis."
+            "alternatives, veto ledger, quality-attribute weights that drove the scoring) without "
+            "generating applications or evaluating them. The selection is a routing decision, not "
+            "an implementation spec: it carries no participants, implementation steps, code "
+            "sketches or language bindings — before implementing, call generate_design with this "
+            "payload to materialize the bound applications without re-running the analysis, or "
+            "get_design_pattern for each selected pattern when only the catalog record and "
+            "language bindings are needed. A true is_fallback (payload level, or per part with "
+            "fallback_reason) marks a selection with no eligible primary — treat it as fallback "
+            "guidance, not a real match. Use select_design_patterns when the caller wants the "
+            "generated design."
         ),
         tags={"design-patterns", "selection", "analyze"},
         annotations=ToolAnnotations(

@@ -46,8 +46,9 @@ Existing code/design to score?
 ├── YES → evaluate_design (device mcp__design_pattern_local_evaluate_design)
 └── NO
     ├── Explore the catalog first   → list_design_patterns (category?) → get_design_pattern(name)
-    ├── Agent writes the code       → analyze_design: brief + decision parts + per-part
-    │   itself                        selections with rationale; no generated design
+    ├── Agent writes the code       → analyze_design → generate_design(analysis): selections,
+    │   itself                        then bound applications (participants, steps, sketch,
+    │                                 variant) — implement from the applications
     ├── Caller wants the design     → job trio: submit_design_job → get_design_status
     │                                 (full pipeline: analyze → generate → evaluate → refine)
     └── Known patterns              → generate_design (explicit pattern names)
@@ -58,7 +59,7 @@ Existing code/design to score?
 | Device suffix | Purpose | Latency |
 |---|---|---|
 | `select_design_patterns` | Design path: full pipeline, one call | 2–10 min |
-| `analyze_design` | Analysis-only: brief + decision parts + per-part selections, no design generated — the path when the agent writes the code itself | ~1 min |
+| `analyze_design` | Analysis-only: brief + per-part selections; follow with `generate_design` (same payload) for the implementation material (participants, steps, bindings) — the path when the agent writes the code itself | ~1 min + ~1 min |
 | `generate_design` | Applications from a prior analyze_design payload or explicit pattern names | ~1 min |
 | `evaluate_design` | Score a design JSON | ~30 s |
 | `submit_design_job` | Start pipeline, returns `job_id` | <1 s |

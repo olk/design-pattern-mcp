@@ -202,7 +202,10 @@ enricher, sink. Constraints: at-least-once delivery, backpressure, Python.
 
 Your agent calls `select_design_patterns` internally. The server returns the `DesignResult`: `overview` (primary pattern, supporting patterns, principles, score, reasoning), `applications[]` (participants, interactions, implementation_steps, code_sketch, language_binding with the bound variant), `interactions[]`, `quality_attributes`, `test_strategy`, and `risks[]`.
 
-**Coding agents that write the code themselves should call `analyze_design` instead.** It runs the same ANALYZE phase (§1–§8: brief repair → decision parts → per-part retrieval → quality weights → selection) and stops there: you get the repaired brief, the decision parts and one selection per part (primary, supporting patterns, ranked alternatives, veto ledger, weights) with no generated applications and no evaluation. `select_design_patterns` remains the design path — it continues through GENERATE → EVALUATE, where the bulk of a full run's wall clock goes. Either way, the decisions come from the same ANALYZE stage — a fresh LLM analysis per call, so neither path is idempotent; pass the `analyze_design` payload to `generate_design` if you later want the materialized applications.
+**Coding agents that write the code themselves should call `analyze_design` instead.** It runs the same ANALYZE phase (§1–§8: brief repair → decision parts → per-part retrieval → quality weights → selection) and stops there: you get the repaired brief, the decision parts and one selection per part (primary, supporting patterns, ranked alternatives, veto ledger, weights) with no generated applications and no evaluation. The selection names *what* to apply per part, not *how* — participants, implementation steps,
+code sketches and language bindings are materialized by `generate_design` from that payload (or
+read via `get_design_pattern` per pattern); implement from the applications, never from the
+bare pattern names. `select_design_patterns` remains the design path — it continues through GENERATE → EVALUATE, where the bulk of a full run's wall clock goes. Either way, the decisions come from the same ANALYZE stage — a fresh LLM analysis per call, so neither path is idempotent; pass the `analyze_design` payload to `generate_design` if you later want the materialized applications.
 
 **Or call tools directly** from your agent:
 
@@ -283,7 +286,7 @@ make client-async       # Terminal 2
 | Tool | Description |
 |---|---|
 | `select_design_patterns` | Design path for callers that want the generated design: full pipeline (analyze → weights ∥ retrieval → generate → evaluate → refine, `LOOP_MAX_TRIES` attempts), returning applications with participants, implementation steps, bound variants, quality attributes, a test strategy and risks. *Long-running (2–10 min). Heartbeat-defended.* |
-| `analyze_design` | Analysis-only path for coding agents that write the code themselves: requirements → brief, decision parts and per-part selection (primary, supporting, alternatives, vetoes, weights) with no generated design. *Long-running (~1 min).* |
+| `analyze_design` | Analysis-only path for coding agents that write the code themselves: requirements → brief, decision parts and per-part selection (primary, supporting, alternatives, vetoes, weights) with no generated design. Follow with `generate_design` (same payload) for participants, steps and language bindings before coding. *Long-running (~1 min).* |
 | `generate_design` | Materialize applications from a prior `analyze_design` payload or explicitly named patterns. *Long-running (~1 min).* |
 | `evaluate_design` | Score an existing design JSON against the eight quality axes. *Long-running (~30 s).* |
 | `submit_design_job` | Start a background selection job and return a `job_id` immediately (SQLite-backed, survives server restart). For short-timeout clients. |
@@ -373,6 +376,9 @@ Recommended order — macro first, micro second:
 Both pattern calls run the same ANALYZE stage (§1–§8); `analyze_design` stops there, before generation and evaluation. Each call runs its own LLM analysis (neither tool is idempotent), so two calls can select differently on the same description.
 
 Concrete handoff on the IoT example: the sibling emits the `pipe-and-filter` architecture (Kafka source → JSON parser filter → geolocation enricher → InfluxDB/S3 sinks, with at-least-once delivery and backpressure in the contracts). The geolocation enricher's cache-miss path then comes here: `analyze_design` returns the `circuit-breaker` + `retry` decision with its rationale when your agent writes the enricher, while `select_design_patterns` additionally materializes the applications (participants, `implementation_steps`, a Python `code_sketch`) when the caller wants the generated design — internals the architecture-level component contract references but never implements.
+On the `analyze_design` path, run `generate_design` on the returned payload (or
+`get_design_pattern("circuit-breaker")` for the Python binding and pitfalls) before writing
+the enricher code.
 
 Run both servers side by side (dev host ports `:8060` architecture, `:8822` design-pattern; systemd `:8050` / `:8812`). They are independent — either order works for exploration — but architecture-first keeps component boundaries stable while this server fills in the internals.
 
