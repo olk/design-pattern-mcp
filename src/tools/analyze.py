@@ -55,11 +55,14 @@ class AnalyzeDesignTool:
     @tool(
         name="analyze_design",
         description=(
-            "Analyze a system description and select design patterns per decision part. Returns "
-            "the repaired design brief, the decision parts with their scope/category hypothesis, "
-            "and one selection per part (primary pattern, supporting patterns with roles, ranked "
-            "alternatives, veto ledger, quality-attribute weights). Feed the payload into "
-            "generate_design to materialize the applications, or use it standalone for review."
+            "Analyze a system description and select design patterns per decision part — the "
+            "analysis-only path for coding agents that write the code themselves. Returns the "
+            "repaired design brief, the decision parts with their scope/category hypothesis, and "
+            "one selection per part (primary pattern, supporting patterns with roles, ranked "
+            "alternatives, veto ledger, quality-attribute weights) without generating applications "
+            "or evaluating them. Use select_design_patterns when the caller wants the generated "
+            "design; feed this payload into generate_design to materialize the applications without "
+            "re-running the analysis."
         ),
         tags={"design-patterns", "selection", "analyze"},
         annotations=ToolAnnotations(
@@ -136,9 +139,7 @@ class AnalyzeDesignTool:
                 ("focus", focus),
             ):
                 if value is not None:
-                    ensure_printable_text(
-                        value, field=field_name, allow_line_breaks=False, max_length=200
-                    )
+                    ensure_printable_text(value, field=field_name, allow_line_breaks=False, max_length=200)
             analysis = await run_bounded(
                 self._pipeline.analyze(
                     description=text,
@@ -177,8 +178,6 @@ class AnalyzeDesignTool:
             stop_heartbeat(heartbeat)
 
 
-def analyze_design_tool(
-    pipeline: DesignPipeline, tasks_config: TasksConfig | None = None
-) -> AnalyzeDesignTool:
+def analyze_design_tool(pipeline: DesignPipeline, tasks_config: TasksConfig | None = None) -> AnalyzeDesignTool:
     """Factory: create the ``AnalyzeDesignTool`` instance (DP-4)."""
     return AnalyzeDesignTool(pipeline=pipeline, tasks_config=tasks_config)

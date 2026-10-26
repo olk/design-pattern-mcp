@@ -150,7 +150,9 @@ def check_stage_table() -> None:
     recorder = StageRecorder()
     started = recorder.now_ns()
     recorder.mark(stage=STAGE_LLM_ANALYZE, op="extract_brief_and_parts", started_ns=started, ok=True)
-    recorder.mark(stage=STAGE_LLM_ANALYZE, op="extract_brief_and_parts", started_ns=started, ok=False, meta={"error": "x"})
+    recorder.mark(
+        stage=STAGE_LLM_ANALYZE, op="extract_brief_and_parts", started_ns=started, ok=False, meta={"error": "x"}
+    )
     recorder.mark(stage=STAGE_LLM_WEIGHTS, op="extract_weights_batch", started_ns=started, ok=True)
     table = stage_table(recorder.snapshot())
     _assert(table[STAGE_LLM_ANALYZE]["count"] == 2, f"count: {table}")
@@ -219,8 +221,10 @@ def check_recall_and_f1() -> None:
         ]
     )
     block = scoring.supporting_prf(analysis, ["s1", "s3"])
-    _assert(block["true_positive"] == 2 and block["false_positive"] == 1 and block["false_negative"] == 2,
-            f"micro counts: {block}")
+    _assert(
+        block["true_positive"] == 2 and block["false_positive"] == 1 and block["false_negative"] == 2,
+        f"micro counts: {block}",
+    )
     _approx(block["precision"], 2 / 3, label="supporting precision", tolerance=1e-6)
     _approx(block["recall"], 0.5, label="supporting recall", tolerance=1e-6)
     _approx(block["f1"], 0.571429, label="supporting F1", tolerance=1e-6)
@@ -256,7 +260,10 @@ def check_hit_and_score() -> None:
                     "p1",
                     primary="entity",
                     supporting=["repository"],
-                    alternatives=["aggregate (fit 71.5)", "money considered but discouraged in python; use value-object"],
+                    alternatives=[
+                        "aggregate (fit 71.5)",
+                        "money considered but discouraged in python; use value-object",
+                    ],
                 )
             ]
         )
@@ -264,6 +271,54 @@ def check_hit_and_score() -> None:
     _assert(selected == ["entity", "repository", "aggregate", "money"], f"ordered selection: {selected}")
     _approx(scoring.recall_at_k(selected, ["entity", "money"], 5), 1.0, label="recall over seeds")
     _assert(scoring.parse_seed_name("") is None, "empty seed has no name")
+
+
+def check_analyze_mode() -> None:
+    """Analyze-only arm: mode/config plumbing and the no-result quality record.
+
+    The arm differs from ``live`` only by phase scope, so these anchors pin the two things a
+    refactor can silently break: the CLI/mode registry forwarding and the record contract
+    (hit/recall/score from the analysis, pipeline block null, never a fabricated zero).
+    """
+    from . import config as cfg
+    from . import runner
+    from .main import build_parser
+
+    _assert("analyze" in cfg.MODES, f"analyze must be a registered harness mode: {cfg.MODES}")
+    parsed = build_parser().parse_args(["--mode", "analyze"])
+    _assert(parsed.mode == "analyze", "the harness CLI must accept --mode analyze")
+    _assert(
+        cfg.load_server_config("analyze") == cfg.load_server_config("live"),
+        "analyze must run the shipped configuration; only offline may override it",
+    )
+
+    scenario = cfg.Scenario(
+        scenario_id="selfcheck-analyze",
+        family="selfcheck",
+        category="domain-modeling",
+        split="train",
+        description="selfcheck",
+        decision_statement="pick a primary pattern",
+        acceptable_primary=("entity", "aggregate"),
+        acceptable_supporting=("repository",),
+    )
+    analysis = _analysis(
+        [
+            _selection(
+                "p1",
+                primary="entity",
+                supporting=["repository"],
+                candidates=[_candidate("entity", 90.0)],
+            )
+        ]
+    )
+    hit = runner._quality_block(analysis, None, scenario, final_pattern="entity")
+    _assert(hit["hit"] is True, "analyze record: an acceptable composed primary hits")
+    _approx(hit["score"], 0.9, label="analyze record: score comes from the elected primary fit")
+    _approx(hit["recall_at_5"], 2 / 3, label="analyze record: recall over the acceptable set", tolerance=1e-6)
+    miss = runner._quality_block(analysis, None, scenario, final_pattern="repository")
+    _assert(miss["hit"] is False, "analyze record: an acceptable supporting pattern is not a hit")
+    _assert(runner._pipeline_block(None) is None, "analyze record: the pipeline block is null")
 
 
 def check_veto_conflicts() -> None:
@@ -284,7 +339,8 @@ def check_veto_conflicts() -> None:
     conflicts = scoring.veto_conflicts(analysis)
     kinds = sorted(conflict["type"] for conflict in conflicts)
     _assert(
-        kinds == [
+        kinds
+        == [
             "primary_in_supporting",
             "vetoed_pattern_elected",
             "vetoed_pattern_supported",
@@ -294,7 +350,16 @@ def check_veto_conflicts() -> None:
     )
     _assert(all(conflict["part"] == "p1" for conflict in conflicts), "conflicts name the part")
     clean = scoring.veto_conflicts(
-        _analysis([_selection("p1", primary="entity", supporting=["repository"], veto_ledger=["money considered but discouraged in python"])])
+        _analysis(
+            [
+                _selection(
+                    "p1",
+                    primary="entity",
+                    supporting=["repository"],
+                    veto_ledger=["money considered but discouraged in python"],
+                )
+            ]
+        )
     )
     _assert(clean == [], f"a clean selection has no conflicts: {clean}")
 
@@ -368,10 +433,14 @@ def check_proxies() -> None:
         # Step-0b: stage_table exposes null data fields for stages without capture.
         table = stage_table(recorder.snapshot())
         entry = table[STAGE_LLM_GENERATE]
-        _assert(entry["prompt_chars_mean"] is None and entry["response_chars_mean"] is None,
-                f"no capture → null chars: {entry}")
-        _assert(entry["chars_per_s_mean"] is None and entry["cached_tokens_mean"] is None,
-                f"no capture → null derived data: {entry}")
+        _assert(
+            entry["prompt_chars_mean"] is None and entry["response_chars_mean"] is None,
+            f"no capture → null chars: {entry}",
+        )
+        _assert(
+            entry["chars_per_s_mean"] is None and entry["cached_tokens_mean"] is None,
+            f"no capture → null derived data: {entry}",
+        )
         _assert(entry["repair_calls"] == 0, f"no capture → zero repairs: {entry}")
         # Step-0b log_capture: the validation WARNING flags the NEXT transport success
         # for the same operation as repair=True (schema→operation mapping).
@@ -400,6 +469,7 @@ CHECKS: tuple[tuple[str, Any], ...] = (
     ("Newcombe difference CI", check_newcombe),
     ("recall@K + F1s", check_recall_and_f1),
     ("hit/fallback + score source", check_hit_and_score),
+    ("analyze-mode record contract", check_analyze_mode),
     ("veto-conflict counting", check_veto_conflicts),
     ("Brier + ECE", check_calibration),
     ("risk-coverage", check_risk_coverage),

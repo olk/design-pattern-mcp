@@ -581,8 +581,8 @@ version of it.
 ```bash
 # 1. two identical blocking calls, sequentially (the dev client waits for the full pipeline;
 #    measured 470-832 s per call on this dev stack, i.e. 8-14 minutes)
-make client                                  # writes the DesignResult JSON to stdout
-make client
+make client-design                          # writes the DesignResult JSON to stdout
+make client-design
 
 # 2. the server-side ledger for each call (JSON records go to stderr, not stdout)
 docker logs --since 60m design-pattern-mcp-dev 2>&1 >/dev/null | python3 -c '
@@ -602,7 +602,7 @@ two-attempt loop with reselection. The per-part `Candidate scored` records carry
 `fit_score`/`analysis_score`/adjustment ledger needed to replay the deterministic core (§3).
 
 This recipe was re-run against the dev stack on 2026-09-26 and works verbatim (68 records matched);
-the second controlled pair (§1.4) was produced with the same `make client` call twice, redirecting
+the second controlled pair (§1.4) was produced with the same `make client-design` call twice, redirecting
 stdout to a file per run. Two operational notes:
 
 - **Segment by part-id set, not by time window.** Concurrent requests interleave in one log — two

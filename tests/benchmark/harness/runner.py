@@ -25,7 +25,7 @@ from src.patterns.embedder import build_embedder, embedder_identity
 from src.patterns.loader import PatternLoader
 from src.patterns.retriever import RetrievalIndex
 from src.patterns.safe_tei_rerank import build_reranker
-from src.pipeline import DesignPipeline
+from src.pipeline import DesignPipeline, compose_selection
 from src.decisions.client import DecisionModelClient
 from src.reasoning.client import ReasoningClient
 from src.schemas import AnalysisResult, PipelineResult
@@ -77,8 +77,8 @@ class ScenarioExecutor(Protocol):
 
     async def run(
         self, scenario: cfg.Scenario
-    ) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
-        """Execute ``scenario``; return (analysis, pipeline result, stage slice, provenance)."""
+    ) -> tuple[AnalysisResult, PipelineResult | None, list[StageRecord], dict[str, Any]]:
+        """Execute ``scenario``; return (analysis, pipeline result or None, stage slice, provenance)."""
         ...
 
 
@@ -118,7 +118,7 @@ class OfflineExecutor:
 
     async def run(
         self, scenario: cfg.Scenario
-    ) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
+    ) -> tuple[AnalysisResult, PipelineResult | None, list[StageRecord], dict[str, Any]]:
         """Run one scenario through the real pipeline over the scenario's scripted pool."""
         script: OfflineScript = build_script(scenario, self._catalog, flip=scenario.scenario_id in self._flips)
         pipeline = build_offline_pipeline(script, config=self._config, catalog=self._catalog, recorder=self._recorder)
@@ -231,10 +231,39 @@ class LiveExecutor:
 
     async def run(
         self, scenario: cfg.Scenario
-    ) -> tuple[AnalysisResult, PipelineResult, list[StageRecord], dict[str, Any]]:
+    ) -> tuple[AnalysisResult, PipelineResult | None, list[StageRecord], dict[str, Any]]:
         """Run one scenario in-process; failures propagate (no silent degradation)."""
         analysis, result, slice_records = await _execute_pipeline(self._pipeline, scenario, self._recorder)
         return analysis, result, slice_records, {}
+
+
+class AnalyzeExecutor(LiveExecutor):
+    """Live seams, ANALYZE phase only: the arm a generation-skipping default would ship.
+
+    The wiring is :class:`LiveExecutor`'s (real TEI embedder/reranker, real generator for the
+    brief/parts and requirement weights, optional reasoning); only the phase scope differs:
+    :meth:`DesignPipeline.analyze` runs and ``design_loop`` does not. Hit/recall stay fully
+    observable because they come from the analysis; the dominant pattern is the deterministic
+    §9 composition over those selections, exactly the value the full arm's ``final_pattern``
+    carries when no loop reselection happens. The design/evaluation block is ``null``, never a
+    zero.
+    """
+
+    name = "analyze"
+
+    async def run(self, scenario: cfg.Scenario) -> tuple[AnalysisResult, None, list[StageRecord], dict[str, Any]]:
+        """Run ANALYZE only; failures propagate to the runner's failure policy."""
+        analysis, slice_records = await _execute_analyze_pipeline(self._pipeline, scenario, self._recorder)
+        return analysis, None, slice_records, {"phases": ["analyze"]}
+
+    def describe(self) -> dict[str, Any]:
+        """Seam provenance: the live wiring plus the reduced phase scope."""
+        description = super().describe()
+        description["seams"]["phases"] = (
+            "analyze only via DesignPipeline.analyze (no generate/evaluate; "
+            "pipeline block and evaluation null, hit/recall/score observable)"
+        )
+        return description
 
 
 async def _execute_pipeline(
@@ -256,6 +285,26 @@ async def _execute_pipeline(
     )
     result = await pipeline.design_loop(analysis)
     return analysis, result, recorder.snapshot()[offset:]
+
+
+async def _execute_analyze_pipeline(
+    pipeline: DesignPipeline, scenario: cfg.Scenario, recorder: StageRecorder
+) -> tuple[AnalysisResult, list[StageRecord]]:
+    """ANALYZE only: the same request construction and phase as :func:`_execute_pipeline`.
+
+    The arm is a strict phase subset of a ``live`` run: intake, brief/parts, retrieval, weights,
+    reasoning and deterministic selection all run; the generate–evaluate loop does not. Failures
+    propagate, exactly as in the full arm.
+    """
+    offset = len(recorder)
+    analysis = await pipeline.analyze(
+        description=scenario.description,
+        architecture_style=scenario.architecture_style,
+        language=scenario.language,
+        paradigm=scenario.paradigm,
+        focus=scenario.focus,
+    )
+    return analysis, recorder.snapshot()[offset:]
 
 
 async def run_benchmark(options: RunOptions) -> dict[str, Any]:
@@ -312,6 +361,8 @@ async def _run_benchmark(options: RunOptions) -> dict[str, Any]:
     executor: ScenarioExecutor
     if options.mode == "offline":
         executor = OfflineExecutor(config=config, catalog=catalog, recorder=recorder, flips=frozenset(options.flips))
+    elif options.mode == "analyze":
+        executor = await AnalyzeExecutor.create(config=config, catalog=catalog, recorder=recorder)
     else:
         executor = await LiveExecutor.create(config=config, catalog=catalog, recorder=recorder)
 
@@ -321,19 +372,24 @@ async def _run_benchmark(options: RunOptions) -> dict[str, Any]:
 
     warmup_record: dict[str, Any] | None = None
     if options.warmup:
-        warmup_record, _warmup_stages = await _execute(executor, selected[0], repeat=0, warmup=True)
+        warmup_record, _warmup_stages = await _execute(
+            executor, selected[0], repeat=0, warmup=True, catalog=catalog, config=config
+        )
         cfg.write_json(paths.root / "warmup.json", warmup_record)
 
     records: list[dict[str, Any]] = []
     stage_records: list[StageRecord] = []
     for repeat in range(1, options.repeats + 1):
         for scenario in selected:
-            record, slice_records = await _execute(executor, scenario, repeat=repeat, warmup=False)
+            record, slice_records = await _execute(
+                executor, scenario, repeat=repeat, warmup=False, catalog=catalog, config=config
+            )
             records.append(record)
             stage_records.extend(slice_records)
             cfg.write_json(paths.scenarios_dir / f"{scenario.scenario_id}-r{repeat}.json", record)
 
     notes = _fixture_notes(options, records)
+    notes.extend(_mode_notes(options))
     if not options.warmup:
         notes.append(
             "NO_WARMUP protocol deviation (2026-10-07 latency-reduction round): the warmup "
@@ -389,14 +445,25 @@ async def _run_benchmark(options: RunOptions) -> dict[str, Any]:
 
 
 async def _execute(
-    executor: ScenarioExecutor, scenario: cfg.Scenario, *, repeat: int, warmup: bool
+    executor: ScenarioExecutor,
+    scenario: cfg.Scenario,
+    *,
+    repeat: int,
+    warmup: bool,
+    catalog: PatternLoader,
+    config: ServerConfig,
 ) -> tuple[dict[str, Any], list[StageRecord]]:
     """Run one scenario, time it at the run boundary and assemble its record."""
     started_ns = executor.recorder.now_ns()
     analysis, result, slice_records, extra = await executor.run(scenario)
     e2e_ms = round((executor.recorder.now_ns() - started_ns) / 1_000_000.0, 3)
     table = stage_table(slice_records)
-    quality = _quality_block(analysis, result, scenario)
+    final_pattern = (
+        scoring.final_pattern_of(analysis, result)
+        if result is not None
+        else _analyze_dominant_pattern(analysis, catalog, config)
+    )
+    quality = _quality_block(analysis, result, scenario, final_pattern=final_pattern)
     stage_total = round(sum(float(entry["total_ms"]) for entry in table.values()), 3)
     residual = residual_ms(e2e_ms, table)
     record: dict[str, Any] = {
@@ -418,6 +485,22 @@ async def _execute(
     return record, slice_records
 
 
+def _analyze_dominant_pattern(analysis: AnalysisResult, catalog: PatternLoader, config: ServerConfig) -> str:
+    """§9 Stage-F election over an analyze-only payload.
+
+    ``DesignPipeline._pipeline_result`` sets ``final_pattern`` to exactly this deterministic
+    composition over the loop's selections (``src/pipeline.py:2064``). Replaying it for the
+    analyze arm keeps its hit definition identical to the full arm's before any loop reselection;
+    a payload that cannot compose raises, exactly as the full arm's GENERATE would.
+    """
+    return compose_selection(
+        selections=analysis.selections,
+        brief=analysis.design_brief,
+        catalog=catalog,
+        config=config,
+    ).primary
+
+
 def _residual_note(residual: float) -> str | None:
     """Explain a negative residual: overlapping stages break the sum-is-wall-clock identity.
 
@@ -434,10 +517,21 @@ def _residual_note(residual: float) -> str | None:
     )
 
 
-def _quality_block(analysis: AnalysisResult, result: PipelineResult, scenario: cfg.Scenario) -> dict[str, Any]:
-    """Every quality metric for one scenario (plan §4)."""
+def _quality_block(
+    analysis: AnalysisResult,
+    result: PipelineResult | None,
+    scenario: cfg.Scenario,
+    *,
+    final_pattern: str | None,
+) -> dict[str, Any]:
+    """Every quality metric for one scenario (plan §4).
+
+    ``result`` is ``None`` on the analyze-only arm; its dominant pattern is the caller-supplied
+    §9 composition of the analysis. Hit, recall, supporting PRF, veto conflicts and the
+    calibration score (the elected primary's candidate ``fit_score``, not the evaluation score)
+    are all observable from the analysis, so only the pipeline block is absent.
+    """
     fallback = scoring.is_fallback(analysis, result)
-    final_pattern = scoring.final_pattern_of(analysis, result)
     hit = (not fallback) and final_pattern is not None and final_pattern in set(scenario.acceptable_primary)
     selected = scoring.selected_ordered(analysis)
     score = scoring.primary_fit_score(analysis)
@@ -465,8 +559,10 @@ def _quality_block(analysis: AnalysisResult, result: PipelineResult, scenario: c
     }
 
 
-def _pipeline_block(result: PipelineResult) -> dict[str, Any]:
-    """Run-level observables of the G–H loop (compact, replay-relevant)."""
+def _pipeline_block(result: PipelineResult | None) -> dict[str, Any] | None:
+    """Run-level observables of the G–H loop (compact, replay-relevant); ``None`` when absent."""
+    if result is None:
+        return None
     return {
         "attempts": result.attempts,
         "final_pattern": result.final_pattern,
@@ -545,6 +641,20 @@ def _fixture_notes(options: RunOptions, records: Sequence[dict[str, Any]]) -> li
         raise ValueError("offline fixture integrity failed:\n  " + "\n  ".join(violations))
     notes.append("offline fixture integrity verified: every non-flipped scenario hit, every flipped scenario missed")
     return notes
+
+
+def _mode_notes(options: RunOptions) -> list[str]:
+    """Mode-specific observability note: what this arm structurally cannot measure."""
+    if options.mode != "analyze":
+        return []
+    return [
+        (
+            "analyze-only arm: hit = the §9 dominant election replayed over the ANALYZE selections "
+            "(the same definition as the full arm's final_pattern before loop reselection), recall = "
+            "the analysis selection; generate/evaluate are skipped, so the pipeline block is null "
+            "and e2e_ms is a phase subset, not a full-run latency"
+        )
+    ]
 
 
 # --------------------------------------------------------------------------------------

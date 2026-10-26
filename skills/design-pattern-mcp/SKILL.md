@@ -22,8 +22,9 @@ OMP applies one MCP request deadline, resolved as: `OMP_MCP_TIMEOUT_MS` env → 
 | `cancel_design` | <1 s |
 | `list_design_patterns` / `get_design_pattern` | <1 s |
 | `select_design_patterns` (full pipeline) | 2–10 min |
+| `analyze_design` (analysis only) | ~1 min |
 
-Use the job trio for the full pipeline. See the device quick reference.
+Use the job trio for the full pipeline. `analyze_design` also exceeds the 30 s deadline and has no job counterpart — raise the server timeout before calling it. See the device quick reference.
 
 ### 2. Tools are `xd://` devices
 
@@ -45,17 +46,20 @@ Existing code/design to score?
 ├── YES → evaluate_design (device mcp__design_pattern_local_evaluate_design)
 └── NO
     ├── Explore the catalog first   → list_design_patterns (category?) → get_design_pattern(name)
-    ├── Full selection + generation → job trio: submit_design_job → get_design_status
-    └── Known patterns             → select_design_patterns (blocking)
+    ├── Agent writes the code       → analyze_design: brief + decision parts + per-part
+    │   itself                        selections with rationale; no generated design
+    ├── Caller wants the design     → job trio: submit_design_job → get_design_status
+    │                                 (full pipeline: analyze → generate → evaluate → refine)
+    └── Known patterns              → generate_design (explicit pattern names)
 ```
 
 ## Device quick reference
 
 | Device suffix | Purpose | Latency |
 |---|---|---|
-| `select_design_patterns` | Full pipeline, one call | 2–10 min |
-| `analyze_design` | Style + pattern recommendations | ~1 min |
-| `generate_design` | Design from explicit patterns | ~1 min |
+| `select_design_patterns` | Design path: full pipeline, one call | 2–10 min |
+| `analyze_design` | Analysis-only: brief + decision parts + per-part selections, no design generated — the path when the agent writes the code itself | ~1 min |
+| `generate_design` | Applications from a prior analyze_design payload or explicit pattern names | ~1 min |
 | `evaluate_design` | Score a design JSON | ~30 s |
 | `submit_design_job` | Start pipeline, returns `job_id` | <1 s |
 | `get_design_status` | Poll job; `result` when `completed` | <1 s |

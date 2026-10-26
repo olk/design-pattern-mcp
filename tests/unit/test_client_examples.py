@@ -39,13 +39,16 @@ def client(request: pytest.FixtureRequest) -> ModuleType:
 def _run_amain(module: ModuleType, monkeypatch: pytest.MonkeyPatch, exc: Exception) -> int:
     """Drive the client's ``amain`` with a stubbed tool call that raises ``exc``."""
     import asyncio
+    import inspect
 
     async def _boom(*_args: object, **_kwargs: object) -> None:
         raise exc
 
-    monkeypatch.setattr(module, "call_select_design_patterns", _boom, raising=False)
+    monkeypatch.setattr(module, "call_design_tool", _boom, raising=False)
     monkeypatch.setattr(module.Client, "call_tool", _boom, raising=False)
     monkeypatch.setattr(module.Client, "__aenter__", _boom, raising=False)
+    if "tool" in inspect.signature(module.amain).parameters:
+        return int(asyncio.run(module.amain("analyze")))
     return int(asyncio.run(module.amain()))
 
 

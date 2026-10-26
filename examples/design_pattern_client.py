@@ -20,28 +20,35 @@
 # SOFTWARE.
 
 """
-Design Pattern MCP — Client Demo (synchronous)
+Design Pattern MCP — Client Demo
 
-Connects to a running MCP server over HTTP, calls select_design_patterns
-with an event-driven ingestion service description, and pretty-prints the
-returned DesignResult JSON to stdout.
+Connects to a running MCP server over HTTP and calls one tool with an
+event-driven ingestion service description, then pretty-prints the JSON
+result:
 
-The call is synchronous from the client's perspective: the tool runs the
-whole selection pipeline before answering, so the HTTP request can take
-tens of seconds (deterministic retrieval + optional generator LLM).
-For short client timeouts use the job trio instead — see
-examples/design_pattern_client_async.py.
+- analyze_design (default) — ANALYZE phase only: repaired brief, decision
+  parts, per-part selections. Fast; no design generated.
+- select_design_patterns (--tool design) — full design artifact: analyze →
+  generate → evaluate → refine. Long-running (minutes).
+
+The design call is synchronous from the client's perspective: the tool runs
+the whole selection pipeline before answering, so the HTTP request can take
+minutes (deterministic retrieval + generator LLM). For short client timeouts
+use the job trio instead — see examples/design_pattern_client_async.py.
 
 Usage:
     # Terminal 1: start the server (Docker dev stack)
     $ make docker-up
 
     # Terminal 2: run the client
-    $ make client
+    $ make client-analyze    # analyze (fast)
+    $ make client-design     # full design
 
 Or pipe the JSON output:
     $ CLIENT_URL=http://localhost:8822/mcp \
-        uv run python examples/design_pattern_client.py 2>/dev/null | jq '.applications[0]'
+        uv run python examples/design_pattern_client.py 2>/dev/null | jq '.selected_patterns'
+    $ CLIENT_URL=http://localhost:8822/mcp \
+        uv run python examples/design_pattern_client.py --tool design 2>/dev/null | jq '.applications[0]'
 
 Requires:
     - MCP server running on http://localhost:8822/mcp (default; raw server: 8050)
@@ -58,6 +65,7 @@ import os
 import sys
 from typing import Any
 
+import click
 from fastmcp import Client  # type: ignore[attr-defined]
 from fastmcp.exceptions import ClientError, McpError, ToolError
 
@@ -80,8 +88,15 @@ dispatch component.
 LANGUAGE = "python"
 
 
-async def call_select_design_patterns(server_url: str) -> dict[str, Any]:
-    """Connect to the MCP server and call the select_design_patterns tool."""
+TOOL_NAMES: dict[str, str] = {
+    "analyze": "analyze_design",
+    "design": "select_design_patterns",
+}
+
+
+async def call_design_tool(server_url: str, tool: str) -> dict[str, Any]:
+    """Connect to the MCP server and call the selected design tool."""
+    tool_name = TOOL_NAMES[tool]
     client = Client(server_url)
 
     async with client:
@@ -90,11 +105,11 @@ async def call_select_design_patterns(server_url: str) -> dict[str, Any]:
         print(f"Available tools: {[t.name for t in tools]}", file=sys.stderr)
 
         print(
-            f"Calling select_design_patterns(language='{LANGUAGE}')...",
+            f"Calling {tool_name}(language='{LANGUAGE}')...",
             file=sys.stderr,
         )
         result = await client.call_tool(
-            "select_design_patterns",
+            tool_name,
             {
                 "description": DESCRIPTION,
                 "language": LANGUAGE,
@@ -120,10 +135,10 @@ def print_startup_hint() -> None:
     )
 
 
-async def amain() -> int:
+async def amain(tool: str) -> int:
     """Call the tool; classify the failure (tool error / transport error / unexpected)."""
     try:
-        result = await call_select_design_patterns(SERVER_URL)
+        result = await call_design_tool(SERVER_URL, tool)
     except ToolError as exc:
         # The server answered and the tool itself failed (ERR_x in the message) —
         # the server is up, so the startup block would be misleading.
@@ -141,9 +156,20 @@ async def amain() -> int:
     return 0
 
 
-def main() -> int:
-    return asyncio.run(amain())
+@click.command()
+@click.option(
+    "--tool",
+    type=click.Choice(tuple(TOOL_NAMES)),
+    default="analyze",
+    show_default=True,
+    help="design tool to call (design runs the full pipeline)",
+)
+def cli(tool: str) -> None:
+    """Call analyze_design (default) or select_design_patterns on a running MCP server."""
+    exit_code = asyncio.run(amain(tool))
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli()

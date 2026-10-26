@@ -42,7 +42,7 @@ DEFAULT_SCENARIOS = SCENARIOS_DIR / "seed.json"
 SCENARIO_SCHEMA = SCENARIOS_DIR / "scenario.schema.json"
 DEFAULT_OUT_DIR = REPO_ROOT / "data" / "benchmark-runs"
 
-MODES: tuple[str, ...] = ("offline", "live", "e2e")
+MODES: tuple[str, ...] = ("offline", "live", "analyze", "e2e")
 SPLITS: tuple[str, ...] = ("train", "holdout")
 
 _SECRET_KEY_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
@@ -170,8 +170,8 @@ def load_server_config(mode: str) -> ServerConfig:
     """Load the effective ``ServerConfig`` for ``mode`` through the production loader.
 
     Only ``offline`` changes anything: its scripted Stage-C hits always clear the §8.1 dual gate,
-    so the two thresholds are pinned to 0 there (see ``README.md`` "Offline mode"). Live and e2e
-    run the shipped configuration unmodified.
+    so the two thresholds are pinned to 0 there (see ``README.md`` "Offline mode"). ``analyze`` and
+    ``live`` run the shipped configuration unmodified; ``analyze`` differs only in phase scope.
     """
     if mode not in MODES:
         raise ValueError(f"unknown benchmark mode {mode!r}; expected one of {MODES}")

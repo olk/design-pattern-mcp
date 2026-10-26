@@ -18,6 +18,7 @@ to `RetrievalIndex.build` and `DesignPipeline.__init__`.
 | `make benchmark-offline` | scripted deterministic run over `scenarios/seed.json` (<60 s) |
 | `make benchmark-offline FLIP=<scenario_id>` | same, with one scenario scripted to miss (compare dry run) |
 | `make benchmark-live LIMIT=2` | real in-process pipeline with full stage attribution |
+| `make benchmark-analyze LIMIT=2` | same live seams, ANALYZE phase only (selection hit/recall, no generation) |
 | `make benchmark-e2e LIMIT=2` | black-box run against the running compose stack |
 | `make benchmark-compare A=<dir> B=<dir>` | two-arm comparison + verdict |
 | `make benchmark-draft` | draft `full.json` candidates from the catalog (`DRY_RUN=1` prints the prompt) |
@@ -31,6 +32,7 @@ Raw entry points (same options via `--help`):
 
 ```bash
 uv run python -m tests.benchmark.harness.main --mode offline --limit 3 --out data/benchmark-runs/offline-smoke
+uv run python -m tests.benchmark.harness.main --mode analyze --out data/benchmark-runs/analyze-all
 uv run python -m tests.benchmark.harness.e2e --limit 2 --out data/benchmark-runs/e2e-smoke
 uv run python -m tests.benchmark.harness.compare data/benchmark-runs/base data/benchmark-runs/cand
 uv run python -m tests.benchmark.harness.draft --dry-run          # corpus drafting prompt
@@ -46,14 +48,14 @@ silently and the manifest's `reasoning_health` records exactly which tool was un
 
 ## Modes: what each one proves
 
-| | offline | live (in-process) | e2e (black-box) |
-|---|---|---|---|
-| retrieval | scripted label pool (`retrieval.scripted`) | real dense + BM25 + cross-encoder (`embed.query`, `rerank`) | server-side, not observable |
-| LLM / reasoning | scripted doubles | real LiteLLM generator + reasoning MCP client (`llm.*`, `reasoning.<phase>`) | server-side |
-| stage attribution | llm/reasoning only | every seam (incl. `build.embed_documents`) | none (total latency only) |
-| quality observables | all metrics | all metrics | hit + recall + `overview.score` only |
-| network / keys | none | TEI sidecars + generator key | full stack |
-| runtime | ~15 s | 300–800 s/request (CPU tier) | 300–800 s/request |
+| | offline | live (in-process) | analyze (in-process) | e2e (black-box) |
+|---|---|---|---|---|
+| retrieval | scripted label pool (`retrieval.scripted`) | real dense + BM25 + cross-encoder (`embed.query`, `rerank`) | same as live | server-side, not observable |
+| LLM / reasoning | scripted doubles | real LiteLLM generator + reasoning MCP client (`llm.*`, `reasoning.<phase>`) | same as live, ANALYZE phases only (`llm.analyze`, `llm.weights`) | server-side |
+| stage attribution | llm/reasoning only | every seam (incl. `build.embed_documents`) | every ANALYZE seam (`embed.query`, `rerank`, `llm.analyze`, `llm.weights`, `reasoning.*`) | none (total latency only) |
+| quality observables | all metrics | all metrics | hit + recall + score/calibration/risk-coverage; pipeline block null | hit + recall + `overview.score` only |
+| network / keys | none | TEI sidecars + generator key | TEI sidecars + generator key | full stack |
+| runtime | ~15 s | 300–800 s/request (CPU tier) | ~60 % of a live request's p50 (no generation) | 300–800 s/request |
 
 **Offline mode is not a quality instrument.** Its Stage-C hits are derived from the scenario's own
 label pool (acceptable primaries first, then acceptable supporting patterns) and the request
@@ -68,6 +70,33 @@ Offline also pins `selection.primary_score_threshold` and `supporting_score_thre
 the scripted pool always clears the §8.1 dual gate; the effective `ServerConfig` is recorded in
 every manifest, and the override is visible in `summary.json` → `per_scenario[].effective_config`.
 
+**Analyze mode is the analysis prefix of live.** It runs the same shipped configuration and the
+same seams, then stops after `DesignPipeline.analyze`: no GENERATE, no EVALUATE, no design loop.
+Hit, recall, supporting F1, acceptable-primary F1, veto conflicts and the calibration score all
+come from the `AnalysisResult`, so they stay observable; the dominant pattern is the deterministic
+§9 composition (`compose_selection`) replayed over the analyze selections — exactly the value the
+full arm's `final_pattern` carries when its loop does not reselect. `pipeline` (attempts,
+evaluation score, matched categories) is `null`, never a zero, and `e2e_ms` is a phase subset, not
+a full-run latency. Use it to price the generation work and to check that a generation-skipping
+default keeps the full arm's selection quality.
+
+**Measured analyze vs live, 2026-10-25** — baseline `benchmarks/live-20261025`, candidate
+`benchmarks/analyze-20261025` (same seed corpus, `NO_WARMUP=1`, MiniMax-M2.7, identical effective
+config/environment/worktree; comparison committed under `benchmarks/analyze-20261025/comparison/`):
+
+| split | hit analyze | hit live | Δ hit (analyze − live) [95 % Newcombe CI] | recall@3 A/L | recall@5 A/L |
+|---|---|---|---|---|---|
+| overall | 12/18 (66.7 %) | 12/18 (66.7 %) | +0.000 [−0.286, +0.286] | 0.267 / 0.300 | 0.378 / 0.367 |
+| train | 8/12 (66.7 %) | 7/12 (58.3 %) | +0.083 [−0.272, +0.412] | 0.267 / 0.283 | 0.400 / 0.350 |
+| holdout | 4/6 (66.7 %) | 5/6 (83.3 %) | −0.167 [−0.558, +0.295] | 0.267 / 0.333 | 0.333 / 0.400 |
+
+Four scenarios flip (2 hits lost, 2 gained), so the equal overall totals are not the same
+scenarios. Latency: analyze p50 161.5 s / p95 378.1 s vs live p50 273.0 s / p95 474.6 s — the
+candidate is 93.2 s faster per scenario at the median (sign test p = 0.0075, 15/18 faster), by
+construction because generation and evaluation are skipped. At n=18 the hit-rate intervals cover
+zero on every split; this arm does not establish a quality regression, and it does not justify
+changing a default either.
+
 ## Stage attribution
 
 `TimingProxy` classes wrap the four injected seams and append one `StageRecord`
@@ -79,7 +108,7 @@ every manifest, and the override is visible in `summary.json` → `per_scenario[
   (`extract_weights_batch`), `llm.generate` (one record per GENERATE batch), `llm.evaluate`,
   `retrieval.scripted` (offline only) and `reasoning.<phase>` (analyze/weights/generate/evaluate/…);
 - `e2e_ms` — wall clock around `DesignPipeline.analyze` + `design_loop` (the two phases
-  `run_design` itself calls, `src/pipeline.py:1358`);
+  `run_design` itself calls, `src/pipeline.py:1358`); the analyze arm times `analyze` only;
 - `residual_ms = e2e_ms − Σ(stage totals)` — a diagnostic of the deterministic core (scoring,
   planning, assembly) and harness overhead. It can go **negative** in live runs: GENERATE
   dispatches up to `generation_max_concurrency` batches in flight
@@ -137,7 +166,11 @@ Both arms run the **same scenario file**; every manifest pins the corpus sha256,
 worktree hash, the masked deployment environment (`REASONING_*` plus every config
 `{env:...}` name) and the effective
 `ServerConfig`. `compare` refuses two runs whose corpus hashes differ (`--allow-mismatch`
-overrides, with a warning) and refuses cross-mode pairs outright; config/env drift is warned on.
+overrides, with a warning) and refuses cross-mode pairs outright — except `analyze` vs `live`,
+which is accepted as a phase-subset pair: hit/recall and the selection metrics compare directly,
+the pipeline block is null on the analyze arm, and the pre-registered p95 rule is reported
+`inconclusive` because the e2e delta is the omitted generate/evaluate work by construction.
+Config/env drift is warned on.
 
 ### Live-run prerequisite (sidecar loopback ports)
 
@@ -204,8 +237,9 @@ data/benchmark-runs/<run-id>/
 
 `compare` writes `comparison.json` + `comparison.md` (default: `<candidate>/comparison/`) and exits
 non-zero for a `candidate-loss` verdict, so a CI step can gate on it. `compare` also **refuses**
-cross-mode pairs (e.g. live vs e2e) and different scenario files; `--allow-mismatch` overrides with
-a recorded warning.
+cross-mode pairs (e.g. live vs e2e) and different scenario files; the analyze/live phase-subset
+pair is the documented exception, and `--allow-mismatch` overrides the rest with a recorded
+warning.
 
 A failed arm leaves an `aborted.json` marker next to its partial `scenarios/` records (the runner
 propagates the failure — live attribution must not average over it) and **no**

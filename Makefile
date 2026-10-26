@@ -12,8 +12,8 @@
 	test-unit test-oracles test-mutations regen-mutmut-baseline test-all \
 	verify-fizz verify-fizz-simulation verify-fizz-garden regen-fizz-traces \
 	verify-ledger verify-cross-consistency verify-patterns verify-all \
-	health client client-async \
-	benchmark-selfcheck benchmark-offline benchmark-live benchmark-e2e benchmark-compare \
+	health client-analyze client-design client-async \
+	benchmark-selfcheck benchmark-offline benchmark-live benchmark-analyze benchmark-e2e benchmark-compare \
 	benchmark-sidecars-up benchmark-draft \
 	docker-build docker-build-all docker-build-cached docker-build-nocache \
 	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
@@ -227,8 +227,11 @@ verify-all: ## Run every verify-* target (nightly entry point)
 health: ## Run the offline readiness check (prints OK)
 	@$(UV) run python -m src --health
 
-client: ## Run the MCP client demo (blocking select_design_patterns)
-	@CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client.py
+client-analyze: ## Run the analyze_design MCP client demo (synchronous)
+	@CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client.py --tool analyze
+
+client-design: ## Run the select_design_patterns MCP client demo (synchronous, long-running)
+	@CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client.py --tool design
 
 client-async: ## Run the async job trio demo (submit_design_job + get_design_status)
 	@CLIENT_URL=http://localhost:8822/mcp $(UV) run python examples/design_pattern_client_async.py
@@ -388,6 +391,8 @@ BENCH_RERANK_URL   ?= http://127.0.0.1:18082
 BENCH_RUN_ARGS     := $(if $(OUT),--out $(OUT),) $(if $(RUN_ID),--run-id $(RUN_ID),) \
 	$(if $(LIMIT),--limit $(LIMIT),) $(if $(SPLIT),--split $(SPLIT),) $(if $(REPEAT),--repeat $(REPEAT),) \
 	$(if $(NO_WARMUP),--no-warmup,) $(if $(LOG_LEVEL),--log-level $(LOG_LEVEL),)
+# In-process arm scope: live = full pipeline, analyze = ANALYZE phase only (no generation).
+BENCH_MODE         ?= live
 
 benchmark-selfcheck: ## Benchmark: hand-computed anchors for every metric formula (no network)
 	$(UV) run python -m tests.benchmark.harness.selfcheck
@@ -425,8 +430,11 @@ benchmark-live: ## Benchmark: in-process live run with full stage attribution
 		export EMBEDDER_API_KEY="$${EMBEDDER_API_KEY:-tei-noauth}"; \
 		export RERANKER_BASE_URL="$(BENCH_RERANK_URL)"; \
 		export DENSE_CACHE_PATH="$(CURDIR)/data/dense-cache"; \
-		exec $(UV) run python -m tests.benchmark.harness.main --mode live \
+		exec $(UV) run python -m tests.benchmark.harness.main --mode $(BENCH_MODE) \
 			--scenarios $(BENCH_SCENARIOS) $(BENCH_RUN_ARGS)'
+
+benchmark-analyze: BENCH_MODE = analyze
+benchmark-analyze: benchmark-live ## Benchmark: in-process analyze-only arm (hit/recall, no generation)
 
 benchmark-e2e: ## Benchmark: black-box run against the running compose stack
 	$(UV) run python -m tests.benchmark.harness.e2e \

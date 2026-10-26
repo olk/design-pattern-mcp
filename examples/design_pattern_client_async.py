@@ -83,7 +83,7 @@ LANGUAGE = "kotlin"
 SHUTDOWN = {"interrupted": False}
 
 
-def _request_shutdown(signum: int, frame: object) -> None:  # noqa: ARG001
+def _request_shutdown() -> None:  # noqa: ARG001
     SHUTDOWN["interrupted"] = True
 
 

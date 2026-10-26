@@ -3,22 +3,34 @@
 ## Pipeline tools (blocking, heartbeat-defended)
 
 ### `select_design_patterns`
-Full pipeline (analyze → weights ∥ retrieval → generate → evaluate → bounded
-refine). Long-running (2–10 min) — prefer the job trio under short timeouts.
+Design path for callers that want the generated design: full pipeline (analyze →
+weights ∥ retrieval → generate → evaluate → bounded refine), returning
+applications with participants, implementation steps, code sketches and bound
+variants, plus quality attributes, a test strategy and risks. Long-running
+(2–10 min) — prefer the job trio under short timeouts.
 
 **Args:** `{"description": "...", "architecture_style"?: str, "language"?: str, "paradigm"?: str, ...}`
 
 **Returns:** `DesignResult` (`overview`, `applications[]`, ... — see `docs/result-schema.json`)
 
 ### `analyze_design`
-Analyze requirements and recommend patterns.
+Analysis-only path for coding agents that write the code themselves: the same
+ANALYZE phase (§1–§8) as `select_design_patterns`, stopping before generation
+and evaluation. Returns the repaired brief, the decision parts and one selection
+per part (primary, supporting patterns with roles, ranked alternatives, veto
+ledger, weights); no `applications[]`.
 
-**Args:** `{"description": "...", ...}`
+**Args:** `{"description": "...", "architecture_style"?: str, "language"?: str, "paradigm"?: str, "focus"?: str}`
+
+**Returns:** `AnalysisResult` (`design_brief`, `decision_parts[]`, `selections{}`)
+plus `selected_patterns` (deduplicated primaries) and `categories`; feed it to
+`generate_design` to materialize the applications.
 
 ### `generate_design`
-Generate design from explicitly named patterns.
+Materialize applications from a prior `analyze_design` payload or explicit
+pattern names.
 
-**Args:** `{"description": "...", "selected_patterns": [...]}`
+**Args:** `{"analysis"?: {...}}` or `{"description": "...", "patterns": [...], "language"?: str}`
 
 ### `evaluate_design`
 Evaluate an existing design.

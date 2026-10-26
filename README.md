@@ -51,12 +51,12 @@ export MINIMAXAI_API_KEY=your_key_here
 make docker-build-all
 make docker-up
 
-# 4. Demo
-make client           # blocking select_design_patterns call
-make client-async     # same run via the background job trio
+# 4. Demo (analyze-only: fast. For the full design: make client-design)
+make client-analyze
+make client-async     # full design via the background job trio
 ```
 
-Server starts on **streamable-http** at `http://localhost:8822/mcp` (dev compose maps host `8822` → container `8050`). `make client` targets `http://localhost:8822/mcp`; override with `CLIENT_URL`.
+Server starts on **streamable-http** at `http://localhost:8822/mcp` (dev compose maps host `8822` → container `8050`). `make client-analyze` / `make client-design` target `http://localhost:8822/mcp`; override with `CLIENT_URL`.
 
 ---
 
@@ -176,6 +176,7 @@ cp -r skills/design-pattern-mcp ~/.omp/agent/skills/
 The skill then tells the agent:
 
 - Which entry point fits OMP's 30 s deadline: the async job trio by default; `select_design_patterns` (full pipeline) takes 2–10 min
+- Which path fits the job: `analyze_design` when the agent writes the code itself (decisions and rationale, no generated design), the full pipeline when the caller wants the design
 - That `job_id` is the only durable handle — persist it (SQLite job store, `JOBS_DB`)
 - How to phrase `description` (component names + responsibilities + constraints), and `language`, `paradigm`, `focus` as separate structured arguments
 - How to interpret `overview.score` (0–100), `findings[]`, and per-part selections
@@ -200,6 +201,8 @@ enricher, sink. Constraints: at-least-once delivery, backpressure, Python.
 ```
 
 Your agent calls `select_design_patterns` internally. The server returns the `DesignResult`: `overview` (primary pattern, supporting patterns, principles, score, reasoning), `applications[]` (participants, interactions, implementation_steps, code_sketch, language_binding with the bound variant), `interactions[]`, `quality_attributes`, `test_strategy`, and `risks[]`.
+
+**Coding agents that write the code themselves should call `analyze_design` instead.** It runs the same ANALYZE phase (§1–§8: brief repair → decision parts → per-part retrieval → quality weights → selection) and stops there: you get the repaired brief, the decision parts and one selection per part (primary, supporting patterns, ranked alternatives, veto ledger, weights) with no generated applications and no evaluation. `select_design_patterns` remains the design path — it continues through GENERATE → EVALUATE, where the bulk of a full run's wall clock goes. Either way, the decisions come from the same ANALYZE stage — a fresh LLM analysis per call, so neither path is idempotent; pass the `analyze_design` payload to `generate_design` if you later want the materialized applications.
 
 **Or call tools directly** from your agent:
 
@@ -279,9 +282,9 @@ make client-async       # Terminal 2
 
 | Tool | Description |
 |---|---|
-| `select_design_patterns` | Full pipeline (analyze → weights ∥ retrieval → generate → evaluate → refine, `LOOP_MAX_TRIES` attempts). *Long-running (2–10 min). Heartbeat-defended.* |
-| `analyze_design` | Requirements analysis only: decision-part decomposition, style/category recommendations. *Long-running (~1 min).* |
-| `generate_design` | Generate a design from explicitly named patterns. *Long-running (~1 min).* |
+| `select_design_patterns` | Design path for callers that want the generated design: full pipeline (analyze → weights ∥ retrieval → generate → evaluate → refine, `LOOP_MAX_TRIES` attempts), returning applications with participants, implementation steps, bound variants, quality attributes, a test strategy and risks. *Long-running (2–10 min). Heartbeat-defended.* |
+| `analyze_design` | Analysis-only path for coding agents that write the code themselves: requirements → brief, decision parts and per-part selection (primary, supporting, alternatives, vetoes, weights) with no generated design. *Long-running (~1 min).* |
+| `generate_design` | Materialize applications from a prior `analyze_design` payload or explicitly named patterns. *Long-running (~1 min).* |
 | `evaluate_design` | Score an existing design JSON against the eight quality axes. *Long-running (~30 s).* |
 | `submit_design_job` | Start a background selection job and return a `job_id` immediately (SQLite-backed, survives server restart). For short-timeout clients. |
 | `get_design_status` | Poll job status; returns the full `DesignResult` when `completed`. |
@@ -352,15 +355,24 @@ Recommended order — macro first, micro second:
      domain: "data-processing"
    # → components (Kafka source, parser filter, enricher, sinks),
    #   relationships, API contracts, data models, event contracts
+   # Keep design_architecture for callers that want the design: the sibling's LLM
+   # generates the architecture artifact (5–10 min) rather than only advising.
 
-2. For each component with non-trivial internal logic, call select_design_patterns with:
-     description: "<component name + responsibilities + constraints from step 1>"
-     language: "python"
-   # → primary + supporting patterns, participants, implementation_steps,
-   #   code_sketch with the bound language variant
+2. For each component with non-trivial internal logic, ask for the pattern decisions:
+   - coding agent writes the code itself → analyze_design with:
+       description: "<component name + responsibilities + constraints from step 1>"
+       language: "python"
+     # → decision parts + per-part selection with rationale; no generated applications
+   - caller wants the generated pattern design → select_design_patterns with:
+       description: "<component name + responsibilities + constraints from step 1>"
+       language: "python"
+     # → primary + supporting patterns, participants, implementation_steps,
+     #   code_sketch with the bound language variant
 ```
 
-Concrete handoff on the IoT example: the sibling emits the `pipe-and-filter` architecture (Kafka source → JSON parser filter → geolocation enricher → InfluxDB/S3 sinks, with at-least-once delivery and backpressure in the contracts). The geolocation enricher's cache-miss path then comes here via `select_design_patterns` ("cache-aside enrichment with Redis fallback, Python") — e.g. a `circuit-breaker` + `retry` design with participants, `implementation_steps`, and a Python `code_sketch` — which the architecture-level component contract references but never implements.
+Both pattern calls run the same ANALYZE stage (§1–§8); `analyze_design` stops there, before generation and evaluation. Each call runs its own LLM analysis (neither tool is idempotent), so two calls can select differently on the same description.
+
+Concrete handoff on the IoT example: the sibling emits the `pipe-and-filter` architecture (Kafka source → JSON parser filter → geolocation enricher → InfluxDB/S3 sinks, with at-least-once delivery and backpressure in the contracts). The geolocation enricher's cache-miss path then comes here: `analyze_design` returns the `circuit-breaker` + `retry` decision with its rationale when your agent writes the enricher, while `select_design_patterns` additionally materializes the applications (participants, `implementation_steps`, a Python `code_sketch`) when the caller wants the generated design — internals the architecture-level component contract references but never implements.
 
 Run both servers side by side (dev host ports `:8060` architecture, `:8822` design-pattern; systemd `:8050` / `:8812`). They are independent — either order works for exploration — but architecture-first keeps component boundaries stable while this server fills in the internals.
 
@@ -620,7 +632,7 @@ Latency note: a full run issues 8 reasoning tool calls (2 per phase) as serial s
 
 ## Long-running tools & timeouts
 
-`select_design_patterns` runs a multi-stage pipeline that **takes minutes per call**. This is inherent to the workload: the generator LLM processes the fused retrieval candidates, per-part quality weights, and the full output of every previous stage, and produces a large, strictly structured JSON document one token at a time. The design loop repeats generate → evaluate up to `LOOP_MAX_TRIES` times.
+`select_design_patterns` runs a multi-stage pipeline that **takes minutes per call**. This is inherent to the workload: the generator LLM processes the fused retrieval candidates, per-part quality weights, and the full output of every previous stage, and produces a large, strictly structured JSON document one token at a time. The design loop repeats generate → evaluate up to `LOOP_MAX_TRIES` times. If the caller only needs the pattern decisions (the agent writes the code itself), `analyze_design` runs §1–§8 alone and skips the generate → evaluate loop.
 
 ### Four bounds govern a run — do not confuse them
 
@@ -647,14 +659,17 @@ cancel_design(job_id)                           → best-effort, next stage boun
 
 `submit_design_job` returns a `job_id` in milliseconds; the pipeline runs in a background task and the store is SQLite (`JOBS_DB`). Poll every 10–30 seconds. **This is the fix that works for TS-SDK clients.**
 
-### Bypassing client timeouts entirely: `make client`
+### Bypassing client timeouts with a direct HTTP client
 
 `examples/design_pattern_client.py` is a direct Python HTTP client with **no client-side idle timeout** — one blocking request, full response regardless of duration:
 
 ```bash
 make docker-up          # Terminal 1
-make client             # Terminal 2
+make client-analyze     # Terminal 2: analyze_design only
+make client-design      # Terminal 2: select_design_patterns, the long synchronous call
 ```
+
+Both targets drive the same direct client (`--tool analyze|design`). `make client-design` demonstrates that the server **correctly completes** long requests — the timeout issue is purely a client-side problem. Host applications that wrap MCP (Claude Desktop, Cursor, …) impose their own timeouts; use the async job trio there.
 
 ---
 
@@ -662,7 +677,7 @@ make client             # Terminal 2
 
 This repo treats selection quality and pipeline latency as measured properties, not claims.
 
-**Benchmark harness** (`tests/benchmark/`, `make benchmark-*`): an 18-scenario corpus with holdout split; `make benchmark-live NO_WARMUP=1 OUT=benchmarks/<arm> RUN_ID=<id>` runs the full pipeline in-process with per-stage attribution (reasoning.*, llm.*, rerank, embed — calls, latency, chars/s, repair counters). `make benchmark-selfcheck` hand-verifies every metric formula. `make benchmark-compare A=<baseline> B=<candidate>` applies the preregistered rule — *candidate wins iff holdout p95 e2e improves ≥ 15 % AND candidate overall acceptable-primary hit rate ≥ the baseline's overall Wilson lower bound* — and **exits 1 on candidate-loss**. The e2e mode measures the deployed compose stack and is not comparable with the in-process mode.
+**Benchmark harness** (`tests/benchmark/`, `make benchmark-*`): an 18-scenario corpus with holdout split; `make benchmark-live NO_WARMUP=1 OUT=benchmarks/<arm> RUN_ID=<id>` runs the full pipeline in-process with per-stage attribution (reasoning.*, llm.*, rerank, embed — calls, latency, chars/s, repair counters). `make benchmark-analyze` runs the same seams and stops after ANALYZE (selection hit/recall/score, no generation); `make benchmark-compare` accepts an analyze/live pair and reports the hit-rate Newcombe interval, the selection metric deltas and the hit flips, with the p95 latency rule marked inapplicable because the e2e delta is the skipped generation work. `make benchmark-selfcheck` hand-verifies every metric formula. `make benchmark-compare A=<baseline> B=<candidate>` applies the preregistered rule — *candidate wins iff holdout p95 e2e improves ≥ 15 % AND candidate overall acceptable-primary hit rate ≥ the baseline's overall Wilson lower bound* — and **exits 1 on candidate-loss**. The e2e mode measures the deployed compose stack and is not comparable with the in-process mode.
 
 **Reference arms** (committed under `benchmarks/`, all MiniMax-M2.7, 18 scenarios):
 
@@ -671,6 +686,14 @@ This repo treats selection quality and pipeline latency as measured properties, 
 | `base-fresh` | shipped defaults (reasoning all phases on) | 288.4 s | 439.6 s |
 | `cfg-reasoning` | + weights/evaluate reasoning off (opt-in env) | 253.0 s | 413.9 s |
 | `code-levers` | + L5 truncation-boost, L6 trace cap, L7 stable-prefix (all default-off, env-driven) | 223.6 s | 379.2 s |
+| `analyze-20261025` | analyze-only arm (no generate/evaluate), same config/env as `live-20261025` | 161.5 s | 378.1 s |
+| `live-20261025` | full pipeline, `NO_WARMUP=1`, shipped defaults | 273.0 s | 474.6 s |
+
+The analyze-vs-live pair (2026-10-25, baseline `live-20261025`, candidate `analyze-20261025`)
+measured **12/18 vs 12/18** overall acceptable-primary hits (Newcombe Δ +0.000 [−0.286, +0.286]);
+holdout 4/6 vs 5/6 (Δ −0.167 [−0.558, +0.295]), recall@5 0.378 vs 0.367. Two scenarios flip in
+each direction (4 total), so the equal totals are different scenarios; the intervals cover zero on
+every split. No default was changed on this evidence.
 
 The code levers are shipped as opt-in env configuration, not defaults: the cumulative win claim passed the preregistered gate against `base-fresh` (holdout p95 410.9 → 297.5 s = 27.6 % ≥ 15 %, overall 13/18 ≥ floor), but the attribution comparison against `cfg-reasoning` recorded a candidate-loss (+12.5 % < 15 %), so defaults stay behavior-neutral. To opt in:
 
@@ -753,11 +776,11 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 | `make test-mutations` | mutmut ratchet against `verify/mutmut-baseline.json` |
 | `make verify-fizz` | Exhaustive FizzBee model checks (L4) |
 | `make verify-ledger` / `make verify-cross-consistency` | Ledger + NL-doc consistency gates |
-| `make benchmark-live` / `make benchmark-compare` / `make benchmark-selfcheck` | Benchmark harness (see above) |
+| `make benchmark-live` / `make benchmark-analyze` / `make benchmark-compare` / `make benchmark-selfcheck` | Benchmark harness (see above) |
 | `make embed-cache` | Force-regenerate `data/dense-cache/` |
 | `make docker-build-all` | Build all three images (dense cache baked in) |
 | `make docker-up` / `make docker-down` | Start / stop the dev stack |
-| `make client` / `make client-async` | Demo clients against `http://localhost:8822/mcp` |
+| `make client-analyze` / `make client-design` / `make client-async` | Demo clients against `http://localhost:8822/mcp` |
 | `make docker-publish` | Push the server image to Docker Hub + GHCR (+ git tag) |
 
 **Development workflow:**

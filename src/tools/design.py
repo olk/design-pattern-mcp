@@ -61,7 +61,10 @@ class SelectDesignPatternsTool:
             "language bindings and a traceable reasoning trail. Send the components, their "
             "responsibilities and the constraints derived from an architecture result. Returns "
             "applications (pattern, participants, implementation steps, bound language variant), "
-            "supporting patterns, interactions, quality attributes, a test strategy and risks."
+            "supporting patterns, interactions, quality attributes, a test strategy and risks. Use "
+            "this when the caller wants the generated design; when your agent writes the code itself "
+            "and only needs the decisions, call analyze_design instead — it runs the same ANALYZE "
+            "phase and skips generation and evaluation."
         ),
         tags={"design-patterns", "selection"},
         annotations=ToolAnnotations(
@@ -140,9 +143,7 @@ class SelectDesignPatternsTool:
                 ("focus", focus),
             ):
                 if value is not None:
-                    ensure_printable_text(
-                        value, field=field_name, allow_line_breaks=False, max_length=200
-                    )
+                    ensure_printable_text(value, field=field_name, allow_line_breaks=False, max_length=200)
             result = await run_bounded(
                 self._pipeline.run_design(
                     description=text,

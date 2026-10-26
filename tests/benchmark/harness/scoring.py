@@ -65,16 +65,18 @@ def first_part_selection(analysis: AnalysisResult) -> PartSelection | None:
     return None
 
 
-def is_fallback(analysis: AnalysisResult, result: PipelineResult) -> bool:
-    """Run-level fallback: the loop's flag, the analysis flag or any part-level fallback."""
-    if result.is_fallback or analysis.is_fallback:
+def is_fallback(analysis: AnalysisResult, result: PipelineResult | None) -> bool:
+    """Run-level fallback: the loop's flag when a result exists, else the analysis flag."""
+    if result is not None and result.is_fallback:
+        return True
+    if analysis.is_fallback:
         return True
     return any(selection.is_fallback for selection in analysis.selections.values())
 
 
-def final_pattern_of(analysis: AnalysisResult, result: PipelineResult) -> str | None:
+def final_pattern_of(analysis: AnalysisResult, result: PipelineResult | None) -> str | None:
     """The pipeline's dominant pattern; falls back to the first part's primary when absent."""
-    if result.final_pattern:
+    if result is not None and result.final_pattern:
         return result.final_pattern
     selection = first_part_selection(analysis)
     return selection.primary if selection is not None else None
@@ -188,15 +190,11 @@ def veto_conflicts(analysis: AnalysisResult) -> list[dict[str, str]]:
             if name is not None:
                 vetoed.add(name)
         if selection.primary and selection.primary in vetoed:
-            conflicts.append(
-                {"type": "vetoed_pattern_elected", "part": part.id, "pattern": selection.primary}
-            )
+            conflicts.append({"type": "vetoed_pattern_elected", "part": part.id, "pattern": selection.primary})
         for pattern in sorted(supporting & vetoed):
             conflicts.append({"type": "vetoed_pattern_supported", "part": part.id, "pattern": pattern})
         if selection.primary and selection.primary in supporting:
-            conflicts.append(
-                {"type": "primary_in_supporting", "part": part.id, "pattern": selection.primary}
-            )
+            conflicts.append({"type": "primary_in_supporting", "part": part.id, "pattern": selection.primary})
     return conflicts
 
 
@@ -220,8 +218,15 @@ def brier(entries: Sequence[tuple[float, bool]]) -> float | None:
 def calibration(entries: Sequence[tuple[float, bool]], bins: int = ECE_BINS) -> dict[str, Any]:
     """Brier + 10-bin equal-width ECE with the full reliability table (per arm, train split only)."""
     table = [
-        {"bin": index, "low": round(index / bins, 3), "high": round((index + 1) / bins, 3), "count": 0,
-         "avg_score": None, "accuracy": None, "gap": None}
+        {
+            "bin": index,
+            "low": round(index / bins, 3),
+            "high": round((index + 1) / bins, 3),
+            "count": 0,
+            "avg_score": None,
+            "accuracy": None,
+            "gap": None,
+        }
         for index in range(bins)
     ]
     # One pass: per bin, accumulate clipped scores and hit bits (n = score count = hit count).
@@ -241,8 +246,12 @@ def calibration(entries: Sequence[tuple[float, bool]], bins: int = ECE_BINS) -> 
         avg_score = score_sums[index] / counts[index]
         accuracy = hit_sums[index] / counts[index]
         table[index].update(
-            {"count": counts[index], "avg_score": round(avg_score, 6), "accuracy": round(accuracy, 6),
-             "gap": round(abs(accuracy - avg_score), 6)}
+            {
+                "count": counts[index],
+                "avg_score": round(avg_score, 6),
+                "accuracy": round(accuracy, 6),
+                "gap": round(abs(accuracy - avg_score), 6),
+            }
         )
         ece += (counts[index] / len(entries)) * abs(accuracy - avg_score)
     return {"brier": brier(entries), "ece": round(ece, 6) if entries else None, "bins": table}
@@ -267,10 +276,7 @@ def risk_coverage(entries: Sequence[tuple[float, bool]]) -> dict[str, Any]:
         risk = misses / index
         risks.append(risk)
         points.append((index / total, risk))
-    auc = sum(
-        (points[i + 1][0] - points[i][0]) * (points[i][1] + points[i + 1][1]) / 2
-        for i in range(len(points) - 1)
-    )
+    auc = sum((points[i + 1][0] - points[i][0]) * (points[i][1] + points[i + 1][1]) / 2 for i in range(len(points) - 1))
     return {
         "samples": total,
         "risk_at_80": round(risks[max(1, math.ceil(0.8 * total)) - 1], 6),
@@ -300,8 +306,7 @@ def wilson_interval(successes: int, total: int, z: float = Z_95) -> dict[str, An
     """Wilson score interval for a binomial proportion; ``null`` bounds when ``total == 0``."""
     bounds = _wilson_bounds(successes, total, z)
     if bounds is None:
-        return {"successes": successes, "total": total, "p_hat": None, "low": None, "high": None,
-                "note": "no samples"}
+        return {"successes": successes, "total": total, "p_hat": None, "low": None, "high": None, "note": "no samples"}
     low, high = bounds
     return {
         "successes": successes,
