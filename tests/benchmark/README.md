@@ -216,13 +216,15 @@ primary's subgroup and enforces the family-disjoint split.
 Seed labels are author-drafted (catalog-grounded) and **await expert review**; the seed run is the
 Stage-0 dry run.
 
-`scenarios/full.json` (60–90 reviewed scenarios, 2–3 per family) is produced by
-`tests/benchmark/harness/draft.py`: it drafts per family from the real catalog records, repairs
-ids deterministically, assigns the split by family and writes
-`data/benchmark-runs/drafts/full.draft.json`. The catalog carries 53 families, so
-`--per-family 2` yields ~106 candidates — the review step is where the ~60–90 that join
-`full.json` are selected (drop the weaker siblings, keep both splits family-disjoint). That file
-lives under `data/` (gitignored) and is **never committed**.
+`scenarios/full.json` — 100 reviewed scenarios across all 52 sibling-capable families
+(whole-part excluded: a single record, so no sibling is possible), split 70 train / 30
+holdout by `draft.py`'s family rule (last third of the sorted family order → holdout,
+family-disjoint). Produced 2026-10-27 via `make benchmark-draft` (MiniMax-M2.7,
+`--per-family 3`, 156 candidates) + agent curation to 100; descriptions never name the
+pattern or its family's aliases, and each scenario carries a concrete language chosen
+under the no-discouraged-label rule. Drafts live under `data/benchmark-runs/drafts/`
+(gitignored, never committed). Full labels are agent-curated and **await human expert
+review**.
 
 ## Run directory
 
