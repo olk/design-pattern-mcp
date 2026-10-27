@@ -12,15 +12,16 @@ scenarios, so no new review burden). Corpus labels are agent-curated,
 | `choice.jsonl` | 100 | `state` + 9 `criteria` + `label` (category) | J2 category |
 | `noul.jsonl` | 1900 | `state` + `proposition` + boolean `label` | J1 per-candidate relevance |
 
-`state` = scenario `description` + `decision_statement`. Each record carries
-`source: {corpus, corpus_sha12, scenario_id, split}`.
-
-- Choice: 1 per scenario, criteria = the 9 catalog categories, label = the
+- Choice: 1 per scenario, criteria = the 9 catalog categories with a one-line
+  gloss each (same `_STYLE_GLOSSES` idea as the style seam), label = the
   scenario's category.
 - Noul: 19 per scenario — every labeled pattern is a positive
   (`label_tier`: `primary` / `acceptable_primary` / `supporting`), padded
   with cross-category negatives (`label_tier: negative`, deterministic
   per-scenario seed) for a fixed 19. Verdict: 307 true / 1593 false.
+  `candidate_text` is the compact catalog evidence (`name: intent` + problem
+  excerpt) — the CLM action text / J1 compact evidence; `proposition` embeds
+  it so single-text trainers also see description alignment, not just names.
 
 ## Split
 
