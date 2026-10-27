@@ -23,6 +23,12 @@ Finetuning notes:
   (families never cross the split — see the corpus `_meta`).
 - `answer` is the primary label; `labels.acceptable_primary` holds the
   near-miss siblings a reviewer would also accept (soft-label source).
+- Label budget gate (`docs/recommendation_design-pattern-mcp_decision-models.md`
+  §7.5): do not fine-tune before the label budget and a measured gap exist —
+  <200 labels means prompting, 200–1,000 is possible with review, and the
+  AnyJev/CLM/Eikos/Clef/Kev recipes want 500–2,000 labeled decisions. These
+  100 pairs (still awaiting human expert review) are seed data to extend
+  toward that budget, not a training set for a 4B–9B model.
 - Per `docs/recommendation_design-pattern-mcp_decision-models.md` §1.5, decision
   models belong only in bounded judgments (category, per-candidate relevance,
   weights, defer) — never as the final pattern selector.
