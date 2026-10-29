@@ -15,7 +15,7 @@ import os
 from typing import Any, ClassVar, Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.config_expansion import expand_env_in_obj
 from src.reasoning.config import ReasoningConfig
@@ -128,6 +128,13 @@ class RerankerConfig(BaseModel):
     #: first two use cases (~3x fewer characters, measured 3.6-4.3x faster on
     #: the CPU sidecar). Rankings are NOT equivalent — capsule is opt-in.
     rerank_text: Literal["full", "capsule"] = Field(default="full")
+    #: Rerank backend (§6 step 4): ``tei`` = the cross-encoder sidecar (default),
+    #: ``clm`` = clm-serve ``POST /v1/rank`` with the already-hosted CLM-8B
+    #: encoder — every failure falls back to the TEI sidecar, so retrieval never
+    #: depends on the CLM stack being up.
+    provider: Literal["tei", "clm"] = Field(default="tei")
+    clm_base_url: str = Field(default="http://design-pattern-clm:8700/v1")
+    clm_timeout_seconds: float = Field(default=60.0, gt=0.0)
     config: RerankerInnerConfig = Field(default_factory=RerankerInnerConfig)
 
     model_config = {"extra": "forbid"}
@@ -304,38 +311,111 @@ class PromptConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-class DecisionsConfig(BaseModel):
-    """Decision-model (JEV) integration configuration. Opt-in: default off."""
+class DecisionSeamConfig(BaseModel):
+    """One decision-model seam: provider endpoint plus the gate knobs that bound it.
 
-    enabled: bool = Field(
-        default=False,
-        description="Master switch. Opt in via DECISIONS_ENABLED=true.",
-    )
+    Every seam is default-off. ``provider`` records which serving stack answers the
+    seam so the startup report can say it out loud; the wire is fixed per provider
+    (``clm`` = TypeSafe-compatible ``/v1/systemone`` + ``/v1/rank``, ``tacit`` =
+    AnyJev ``/v1/decide``). ``api_key_env`` is the only credential path: it stays
+    reachable for a hosted endpoint with the same wire, and ``None`` means no
+    ``Authorization`` header at all.
+    """
+
+    enabled: bool = Field(default=False, description="Opt-in seam switch.")
+    provider: Literal["clm", "tacit"] = Field(default="clm", description="Serving stack behind the seam.")
     base_url: str = Field(
-        default="https://opencode.ai/inference/systemone/v1",
-        description="Decision-model provider host; /systemone appended.",
+        default="http://design-pattern-clm:8700/v1",
+        description="clm-serve /v1 root, or the anyjev gateway root (no /v1 suffix).",
     )
-    model: str = Field(
-        default="jev-1.13-free",
-        description="Pinned model (OpenCode free tier, limited-time); jev-1.13 is the paid pin.",
+    model: str = Field(default="clm-latest", description="Served model name (clm-latest | tacit-4b).")
+    api_key_env: str | None = Field(
+        default=None,
+        description="Optional env var holding a bearer key; None = no Authorization header.",
     )
-    api_key_env: str = Field(
-        default="OPENCODE_API_KEY",
-        description="Env var holding the OpenCode Console API key (Go/Go Plus).",
-    )
-    style_confidence_floor: float = Field(
+    confidence_floor: float = Field(
         default=0.5,
         ge=0.0,
         le=1.0,
-        description="Minimum choice confidence to override the LLM-extracted style.",
+        description="Minimum confidence/probability to act on the answer (ignored by the weights seam).",
     )
     timeout_seconds: float = Field(
-        default=5.0,
+        default=10.0,
         gt=0.0,
-        description="Per-call timeout; expiry degrades to the LLM style.",
+        description="Per-call timeout; expiry degrades to the non-model path.",
     )
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _empty_key_env_is_none(cls, value: str | None) -> str | None:
+        """Treat an empty placeholder (``""``) as "no auth", not as "look up ''"."""
+        return value or None
+
+
+#: Per-seam defaults. ``DecisionSeamConfig``'s own defaults describe the CLM wire; a seam
+#: that points elsewhere must keep ITS endpoint when a caller supplies only a partial
+#: override (``{"weights": {"enabled": true}}``), which a nested-model replacement would
+#: otherwise resolve back onto the CLM defaults.
+_SEAM_DEFAULTS: dict[str, dict[str, Any]] = {
+    "style": {
+        "provider": "clm",
+        "base_url": "http://design-pattern-clm:8700/v1",
+        "model": "clm-latest",
+        "timeout_seconds": 10.0,
+    },
+    "weights": {
+        "provider": "tacit",
+        "base_url": "http://design-pattern-tacit:8100",
+        "model": "tacit-4b",
+        "timeout_seconds": 30.0,
+    },
+    "category": {
+        "provider": "tacit",
+        "base_url": "http://design-pattern-tacit:8100",
+        "model": "tacit-4b",
+        "timeout_seconds": 10.0,
+    },
+    "reasoning_gate": {
+        "provider": "tacit",
+        "base_url": "http://design-pattern-tacit:8100",
+        "model": "tacit-4b",
+        "timeout_seconds": 5.0,
+    },
+}
+
+
+class DecisionsConfig(BaseModel):
+    """The four decision-model seams (JEV report §1.5); all default-off, wired per seam.
+
+    Hosted TypeSafe Jev defaults are gone — the same wire stays reachable by pointing
+    ``base_url`` + ``api_key_env`` at it. A seam left out of the config keeps its own
+    default endpoint, and a *partial* seam object is merged onto that endpoint rather than
+    replaced by the generic ``DecisionSeamConfig`` defaults.
+    """
+
+    style: DecisionSeamConfig = Field(default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["style"]))
+    weights: DecisionSeamConfig = Field(default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["weights"]))
+    category: DecisionSeamConfig = Field(default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["category"]))
+    reasoning_gate: DecisionSeamConfig = Field(
+        default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["reasoning_gate"])
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_partial_seams(cls, data: Any) -> Any:
+        """Fill each supplied seam object's absent keys from that seam's own defaults."""
+        if not isinstance(data, dict):
+            return data
+        merged = dict(data)
+        for name, defaults in _SEAM_DEFAULTS.items():
+            value = merged.get(name)
+            if isinstance(value, dict):
+                merged[name] = {**defaults, **value}
+        return merged
 
 
 class ServerConfig(BaseModel):
@@ -415,9 +495,12 @@ class ServerConfig(BaseModel):
             "generator_circuit_breaker_failure_threshold": (self.generator.config.circuit_breaker_failure_threshold),
             "generator_circuit_breaker_cooldown_seconds": (self.generator.config.circuit_breaker_cooldown_seconds),
             "tasks_deadline_seconds": self.tasks.deadline_seconds,
-            "decisions_enabled": self.decisions.enabled,
-            "decisions_model": self.decisions.model,
-            "decisions_style_confidence_floor": self.decisions.style_confidence_floor,
+            "decisions_style_enabled": self.decisions.style.enabled,
+            "decisions_style_model": self.decisions.style.model,
+            "decisions_weights_enabled": self.decisions.weights.enabled,
+            "decisions_category_enabled": self.decisions.category.enabled,
+            "decisions_reasoning_gate_enabled": self.decisions.reasoning_gate.enabled,
+            "reranker_provider": self.reranker.provider,
         }
 
 
@@ -432,9 +515,7 @@ class ConfigManager:
     def load_config(cls, config_path: str | None = None) -> dict[str, Any]:
         """Resolve CONFIG_PATH env > argument > DEFAULT_CONFIG_PATH, expand, return."""
         load_dotenv()
-        resolved = os.path.expanduser(
-            os.environ.get("CONFIG_PATH") or config_path or cls.DEFAULT_CONFIG_PATH
-        )
+        resolved = os.path.expanduser(os.environ.get("CONFIG_PATH") or config_path or cls.DEFAULT_CONFIG_PATH)
         try:
             with open(resolved, encoding="utf-8") as fh:
                 raw: dict[str, Any] = json.load(fh)

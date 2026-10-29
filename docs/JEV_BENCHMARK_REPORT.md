@@ -5,6 +5,10 @@ Corpus: `tests/benchmark/scenarios/seed.json`, holdout split (6 scenarios × REP
 Generator: `minimax/MiniMax-M2.7` · Decision model: `jev-1.13-free` via OpenCode SystemOne ·
 Verdict: **`candidate-loss` — keep `DECISIONS_ENABLED=false`**
 
+> **Renamed per-seam 2026-10-27** (`DECISIONS_ENABLED` → `decisions.{style,weights,category,reasoning_gate}`,
+> all default-off; hosted Jev is no longer a default). The record below is unedited: it measures the
+> *style* seam against hosted `jev-1.13-free`, and its verdict still holds for that seam.
+
 ## 1. What was tested
 
 Whether routing the Ch2 architecture-style choice through the hosted JEV decision model

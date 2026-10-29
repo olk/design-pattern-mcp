@@ -4,7 +4,11 @@
 
 **Evidence cutoff:** 2026-10-27. **Consumer:** `/home/graemer/Projekte/Python/design-pattern-mcp` (catalog 486 main records, 6,804 language files, 9 categories, 7 scopes). **Hardware:** CPUs and GPUs; training limited to 4× RTX 3090 (24 GB each, 96 GB total).
 
-**Status:** recommendation complete. The one-line answer is in §0; the evidence is in §1–§6; the adoption plan is in §7.
+**Status:** recommendation complete, and **implemented** (2026-10-27): the four decision seams and the
+rerank provider switch ship in `src/decisions/`, `src/patterns/clm_rerank.py` and the two
+`docker/Dockerfile.{tacit,clm}` sidecars, all default-off — see README §"Decision models
+(CLM-8B + AnyJev Tacit-4B)" and `docs/implementation-guide.md` §6/§7.1/§14. The one-line answer is
+in §0; the evidence is in §1–§6; the adoption plan is in §7.
 
 ---
 

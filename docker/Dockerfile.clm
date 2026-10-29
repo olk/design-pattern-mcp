@@ -1,0 +1,178 @@
+# syntax=docker/dockerfile:1.14-labs
+# CLM-8B sidecar for design-pattern-mcp: the Ch2 style seam and the J1 rerank leg.
+#
+# One container, two stacks (this is how CLM is served upstream):
+#   * ``vllm serve /models/qwen3-8b --runner pooling`` on 127.0.0.1:8090 — the frozen
+#     Qwen3-8B encoder (16 GB of the GPU budget);
+#   * ``clm-serve`` on 0.0.0.0:8700 — two 20M contrastive heads over that encoder,
+#     exposing the TypeSafe-compatible wire this server speaks:
+#       POST /v1/systemone  {model, state, questions: {id: {type, instructions, criteria}}}
+#                           -> {answers: {id: {choice, confidence, probabilities}}}
+#       POST /v1/rank       {context, question, answers[]} -> {ranked: [{rank, candidate, prob}]}
+#       GET  /health, GET /v1/models
+#
+# The heads are *fine-tuned in this build* on this repo's own typed decision labels
+# (``qa/typed/choice.jsonl``, train split only — the benchmark holdout families never
+# reach the weights). The fine-tune is domain adaptation of the
+# (state, question, candidate) heads to this server's decision questions, not a
+# category classifier: nothing here is wired to the category seam (that is Tacit).
+#
+# Two runtime targets, because the fine-tune needs a GPU on the builder:
+#
+#   --target runtime-finetuned  (default) heads trained in this build; needs a GPU on the
+#                               builder (see the entitlement note below).
+#   --target runtime-released   released heads baked untrained; NO GPU anywhere.
+#
+# The Makefile drives them: ``make docker-build-clm`` and ``make docker-build-clm-base``.
+# The fine-tune RUN requests a GPU through a CDI device, which BuildKit gates behind an
+# explicit entitlement — Docker's ``RUN`` has no ``--gpus`` flag:
+#
+#   docker build --allow device=nvidia.com/gpu=all -f docker/Dockerfile.clm .
+#
+# Requirements for the default target: Docker >= 25 with CDI specs generated
+# (``nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml``) and a working NVIDIA
+# runtime. The labs frontend is pinned because ``RUN --device`` only exists from
+# dockerfile 1.14.0-labs onward.
+#
+# The GPU itself must be Ampere or newer: vLLM needs compute capability >= 7.0, so the
+# 8B encoder cannot even serve on an older card and the fine-tune stage fails first.
+#
+# Build args (the Makefile forwards them):
+#   CLM_ENCODER_REPO   encoder (default ``Qwen/Qwen3-8B``).
+#   CLM_HEADS_REPO     released heads (default ``Contrastive-LM/CLM-v0.1-8B``).
+#   CLM_REPO_PIN       CLM git revision (default ``d5f9ef0``).
+#   VLLM_IMAGE_TAG     vLLM base image tag (default ``v0.17.1``).
+#   CLM_FINETUNE_BATCH choice-head batch size (default 32).
+#
+# Not in the default build: the ``--task clm`` rank fine-tune over the 1400 noul train
+# rows. That flow wants the precomputed-embedding dataset path
+# (``preprocessing/hf_embeddings.py``) to amortise the encoder pass over marginal data
+# volume, so it is an explicit follow-up (``--task clm --emb-dir ...``) rather than part
+# of every image build. The released heads already serve ``/v1/rank``.
+
+ARG VLLM_IMAGE_TAG=v0.17.1
+
+# -- Stage 1: download the frozen encoder ------------------------------------------------
+FROM python:3.11-slim AS encoder
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG CLM_ENCODER_REPO=Qwen/Qwen3-8B
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "from huggingface_hub import snapshot_download; \
+        snapshot_download('${CLM_ENCODER_REPO}', local_dir='/models/qwen3-8b')"
+
+# -- Stage 2: download the released projection heads ------------------------------------
+FROM python:3.11-slim AS heads
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG CLM_HEADS_REPO=Contrastive-LM/CLM-v0.1-8B
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "from huggingface_hub import hf_hub_download; \
+        hf_hub_download('${CLM_HEADS_REPO}', 'CLM_v0.1-8B.pt', local_dir='/clm/heads-released')"
+
+# -- Stage 3: fine-tune the heads on this repo's typed labels (GPU builder) --------------
+FROM vllm/vllm-openai:${VLLM_IMAGE_TAG} AS finetune
+
+ARG CLM_REPO_PIN=d5f9ef0
+ARG CLM_FINETUNE_BATCH=32
+
+COPY --from=encoder /models/qwen3-8b /models/qwen3-8b
+COPY --from=heads /clm/heads-released /clm/heads-released
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/Contrastive-LM/CLM.git /opt/CLM \
+    && cd /opt/CLM && git checkout "${CLM_REPO_PIN}" \
+    && pip install --no-cache-dir -e . pyarrow \
+    && rm -rf /opt/CLM/.git
+
+COPY scripts/decision_models/export_clm_dataset.py /build/export_clm_dataset.py
+COPY qa/typed/choice.jsonl /build/qa/typed/choice.jsonl
+
+# One fat RUN: start the encoder, export the dataset, fine-tune the choice heads, stop.
+# The vLLM process is what supplies the 8B embeddings the heads train over, so it has to
+# be alive for the duration; the trap keeps it from leaking into the layer on failure.
+RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
+    trap "kill ${VLLM_PID:-0} 2>/dev/null || true" EXIT INT TERM; \
+    vllm serve /models/qwen3-8b --served-model-name qwen3-8b --runner pooling \
+      --max-model-len 2048 --host 127.0.0.1 --port 8090 & \
+    VLLM_PID=$!; \
+    until python3 -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8090/health\", timeout=3)" 2>/dev/null; do \
+      kill -0 "${VLLM_PID}" 2>/dev/null || { echo "encoder failed to start" >&2; exit 1; }; \
+      sleep 3; \
+    done; \
+    python3 /build/export_clm_dataset.py \
+      --choice /build/qa/typed/choice.jsonl --out /clm/data/typed-choice; \
+    python3 /opt/CLM/train/finetune.py \
+      --task choice \
+      --data /clm/data/typed-choice \
+      --workflow all \
+      --init-ckpt /clm/heads-released/CLM_v0.1-8B.pt \
+      --out-dir /clm/heads-trained \
+      --embed-url http://127.0.0.1:8090/v1/embeddings \
+      --embed-model qwen3-8b \
+      --max-len 2048 \
+      --batch "${CLM_FINETUNE_BATCH}"; \
+    kill -TERM "${VLLM_PID}" 2>/dev/null || true; \
+    wait "${VLLM_PID}" 2>/dev/null || true'
+
+# -- Stage 4: runtime shell shared by both targets ---------------------------------------
+FROM vllm/vllm-openai:${VLLM_IMAGE_TAG} AS runtime-base
+
+ARG CLM_REPO_PIN=d5f9ef0
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir "git+https://github.com/Contrastive-LM/CLM@${CLM_REPO_PIN}"
+
+COPY --from=encoder /models/qwen3-8b /models/qwen3-8b
+COPY docker/clm-entrypoint.sh /usr/local/bin/clm-entrypoint.sh
+RUN chmod +x /usr/local/bin/clm-entrypoint.sh
+
+# No hub access at runtime: encoder and heads are in the image, and --no-download keeps
+# clm-serve from trying to fetch the reference head.
+ENV HF_HUB_OFFLINE=1 \
+    CLM_MODEL_DIR=/models/qwen3-8b \
+    CLM_SERVED_MODEL=qwen3-8b \
+    CLM_UPSTREAM_PORT=8090 \
+    CLM_PORT=8700 \
+    CLM_CKPT=/clm/heads/best_head.pt
+
+EXPOSE 8700
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=5 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8700/health', timeout=5)"
+
+ENTRYPOINT ["/usr/local/bin/clm-entrypoint.sh"]
+
+# -- Stage 5a: released heads, no GPU needed --------------------------------------------
+FROM runtime-base AS runtime-released
+
+COPY --from=heads /clm/heads-released/CLM_v0.1-8B.pt /clm/heads/best_head.pt
+
+# -- Stage 5b: fine-tuned heads (DEFAULT target) ----------------------------------------
+FROM runtime-base AS runtime-finetuned
+
+COPY --from=finetune /clm/heads-trained /clm/heads

@@ -13,6 +13,40 @@
 > carried, "survivors are hints, never verdicts", is restated in
 > `verify/mutmut-equivalents.md`.)
 
+## 2026-10-27 regen (decision-model integration)
+
+The decision-model seams landed as transport/shape-parsing clients under a
+silent-degradation contract, so `src/decisions/*` and `src/patterns/clm_rerank.py`
+joined `do_not_mutate` (rows in the *Model-checked* table below) and the scratch
+tree was reset before the sweep. Two clean sweeps were taken on an otherwise idle
+box; the second one followed the test work that killed the new clusters:
+
+| Measurement | Value |
+|---|---|
+| Surface | 14 modules, 6650 mutants, 6624 classified |
+| Killed / survived | 4186 killed, 2438 survived (module ratios 0.54–1.00) |
+| `src/pipeline.py` | 62 functions / 2706 mutants, 1670 killed (ratio 0.62) |
+| `_decision_part_state` | 18/18 killed (1.00) — the state text is pinned byte-for-byte incl. the 8/4/1500 caps |
+| `_matches_category` | 5/5 killed (1.00) |
+| `_narrow_by_category` | 90/92 killed (0.98) — floor boundary, per-part continuation (skip + empty-filter), the override map and the kept/pool/skipped/replaced log fields |
+| `_process_weight_proposals` | 64/104 killed (0.62) — prior blend, `+architecture_prior` label, E4 label and smoothing are pinned |
+| `_tacit_weight_proposals` | 47/59 killed (0.80) — per-part retry and the retried-part log field |
+| Gate | `--gate` clean against the regenerated baseline |
+
+Three sweeps were needed to get here because every edit inside a mutated function
+renumbers that function's mutant keys: the first two runs were contaminated (taken
+alongside a 16 GB image build and the full test suite) and the last two were clean and
+idle. `_select_all` and `select_for_part` still report "new" survivor keys after every
+edit — those are renumbered *pre-existing* survivors of the log/argument cluster, which
+is why the gate compares ratios as well as keys.
+
+The one surviving cluster the gate reports (`src/tools/jobs.py::_init`, 10 mutants)
+is recorded as **equivalent** in `verify/mutmut-equivalents.md` (SQL keyword case +
+`logger.debug` fields). Two other flips surfaced by the first sweep
+(`src/tools/jobs.py::close`, `src/patterns/loader.py::_read_json`) were *test gaps,
+not equivalents*, and were killed with new assertions (double-close is a no-op;
+malformed JSON names the file and the parse error) rather than baselined away.
+
 ## Why a narrow scope
 
 The mutation surface is the decision logic — the code where a silent bug is a
@@ -40,17 +74,17 @@ checklist rows hold; it leaves scope only through a row edit here.
 
 | Module | Mutated surface | Ownership (kill authority) | Why in scope | Expected survivors |
 |---|---|---|---|---|
-| `src/pipeline.py` | 54 functions / 2695 mutants — the whole orchestration + analyze/generate/evaluate seam (`run_design`, `design_loop`, `analyze`, `generate`, `evaluate`, `score_candidates`, `select_for_part`, `apply_vetoes`, `_fallback_selection`, `_reasoning`, `validate`, the prompt builders) | L1 `test_analyze.py`, `test_generate.py`, `test_evaluate.py`, `test_scoring.py`, `test_selection.py`, `test_fallbacks.py`, `test_composition.py`, `test_input_validation.py`, `test_style_precedence.py`, `test_pipeline_validate.py` + L2 `tests/verification/test_bug_garden.py` | the decision core of the whole server: intake, decomposition, per-part scoring, vetoes, fallback, DL attempt loop | **yes — 1285/2695 survive (ratio 0.52); the largest surface, and prompt-string plus log-format mutants dominate. Triage pending** |
-| `src/patterns/loader.py` | 22 functions / 1262 mutants — `load_catalog`, `assert_enums_in_sync`, `parse_catalog_order`, `parse_out_of_scope_terms`, `parse_locally_implementable_names`, `_check_variants`, `_build_record`, `_build_alias_index`, `_load_one_record` | L1 `test_catalog.py` | catalog discovery, schema-enum sync and alias closure decide which patterns a query can ever see; a dropped membership check silently ships a broken catalog | yes — 519/1262 (ratio 0.59); JSON/DDL construction mutants. Triage pending |
-| `src/patterns/dense_cache.py` | 21 functions / 818 mutants *(pre-2026-10-25 snapshot — the logging/write-back edit shifted per-function indices, regen pending)* — `resolve_dense_vectors`, `load_manifest`, `load_vectors`, `store_cache`, `build_manifest`, `corpus_digest`, `_metadata_fingerprint_match`, `_corpus_fingerprint_match`, `probe_cosine`, `_probe_embed`, `_write_back` | L1 `test_dense_cache.py` + `test_config.py` + `test_retrieval.py::test_warm_start_embeds_only_the_probe_text` + L4 `dense_cache.fizz` (EMB-1..4, FG-37..40) | the two-layer cache fingerprint + semantic probe decide "reuse the cache or re-embed"; a stale-hit is a silent-wrong-answer class. Since 2026-10-25 the module also owns restart durability: a dropped write-back guard makes every restart re-embed (~19 min), and a write-back that raises or discards the freshly embedded vectors turns a read-only cache directory into a startup failure — `_write_back` is best-effort by contract (EMB-4). The decision log lines (`Dense cache hit/miss/written/disabled`, each carrying `path`) are pinned by `test_hit_and_write_lines_name_the_cache_directory` / `test_miss_and_disabled_lines_name_the_cache_directory` (message **and** extras). Those insertions shift mutmut's per-function indices, so `scripts/mutmut_baseline.py --gate` will report pre-existing survivors under new keys until `make regen-mutmut-baseline` runs deliberately — **the ratchet was not re-run for this edit**; the log-mutant kill is unit-pinned, the ratchet status is unverified | yes — 336/818 (ratio 0.59, **pre-change snapshot**); manifest/npy IO string mutants. Regen + triage pending |
+| `src/pipeline.py` | 62 functions / 2687 mutants (2026-10-27 regen) — the whole orchestration + analyze/generate/evaluate seam (`run_design`, `design_loop`, `analyze`, `generate`, `evaluate`, `score_candidates`, `select_for_part`, `apply_vetoes`, `_fallback_selection`, `_reasoning`, `validate`, the prompt builders) plus the decision-seam helpers (`_process_weight_proposals`, `_tacit_weight_proposals`, `_narrow_by_category`, `_matches_category`, `_decision_part_state`) | L1 `test_analyze.py`, `test_generate.py`, `test_evaluate.py`, `test_scoring.py`, `test_selection.py`, `test_fallbacks.py`, `test_composition.py`, `test_input_validation.py`, `test_style_precedence.py`, `test_pipeline_validate.py` + L2 `tests/verification/test_bug_garden.py` | the decision core of the whole server: intake, decomposition, per-part scoring, vetoes, fallback, DL attempt loop | **yes — 1013/2706 survive (kill ratio 0.62); the largest surface, and prompt-string plus log-format mutants dominate. Triage pending** |
+| `src/patterns/loader.py` | 22 functions / 1262 mutants — `load_catalog`, `assert_enums_in_sync`, `parse_catalog_order`, `parse_out_of_scope_terms`, `parse_locally_implementable_names`, `_check_variants`, `_build_record`, `_build_alias_index`, `_load_one_record` | L1 `test_catalog.py` | catalog discovery, schema-enum sync and alias closure decide which patterns a query can ever see; a dropped membership check silently ships a broken catalog | yes — 508/1261 (kill ratio 0.60); JSON/DDL construction mutants. Triage pending |
+| `src/patterns/dense_cache.py` | 21 functions / 882 mutants (2026-10-27 regen — the 2026-10-25 write-back edit is now ratcheted) — `resolve_dense_vectors`, `load_manifest`, `load_vectors`, `store_cache`, `build_manifest`, `corpus_digest`, `_metadata_fingerprint_match`, `_corpus_fingerprint_match`, `probe_cosine`, `_probe_embed`, `_write_back` | L1 `test_dense_cache.py` + `test_config.py` + `test_retrieval.py::test_warm_start_embeds_only_the_probe_text` + L4 `dense_cache.fizz` (EMB-1..4, FG-37..40) | the two-layer cache fingerprint + semantic probe decide "reuse the cache or re-embed"; a stale-hit is a silent-wrong-answer class. Since 2026-10-25 the module also owns restart durability: a dropped write-back guard makes every restart re-embed (~19 min), and a write-back that raises or discards the freshly embedded vectors turns a read-only cache directory into a startup failure — `_write_back` is best-effort by contract (EMB-4). The decision log lines (`Dense cache hit/miss/written/disabled`, each carrying `path`) are pinned by `test_hit_and_write_lines_name_the_cache_directory` / `test_miss_and_disabled_lines_name_the_cache_directory` (message **and** extras). Those insertions shift mutmut's per-function indices, so `scripts/mutmut_baseline.py --gate` will report pre-existing survivors under new keys until `make regen-mutmut-baseline` runs deliberately — **the ratchet was not re-run for this edit**; the log-mutant kill is unit-pinned, the ratchet status is unverified | yes — 344/882 (ratio 0.61, **pre-change snapshot**); manifest/npy IO string mutants. Regen + triage pending |
 | `src/patterns/retriever.py` | 16 functions / 420 mutants — `retrieve`, `retrieve_many`, `build`, `_fuse`, `_blend`, `_min_max`, `reciprocal_rank_score`, `_rerank`, `_leg_scores_many`, `_blend_and_cap` | L1 `test_retrieval.py` | fusion weights, the per-leg min–max normalization, the RRF arithmetic and the per-leg recall caps decide whether a query sees real patterns or the fallback | yes — 100/420 (ratio 0.76, the strongest large module); async/concurrency mutants need the fakes. Triage pending |
 | `src/variants.py` | 14 functions / 317 mutants — `select_variant`, `bind_entry`, `variants_for_pattern`, `_by_explicit_id`, `_by_paradigm`, `_by_capability_floor`, `_satisfies`, `_floor_sort_key`, `variants_payload` | L1 `test_variants.py` + `test_catalog.py` | the §8.4 four-layer variant precedence: a wrong layer wins and a design silently binds a non-default realization | yes — 100/317 (ratio 0.68); payload-shaping mutants. Triage pending |
-| `src/design_normalization.py` | 12 functions / 353 mutants — `build_brief`, `repair_parts`, `_normalize_priorities`, `_merge_oversized`, `synthesize_construction_part`, `truncate`, `first_sentence`, `kebab`, the four `as_*` coercers | L1 `test_fallbacks.py`, `test_input_validation.py` (indirect) | §4.11/§5 denormalization precedence, the priority invariant ("exactly one part at 1.0") and the bounded merge repair | yes — 157/353 (ratio 0.56); the coercers and the merge search are search-heavy. Triage pending |
-| `src/tools/jobs.py` | 16 functions / 182 mutants — the whole `JobsStore` lifecycle (`create_job`, `set_running`, `set_completed`, `set_failed`, `set_cancelled`, `is_cancelled`, `get_job`, `close`) + `_guarded_update`, `_init` | L1 `test_jobs.py` (transition matrix) + L2 `tests/verification/test_bug_garden.py` (J-1/J-2) | W0-1 guarded transitions: the `AND status = ?` clause is the whole check-and-set; the single most safety-critical automaton in the server | yes — 69/182 (ratio 0.62); mostly SQL-string f-string mutants, killable only through behaviour. Triage pending |
+| `src/design_normalization.py` | 12 functions / 353 mutants — `build_brief`, `repair_parts`, `_normalize_priorities`, `_merge_oversized`, `synthesize_construction_part`, `truncate`, `first_sentence`, `kebab`, the four `as_*` coercers | L1 `test_fallbacks.py`, `test_input_validation.py` (indirect) | §4.11/§5 denormalization precedence, the priority invariant ("exactly one part at 1.0") and the bounded merge repair | yes — 151/353 (kill ratio 0.57); the coercers and the merge search are search-heavy. Triage pending |
+| `src/tools/jobs.py` | 16 functions / 182 mutants — the whole `JobsStore` lifecycle (`create_job`, `set_running`, `set_completed`, `set_failed`, `set_cancelled`, `is_cancelled`, `get_job`, `close`) + `_guarded_update`, `_init` | L1 `test_jobs.py` (transition matrix) + L2 `tests/verification/test_bug_garden.py` (J-1/J-2) | W0-1 guarded transitions: the `AND status = ?` clause is the whole check-and-set; the single most safety-critical automaton in the server | yes — 66/182 (kill ratio 0.64); mostly SQL-string f-string mutants (the SQL-case + debug-log cluster is a recorded equivalent), killable only through behaviour. Triage pending |
 | `src/validation.py` | 3 functions / 96 mutants — `validate_with_retries`, `format_validation_errors`, `_format_failure` | L1 `test_validation.py` | the self-healing repair loop at the LLM boundary: an unbounded retry is a hang class, a swallowed `LLMError` is a silent-degradation class | **yes — 44/96 (ratio 0.54); `validate_with_retries` alone 35/75 survive, the weakest audited function. Triage pending** |
 | `src/text_validation.py` | 6 functions / 84 mutants — `ensure_printable_text` (strip window + length clamp), the three `AfterValidator` wrappers, `_is_control_or_format`, `_is_letter_or_digit` | L1 `test_input_validation.py` | the E1/E2 intake gate: the strip window and the `hi - lo > max_length` clamp decide what text ever reaches the LLM | yes — 23/84 (ratio 0.73); `ensure_printable_text` 18/44, the wrapper `field=` literals are the known cluster |
 | `src/provider_health.py` | 6 functions / 155 mutants — `before_call`, `record_failure`, `record_success`, `is_circuit_qualifying_status`, `extract_status_code` | L1 `test_provider_health.py` | the circuit breaker: which failures count as qualifying decides whether a dead provider burns the full call budget | yes — 34/155 (ratio 0.78); timestamp/threshold arithmetic. Triage pending |
-| `src/anti_scope.py` | 6 functions / 156 mutants — `is_architecture_only`, `matched_terms`, `catalog_phrases`, `hypothesis_for`, `_normalize` | L1 `test_anti_scope.py` + `test_pipeline_validate.py` | §5 rule 5: an architecture-only part that survives drives selection on a name the catalog deliberately excludes | yes — 49/156 (ratio 0.69); token-count threshold mutants. Triage pending |
+| `src/anti_scope.py` | 6 functions / 156 mutants — `is_architecture_only`, `matched_terms`, `catalog_phrases`, `hypothesis_for`, `_normalize` | L1 `test_anti_scope.py` + `test_pipeline_validate.py` | §5 rule 5: an architecture-only part that survives drives selection on a name the catalog deliberately excludes | yes — 47/156 (kill ratio 0.70); token-count threshold mutants. Triage pending |
 | `src/conflicts.py` | 1 function / 3 mutants — `conflicting` | L1 `test_selection.py` | §8.3 rule 3: a missing conflict pair lets two incompatible patterns share a decision part | none (3/3 killed) |
 | `src/config_expansion.py` | 2 functions / 30 mutants — `expand_env`, `expand_env_in_obj` | L1 `test_config.py` + L2 `tests/verification/test_config_properties.py` (CE-1..CE-6) | `{env:VAR}` expansion feeds every config secret and URL — silent mis-expansion is a config-injection class | yes — 6/30 (ratio 0.80); the nested dict/list recursion in `expand_env_in_obj` is the open cluster. Triage pending |
 | `src/style_affinity.py` | 1 function / 5 mutants — `affinity_for` | L1 `test_style_precedence.py` | §10.1 soft prior: a wrong category set silently disables or misapplies the style bonus | 2/5 (ratio 0.60) — the affinity-set membership mutants; triage pending |
@@ -98,8 +132,10 @@ checklist rows hold; it leaves scope only through a row edit here.
 | `src/design_validation.py` | `evaluate_design_integrity`, `_duplicate_id_violations`, `_relationship_violations`, `_event_violations`, `_api_contract_violations` | the INV-2..5 cross-reference gate runs on the LLM output *inside* `assemble_result`, which is itself mutated (`src/pipeline.py` is in scope); a second mutation layer over the same rule mostly re-tests the schema validators | L1 `test_adapters.py::TestDesignIntegrityFindings` + schema enforcement at the tool boundary |
 | `src/patterns/embedder.py` | `_normalize` (row normalisation, zero-vector guard) | the zero-vector → NaN guard is the decision and is pinned directly; the wrapper classes around it have no branches. NaN embeddings are also caught downstream by the dense-cache cosine probe (mutated via `src/patterns/dense_cache.py`) | L1 `test_retrieval.py` / `test_dense_cache.py` + L0 |
 | `src/patterns/safe_tei_rerank.py` | `_safe_tei_rerank_call`, `SafeTEIReranker._call_api` | error verdicts must stay pure signals — a partial result masquerading as REAL is the RET-1 kill class, and the fallback decision is a single `except` whose branches are pinned by the generated status/body matrix | L1 `test_retrieval.py` HTTP-error tests + L4 `tei_fallback.fizz` (FG-23/24) |
+| `src/decisions/*` (`client.py`, `tacit.py`, `seam_prompts.py`) | `DecisionModelClient.choose_style` / `_parse_choice`, `TacitClient.decide` / `decide_batch` / `score_axes_many` / `_expected_level`, the category/gate wrappers | transport + shape-parsing under the silent-degradation contract: an outage must never fail a tool call, so every mutant here is either a `logger.`/formatting line or a branch of the same degrade rule. The wire matrices (status × payload × timeout × cancellation, both map and list shapes, batch envelopes) are exhaustive L1 coverage, and the `seam_prompts` half is declarative prompt text | L1 `test_decisions_client.py`, `test_tacit_client.py` (MockTransport matrices) + L1 `test_decision_seams.py` (pipeline-level: retry, fallback, narrowing) |
+| `src/patterns/clm_rerank.py` | `CLMReranker.rerank` (dedupe/restore, cap, sort) and `_request` (status/JSON/shape verdicts) | same RET-1 contract as `safe_tei_rerank.py`: a degraded CLM leg must re-issue the identical TEI call, never a partial list. The verdict matrix is generated in L1 and the dedupe/restore arithmetic is index-exact there | L1 `test_clm_rerank.py` (protocol conformance, dedupe, every degrade path) |
 
-> **`src/pipeline.py` is IN the mutmut scope** (54 functions / 2695 mutants — the
+> **`src/pipeline.py` is IN the mutmut scope** (62 functions / 2687 mutants — the
 > largest mutated module; see the module ledger). The four `src/pipeline.py`
 > rows the table used to carry claimed an exclusion that does not exist in
 > `do_not_mutate`; they were removed rather than restated. FizzBee
@@ -175,7 +211,11 @@ checklist rows hold; it leaves scope only through a row edit here.
    is unaffected). Done 2026-09-11 after the round-2 scope expansion,
    2026-09-12 after adding `pattern/` to `also_copy`, 2026-09-12 after
    the consecutive-run cache warning ("pyproject.toml changed … cached
-   results were kept").
+   results were kept"), and 2026-10-27 after excluding `src/decisions/*` +
+   `src/patterns/clm_rerank.py` (the decision-model seam clients) — the scratch
+   tree still carried `src/decisions/client.py.meta` from the run that had
+   mutated it, so a sweep without the reset would have distilled an
+   out-of-scope module into the gate.
 9. Dependency-change policy: `on_dependency_change = "rerun"` +
    `cache_invalidation_files = ["docs/design-patterns.md",
    "docs/pattern-schema.json", "pattern/*.json"]` (both keys verified
@@ -205,16 +245,18 @@ missing kill, or (b) a true equivalent — record it in
 `make regen-mutmut-baseline`. The baseline only ever moves deliberately.
 
 Current per-module ratios are read from the committed
-`verify/mutmut-baseline.json` after each regen. That baseline (regenerated at commit
-`923eec5`, per `run.git_commit` in the JSON) records
-6328 mutants / 3862 killed / 2440 survived — overall kill ratio 0.610. The weakest
-ratios in scope are `src/validation.py` (0.54), `src/design_normalization.py`
-(0.57), `src/pipeline.py` (0.58) and `src/patterns/dense_cache.py` (0.59).
-Cluster-by-cluster dispositions live in `verify/mutmut-equivalents.md`.
+`verify/mutmut-baseline.json` after each regen. That baseline (regenerated 2026-10-27
+from a working tree on top of commit `f7073d3`, per `run.git_commit` in the JSON) records
+6631 mutants / 6605 classified / 4144 killed / 2461 survived — overall kill ratio 0.627.
+The weakest ratios in scope are `src/validation.py` (0.54),
+`src/design_normalization.py` (0.57), `src/patterns/loader.py` (0.59) and
+`src/patterns/dense_cache.py` (0.61); the strongest large module remains
+`src/patterns/retriever.py` (0.76). Cluster-by-cluster dispositions live in
+`verify/mutmut-equivalents.md`.
 
-**Post-baseline edits not yet ratcheted (2026-10-25):** `src/patterns/dense_cache.py`
-gained the best-effort `_write_back` and the four cache-path log lines. Statements were
-inserted inside mutated functions, so per-function mutant indices moved; the next
-`make test-mutations` will surface pre-existing survivors under new keys and needs a
-deliberate `make regen-mutmut-baseline` (the numbers above still describe the
-`923eec5` snapshot, not this tree).
+**Closed caveats.** The 2026-10-25 dense-cache edit (`_write_back` + the four cache-path
+log lines) is ratcheted: `src/patterns/dense_cache.py` now measures 882 mutants /
+344 survivors (kill ratio 0.61) in the 2026-10-27 regen, so the "pre-2026-10-25 snapshot,
+regen pending" note is retired. Any future edit that inserts statements into a mutated
+function still moves per-function mutant indices — that is expected, not an unratcheted
+state: take a clean sweep on an idle box and refresh deliberately.

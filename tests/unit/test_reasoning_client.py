@@ -675,3 +675,104 @@ class TestForwardedLogLevels:
         with pytest.raises(asyncio.TimeoutError):
             await client._call_tool(SHANNON_TOOL, ThoughtDraft(thought="stub", phase_tag="proof"), 1, 1)
         assert client._clients == {}, "wedged spawn must not leave a pooled client"
+
+
+# --------------------------------------------------------------------------------------
+# J5 gate: a decision-model veto on one call's deliberation
+# --------------------------------------------------------------------------------------
+
+
+class TestReasoningGate:
+    """The gate is fail-open and cache-neutral: only an explicit ``False`` skips."""
+
+    def test_false_yields_an_empty_non_degraded_trace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, agent = _client()
+        seen: list[tuple[str, dict[str, object]]] = []
+
+        async def _gate(phase: str, payload: dict[str, object]) -> bool | None:
+            seen.append((phase, payload))
+            return False
+
+        client._gate = _gate
+
+        async def _explode(*_args: object, **_kwargs: object) -> str:
+            raise AssertionError("a gated-out call must not reach a reasoning tool")
+
+        monkeypatch.setattr(client, "_call_tool", _explode)
+
+        trace = asyncio.run(client.run_pre_llm("weights", {"part": "p1"}))
+
+        assert trace.phase == "weights"
+        assert trace.steps == []
+        assert trace.degraded is False
+        assert trace.degradation_reason is None
+        assert client._trace_cache == {}, "a gated-out call must not consume a cache slot"
+        assert client._inflight == {}
+        assert agent.calls == 0
+        assert seen == [("weights", {"part": "p1"})]
+
+    def test_true_proceeds_to_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, agent = _client()
+
+        async def _gate(_phase: str, _payload: dict[str, object]) -> bool | None:
+            return True
+
+        client._gate = _gate
+
+        async def _fake_call_tool(*_args: object, **_kwargs: object) -> str:
+            return "ok"
+
+        monkeypatch.setattr(client, "_call_tool", _fake_call_tool)
+
+        trace = asyncio.run(client.run_pre_llm("weights", {"part": "p1"}))
+        assert trace.steps, f"degraded: {trace.degradation_reason!r}"
+        assert agent.calls >= 1
+
+    def test_none_proceeds_to_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``None`` is the degradation signal (TacitClient down): reasoning still runs."""
+        client, _agent = _client()
+
+        async def _gate(_phase: str, _payload: dict[str, object]) -> bool | None:
+            return None
+
+        client._gate = _gate
+
+        async def _fake_call_tool(*_args: object, **_kwargs: object) -> str:
+            return "ok"
+
+        monkeypatch.setattr(client, "_call_tool", _fake_call_tool)
+
+        trace = asyncio.run(client.run_pre_llm("weights", {"part": "p1"}))
+        assert trace.steps
+
+    def test_gate_exception_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A broken gate closure must never fail the tool call: reasoning proceeds."""
+        client, _agent = _client()
+
+        async def _gate(_phase: str, _payload: dict[str, object]) -> bool | None:
+            raise RuntimeError("boom")
+
+        client._gate = _gate
+
+        async def _fake_call_tool(*_args: object, **_kwargs: object) -> str:
+            return "ok"
+
+        monkeypatch.setattr(client, "_call_tool", _fake_call_tool)
+
+        trace = asyncio.run(client.run_pre_llm("weights", {"part": "p1"}))
+        assert trace.steps, f"degraded: {trace.degradation_reason!r}"
+
+    def test_disabled_phase_never_asks_the_gate(self) -> None:
+        client, _agent = _client()
+        client._config.per_phase["weights"] = client._config.get_strategy("weights").model_copy(
+            update={"enabled": False}
+        )
+        asked: list[str] = []
+
+        async def _gate(phase: str, _payload: dict[str, object]) -> bool | None:
+            asked.append(phase)
+            return False
+
+        client._gate = _gate
+        asyncio.run(client.run_pre_llm("weights", {"part": "p1"}))
+        assert asked == []

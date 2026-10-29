@@ -257,9 +257,15 @@ class ReasoningClient:
     - ``enabled`` property honors the master switch and per-phase strategies.
     """
 
-    def __init__(self, config: ReasoningConfig, agent: DesignAgent) -> None:
+    def __init__(
+        self,
+        config: ReasoningConfig,
+        agent: DesignAgent,
+        gate: Callable[[str, dict[str, Any]], Awaitable[bool | None]] | None = None,
+    ) -> None:
         self._config = config
         self._agent = agent
+        self._gate = gate
         self._trace_cache: OrderedDict[tuple[str, str, int], ReasoningTrace] = OrderedDict()
         self._inflight: dict[tuple[str, str, int], asyncio.Future[ReasoningTrace]] = {}
         self._clients: dict[str, Client[StdioTransport]] = {}
@@ -286,6 +292,11 @@ class ReasoningClient:
 
         A phase whose strategy is disabled returns an empty, non-degraded trace
         before the cache is consulted.
+
+        The optional ``gate`` (the J5 decision-model seam) can veto the deliberation
+        for one call: ``False`` returns the same empty, non-degraded trace a disabled
+        phase produces, ``True``/``None`` proceed. The gate is fail-open by contract —
+        it is asked before the cache so a gated-out call consumes no cache slot.
         """
         if not self.enabled or self._closed:
             return self._degraded_trace(phase, "reasoning disabled")
@@ -294,6 +305,11 @@ class ReasoningClient:
             # A disabled phase contributes an empty context, not the degraded
             # in-prompt scaffold: no generator call, no subprocess, no cache entry.
             return ReasoningTrace(phase=phase)
+        if self._gate is not None:
+            proceed = await self._ask_gate(phase, context_payload)
+            if proceed is False:
+                logger.debug("Reasoning gate skipped deliberation", extra={"phase": phase})
+                return ReasoningTrace(phase=phase)
 
         key = _cache_key(phase, context_payload)
         if key is not None:
@@ -305,6 +321,19 @@ class ReasoningClient:
             if joined is not None:
                 return joined
         return await self._run_loop(phase, strategy, context_payload, key)
+
+    async def _ask_gate(self, phase: str, context_payload: dict[str, Any]) -> bool | None:
+        """Ask the J5 gate, failing open: a broken gate must never fail a tool call."""
+        gate = self._gate
+        if gate is None:  # pragma: no cover - callers check first
+            return None
+        try:
+            return await gate(phase, context_payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the gate is an optional accelerator
+            logger.warning("Reasoning gate failed; proceeding with reasoning: %s", exc)
+            return None
 
     async def _join_in_flight(
         self,

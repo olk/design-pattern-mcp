@@ -18,6 +18,8 @@
 	docker-build docker-build-all docker-build-cached docker-build-nocache \
 	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
 	docker-build-tei-rerank dense-cache \
+	docker-build-tacit docker-build-tacit-base docker-build-clm docker-build-clm-base \
+	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
 	docker-publish docker-publish-tei docker-publish-all \
 	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
 	embed-cache
@@ -44,6 +46,28 @@ EMBED_DTYPE        ?= float32
 EMBED_TEI_BASE     ?= ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
 EMBED_TEI_BASE_GPU ?= ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
 DENSE_CACHE_DIR    ?= data/dense-cache
+
+# Decision-model sidecars (docker/docker-compose.decision-models.yml). Both are GPU-only
+# at run time; the *-base targets build the released-weights variant and need no GPU.
+TACIT_IMAGE      := design-pattern-tacit
+CLM_IMAGE        := design-pattern-clm
+TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
+# Self-distillation knobs. The teacher pass is one sequential generate per problem, so
+# build time scales with TACIT_PROBLEMS x TACIT_COT_MAX_TOKENS (defaults: single-digit
+# hours on one 3090). `make docker-build-tacit TACIT_PROBLEMS=200 TACIT_COT_MAX_TOKENS=512`
+# is the quick-smoke shape.
+TACIT_PROBLEMS       ?= 2000
+TACIT_EPOCHS         ?= 1
+TACIT_LR             ?= 1e-4
+TACIT_BATCH          ?= 4
+TACIT_ACCUM          ?= 8
+TACIT_COT_MAX_TOKENS ?= 2048
+TACIT_MAX_NEW_TOKENS ?= 256
+CLM_ENCODER_REPO ?= Qwen/Qwen3-8B
+CLM_HEADS_REPO   ?= Contrastive-LM/CLM-v0.1-8B
+CLM_REPO_PIN     ?= d5f9ef0
+VLLM_IMAGE_TAG   ?= v0.17.1
+COMPOSE_DM := docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml
 
 .DEFAULT_GOAL := help
 
@@ -288,6 +312,67 @@ docker-build-tei: docker-build-tei-embed docker-build-tei-rerank ## Build both T
 docker-build-all: docker-build docker-build-tei ## Build all three images, dense cache generated and baked in
 
 docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense cache, then build all three images
+
+##@ Decision models (CLM-8B + AnyJev Tacit-4B)
+
+docker-build-tacit: ## Build the Tacit sidecar, self-distilled in-image (needs a GPU + CDI on the builder)
+	docker build --allow device=nvidia.com/gpu=all \
+		-f docker/Dockerfile.tacit --target runtime-distilled \
+		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
+		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
+		--build-arg TACIT_PROBLEMS=$(TACIT_PROBLEMS) \
+		--build-arg TACIT_EPOCHS=$(TACIT_EPOCHS) \
+		--build-arg TACIT_LR=$(TACIT_LR) \
+		--build-arg TACIT_BATCH=$(TACIT_BATCH) \
+		--build-arg TACIT_ACCUM=$(TACIT_ACCUM) \
+		--build-arg TACIT_COT_MAX_TOKENS=$(TACIT_COT_MAX_TOKENS) \
+		--build-arg TACIT_MAX_NEW_TOKENS=$(TACIT_MAX_NEW_TOKENS) \
+		-t $(TACIT_IMAGE):$(DOCKER_TAG) -t $(TACIT_IMAGE):latest .
+
+docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (no GPU needed; tag :base)
+	docker build -f docker/Dockerfile.tacit --target runtime-released \
+		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
+		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
+		-t $(TACIT_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_IMAGE):base .
+
+docker-build-clm: ## Build the CLM sidecar, heads fine-tuned in-image (needs a GPU + CDI on the builder)
+	docker build --allow device=nvidia.com/gpu=all \
+		-f docker/Dockerfile.clm --target runtime-finetuned \
+		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
+		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
+		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
+		--build-arg CLM_REPO_PIN=$(CLM_REPO_PIN) \
+		-t $(CLM_IMAGE):$(DOCKER_TAG) -t $(CLM_IMAGE):latest .
+
+docker-build-clm-base: ## Build the CLM sidecar with the released heads (no GPU needed; tag :base)
+	docker build -f docker/Dockerfile.clm --target runtime-released \
+		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
+		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
+		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
+		--build-arg CLM_REPO_PIN=$(CLM_REPO_PIN) \
+		-t $(CLM_IMAGE):$(DOCKER_TAG)-base -t $(CLM_IMAGE):base .
+
+docker-build-decision-models: docker-build-tacit docker-build-clm ## Build both decision-model sidecars, trained in-image
+
+docker-up-decisions: ## Start the dev stack with both decision-model sidecars (one GPU each)
+	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) CLM_IMAGE=$(CLM_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) up -d
+
+docker-down-decisions: ## Stop the whole dev stack including the decision-model sidecars
+	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) CLM_IMAGE=$(CLM_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) down
+
+decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docker-up-decisions)
+	@echo "==> Tacit /v1/decide"
+	@curl -fsS http://127.0.0.1:18100/v1/decide -H 'Content-Type: application/json' \
+		-d '{"state":"System goal: serve order views\nDecision part: invalidate cached views","question":"Which design-pattern category best describes the concern of this decision part?","options":["persistence-state","behavior-selection"],"kind":"choice"}' \
+		| python3 -m json.tool
+	@echo "==> CLM /v1/systemone"
+	@curl -fsS http://127.0.0.1:18700/v1/systemone -H 'Content-Type: application/json' \
+		-d '{"model":"clm-latest","state":"A checkout service with flash sales.","questions":{"style":{"type":"choice","instructions":"Which style fits?","criteria":{"event-driven":"Event flow and reactions","layered":"Tiered separation"}}}}' \
+		| python3 -m json.tool
+	@echo "==> CLM /v1/rank"
+	@curl -fsS http://127.0.0.1:18700/v1/rank -H 'Content-Type: application/json' \
+		-d '{"context":"","question":"Wrap external payment providers.","answers":["Adapter","Observer","Memento"]}' \
+		| python3 -m json.tool
 
 # Tag and push a local image to both Docker Hub and GHCR.
 # Args: local_image hub_repo ghcr_repo

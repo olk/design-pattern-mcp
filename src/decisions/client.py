@@ -1,10 +1,14 @@
-"""Decision-model (JEV) client — the Ch2 style-substitution seam.
+"""Decision-model client — the Ch2 style-substitution seam (CLM ``/v1/systemone``).
 
 ``select_design_patterns`` samples ``brief.architecture_style`` from the A+B LLM call
 (entropy channel 2 in docs/SELECTION_VARIABILITY_ANALYSIS.md §2.2). This client
-replaces that prose sample with one JEV ``choice`` question over the 35
-``STYLE_AFFINITY`` keys plus ``none``, behind the default-off ``decisions``
-config switch.
+replaces that prose sample with one ``choice`` question over the 35
+``STYLE_AFFINITY`` keys plus ``none``, behind the default-off
+``decisions.style`` seam.
+
+The wire is the TypeSafe-compatible ``POST /v1/systemone`` shape, served locally by
+``clm-serve`` (the CLM-8B heads stack) and still reachable for hosted judging by
+pointing ``base_url`` + ``api_key_env`` at any provider that speaks it.
 
 Contract (mirrors ReasoningClient):
 - Silent per-call degradation: any failure yields ``None`` (the LLM-extracted
@@ -28,7 +32,7 @@ import httpx
 from src.style_affinity import STYLE_AFFINITY
 
 if TYPE_CHECKING:
-    from src.config import DecisionsConfig
+    from src.config import DecisionSeamConfig
 
 logger = logging.getLogger(__name__)
 
@@ -107,17 +111,21 @@ class StyleDecision:
 
 
 class DecisionModelClient:
-    """JEV choice-question client with cache-first, degrade-on-failure semantics."""
+    """CLM ``/v1/systemone`` choice-question client: cache-first, degrade-on-failure."""
 
-    def __init__(self, config: DecisionsConfig, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(self, config: DecisionSeamConfig, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._config = config
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
         self._cache: OrderedDict[bytes, StyleDecision] = OrderedDict()
 
     def enabled(self) -> bool:
-        """True when the master switch is on AND the API key env var resolves non-empty."""
-        return self._config.enabled and bool(os.environ.get(self._config.api_key_env))
+        """True when the seam switch is on and its credential (if it wants one) resolves."""
+        if not self._config.enabled:
+            return False
+        if self._config.api_key_env is None:
+            return True
+        return bool(os.environ.get(self._config.api_key_env))
 
     async def choose_style(self, description: str) -> StyleDecision | None:
         """Resolve the style choice for ``description``; None degrades to the LLM style."""
@@ -183,12 +191,14 @@ class DecisionModelClient:
                 }
             },
         }
-        api_key = os.environ.get(self._config.api_key_env, "")
+        headers: dict[str, str] = {}
+        if self._config.api_key_env is not None:
+            headers["Authorization"] = f"Bearer {os.environ.get(self._config.api_key_env, '')}"
         if self._client is None:
             self._client = httpx.AsyncClient(transport=self._transport, timeout=self._config.timeout_seconds)
         response = await self._client.post(
             f"{self._config.base_url.rstrip('/')}/systemone",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             json=body,
         )
         if response.status_code != 200:

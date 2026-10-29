@@ -84,6 +84,7 @@ from src.schemas.evaluation import DesignEvaluation, PipelineResult
 from src.schemas.enums import (
     FALLBACK_PRIMARY,
     QUALITY_AXES,
+    PatternCategory,
 )
 from src.schemas.generation import (
     ApplicationSeed,
@@ -108,6 +109,7 @@ from src.variants import bind_entry, select_variant, variant_summaries
 
 if TYPE_CHECKING:  # pragma: no cover - type-only import (reasoning.client pulls fastmcp)
     from src.decisions.client import DecisionModelClient
+    from src.decisions.tacit import TacitClient
     from src.reasoning.client import ReasoningClient
 
 logger = logging.getLogger(__name__)
@@ -444,9 +446,9 @@ async def extract_part_weights_batch(
     """§7.1 weight extraction for all parts: ONE call, then deterministic per-part processing.
 
     Order of operations: one batched proposal → all-zero retry (E4) batched over exactly the
-    parts that came back all-zero → max-normalization → architectural prior blend (0.7
-    extracted / 0.3 prior, only when the part carries no priority evidence) → convex smoothing
-    ``w' = α·w + (1−α)/8``. The tail is strictly per part, so batching cannot couple the ratings.
+    parts that came back all-zero → :func:`_process_weight_proposals` (max-normalization →
+    architectural prior blend → convex smoothing). The tail is strictly per part, so
+    batching cannot couple the ratings.
 
     Returns:
         ``{part_id: (processed_weights, weights_source)}`` for every supplied part.
@@ -467,14 +469,39 @@ async def extract_part_weights_batch(
             retry = retried.get(part_id, RequirementWeights())
             if max(retry.as_dict().values(), default=0.0) > 0.0:
                 proposals[part_id] = retry
+    return _process_weight_proposals(
+        {part_id: weights.as_dict() for part_id, weights in proposals.items()},
+        parts,
+        brief,
+        config,
+        default_source="llm",
+    )
+
+
+def _process_weight_proposals(
+    proposals: dict[str, dict[str, float]],
+    parts: Sequence[DecisionPart],
+    brief: DesignBrief,
+    config: ServerConfig,
+    *,
+    default_source: str,
+) -> dict[str, tuple[dict[str, float], str]]:
+    """The deterministic §7.1 tail shared by the LLM and the decision-model paths.
+
+    Per part: all-zero → unweighted mean (E4); a flat vector (peak ≤ 0.2) with catalog
+    architecture attributes → 0.7 proposal / 0.3 prior blend; then max-normalization and
+    convex smoothing ``w' = α·w + (1−α)/8``. ``default_source`` names the origin in the
+    ``weights_source`` label (``llm`` / ``decision-model``); the blend appends
+    ``+architecture_prior`` and the E4 path always reports ``e4_mean``.
+    """
     processed: dict[str, tuple[dict[str, float], str]] = {}
     for part in parts:
-        raw = proposals.get(part.id, RequirementWeights()).as_dict()
-        source = "llm"
+        raw = proposals.get(part.id) or dict.fromkeys(QUALITY_AXES, 0.0)
+        source = default_source
         if max(raw.values(), default=0.0) <= 0.0:
             logger.warning(
                 "Weight extraction returned all-zero twice; using the unweighted mean (E4)",
-                extra={"part_id": part.id},
+                extra={"part_id": part.id, "weights_source": default_source},
             )
             raw = dict.fromkeys(QUALITY_AXES, 0.125)
             source = "e4_mean"
@@ -485,7 +512,7 @@ async def extract_part_weights_batch(
                 raw = {
                     axis: 0.7 * raw.get(axis, 0.0) + 0.3 * prior.get(axis, raw.get(axis, 0.0)) for axis in QUALITY_AXES
                 }
-                source = "llm+architecture_prior"
+                source = f"{source}+architecture_prior"
         normalized = _max_normalize(raw)
         alpha = config.scoring.weight_smoothing_alpha
         smoothed = {
@@ -502,6 +529,40 @@ async def extract_part_weights_batch(
         )
         processed[part.id] = (smoothed, source)
     return processed
+
+
+#: Cap on the state text handed to a part-scoped decision-model question.
+_MAX_DECISION_STATE_CHARS = 1500
+
+
+def _with_effective_category(part: DecisionPart, category: PatternCategory | None) -> DecisionPart:
+    """``part`` with a confident decision-model category as its hypothesis (None = unchanged).
+
+    The §7.3 category adjustment and the E5/E7 fallback primary both read
+    ``part.category_hypothesis``; a narrowed pool scored against a different hypothesis
+    would take the -10 mismatch on every survivor and fall back outside the pool.
+    """
+    if category is None or part.category_hypothesis == category:
+        return part
+    return part.model_copy(update={"category_hypothesis": category})
+
+
+def _decision_part_state(brief: DesignBrief, part: DecisionPart) -> str:
+    """Deterministic state text for a decision-model question about one part.
+
+    The brief's repaired fields, not the raw user description (which the selection
+    stages no longer carry), so a replayed part produces the same bytes.
+    """
+    components = ", ".join(component.name for component in brief.components[:8])
+    lines = [f"System goal: {brief.restated_goal}"]
+    if components:
+        lines.append(f"Components: {components}")
+    lines.append(f"Decision part: {part.statement}")
+    if part.scope:
+        lines.append(f"Scope: {part.scope}")
+    if part.constraints:
+        lines.append("Constraints: " + "; ".join(part.constraints[:4]))
+    return "\n".join(lines)[:_MAX_DECISION_STATE_CHARS]
 
 
 async def _safe_extract_weights_batch(
@@ -737,7 +798,13 @@ def select_for_part(
         weights_source=weights_source,
     )
     if not ordered_candidates:
-        return _fallback_selection(selection, "no candidate survived retrieval and the veto pre-filters (E5)", catalog)
+        # The caller knows why the pool is empty (vetoed out vs below the fusion floor);
+        # its reason is the one worth reporting, the fixed E5 text is the fallback.
+        return _fallback_selection(
+            selection,
+            fallback_reason or "no candidate survived retrieval and the veto pre-filters (E5)",
+            catalog,
+        )
     leader = ordered_candidates[0]
     gate = (
         leader.fit_score >= config.selection.primary_score_threshold
@@ -1471,6 +1538,8 @@ class DesignPipeline(Workflow):
         guard: AntiScopeGuard | None = None,
         reasoning: ReasoningClient | None = None,
         decision_client: DecisionModelClient | None = None,
+        weights_client: TacitClient | None = None,
+        category_client: TacitClient | None = None,
     ) -> None:
         # Internal whole-run budget (§14): fires strictly inside the outer
         # ``run_with_deadline`` backstop and cancels the in-flight step cleanly
@@ -1482,6 +1551,8 @@ class DesignPipeline(Workflow):
         self._llm = llm
         self._reasoning = reasoning
         self._decision_client = decision_client
+        self._weights_client = weights_client
+        self._category_client = category_client
         self._guard = (
             guard
             if guard is not None
@@ -1627,7 +1698,10 @@ class DesignPipeline(Workflow):
         )
         analysis = AnalysisResult(
             design_brief=brief,
-            decision_parts=parts,
+            # The parts the run actually used: a confident decision-model category
+            # replaces the LLM hypothesis, and the analyze payload must not disagree
+            # with the selection it ships next to.
+            decision_parts=[selections[part.id].part if part.id in selections else part for part in parts],
             selections=selections,
             effective_language=as_language(effective_language),
             focus=ev.focus,
@@ -2154,13 +2228,49 @@ class DesignPipeline(Workflow):
         decision = await self._decision_client.choose_style(description)
         if decision is None or decision.style is None:
             return brief
-        if decision.confidence < self._config.decisions.style_confidence_floor:
+        if decision.confidence < self._config.decisions.style.confidence_floor:
             return brief
         logger.info(
             "Architecture style resolved by decision model",
             extra={"source": "decision_model", "style": decision.style, "confidence": decision.confidence},
         )
         return brief.model_copy(update={"architecture_style": decision.style})
+
+    async def _tacit_weight_proposals(
+        self,
+        parts: Sequence[DecisionPart],
+        brief: DesignBrief,
+    ) -> dict[str, dict[str, float]]:
+        """J4: Tacit weight vectors for the parts it can answer, one retry for the rest.
+
+        One batched round trip for all parts (8 axis questions each); parts whose
+        vector came back missing or all-zero get exactly one more attempt, and
+        everything still unusable is simply absent from the result — the caller sends
+        those parts down the LLM path, which keeps the E4 semantics in one place.
+        """
+        client = self._weights_client
+        if client is None:
+            return {}
+        states = [_decision_part_state(brief, part) for part in parts]
+        vectors = await client.score_axes_many(states)
+        proposals: dict[str, dict[str, float]] = {}
+        retry: list[int] = []
+        for index, (part, vector) in enumerate(zip(parts, vectors, strict=True)):
+            if vector is None or max(vector.values(), default=0.0) <= 0.0:
+                retry.append(index)
+            else:
+                proposals[part.id] = vector
+        if not retry:
+            return proposals
+        logger.info(
+            "Tacit weights unusable; retrying those parts",
+            extra={"part_ids": [parts[index].id for index in retry]},
+        )
+        retried = await client.score_axes_many([states[index] for index in retry])
+        for index, vector in zip(retry, retried, strict=True):
+            if vector is not None and max(vector.values(), default=0.0) > 0.0:
+                proposals[parts[index].id] = vector
+        return proposals
 
     # -- Stage C/D/E --------------------------------------------------------------
 
@@ -2174,29 +2284,52 @@ class DesignPipeline(Workflow):
         """Stage C/D/E per part, in pipeline order (weights → retrieval → vetoes → scoring → selection)."""
         selections: dict[str, PartSelection] = {}
         _check_cancelled(cancellation, "weight extraction")
+        # J4: the decision model answers the weight question first (one batched round
+        # trip); only the parts it could not resolve pay the LLM call. The deterministic
+        # §7.1 tail is shared, so a decision-model vector and an LLM vector stay
+        # comparable and the E4 semantics are untouched.
+        tacit_weights: dict[str, dict[str, float]] = {}
+        if self._config.decisions.weights.enabled:
+            tacit_weights = await self._tacit_weight_proposals(parts, brief)
+        llm_parts = [part for part in parts if part.id not in tacit_weights]
         # Stage D (weights) and Stage C (retrieval) depend only on parts+brief, so
         # they overlap; the deterministic Stage E loop below joins both (§14 note:
         # bounded-concurrent stage overlap). extract_part_weights_batch never
         # raises (safe per-part wrappers); retrieval errors propagate (RET-1).
-        batch_weights, hits_by_part = await asyncio.gather(
+        batch_weights, (hits_by_part, category_overrides) = await asyncio.gather(
             extract_part_weights_batch(
-                self._llm, parts, brief, config=self._config, reasoning_context=weights_reasoning
+                self._llm, llm_parts, brief, config=self._config, reasoning_context=weights_reasoning
             ),
             self._retrieve_for_parts(parts, brief, cancellation),
         )
+        if tacit_weights:
+            batch_weights.update(
+                _process_weight_proposals(
+                    tacit_weights,
+                    [part for part in parts if part.id in tacit_weights],
+                    brief,
+                    self._config,
+                    default_source="decision-model",
+                )
+            )
         for part, hits in zip(parts, hits_by_part, strict=True):
             weights, weights_source = batch_weights[part.id]
+            # J2: a confident decision-model category replaces the LLM hypothesis for this
+            # part, so the §7.3 category adjustment, the E5/E7 fallback primary and the
+            # narrowed pool all speak the same category (otherwise every narrowed hit would
+            # take the -10 mismatch and the fallback would come from outside the pool).
+            effective_part = _with_effective_category(part, category_overrides.get(part.id))
             survivors, ledger, vetoed = apply_vetoes(
                 hits,
                 record_of=self._catalog.records,
-                part=part,
+                part=effective_part,
                 language=brief.language,
                 negative_signals=[*part.negative_signals, *brief.negative_signals],
             )
             best_blend = max((hit.retrieval_score for hit in survivors), default=0.0)
             if not survivors or best_blend < self._config.retrieval.min_fusion_score:
                 selection = select_for_part(
-                    part=part,
+                    part=effective_part,
                     candidates=[],
                     record_of=self._catalog.records,
                     catalog=self._catalog,
@@ -2217,7 +2350,7 @@ class DesignPipeline(Workflow):
             else:
                 annotated = score_candidates(
                     survivors,
-                    part=part,
+                    part=effective_part,
                     brief=brief,
                     weights=weights,
                     record_of=self._catalog.records,
@@ -2225,7 +2358,7 @@ class DesignPipeline(Workflow):
                     config=self._config,
                 )[: self._config.retrieval.top_k_candidates]
                 selection = select_for_part(
-                    part=part,
+                    part=effective_part,
                     candidates=annotated,
                     record_of=self._catalog.records,
                     catalog=self._catalog,
@@ -2254,10 +2387,14 @@ class DesignPipeline(Workflow):
         parts: Sequence[DecisionPart],
         brief: DesignBrief,
         cancellation: CancellationToken | None,
-    ) -> Awaitable[list[list[RetrievalHit]]]:
-        """One batched §6 retrieval for all parts (embed round trip shared, L1)."""
+    ) -> Awaitable[tuple[list[list[RetrievalHit]], dict[str, PatternCategory]]]:
+        """One batched §6 retrieval for all parts (embed round trip shared, L1).
 
-        async def _run() -> list[list[RetrievalHit]]:
+        Returns the per-part hits and, for the parts a confident decision-model category
+        narrowed, the category to use as that part's effective category downstream.
+        """
+
+        async def _run() -> tuple[list[list[RetrievalHit]], dict[str, PatternCategory]]:
             _check_cancelled(cancellation, "retrieval")
             queries = [
                 PartQuery(
@@ -2267,9 +2404,73 @@ class DesignPipeline(Workflow):
                 )
                 for part in parts
             ]
-            return await self._index.retrieve_many(queries)
+            hits_by_part = await self._index.retrieve_many(queries)
+            return await self._narrow_by_category(parts, brief, hits_by_part)
 
         return _run()
+
+    async def _narrow_by_category(
+        self,
+        parts: Sequence[DecisionPart],
+        brief: DesignBrief,
+        hits_by_part: list[list[RetrievalHit]],
+    ) -> tuple[list[list[RetrievalHit]], dict[str, PatternCategory]]:
+        """J2: keep the hits whose catalog category matches a confident choice (soft, never a router).
+
+        Narrowing only ever reorders the pool *after* retrieval: no category means no
+        narrowing, below-floor confidence means no narrowing, and a filter that would
+        empty the pool falls back to the unfiltered list — so recall can shrink but the
+        decision can never be starved by the model.
+
+        Returns the (possibly narrowed) hits plus, per narrowed part, the category the
+        caller must adopt as that part's effective category (§7.3 adjustment and E5/E7
+        fallback read the part's hypothesis, so leaving a stale one would score the pool
+        against a category the pool no longer contains).
+        """
+        client = self._category_client
+        seam = self._config.decisions.category
+        if client is None or not seam.enabled:
+            return hits_by_part, {}
+        narrowed: list[list[RetrievalHit]] = []
+        overrides: dict[str, PatternCategory] = {}
+        for part, hits in zip(parts, hits_by_part, strict=True):
+            category, confidence = await client.choose_category(_decision_part_state(brief, part))
+            if category is None or confidence < seam.confidence_floor:
+                logger.debug(
+                    "Category narrowing skipped",
+                    extra={"part_id": part.id, "category": category, "confidence": round(confidence, 4)},
+                )
+                narrowed.append(hits)
+                continue
+            kept = [hit for hit in hits if self._matches_category(hit.name, category)]
+            if not kept:
+                logger.info(
+                    "Category narrowing kept nothing; using the unfiltered pool",
+                    extra={"part_id": part.id, "category": category, "pool": len(hits)},
+                )
+                narrowed.append(hits)
+                continue
+            overrides[part.id] = as_category(category)
+            logger.info(
+                "Category narrowing applied",
+                extra={
+                    "part_id": part.id,
+                    "category": category,
+                    "confidence": round(confidence, 4),
+                    "kept": len(kept),
+                    "pool": len(hits),
+                    "replaced_hypothesis": part.category_hypothesis
+                    if part.category_hypothesis != category
+                    else None,
+                },
+            )
+            narrowed.append(kept)
+        return narrowed, overrides
+
+    def _matches_category(self, name: str, category: str) -> bool:
+        """True when the catalog record's category matches; unknown names are never dropped."""
+        record = self._catalog.records.get(name)
+        return True if record is None else record.category == category
 
     def _reselect(
         self,

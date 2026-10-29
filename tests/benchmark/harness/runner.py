@@ -27,6 +27,7 @@ from src.patterns.retriever import RetrievalIndex
 from src.patterns.safe_tei_rerank import build_reranker
 from src.pipeline import DesignPipeline, compose_selection
 from src.decisions.client import DecisionModelClient
+from src.decisions.tacit import TacitClient, reasoning_gate
 from src.reasoning.client import ReasoningClient
 from src.schemas import AnalysisResult, PipelineResult
 
@@ -126,6 +127,30 @@ class OfflineExecutor:
         return analysis, result, slice_records, {"script": script.describe()}
 
 
+def _unconfigured(seam: Any) -> bool:
+    """True when the seam wants a credential it cannot resolve."""
+    return seam.api_key_env is not None and not os.environ.get(seam.api_key_env)
+
+
+def _style_client(seam: Any) -> DecisionModelClient | None:
+    """The style-seam client, or None when the seam is off/unconfigured."""
+    return None if not seam.enabled or _unconfigured(seam) else DecisionModelClient(seam)
+
+
+def _tacit_client(seam: Any) -> TacitClient | None:
+    """The Tacit client for one seam, or None when the seam is off/unconfigured."""
+    return None if not seam.enabled or _unconfigured(seam) else TacitClient(seam)
+
+
+def _seam_provenance(name: str, seam: Any, client: Any, client_type: str) -> str:
+    """``name=wired|unconfigured|disabled`` — read off the wired object, never the flag."""
+    if client is not None:
+        return f"{name}=wired({client_type} {seam.model})"
+    if not seam.enabled:
+        return f"{name}=disabled"
+    return f"{name}=unconfigured({seam.api_key_env} unset)"
+
+
 class LiveExecutor:
     """Real seams in-process: TEI embedder/reranker, LiteLLM generator, reasoning client."""
 
@@ -134,6 +159,7 @@ class LiveExecutor:
     def __init__(
         self,
         *,
+        gate_client: TacitClient | None,
         config: ServerConfig,
         catalog: PatternLoader,
         recorder: StageRecorder,
@@ -146,6 +172,7 @@ class LiveExecutor:
         self._recorder = recorder
         self._pipeline = pipeline
         self._reasoning_health = reasoning_health
+        self._gate_client = gate_client
         self._index_source = index_source
         self.recorder = recorder
 
@@ -178,10 +205,20 @@ class LiveExecutor:
         )
         agent = build_llm_client(config)
         llm = LLMTimingProxy(agent, recorder)
+        # Mirror DesignPatternServer._wire_decision_seams: an arm that turns a seam on must
+        # actually get the client, or the run is silently A/A and the manifest lies about it.
+        style_client = _style_client(config.decisions.style)
+        weights_client = _tacit_client(config.decisions.weights)
+        category_client = _tacit_client(config.decisions.category)
+        gate_client = _tacit_client(config.decisions.reasoning_gate)
         reasoning_inner: ReasoningClient | None = None
         reasoning_health: dict[str, str] | None = None
         if config.reasoning.enabled:
-            reasoning_inner = ReasoningClient(config.reasoning, agent)  # type: ignore[arg-type]  # runtime is DesignAgent
+            reasoning_inner = ReasoningClient(  # type: ignore[arg-type]  # runtime is DesignAgent
+                config.reasoning,
+                agent,
+                gate=reasoning_gate(gate_client, config.decisions.reasoning_gate),
+            )
             reasoning_health = await reasoning_inner.health_check()
         pipeline = DesignPipeline(
             config=config,
@@ -193,12 +230,26 @@ class LiveExecutor:
                 if reasoning_inner is not None
                 else None
             ),
-            decision_client=DecisionModelClient(config.decisions)
-            if config.decisions.enabled and os.environ.get(config.decisions.api_key_env)
-            else None,
+            decision_client=style_client,
+            weights_client=weights_client,
+            category_client=category_client,
         )
         pipeline.validate()
+        if any(
+            seam.enabled and not _unconfigured(seam)
+            for seam in (
+                config.decisions.style,
+                config.decisions.weights,
+                config.decisions.category,
+                config.decisions.reasoning_gate,
+            )
+        ) and not (style_client or weights_client or category_client or gate_client):
+            raise RuntimeError(
+                "decision seams are enabled but no client was wired — an arm like this would "
+                "measure A/A and record a false provenance line"
+            )
         return cls(
+            gate_client=gate_client,
             config=config,
             catalog=catalog,
             recorder=recorder,
@@ -206,6 +257,19 @@ class LiveExecutor:
             reasoning_health=reasoning_health,
             index_source=f"RetrievalIndex.build (dense cache: {config.dense_cache.mode} @ {config.dense_cache.path})",
         )
+
+    def _describe_decision_seams(self) -> str:
+        """One provenance line naming every seam's wired state (never a flag alone)."""
+        decisions = self._config.decisions
+        parts = [
+            _seam_provenance(
+                "style", decisions.style, self._pipeline._decision_client, "DecisionModelClient"
+            ),
+            _seam_provenance("weights", decisions.weights, self._pipeline._weights_client, "TacitClient"),
+            _seam_provenance("category", decisions.category, self._pipeline._category_client, "TacitClient"),
+            _seam_provenance("gate", decisions.reasoning_gate, self._gate_client, "TacitClient"),
+        ]
+        return " ".join(parts) + f" reranker={self._config.reranker.provider}"
 
     def describe(self) -> dict[str, Any]:
         """Seam provenance: real objects behind timing proxies plus the reasoning health map."""
@@ -218,13 +282,7 @@ class LiveExecutor:
                     if self._config.reasoning.enabled
                     else "disabled via REASONING_ENABLED=false"
                 ),
-                "decisions": (
-                    f"DecisionModelClient ({self._config.decisions.model})"
-                    if self._pipeline._decision_client is not None
-                    else f"unconfigured ({self._config.decisions.api_key_env} unset)"
-                    if self._config.decisions.enabled
-                    else "disabled via DECISIONS_ENABLED=false"
-                ),
+                "decisions": self._describe_decision_seams(),
             },
             "reasoning_health": self._reasoning_health,
         }

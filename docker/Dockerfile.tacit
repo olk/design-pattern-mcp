@@ -1,0 +1,162 @@
+# syntax=docker/dockerfile:1.14-labs
+# AnyJev Tacit-4B decision sidecar for design-pattern-mcp (J4 weights, J2 category, J5 gate).
+#
+# Two stacks in one container, because they are one model:
+#   * ``vllm serve /models/tacit`` on 127.0.0.1:8000 — the model itself, all weights baked
+#     into the image (``HF_HUB_OFFLINE=1`` at runtime, nothing is downloaded on start);
+#   * ``python -m anyjev.serve`` on 0.0.0.0:8100 — AnyJev's decision gateway, exposing
+#     ``POST /v1/decide`` ({"state","question","options","kind"} or {"items": [...]}) and
+#     ``GET /v1/stats``.
+#
+# The served weights are *self-distilled in this build* (scripts/decision_models/
+# tacit_self_distill.py): the released Tacit-4B writes decision states in this server's
+# state shape, answers them with its own thinking, and a QLoRA student is trained to
+# reproduce that reasoning-conditioned label distribution in one forward. The prompts
+# come from ``src/decisions/seam_prompts.py`` — the same module the server asks with — so
+# the student is trained on exactly the bytes it answers in production.
+#
+# Two runtime targets, because the training stage needs a GPU on the builder:
+#
+#   --target runtime-distilled  (default) weights trained in this build; needs a GPU on
+#                               the builder (see the entitlement note below).
+#   --target runtime-released   released weights baked untrained; NO GPU anywhere,
+#                               so a CPU-only box can still build and inspect the image.
+#
+# The Makefile drives them: ``make docker-build-tacit`` (distilled) and
+# ``make docker-build-tacit-base`` (released). The training RUN requests a GPU through a
+# CDI device, which BuildKit gates behind an explicit entitlement — Docker's ``RUN`` has
+# no ``--gpus`` flag:
+#
+#   docker build --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit .
+#
+# Requirements for the default target: Docker >= 25 with CDI specs generated
+# (``nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml``) and a working NVIDIA
+# runtime. The labs frontend is pinned because ``RUN --device`` only exists from
+# dockerfile 1.14.0-labs onward. Without a GPU builder, train out of band (see below).
+#
+# The GPU itself must be Ampere or newer: vLLM needs compute capability >= 7.0, and the
+# QLoRA student is 4-bit bitsandbytes (>= 7.5 plus bfloat16). A Pascal/Turing training
+# card fails this stage, not the runtime.
+#
+# Build args (the Makefile forwards them):
+#   TACIT_MODEL_REPO   HuggingFace checkpoint (default ``morriszjm/Tacit-4B``, Apache-2.0).
+#   VLLM_IMAGE_TAG     vLLM base image tag (default ``v0.17.1``).
+#   TACIT_PROBLEMS / TACIT_EPOCHS / TACIT_LR / TACIT_BATCH / TACIT_ACCUM
+#                      self-distillation knobs of the default target.
+#   TACIT_COT_MAX_TOKENS / TACIT_MAX_NEW_TOKENS
+#                      generation bounds (defaults 2048 / 256). The teacher pass issues
+#                      one sequential generate per problem, so the build cost is roughly
+#                      `TACIT_PROBLEMS x TACIT_COT_MAX_TOKENS`: the 2000 x 2048 default is
+#                      single-digit hours on one 3090. Lower both for a fast local build.
+#
+# If the builder cannot be given a GPU, train out of band against the trainer stage — the
+# runtime stages carry only the entrypoint and ``/models/tacit``, never ``/build``:
+#   docker build --target self-distill -t tacit-trainer -f docker/Dockerfile.tacit .
+#   docker run --gpus all -v "$PWD/out:/out" tacit-trainer python3 /build/tacit_self_distill.py \
+#       --init-dir /models/tacit-4b --out /out/tacit-4b \
+#       --seam-prompts /build/seam_prompts.py --seed-texts /build/qa/qa.jsonl
+# then ``docker build --target runtime-released`` and copy ``out/tacit-4b`` over
+# ``/models/tacit`` (rebuild that stage with the directory added to the build context).
+#
+# The gateway reads the model's tokenizer, so the checkpoint directory must stay a plain
+# HF layout (config.json + weights + tokenizer) — that is what the trainer writes.
+
+ARG VLLM_IMAGE_TAG=v0.17.1
+
+# -- Stage 1: download the released checkpoint -------------------------------------------
+FROM python:3.11-slim AS weights
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG TACIT_MODEL_REPO=morriszjm/Tacit-4B
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "from huggingface_hub import snapshot_download; \
+        snapshot_download('${TACIT_MODEL_REPO}', local_dir='/models/tacit-4b')"
+
+# -- Stage 2: self-distil (GPU builder; only reached by runtime-distilled) ---------------
+FROM vllm/vllm-openai:${VLLM_IMAGE_TAG} AS self-distill
+
+ARG TACIT_MODEL_REPO=morriszjm/Tacit-4B
+ARG TACIT_PROBLEMS=2000
+ARG TACIT_EPOCHS=1
+ARG TACIT_LR=1e-4
+ARG TACIT_BATCH=4
+ARG TACIT_ACCUM=8
+# Generation bounds. The teacher pass is one SEQUENTIAL `generate` per problem on the
+# transformers engine (not batched), so these two knobs — not the QLoRA epochs — decide
+# how long this stage runs: 2000 problems x up to 2048 CoT tokens is single-digit hours
+# on one 3090, and roughly linear in the product. Shrink `TACIT_PROBLEMS` or
+# `TACIT_COT_MAX_TOKENS` for a quick build; `TACIT_MAX_NEW_TOKENS` bounds the
+# state-writing pass only.
+ARG TACIT_COT_MAX_TOKENS=2048
+ARG TACIT_MAX_NEW_TOKENS=256
+
+# QLoRA stack. The base image already carries torch/transformers/accelerate.
+RUN pip install --no-cache-dir "anyjev[client]==0.3.0" peft bitsandbytes datasets
+
+COPY --from=weights /models/tacit-4b /models/tacit-4b
+COPY scripts/decision_models/tacit_self_distill.py /build/tacit_self_distill.py
+# The server's own prompt vocabulary: the trainer asks exactly what the server asks.
+COPY src/decisions/seam_prompts.py /build/seam_prompts.py
+COPY qa/qa.jsonl /build/qa/qa.jsonl
+
+RUN --device=nvidia.com/gpu=all python3 /build/tacit_self_distill.py \
+    --init-dir /models/tacit-4b \
+    --out /out/tacit-4b \
+    --seam-prompts /build/seam_prompts.py \
+    --seed-texts /build/qa/qa.jsonl \
+    --repo "${TACIT_MODEL_REPO}" \
+    --problems "${TACIT_PROBLEMS}" \
+    --epochs "${TACIT_EPOCHS}" \
+    --lr "${TACIT_LR}" \
+    --batch "${TACIT_BATCH}" \
+    --accum "${TACIT_ACCUM}" \
+    --cot-max-tokens "${TACIT_COT_MAX_TOKENS}" \
+    --max-new-tokens "${TACIT_MAX_NEW_TOKENS}"
+
+# -- Stage 3: runtime shell shared by both targets ---------------------------------------
+FROM vllm/vllm-openai:${VLLM_IMAGE_TAG} AS runtime-base
+
+# The gateway only needs the client extra (transformers for the tokenizer); the model
+# itself runs in the vLLM child process.
+RUN pip install --no-cache-dir "anyjev[client]==0.3.0"
+
+COPY docker/tacit-entrypoint.sh /usr/local/bin/tacit-entrypoint.sh
+RUN chmod +x /usr/local/bin/tacit-entrypoint.sh
+
+# No hub access at runtime: every weight and tokenizer file is in the image.
+ENV HF_HUB_OFFLINE=1 \
+    TACIT_MODEL_DIR=/models/tacit \
+    TACIT_SERVED_MODEL=tacit-4b \
+    TACIT_UPSTREAM_PORT=8000 \
+    TACIT_PORT=8100 \
+    TACIT_ADAPTIVE=false
+
+EXPOSE 8100
+
+# The gateway answers /v1/stats without touching the model, so the healthcheck stays
+# cheap; the entrypoint is what waits for vLLM itself.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=5 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/v1/stats', timeout=5)"
+
+ENTRYPOINT ["/usr/local/bin/tacit-entrypoint.sh"]
+
+# -- Stage 4a: released weights, no GPU needed ------------------------------------------
+FROM runtime-base AS runtime-released
+
+COPY --from=weights /models/tacit-4b /models/tacit
+
+# -- Stage 4b: self-distilled weights (DEFAULT target) ----------------------------------
+FROM runtime-base AS runtime-distilled
+
+COPY --from=self-distill /out/tacit-4b /models/tacit

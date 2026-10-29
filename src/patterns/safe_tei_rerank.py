@@ -18,6 +18,7 @@ import httpx
 
 from src.config import RerankerConfig
 from src.errors import ERROR_RETRIEVAL_UNAVAILABLE, DesignPatternError
+from src.patterns.clm_rerank import CLMReranker
 from src.patterns.nodes import tokenize
 
 
@@ -135,11 +136,26 @@ class LexicalReranker:
 
 
 def build_reranker(config: RerankerConfig) -> RerankerProtocol:
-    """TEI reranker for ``config``; refuses an empty ``base_url`` at construction (§2.2)."""
+    """The reranker for ``config`` (§6 step 4).
+
+    ``provider="tei"`` (default) is the mandatory cross-encoder pass and refuses an
+    empty ``base_url`` at construction. ``provider="clm"`` wraps ``clm-serve
+    /v1/rank`` around exactly that TEI reranker, so an unreachable CLM stack
+    degrades to the same cross-encoder pass instead of failing retrieval.
+    """
     if not config.config.base_url.strip():
         raise DesignPatternError(
             ERROR_RETRIEVAL_UNAVAILABLE,
             "reranker base_url is empty — the mandatory cross-encoder pass cannot start",
             hint="set RERANKER_BASE_URL or config/config.json reranker.config.base_url",
         )
-    return TEIReranker(config)
+    tei = TEIReranker(config)
+    if config.provider == "clm":
+        if not config.clm_base_url.strip():
+            raise DesignPatternError(
+                ERROR_RETRIEVAL_UNAVAILABLE,
+                "reranker.provider is 'clm' but clm_base_url is empty",
+                hint="set RERANKER_CLM_BASE_URL or config/config.json reranker.clm_base_url",
+            )
+        return CLMReranker(config.clm_base_url, config.clm_timeout_seconds, fallback=tei)
+    return tei

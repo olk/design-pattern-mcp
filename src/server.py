@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 import warnings
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,7 +39,7 @@ from src.patterns.loader import (
     parse_locally_implementable_names,
     parse_out_of_scope_terms,
 )
-from src.config import ConfigManager, ServerConfig
+from src.config import ConfigManager, DecisionSeamConfig, ServerConfig
 from src.tools.jobs import JobsStore
 from src.agent import LLMClientProtocol, build_llm_client
 from src.pipeline import DesignPipeline
@@ -50,26 +50,39 @@ from src.tools import create_all_tools
 from src.reasoning import ReasoningConfig
 from src.reasoning.client import ReasoningClient
 from src.decisions.client import DecisionModelClient
+from src.decisions.tacit import TacitClient, reasoning_gate
 
 ERROR_SERVER_INIT = "ERR_013"
 
 logger = logging.getLogger(__name__)
 
 
-def _decisions_status(config: ServerConfig) -> str:
-    """Offline decisions (JEV) status string; pure, no network call.
+SEAM_NAMES: tuple[str, ...] = ("style", "weights", "category", "reasoning_gate")
 
-    Shared by the ``--health`` report and the startup log line: ``disabled`` when
-    the master switch is off, ``unconfigured`` when enabled but the API key env
-    var is unset, else ``ok (model=...)``. A set-but-unreachable key still
-    reports ``ok`` here — reachability surfaces per-call as degrade.
+
+def _seam_status(seam: DecisionSeamConfig) -> str:
+    """Offline status of one decision-model seam; pure, no network call.
+
+    ``disabled`` when the seam switch is off, ``unconfigured`` when it is on but its
+    credential env var is unset, else ``ok (provider=..., model=...)``. A configured
+    but unreachable endpoint still reports ``ok`` here — reachability surfaces per
+    call as silent degradation into the non-model path.
     """
-    decisions = config.decisions
-    if not decisions.enabled:
+    if not seam.enabled:
         return "disabled"
-    if not os.environ.get(decisions.api_key_env):
-        return f"unconfigured ({decisions.api_key_env} unset)"
-    return f"ok (model={decisions.model})"
+    if seam.api_key_env is not None and not os.environ.get(seam.api_key_env):
+        return f"unconfigured ({seam.api_key_env} unset)"
+    return f"ok (provider={seam.provider}, model={seam.model})"
+
+
+def _decisions_status(config: ServerConfig) -> dict[str, str]:
+    """Per-seam status map for the startup log line (all four seams, always present)."""
+    return {
+        "style": _seam_status(config.decisions.style),
+        "weights": _seam_status(config.decisions.weights),
+        "category": _seam_status(config.decisions.category),
+        "reasoning_gate": _seam_status(config.decisions.reasoning_gate),
+    }
 
 
 def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None:
@@ -256,7 +269,12 @@ class DesignPatternServer:
         self._reasoning_client: ReasoningClient | None = None
         self._reasoning_health: dict[str, str] = {}
         self._decision_client: DecisionModelClient | None = None
-        self._decisions_status: str = "disabled"
+        # One TacitClient per Tacit seam (weights / category / reasoning gate): separate
+        # instances keep each seam's timeout and cache exact instead of sharing one knob.
+        self._weights_client: TacitClient | None = None
+        self._category_client: TacitClient | None = None
+        self._gate_client: TacitClient | None = None
+        self._decisions_status: dict[str, str] = dict.fromkeys(SEAM_NAMES, "disabled")
 
     # -- startup ------------------------------------------------------------------
 
@@ -312,6 +330,10 @@ class DesignPatternServer:
             await self._pipeline.warmup()
             self._pipeline.validate()
 
+            # Decision seams first: the J5 gate client is an input of the reasoning client.
+            self._decisions_status = self._decisions_health()
+            self._wire_decision_seams()
+
             self._reasoning_client = self._build_reasoning_client()
             if self._reasoning_client is not None and self._reasoning_client.enabled:
                 await self._check_reasoning_health(
@@ -319,11 +341,6 @@ class DesignPatternServer:
                     self._config.reasoning.fail_fast,
                 )
                 self._pipeline._reasoning = self._reasoning_client
-
-            self._decisions_status = self._decisions_health()
-            if self._decisions_status.startswith("ok"):
-                self._decision_client = DecisionModelClient(self._config.decisions)
-                self._pipeline._decision_client = self._decision_client
 
             JobsStore.configure(str(Path(self._config.jobs.db_path).expanduser()))
             await JobsStore.get_instance()
@@ -355,7 +372,7 @@ class DesignPatternServer:
             return None
         if self._llm is None:
             raise RuntimeError("DesignAgent not initialized — cannot build ReasoningClient")
-        return ReasoningClient(reasoning_config, self._llm)  # type: ignore[arg-type]  # runtime is DesignAgent
+        return ReasoningClient(reasoning_config, self._llm, gate=self._reasoning_gate())  # type: ignore[arg-type]  # runtime is DesignAgent
 
     async def _check_reasoning_health(self, client: ReasoningClient, fail_fast: bool) -> None:
         """LOUD startup health check for the reasoning MCP tools.
@@ -384,16 +401,50 @@ class DesignPatternServer:
         if fail_fast and any(s != "ok" for s in self._reasoning_health.values()):
             raise RuntimeError(f"Reasoning MCP failed its health check (fail_fast=true): {self._reasoning_health}")
 
-    def _decisions_health(self) -> str:
-        """Log the offline decisions (JEV) status; never raises (fail_fast=false)."""
+    def _decisions_health(self) -> dict[str, str]:
+        """Log the per-seam decision-model status; never raises (fail_fast=false).
+
+        One summary line names every seam and the rerank provider, so an operator can
+        read the whole decision layer off the startup log. An enabled seam whose
+        credential is unset additionally logs at ERROR: the seam would silently
+        degrade every call otherwise.
+        """
         status = _decisions_status(self._config)
-        if status == "disabled":
-            logger.info("Decision model disabled")
-        elif status.startswith("unconfigured"):
-            logger.error("Decision model enabled but unconfigured: %s", status)
-        else:
-            logger.info("Decision model ready: %s", status)
+        summary = " ".join(f"{name}={value}" for name, value in status.items())
+        logger.info("Decision models: %s reranker=%s", summary, self._config.reranker.provider)
+        for name, value in status.items():
+            if value.startswith("unconfigured"):
+                logger.error("Decision-model seam %s is enabled but unconfigured: %s", name, value)
         return status
+
+    def _wire_decision_seams(self) -> None:
+        """Construct the enabled seam clients and inject them into the pipeline.
+
+        No network call happens here: every client degrades per call, so a
+        misconfigured or unreachable sidecar costs a warning, never a failed tool
+        call. Seams whose status is not ``ok`` are left unwired — the startup log
+        already says why.
+        """
+        if self._pipeline is None:
+            return
+        style = self._config.decisions.style
+        if self._decisions_status["style"].startswith("ok"):
+            self._decision_client = DecisionModelClient(style)
+            self._pipeline._decision_client = self._decision_client
+        weights = self._config.decisions.weights
+        if self._decisions_status["weights"].startswith("ok"):
+            self._weights_client = TacitClient(weights)
+            self._pipeline._weights_client = self._weights_client
+        category = self._config.decisions.category
+        if self._decisions_status["category"].startswith("ok"):
+            self._category_client = TacitClient(category)
+            self._pipeline._category_client = self._category_client
+        if self._decisions_status["reasoning_gate"].startswith("ok"):
+            self._gate_client = TacitClient(self._config.decisions.reasoning_gate)
+
+    def _reasoning_gate(self) -> Callable[[str, dict[str, Any]], Awaitable[bool | None]] | None:
+        """The J5 gate closure over the Tacit client (``None`` when the seam is off)."""
+        return reasoning_gate(self._gate_client, self._config.decisions.reasoning_gate)
 
     async def _cleanup(self) -> None:
         """Tear down resources; always called from the lifespan finally block."""
@@ -412,9 +463,15 @@ class DesignPatternServer:
             if self._reasoning_client:
                 await self._reasoning_client.close()
                 logger.debug("Cleaned up ReasoningClient")
-            if self._decision_client:
-                await self._decision_client.close()
-                logger.debug("Cleaned up DecisionModelClient")
+            for name, client in (
+                ("DecisionModelClient", self._decision_client),
+                ("TacitClient(weights)", self._weights_client),
+                ("TacitClient(category)", self._category_client),
+                ("TacitClient(reasoning_gate)", self._gate_client),
+            ):
+                if client is not None:
+                    await client.close()
+                    logger.debug("Cleaned up %s", name)
             self._tools.clear()
             logger.info("Server resources cleanup completed")
         except Exception as exc:

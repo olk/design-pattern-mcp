@@ -199,6 +199,17 @@ def test_language_implementations_in_main_record_is_rejected(tmp_path: Path) -> 
     assert "language_implementations" in excinfo.value.detail
 
 
+def test_malformed_json_names_the_file_and_the_parse_error(tmp_path: Path) -> None:
+    """A broken record file must say WHICH file and WHY — the loader's only diagnostic."""
+    path = write_record(tmp_path, "alpha-pattern")
+    path.write_text("{ this is not json", encoding="utf-8")
+    with pytest.raises(DesignPatternError) as excinfo:
+        _catalog_of(tmp_path)
+    assert excinfo.value.code == ERROR_CATALOG_INVALID
+    assert str(path) in excinfo.value.detail
+    assert "is not valid JSON" in excinfo.value.detail
+
+
 def test_canonical_order_prefers_the_catalog_document(tmp_path: Path) -> None:
     """Row order inside a section defines the canonical index (§8.1 tie-break)."""
     write_record(tmp_path, "first-pattern")

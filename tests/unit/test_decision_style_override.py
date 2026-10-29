@@ -106,6 +106,6 @@ async def test_no_client_keeps_llm_style(catalog: PatternLoader) -> None:
 
 async def test_floor_is_configurable(catalog: PatternLoader) -> None:
     fake = _FakeDecisionClient(StyleDecision(style="event-driven", confidence=0.3, probabilities={"event-driven": 0.3}))
-    pipeline = _pipeline(catalog, fake, decisions={"style_confidence_floor": 0.2})
+    pipeline = _pipeline(catalog, fake, decisions={"style": {"confidence_floor": 0.2}})
     result = await pipeline._apply_decision_style(DESCRIPTION, None, _brief("microservices"))
     assert result.architecture_style == "event-driven"

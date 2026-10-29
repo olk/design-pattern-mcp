@@ -1,0 +1,114 @@
+# Decision-model override: adds the two GPU sidecars and turns the seams on.
+#
+# This file is an explicit opt-in layer, never a default:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml up -d
+#   make docker-up-decisions
+#
+# Both sidecars are GPU-only and each wants its own card:
+#   * design-pattern-clm      frozen Qwen3-8B encoder (~16 GB) + two 20M heads;
+#   * design-pattern-tacit    Tacit-4B (~8 GB) in vLLM plus the AnyJev gateway.
+# On a single 24 GB card, start one seam set at a time (`--scale`-style partial start:
+# `docker compose ... up -d design-pattern-clm design-pattern-mcp`).
+#
+# Every seam is switched on here and only here: the base compose file has no
+# decision-model env at all, and config/config.json defaults every seam to false.
+# An outage of either sidecar degrades to the non-model path (LLM style and weights,
+# TEI rerank, unfiltered retrieval, reasoning runs) — it never fails a tool call.
+name: design-pattern-mcp-dev
+
+services:
+  design-pattern-tacit:
+    image: ${TACIT_IMAGE:-design-pattern-tacit:latest}
+    container_name: design-pattern-tacit-dev
+    restart: unless-stopped
+    environment:
+      # All weights are baked into the image; the gateway must not reach the Hub.
+      - HF_HUB_OFFLINE=1
+      # false = one forward per decision (deterministic, the shipped behaviour).
+      - TACIT_ADAPTIVE=${TACIT_ADAPTIVE:-false}
+    ports:
+      # Loopback only: anyjev.serve has no auth of its own (its own docstring), so this
+      # sidecar must never be reachable beyond the workstation — same rule as the
+      # benchmark TEI override.
+      - "127.0.0.1:18100:8100" # dev host port; container 8100 = the gateway
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/v1/stats', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  design-pattern-clm:
+    image: ${CLM_IMAGE:-design-pattern-clm:latest}
+    container_name: design-pattern-clm-dev
+    restart: unless-stopped
+    environment:
+      - HF_HUB_OFFLINE=1
+    ports:
+      # Loopback only: clm-serve's auth() is a no-op while CLM_API_KEY is unset, which this
+      # override leaves unset (the server sends no Authorization either).
+      - "127.0.0.1:18700:8700" # dev host port; container 8700 = clm-serve
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8700/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  design-pattern-mcp:
+    environment:
+      # J1 rerank: CLM's list scorer in front of the fused pool; the TEI sidecar stays
+      # the mandatory fallback inside the client, so it remains a dependency.
+      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-clm}
+      - RERANKER_CLM_BASE_URL=http://design-pattern-clm:8700/v1
+      # Ch2 style: CLM /v1/systemone over the 36 style criteria, no credential (local).
+      - DECISIONS_STYLE_ENABLED=${DECISIONS_STYLE_ENABLED:-true}
+      - DECISIONS_STYLE_PROVIDER=clm
+      - DECISIONS_STYLE_BASE_URL=http://design-pattern-clm:8700/v1
+      - DECISIONS_STYLE_MODEL=clm-latest
+      # J4 weights: Tacit score questions, 8 axes per part.
+      - DECISIONS_WEIGHTS_ENABLED=${DECISIONS_WEIGHTS_ENABLED:-true}
+      - DECISIONS_WEIGHTS_PROVIDER=tacit
+      - DECISIONS_WEIGHTS_BASE_URL=http://design-pattern-tacit:8100
+      - DECISIONS_WEIGHTS_MODEL=tacit-4b
+      # J2 category: soft 9-way narrowing of the retrieved pool.
+      - DECISIONS_CATEGORY_ENABLED=${DECISIONS_CATEGORY_ENABLED:-true}
+      - DECISIONS_CATEGORY_PROVIDER=tacit
+      - DECISIONS_CATEGORY_BASE_URL=http://design-pattern-tacit:8100
+      - DECISIONS_CATEGORY_MODEL=tacit-4b
+      # J5 gate: skip deliberation when the decision is already determined.
+      - DECISIONS_REASONING_GATE_ENABLED=${DECISIONS_REASONING_GATE_ENABLED:-true}
+      - DECISIONS_REASONING_GATE_PROVIDER=tacit
+      - DECISIONS_REASONING_GATE_BASE_URL=http://design-pattern-tacit:8100
+      - DECISIONS_REASONING_GATE_MODEL=tacit-4b
+    depends_on:
+      design-pattern-tacit:
+        condition: service_healthy
+      design-pattern-clm:
+        condition: service_healthy

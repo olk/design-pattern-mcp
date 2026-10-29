@@ -171,3 +171,18 @@ async def test_configure_is_used_when_env_unset(monkeypatch, tmp_path):
     finally:
         JobsStore.configure(str(tmp_path / "discard.db"))
         await JobsStore.reset_for_test()
+async def test_close_is_idempotent_and_drops_the_singleton(monkeypatch, tmp_path):
+    """Teardown contract: close() releases the connection, and a second close() is a no-op.
+
+    The server's cleanup path calls close() unconditionally, so it must survive both the
+    "connection is open" and the "already closed" state without raising.
+    """
+    store = await _fresh_store(monkeypatch, tmp_path)
+    assert store._db is not None
+
+    await store.close()
+    assert store._db is None
+    assert JobsStore._instance is None
+
+    await store.close()  # must not raise on an already-closed store
+    assert store._db is None
