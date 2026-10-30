@@ -54,15 +54,16 @@ For Path B additionally:
 systemctl is-system-running                 # expect "running" or "degraded"
 ```
 
-The deployed stack defaults to **MiniMax** as generator LLM, so obtain a
-`MINIMAXAI_API_KEY` (`sk-...`). To use another provider (OpenAI, DeepSeek,
+The deployed stack defaults to **Muse Spark 1.3 Contributor** (via the OpenCode Go
+gateway, `https://opencode.ai/zen/go/v1`) as generator LLM, so obtain an
+`OPENCODE_API_KEY`. To use another provider (OpenAI, MiniMax, DeepSeek,
 Ollama, …) see [Switching the generator LLM](#switching-the-generator-llm) —
 the install steps below stay the same.
 
 ## Path A — Compose stack (repo clone, no build, no root)
 
 `docker/docker-compose.yml` has no `build:` sections; images are parameterized
-(`MCP_IMAGE`, `TEI_IMAGE`, `TEI_RERANK_IMAGE`, `MINIMAXAI_API_KEY`)
+(`MCP_IMAGE`, `TEI_IMAGE`, `TEI_RERANK_IMAGE`, `OPENCODE_API_KEY`)
 and resolved from an env file.
 
 ```bash
@@ -87,13 +88,12 @@ cat > docker/.env <<EOF
 MCP_IMAGE=olkowa/design-pattern-mcp:${VERSION}
 TEI_IMAGE=olkowa/pattern-tei-embed:${TEI_VERSION}
 TEI_RERANK_IMAGE=olkowa/pattern-tei-rerank:${TEI_VERSION}
-MINIMAXAI_API_KEY=sk-REPLACE-ME
+OPENCODE_API_KEY=sk-REPLACE-ME
 EOF
 
 # A3. Sanity check: interpolation resolved to the Hub refs (each printed image:
 #     olkowa/design-pattern-mcp:…, olkowa/pattern-tei-embed:…,
-#     olkowa/pattern-tei-rerank:…). Empty MINIMAXAI_API_KEY warning is expected
-#     only if you skipped the key.
+#     olkowa/pattern-tei-rerank:…). Empty OPENCODE_API_KEY warning is expected
 docker compose --env-file docker/.env -f docker/docker-compose.yml config | grep 'image:'
 
 # A4. Start. TEI sidecars cold-start model weights; first start takes ~2 min.
@@ -198,7 +198,7 @@ sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
 # root:docker 640: the service runs as a non-root docker-group user, which
 # must be able to read the file; the docker group is effectively privileged.
 sudo tee /etc/design-pattern-mcp/.env > /dev/null <<EOF
-MINIMAXAI_API_KEY=sk-REPLACE-ME
+OPENCODE_API_KEY=sk-REPLACE-ME
 COMPOSE_PROJECT_NAME=dpml-systemd
 EOF
 sudo chown root:docker /etc/design-pattern-mcp/.env
@@ -311,8 +311,8 @@ probe embedding instead of a full corpus pass.
 
 ## Switching the generator LLM
 
-Both compose files hardcode the MiniMax generator env block. To use another
-LiteLLM provider, edit the four `GENERATOR_*` lines in the
+Both compose files hardcode the Muse Spark generator env block. To use another
+LiteLLM provider, edit the five `GENERATOR_*` lines in the
 installed compose file — Path A: `docker/docker-compose.yml`; Path B:
 `/etc/design-pattern-mcp/docker-compose.yml` — e.g. for OpenAI:
 

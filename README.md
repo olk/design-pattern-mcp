@@ -46,7 +46,7 @@ An MCP (Model Context Protocol) server that provides design-pattern selection ex
 git clone https://git.odvlh.xyz/olli/design-pattern-mcp.git && cd design-pattern-mcp
 
 # 2. Add your API key
-export MINIMAXAI_API_KEY=your_key_here
+export OPENCODE_API_KEY=your_key_here
 
 # 3. Build + start (three images: MCP server + TEI embed + TEI rerank)
 make docker-build-all
@@ -75,7 +75,7 @@ Pick one path in `INSTALL.md`:
 - **Path A — Compose stack** (`:8822`): evaluating / developing, no sudo needed. Own TEI sidecar copies.
 - **Path B — systemd stack** (`:8812`): persistent host service, starts at boot, needs `sudo`. Uses the shared `pattern-tei-infra` TEI stack.
 
-The agent needs a repo clone, Docker ≥ v2.20 with group membership, ~8 GB free, a `MINIMAXAI_API_KEY` (or another provider per `INSTALL.md#switching-the-generator-llm`), and linux/amd64 (on arm64 it builds locally via `make docker-build-all`). Dev and systemd stacks run concurrently on their default host ports (8822 vs 8812). After install, continue with [Connect Your Agent](#-connect-your-agent) below.
+The agent needs a repo clone, Docker ≥ v2.20 with group membership, ~8 GB free, a `OPENCODE_API_KEY` (or another provider per `INSTALL.md#switching-the-generator-llm`), and linux/amd64 (on arm64 it builds locally via `make docker-build-all`). Dev and systemd stacks run concurrently on their default host ports (8822 vs 8812). After install, continue with [Connect Your Agent](#-connect-your-agent) below.
 
 ---
 
@@ -89,10 +89,11 @@ uv pip install -e .
 
 # Run as stdio subprocess — pass the API key via env
 claude mcp add design-patterns \
-  -e GENERATOR_PROVIDER=minimax \
-  -e GENERATOR_MODEL=minimax/MiniMax-M2.7 \
-  -e GENERATOR_BASE_URL=https://api.minimax.io/v1 \
+  -e GENERATOR_PROVIDER=opencode-go \
+  -e GENERATOR_MODEL=openai/muse-spark-1.3-contributor \
+  -e GENERATOR_BASE_URL=https://opencode.ai/zen/go/v1 \
   -e GENERATOR_API_KEY=your_key \
+  -e GENERATOR_SESSION_ID=design-pattern-mcp \
   -- design-pattern-mcp --transport stdio
 ```
 
@@ -140,10 +141,11 @@ command = "design-pattern-mcp"
 args = ["--transport", "stdio"]
 
 [mcp_servers.design-patterns.env]
-GENERATOR_PROVIDER = "minimax"
-GENERATOR_MODEL = "minimax/MiniMax-M2.7"
-GENERATOR_BASE_URL = "https://api.minimax.io/v1"
+GENERATOR_PROVIDER = "opencode-go"
+GENERATOR_MODEL = "openai/muse-spark-1.3-contributor"
+GENERATOR_BASE_URL = "https://opencode.ai/zen/go/v1"
 GENERATOR_API_KEY = "your_key"
+GENERATOR_SESSION_ID = "design-pattern-mcp"
 ```
 
 Or via CLI:
@@ -392,7 +394,7 @@ Run both servers side by side (dev host ports `:8060` architecture, `:8822` desi
 make docker-build-all
 
 # Run with your API key
-MINIMAXAI_API_KEY=your_key make docker-up
+OPENCODE_API_KEY=your_key make docker-up
 ```
 
 First `docker-build-all` generates the FAISS dense cache (`data/dense-cache/`) via the TEI embed sidecar and bakes it into the server image; `make docker-build-nocache` skips that (first startup then embeds the corpus, ~19 min).
@@ -421,10 +423,11 @@ host value into the container, and a host run reads it directly. Details:
 make install
 
 # Configure — the shipped wire config with {env:...} placeholders
-export GENERATOR_PROVIDER=minimax
-export GENERATOR_MODEL=minimax/MiniMax-M2.7
-export GENERATOR_BASE_URL=https://api.minimax.io/v1
+export GENERATOR_PROVIDER=opencode-go
+export GENERATOR_MODEL=openai/muse-spark-1.3-contributor
+export GENERATOR_BASE_URL=https://opencode.ai/zen/go/v1
 export GENERATOR_API_KEY=your_key
+export GENERATOR_SESSION_ID=design-pattern-mcp
 # Dense cache (host runs): the image default /app/data/dense-cache does not exist
 # on a workstation, so point it at the gitignored repo snapshot. `make embed-cache`
 # fills it; otherwise the first start embeds once and writes it (later starts warm).
@@ -466,6 +469,7 @@ The server reads `config/config.json` relative to the repo (override with `--con
       "model": "{env:GENERATOR_MODEL:-gpt-4o-mini}",
       "base_url": "{env:GENERATOR_BASE_URL:-https://api.openai.com/v1}",
       "api_key": "{env:GENERATOR_API_KEY:-}",
+      "session_id": "{env:GENERATOR_SESSION_ID:-}",
       "temperature": "{env:GENERATOR_TEMPERATURE:-0.1}",
       "timeout_seconds": "{env:GENERATOR_TIMEOUT_SECONDS:-120.0}",
       "generation_batch_size": "{env:GENERATOR_GENERATION_BATCH_SIZE:-5}",
@@ -488,14 +492,15 @@ The server reads `config/config.json` relative to the repo (override with `--con
 
 ### Generator LLM (LlamaIndex LiteLLM)
 
-The generator LLM is accessed through the **LlamaIndex LiteLLM integration**. All provider settings follow **LiteLLM's model syntax**: `<provider>/<model>`. The dev stack and benchmark harness default to MiniMax:
+The generator LLM is accessed through the **LlamaIndex LiteLLM integration**. All provider settings follow **LiteLLM's model syntax**: `<provider>/<model>`. The dev stack and benchmark harness default to Muse Spark via the OpenCode Go gateway (OpenAI-compatible chat completions; the `openai/` prefix routes LiteLLM's OpenAI handler at the custom `api_base`):
 
 | Config / env | Dev-stack default |
 |---|---|
-| `GENERATOR_PROVIDER` | `minimax` |
-| `GENERATOR_MODEL` | `minimax/MiniMax-M2.7` |
-| `GENERATOR_BASE_URL` | `https://api.minimax.io/v1` |
-| `GENERATOR_API_KEY` | falls back to `MINIMAXAI_API_KEY` (host env or `.env`) |
+| `GENERATOR_PROVIDER` | `opencode-go` |
+| `GENERATOR_MODEL` | `openai/muse-spark-1.3-contributor` |
+| `GENERATOR_BASE_URL` | `https://opencode.ai/zen/go/v1` |
+| `GENERATOR_API_KEY` | falls back to `OPENCODE_API_KEY` (host env or `.env`) |
+| `GENERATOR_SESSION_ID` | `design-pattern-mcp` (sent as `x-opencode-session`; the gateway rejects calls without it) |
 
 Provider list and syntax: [LiteLLM Providers documentation](https://docs.litellm.ai/docs/providers). `temperature`, `top_p`, `top_k`, `timeout_seconds`, and the circuit-breaker knobs map to the corresponding LiteLLM/provider parameters.
 
@@ -612,10 +617,11 @@ On a single 24 GB card start one sidecar at a time: Tacit ≈ 8 GB, CLM ≈ 16-1
 
 | Variable | Default | Description |
 |---|---|---|
-| `GENERATOR_API_KEY` | *(required)* | Generator API key (dev stack falls back to `MINIMAXAI_API_KEY`) |
-| `GENERATOR_PROVIDER` | `openai` | LiteLLM provider prefix (`minimax`, `openai`, `anthropic`, `openrouter`, …) |
-| `GENERATOR_MODEL` | `gpt-4o-mini` | Model name; `minimax/MiniMax-M2.7` is the measured dev-stack default |
+| `GENERATOR_API_KEY` | *(required)* | Generator API key (dev stack falls back to `OPENCODE_API_KEY`) |
+| `GENERATOR_PROVIDER` | `openai` | LiteLLM provider prefix (`opencode-go`, `minimax`, `openai`, `anthropic`, `openrouter`, …) |
+| `GENERATOR_MODEL` | `gpt-4o-mini` | Model name; `openai/muse-spark-1.3-contributor` is the dev-stack default (all committed benchmark arms were measured on MiniMax-M2.7) |
 | `GENERATOR_BASE_URL` | `https://api.openai.com/v1` | API base URL (LiteLLM `api_base`) |
+| `GENERATOR_SESSION_ID` | *(empty)* | Session id sent as `x-opencode-session` (required by the OpenCode Go gateway) |
 | `GENERATOR_TEMPERATURE` | `0.1` | Sampling temperature |
 | `GENERATOR_TIMEOUT_SECONDS` | `120.0` | Bounds ONE HTTP request to the model |
 | `GENERATOR_GENERATION_BATCH_SIZE` | `5` | Patterns per GENERATE batch |
@@ -803,7 +809,7 @@ Local non-Docker runs must point `EMBEDDER_BASE_URL` / `RERANKER_BASE_URL` at re
 
 ### LLM provider errors (502 / 401)
 
-- Confirm `GENERATOR_API_KEY` (or `MINIMAXAI_API_KEY` on the dev stack) is set and not expired
+- Confirm `GENERATOR_API_KEY` (or `OPENCODE_API_KEY` on the dev stack) is set and not expired
 - Verify `GENERATOR_BASE_URL` matches your provider's endpoint
 - After 3 consecutive transport failures the circuit opens for 60 s (`..._CIRCUIT_BREAKER_*` knobs); auth/configuration 4xx never count toward it
 

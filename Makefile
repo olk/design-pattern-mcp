@@ -468,77 +468,50 @@ docker-rm: ## Remove the local server image
 # The harness lives in tests/benchmark/ (no pytest collection) and never edits src/: the pipeline
 # is constructor-injected, so the runners wrap the seams they hand in. See tests/benchmark/README.md
 # for the mode matrix, the metric definitions and the pre-registered A/B decision rule.
-BENCH_RUNS         ?= data/benchmark-runs
-BENCH_SCENARIOS    ?= tests/benchmark/scenarios/seed.json
-BENCH_COMPOSE      := docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml
-BENCH_EMBED_URL    ?= http://127.0.0.1:18081/v1
-BENCH_RERANK_URL   ?= http://127.0.0.1:18082
-BENCH_RUN_ARGS     := $(if $(OUT),--out $(OUT),) $(if $(RUN_ID),--run-id $(RUN_ID),) \
-	$(if $(LIMIT),--limit $(LIMIT),) $(if $(SPLIT),--split $(SPLIT),) $(if $(REPEAT),--repeat $(REPEAT),) \
-	$(if $(NO_WARMUP),--no-warmup,) $(if $(LOG_LEVEL),--log-level $(LOG_LEVEL),)
-# In-process arm scope: live = full pipeline, analyze = ANALYZE phase only (no generation).
-BENCH_MODE         ?= live
+#
+# Every target executes the harness inside Docker via scripts/benchmark-docker.sh
+# (docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml run --rm
+# benchmark): the modules, corpora, metrics and verdicts are unchanged — the script owns image
+# preflight, stack lifecycle (up --wait → run → down), the MCP readiness probe and exit-code
+# propagation. live/analyze need a warm data/dense-cache (make dense-cache) plus the generator
+# key from config/.env; e2e runs the full stack under DENSE_CACHE_MODE=off (cold start re-embeds
+# the catalog, ~20 min on CPU) and tears the stack down afterwards (restart dev stack:
+# make docker-up).
+BENCH_RUNS      ?= data/benchmark-runs
+BENCH_SCENARIOS ?= tests/benchmark/scenarios/seed.json
+BENCH_COMPOSE   := docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml
+BENCH_DOCKER    := bash scripts/benchmark-docker.sh
+BENCH_ENV := BENCH_SCENARIOS="$(BENCH_SCENARIOS)" OUT="$(OUT)" RUN_ID="$(RUN_ID)" LIMIT="$(LIMIT)" \
+	SPLIT="$(SPLIT)" REPEAT="$(REPEAT)" NO_WARMUP="$(NO_WARMUP)" LOG_LEVEL="$(LOG_LEVEL)" \
+	FLIP="$(FLIP)" CLIENT_URL="$(CLIENT_URL)" CALL_TIMEOUT="$(CALL_TIMEOUT)" A="$(A)" B="$(B)" \
+	ALLOW_MISMATCH="$(ALLOW_MISMATCH)" DRY_RUN="$(DRY_RUN)" PER_FAMILY="$(PER_FAMILY)" \
+	FAMILIES="$(FAMILIES)" DRAFT_OUT="$(DRAFT_OUT)"
 
-benchmark-selfcheck: ## Benchmark: hand-computed anchors for every metric formula (no network)
-	$(UV) run python -m tests.benchmark.harness.selfcheck
+benchmark-selfcheck: ## Benchmark: metric self-check, hand-computed anchors (in Docker; no stack)
+	@$(BENCH_ENV) $(BENCH_DOCKER) selfcheck
 
-benchmark-offline: ## Benchmark: deterministic offline plumbing run (FLIP=<scenario_id> = flip arm)
-	$(UV) run python -m tests.benchmark.harness.main --mode offline \
-		--scenarios $(BENCH_SCENARIOS) $(if $(FLIP),--flip $(FLIP),) $(BENCH_RUN_ARGS)
+benchmark-offline: ## Benchmark: deterministic offline run (in Docker; FLIP=<scenario_id> = flip arm)
+	@$(BENCH_ENV) $(BENCH_DOCKER) offline
 
-# Needs the TEI sidecars reachable on loopback (benchmark-sidecars-up) plus a warm dense cache and
-# the generator key from config/.env; the runner refuses to start against a cold cache.
-benchmark-sidecars-up: ## Benchmark: publish the TEI sidecars on loopback (additive compose override)
+benchmark-sidecars-up: ## Benchmark: publish the TEI sidecars on loopback (manual host-native escape hatch)
 	$(BENCH_COMPOSE) up -d design-pattern-tei-embed design-pattern-tei-rerank
 
-# Provider defaults mirror docker/docker-compose.yml's dev stack (MiniMax + the key from
-# MINIMAXAI_API_KEY), so an in-process live arm talks to the same generator as the containerized
-# stack; any GENERATOR_* value already in the environment wins.
-#
-# Reasoning servers: the config default points at the Docker-embedded entry points, which do not
-# exist on a workstation, so the recipe points REASONING_*_CMD at the globally installed npm
-# packages (`make install-mcps`) when they are present. Without them the pipeline degrades per
-# call (visible as reasoning_health in the run manifest). The discovery runs inside the recipe's
-# shell, so no other make invocation pays for `npm root -g`.
-benchmark-live: ## Benchmark: in-process live run with full stage attribution
-	@sh -c 'root=$$(npm root -g 2>/dev/null); \
-		if [ -n "$$root" ] && [ -f "$$root/server-shannon-thinking/dist/index.js" ]; then \
-			export REASONING_SHANNONTHINKING_CMD="[\"node\", \"$$root/server-shannon-thinking/dist/index.js\"]"; \
-			export REASONING_CODE_REASONING_CMD="[\"node\", \"$$root/@mettamatt/code-reasoning/dist/index.js\"]"; \
-		fi; \
-		export GENERATOR_PROVIDER="$${GENERATOR_PROVIDER:-minimax}"; \
-		export GENERATOR_MODEL="$${GENERATOR_MODEL:-minimax/MiniMax-M2.7}"; \
-		export GENERATOR_BASE_URL="$${GENERATOR_BASE_URL:-https://api.minimax.io/v1}"; \
-		export GENERATOR_API_KEY="$${GENERATOR_API_KEY:-$${MINIMAXAI_API_KEY:-}}"; \
-		export GENERATOR_TIMEOUT_SECONDS="$${GENERATOR_TIMEOUT_SECONDS:-300.0}"; \
-		export EMBEDDER_BASE_URL="$(BENCH_EMBED_URL)"; \
-		export EMBEDDER_API_KEY="$${EMBEDDER_API_KEY:-tei-noauth}"; \
-		export RERANKER_BASE_URL="$(BENCH_RERANK_URL)"; \
-		export DENSE_CACHE_PATH="$(CURDIR)/data/dense-cache"; \
-		exec $(UV) run python -m tests.benchmark.harness.main --mode $(BENCH_MODE) \
-			--scenarios $(BENCH_SCENARIOS) $(BENCH_RUN_ARGS)'
+benchmark-live: ## Benchmark: in-process live run (in Docker; starts/tears down the TEI sidecars)
+	@$(BENCH_ENV) $(BENCH_DOCKER) live
 
-benchmark-analyze: BENCH_MODE = analyze
-benchmark-analyze: benchmark-live ## Benchmark: in-process analyze-only arm (hit/recall, no generation)
+benchmark-analyze: ## Benchmark: in-process analyze-only arm, hit/recall (in Docker; sidecars managed)
+	@$(BENCH_ENV) $(BENCH_DOCKER) analyze
 
-benchmark-e2e: ## Benchmark: black-box run against the running compose stack
-	$(UV) run python -m tests.benchmark.harness.e2e \
-		--scenarios $(BENCH_SCENARIOS) $(BENCH_RUN_ARGS) \
-		$(if $(CLIENT_URL),--url $(CLIENT_URL),) \
-		$(if $(CALL_TIMEOUT),--call-timeout-seconds $(CALL_TIMEOUT),)
+benchmark-e2e: ## Benchmark: black-box run through docker compose (full stack, readiness-gated, torn down)
+	@$(BENCH_ENV) $(BENCH_DOCKER) e2e
 
-# User-gated corpus expansion (plan §11): drafts scenario candidates from the catalog records and
-# writes data/benchmark-runs/drafts/full.draft.json for review — never committed, and the reviewed
-# scenarios are hand-copied into tests/benchmark/scenarios/full.json. DRY_RUN=1 prints the prompt.
-benchmark-draft: ## Benchmark: draft full.json scenario candidates from the catalog (user review gate)
-	$(UV) run python -m tests.benchmark.harness.draft $(if $(DRY_RUN),--dry-run,) \
-		$(if $(PER_FAMILY),--per-family $(PER_FAMILY),) $(if $(FAMILIES),--families '$(FAMILIES)',) \
-		$(if $(DRAFT_OUT),--out $(DRAFT_OUT),)
+benchmark-draft: ## Benchmark: draft full.json candidates from the catalog (in Docker; user review gate)
+	@$(BENCH_ENV) $(BENCH_DOCKER) draft
 
 # Exits 1 on a candidate-loss verdict (pre-registered rule in tests/benchmark/README.md).
-benchmark-compare: ## Benchmark: compare two run dirs (A=<baseline> B=<candidate>)
+benchmark-compare: ## Benchmark: compare two run dirs (A=<baseline> B=<candidate>), in Docker
 	@[ -n "$(A)" ] && [ -n "$(B)" ] || { echo "usage: make benchmark-compare A=<baseline-dir> B=<candidate-dir>"; exit 2; }
-	$(UV) run python -m tests.benchmark.harness.compare $(A) $(B) $(if $(ALLOW_MISMATCH),--allow-mismatch,)
+	@$(BENCH_ENV) $(BENCH_DOCKER) compare
 
 ##@ Maintenance
 clean: ## Remove caches and build artifacts

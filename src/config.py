@@ -50,6 +50,9 @@ class GeneratorInnerConfig(BaseModel):
     circuit_breaker_failure_threshold: int = Field(default=3, ge=1)
     #: Seconds an open circuit rejects calls before one half-open probe is admitted.
     circuit_breaker_cooldown_seconds: float = Field(default=60.0, gt=0.0)
+    #: Extra HTTP headers for the provider call (OpenCode Go gateway requires
+    #: ``x-opencode-session``; empty = none). Set via GENERATOR_SESSION_ID.
+    session_id: str = Field(default="")
 
     model_config = {"extra": "forbid"}
 
