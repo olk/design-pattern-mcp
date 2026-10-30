@@ -99,6 +99,9 @@ case "$MODE" in
       export GENERATOR_API_KEY="${GENERATOR_API_KEY:-${OPENCODE_API_KEY:-}}"
       export GENERATOR_SESSION_ID="${GENERATOR_SESSION_ID:-design-pattern-mcp-benchmark}"
       export GENERATOR_TIMEOUT_SECONDS="${GENERATOR_TIMEOUT_SECONDS:-300.0}"
+      # Generator and Jev share one Console key: point the decision client at the
+      # already-forwarded GENERATOR_API_KEY so OPENCODE_* needs no forwarding.
+      export DECISIONS_API_KEY_ENV="${DECISIONS_API_KEY_ENV:-GENERATOR_API_KEY}"
       stack=sidecars
     fi
     ;;
@@ -220,7 +223,7 @@ while IFS= read -r name; do
   case "$name" in REASONING_*_CMD) continue ;; esac
   fwd+=(-e "$name=${!name}")
   case "$name" in *KEY* | *SECRET* | *TOKEN*) fwd_debug+=("$name=<redacted>") ;; *) fwd_debug+=("$name=${!name}") ;; esac
-done < <(compgen -A export | grep -E '^(GENERATOR_|GENERATION_|REASONING_|DECISIONS_|SELECTION_|LOOP_|RETRIEVAL_|SCORING_|RERANK_|VALIDATION_|PROMPT_|LITELLM_|LOGGING_|MINIMAXAI_|OPENCODE_|TASKS_|DENSE_CACHE_(MODE|WRITE|PROBE_)|EMBED_(MODEL_REPO|ONNX_VARIANT))' || true)
+done < <(compgen -A export | grep -E '^(GENERATOR_|GENERATION_|REASONING_|DECISIONS_|SELECTION_|LOOP_|RETRIEVAL_|SCORING_|RERANK_|VALIDATION_|PROMPT_|LITELLM_|LOGGING_|TASKS_|DENSE_CACHE_(MODE|WRITE|PROBE_)|EMBED_(MODEL_REPO|ONNX_VARIANT))' || true)
 if [ "${#fwd_debug[@]}" -gt 0 ]; then echo ">> container env: ${fwd_debug[*]}"; fi
 
 # --- run --------------------------------------------------------------------
