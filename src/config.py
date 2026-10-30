@@ -50,6 +50,9 @@ class GeneratorInnerConfig(BaseModel):
     circuit_breaker_failure_threshold: int = Field(default=3, ge=1)
     #: Seconds an open circuit rejects calls before one half-open probe is admitted.
     circuit_breaker_cooldown_seconds: float = Field(default=60.0, gt=0.0)
+    #: Extra HTTP headers for the provider call (OpenCode Go gateway requires
+    #: ``x-opencode-session``; empty = none). Set via GENERATOR_SESSION_ID.
+    session_id: str = Field(default="")
 
     model_config = {"extra": "forbid"}
 
@@ -432,9 +435,7 @@ class ConfigManager:
     def load_config(cls, config_path: str | None = None) -> dict[str, Any]:
         """Resolve CONFIG_PATH env > argument > DEFAULT_CONFIG_PATH, expand, return."""
         load_dotenv()
-        resolved = os.path.expanduser(
-            os.environ.get("CONFIG_PATH") or config_path or cls.DEFAULT_CONFIG_PATH
-        )
+        resolved = os.path.expanduser(os.environ.get("CONFIG_PATH") or config_path or cls.DEFAULT_CONFIG_PATH)
         try:
             with open(resolved, encoding="utf-8") as fh:
                 raw: dict[str, Any] = json.load(fh)

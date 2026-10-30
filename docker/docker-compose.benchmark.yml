@@ -1,23 +1,24 @@
-# Additive benchmark override (plan §2.10): publish the TEI sidecars on loopback only, so the
-# in-process benchmark runner (`make benchmark-live`) can reach the same inference servers the
-# containerized stack uses. The base file is NOT edited; merge the two:
+# Additive benchmark override (plan §2.10):
+#  - publishes the TEI sidecars on loopback for manual host-native harness runs
+#    (`make benchmark-sidecars-up`)
+#  - adds the `benchmark` service that executes the harness modules in-container
+#    (scripts/benchmark-docker.sh → the make benchmark-* targets): ../tests carries
+#    the harness + corpora, ../config keeps manifest provenance in sync with the
+#    server's bind-mounted config, ../data/dense-cache is the repo's disposable
+#    cache the in-process arms require (never the persistent named volume).
+# The base file is NOT edited; merge the two:
 #
-#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml \
-#     up -d design-pattern-tei-embed design-pattern-tei-rerank
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml …
 #
 # The published ports are bound to 127.0.0.1 on purpose: a benchmark must never expose the
 # unauthenticated sidecars beyond the workstation. Override the host ports with BENCH_EMBED_PORT /
-# BENCH_RERANK_PORT (the runner's defaults live in the Makefile: BENCH_EMBED_URL/BENCH_RERANK_URL).
+# BENCH_RERANK_PORT.
 services:
   # A benchmark stack must never warm, populate or invalidate the persistent
   # dense-cache volume: mode=off embeds the corpus per start and touches no
   # cache directory, so an arm can neither measure a warm start nor leave a
-  # snapshot that silently becomes the next arm's starting state. (The
-  # in-process harness pins the same policy from tests/benchmark/harness: a
-  # warm cache under `make benchmark-*` is the repo's disposable
-  # data/dense-cache, never the volume.) Merged over the base file this only
-  # bites if the MCP service is started under this override —
-  # `make benchmark-sidecars-up` starts the sidecars alone.
+  # snapshot that silently becomes the next arm's starting state. Bites when the
+  # MCP service is started under this override (`make benchmark-e2e` does).
   design-pattern-mcp:
     environment:
       - DENSE_CACHE_MODE=off
@@ -29,3 +30,24 @@ services:
   design-pattern-tei-rerank:
     ports:
       - "127.0.0.1:${BENCH_RERANK_PORT:-18082}:8080"
+
+  # In-container benchmark runner. Entrypoint override: the image ENTRYPOINT is
+  # `python -m src.main` (the server); the benchmark targets pass
+  # `-m tests.benchmark.harness.* …` as the compose-run command instead.
+  # CLIENT_URL / EMBEDDER_BASE_URL / RERANKER_BASE_URL defaults are the compose
+  # service DNS names, so the e2e client and the in-process arms reach the same
+  # inference servers as the containerized server (no loopback ports involved).
+  # Generator/decision env is forwarded per-run by scripts/benchmark-docker.sh.
+  benchmark:
+    image: ${MCP_IMAGE:-design-pattern-mcp:latest}
+    entrypoint: ["/app/.venv/bin/python"]
+    environment:
+      - CLIENT_URL=${BENCH_CLIENT_URL:-http://design-pattern-mcp:8050/mcp}
+      - EMBEDDER_BASE_URL=http://design-pattern-tei-embed:8080/v1
+      - EMBEDDER_API_KEY=${EMBEDDER_API_KEY:-tei-noauth}
+      - RERANKER_BASE_URL=http://design-pattern-tei-rerank:8080
+      - DENSE_CACHE_PATH=/app/data/dense-cache
+    volumes:
+      - ../tests:/app/tests:ro
+      - ../config:/app/config:ro
+      - ../data/dense-cache:/app/data/dense-cache

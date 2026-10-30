@@ -62,6 +62,7 @@ class _LLMIdentity(TypedDict):
     model: str
     failure_kind: LLMFailureKind
 
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DOCS_DIRECTORY = _REPO_ROOT / "docs"
 
@@ -112,7 +113,6 @@ class LLMClientProtocol(Protocol):
     ) -> dict[str, RequirementWeights]:
         """One weight call for all parts (§7.1); exactly the eight axes per part id, in [0, 1]."""
         ...
-
 
     async def generate(self, seed: GenerationSeed, *, reasoning_context: str = "") -> RawGeneration:
         """GENERATE call, one application per seed (§11 item 1)."""
@@ -182,9 +182,7 @@ def normalize_weights_payload(payload: dict[str, Any]) -> RequirementWeights:
     return RequirementWeights(**weights)
 
 
-def parse_weights_batch(
-    payload: dict[str, Any], expected_ids: Sequence[str]
-) -> RequirementWeightsBatch:
+def parse_weights_batch(payload: dict[str, Any], expected_ids: Sequence[str]) -> RequirementWeightsBatch:
     """Parse the batched §7.1 response: exactly one entry per supplied decision-part id.
 
     A missing or extra id is an error the structured-output repair path must see: silently
@@ -201,13 +199,11 @@ def parse_weights_batch(
         missing = sorted(expected - received)
         unexpected = sorted(received - expected)
         raise ValueError(  # noqa: TRY004 — payload-validation contract feeds the retry path
-            f"weights must cover exactly the requested decision parts "
-            f"(missing={missing}, unexpected={unexpected})"
+            f"weights must cover exactly the requested decision parts (missing={missing}, unexpected={unexpected})"
         )
     return RequirementWeightsBatch(
         weights={part_id: normalize_weights_payload(value) for part_id, value in raw.items()}
     )
-
 
 
 def _model_parser[ModelT: BaseModel](
@@ -256,13 +252,19 @@ class DesignAgent:
         # 0.7.x wrapper). ``max_retries=1`` keeps the effective transport envelope at one
         # initial request: the structured-output repair retry (§4 rule 1) owns retries, and
         # the wrapper default of 10 would multiply every attempt silently.
+        # The OpenCode Go gateway (opencode.ai/zen/go) requires the
+        # ``x-opencode-session`` header — without it every call fails 400
+        # MissingSessionID. LiteLLM forwards ``extra_headers`` verbatim.
+        extra_kwargs: dict[str, Any] = {"timeout": inner.timeout_seconds}
+        if inner.session_id:
+            extra_kwargs["extra_headers"] = {"x-opencode-session": inner.session_id}
         self._client = LiteLLM(
             model=inner.model,
             api_base=inner.base_url or None,
             api_key=inner.api_key or None,
             temperature=inner.temperature,
             top_p=inner.top_p,
-            additional_kwargs={"timeout": inner.timeout_seconds},
+            additional_kwargs=extra_kwargs,
             max_retries=1,
         )
         # One process-local breaker per configured provider/model pair (§14). Transport
@@ -314,23 +316,15 @@ class DesignAgent:
         """
         parser = parse if parse is not None else _model_parser(response_schema)
         if reasoning_context.strip():
-            user_prompt = (
-                f"{user_prompt}\n\n{REASONING_SECTION}\n{untrusted_block(reasoning_context.strip())}"
-            )
+            user_prompt = f"{user_prompt}\n\n{REASONING_SECTION}\n{untrusted_block(reasoning_context.strip())}"
         if not self._validation.retry_on_fail or self._validation.max_retries <= 0:
-            return await self._generate_structured_once(
-                system_prompt, user_prompt, parser, operation
-            )
+            return await self._generate_structured_once(system_prompt, user_prompt, parser, operation)
 
         async def initial_caller() -> ModelT:
-            return await self._generate_structured_once(
-                system_prompt, user_prompt, parser, operation
-            )
+            return await self._generate_structured_once(system_prompt, user_prompt, parser, operation)
 
         async def repair_caller(repaired_system: str, repaired_user: str) -> ModelT:
-            return await self._generate_structured_once(
-                repaired_system, repaired_user, parser, operation
-            )
+            return await self._generate_structured_once(repaired_system, repaired_user, parser, operation)
 
         return await validate_with_retries(
             initial_caller,
@@ -366,10 +360,7 @@ class DesignAgent:
         try:
             return parse(extract_json_object(response_text))
         except Exception:  # noqa: BLE001 - narrowed to parse failures below (non-parse raise)
-            if (
-                self._validation.truncation_rerun == "boost"
-                and finish_reason == "length"
-            ):
+            if self._validation.truncation_rerun == "boost" and finish_reason == "length":
                 logger.warning(
                     "LLM %s output truncated by the provider token ceiling (length); "
                     "retrying once with the boosted completion budget (§4 rule 1a)",
@@ -590,10 +581,7 @@ class DesignAgent:
                     f"status={status if status is not None else 'none'}, "
                     f"elapsed={elapsed_ms():g}ms, prompt_chars={prompt_chars}): {exc}"
                 ),
-                hint=(
-                    "check generator.provider/base_url/api_key; the pipeline's documented "
-                    "fallbacks apply"
-                ),
+                hint=("check generator.provider/base_url/api_key; the pipeline's documented fallbacks apply"),
                 extra={**base_extra(), "status": status, "circuit_state": self._circuit.state},
             ) from exc
         content = response.message.content

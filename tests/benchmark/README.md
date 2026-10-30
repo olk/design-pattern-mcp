@@ -14,37 +14,48 @@ to `RetrievalIndex.build` and `DesignPipeline.__init__`.
 
 | Command | What it does |
 |---|---|
-| `make benchmark-selfcheck` | hand-computed anchors for every metric formula (no network, no LLM) |
-| `make benchmark-offline` | scripted deterministic run over `scenarios/seed.json` (<60 s) |
+| `make benchmark-selfcheck` | hand-computed anchors for every metric formula (in Docker; no stack, no network, no LLM) |
+| `make benchmark-offline` | scripted deterministic run over `scenarios/seed.json` (<60 s, in Docker; no stack) |
 | `make benchmark-offline FLIP=<scenario_id>` | same, with one scenario scripted to miss (compare dry run) |
-| `make benchmark-live LIMIT=2` | real in-process pipeline with full stage attribution |
+| `make benchmark-live LIMIT=2` | real in-process pipeline with full stage attribution (in Docker; TEI sidecars started, then torn down) |
 | `make benchmark-analyze LIMIT=2` | same live seams, ANALYZE phase only (selection hit/recall, no generation) |
-| `make benchmark-e2e LIMIT=2` | black-box run against the running compose stack |
-| `make benchmark-compare A=<dir> B=<dir>` | two-arm comparison + verdict |
-| `make benchmark-draft` | draft `full.json` candidates from the catalog (`DRY_RUN=1` prints the prompt) |
+| `make benchmark-e2e LIMIT=2` | black-box run through docker compose (full stack started, readiness-gated, then torn down) |
+| `make benchmark-compare A=<dir> B=<dir>` | two-arm comparison + verdict (in Docker) |
+| `make benchmark-draft` | draft `full.json` candidates from the catalog (in Docker; `DRY_RUN=1` prints the prompt) |
 
 Shared knobs: `LIMIT=<n>`, `SPLIT=train|holdout`, `REPEAT=<n>`, `NO_WARMUP=1`, `OUT=<dir>`,
 `RUN_ID=<id>`, `BENCH_SCENARIOS=<path>`; `FLIP=<scenario_id>` (offline only) and
 `ALLOW_MISMATCH=1` (compare) are documented above. Each command also exposes the same options via
 `--help`.
 
-Raw entry points (same options via `--help`):
+`scripts/benchmark-docker.sh` is the single execution layer behind every `make benchmark-*`
+target: it runs the unchanged harness modules inside a container of the production server
+image (`docker compose -f docker/docker-compose.yml -f
+docker/docker-compose.benchmark.yml run --rm benchmark -m tests.benchmark.harness.* …`) with
+the repository bind-mounted, so modules, corpora, metrics and verdicts are identical to the
+former host-native runs. Host-native `uv run python -m tests.benchmark.harness.* …` remains
+a development escape hatch only (TEI sidecars via `make benchmark-sidecars-up`); all
+documented results come from the containerized path.
 
-```bash
-uv run python -m tests.benchmark.harness.main --mode offline --limit 3 --out data/benchmark-runs/offline-smoke
-uv run python -m tests.benchmark.harness.main --mode analyze --out data/benchmark-runs/analyze-all
-uv run python -m tests.benchmark.harness.e2e --limit 2 --out data/benchmark-runs/e2e-smoke
-uv run python -m tests.benchmark.harness.compare data/benchmark-runs/base data/benchmark-runs/cand
-uv run python -m tests.benchmark.harness.draft --dry-run          # corpus drafting prompt
-```
+`make benchmark-live` / `make benchmark-analyze` inject the dev stack's provider defaults
+(Muse Spark via `OPENCODE_API_KEY`) into the benchmark container, which also uses the
+image-embedded reasoning MCP entry points the shipped config names (`make install-mcps` is
+no longer needed for benchmarks). Without a generator or reasoning backend the pipeline
+still runs: each phase degrades silently and the manifest's `reasoning_health` records
+exactly which tool was unavailable (the `reasoning.<phase>` stage timing then measures the
+failed attach, not real reasoning).
 
-`make benchmark-live` mirrors the dev stack's provider defaults (MiniMax via
-`MINIMAXAI_API_KEY`) and points `REASONING_SHANNONTHINKING_CMD` / `REASONING_CODE_REASONING_CMD`
-at the globally installed reasoning MCP packages (`make install-mcps`) when they are present —
-the shipped config default names the Docker-embedded entry points, which do not exist on a
-workstation. Without those packages the pipeline still runs: each reasoning phase degrades
-silently and the manifest's `reasoning_health` records exactly which tool was unavailable (the
-`reasoning.<phase>` stage timing then measures the failed attach, not real reasoning).
+### Dockerized execution
+
+Lifecycle per run: image preflight → `compose up -d --wait` (sidecars for live/analyze,
+full stack for e2e + a `POST /mcp initialize` readiness probe) → `compose run --rm
+benchmark` → result collection → `compose down` in a trap (`down`, never `down -v`: the
+persistent dense-cache volume survives). A running dev stack is recreated under
+`DENSE_CACHE_MODE=off` for stack modes and torn down afterwards — restart it with
+`make docker-up`. Under `DENSE_CACHE_MODE=off` the server never touches the volume: the
+cold start re-embeds the catalog (~20 min on CPU). Every failure (missing images, stack
+startup failure, readiness timeout, benchmark failure, missing artifacts) exits nonzero
+and still tears the stack down.
 
 ## Modes: what each one proves
 
@@ -172,12 +183,16 @@ the pipeline block is null on the analyze arm, and the pre-registered p95 rule i
 `inconclusive` because the e2e delta is the omitted generate/evaluate work by construction.
 Config/env drift is warned on.
 
-### Live-run prerequisite (sidecar loopback ports)
+### Manual host-native runs (sidecar loopback ports)
+
+Containerized runs need no loopback plumbing: the benchmark container reaches the TEI
+sidecars over compose service DNS. The loopback publishing below exists only for manual
+host-native harness runs (the development escape hatch).
 
 `make benchmark-sidecars-up` merges `docker/docker-compose.benchmark.yml` on top of the base file
 and publishes the TEI sidecars on `127.0.0.1:18081`/`18082`. Any later **base-only**
 `docker compose -f docker/docker-compose.yml up …` recreates those containers *without* the
-override's ports, and the next live run fails with `Connection refused` on the embedder — re-run
+override's ports, and the next host-native live run fails with `Connection refused` on the embedder — re-run
 `make benchmark-sidecars-up` after any such stack operation. The merged form is always safe:
 
 ```bash
