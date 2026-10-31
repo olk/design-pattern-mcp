@@ -98,6 +98,18 @@ TACIT_BUILD_TARGET  := $(if $(and $(wildcard $(TACIT_HOST_CONFIG)),$(wildcard $(
 CLM_TRAIN_TARGET    := runtime-finetuned
 CLM_CACHED_TARGET   := runtime-finetuned-cached
 CLM_BUILD_TARGET    := $(if $(and $(wildcard $(CLM_HOST_CKPT)),$(wildcard $(CLM_HOST_COMPLETE))),$(CLM_CACHED_TARGET),$(CLM_TRAIN_TARGET))
+# HF Hub token for authenticated model downloads (higher rate limits, gated repos).
+# File holds the raw token only, no key=value. Empty/missing file = anonymous
+# download (fine for the pinned public repos, just the huggingface_hub warning).
+# All four HF-fetching Dockerfiles read it via `RUN --mount=type=secret,id=hf_token`;
+# the secret is mounted per-RUN and never baked into a layer.
+comma := ,
+HF_TOKEN_FILE ?= $(HOME)/.cache/hf_token
+# Resolve to --secret when the file exists and is non-empty. A missing default
+# is fine (anonymous download); but an explicitly-set missing path is a typo,
+# so fail instead of silently going anonymous. Recursive (=, not :=) so the
+# error fires only when a docker-build recipe expands HF_SECRET_ARG.
+HF_SECRET_ARG = $(if $(shell test -s "$(HF_TOKEN_FILE)" && echo yes),--secret id=hf_token$(comma)src=$(HF_TOKEN_FILE),$(if $(filter-out file,$(origin HF_TOKEN_FILE)),$(error HF_TOKEN_FILE="$(HF_TOKEN_FILE)" is missing or empty)))
 COMPOSE_DM := docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml
 
 .DEFAULT_GOAL := help
@@ -323,7 +335,7 @@ docker-build-bootstrap: ## [internal] Build the server image that runs the cache
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):latest .
 
 docker-build-tei-embed: ## Build the TEI embed sidecar (EMBED_MODEL_REPO=…, EMBED_ONNX_VARIANT=fp32|int8)
-	docker build -f docker/Dockerfile.tei-embed \
+	docker build -f docker/Dockerfile.tei-embed $(HF_SECRET_ARG) \
 		--build-arg EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) \
 		--build-arg EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) \
 		--build-arg EMBED_POOLING=$(EMBED_POOLING) \
@@ -335,7 +347,7 @@ docker-build-tei-embed-gpu: ## Build the TEI embed sidecar on the CUDA base (nee
 	$(MAKE) --no-print-directory docker-build-tei-embed EMBED_TEI_BASE=$(EMBED_TEI_BASE_GPU)
 
 docker-build-tei-rerank: ## Build the TEI rerank sidecar image
-	docker build -f docker/Dockerfile.tei-rerank \
+	docker build -f docker/Dockerfile.tei-rerank $(HF_SECRET_ARG) \
 		-t $(TEI_RERANK_IMAGE):$(DOCKER_TAG) -t $(TEI_RERANK_IMAGE):latest .
 
 docker-build-tei: docker-build-tei-embed docker-build-tei-rerank ## Build both TEI sidecar images
@@ -347,7 +359,7 @@ docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense 
 ##@ Decision models (CLM-8B + AnyJev Tacit-4B)
 
 docker-build-tacit: ## Build the Tacit sidecar (GPU self-distill once; later runs reuse models/tacit-4b with no GPU)
-	docker build --allow device=nvidia.com/gpu=all \
+	docker build --allow device=nvidia.com/gpu=all $(HF_SECRET_ARG) \
 		-f docker/Dockerfile.tacit --target $(TACIT_BUILD_TARGET) \
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
@@ -375,13 +387,13 @@ docker-build-tacit: ## Build the Tacit sidecar (GPU self-distill once; later run
 	@test -s "$(TACIT_HOST_CONFIG)" && test -s "$(TACIT_HOST_MANIFEST)" && test -f "$(TACIT_HOST_COMPLETE)"
 
 docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (no GPU needed; tag :base)
-	docker build -f docker/Dockerfile.tacit --target runtime-released \
+	docker build -f docker/Dockerfile.tacit --target runtime-released $(HF_SECRET_ARG) \
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		-t $(TACIT_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_IMAGE):base .
 
 docker-build-clm: ## Build the CLM sidecar (GPU head fine-tune once; later runs reuse models/clm-heads with no GPU)
-	docker build --allow device=nvidia.com/gpu=all \
+	docker build --allow device=nvidia.com/gpu=all $(HF_SECRET_ARG) \
 		-f docker/Dockerfile.clm --target $(CLM_BUILD_TARGET) \
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
@@ -404,7 +416,7 @@ docker-build-clm: ## Build the CLM sidecar (GPU head fine-tune once; later runs 
 	@test -s "$(CLM_HOST_CKPT)" && test -f "$(CLM_HOST_COMPLETE)"
 
 docker-build-clm-base: ## Build the CLM sidecar with the released heads (no GPU needed; tag :base)
-	docker build -f docker/Dockerfile.clm --target runtime-released \
+	docker build -f docker/Dockerfile.clm --target runtime-released $(HF_SECRET_ARG) \
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
 		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
