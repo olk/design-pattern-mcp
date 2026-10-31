@@ -80,6 +80,28 @@ class Example:
     target: list[float]
 
 
+class _Progress:
+    """Count-based progress logs for a long build phase (one line per ~5%).
+
+    Build logs are not TTYs, so this emits plain ``logger.info`` lines instead
+    of a carriage-return bar — greppable and ``tee``-friendly.
+    """
+
+    def __init__(self, total: int, label: str, every: float = 0.05) -> None:
+        self._total = max(1, total)
+        self._label = label
+        self._every = every
+        self._next = every
+
+    def advance(self, done: int) -> None:
+        """Log when ``done`` crosses the next milestone (or finishes)."""
+        frac = min(1.0, done / self._total)
+        if frac >= self._next or done >= self._total:
+            logger.info("%s %d/%d (%.0f%%)", self._label, min(done, self._total), self._total, frac * 100.0)
+            while self._next <= frac:
+                self._next += self._every
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Command line for the image build (all knobs are build args)."""
     parser = argparse.ArgumentParser(description="Self-distil Tacit-4B for the decision seams.")
@@ -176,9 +198,12 @@ def generate_states(
     model = tacit.engine.model
     tokenizer = tacit.tok
     states: list[str] = []
+    batch_size = max(1, getattr(tacit, "batch_size", 8))
+    logger.info("phase 1/3: writing %d design states", len(prompts))
+    progress = _Progress(len(prompts), "state-writing")
     with torch.no_grad():
-        for start in range(0, len(prompts), max(1, getattr(tacit, "batch_size", 8))):
-            chunk = prompts[start : start + max(1, getattr(tacit, "batch_size", 8))]
+        for start in range(0, len(prompts), batch_size):
+            chunk = prompts[start : start + batch_size]
             rendered = [
                 tokenizer.apply_chat_template(
                     [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
@@ -199,6 +224,7 @@ def generate_states(
                 state = _normalise_state(text)
                 if state is not None:
                     states.append(state)
+            progress.advance(start + len(chunk))
     rng.shuffle(states)
     return states[:problems]
 
@@ -259,8 +285,11 @@ def teacher_examples(
 
     examples: list[Example] = []
     dropped = {"unsharp": 0, "unrouted": 0}
-    for start in range(0, len(problems), max(1, getattr(tacit, "batch_size", 8))):
-        chunk = problems[start : start + max(1, getattr(tacit, "batch_size", 8))]
+    batch_size = max(1, getattr(tacit, "batch_size", 8))
+    logger.info("phase 2/3: teacher answering %d problems (sequential CoT)", len(problems))
+    progress = _Progress(len(problems), "teacher")
+    for start in range(0, len(problems), batch_size):
+        chunk = problems[start : start + batch_size]
         results = tacit.decide_batch([dict(item) for item in chunk])
         for item, result in zip(chunk, results, strict=True):
             if result.get("route") != "cot":
@@ -287,6 +316,7 @@ def teacher_examples(
                     target=target,
                 )
             )
+        progress.advance(start + len(chunk))
     logger.info("teacher kept %d of %d problems %s", len(examples), len(problems), dropped)
     return examples, dropped
 
@@ -330,6 +360,9 @@ def train_student(init_dir: Path, examples: Sequence[Example], args: argparse.Na
     for epoch in range(args.epochs):
         order = list(range(len(examples)))
         rng.shuffle(order)
+        total_steps = max(1, (len(order) + args.batch - 1) // args.batch)
+        logger.info("phase 3/3: QLoRA epoch %d/%d (%d steps)", epoch + 1, args.epochs, total_steps)
+        progress = _Progress(total_steps, f"epoch {epoch + 1}/{args.epochs}")
         for step, start in enumerate(range(0, len(order), args.batch), start=1):
             rows = [examples[index] for index in order[start : start + args.batch]]
             loss = _batch_loss(model, tokenizer, rows, device) / (len(rows) * args.accum)
@@ -337,8 +370,10 @@ def train_student(init_dir: Path, examples: Sequence[Example], args: argparse.Na
             if step % args.accum == 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            if step % 50 == 0:
-                logger.info("epoch %d step %d loss %.4f", epoch, step, float(loss.detach()) * len(rows) * args.accum)
+            if step % 50 == 0 or step == total_steps:
+                current = float(loss.detach()) * len(rows) * args.accum
+                logger.info("epoch %d step %d/%d loss %.4f", epoch, step, total_steps, current)
+            progress.advance(step)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
     return model
@@ -413,6 +448,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         cot_max_tokens=args.cot_max_tokens,
         batch_size=max(1, args.batch),
     )
+    logger.info(
+        "self-distill start: problems=%d epochs=%d batch=%d accum=%d cot_max=%d (teacher model: %s)",
+        args.problems,
+        args.epochs,
+        args.batch,
+        args.accum,
+        args.cot_max_tokens,
+        args.repo,
+    )
     states = generate_states(teacher, hints, args.problems, args.seed, args.max_new_tokens)
     logger.info("generated %d design states", len(states))
     problems = build_problems(states, seams)
@@ -420,6 +464,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not examples:
         raise SystemExit(f"no usable teacher examples (dropped {dropped}); lower --answer-mass-floor")
     student = train_student(init_dir, examples, args)
+    logger.info("saving merged checkpoint to %s", out_dir)
     save_checkpoint(student, init_dir, out_dir)
     (out_dir / "self-distill.json").write_text(
         json.dumps(

@@ -95,6 +95,8 @@ RUN --mount=type=secret,id=hf_token \
 # -- Stage 3: fine-tune the heads on this repo's typed labels (GPU builder) --------------
 FROM vllm/vllm-openai:${VLLM_IMAGE_TAG} AS finetune
 
+# Unbuffered python so the encoder, exporter, and finetune logs stream line by line.
+ENV PYTHONUNBUFFERED=1
 ARG CLM_REPO_PIN=d5f9ef0
 ARG CLM_FINETUNE_BATCH=32
 
@@ -116,6 +118,7 @@ COPY qa/typed/choice.jsonl /build/qa/typed/choice.jsonl
 # be alive for the duration; the trap keeps it from leaking into the layer on failure.
 RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
     trap "kill ${VLLM_PID:-0} 2>/dev/null || true" EXIT INT TERM; \
+    echo "clm-finetune: [1/4] starting pooling encoder on 127.0.0.1:8090"; \
     vllm serve /models/qwen3-8b --served-model-name qwen3-8b --runner pooling \
       --max-model-len 2048 --host 127.0.0.1 --port 8090 & \
     VLLM_PID=$!; \
@@ -123,9 +126,11 @@ RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
       kill -0 "${VLLM_PID}" 2>/dev/null || { echo "encoder failed to start" >&2; exit 1; }; \
       sleep 3; \
     done; \
-    python3 /build/export_clm_dataset.py \
+    echo "clm-finetune: [2/4] encoder healthy, exporting typed-choice dataset"; \
+    python3 -u /build/export_clm_dataset.py \
       --choice /build/qa/typed/choice.jsonl --out /clm/data/typed-choice; \
-    python3 /opt/CLM/train/finetune.py \
+    echo "clm-finetune: [3/4] fine-tuning choice heads (--task choice --workflow all)"; \
+    python3 -u /opt/CLM/train/finetune.py \
       --task choice \
       --data /clm/data/typed-choice \
       --workflow all \
@@ -135,6 +140,7 @@ RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
       --embed-model qwen3-8b \
       --max-len 2048 \
       --batch "${CLM_FINETUNE_BATCH}"; \
+    echo "clm-finetune: [4/4] done, stopping encoder"; \
     kill -TERM "${VLLM_PID}" 2>/dev/null || true; \
     wait "${VLLM_PID}" 2>/dev/null || true'
 

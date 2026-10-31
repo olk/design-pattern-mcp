@@ -141,6 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     choice_path = Path(args.choice)
     if not choice_path.is_file():
         raise SystemExit(f"--choice {choice_path} does not exist")
+    logger.info("reading %s split rows from %s", args.split, choice_path)
     rows = [to_typed_row(row) for row in load_rows(choice_path, args.split)]
     train, test = split_rows(rows, args.test_frac, args.seed)
     root = Path(args.out) / args.workflow
