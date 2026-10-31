@@ -67,6 +67,37 @@ CLM_ENCODER_REPO ?= Qwen/Qwen3-8B
 CLM_HEADS_REPO   ?= Contrastive-LM/CLM-v0.1-8B
 CLM_REPO_PIN     ?= d5f9ef0
 VLLM_IMAGE_TAG   ?= v0.17.1
+
+# Host-persisted trained artifacts (extract-then-rebuild).
+# First run of docker-build-tacit / docker-build-clm trains on the GPU builder,
+# tags the image as usual, then extracts the shipped weights to the host dir via
+# `docker create` + `docker cp` (the container is never started, no GPU needed).
+# A later run finds the sentinels plus the .extract-complete marker and builds
+# the *-cached Dockerfile stage instead, which COPYs the host dir into the image
+# as the fine-tuned model — same image names, tags, and build args, no GPU, no
+# retrain. The marker is written LAST, only after a successful copy with
+# non-empty sentinels, so a partial copy never leaves a reusable dir; it is
+# committed with the artifacts so a fresh clone still reuses.
+#   Tacit: models/tacit-4b  <- /models/tacit (full HF checkpoint: config.json,
+#          model.safetensors shards, tokenizer files, self-distill.json)
+#   CLM:   models/clm-heads <- /clm/heads (finetune.py --out-dir contents,
+#          incl. best_head.pt served via CLM_CKPT)
+TACIT_HOST_DIR      := models/tacit-4b
+TACIT_HOST_CONFIG   := $(TACIT_HOST_DIR)/config.json
+TACIT_HOST_MANIFEST := $(TACIT_HOST_DIR)/self-distill.json
+TACIT_HOST_COMPLETE := $(TACIT_HOST_DIR)/.extract-complete
+CLM_HOST_DIR        := models/clm-heads
+CLM_HOST_CKPT       := $(CLM_HOST_DIR)/best_head.pt
+CLM_HOST_COMPLETE   := $(CLM_HOST_DIR)/.extract-complete
+# Parse-time target switch (same shape as DENSE_CACHE_PREREQ): sentinels plus
+# the completion marker, or the train path — a dir without the marker is not
+# proven complete output, even if a header file survived a partial copy.
+TACIT_TRAIN_TARGET  := runtime-distilled
+TACIT_CACHED_TARGET := runtime-distilled-cached
+TACIT_BUILD_TARGET  := $(if $(and $(wildcard $(TACIT_HOST_CONFIG)),$(wildcard $(TACIT_HOST_MANIFEST)),$(wildcard $(TACIT_HOST_COMPLETE))),$(TACIT_CACHED_TARGET),$(TACIT_TRAIN_TARGET))
+CLM_TRAIN_TARGET    := runtime-finetuned
+CLM_CACHED_TARGET   := runtime-finetuned-cached
+CLM_BUILD_TARGET    := $(if $(and $(wildcard $(CLM_HOST_CKPT)),$(wildcard $(CLM_HOST_COMPLETE))),$(CLM_CACHED_TARGET),$(CLM_TRAIN_TARGET))
 COMPOSE_DM := docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml
 
 .DEFAULT_GOAL := help
@@ -315,9 +346,9 @@ docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense 
 
 ##@ Decision models (CLM-8B + AnyJev Tacit-4B)
 
-docker-build-tacit: ## Build the Tacit sidecar, self-distilled in-image (needs a GPU + CDI on the builder)
+docker-build-tacit: ## Build the Tacit sidecar (GPU self-distill once; later runs reuse models/tacit-4b with no GPU)
 	docker build --allow device=nvidia.com/gpu=all \
-		-f docker/Dockerfile.tacit --target runtime-distilled \
+		-f docker/Dockerfile.tacit --target $(TACIT_BUILD_TARGET) \
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		--build-arg TACIT_PROBLEMS=$(TACIT_PROBLEMS) \
@@ -328,6 +359,20 @@ docker-build-tacit: ## Build the Tacit sidecar, self-distilled in-image (needs a
 		--build-arg TACIT_COT_MAX_TOKENS=$(TACIT_COT_MAX_TOKENS) \
 		--build-arg TACIT_MAX_NEW_TOKENS=$(TACIT_MAX_NEW_TOKENS) \
 		-t $(TACIT_IMAGE):$(DOCKER_TAG) -t $(TACIT_IMAGE):latest .
+	@# Train path only: extract the shipped weights to $(TACIT_HOST_DIR)/ via
+	@# `docker create` (never started) + `docker cp`; the next run builds cached.
+	@# The .extract-complete marker is written LAST, only after a successful copy
+	@# with non-empty sentinels — a partial copy never leaves a reusable dir.
+	@if [ "$(TACIT_BUILD_TARGET)" = "$(TACIT_TRAIN_TARGET)" ]; then \
+		mkdir -p "$(TACIT_HOST_DIR)"; \
+		cid=$$(docker create "$(TACIT_IMAGE):$(DOCKER_TAG)"); \
+		docker cp "$$cid:/models/tacit/." "$(TACIT_HOST_DIR)/"; rc=$$?; \
+		docker rm "$$cid" >/dev/null; \
+		if [ $$rc -ne 0 ]; then rm -f "$(TACIT_HOST_COMPLETE)"; exit $$rc; fi; \
+		test -s "$(TACIT_HOST_CONFIG)" && test -s "$(TACIT_HOST_MANIFEST)" || exit 1; \
+		echo "$(TACIT_IMAGE):$(DOCKER_TAG) $$(date -u +%FT%TZ)" > "$(TACIT_HOST_COMPLETE)"; \
+	fi
+	@test -s "$(TACIT_HOST_CONFIG)" && test -s "$(TACIT_HOST_MANIFEST)" && test -f "$(TACIT_HOST_COMPLETE)"
 
 docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (no GPU needed; tag :base)
 	docker build -f docker/Dockerfile.tacit --target runtime-released \
@@ -335,14 +380,28 @@ docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (n
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		-t $(TACIT_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_IMAGE):base .
 
-docker-build-clm: ## Build the CLM sidecar, heads fine-tuned in-image (needs a GPU + CDI on the builder)
+docker-build-clm: ## Build the CLM sidecar (GPU head fine-tune once; later runs reuse models/clm-heads with no GPU)
 	docker build --allow device=nvidia.com/gpu=all \
-		-f docker/Dockerfile.clm --target runtime-finetuned \
+		-f docker/Dockerfile.clm --target $(CLM_BUILD_TARGET) \
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
 		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
 		--build-arg CLM_REPO_PIN=$(CLM_REPO_PIN) \
 		-t $(CLM_IMAGE):$(DOCKER_TAG) -t $(CLM_IMAGE):latest .
+	@# Train path only: extract the shipped heads to $(CLM_HOST_DIR)/ via
+	@# `docker create` (never started) + `docker cp`; the next run builds cached.
+	@# The .extract-complete marker is written LAST, only after a successful copy
+	@# with a non-empty checkpoint — a partial copy never leaves a reusable dir.
+	@if [ "$(CLM_BUILD_TARGET)" = "$(CLM_TRAIN_TARGET)" ]; then \
+		mkdir -p "$(CLM_HOST_DIR)"; \
+		cid=$$(docker create "$(CLM_IMAGE):$(DOCKER_TAG)"); \
+		docker cp "$$cid:/clm/heads/." "$(CLM_HOST_DIR)/"; rc=$$?; \
+		docker rm "$$cid" >/dev/null; \
+		if [ $$rc -ne 0 ]; then rm -f "$(CLM_HOST_COMPLETE)"; exit $$rc; fi; \
+		test -s "$(CLM_HOST_CKPT)" || exit 1; \
+		echo "$(CLM_IMAGE):$(DOCKER_TAG) $$(date -u +%FT%TZ)" > "$(CLM_HOST_COMPLETE)"; \
+	fi
+	@test -s "$(CLM_HOST_CKPT)" && test -f "$(CLM_HOST_COMPLETE)"
 
 docker-build-clm-base: ## Build the CLM sidecar with the released heads (no GPU needed; tag :base)
 	docker build -f docker/Dockerfile.clm --target runtime-released \
