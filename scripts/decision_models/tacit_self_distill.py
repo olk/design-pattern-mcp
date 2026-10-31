@@ -152,6 +152,31 @@ def _seed_everything(seed: int) -> None:
         pass
 
 
+def _require_cuda() -> str:
+    """Fail fast when the trainer cannot see a GPU, before loading any weights.
+
+    The teacher is the dominant cost of this build (2000 state writes plus one
+    sequential CoT answer per problem). Without a CUDA context it would grind
+    through all of that on CPU for hours while nvtop stays empty — abort in
+    seconds instead. Returns the device-0 name for the run banner.
+
+    Unit tests never reach this: they stub ``anyjev`` and ``main`` short of the
+    real ``Tacit.from_pretrained`` path (``main`` with fakes, or ``--skip``).
+    """
+    try:
+        import torch
+    except ImportError:
+        raise SystemExit("torch is not installed; the trainer needs the GPU image stage")
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "torch.cuda.is_available() is false: no GPU visible to the trainer "
+            "(check RUN --device + docker build --allow on the trainer host)"
+        )
+    name = str(torch.cuda.get_device_name(0))
+    logger.info("cuda preflight: %d device(s), device 0 = %s", torch.cuda.device_count(), name)
+    return name
+
+
 def load_seam_prompts(path: Path) -> ModuleType:
     """Import the server's ``seam_prompts.py`` by path (stdlib-only, no package needed)."""
     spec = importlib.util.spec_from_file_location("seam_prompts", path)
@@ -436,8 +461,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     from anyjev import Tacit
 
     _seed_everything(args.seed)
+    device_name = _require_cuda()
+    logger.info("loading teacher %s onto CUDA (this takes minutes, no progress yet)", args.repo)
     seams = load_seam_prompts(Path(args.seam_prompts))
     hints = load_topic_hints(Path(args.seed_texts), limit=max(8, args.problems // 4)) if args.seed_texts else []
+    # Explicit cuda:0 placement: the default device_map="auto" only uses CUDA when
+    # torch.cuda.is_available(), and "auto" may also shard. Verified against the
+    # anyjev 0.3.0 wheel (tacit.py): device_map is forwarded to
+    # AutoModelForCausalLM.from_pretrained, which accepts the {"": 0} dict form.
     teacher = Tacit.from_pretrained(
         str(init_dir),
         engine="transformers",
@@ -447,15 +478,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         cot_window=None,
         cot_max_tokens=args.cot_max_tokens,
         batch_size=max(1, args.batch),
+        device_map={"": 0},
     )
+    teacher_device = str(getattr(getattr(getattr(teacher, "engine", None), "model", None), "device", "unknown"))
+    logger.info("teacher resident on %s", teacher_device)
+    if "cuda" not in teacher_device:
+        raise SystemExit(
+            f"teacher landed on {teacher_device}, not CUDA: refusing an hours-long CPU run "
+            "(check the trainer logs above for an accelerate/device_map fallback)"
+        )
     logger.info(
-        "self-distill start: problems=%d epochs=%d batch=%d accum=%d cot_max=%d (teacher model: %s)",
+        "self-distill start: problems=%d epochs=%d batch=%d accum=%d cot_max=%d (teacher: %s on %s)",
         args.problems,
         args.epochs,
         args.batch,
         args.accum,
         args.cot_max_tokens,
         args.repo,
+        device_name,
     )
     states = generate_states(teacher, hints, args.problems, args.seed, args.max_new_tokens)
     logger.info("generated %d design states", len(states))

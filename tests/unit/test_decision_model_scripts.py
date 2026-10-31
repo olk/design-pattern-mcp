@@ -44,24 +44,41 @@ def _load(name: str, filename: str) -> types.ModuleType:
 
 @pytest.fixture(scope="module")
 def trainer() -> Iterator[types.ModuleType]:
-    """The Tacit trainer, with a stub ``anyjev`` so importing it needs no torch."""
+    """The Tacit trainer, with stub ``anyjev``/``torch`` so importing it needs no GPU."""
     stub = types.ModuleType("anyjev")
 
     class _StubTacit:
         batch_size = 2
+
+        def __init__(self) -> None:
+            engine = types.SimpleNamespace(model=types.SimpleNamespace(device="cuda:0"))
+            self.engine = engine  # noqa: F841 - read by main()'s teacher-device check
 
         @classmethod
         def from_pretrained(cls, *_args: Any, **_kwargs: Any) -> _StubTacit:
             return cls()
 
     stub.Tacit = _StubTacit  # type: ignore[attr-defined]
+    torch_stub = types.ModuleType("torch")
+    cuda_stub = types.SimpleNamespace(
+        is_available=lambda: True, device_count=lambda: 1, get_device_name=lambda _i: "stub-cuda:0"
+    )
+    torch_stub.cuda = cuda_stub  # type: ignore[attr-defined]
+    torch_stub.manual_seed = lambda _seed: None  # type: ignore[attr-defined]
+    torch_stub.cuda.manual_seed_all = lambda _seed: None  # type: ignore[attr-defined]
     previous = sys.modules.get("anyjev")
+    previous_torch = sys.modules.get("torch")
     sys.modules["anyjev"] = stub
+    sys.modules["torch"] = torch_stub
     yield _load("tacit_self_distill", "tacit_self_distill.py")
     if previous is None:
         sys.modules.pop("anyjev", None)
     else:
         sys.modules["anyjev"] = previous
+    if previous_torch is None:
+        sys.modules.pop("torch", None)
+    else:
+        sys.modules["torch"] = previous_torch
 
 
 def test_trainer_asks_the_questions_the_server_asks(trainer: types.ModuleType) -> None:
