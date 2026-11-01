@@ -252,8 +252,11 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "Regional shipping events validated at one ingress boundary before reaching parcel domain handlers",
     ),
     "security-verification-payment-release": (
-        "saga",
-        "A wire disbursement coordinated as create -> approve -> release steps across console, workflow, and adapter",
+        "monolithic",
+        "One HarborPay system (console + workflow + adapter + ledger) with no deployment or messaging signals: "
+        "the create -> approve -> release handoffs are human authorization gates that leave the payment pending, "
+        "not compensating local transactions, so 'saga' over-reads the domain; per the rubric this is one deployable, "
+        "not a bare library decision ('none').",
     ),
     "security-verification-unmatched-api-access": (
         "api-gateway",
