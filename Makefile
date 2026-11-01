@@ -20,7 +20,7 @@
 	docker-build-tei-rerank dense-cache \
 	docker-build-tacit docker-build-tacit-base docker-build-clm docker-build-clm-base \
 	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
-	clm-payloads clm-payloads-check clm-calibrate \
+	clm-payloads clm-payloads-check clm-calibrate check-dockerfile-shell \
 	docker-publish docker-publish-tei docker-publish-all \
 	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
 	embed-cache
@@ -116,6 +116,7 @@ CLM_TRAIN_INPUTS    := qa/typed/choice.jsonl qa/typed/style.jsonl \
 	qa/typed/rank_payloads.jsonl tests/benchmark/scenarios/full.json \
 	scripts/decision_models/export_clm_dataset.py scripts/decision_models/clm_eval_gate.py \
 	scripts/decision_models/clm_rank_parity.py scripts/decision_models/derive_rank_payloads.py \
+	scripts/decision_models/clm_preflight.py \
 	docker/Dockerfile.clm
 # The gate outputs that admitted the extracted heads; the marker pins their bytes too,
 # so a cached rebuild can be audited against the evidence that produced the checkpoint.
@@ -423,7 +424,7 @@ docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (n
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		-t $(TACIT_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_IMAGE):base .
 
-docker-build-clm: clm-payloads-check ## Build the CLM sidecar (GPU head fine-tune once; later runs reuse models/clm-heads with no GPU)
+docker-build-clm: clm-payloads-check check-dockerfile-shell ## Build the CLM sidecar (GPU head fine-tune once; later runs reuse models/clm-heads with no GPU)
 	@# Cached path first: refuse a stale host dir whose marker shas no longer match
 	@# the current train inputs — BEFORE docker build, so a stale cache never
 	@# re-tags the image and the failure is loud, not a silent old-heads rebuild.
@@ -521,6 +522,16 @@ clm-payloads-check: ## Fail when qa/typed/rank_payloads.jsonl drifts from the co
 		rm -f $(CLM_PAYLOAD_CHECK); exit 1; \
 	fi
 	@rm -f $(CLM_PAYLOAD_CHECK)
+
+# `docker build --check` does not evaluate shell syntax, and Dockerfile shells are dash
+# even when the developer's /bin/sh is bash. Two real defects reached a build this way: a
+# stray quote that produced `Syntax error: "(" unexpected`, and a '#' that commented out
+# the rank gate. Validate every shell payload before spending an hour on the image; this
+# runs from the build targets so it cannot regress silently.
+DOCKERFILE_SHELL_CHECK := $(UV) run python scripts/decision_models/check_dockerfile_shell.py
+
+check-dockerfile-shell: ## Validate Dockerfile shell payloads (dash) before a build
+	@$(DOCKERFILE_SHELL_CHECK) docker/Dockerfile.clm docker/Dockerfile.tacit
 
 # Floor calibration for the Ch2 style seam. The head ships uncalibrated: run this
 # against a live clm-serve (docker-up-decisions) and set the floor it recommends —

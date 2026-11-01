@@ -1911,3 +1911,88 @@ def test_rank_payload_artifact_is_served_shaped() -> None:
         assert len(payload["relevance"]) == 20
         assert all(gain in (0, 1, 2, 3) for gain in payload["relevance"])
         assert any(gain > 0 for gain in payload["relevance"])
+
+
+@pytest.fixture(scope="module")
+def preflight() -> types.ModuleType:
+    return _load("clm_preflight", "clm_preflight.py")
+
+
+@pytest.fixture(scope="module")
+def shell_check() -> types.ModuleType:
+    return _load("check_dockerfile_shell", "check_dockerfile_shell.py")
+
+
+def test_preflight_pin_matches_and_rejects_a_mismatch(preflight: types.ModuleType, tmp_path: Path) -> None:
+    """The pin check is what stops a dataset exported for another CLM revision."""
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"clm_pin": "d5f9ef0"}), encoding="utf-8")
+    assert "d5f9ef0" in preflight.check_pin(manifest, "d5f9ef0")
+    with pytest.raises(SystemExit, match="adapter layout may have moved"):
+        preflight.check_pin(manifest, "deadbee")
+    manifest.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="dataset exported for CLM None"):
+        preflight.check_pin(manifest, "d5f9ef0")
+
+
+def test_preflight_refuses_a_served_alias_instead_of_a_snapshot(preflight: types.ModuleType, tmp_path: Path) -> None:
+    """A bare alias is the 401 bug: it is not a local directory, so the build must stop."""
+    with pytest.raises(SystemExit, match="not a local directory"):
+        preflight.check_entity(tmp_path / "qwen3-8b")
+
+
+def test_preflight_requires_consistent_arguments(preflight: types.ModuleType) -> None:
+    """Neither flag alone may silently no-op a check."""
+    with pytest.raises(SystemExit):
+        preflight.parse_args([])
+    with pytest.raises(SystemExit):
+        preflight.parse_args(["--manifest", "m.json"])
+    with pytest.raises(SystemExit):
+        preflight.parse_args(["--expect-pin", "d5f9ef0"])
+
+
+def test_shell_check_flags_an_embedded_single_quote(shell_check: types.ModuleType) -> None:
+    """The exact defect that produced 'Syntax error: \"(\" unexpected'."""
+
+    class _P:
+        line = 1
+        instruction = "RUN"
+        command = "sh -c 'set -eu; python3 -c \"x('y')\"'"
+        payload = "set -eu; python3 -c \"x('y')\""
+
+    found = shell_check.problems(_P())
+    assert any("single quote inside the sh -c payload" in problem for problem in found)
+
+
+def test_shell_check_flags_a_comment_that_swallows_later_commands(shell_check: types.ModuleType) -> None:
+    """A '#' outside quotes silently skipped the rank gate; it must fail the check."""
+
+    class _P:
+        line = 1
+        instruction = "RUN"
+        command = "sh -c 'a; # note; b'"
+        payload = "a; # note; b"
+
+    assert any("outside quotes" in problem for problem in shell_check.problems(_P()))
+
+
+def test_shell_check_passes_a_clean_payload(shell_check: types.ModuleType) -> None:
+    """The current Dockerfile form: no embedded quotes, no bare '#'."""
+
+    class _P:
+        line = 1
+        instruction = "RUN"
+        command = "sh -c 'set -eu; echo \"a (b)\"; python3 -u /build/x.py --pin \"${P}\"'"
+        payload = 'set -eu; echo "a (b)"; python3 -u /build/x.py --pin "${P}"'
+
+    assert shell_check.problems(_P()) == []
+    assert shell_check._unquoted_hash('echo "a # b"') is False
+
+
+def test_shell_check_reads_the_real_dockerfile(shell_check: types.ModuleType) -> None:
+    """The fat CLM RUN must be discovered and carry no hazard."""
+    text = (REPO_ROOT / "docker" / "Dockerfile.clm").read_text(encoding="utf-8")
+    fat = [p for p in shell_check.payloads(text) if "clm-finetune" in p.command]
+    assert fat, "the fine-tune RUN must be discoverable"
+    for payload in fat:
+        assert shell_check.problems(payload) == []
