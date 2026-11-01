@@ -57,6 +57,15 @@ TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
 # hours on one 3090). `make docker-build-tacit TACIT_PROBLEMS=200 TACIT_COT_MAX_TOKENS=512`
 # is the quick-smoke shape.
 TACIT_PROBLEMS       ?= 2000
+# Design states to write. 0 = derive from TACIT_PROBLEMS (questions per state shrink as
+# this grows, so the teacher budget holds while state diversity rises).
+TACIT_STATES         ?= 0
+# Must equal the served seam floor (DESIGN_PATTERN_DECISIONS_*_CONFIDENCE_FLOOR).
+TACIT_CONFIDENCE_FLOOR ?= 0.5
+# The reasoning-gate seam's own floor, when the deployment raises it alone.
+TACIT_GATE_CONFIDENCE_FLOOR ?= $(TACIT_CONFIDENCE_FLOOR)
+# Build fails when a serving kind (choice/score/yes_no) keeps fewer rows than this.
+TACIT_MIN_KIND_ROWS  ?= 1
 TACIT_EPOCHS         ?= 1
 TACIT_LR             ?= 1e-4
 TACIT_BATCH          ?= 4
@@ -369,6 +378,10 @@ docker-build-tacit: ## Build the Tacit sidecar (GPU self-distill once; later run
 		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		--build-arg TACIT_PROBLEMS=$(TACIT_PROBLEMS) \
+		--build-arg TACIT_STATES=$(TACIT_STATES) \
+		--build-arg TACIT_CONFIDENCE_FLOOR=$(TACIT_CONFIDENCE_FLOOR) \
+		--build-arg TACIT_GATE_CONFIDENCE_FLOOR=$(TACIT_GATE_CONFIDENCE_FLOOR) \
+		--build-arg TACIT_MIN_KIND_ROWS=$(TACIT_MIN_KIND_ROWS) \
 		--build-arg TACIT_EPOCHS=$(TACIT_EPOCHS) \
 		--build-arg TACIT_LR=$(TACIT_LR) \
 		--build-arg TACIT_BATCH=$(TACIT_BATCH) \

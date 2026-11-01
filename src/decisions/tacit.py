@@ -36,6 +36,7 @@ import httpx
 from src.decisions.seam_prompts import (
     CATEGORY_GLOSSES,
     CATEGORY_SLUGS,
+    GATE_STATE_MAX_CHARS,
     WEIGHT_LEVELS,
     axis_question,
     category_question,
@@ -69,18 +70,18 @@ def category_options() -> list[str]:
     return values
 
 
-#: Cap on the state text sent to the J5 gate (the gate only needs the gist).
-_MAX_GATE_STATE_CHARS = 1500
-
-
 def gate_state(phase: str, payload: dict[str, Any]) -> str:
-    """Compact gate question state: the phase plus the payload's scalar fields."""
+    """Compact gate question state: the phase plus the payload's scalar fields.
+
+    Emits EVERY scalar key of the payload (no subset, no reordering), capped at
+    ``seam_prompts.GATE_STATE_MAX_CHARS`` — the shape the trainer must reproduce.
+    """
     scalars = [
         f"{key}: {value}"
         for key, value in payload.items()
         if isinstance(value, (str, int, float)) and not isinstance(value, bool)
     ]
-    return "\n".join([f"phase: {phase}", *scalars])[:_MAX_GATE_STATE_CHARS]
+    return "\n".join([f"phase: {phase}", *scalars])[:GATE_STATE_MAX_CHARS]
 
 
 def reasoning_gate(

@@ -40,6 +40,7 @@ from src.patterns.loader import (
 )
 from src.conflicts import conflicting
 from src.config import ServerConfig
+from src.decisions.seam_prompts import DECISION_STATE_MAX_CHARS
 from src.design_normalization import (
     as_category,
     as_language,
@@ -531,10 +532,6 @@ def _process_weight_proposals(
     return processed
 
 
-#: Cap on the state text handed to a part-scoped decision-model question.
-_MAX_DECISION_STATE_CHARS = 1500
-
-
 def _with_effective_category(part: DecisionPart, category: PatternCategory | None) -> DecisionPart:
     """``part`` with a confident decision-model category as its hypothesis (None = unchanged).
 
@@ -562,7 +559,27 @@ def _decision_part_state(brief: DesignBrief, part: DecisionPart) -> str:
         lines.append(f"Scope: {part.scope}")
     if part.constraints:
         lines.append("Constraints: " + "; ".join(part.constraints[:4]))
-    return "\n".join(lines)[:_MAX_DECISION_STATE_CHARS]
+    return "\n".join(lines)[:DECISION_STATE_MAX_CHARS]
+
+
+def _gate_payload_analyze(description: str) -> dict[str, str]:
+    """Scalar J5 gate payload for ``analyze``; keys pinned to ``seam_prompts.GATE_PHASE_PAYLOAD_KEYS``."""
+    return {"description": description}
+
+
+def _gate_payload_weights(description: str, restated_goal: str, decision_parts: str) -> dict[str, str]:
+    """Scalar J5 gate payload for ``weights``; ``decision_parts`` is the joined per-part digest."""
+    return {"description": description, "restated_goal": restated_goal, "decision_parts": decision_parts}
+
+
+def _gate_payload_generate(restated_goal: str, applications: str) -> dict[str, str]:
+    """Scalar J5 gate payload for ``generate``; ``applications`` is the joined seed digest."""
+    return {"restated_goal": restated_goal, "applications": applications}
+
+
+def _gate_payload_evaluate(primary_pattern: str, applications: str, parts: str) -> dict[str, str]:
+    """Scalar J5 gate payload for ``evaluate``; ``applications``/``parts`` are the joined digests."""
+    return {"primary_pattern": primary_pattern, "applications": applications, "parts": parts}
 
 
 async def _safe_extract_weights_batch(
@@ -1677,7 +1694,7 @@ class DesignPipeline(Workflow):
                 "parameters": self._config.effective_parameters(),
             },
         )
-        analyze_reasoning = await self._reasoning_block("analyze", {"description": text})
+        analyze_reasoning = await self._reasoning_block("analyze", _gate_payload_analyze(text))
         brief, parts = await self._stage_a_b(text, hints, analyze_reasoning)
         brief = await self._apply_decision_style(text, hints.architecture_style, brief)
         if not parts:
@@ -1685,11 +1702,11 @@ class DesignPipeline(Workflow):
         _check_cancelled(ev.cancellation, "stage B")
         weights_reasoning = await self._reasoning_block(
             "weights",
-            {
-                "description": text,
-                "restated_goal": brief.restated_goal,
-                "decision_parts": "; ".join(f"{part.id}: {part.statement}" for part in parts),
-            },
+            _gate_payload_weights(
+                text,
+                brief.restated_goal,
+                "; ".join(f"{part.id}: {part.statement}" for part in parts),
+            ),
         )
         selections = await self._select_all(parts, brief, ev.cancellation, weights_reasoning)
         _check_cancelled(ev.cancellation, "stage E")
@@ -1746,13 +1763,13 @@ class DesignPipeline(Workflow):
             )
             reasoning_context = await self._reasoning_block(
                 "generate",
-                {
-                    "restated_goal": analysis.design_brief.restated_goal,
-                    "applications": "; ".join(
+                _gate_payload_generate(
+                    analysis.design_brief.restated_goal,
+                    "; ".join(
                         f"{seed_item.id}: {seed_item.pattern} for {seed_item.part_id}"
                         for seed_item in seed.applications
                     ),
-                },
+                ),
             )
             raw_generation = await self._generate_in_batches(seed, reasoning_context=reasoning_context)
             result = assemble_result(
@@ -1786,25 +1803,21 @@ class DesignPipeline(Workflow):
         if isinstance(ev, EvaluateEntry):
             reasoning_context = await self._reasoning_block(
                 "evaluate",
-                {
-                    "primary_pattern": ev.result.overview.primary_pattern,
-                    "applications": "; ".join(
-                        f"{application.id}: {application.pattern}" for application in ev.result.applications
-                    ),
-                    "parts": "; ".join(f"{part.id}: {part.statement}" for part in ev.parts),
-                },
+                _gate_payload_evaluate(
+                    ev.result.overview.primary_pattern,
+                    "; ".join(f"{application.id}: {application.pattern}" for application in ev.result.applications),
+                    "; ".join(f"{part.id}: {part.statement}" for part in ev.parts),
+                ),
             )
             evaluation = await self._llm.evaluate(ev.result, ev.parts, reasoning_context=reasoning_context)
             return PipelineDone(result=evaluation, mode="evaluate")
         reasoning_context = await self._reasoning_block(
             "evaluate",
-            {
-                "primary_pattern": ev.result.overview.primary_pattern,
-                "applications": "; ".join(
-                    f"{application.id}: {application.pattern}" for application in ev.result.applications
-                ),
-                "parts": "; ".join(f"{part.id}: {part.statement}" for part in ev.analysis.decision_parts),
-            },
+            _gate_payload_evaluate(
+                ev.result.overview.primary_pattern,
+                "; ".join(f"{application.id}: {application.pattern}" for application in ev.result.applications),
+                "; ".join(f"{part.id}: {part.statement}" for part in ev.analysis.decision_parts),
+            ),
         )
         evaluation = await self._llm.evaluate(
             ev.result, ev.analysis.decision_parts, reasoning_context=reasoning_context
@@ -2459,9 +2472,7 @@ class DesignPipeline(Workflow):
                     "confidence": round(confidence, 4),
                     "kept": len(kept),
                     "pool": len(hits),
-                    "replaced_hypothesis": part.category_hypothesis
-                    if part.category_hypothesis != category
-                    else None,
+                    "replaced_hypothesis": part.category_hypothesis if part.category_hypothesis != category else None,
                 },
             )
             narrowed.append(kept)

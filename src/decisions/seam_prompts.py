@@ -46,6 +46,29 @@ CATEGORY_GLOSSES: dict[str, str] = {
     "specialized-components": "Domain-specific components without a general home",
 }
 
+#: The pipeline phases that carry a reasoning strategy and can hit the J5 gate
+#: (src/reasoning/config.py::_default_per_phase; payloads at src/pipeline.py:1680-1808).
+GATE_PHASES: tuple[str, ...] = ("analyze", "weights", "generate", "evaluate")
+
+#: Scalar payload keys each phase puts into gate_state, in the order the pipeline
+#: builds them (src/pipeline.py:1680-1808). ``tacit.gate_state`` emits all of a
+#: phase's keys, so a question missing one is a state the server never sends; the
+#: trainer rejects those rather than training on them.
+GATE_PHASE_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
+    "analyze": ("description",),
+    "weights": ("description", "restated_goal", "decision_parts"),
+    "generate": ("restated_goal", "applications"),
+    "evaluate": ("primary_pattern", "applications", "parts"),
+}
+
+#: Cap on the gate-state text (the gate only needs the gist). Shared so the trainer
+#: truncates exactly where ``src.decisions.tacit.gate_state`` does.
+GATE_STATE_MAX_CHARS = 1500
+
+#: Cap on the decision-part state text (the seams only need the gist). Shared so the
+#: trainer truncates exactly where ``src.pipeline._decision_part_state`` does.
+DECISION_STATE_MAX_CHARS = 1500
+
 
 def category_question() -> str:
     """The J2 category ``choice`` question, every gloss inline in enum order."""
