@@ -1,18 +1,18 @@
 # Typed labels for decision-model finetuning
 
-2,200 typed labels derived from `tests/benchmark/scenarios/full.json`
-(the 2,100 script-derived rows of 2026-10-27 plus 100 reviewed style rows):
-the choice/noul labels are script-derived from the 100 reviewed scenarios (no
-new review burden); the style labels are per-scenario reviewed judgments with a
-quoted rationale each (`scripts/decision_models/derive_style_labels.py`).
+2,338 typed labels derived from `tests/benchmark/scenarios/full.json`
+(the 2,169 script-derived rows plus 169 reviewed style rows): the choice/noul
+labels are script-derived from the 169 reviewed scenarios (no new review burden);
+the style labels are per-scenario reviewed judgments with a quoted rationale each
+(`scripts/decision_models/derive_style_labels.py`).
 Corpus labels are agent-curated, **human expert review pending**.
 
 ## Files
 
 | file | n | shape | seam |
 |---|---|---|---|
-| `choice.jsonl` | 100 | `state` + 9 `criteria` + `label` (category) | J2 category |
-| `style.jsonl` | 100 | `state` + 36 `criteria` + `label` (style) | Ch2 style |
+| `choice.jsonl` | 169 | `state` + 9 `criteria` + `label` (category) | J2 category |
+| `style.jsonl` | 169 | `state` + 36 `criteria` + `label` (style) | Ch2 style |
 | `noul.jsonl` | 2000 | `state` + `proposition` + boolean `label` (+ `candidate_text`) | J1 per-candidate relevance |
 | `rank_payloads.jsonl` | 30 | `context` + `question` + 20 served `answers` (+ `answer_names`) | J1 rank-parity gate |
 
@@ -22,16 +22,19 @@ Corpus labels are agent-curated, **human expert review pending**.
 - Style: 1 per scenario, criteria/instructions = the served Ch2 prompt verbatim
   (`src/decisions/seam_prompts.py` shared vocabulary), `state` = the raw scenario
   description bytes the seam receives, label = the reviewed dominant
-  architecture style with a quoted rationale. Train split: 70 rows over 13
-  criterion keys (monolithic 20, none 11, layered-monolith 10); the 30 holdout
-  rows are labeled for eval only and never reach training weights.
+  architecture style with a quoted rationale. Train split: 139 rows over all 36
+  criterion keys — every served style has at least one train positive (the 69
+  train-only style-exemplar scenarios added 2026-11 closed the last 23 gaps;
+  largest classes are monolithic 20, none 11, layered-monolith 10); the 30
+  holdout rows are labeled for eval only and never reach training weights.
   Review state is machine-readable: `review.json` (currently `unreviewed`)
   records per-scenario human certification, and `make clm-calibrate` refuses to
   recommend a confidence floor until the ledger certifies the label source
   byte-for-byte — no calibrated floor exists for unreviewed labels.
-- Noul: 20 per scenario — every labeled pattern is a positive
-  (`label_tier`: `primary` / `acceptable_primary` / `supporting`), padded
-  with cross-category negatives (`label_tier: negative`, deterministic
+- Noul: 20 per scenario over the 100 scenarios authored 2026-10-27 (the 2026-11
+  style-exemplar scenarios added no noul rows) — every labeled pattern is a
+  positive (`label_tier`: `primary` / `acceptable_primary` / `supporting`),
+  padded with cross-category negatives (`label_tier: negative`, deterministic
   per-scenario seed) for a fixed 20. Verdict: 307 true / 1693 false.
   `candidate_text` is the compact catalog evidence (`name: intent` + problem
   excerpt) — the `--task clm` action text / J1 compact evidence; `proposition`
@@ -47,7 +50,7 @@ Corpus labels are agent-curated, **human expert review pending**.
 
 ## Split
 
-Train = 1,540, holdout = 660 (choice + style: 70/30 each; noul: 1,400/600).
+Train = 1,678, holdout = 660 (choice + style: 139/30 each; noul: 1,400/600).
 Families never cross the split. Train on `source.split == "train"`; fit thresholds
 / temperature on held-out **families**, not training rows (recommendation §6.6).
 
@@ -64,8 +67,8 @@ Per `docs/recommendation_design-pattern-mcp_decision-models.md` §4/§7.5:
 - **AnyJev Tacit**: needs zero labels (self-distilled) — use these as
   *evaluation* data; only a later QLoRA of the Qwen3-8B base (500–2,000
   labeled decisions) would train on them.
-- **CLM-8B**: heads-only `finetune.py --task choice --init-ckpt` over the 140
-  train rows (70 category + 70 style — `scripts/decision_models/export_clm_dataset.py`
+- **CLM-8B**: heads-only `finetune.py --task choice --init-ckpt` over the 278
+  train rows (139 category + 139 style — `scripts/decision_models/export_clm_dataset.py`
   to the typed-decisions parquet layout). The style set is the exact question the
   Ch2 seam serves; the 2,000 noul rows (1,400 train) remain the `--task clm`
   rank-follow-up shape: `state` is the CLM state text, `candidate_text` the action text.
@@ -84,7 +87,7 @@ Per `docs/recommendation_design-pattern-mcp_decision-models.md` §4/§7.5:
   until then.
 - **Eikos-4B** (LoRA r64), **Clef-flash-9B** (QLoRA), **Kev-4B**
   (`kev.train --init_from`) each want 500–2,000 labeled decisions — this
-  export (1,470 train) is in budget. Kev's data shape is the API shape plus
+  export (1,678 train) is in budget. Kev's data shape is the API shape plus
   `label`, exactly these records.
 
 Label tiers double as sample weights: `primary` > `acceptable_primary` >

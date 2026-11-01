@@ -231,15 +231,23 @@ primary's subgroup and enforces the family-disjoint split.
 Seed labels are author-drafted (catalog-grounded) and **await expert review**; the seed run is the
 Stage-0 dry run.
 
-`scenarios/full.json` — 100 reviewed scenarios across all 52 sibling-capable families
-(whole-part excluded: a single record, so no sibling is possible), split 70 train / 30
-holdout by `draft.py`'s family rule (last third of the sorted family order → holdout,
-family-disjoint). Produced 2026-10-27 via `make benchmark-draft` (MiniMax-M2.7,
-`--per-family 3`, 156 candidates) + agent curation to 100; descriptions never name the
-pattern or its family's aliases, and each scenario carries a concrete language chosen
-under the no-discouraged-label rule. Drafts live under `data/benchmark-runs/drafts/`
-(gitignored, never committed). Full labels are agent-curated and **await human expert
-review**.
+`scenarios/full.json` — 169 reviewed scenarios: the 100 authored 2026-10-27 across all 52
+sibling-capable families (whole-part excluded: a single record, so no sibling is possible),
+split 70 train / 30 holdout by `draft.py`'s family rule (last third of the sorted family order
+→ holdout, family-disjoint), plus 69 train-only style-exemplar scenarios appended 2026-11
+(23 Ch2 architecture criteria × 3) so every served style has a train positive; those keep
+their primary's catalog family, so no holdout family gained a row and every holdout verdict
+still rests on the same 30 scenarios. The 100 were produced 2026-10-27 via
+`make benchmark-draft` (MiniMax-M2.7, `--per-family 3`, 156 candidates) + agent curation to
+100; the 69 came from `draft.py --style-criterion <key> --style-count 4` and were curated to
+3 per criterion (the style's structural signals must carry the label, while the decision
+stays an ordinary catalog decision). Descriptions never name the pattern, its family's
+aliases, or the architecture style being exemplified, and each scenario's requested language
+is chosen under the no-discouraged-label rule (a style exemplar keeps the language its
+description names, and requests none when the description names several stacks or the style's
+labels are not idiomatic there). Drafts live under
+`data/benchmark-runs/drafts/` (gitignored, never committed). Full labels are agent-curated
+and **await human expert review**.
 
 ## Run directory
 

@@ -38,7 +38,10 @@ Rules (every rule prints PASS / FAIL / SKIP with its numbers):
      (never positive in training, still winnable at serve time) must be
      explicitly acknowledged in ``qa/typed/review.json``'s ``coverage_ack`` for
      the manifest's source bytes: unknown unknowns may not ship silently. An
-     unacknowledged key fails with its name; today that is 23 style criteria.
+     unacknowledged key fails with its name. Since the 2026-11 style-exemplar
+     extension every served style criterion has a train positive, so the rule
+     passes vacuously today — it stays as the guard for a future gold edit that
+     uncovers a criterion again.
   R8 advisory — the category (choice) gold the heads also train on: prints
      whether ``review.json`` certifies the ``choice.jsonl`` bytes, never
      blocking. Category has no served CLM consumer (the seam is Tacit), so an

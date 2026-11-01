@@ -253,10 +253,12 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
     ),
     "security-verification-payment-release": (
         "monolithic",
-        "One HarborPay system (console + workflow + adapter + ledger) with no deployment or messaging signals: "
-        "the create -> approve -> release handoffs are human authorization gates that leave the payment pending, "
-        "not compensating local transactions, so 'saga' over-reads the domain; per the rubric this is one deployable, "
-        "not a bare library decision ('none').",
+        (
+            "One HarborPay system (console + workflow + adapter + ledger) with no deployment or messaging signals: "
+            "the create -> approve -> release handoffs are human authorization gates that leave the payment pending, "
+            "not compensating local transactions, so 'saga' over-reads the domain; per the rubric this is one deployable, "
+            "not a bare library decision ('none')."
+        ),
     ),
     "security-verification-unmatched-api-access": (
         "api-gateway",
@@ -463,6 +465,306 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
     "compile-time-access-iterator-core": (
         "none",
         "A C++ iterator-adapter access decision for one graph database; no system shape is described",
+    ),
+    # -- style-coverage extension (23 Ch2 criteria x 3, appended 2026-11) ------
+    # actor-based
+    "actor-based-dispatch-extensibility-manual-ops": (
+        "actor-based",
+        "twelve machines running thousands of lightweight isolated processes that own private state plus a mailbox and exchange immutable envelopes by address, with no shared memory and no direct calls",
+    ),
+    "actor-based-algorithms-parcel-fare-variants": (
+        "actor-based",
+        "a delivery mesh where every district coordinator and every courier unit holds private queue and routing state and nothing is shared, all coordination being immutable records sent between units",
+    ),
+    "actor-based-functional-composition-order-admission": (
+        "actor-based",
+        "six machines of small private-state processes with inboxes and a supervision tree restarting crashed processes from snapshots, placement location transparent and no remote method calls at all",
+    ),
+    # aiml-centric
+    "aiml-centric-temporal-scoring-authority-window": (
+        "aiml-centric",
+        "a screening service built around a fleet of versioned predictors pulled from a predictor registry onto accelerator-backed pods, with a training orchestrator publishing new weight bundles as the revenue path",
+    ),
+    "aiml-centric-values-checkpoint-identifier-confusion": (
+        "aiml-centric",
+        "a personalization platform whose revenue path is serving versioned ranking checkpoints, with a feature ledger for point-in-time frames and a scheduler publishing weight bundles to a versioned registry",
+    ),
+    "aiml-centric-model-clarity-basket-quote-reproducibility": (
+        "aiml-centric",
+        "a personalized-offers platform where request revenue flows through learned predictors served by an autoscaled inference fleet behind a gateway, with canary rollout and drift-triggered rollback",
+    ),
+    # backend-for-frontend
+    "backend-for-frontend-concurrent-objects-mobile-batch-queue": (
+        "backend-for-frontend",
+        "all mobile calls go only to MobileEdge and all web calls only to WebEdge, two services exposing different shapes over the same inventory, pricing and order services",
+    ),
+    "backend-for-frontend-dependency-failure-mobile-edge-starvation": (
+        "backend-for-frontend",
+        "ShopSphere Mobile calls only MobileEdge and the web SPA calls only WebEdge, each backend with its own aggregation code over shared catalog, pricing, inventory and recommender services",
+    ),
+    "backend-for-frontend-coordination-checkout-surge-mobile-edge": (
+        "backend-for-frontend",
+        "native Android and iOS apps reach only ShopMobileEdge while the browser app reaches only ShopWebEdge, two independently deployable gateways aggregating the same downstream services differently",
+    ),
+    # blockchain-based
+    "blockchain-based-message-provenance-reply-matching": (
+        "blockchain-based",
+        "nine organizations each run a replica node holding a full hash-chained append-only copy, and an update settles only after more than two thirds of the nodes sign votes in numbered rounds",
+    ),
+    "blockchain-based-server-side-presentation-provenance-shell": (
+        "blockchain-based",
+        "four retailers and three certifiers each operate a peer holding a tamper-evident append-only log, with endorsements collected before an ordering cluster sequences batches and peers validate them by quorum",
+    ),
+    "blockchain-based-remote-contracts-custody-history-walk": (
+        "blockchain-based",
+        "twelve validator peers plus a five-sequencer ordering cluster, where a transfer settles only once matching execution results are collected from a quorum of peers onto the shared log",
+    ),
+    # command-query-responsibility-segregation
+    "command-query-responsibility-segregation-tactical-domain-modelling-cart-credit": (
+        "command-query-responsibility-segregation",
+        "update handling and display handling split into separate deployables with separate stores, a writer owning every change against normalized tables and a reader served only from a denormalized store",
+    ),
+    "command-query-responsibility-segregation-model-clarity-hold-invariants": (
+        "command-query-responsibility-segregation",
+        "submission intents applied to a normalized transactional ledger that is the sole authority for changes, while a projector maintains denormalized seat-map and order-history views from committed entries",
+    ),
+    "command-query-responsibility-segregation-time-contract-amendment-versions": (
+        "command-query-responsibility-segregation",
+        "two isolated paths with two stores: amendments appended to a normalized ledger that emits accepted events, and a view builder maintaining a denormalized snapshot store for the portal",
+    ),
+    # data-mesh
+    "data-mesh-translation-ledger-intake": (
+        "data-mesh",
+        "independent crews with separate repositories, databases and stream namespaces each own and serve their own shared tables, while a thin platform crew supplies storage, a schema catalog and identities but writes no business tables",
+    ),
+    "data-mesh-change-tracking-registry-overwrite": (
+        "data-mesh",
+        "three squads each running their own account, database, bucket and stream, publishing shares into a shared catalog index and serving reads from their own bucket with no central warehouse team",
+    ),
+    "data-mesh-domain-to-store-mapping-shipment-plan": (
+        "data-mesh",
+        "checkout, inventory and risk run as autonomous squads with their own databases, versioned extracts and its own read API, joined through a policy gateway rather than a central warehouse",
+    ),
+    # edge-computing
+    "edge-computing-time-store-price-history": (
+        "edge-computing",
+        "each shop's cabinet server authorizes sales, applies promotions and reprints receipts locally while the wide-area link is down for days, with the central catalog only synchronizing",
+    ),
+    "edge-computing-values-vineyard-ids-units": (
+        "edge-computing",
+        "every vineyard shed runs its own hub computer wired to probes and valves, issuing spray and valve commands within seconds while the cellular link to the cloud is down",
+    ),
+    "edge-computing-tactical-domain-model-signal-plan-ownership": (
+        "edge-computing",
+        "each junction's roadside cabinet runs sensor fusion and phase scheduling and drives the lamps within a 40 ms budget, independent of the hub and across multi-day link loss",
+    ),
+    # enterprise-service-bus
+    "enterprise-service-bus-dependency-wiring-shared-ops-packaging": (
+        "enterprise-service-bus",
+        "five incompatible applications on a mainframe over message queues, Java over HTTPS, Python over gRPC, SAP over RFC and a SaaS email API, integrating only through one separately deployed hub that translates schemas and bridges protocols",
+    ),
+    "enterprise-service-bus-task-lifetimes-centralflow-drain": (
+        "enterprise-service-bus",
+        "SOAP/XML on an application server, REST/JSON and EDI flat files over SFTP are all picked up by protocol adapters and forwarded as one canonical envelope into a centrally operated mediation tier",
+    ),
+    "enterprise-service-bus-creation-vendor-trio": (
+        "enterprise-service-bus",
+        "three surrounding systems speak RFC, REST and TCP SQL, and every exchange passes through one shared clustered hub that normalizes payloads between them",
+    ),
+    # hybrid-cloud
+    "hybrid-cloud-translation-plant-usage-unification": (
+        "hybrid-cloud",
+        "usage facts originate in an on-premises plant computer room from fixed-width historian files and a lab system, and converge with a third-party cloud feed into one intake",
+    ),
+    "hybrid-cloud-change-tracking-plant-reconciler-duplicates": (
+        "hybrid-cloud",
+        "plant scanning writes to a database on the next rack in the factory basement for sub-millisecond acknowledgement while the catalog service runs in a provider-managed cluster in another region over a wide-area link",
+    ),
+    "hybrid-cloud-data-access-gateways-parts-stock": (
+        "hybrid-cloud",
+        "the parts-stock cluster stays in a company-operated data centre for export-control reasons while the customer-facing storefront runs on managed cloud functions and a managed gateway",
+    ),
+    # kappa-architecture
+    "kappa-architecture-resource-lifecycle-and-caching-cityflow-enrichment": (
+        "kappa-architecture",
+        "an ordered durable log with 90-day retention is the only source of truth and one long-running job is the only computation over it, so a rebuild replays the same log instead of a separate offline path",
+    ),
+    "kappa-architecture-audit-cityflow-payout-trail": (
+        "kappa-architecture",
+        "a retained ordered topic holds every raw event for 400 days and a single streaming job is the only computation over that history, serving both live views and replays",
+    ),
+    "kappa-architecture-capabilities-isolation-tenant-ledger-expiry": (
+        "kappa-architecture",
+        "ingestion appends to an immutable durable ordered store and one long-lived engine reads it from the latest offset while a replay coordinator restarts that same job to recompute",
+    ),
+    # lambda-architecture
+    "lambda-architecture-queries-driver-aggregates-access": (
+        "lambda-architecture",
+        "nightly full-history rebuilders rescan the log from day zero into canonical aggregates while a parallel live job maintains deltas, so batch and speed paths serve the same platform",
+    ),
+    "lambda-architecture-long-running-change-merchant-curation": (
+        "lambda-architecture",
+        "a nightly job rereads the whole archive from day zero and overwrites the totals table while a streaming deployment upserts per-minute increments over the same events",
+    ),
+    "lambda-architecture-relational-structure-video-collections": (
+        "lambda-architecture",
+        "a nightly rebuild cluster scans the full immutable archive to recompute authoritative totals while a live path derives increments, and both land in the serving store",
+    ),
+    # modular-monolith
+    "modular-monolith-dependency-failure-shared-workers": (
+        "modular-monolith",
+        "one release artifact per host behind a load balancer, with checkout, stock, loyalty and messaging areas owning their tables and reachable only through each area's public facade",
+    ),
+    "modular-monolith-concurrent-io-freshcart-pickqueue": (
+        "modular-monolith",
+        "one service image launched as one OS process, with ordering, stock and fulfilment slices owning their own tables and crossing only through explicit public functions",
+    ),
+    "modular-monolith-coordination-parcel-intake-handoff": (
+        "modular-monolith",
+        "built and released as one executable on a single deployment, with scan, route, billing and audit packages strictly isolated behind public interfaces",
+    ),
+    # multi-cloud
+    "multi-cloud-long-running-change-voyage-checkout": (
+        "multi-cloud",
+        "US planners are served from one public cloud and EU planners from a second, both writing the same ledger in the first provider's database through a replica in the second",
+    ),
+    "multi-cloud-queries-cross-border-claims": (
+        "multi-cloud",
+        "ingress runs as managed functions in one public cloud, scoring as functions in a second, and settlement on containers in the first, all sharing one logical store split across both providers",
+    ),
+    "multi-cloud-relational-structure-mapping-film-performer-pairs": (
+        "multi-cloud",
+        "ingest runs on a cluster in one public cloud and the portal on a cluster in another, over a primary database in the first and a read replica in the second",
+    ),
+    # presentation-abstraction-control
+    "presentation-abstraction-control-message-ephemeral-scoring-route": (
+        "presentation-abstraction-control",
+        "a fleet console built as a tree of self-contained interactive units, each split into a view, a store and a liaison that alone talks to other units",
+    ),
+    "presentation-abstraction-control-remote-contracts-strip-refresh": (
+        "presentation-abstraction-control",
+        "every console pane is a closed trio of presentation, abstraction and control, with the abstraction owning the boundary to the shared holdings",
+    ),
+    "presentation-abstraction-control-server-side-presentation-harbor-shell": (
+        "presentation-abstraction-control",
+        "the operations board is a hierarchy of UI units, each owning three cooperating parts for rendering, state and coordination of traffic",
+    ),
+    # reactive-architecture
+    "reactive-architecture-capabilities-isolation-tenant-window-cutoff": (
+        "reactive-architecture",
+        "routing feeds single-threaded event loops that never block, emitting derived alerts downstream while consumers advertise demand and producers stall when buffers fill",
+    ),
+    "reactive-architecture-compile-time-access-control-batch-assembly": (
+        "reactive-architecture",
+        "ingress pushes ticks into bounded non-blocking queues feeding workers pinned to their own event loops, with downstream stages returning demand credits",
+    ),
+    "reactive-architecture-audit-payout-trail-integrity": (
+        "reactive-architecture",
+        "a topology of stateless stages fans out over bounded event channels in which each consumer advertises demand and producers stall when buffers fill",
+    ),
+    # reflection-architecture
+    "reflection-architecture-queries-live-sensor-catalog": (
+        "reflection-architecture",
+        "a long-lived service that imports a newly added dataclass module without restarting, reads its annotations and column tags, and refreshes a central type catalog at runtime",
+    ),
+    "reflection-architecture-relational-structure-mapping-blueprint-spec-pairing": (
+        "reflection-architecture",
+        "an in-memory graph of which detectors are running and how the router connects them is inspected and rewired through an admin API while the fabric keeps running without restarts",
+    ),
+    "reflection-architecture-long-running-change-permit-hub-collision": (
+        "reflection-architecture",
+        "a session coordinator tracks open edit sessions and routes each request to the current service implementations without restarting the hub",
+    ),
+    # rule-based-system
+    "rule-based-system-functional-composition-claim-math-separation": (
+        "rule-based-system",
+        "adjudication is driven by analyst-authored policy bundles listing patterns over a fact store plus the assertions and retractions to perform when they hold",
+    ),
+    "rule-based-system-functional-data-modelling-underwriting-verdict": (
+        "rule-based-system",
+        "several hundred analyst-authored clauses are hot-swapped from a repository and matched against a shared working memory, driving asserts, retracts and updates",
+    ),
+    "rule-based-system-method-clause-assembly": (
+        "rule-based-system",
+        "a matcher loads about 240 analyst-authored clauses that reload without restart and pushes matches onto a salience-ordered agenda for consequence execution",
+    ),
+    # saga
+    "saga-message-contracts-trip-pairing": (
+        "saga",
+        "one planning service drives flight, hotel, payment and car holds against four external providers it does not operate, reversing earlier holds through their cancel endpoints when a later step is refused",
+    ),
+    "saga-message-endpoint-holiday-replies": (
+        "saga",
+        "one managing service drives external seat, room and card providers in sequence and reverses the earlier holds when a later stage declines or times out, with outcomes persisted per step",
+    ),
+    "saga-remote-contracts-trip-coordinator-vendor-access": (
+        "saga",
+        "one container coordinates seat, room, payment and ground-dispatch parties it does not operate, cancelling holds and refunding charges through their APIs when a later party refuses",
+    ),
+    # serverless
+    "serverless-method-nightly-digest-query-assembly": (
+        "serverless",
+        "handlers are launched by the vendor only when messages arrive, billed per invocation and per millisecond, and nothing stays running in quiet periods",
+    ),
+    "serverless-domain-logic-seat-hold-flow": (
+        "serverless",
+        "three isolated on-demand handlers started only when an event or call arrives, billed for the milliseconds used and discarded afterwards",
+    ),
+    "serverless-functional-composition-receipt-amount": (
+        "serverless",
+        "a managed front door invokes one function, object writes fire a second and a backlog queue fires a third, each created per event with no always-on host",
+    ),
+    # service-mesh
+    "service-mesh-task-lifetimes-ingest-overload": (
+        "service-mesh",
+        "every pod runs the service container plus a companion network container that all inbound and outbound calls pass through, enforcing mutual TLS, timeouts and retries pushed from a control plane",
+    ),
+    "service-mesh-dependency-wiring-and-discovery-order-processor": (
+        "service-mesh",
+        "application code never dials a peer directly, calling localhost where a co-located traffic agent injects mutual TLS, retries and load balancing",
+    ),
+    "service-mesh-composition-pricing-client-options": (
+        "service-mesh",
+        "each pod pairs a business container with a co-located traffic agent injected at deploy time that intercepts outbound localhost calls",
+    ),
+    # service-oriented-architecture
+    "service-oriented-architecture-long-running-change-policy-edit-collision": (
+        "service-oriented-architecture",
+        "independently deployable units on different stacks each publish a contract to a central registry and call each other only over standard protocol, with no shared database",
+    ),
+    "service-oriented-architecture-queries-claims-persistence-centralization": (
+        "service-oriented-architecture",
+        "separately versioned units publish contracts and talk only through them, with a central directory holding endpoint addresses so callers in three languages bind without custom adapters",
+    ),
+    "service-oriented-architecture-relational-structure-mapping-invoice-money-columns": (
+        "service-oriented-architecture",
+        "four separately deployed processes on two stacks publish contracts and exchange messages over standard protocol through a central endpoint directory",
+    ),
+    # space-based
+    "space-based-message-venue-catalog-replication": (
+        "space-based",
+        "identical cells each hold a heap-resident partition of inventory and stay coherent through a peer replication backbone, with no central database on the hot path",
+    ),
+    "space-based-remote-contracts-peer-transport-abstraction": (
+        "space-based",
+        "identical replicas bundle request handling with a RAM-resident partition of live state, authoritative in process and flushed asynchronously, with capacity added by starting more cells",
+    ),
+    "space-based-server-side-presentation-seat-portal-shell": (
+        "space-based",
+        "edge gateways hash each event to one of twelve cells that hold their slice of seat state in local memory and complete most checkouts without touching the centre",
+    ),
+    # task-control-architecture
+    "task-control-architecture-task-lifetimes-rover-abort-propagation": (
+        "task-control-architecture",
+        "a fleet supervisor assigns missions that each rover's supervisor expands into concurrent navigation, scanning and lift activities, each driving lower sequencers in a nested control tree",
+    ),
+    "task-control-architecture-creation-configuration-traverse-order": (
+        "task-control-architecture",
+        "a unit supervisor splits a job into locomotion and manipulation activities ticked at 20 Hz in isolated partitions, emitting setpoint streams to servo loops",
+    ),
+    "task-control-architecture-dependency-wiring-onboard-helpers": (
+        "task-control-architecture",
+        "each robot hosts three simultaneous loops where a mission sequencer steps a pick job and can preempt or suspend the lower navigation and manipulation loops",
     ),
 }
 

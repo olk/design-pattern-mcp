@@ -162,8 +162,9 @@ def label_coverage(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
     ``labels`` is the gold distribution the head is asked to learn; ``uncovered`` lists
     criteria keys that appear in some row's criteria but never as a gold label — the
-    honest coverage record (today: 23 of the 36 style keys, and 2 category keys, have
-    zero positive rows). A key that is never positive can only be learned as a negative.
+    honest coverage record (after the 2026-11 style-exemplar extension: 0 of the 35
+    style keys and 2 category keys have zero positive rows; before it, 23 style keys).
+    A key that is never positive can only be learned as a negative.
     """
     histograms: dict[str, dict[str, int]] = {}
     criteria_keys: dict[str, set[str]] = {}

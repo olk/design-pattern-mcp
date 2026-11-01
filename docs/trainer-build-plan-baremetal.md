@@ -210,7 +210,7 @@ docker run --rm --entrypoint sha256sum design-pattern-clm:base /clm/heads/best_h
 
 ```bash
 # Expected: Tacit log shows teacher-kept + wrote-checkpoint lines (tacit_self_distill.py:290/:443);
-# CLM log shows both shard lines (export_clm_dataset.py: 140 train rows, 60 holdout rows =
+# CLM log shows both shard lines (export_clm_dataset.py: 278 train rows, 60 holdout rows =
 # 30 per question) AND the clm-eval-gate PASS line. That gate is the quality gate: test acc
 # >= released init on the FAMILY-DISJOINT holdout shard, the served question
 # (architecture_style) within one row (1/30) of its init baseline, above the majority-
