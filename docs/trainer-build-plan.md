@@ -26,7 +26,7 @@ nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1
    - Tacit: `morriszjm/Tacit-4B` (`docker/Dockerfile.tacit:weights` L73 `TACIT_MODEL_REPO`), `anyjev[client]==0.3.0` (`docker/Dockerfile.tacit:self-distill` L105, `:runtime-base` L132).
    - Bases: `python:3.11-slim` (downloader stages) + `vllm/vllm-openai:${VLLM_IMAGE_TAG}`, default `v0.17.1`.
 5. Secrets: `HF_TOKEN` only if any HF repo is gated. Both Dockerfiles read it via `RUN --mount=type=secret,id=hf_token` (`docker/Dockerfile.clm` L70/L90, `docker/Dockerfile.tacit` L81) and proceed with empty token otherwise. Runtime needs no Hub access (`HF_HUB_OFFLINE=1` in `docker/Dockerfile.clm:runtime-base` L156 and `docker/Dockerfile.tacit:runtime-base` L152).
-6. In-repo training inputs (must exist in the clone): `scripts/decision_models/tacit_self_distill.py`, `scripts/decision_models/export_clm_dataset.py`, `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/choice.jsonl`, `docker/*-entrypoint.sh` — kept in context by `.dockerignore` L19-22 negations while the rest of `scripts/` and `docker/` stays excluded.
+6. In-repo training inputs (must exist in the clone): `scripts/decision_models/tacit_self_distill.py`, `scripts/decision_models/export_clm_dataset.py`, `scripts/decision_models/clm_eval_gate.py`, `scripts/decision_models/clm_rank_parity.py`, `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/choice.jsonl`, `qa/typed/style.jsonl`, `qa/typed/noul.jsonl`, `docker/*-entrypoint.sh` — kept in context by `.dockerignore` L19-24 negations while the rest of `scripts/` and `docker/` stays excluded.
 
 ## Training Design at Build Time
 
@@ -34,7 +34,7 @@ Each bullet traces base image → COPY/RUN → cached artifact → what the fina
 
 1. CLM `docker/Dockerfile.clm` `:encoder` (`FROM python:3.11-slim` L56): `pip install huggingface_hub`, then `snapshot_download(Qwen/Qwen3-8B)` → cached artifact `/models/qwen3-8b`.
 2. CLM `docker/Dockerfile.clm` `:heads` (`FROM python:3.11-slim` L76): `hf_hub_download(Contrastive-LM/CLM-v0.1-8B, CLM_v0.1-8B.pt)` → cached artifact `/clm/heads-released/CLM_v0.1-8B.pt`.
-3. CLM `docker/Dockerfile.clm` `:finetune` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}` L96): `COPY --from=encoder` + `COPY --from=heads` (L101-102), `git clone CLM && git checkout d5f9ef0 && pip install -e . pyarrow` (L104-109), `COPY` exporter + `qa/typed/choice.jsonl` to `/build` (L111-112), then the single GPU `RUN --device=nvidia.com/gpu=all` (L117-139): starts `vllm serve /models/qwen3-8b --runner pooling --max-model-len 2048` on `127.0.0.1:8090`, polls `/health`, runs `export_clm_dataset.py` (train split only; holdout excluded by construction) to `/clm/data/typed-choice`, runs `/opt/CLM/train/finetune.py --task choice --data ... --init-ckpt /clm/heads-released/CLM_v0.1-8B.pt --out-dir /clm/heads-trained --embed-url .../v1/embeddings --batch ${CLM_FINETUNE_BATCH}`, then kills vLLM via trap. Cached artifact: `/clm/heads-trained/`. The `--task clm` rank fine-tune is explicitly NOT in this build (header L47-51); `/v1/rank` serves from the released-head lineage.
+3. CLM `docker/Dockerfile.clm` `:finetune` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}` L96): `COPY --from=encoder` + `COPY --from=heads` (L101-102), `git clone CLM && git checkout d5f9ef0 && pip install -e . pyarrow` (L104-109), `COPY` exporter + gates + `qa/typed/choice.jsonl` + `qa/typed/style.jsonl` + `qa/typed/noul.jsonl` to `/build` (L111-112), then the single GPU `RUN --device=nvidia.com/gpu=all` (L117-139): starts `vllm serve /models/qwen3-8b --runner pooling --max-model-len 2048` on `127.0.0.1:8090`, polls `/health`, runs `export_clm_dataset.py` (train split only; holdout excluded by construction) to `/clm/data/typed-choice`, runs `/opt/CLM/train/finetune.py --task choice --data ... --init-ckpt /clm/heads-released/CLM_v0.1-8B.pt --out-dir /clm/heads-trained --embed-url .../v1/embeddings --batch ${CLM_FINETUNE_BATCH}`, then kills vLLM via trap. Cached artifact: `/clm/heads-trained/`. The `--task clm` rank fine-tune is explicitly NOT in this build (header L47-51); `/v1/rank` serves from the released-head lineage.
 4. CLM `docker/Dockerfile.clm` `:runtime-base` (L142): fresh `vllm-openai` shell, `pip install git+CLM@${CLM_REPO_PIN}` (L148), `COPY --from=encoder /models/qwen3-8b`, `COPY docker/clm-entrypoint.sh` (L150-152), `ENV HF_HUB_OFFLINE=1`, `EXPOSE 8700`, `HEALTHCHECK` on `127.0.0.1:8700/health` (L165-166), `ENTRYPOINT clm-entrypoint.sh` (L168).
 5. CLM `docker/Dockerfile.clm` `:runtime-finetuned` (L176-178, DEFAULT as last stage): `COPY --from=finetune /clm/heads-trained /clm/heads` — the only trained artifact in the shipped image. (`:runtime-released` L171-173 COPYs the untrained `.pt` instead; fallback only.)
 6. CLM serve path (`ENTRYPOINT` L168 + `docker/clm-entrypoint.sh`): asserts `/clm/heads/best_head.pt` and `/models/qwen3-8b/config.json`, backgrounds `vllm serve ${MODEL_DIR} --runner pooling --max-model-len 2048 --host 127.0.0.1 --port 8090`, polls `/health` (900 s timeout), then `exec clm-serve --host 0.0.0.0 --port 8700 --emb-url .../v1/embeddings --ckpt ... --no-download --no-ui`. Final image runs only `vllm serve` + `clm-serve` (`POST /v1/systemone`, `POST /v1/rank`, `GET /health`).
@@ -151,7 +151,7 @@ set -euxo pipefail
 git clone <repo-url> /root/design-pattern-mcp
 cd /root/design-pattern-mcp
 git rev-parse HEAD
-ls docker/Dockerfile.clm docker/Dockerfile.tacit scripts/decision_models/tacit_self_distill.py scripts/decision_models/export_clm_dataset.py qa/qa.jsonl qa/typed/choice.jsonl src/decisions/seam_prompts.py
+ls docker/Dockerfile.clm docker/Dockerfile.tacit scripts/decision_models/tacit_self_distill.py scripts/decision_models/export_clm_dataset.py scripts/decision_models/clm_eval_gate.py scripts/decision_models/clm_rank_parity.py qa/qa.jsonl qa/typed/choice.jsonl qa/typed/style.jsonl qa/typed/noul.jsonl src/decisions/seam_prompts.py
 '
 ```
 
@@ -226,7 +226,10 @@ pct exec 220 -- bash -lc '
 set -euxo pipefail; cd /root/design-pattern-mcp
 grep -E "teacher kept [0-9]+ of [0-9]+ problems" build-tacit.log || { echo "GATE FAIL: no teacher-kept line in build-tacit.log" >&2; exit 1; }
 grep -E "wrote distilled checkpoint to /out/tacit-4b" build-tacit.log || { echo "GATE FAIL: no wrote-checkpoint line in build-tacit.log" >&2; exit 1; }
-grep -E "exported [0-9]+ train / [0-9]+ test rows" build-clm.log || { echo "GATE FAIL: no exported-rows line in build-clm.log" >&2; exit 1; }
+grep -E "exported train shard: [0-9]+ rows" build-clm.log || { echo "GATE FAIL: no train-shard line in build-clm.log" >&2; exit 1; }
+grep -E "exported test shard: [0-9]+ rows" build-clm.log || { echo "GATE FAIL: no holdout test-shard line in build-clm.log" >&2; exit 1; }
+grep -E "clm-eval-gate: PASS" build-clm.log || { echo "GATE FAIL: no eval-gate PASS line in build-clm.log (the fine-tune regressed or never evaluated)" >&2; exit 1; }
+grep -E "clm-rank-parity: PASS" build-clm.log || { echo "GATE FAIL: no rank-parity PASS line in build-clm.log (the rank wire drifted past budget)" >&2; exit 1; }
 grep -c -E "finetune.py|best_head|heads-trained" build-clm.log || true   # informational only, NOT a gate
 make docker-build-tacit-base docker-build-clm-base
 docker run --rm --entrypoint cat design-pattern-tacit:latest /models/tacit/self-distill.json
@@ -237,13 +240,30 @@ docker run --rm --entrypoint sha256sum design-pattern-clm:base /clm/heads/best_h
 
 ```bash
 # Expected: Tacit log shows teacher-kept + wrote-checkpoint lines (tacit_self_distill.py:290/:443);
-# CLM log shows exported-rows line (export_clm_dataset.py:164); Tacit :latest carries
+# CLM log shows both shard lines (export_clm_dataset.py: 140 train rows, 60 holdout rows =
+# 30 per question) AND the clm-eval-gate PASS line. That gate is the quality gate: test acc
+# >= released init on the FAMILY-DISJOINT holdout shard, the served question
+# (architecture_style) within one row (1/30) of its init baseline, above the majority-
+# label share of that shard, and every test label supported by a train positive (R6);
+# `category` is printed as advisory because no CLM client asks it.
+# The shard lines alone only prove rows were written, not that the head improved.
+# The rank-parity PASS line bounds the /v1/rank drift over qa/typed/rank_payloads.jsonl
+# (served shape: candidate document_text, empty context, decision statement as question),
+# budget 0.25 passed explicitly, with mean top-5 overlap printed beside it — and it fails
+# when the trained head's mean nDCG@10 (graded against the payloads' noul relevance)
+# regresses below the released head's, so a flip toward a worse ranking blocks the build.
+# Both gates also write clm-eval-gate.json / clm-rank-parity.json into /clm/heads-trained,
+# which travel with the extracted checkpoint and are sha256-pinned in
+# models/clm-heads/.extract-complete.
+# Tacit :latest carries
 # /models/tacit/self-distill.json (absent in :base); CLM :latest vs :base best_head.pt hashes differ.
 # Logs need BUILDKIT_PROGRESS=plain (Build Steps 8-9) or trainer stdout never reaches the file.
 # "epoch %d step %d loss" (tacit_self_distill.py:341) only logs at step % 50 == 0 —
 # do not gate tiny smoke builds on it; gate on "wrote distilled checkpoint" + self-distill.json.
-# The finetune.py|best_head count above is informational (|| true): a no-match grep under
-# set -e would otherwise abort the check on a successful build.
+# The finetune.py|best_head count above stays informational (|| true): a no-match grep under
+# set -e would otherwise abort the check on a successful build. The quality gate is the
+# clm-eval-gate and clm-rank-parity PASS lines, which the build itself fails without
+# (Dockerfile.clm [4/6] and [5/6]).
 ```
 
 2. Serve Tacit on one GPU; smoke `vllm serve` + `anyjev.serve` gateway (CDI-native run; wires mirror `make decisions-smoke`).
@@ -292,6 +312,90 @@ docker info | grep -i -E "cdi|runtime"   # cdi serves RUN --device; nvidia runti
 
 5. Pass criteria: both `HEALTHCHECK`s green within `start-period` (300 s + up to 900 s entrypoint timeout), all three gateway wires return 200 with ranked/choice payloads, loopback-only publishes (`127.0.0.1:18x00` — both gateways are unauthenticated per `docker/docker-compose.decision-models.yml` L29-33/L60-63). After the `nvidia-ctk runtime configure` line in Build Step 4, `make docker-up-decisions` works unchanged against the compose `driver: nvidia` reservations.
 
+## Known Upstream Facts (verified at pin `d5f9ef0`, 2026-11-01)
+
+- `train/finetune.py --task choice` trains one `state_head`/`action_head`/`logit_scale`
+  triple (heads-only, encoder frozen) and evaluates it: epoch-0 init accuracies, per-epoch
+  val accuracy with early stop (`--patience 5`, default `--epochs 20`), and a final test
+  accuracy vs the released init checkpoint, all printed (`[choice] best epoch ...`) and
+  written to `finetune_summary.json` (also `history.json`, `best_head.pt`, `final_head.pt`).
+  The build's `[4/6]` gate (`scripts/decision_models/clm_eval_gate.py`) consumes that
+  summary plus the export manifest — no separate eval harness is needed. The summary's
+  `test`/`init_test` blocks both carry `per_question`, and both are scored on the same
+  shard, so the trained-vs-released comparison is apples-to-apples.
+- `/v1/rank` has no separate weights: `src/clm/server.py::rank` → `engine.rank` builds a
+  synthetic `choice` question over the candidates and answers it with the same HeadPair
+  (`src/clm/engine.py`, `src/clm/heads.py`). The choice fine-tune moves the rank scoring
+  surface by construction; the `[5/6]` rank gate bounds it over
+  `qa/typed/rank_payloads.jsonl` (served shape: candidate `document_text`, empty context,
+  decision statement as the question), with the flip budget passed explicitly
+  (`--max-flip-rate 0.25`) and mean top-5 overlap reported beside it.
+- `confidence` on a choice answer is TypeSafe-style (`top prob − mean of rest`,
+  `src/clm/schema.py::confidence`), NOT the top probability — calibrate
+  `decisions.style.confidence_floor` against that definition
+  (`scripts/decision_models/clm_calibrate.py --metric confidence`).
+
+## Cached-Head Provenance
+
+`make docker-build-clm` extracts the trained heads to `models/clm-heads/` once; later
+runs re-bake that host dir with no GPU. The `.extract-complete` marker records the image
+tag + date, the sha256 of every train input (`qa/typed/*.jsonl` including
+`rank_payloads.jsonl`, `tests/benchmark/scenarios/full.json`, the exporter, both gates, the
+payload deriver, `docker/Dockerfile.clm` — `CLM_TRAIN_INPUTS` in the Makefile) AND the
+sha256 of the two gate reports (`clm-eval-gate.json`, `clm-rank-parity.json`) that admitted
+those head bytes. A cached rebuild verifies the marker with `sha256sum -c` and refuses a
+stale host dir: if you change the corpus or a gate script, `rm -rf models/clm-heads` and
+rebuild to retrain. `models/clm-calibration.json` (from `make clm-calibrate`) is the
+third piece of evidence and lives outside the heads dir — it belongs to a serving run,
+not to the checkpoint.
+
+Two guards keep the rank-payload artifact honest, because the catalog itself is not
+hashed (7290 files): `qa/typed/rank_payloads.jsonl` is in `CLM_TRAIN_INPUTS`, so a
+regenerated payload invalidates a cached head build; and `docker-build-clm` depends on
+`make clm-payloads-check`, which re-derives the payloads to a temp path and byte-compares,
+so a catalog edit that was never re-derived fails the build instead of replaying
+`document_text` the server no longer sends.
+
+## Calibrate Before Enabling the Style Seam
+
+The fine-tuned head ships uncalibrated: `decisions.style.confidence_floor` defaults to
+0.5 with no measurement behind it, and the compose overlay therefore keeps
+`DECISIONS_STYLE_ENABLED=false`. Enable the seam only after a calibration run names a
+floor.
+
+```bash
+make docker-up-decisions          # or start only design-pattern-clm + design-pattern-mcp
+make clm-calibrate                # replays the 30 held-out style rows against :18700
+```
+
+`clm-calibrate` writes `models/clm-calibration.json` and prints a `recommended.floor`:
+the lowest floor whose acted answers clear `CLM_CAL_MIN_ACTED_ACCURACY` (0.8) at an acted
+rate of at least `CLM_CAL_MIN_ACTED_RATE` (0.3), with ECE/Brier and the confidence
+distribution alongside. If nothing qualifies it exits 2 — a head that cannot act
+accurately must not be enabled, and the release step says so instead of guessing. Set
+the floor in the same command as the enable:
+
+```bash
+DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=<recommended.floor> make docker-up-decisions
+```
+
+Re-run after every retrain — the floor belongs to the weights, not the repo. Note the
+seam's own A/B against the LLM style is `candidate-loss`
+(`docs/JEV_BENCHMARK_REPORT.md`), so an accurate head is necessary but not sufficient:
+the gate measures the model, not whether acting on it helps selection.
+
+## Measure the Seam Before Trusting the Head
+
+The build gates bound the head; they do not measure the seam. That measurement is
+`make benchmark-style-ab`, which runs the pre-registered A/B twice through the full
+stack with the decision overlay — `DECISIONS_STYLE_ENABLED=false` then `=true` with the
+calibrated floor (read from `models/clm-calibration.json`; the target refuses to run
+without it) — over `tests/benchmark/scenarios/full.json`, `SPLIT=holdout`, `REPEAT=3`,
+and hands both run dirs to `benchmark-compare` (+15% holdout p95 rule). Both arms use the
+same corpus, split, repeat count and images, which is what makes the comparison
+pre-registered rather than exploratory. Record the verdict next to the calibration
+artifact; `candidate-loss` means keep the seam off regardless of head accuracy.
+
 ## Risks, Gaps, and Follow-ups
 
 - R1 — Privileged LXC vs unprivileged + idmap. Plan uses `--unprivileged 0` for trainer simplicity; a privileged container with 4 GPUs and Docker is a wide blast radius. Alternative: unprivileged + `lxc.idmap` for `nvidia-caps` gids. Human must choose before Build Step 2. Owner: infra/human reviewer.
@@ -302,6 +406,6 @@ docker info | grep -i -E "cdi|runtime"   # cdi serves RUN --device; nvidia runti
 - R6 — Base-image tags only half-pinned. `VLLM_IMAGE_TAG=v0.17.1` is pinned; `python:3.11-slim` floats on patch, CLM `pip install -e .` deps are not locked, `peft/bitsandbytes/datasets` are not pinned (`docker/Dockerfile.tacit` L105). Rebuilds months apart may drift. Owner: repo maintainer.
 - R7 — Upstream fragility: `morriszjm/Tacit-4B` + `Contrastive-LM/CLM` + `finetune.py` CLI. No fallback if the Tacit repo is renamed/gated or the CLM CLI drifts from pin `d5f9ef0`. Mitigation: the `:runtime-released` targets (`docker/Dockerfile.clm` L171-173, `docker/Dockerfile.tacit` L155-157) build with no GPU as smoke/standby images. Owner: ML engineer.
 - R8 — Dockerfile-vs-Context conflict (resolved by Constraints). `docker/Dockerfile.tacit` header L52-59 documents training via `docker run --gpus all tacit-trainer ...` outside the build; this plan forbids it — all training is the in-`docker-build` `RUN --device` stages. Owner: acknowledged; no action.
-- R9 — Build-cache invalidation cost + log-grep gate. `COPY qa/...` + trainer scripts sit below the heavy `git clone`/`pip install` layers; any edit re-runs the full multi-hour GPU RUN (no checkpoint resume in either trainer). Keep datasets frozen during a build; use the small-knob smoke shape for iteration. A `CACHED` rebuild must never masquerade as a fresh train — the Verification Step 1 log-grep gate (`teacher kept` / `wrote distilled checkpoint` / `exported rows`) plus the `:base` weight diff enforces this. Logs are captured with `BUILDKIT_PROGRESS=plain` so trainer stdout lands in the file; the speculative `finetune.py|best_head` grep is informational (`|| true`), never a gate. Owner: operator.
+- R9 — Build-cache invalidation cost + log-grep gate. `COPY qa/...` + trainer scripts sit below the heavy `git clone`/`pip install` layers; any edit re-runs the full multi-hour GPU RUN (no checkpoint resume in either trainer). Keep datasets frozen during a build; use the small-knob smoke shape for iteration. A `CACHED` rebuild must never masquerade as a fresh train — the Verification Step 1 log-grep gate (`teacher kept` / `wrote distilled checkpoint` / `exported train shard` + `exported test shard` / `clm-eval-gate: PASS` / `clm-rank-parity: PASS`) plus the `:base` weight diff enforces this. Logs are captured with `BUILDKIT_PROGRESS=plain` so trainer stdout lands in the file; the speculative `finetune.py|best_head` grep is informational (`|| true`), never a gate. Owner: operator.
 - R10 — Missing operator inputs. Clone URL for Build Step 6, Proxmox storage pool name (`local-lvm` assumed), bridge name (`vmbr0` assumed), host driver version. Owner: human reviewer must fill before execution.
 - R11 — Image distribution. Plan yields images inside the trainer LXC's Docker daemon only. Pushing to a registry or `docker save` transfer to serving hosts is out of scope. Owner: infra/repo maintainer.

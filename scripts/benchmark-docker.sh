@@ -18,7 +18,7 @@
 #
 # Knobs (env, all optional): BENCH_SCENARIOS OUT RUN_ID LIMIT SPLIT REPEAT NO_WARMUP
 # LOG_LEVEL FLIP CLIENT_URL CALL_TIMEOUT A B ALLOW_MISMATCH DRY_RUN PER_FAMILY FAMILIES
-# DRAFT_OUT MCP_IMAGE TEI_IMAGE TEI_RERANK_IMAGE BENCH_STACK_TIMEOUT (2100) BENCH_READY_TIMEOUT
+# DRAFT_OUT MCP_IMAGE TEI_IMAGE TEI_RERANK_IMAGE BENCH_DECISION_OVERLAY BENCH_STACK_TIMEOUT (2100) BENCH_READY_TIMEOUT
 # (300) BENCH_PROBE_URL (http://127.0.0.1:8822/mcp).
 
 set -Eeuo pipefail
@@ -33,7 +33,6 @@ case "$MODE" in
   *) echo "benchmark-docker: unknown mode: $MODE" >&2; exit 2 ;;
 esac
 
-compose() { docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml "$@"; }
 die() { echo "benchmark-docker: $*" >&2; exit 1; }
 
 BENCH_SCENARIOS="${BENCH_SCENARIOS:-tests/benchmark/scenarios/seed.json}"
@@ -47,7 +46,7 @@ TEI_RERANK_IMAGE="${TEI_RERANK_IMAGE:-design-pattern-tei-rerank:latest}"
 OUT="${OUT:-}" LIMIT="${LIMIT:-}" SPLIT="${SPLIT:-}" REPEAT="${REPEAT:-}"
 NO_WARMUP="${NO_WARMUP:-}" LOG_LEVEL="${LOG_LEVEL:-}" FLIP="${FLIP:-}"
 CALL_TIMEOUT="${CALL_TIMEOUT:-}" A="${A:-}" B="${B:-}"
-ALLOW_MISMATCH="${ALLOW_MISMATCH:-}" DRY_RUN="${DRY_RUN:-}"
+ALLOW_MISMATCH="${ALLOW_MISMATCH:-}" DRY_RUN="${DRY_RUN:-}" BENCH_DECISION_OVERLAY="${BENCH_DECISION_OVERLAY:-}"
 PER_FAMILY="${PER_FAMILY:-}" FAMILIES="${FAMILIES:-}"
 
 case "$BENCH_SCENARIOS" in
@@ -143,6 +142,21 @@ case "$MODE" in
     ;;
 esac
 
+COMPOSE_FILES=(-f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml)
+# Optional extra overlay — `docker/docker-compose.decision-models.yml` for the Ch2 style A/B.
+# The overlay's own ${VAR:-default} interpolation decides which seams are on, so an arm is
+# selected by the env the caller passes, not by editing a file. Rendering the merge without a
+# GPU: `docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml
+# -f docker/docker-compose.decision-models.yml config`.
+if [ -n "${BENCH_DECISION_OVERLAY:-}" ]; then
+    [ -f "$BENCH_DECISION_OVERLAY" ] || die "BENCH_DECISION_OVERLAY not found: $BENCH_DECISION_OVERLAY"
+    COMPOSE_FILES+=(-f "$BENCH_DECISION_OVERLAY")
+fi
+# Teardown must use the SAME file set as bring-up: services defined only in the overlay
+# (design-pattern-clm / design-pattern-tacit) are invisible to a two-file `compose down`,
+# so `--remove-orphans` would be evaluated against the wrong project.
+compose() { docker compose "${COMPOSE_FILES[@]}" "$@"; }
+
 # --- stack lifecycle --------------------------------------------------------
 started=0
 cleanup() {
@@ -156,7 +170,6 @@ trap cleanup EXIT
 
 require_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image missing: $1 — run: make docker-build-all"; }
 
-COMPOSE_FILES=(-f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml)
 case "$stack" in
   sidecars)
     require_image "$TEI_IMAGE"

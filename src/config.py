@@ -340,7 +340,11 @@ class DecisionSeamConfig(BaseModel):
         default=0.5,
         ge=0.0,
         le=1.0,
-        description="Minimum confidence/probability to act on the answer (ignored by the weights seam).",
+        description=(
+            "Minimum confidence/probability to act on the answer (ignored by the weights seam). "
+            "On the CLM style seam this gates TypeSafe-style confidence (top prob minus mean of rest), "
+            "NOT the top probability — set it from scripts/decision_models/clm_calibrate.py, not the default."
+        ),
     )
     timeout_seconds: float = Field(
         default=10.0,

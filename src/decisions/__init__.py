@@ -24,7 +24,10 @@ from src.decisions.client import (
 from src.decisions.seam_prompts import (
     CATEGORY_GLOSSES,
     CATEGORY_SLUGS,
-    WEIGHT_LEVELS,
+    STYLE_GLOSSES,
+    STYLE_INSTRUCTIONS,
+    STYLE_NONE_GLOSS,
+    STYLE_NONE_KEY,
     axis_question,
     category_question,
     gate_question,
@@ -34,6 +37,10 @@ from src.decisions.tacit import TacitClient, TacitDecision, category_options
 __all__ = [
     "CATEGORY_GLOSSES",
     "CATEGORY_SLUGS",
+    "STYLE_GLOSSES",
+    "STYLE_INSTRUCTIONS",
+    "STYLE_NONE_GLOSS",
+    "STYLE_NONE_KEY",
     "STYLE_QUESTION_ID",
     "WEIGHT_LEVELS",
     "DecisionModelClient",

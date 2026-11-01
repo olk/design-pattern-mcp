@@ -11,11 +11,16 @@
 #       POST /v1/rank       {context, question, answers[]} -> {ranked: [{rank, candidate, prob}]}
 #       GET  /health, GET /v1/models
 #
-# The heads are *fine-tuned in this build* on this repo's own typed decision labels
-# (``qa/typed/choice.jsonl``, train split only — the benchmark holdout families never
-# reach the weights). The fine-tune is domain adaptation of the
-# (state, question, candidate) heads to this server's decision questions, not a
-# category classifier: nothing here is wired to the category seam (that is Tacit).
+# The heads are *fine-tuned in this build* on this repo's own typed decision labels.
+# The train shard is the corpus ``train`` split of ``qa/typed/choice.jsonl`` +
+# ``qa/typed/style.jsonl``; the eval shard is the family-disjoint ``holdout`` split, which
+# ``finetune.py`` reads only after checkpoint selection, so those families never reach
+# the weights and the gate compares trained-vs-released on rows the head never saw. The
+# fine-tune is domain adaptation of the (state, question, candidate) heads to this
+# server's decision questions: the style set is the exact (instructions, criteria) the
+# Ch2 seam serves (shared ``src/decisions/seam_prompts.py`` vocabulary), the category set
+# the decision taxonomy, which no CLM client asks (that seam is Tacit) — so it is
+# reported, never gating.
 #
 # Two runtime targets, because the fine-tune needs a GPU on the builder:
 #
@@ -48,7 +53,21 @@
 # rows. That flow wants the precomputed-embedding dataset path
 # (``preprocessing/hf_embeddings.py``) to amortise the encoder pass over marginal data
 # volume, so it is an explicit follow-up (``--task clm --emb-dir ...``) rather than part
-# of every image build. The released heads already serve ``/v1/rank``.
+# of every image build.
+#
+# Rank-wire note (verified against upstream at pin d5f9ef0, NOT assumed): there are no
+# separate rank-head weights to leave untouched. ``/v1/rank`` is served through the
+# SAME state_head/action_head/logit_scale triple that ``--task choice`` trains —
+# ``src/clm/server.py::rank`` calls ``engine.rank``, which builds a synthetic choice
+# question over the candidates (``src/clm/engine.py::rank``) and answers it with the
+# loaded HeadPair (``src/clm/heads.py::HeadPair``). The fine-tune therefore moves the
+# ``/v1/rank`` scoring surface by construction, and the [5/6] rank gate is what bounds
+# that movement: released-vs-trained top-1 flip rate over the 30 holdout payloads in
+# ``qa/typed/rank_payloads.jsonl`` — the served shape (candidate ``document_text``,
+# empty context, decision statement as the question), derived on the host by
+# ``derive_rank_payloads.py``. The budget is passed explicitly at the call site
+# (``--max-flip-rate 0.25``) and the gate also reports mean top-5 overlap, which is the
+# number to set that budget from.
 
 ARG VLLM_IMAGE_TAG=v0.17.1
 
@@ -111,15 +130,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /opt/CLM/.git
 
 COPY scripts/decision_models/export_clm_dataset.py /build/export_clm_dataset.py
+COPY scripts/decision_models/clm_eval_gate.py /build/clm_eval_gate.py
+COPY scripts/decision_models/clm_rank_parity.py /build/clm_rank_parity.py
 COPY qa/typed/choice.jsonl /build/qa/typed/choice.jsonl
+COPY qa/typed/style.jsonl /build/qa/typed/style.jsonl
+# Human review ledger for the R7 coverage rule and the R8 choice-review advisory.
+COPY qa/typed/review.json /build/qa/typed/review.json
+# Served-shape rank payloads (candidate document_text, not the noul short strings):
+# derived on the host by scripts/decision_models/derive_rank_payloads.py, because this
+# image has no pattern catalog to derive them from.
+COPY qa/typed/rank_payloads.jsonl /build/qa/typed/rank_payloads.jsonl
 
-# One fat RUN: start the encoder, export the dataset, fine-tune the choice heads, stop.
-# The vLLM process is what supplies the 8B embeddings the heads train over, so it has to
-# be alive for the duration; the trap keeps it from leaking into the layer on failure.
+# One fat RUN: start the encoder, export the dataset, fine-tune the choice heads,
+# gate on the choice eval AND the rank-wire parity, stop. The vLLM process is what
+# supplies the 8B embeddings the heads train over, so it has to be alive for the
+# duration; the trap keeps it from leaking into the layer on failure.
+# The choice gate (scripts/decision_models/clm_eval_gate.py) reads the
+# finetune_summary.json the pinned trainer writes and fails the RUN when the trained
+# head regressed below the released init checkpoint on the exported test shard.
+# The rank gate (scripts/decision_models/clm_rank_parity.py) loads released + trained
+# heads side by side through the pinned clm.Engine and fails the RUN when the top-1
+# flip rate over the 30 holdout rank payloads exceeds budget — /v1/rank shares the
+# trained head pair, so this is the bound on the untrained wire's drift. Both PASS
+# lines are the runbook's build gates.
 RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
     ldconfig; \
     trap "kill ${VLLM_PID:-0} 2>/dev/null || true" EXIT INT TERM; \
-    echo "clm-finetune: [1/4] starting pooling encoder on 127.0.0.1:8090"; \
+    echo "clm-finetune: [1/6] starting pooling encoder on 127.0.0.1:8090"; \
     vllm serve /models/qwen3-8b --served-model-name qwen3-8b --runner pooling \
       --max-model-len 2048 --host 127.0.0.1 --port 8090 & \
     VLLM_PID=$!; \
@@ -127,10 +164,12 @@ RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
       kill -0 "${VLLM_PID}" 2>/dev/null || { echo "encoder failed to start" >&2; exit 1; }; \
       sleep 3; \
     done; \
-    echo "clm-finetune: [2/4] encoder healthy, exporting typed-choice dataset"; \
+    echo "clm-finetune: [2/6] encoder healthy, exporting typed-choice dataset"; \
     python3 -u /build/export_clm_dataset.py \
-      --choice /build/qa/typed/choice.jsonl --out /clm/data/typed-choice; \
-    echo "clm-finetune: [3/4] fine-tuning choice heads (--task choice --workflow all)"; \
+      --choice /build/qa/typed/choice.jsonl --style /build/qa/typed/style.jsonl \
+      --clm-pin "${CLM_REPO_PIN}" \
+      --out /clm/data/typed-choice; \
+    echo "clm-finetune: [3/6] fine-tuning choice heads (--task choice --workflow all)"; \
     python3 -u /opt/CLM/train/finetune.py \
       --task choice \
       --data /clm/data/typed-choice \
@@ -141,7 +180,32 @@ RUN --device=nvidia.com/gpu=all sh -c 'set -eu; \
       --embed-model qwen3-8b \
       --max-len 2048 \
       --batch "${CLM_FINETUNE_BATCH}"; \
-    echo "clm-finetune: [4/4] done, stopping encoder"; \
+    echo "clm-finetune: [4/6] gating on the trainer eval (test acc vs released init, per served question)"; \
+    python3 -u /build/export_clm_dataset.py --help >/dev/null; \
+    MANIFEST_PIN="$(python3 -c "import json; print(json.load(open('/clm/data/typed-choice/manifest.json'))['clm_pin'])")"; \
+    test "${MANIFEST_PIN}" = "${CLM_REPO_PIN}" || { echo "clm-finetune: FAIL: dataset exported for CLM ${MANIFEST_PIN}, build pins ${CLM_REPO_PIN} — the adapter layout may have moved; re-verify train/adapters.py" >&2; exit 1; }; \
+    python3 -u /build/clm_eval_gate.py \
+      --summary /clm/heads-trained/finetune_summary.json \
+      --manifest /clm/data/typed-choice/manifest.json \
+      --questions architecture_style \
+      --advisory-questions category \
+      --choice /build/qa/typed/choice.jsonl \
+      --style /build/qa/typed/style.jsonl \
+      --review /build/qa/typed/review.json \
+      --report /clm/heads-trained/clm-eval-gate.json; \
+    echo "clm-finetune: [5/6] gating on rank-wire parity (released vs trained top-1, served payloads)"; \
+    # NOTE: --max-flip-rate 0.25 is an ASSERTED policy budget (see clm_rank_parity.py):
+    # reset it from the first head's parity report + a rank-seam A/B before trusting it.
+    python3 -u /build/clm_rank_parity.py \
+      --payloads /build/qa/typed/rank_payloads.jsonl \
+      --released /clm/heads-released/CLM_v0.1-8B.pt \
+      --trained /clm/heads-trained/best_head.pt \
+      --clm-src /opt/CLM/src \
+      --emb-url http://127.0.0.1:8090/v1/embeddings \
+      --emb-model qwen3-8b \
+      --max-flip-rate 0.25 \
+      --report /clm/heads-trained/clm-rank-parity.json; \
+    echo "clm-finetune: [6/6] done, stopping encoder"; \
     kill -TERM "${VLLM_PID}" 2>/dev/null || true; \
     wait "${VLLM_PID}" 2>/dev/null || true'
 
@@ -189,7 +253,15 @@ FROM runtime-base AS runtime-finetuned-cached
 COPY models/clm-heads /clm/heads
 # Fail fast on an empty or partial host dir: COPY of an empty dir succeeds and
 # would otherwise bake a broken image the entrypoint only catches at run time.
-RUN test -s /clm/heads/best_head.pt
+# The two gate reports must travel with the checkpoint — they are the evidence that
+# admitted these head bytes, and the Makefile pins their sha256 in the cache marker.
+RUN set -e; \
+    test -s /clm/heads/best_head.pt || { \
+        echo "clm-heads: best_head.pt is missing or empty" >&2; exit 1; }; \
+    test -s /clm/heads/clm-eval-gate.json || { \
+        echo "clm-heads: clm-eval-gate.json is missing — the dir predates the build gate or was copied by hand; delete models/clm-heads and rebuild with a GPU" >&2; exit 1; }; \
+    test -s /clm/heads/clm-rank-parity.json || { \
+        echo "clm-heads: clm-rank-parity.json is missing — the dir predates the build gate or was copied by hand; delete models/clm-heads and rebuild with a GPU" >&2; exit 1; }
 
 # -- Stage 5c: fine-tuned heads (DEFAULT target; must stay the last stage) --------------
 FROM runtime-base AS runtime-finetuned
