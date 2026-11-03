@@ -320,6 +320,55 @@ regenerated payload invalidates a cached head build; and `docker-build-clm` depe
 so a catalog edit that was never re-derived fails the build instead of replaying
 `document_text` the server no longer sends.
 
+## Host Runtime Preconditions
+
+`docker compose ... up` needs a net namespace it can configure. On this host (an
+unprivileged Proxmox LXC — `uname -r` ends in `-pve`) it cannot have one, and every
+sandboxed container fails at create time:
+
+```
+Error response from daemon: failed to create task for container: …
+OCI runtime create failed: runc create failed: … open sysctl
+net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
+```
+
+Docker ≥ 28 writes `net.ipv4.ip_unprivileged_port_start=0` into each sandbox's netns so
+non-root images can bind low ports; inside an unprivileged LXC `/proc/sys/net/**` is
+read-only even for root (`echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start` →
+`Keine Berechtigung`) and runc's procfs reopen is denied. The sysctl is not in
+`HostConfig` (`docker inspect` shows `Sysctls: null`) — it is applied by the network
+driver, so `--sysctl`, `--user 0:0`, `--privileged` and
+`--security-opt systempaths=unconfined` all fail identically; `docker build` is
+unaffected (build containers get no sandbox netns), which is why the image build above
+succeeds on a host where `docker run` does not.
+
+Two ways out, in order of preference:
+
+1. **Run Docker where the netns is owned by the container's user namespace** — a
+   privileged LXC (`unprivileged: 0`) or bare metal. Nothing in this repo needs to
+   change, and the compose overlay works as written.
+2. **Run the sidecars with `--network host` and bind them to loopback.** Host networking
+   has no sandbox netns, so no sysctl write, but it also removes the port publish that
+   the overlay's loopback-only rule depends on — the gateways listen on `0.0.0.0` and
+   have no auth (`clm-serve` without `CLM_API_KEY`, `anyjev.serve` in general), so the
+   bind knobs are mandatory, never optional:
+
+```bash
+# CLM sidecar, host networking, loopback-only (needed by `make clm-calibrate`)
+docker run -d --name design-pattern-clm-host --network host \
+    --device nvidia.com/gpu=all -e CLM_BIND_HOST=127.0.0.1 \
+    design-pattern-clm:$(DOCKER_TAG)
+# same for Tacit, with TACIT_BIND_HOST=127.0.0.1 (the gateway binds 18100 only if you
+# also pass -e TACIT_PORT=18100; the image default is 8100)
+make clm-calibrate CLM_BASE_URL=http://127.0.0.1:8700/v1
+```
+
+With host networking the MCP service reaches the sidecars at `127.0.0.1:8700` /
+`127.0.0.1:8100` instead of the compose service names, so a full host-network stack
+needs `DECISIONS_STYLE_BASE_URL`, `DECISIONS_WEIGHTS_BASE_URL`,
+`DECISIONS_CATEGORY_BASE_URL` and `DECISIONS_REASONING_GATE_BASE_URL` overridden —
+which is why the sidecar-only recipe above is what calibration uses.
+
 ## Calibrate Before Enabling the Style Seam
 
 The fine-tuned head ships uncalibrated: `decisions.style.confidence_floor` defaults to
