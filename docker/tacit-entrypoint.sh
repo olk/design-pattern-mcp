@@ -19,6 +19,11 @@ MODEL_DIR="${TACIT_MODEL_DIR:-/models/tacit}"
 SERVED_MODEL="${TACIT_SERVED_MODEL:-tacit-4b}"
 UPSTREAM_PORT="${TACIT_UPSTREAM_PORT:-8000}"
 GATEWAY_PORT="${TACIT_PORT:-8100}"
+#: Where the gateway listens. ``0.0.0.0`` is right for the compose path, where the port is
+#: published as ``127.0.0.1:<host>:<container>`` and the publish is what confines it to
+#: loopback. A ``--network host`` run has no publish to do that, so it MUST pass
+#: ``TACIT_BIND_HOST=127.0.0.1``: anyjev.serve has no auth of its own.
+BIND_HOST="${TACIT_BIND_HOST:-0.0.0.0}"
 STARTUP_TIMEOUT="${TACIT_STARTUP_TIMEOUT:-900}"
 
 if [ ! -f "${MODEL_DIR}/config.json" ]; then
@@ -57,7 +62,7 @@ until python3 -c "import urllib.request,sys; urllib.request.urlopen('http://127.
 done
 
 ARGS=(--model "${MODEL_DIR}" --upstream "http://127.0.0.1:${UPSTREAM_PORT}/v1" --served-model "${SERVED_MODEL}"
-      --host 0.0.0.0 --port "${GATEWAY_PORT}")
+      --host "${BIND_HOST}" --port "${GATEWAY_PORT}")
 if [ "${TACIT_ADAPTIVE:-false}" = "true" ]; then
     ARGS+=(--adaptive)
 fi

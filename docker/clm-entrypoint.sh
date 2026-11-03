@@ -16,6 +16,13 @@ MODEL_DIR="${CLM_MODEL_DIR:-/models/qwen3-8b}"
 SERVED_MODEL="${CLM_SERVED_MODEL:-qwen3-8b}"
 UPSTREAM_PORT="${CLM_UPSTREAM_PORT:-8090}"
 SERVE_PORT="${CLM_PORT:-8700}"
+#: Where clm-serve listens. ``0.0.0.0`` is right for the compose path, where the port is
+#: published as ``127.0.0.1:<host>:<container>`` and the publish is what confines it to
+#: loopback. A ``--network host`` run has no publish to do that, so it MUST pass
+#: ``CLM_BIND_HOST=127.0.0.1``: clm-serve's auth is a no-op while ``CLM_API_KEY`` is unset,
+#: and host networking would otherwise answer unauthenticated ``/v1/systemone`` and
+#: ``/v1/rank`` on the host's LAN address.
+BIND_HOST="${CLM_BIND_HOST:-0.0.0.0}"
 CKPT="${CLM_CKPT:-/clm/heads/best_head.pt}"
 MAX_TOKENS="${CLM_EMB_MAX_TOKENS:-2048}"
 STARTUP_TIMEOUT="${CLM_STARTUP_TIMEOUT:-900}"
@@ -61,7 +68,7 @@ until python3 -c "import urllib.request,sys; urllib.request.urlopen('http://127.
 done
 
 exec clm-serve \
-    --host 0.0.0.0 \
+    --host "${BIND_HOST}" \
     --port "${SERVE_PORT}" \
     --emb-url "http://127.0.0.1:${UPSTREAM_PORT}/v1/embeddings" \
     --emb-model "${SERVED_MODEL}" \
