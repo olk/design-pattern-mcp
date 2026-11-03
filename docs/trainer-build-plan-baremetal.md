@@ -37,12 +37,12 @@ Each bullet traces base image → COPY/RUN → cached artifact → what the fina
 3. CLM `docker/Dockerfile.clm` `:finetune` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}` L96): `COPY --from=encoder` + `COPY --from=heads` (L101-102), `git clone CLM && git checkout d5f9ef0 && pip install -e . pyarrow` (L104-109), `COPY` exporter + gates + `qa/typed/choice.jsonl` + `qa/typed/style.jsonl` + `qa/typed/noul.jsonl` to `/build` (L111-112), then the single GPU `RUN --device=nvidia.com/gpu=all` (L117-139): starts `vllm serve /models/qwen3-8b --runner pooling --max-model-len 2048` on `127.0.0.1:8090`, polls `/health`, runs `export_clm_dataset.py` (train split only; holdout excluded by construction) to `/clm/data/typed-choice`, runs `/opt/CLM/train/finetune.py --task choice --data ... --init-ckpt /clm/heads-released/CLM_v0.1-8B.pt --out-dir /clm/heads-trained --embed-url .../v1/embeddings --batch ${CLM_FINETUNE_BATCH}`, then kills vLLM via trap. Cached artifact: `/clm/heads-trained/`. The `--task clm` rank fine-tune is explicitly NOT in this build (header L47-51); `/v1/rank` serves from the released-head lineage.
 4. CLM `docker/Dockerfile.clm` `:runtime-base` (L142): fresh `vllm-openai` shell, `pip install git+CLM@${CLM_REPO_PIN}` (L148), `COPY --from=encoder /models/qwen3-8b`, `COPY docker/clm-entrypoint.sh` (L150-152), `ENV HF_HUB_OFFLINE=1`, `EXPOSE 8700`, `HEALTHCHECK` on `127.0.0.1:8700/health` (L165-166), `ENTRYPOINT clm-entrypoint.sh` (L168).
 5. CLM `docker/Dockerfile.clm` `:runtime-finetuned` (L176-178, DEFAULT as last stage): `COPY --from=finetune /clm/heads-trained /clm/heads` — the only trained artifact in the shipped image. (`:runtime-released` L171-173 COPYs the untrained `.pt` instead; fallback only.)
-6. CLM serve path (`ENTRYPOINT` L168 + `docker/clm-entrypoint.sh`): asserts `/clm/heads/best_head.pt` and `/models/qwen3-8b/config.json`, backgrounds `vllm serve ${MODEL_DIR} --runner pooling --max-model-len 2048 --host 127.0.0.1 --port 8090`, polls `/health` (900 s timeout), then `exec clm-serve --host 0.0.0.0 --port 8700 --emb-url .../v1/embeddings --ckpt ... --no-download --no-ui`. Final image runs only `vllm serve` + `clm-serve` (`POST /v1/systemone`, `POST /v1/rank`, `GET /health`).
+6. CLM serve path (`ENTRYPOINT` L168 + `docker/clm-entrypoint.sh`): asserts `/clm/heads/best_head.pt` and `/models/qwen3-8b/config.json`, backgrounds `vllm serve ${MODEL_DIR} --runner pooling --max-model-len 2048 --host 127.0.0.1 --port 8090`, polls `/health` (900 s timeout), then `exec clm-serve --host ${CLM_BIND_HOST:-0.0.0.0} --port 8700 --emb-url .../v1/embeddings --ckpt ... --no-download --no-ui` (the bind host is a knob: the compose publish is what confines the gateway to loopback, so a `--network host` run must pass `CLM_BIND_HOST=127.0.0.1`). Final image runs only `vllm serve` + `clm-serve` (`POST /v1/systemone`, `POST /v1/rank`, `GET /health`).
 7. Tacit `docker/Dockerfile.tacit` `:weights` (`FROM python:3.11-slim` L67): `snapshot_download(morriszjm/Tacit-4B)` → cached artifact `/models/tacit-4b`.
 8. Tacit `docker/Dockerfile.tacit` `:self-distill` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}` L87): `pip install anyjev[client]==0.3.0 peft bitsandbytes datasets` (L113), `COPY --from=weights`, `COPY tacit_self_distill.py`, `COPY src/decisions/seam_prompts.py`, `COPY qa/qa.jsonl` (L115-119), then the single GPU `RUN --device=nvidia.com/gpu=all python3 /build/tacit_self_distill.py --init-dir /models/tacit-4b --out /out/tacit-4b ...` (L124-141) with knobs `TACIT_PROBLEMS=2000 / TACIT_STATES=0 / TACIT_CONFIDENCE_FLOOR=0.5 / TACIT_MIN_KIND_ROWS=1 / EPOCHS=1 / LR=1e-4 / BATCH=4 / ACCUM=8 / COT_MAX=2048 / MAX_NEW=256` (L91-110). The script runs teacher state-writing + sequential per-question CoT `generate`, builds gate states from the dataset's own descriptions in the exact `tacit.gate_state` shape, keeps `score` rows unfiltered and `choice` rows only above `TACIT_CONFIDENCE_FLOOR` (dropping any teacher result that omits an option key), and fails the build when a serving kind keeps no rows, QLoRA-trains a 4-bit nf4/bf16 student with `device_map={"": 0}` (single GPU, `scripts/decision_models/tacit_self_distill.py` L304-311), then `merge_and_unload()` + `save_pretrained(..., safe_serialization=True)` plus tokenizer files and `self-distill.json` to `/out/tacit-4b` (L366-374, L424-442). Build time scales with `PROBLEMS × COT_MAX_TOKENS` (single-digit hours on one 3090 at defaults; header L46-50).
 9. Tacit `docker/Dockerfile.tacit` `:runtime-base` (L142): fresh `vllm-openai` shell, `pip install anyjev[client]==0.3.0` (L146), `COPY docker/tacit-entrypoint.sh` (L148-149), `ENV HF_HUB_OFFLINE=1`, `TACIT_ADAPTIVE=false` (L152-157), `EXPOSE 8100`, `HEALTHCHECK` on `127.0.0.1:8100/v1/stats` (L163-164), `ENTRYPOINT tacit-entrypoint.sh` (L166). Never carries `/build` (header L53).
 10. Tacit `docker/Dockerfile.tacit` `:runtime-distilled` (L185-187, DEFAULT): `COPY --from=self-distill /out/tacit-4b /models/tacit` — the only trained artifact in the shipped image. (`:runtime-released` L169-171 COPYs untrained weights instead; fallback only.)
-11. Tacit serve path (`ENTRYPOINT` L166 + `docker/tacit-entrypoint.sh`): asserts `/models/tacit/config.json`, backgrounds `vllm serve ${MODEL_DIR} --served-model-name tacit-4b --host 127.0.0.1 --port 8000 --max-model-len 8192`, polls `/health` (900 s timeout), then `exec python3 -m anyjev.serve --model ... --upstream http://127.0.0.1:8000/v1 --host 0.0.0.0 --port 8100`. Final image runs only `vllm serve` + `anyjev.serve` (`POST /v1/decide`, `GET /v1/stats`).
+11. Tacit serve path (`ENTRYPOINT` L166 + `docker/tacit-entrypoint.sh`): asserts `/models/tacit/config.json`, backgrounds `vllm serve ${MODEL_DIR} --served-model-name tacit-4b --host 127.0.0.1 --port 8000 --max-model-len 8192`, polls `/health` (900 s timeout), then `exec python3 -m anyjev.serve --model ... --upstream http://127.0.0.1:8000/v1 --host ${TACIT_BIND_HOST:-0.0.0.0} --port 8100` (knob for the same reason: a `--network host` run must pass `TACIT_BIND_HOST=127.0.0.1`, since anyjev.serve has no auth). Final image runs only `vllm serve` + `anyjev.serve` (`POST /v1/decide`, `GET /v1/stats`).
 12. Build mechanics both Dockerfiles share: `# syntax=docker/dockerfile:1.14-labs` (L1) is mandatory — `RUN --device` does not parse on 1.7-1.13; `RUN --gpus` does not exist. The GPU is granted by `--device=nvidia.com/gpu=all` on exactly one RUN per Dockerfile (CLM L117, Tacit L124) plus the `docker build --allow device=nvidia.com/gpu=all` entitlement (headers CLM L30, Tacit L30). Daemon side: Docker ≥ 25, `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, `docker info` shows `cdi: nvidia.com/gpu=all` (headers CLM L32-35, Tacit L32-35).
 
 ## Build Procedure on Bare Metal
@@ -332,15 +332,17 @@ OCI runtime create failed: runc create failed: … open sysctl
 net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
 ```
 
-Docker ≥ 28 writes `net.ipv4.ip_unprivileged_port_start=0` into each sandbox's netns so
-non-root images can bind low ports; inside an unprivileged LXC `/proc/sys/net/**` is
-read-only even for root (`echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start` →
-`Keine Berechtigung`) and runc's procfs reopen is denied. The sysctl is not in
-`HostConfig` (`docker inspect` shows `Sysctls: null`) — it is applied by the network
-driver, so `--sysctl`, `--user 0:0`, `--privileged` and
-`--security-opt systempaths=unconfined` all fail identically; `docker build` is
-unaffected (build containers get no sandbox netns), which is why the image build above
-succeeds on a host where `docker run` does not.
+The Docker Engine installed on the 3090 host (29.9.2) asks for
+`net.ipv4.ip_unprivileged_port_start=0` in each sandbox's netns so non-root images can
+bind low ports — the version that introduced that was not bisected, so treat "recent
+Docker" as the trigger rather than a specific release. Inside an unprivileged LXC
+`/proc/sys/net/**` is read-only even for root (`echo 0 >
+/proc/sys/net/ipv4/ip_unprivileged_port_start` → `Keine Berechtigung`) and runc's
+procfs reopen is denied. The sysctl is not in `HostConfig` (`docker inspect` shows
+`Sysctls: null`) — it is applied by the network driver, so `--sysctl`, `--user 0:0`,
+`--privileged` and `--security-opt systempaths=unconfined` all fail identically;
+`docker build` is unaffected (build containers get no sandbox netns), which is why the
+image build above succeeds on a host where `docker run` does not.
 
 Two ways out, in order of preference:
 
@@ -354,10 +356,12 @@ Two ways out, in order of preference:
    bind knobs are mandatory, never optional:
 
 ```bash
-# CLM sidecar, host networking, loopback-only (needed by `make clm-calibrate`)
+# CLM sidecar, host networking, loopback-only (needed by `make clm-calibrate`).
+# DOCKER_TAG is pyproject.toml's version — 1.0.1 at this writing; `make` would expand
+# $(DOCKER_TAG), a shell will not, so pass the literal tag here.
 docker run -d --name design-pattern-clm-host --network host \
     --device nvidia.com/gpu=all -e CLM_BIND_HOST=127.0.0.1 \
-    design-pattern-clm:$(DOCKER_TAG)
+    design-pattern-clm:${DOCKER_TAG:-1.0.1}
 # same for Tacit, with TACIT_BIND_HOST=127.0.0.1 (the gateway binds 18100 only if you
 # also pass -e TACIT_PORT=18100; the image default is 8100)
 make clm-calibrate CLM_BASE_URL=http://127.0.0.1:8700/v1
