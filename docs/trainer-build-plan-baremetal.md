@@ -322,9 +322,9 @@ so a catalog edit that was never re-derived fails the build instead of replaying
 
 ## Host Runtime Preconditions
 
-`docker compose ... up` needs a net namespace it can configure. On this host (an
-unprivileged Proxmox LXC — `uname -r` ends in `-pve`) it cannot have one, and every
-sandboxed container fails at create time:
+`docker compose ... up` needs a net namespace it can configure. When the host cannot
+write the sysctl Docker asks for, **every** sandboxed container fails at create time
+(seen on both 4×3090 hosts we ran the overlay on):
 
 ```
 Error response from daemon: failed to create task for container: …
@@ -332,23 +332,47 @@ OCI runtime create failed: runc create failed: … open sysctl
 net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
 ```
 
-The Docker Engine installed on the 3090 host (29.9.2) asks for
+The Docker Engine installed on the 3090 hosts (29.9.x) asks for
 `net.ipv4.ip_unprivileged_port_start=0` in each sandbox's netns so non-root images can
 bind low ports — the version that introduced that was not bisected, so treat "recent
-Docker" as the trigger rather than a specific release. Inside an unprivileged LXC
-`/proc/sys/net/**` is read-only even for root (`echo 0 >
-/proc/sys/net/ipv4/ip_unprivileged_port_start` → `Keine Berechtigung`) and runc's
-procfs reopen is denied. The sysctl is not in `HostConfig` (`docker inspect` shows
-`Sysctls: null`) — it is applied by the network driver, so `--sysctl`, `--user 0:0`,
-`--privileged` and `--security-opt systempaths=unconfined` all fail identically;
-`docker build` is unaffected (build containers get no sandbox netns), which is why the
-image build above succeeds on a host where `docker run` does not.
+Docker" as the trigger rather than a specific release. The sysctl is not in
+`HostConfig` (`docker inspect` shows `Sysctls: null`) — it is applied by the network
+driver, so `--sysctl`, `--user 0:0`, `--privileged` and
+`--security-opt systempaths=unconfined` all fail identically. `docker build` is
+unaffected (build containers get no sandbox netns), which is why the image build above
+succeeds on a host where `docker run` does not.
+
+### Classify the host before changing anything
+
+Three different causes produce that identical message, so run the write test first:
+
+```bash
+# 1. can this host's root write the sysctl at all?
+echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start   # → permission denied = cause A
+# 2. which daemon is even running?
+docker info --format '{{json .SecurityOptions}} rootless={{.Rootless}}'
+grep -o '"userns-remap"[^,}]*' /etc/docker/daemon.json 2>/dev/null
+uname -r                                                 # a '-pve'/'-lxc' suffix = guest
+```
+
+- **A. The host itself is namespaced** (`/proc/sys/net/**` read-only for root: an
+  unprivileged Proxmox LXC, or a container with a read-only `/proc/sys`). Leaf net-namespace
+  sysctls are writable only when the netns is owned by the host's user namespace, so
+  nothing inside can grant it: fix it on the Proxmox host (`unprivileged: 0`), or run
+  Docker on the physical host, or use the workaround below.
+- **B. Rootless `dockerd`** (`rootless=true`, `DOCKER_HOST=unix:///run/user/<uid>/docker.sock`).
+  Rootless containers cannot write host net sysctls; run the system daemon
+  (`systemctl enable --now docker`) instead of `dockerd-rootless`, or use the workaround.
+- **C. `userns-remap`** in `daemon.json`: container root maps to a subuid, so the netns is
+  owned by that userns and the write is denied. Remove the remap (or run only the
+  affected services with `--userns=host`), or use the workaround.
 
 Two ways out, in order of preference:
 
 1. **Run Docker where the netns is owned by the container's user namespace** — a
-   privileged LXC (`unprivileged: 0`) or bare metal. Nothing in this repo needs to
-   change, and the compose overlay works as written.
+   privileged LXC (`unprivileged: 0`), bare metal, a root daemon, or a daemon without
+   `userns-remap`. Nothing in this repo needs to change, and the compose overlay works
+   as written.
 2. **Run the sidecars with `--network host` and bind them to loopback.** Host networking
    has no sandbox netns, so no sysctl write, but it also removes the port publish that
    the overlay's loopback-only rule depends on — the gateways listen on `0.0.0.0` and
@@ -367,11 +391,15 @@ docker run -d --name design-pattern-clm-host --network host \
 make clm-calibrate CLM_BASE_URL=http://127.0.0.1:8700/v1
 ```
 
-With host networking the MCP service reaches the sidecars at `127.0.0.1:8700` /
-`127.0.0.1:8100` instead of the compose service names, so a full host-network stack
-needs `DECISIONS_STYLE_BASE_URL`, `DECISIONS_WEIGHTS_BASE_URL`,
-`DECISIONS_CATEGORY_BASE_URL` and `DECISIONS_REASONING_GATE_BASE_URL` overridden —
-which is why the sidecar-only recipe above is what calibration uses.
+`docker-up-decisions` itself cannot be rescued by the knobs: compose publishes
+`127.0.0.1:18100`/`127.0.0.1:18700` from a bridge network, so the stack needs cause A/B/C
+fixed. The host-network recipe is the sidecar-only path, and it is what calibration
+needs. With host networking the MCP service would reach the sidecars at
+`127.0.0.1:8700` / `127.0.0.1:8100` instead of the compose service names, so a full
+host-network stack would need `DECISIONS_STYLE_BASE_URL`,
+`DECISIONS_WEIGHTS_BASE_URL`, `DECISIONS_CATEGORY_BASE_URL` and
+`DECISIONS_REASONING_GATE_BASE_URL` overridden — a four-service overlay rewrite, which
+is why we did not ship one.
 
 ## Calibrate Before Enabling the Style Seam
 
