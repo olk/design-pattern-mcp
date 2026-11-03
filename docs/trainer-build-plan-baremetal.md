@@ -324,7 +324,7 @@ so a catalog edit that was never re-derived fails the build instead of replaying
 
 `docker compose ... up` needs a net namespace it can configure. When the host cannot
 write the sysctl Docker asks for, **every** sandboxed container fails at create time
-(seen on both 4×3090 hosts we ran the overlay on):
+(reported on two different 4×3090 hosts):
 
 ```
 Error response from daemon: failed to create task for container: …
@@ -332,7 +332,7 @@ OCI runtime create failed: runc create failed: … open sysctl
 net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
 ```
 
-The Docker Engine installed on the 3090 hosts (29.9.x) asks for
+The Docker Engine we could inspect (29.9.2 on the first host) asks for
 `net.ipv4.ip_unprivileged_port_start=0` in each sandbox's netns so non-root images can
 bind low ports — the version that introduced that was not bisected, so treat "recent
 Docker" as the trigger rather than a specific release. The sysctl is not in
@@ -356,16 +356,23 @@ uname -r                                                 # a '-pve'/'-lxc' suffi
 ```
 
 - **A. The host itself is namespaced** (`/proc/sys/net/**` read-only for root: an
-  unprivileged Proxmox LXC, or a container with a read-only `/proc/sys`). Leaf net-namespace
-  sysctls are writable only when the netns is owned by the host's user namespace, so
-  nothing inside can grant it: fix it on the Proxmox host (`unprivileged: 0`), or run
-  Docker on the physical host, or use the workaround below.
+  unprivileged Proxmox LXC, or a guest whose `/proc/sys` is mounted read-only). Leaf
+  net-namespace sysctls are writable only by a root whose user namespace owns that netns,
+  so nothing inside such a guest can grant it: fix it on the Proxmox host
+  (`unprivileged: 0`), or run Docker on the physical host, or use the workaround below.
+  Verified on the first host (step 1 → `Keine Berechtigung`).
 - **B. Rootless `dockerd`** (`rootless=true`, `DOCKER_HOST=unix:///run/user/<uid>/docker.sock`).
-  Rootless containers cannot write host net sysctls; run the system daemon
-  (`systemctl enable --now docker`) instead of `dockerd-rootless`, or use the workaround.
-- **C. `userns-remap`** in `daemon.json`: container root maps to a subuid, so the netns is
-  owned by that userns and the write is denied. Remove the remap (or run only the
-  affected services with `--userns=host`), or use the workaround.
+  Not verified here; the check is one line, and the fix is to run the system daemon
+  (`systemctl enable --now docker`) instead of `dockerd-rootless`.
+- **C. `userns-remap` in `daemon.json`** (the grep prints a mapping). Not verified here
+  either — treat it as a suspect the one-line check clears cheaply, not as a diagnosis.
+  The fix is to drop the remap for this host, or run these services with
+  `--userns=host` / `userns_mode: host`, or use the workaround below.
+
+Whichever of A/B/C applies, the discriminator is the same: step 1 failing means the cause
+is host-level and no daemon or compose setting can fix it; step 1 succeeding while
+`docker run` still fails means the cause is daemon-level (B or C), and `privileged: 0`
+on a Proxmox guest is then the wrong lever.
 
 Two ways out, in order of preference:
 
