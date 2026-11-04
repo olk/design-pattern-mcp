@@ -48,8 +48,8 @@ EMBED_TEI_BASE     ?= ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
 EMBED_TEI_BASE_GPU ?= ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
 DENSE_CACHE_DIR    ?= data/dense-cache
 
-# Decision-model sidecars (docker/docker-compose.decision-models.yml). Both are GPU-only
-# at run time; the *-base targets build the released-weights variant and need no GPU.
+# Decision-model sidecar (docker/docker-compose.decision-models.yml). It is GPU-only at
+# run time; the *-base target builds the released-weights variant and needs no GPU.
 TACIT_IMAGE      := design-pattern-tacit
 TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
 # Self-distillation knobs, sized to MAX EFFORT: the fine-tune's aim is pattern-selection
@@ -96,8 +96,6 @@ VLLM_IMAGE_TAG   ?= v0.17.1
 # committed with the artifacts so a fresh clone still reuses.
 #   Tacit: models/tacit-4b  <- /models/tacit (full HF checkpoint: config.json,
 #          model.safetensors shards, tokenizer files, self-distill.json)
-#   Tacit: models/tacit-4b  <- /models/tacit (full HF checkpoint: config.json,
-#          model.safetensors shards, tokenizer files, self-distill.json)
 TACIT_HOST_DIR      := models/tacit-4b
 TACIT_HOST_CONFIG   := $(TACIT_HOST_DIR)/config.json
 TACIT_HOST_MANIFEST := $(TACIT_HOST_DIR)/self-distill.json
@@ -118,8 +116,9 @@ TACIT_TRAIN_INPUTS  := scripts/decision_models/tacit_self_distill.py \
 # HF Hub token for authenticated model downloads (higher rate limits, gated repos).
 # File holds the raw token only, no key=value. Empty/missing file = anonymous
 # download (fine for the pinned public repos, just the huggingface_hub warning).
-# All four HF-fetching Dockerfiles read it via `RUN --mount=type=secret,id=hf_token`;
-# the secret is mounted per-RUN and never baked into a layer.
+# Every HF-fetching Dockerfile (tacit, tei-embed, tei-rerank) reads it via
+# `RUN --mount=type=secret,id=hf_token`; the secret is mounted per-RUN, never baked
+# into a layer.
 comma := ,
 # BuildKit progress mode for the decision-model builds. `plain` streams RUN
 # stdout (trainer phases, per-shard progress) to the terminal and `tee`d logs;
@@ -380,7 +379,7 @@ docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense 
 
 ##@ Decision models (AnyJev Tacit-4B)
 
-docker-build-tacit: tacit-payloads-check check-dockerfile-shell ## Build the Tacit sidecar (GPU self-distill once; later runs reuse models/tacit-4b with no GPU)
+docker-build-tacit: tacit-payloads-check check-dockerfile-shell ## Fine-tune Tacit in the image build (GPU self-distill once; later runs reuse models/tacit-4b, no GPU)
 	@# Cached path first: refuse a stale host dir whose marker shas no longer match
 	@# the current train inputs — BEFORE docker build, so a stale cache never
 	@# re-tags the image and the failure is loud, not a silent old-weights rebuild.
@@ -435,7 +434,7 @@ docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (n
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		-t $(TACIT_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_IMAGE):base .
 
-docker-build-decision-models: docker-build-tacit ## Build the decision-model sidecar, trained in-image
+docker-build-decision-models: docker-build-tacit ## Fine-tune + build the decision-model sidecar, in-image
 
 docker-up-decisions: ## Start the dev stack with the decision-model sidecar (one GPU)
 	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) up -d
