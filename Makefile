@@ -55,7 +55,7 @@ TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
 # Registry pair for the sidecar. Published on demand (docker-publish-tacit), never by
 # docker-publish-all: the image is ~29 GB, so a server release must not force that upload.
 TACIT_HUB_REPO   := olkowa/design-pattern-tacit
-TACIT_GHCR_REPO  := ghcr.io/olk/pattern-tacit
+TACIT_GHCR_REPO  := ghcr.io/olk/design-pattern-tacit
 # Self-distillation knobs, sized to MAX EFFORT: the fine-tune's aim is pattern-selection
 # consistency and quality, so the defaults spend the available GPU envelope on volume and
 # coverage (all train rerank pairs, ~1k style questions) and keep the recipe's single epoch.

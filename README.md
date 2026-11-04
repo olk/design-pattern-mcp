@@ -629,6 +629,8 @@ TACIT_IMAGE=design-pattern-tacit:base make docker-up-decisions
 
 The sidecar serves from one 24 GB card (Tacit-4B ≈ 8 GB in vLLM plus the gateway).
 
+Fine-tuning procedure (fine-tune → image → publish): [docs/tacit-fine-tune.md](docs/tacit-fine-tune.md).
+
 ### Key environment variables
 
 | Variable | Default | Description |
@@ -895,7 +897,7 @@ Four images are published to two registries; the three below share the umbrella 
 | MCP server | `olkowa/design-pattern-mcp` | `ghcr.io/olk/design-pattern-mcp` | `$(DOCKER_TAG)`, `latest` |
 | TEI embedder | `olkowa/pattern-tei-embed` | `ghcr.io/olk/pattern-tei-embed` | `$(DOCKER_TAG)`, `latest` |
 | TEI reranker | `olkowa/pattern-tei-rerank` | `ghcr.io/olk/pattern-tei-rerank` | `$(DOCKER_TAG)`, `latest` |
-| Tacit sidecar | `olkowa/design-pattern-tacit` | `ghcr.io/olk/pattern-tacit` | `$(DOCKER_TAG)`, `latest` |
+| Tacit sidecar | `olkowa/design-pattern-tacit` | `ghcr.io/olk/design-pattern-tacit` | `$(DOCKER_TAG)`, `latest` |
 
 All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged. The Tacit sidecar is **not** part of `docker-publish-all`: it is a ~29 GB GPU image, so it is published on demand with `make docker-publish-tacit` (which builds it first, so the pushed weights are the ones pinned by `models/tacit-4b/.extract-complete`).
 
@@ -934,7 +936,7 @@ GHCR packages default to **private**. After the first `make docker-publish-all` 
 | MCP server | `https://github.com/users/olk/packages/container/design-pattern-mcp/settings` |
 | TEI embedder | `https://github.com/users/olk/packages/container/pattern-tei-embed/settings` |
 | TEI reranker | `https://github.com/users/olk/packages/container/pattern-tei-rerank/settings` |
-| Tacit sidecar | `https://github.com/users/olk/packages/container/pattern-tacit/settings` |
+| Tacit sidecar | `https://github.com/users/olk/packages/container/design-pattern-tacit/settings` |
 
 Set each to **Public** and save.
 
