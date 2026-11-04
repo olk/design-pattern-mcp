@@ -21,7 +21,7 @@
 	docker-build-tacit docker-build-tacit-base \
 	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
 	tacit-payloads tacit-payloads-check tacit-calibrate check-dockerfile-shell \
-	docker-publish docker-publish-tei docker-publish-all \
+	docker-publish docker-publish-tei docker-publish-tacit docker-publish-all \
 	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
 	embed-cache
 
@@ -52,6 +52,10 @@ DENSE_CACHE_DIR    ?= data/dense-cache
 # run time; the *-base target builds the released-weights variant and needs no GPU.
 TACIT_IMAGE      := design-pattern-tacit
 TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
+# Registry pair for the sidecar. Published on demand (docker-publish-tacit), never by
+# docker-publish-all: the image is ~29 GB, so a server release must not force that upload.
+TACIT_HUB_REPO   := olkowa/design-pattern-tacit
+TACIT_GHCR_REPO  := ghcr.io/olk/pattern-tacit
 # Self-distillation knobs, sized to MAX EFFORT: the fine-tune's aim is pattern-selection
 # consistency and quality, so the defaults spend the available GPU envelope on volume and
 # coverage (all train rerank pairs, ~1k style questions) and keep the recipe's single epoch.
@@ -539,6 +543,22 @@ docker-publish-tei: docker-build-tei ## Push both TEI images to Docker Hub + GHC
 	docker login ghcr.io -u olk
 	$(call publish-image,$(TEI_EMBED_IMAGE),$(TEI_EMBED_HUB_REPO),$(TEI_EMBED_GHCR_REPO))
 	$(call publish-image,$(TEI_RERANK_IMAGE),$(TEI_RERANK_HUB_REPO),$(TEI_RERANK_GHCR_REPO))
+	docker logout ghcr.io
+
+# On demand, never from docker-publish-all: the sidecar is a ~29 GB GPU image.
+# It depends on the build rule on purpose — that is what pins the pushed weights to
+# TACIT_TRAIN_INPUTS through models/tacit-4b/.extract-complete. No clean-tree gate
+# (unlike docker-publish): the trained checkpoint is deliberately untracked, so a real
+# train output would always trip it. The manifest is echoed as the provenance record.
+docker-publish-tacit: docker-build-tacit ## Push the Tacit sidecar image to Docker Hub + GHCR
+	@test -s "$(TACIT_HOST_MANIFEST)" || { \
+		echo "ERROR: $(TACIT_HOST_MANIFEST) is missing - the image has no train provenance"; exit 1; }
+	@echo "Publishing $(TACIT_IMAGE):$(DOCKER_TAG) distilled from:"
+	@python3 -c "import json;d=json.load(open('$(TACIT_HOST_MANIFEST)'));\
+print({k: d.get(k) for k in ('repo','problems','examples','kept','epochs','lr')})"
+	docker login -u olkowa
+	docker login ghcr.io -u olk
+	$(call publish-image,$(TACIT_IMAGE),$(TACIT_HUB_REPO),$(TACIT_GHCR_REPO))
 	docker logout ghcr.io
 
 docker-publish-all: docker-publish docker-publish-tei ## Build and push all three images

@@ -869,6 +869,7 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 | `make docker-up` / `make docker-down` | Start / stop the dev stack |
 | `make client-analyze` / `make client-design` / `make client-async` | Demo clients against `http://localhost:8822/mcp` |
 | `make docker-publish` | Push the server image to Docker Hub + GHCR (+ git tag) |
+| `make docker-publish-tacit` | Push the Tacit sidecar image to Docker Hub + GHCR |
 
 **Development workflow:**
 
@@ -887,17 +888,18 @@ Ground rules (from `AGENTS.md`): `src/` is mypy-strict; schema changes change `d
 
 ## Publishing
 
-All three images are published to two registries simultaneously:
+Four images are published to two registries; the three below share the umbrella target, the Tacit sidecar has its own on-demand one:
 
 | Image | Docker Hub | GHCR | Tags |
 |---|---|---|---|
 | MCP server | `olkowa/design-pattern-mcp` | `ghcr.io/olk/design-pattern-mcp` | `$(DOCKER_TAG)`, `latest` |
 | TEI embedder | `olkowa/pattern-tei-embed` | `ghcr.io/olk/pattern-tei-embed` | `$(DOCKER_TAG)`, `latest` |
 | TEI reranker | `olkowa/pattern-tei-rerank` | `ghcr.io/olk/pattern-tei-rerank` | `$(DOCKER_TAG)`, `latest` |
+| Tacit sidecar | `olkowa/design-pattern-tacit` | `ghcr.io/olk/pattern-tacit` | `$(DOCKER_TAG)`, `latest` |
 
-All three images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged.
+All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged. The Tacit sidecar is **not** part of `docker-publish-all`: it is a ~29 GB GPU image, so it is published on demand with `make docker-publish-tacit` (which builds it first, so the pushed weights are the ones pinned by `models/tacit-4b/.extract-complete`).
 
-> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred.
+> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred. The Tacit sidecar is ~29 GB uncompressed (vLLM base + baked 4B weights), so its first push is the largest in this repo; re-pushing an unchanged build only transfers new layers.
 
 ### Prerequisites
 
@@ -921,17 +923,18 @@ make docker-publish-all
 docker logout ghcr.io
 ```
 
-On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars.
+On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-tacit` builds and pushes the Tacit sidecar (same two registries, on demand — never from `docker-publish-all`).
 
 ### First push — set packages public (GHCR only)
 
-GHCR packages default to **private**. After the first `make docker-publish-all`, flip all three packages to public:
+GHCR packages default to **private**. After the first `make docker-publish-all` (and the first `make docker-publish-tacit`), flip every package to public:
 
 | Package | Settings URL |
 |---|---|
 | MCP server | `https://github.com/users/olk/packages/container/design-pattern-mcp/settings` |
 | TEI embedder | `https://github.com/users/olk/packages/container/pattern-tei-embed/settings` |
 | TEI reranker | `https://github.com/users/olk/packages/container/pattern-tei-rerank/settings` |
+| Tacit sidecar | `https://github.com/users/olk/packages/container/pattern-tacit/settings` |
 
 Set each to **Public** and save.
 
