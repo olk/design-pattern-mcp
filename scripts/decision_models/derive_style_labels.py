@@ -51,7 +51,7 @@ from src.decisions import seam_prompts  # noqa: E402
 #: Corpus labels are agent-curated, human expert review pending (same status as the
 #: choice.jsonl labels — see qa/typed/README.md). Status is machine-readable:
 #: ``qa/typed/review.json`` records per-scenario review (reviewer, labels_sha256,
-#: rationale_ok) and ``clm_calibrate.py`` refuses to recommend a confidence floor
+#: rationale_ok) and ``tacit_calibrate.py`` refuses to recommend a confidence floor
 #: until the ledger covers this file byte-for-byte — the floor is the seam's
 #: enablement, so unreviewed labels cannot be calibrated into production.
 STYLE_LABELS: dict[str, tuple[str, str]] = {

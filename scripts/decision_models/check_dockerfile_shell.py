@@ -3,7 +3,7 @@
 
 ``docker build --check`` does not evaluate shell syntax, and the shell a Dockerfile lands
 in is dash (Debian) even when the developer's ``/bin/sh`` is bash. Two real defects got
-through that gap in ``docker/Dockerfile.clm``:
+through that gap in a decision-model Dockerfile (since removed; the rule stays):
 
 * a stray ``'`` inside ``sh -c '...'`` terminated the quoted payload, so the rest was
   re-parsed unquoted and dash reported ``Syntax error: "(" unexpected``;
@@ -14,7 +14,7 @@ This checker extracts every shell-form ``RUN``/``CMD``/``ENTRYPOINT`` payload an
 per instruction: unbalanced/embedded quotes, a ``#`` outside quotes, and — when a dash
 binary is available — the actual ``dash -n`` verdict. Exit 1 when any rule fails.
 
-    python scripts/decision_models/check_dockerfile_shell.py docker/Dockerfile.clm
+    python scripts/decision_models/check_dockerfile_shell.py docker/Dockerfile.tacit
 """
 
 from __future__ import annotations

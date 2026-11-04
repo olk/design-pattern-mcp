@@ -109,7 +109,6 @@ from src.style_affinity import affinity_for
 from src.variants import bind_entry, select_variant, variant_summaries
 
 if TYPE_CHECKING:  # pragma: no cover - type-only import (reasoning.client pulls fastmcp)
-    from src.decisions.client import DecisionModelClient
     from src.decisions.tacit import TacitClient
     from src.reasoning.client import ReasoningClient
 
@@ -1554,7 +1553,7 @@ class DesignPipeline(Workflow):
         llm: LLMClientProtocol,
         guard: AntiScopeGuard | None = None,
         reasoning: ReasoningClient | None = None,
-        decision_client: DecisionModelClient | None = None,
+        style_client: TacitClient | None = None,
         weights_client: TacitClient | None = None,
         category_client: TacitClient | None = None,
     ) -> None:
@@ -1567,7 +1566,7 @@ class DesignPipeline(Workflow):
         self._index = index
         self._llm = llm
         self._reasoning = reasoning
-        self._decision_client = decision_client
+        self._style_client = style_client
         self._weights_client = weights_client
         self._category_client = category_client
         self._guard = (
@@ -2236,9 +2235,9 @@ class DesignPipeline(Workflow):
         LLM style — override-on-confident-answer only, so the two error modes stay
         decoupled. Any client failure degrades invisibly to the LLM style.
         """
-        if hint is not None or self._decision_client is None:
+        if hint is not None or self._style_client is None:
             return brief
-        decision = await self._decision_client.choose_style(description)
+        decision = await self._style_client.choose_style(description)
         if decision is None or decision.style is None:
             return brief
         if decision.confidence < self._config.decisions.style.confidence_floor:

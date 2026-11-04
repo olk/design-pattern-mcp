@@ -1,26 +1,21 @@
-"""src/decisions — the decision-model layer (two self-hosted providers, four seams).
+"""src/decisions — the decision-model layer (one self-hosted provider, five seams).
 
-Two serving stacks sit behind the seams, each with its own wire:
+**AnyJev Tacit-4B** (``anyjev.serve`` gateway) speaks ``POST /v1/decide`` and answers
+every seam:
 
-* **CLM-8B** (``clm-serve``) — TypeSafe-compatible ``/v1/systemone`` and ``/v1/rank``.
-  Answers the Ch2 style substitution (:mod:`src.decisions.client`) and the J1 rerank
-  leg (:mod:`src.patterns.clm_rerank`).
-* **AnyJev Tacit-4B** (``anyjev.serve`` gateway) — ``/v1/decide``. Answers the bounded
-  closed-set judgments: J4 quality weights, J2 category narrowing, J5 reasoning gate
-  (:mod:`src.decisions.tacit`).
+* the bounded closed-set judgments — J4 quality weights, J2 category narrowing, J5
+  reasoning gate (:mod:`src.decisions.tacit`);
+* the Ch2 architecture-style substitution, served as a two-stage choice (category →
+  ≤26-style shortlist) because the gateway caps ``choice`` options at 26;
+* the J1 rerank leg, one ``yes_no`` relevance question per candidate
+  (:mod:`src.patterns.tacit_rerank`).
 
 Modules:
-    client: DecisionModelClient (cache, request, dual-shape parse, degrade).
-    tacit: TacitClient (choice/yes_no/score, batch, degrade) + the category glosses
-        and the weight-level scale.
+    seam_prompts: the prompt vocabulary shared by the server and the Tacit trainer.
+    tacit: TacitClient (choice/yes_no/score, batch, degrade) + the category glosses,
+        the weight-level scale, and the two-stage style choice.
 """
 
-from src.decisions.client import (
-    STYLE_QUESTION_ID,
-    DecisionModelClient,
-    StyleDecision,
-    build_style_criteria,
-)
 from src.decisions.seam_prompts import (
     CATEGORY_GLOSSES,
     CATEGORY_SLUGS,
@@ -28,11 +23,14 @@ from src.decisions.seam_prompts import (
     STYLE_INSTRUCTIONS,
     STYLE_NONE_GLOSS,
     STYLE_NONE_KEY,
+    WEIGHT_LEVELS,
     axis_question,
     category_question,
     gate_question,
+    style_question,
+    styles_for_category,
 )
-from src.decisions.tacit import TacitClient, TacitDecision, category_options
+from src.decisions.tacit import StyleDecision, TacitClient, TacitDecision, category_options
 
 __all__ = [
     "CATEGORY_GLOSSES",
@@ -41,15 +39,14 @@ __all__ = [
     "STYLE_INSTRUCTIONS",
     "STYLE_NONE_GLOSS",
     "STYLE_NONE_KEY",
-    "STYLE_QUESTION_ID",
     "WEIGHT_LEVELS",
-    "DecisionModelClient",
     "StyleDecision",
     "TacitClient",
     "TacitDecision",
     "axis_question",
-    "build_style_criteria",
     "category_options",
     "category_question",
     "gate_question",
+    "style_question",
+    "styles_for_category",
 ]

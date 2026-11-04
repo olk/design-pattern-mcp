@@ -132,12 +132,16 @@ class RerankerConfig(BaseModel):
     #: the CPU sidecar). Rankings are NOT equivalent — capsule is opt-in.
     rerank_text: Literal["full", "capsule"] = Field(default="full")
     #: Rerank backend (§6 step 4): ``tei`` = the cross-encoder sidecar (default),
-    #: ``clm`` = clm-serve ``POST /v1/rank`` with the already-hosted CLM-8B
-    #: encoder — every failure falls back to the TEI sidecar, so retrieval never
-    #: depends on the CLM stack being up.
-    provider: Literal["tei", "clm"] = Field(default="tei")
-    clm_base_url: str = Field(default="http://design-pattern-clm:8700/v1")
-    clm_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    #: ``tacit`` = one ``yes_no`` relevance question per fused-pool candidate over the
+    #: AnyJev gateway. The TEI sidecar stays the mandatory fallback inside the client,
+    #: so retrieval never depends on the Tacit stack being up. ``tacit_base_url`` is the
+    #: gateway ROOT (the client appends ``/v1/decide``). With ``tacit``, keep
+    #: ``rerank_text: full``: the pair artifact the fine-tune and its eval are derived
+    #: from carries each candidate's ``document_text``, so ``capsule`` would serve bytes
+    #: the seam never trained on (available, but trained-byte-divergent).
+    provider: Literal["tei", "tacit"] = Field(default="tei")
+    tacit_base_url: str = Field(default="http://design-pattern-tacit:8100")
+    tacit_timeout_seconds: float = Field(default=60.0, gt=0.0)
     config: RerankerInnerConfig = Field(default_factory=RerankerInnerConfig)
 
     model_config = {"extra": "forbid"}
@@ -315,23 +319,21 @@ class PromptConfig(BaseModel):
 
 
 class DecisionSeamConfig(BaseModel):
-    """One decision-model seam: provider endpoint plus the gate knobs that bound it.
+    """One decision-model seam: the AnyJev gateway endpoint plus the knobs that bound it.
 
-    Every seam is default-off. ``provider`` records which serving stack answers the
-    seam so the startup report can say it out loud; the wire is fixed per provider
-    (``clm`` = TypeSafe-compatible ``/v1/systemone`` + ``/v1/rank``, ``tacit`` =
-    AnyJev ``/v1/decide``). ``api_key_env`` is the only credential path: it stays
-    reachable for a hosted endpoint with the same wire, and ``None`` means no
-    ``Authorization`` header at all.
+    Every seam is default-off and every seam speaks the one wire,
+    ``POST /v1/decide`` (``base_url`` is the gateway ROOT — no ``/v1`` suffix; the
+    client appends the path). ``api_key_env`` is the only credential path: it stays
+    reachable for a hosted gateway, and ``None`` means no ``Authorization`` header at
+    all.
     """
 
     enabled: bool = Field(default=False, description="Opt-in seam switch.")
-    provider: Literal["clm", "tacit"] = Field(default="clm", description="Serving stack behind the seam.")
     base_url: str = Field(
-        default="http://design-pattern-clm:8700/v1",
-        description="clm-serve /v1 root, or the anyjev gateway root (no /v1 suffix).",
+        default="http://design-pattern-tacit:8100",
+        description="anyjev gateway root (no /v1 suffix; the client appends /v1/decide).",
     )
-    model: str = Field(default="clm-latest", description="Served model name (clm-latest | tacit-4b).")
+    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b).")
     api_key_env: str | None = Field(
         default=None,
         description="Optional env var holding a bearer key; None = no Authorization header.",
@@ -341,9 +343,9 @@ class DecisionSeamConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Minimum confidence/probability to act on the answer (ignored by the weights seam). "
-            "On the CLM style seam this gates TypeSafe-style confidence (top prob minus mean of rest), "
-            "NOT the top probability — set it from scripts/decision_models/clm_calibrate.py, not the default."
+            "Minimum top probability to act on the answer (ignored by the weights seam). The Ch2 "
+            "style seam gates on TWO stages: both the category question and the shortlist question "
+            "must clear it. Set it from scripts/decision_models/tacit_calibrate.py, not the default."
         ),
     )
     timeout_seconds: float = Field(
@@ -361,31 +363,27 @@ class DecisionSeamConfig(BaseModel):
         return value or None
 
 
-#: Per-seam defaults. ``DecisionSeamConfig``'s own defaults describe the CLM wire; a seam
-#: that points elsewhere must keep ITS endpoint when a caller supplies only a partial
-#: override (``{"weights": {"enabled": true}}``), which a nested-model replacement would
-#: otherwise resolve back onto the CLM defaults.
+#: Per-seam defaults. The seams share one gateway but not one timeout (the weights seam
+#: asks 8 questions per part); a seam must keep ITS timeout when a caller supplies only a
+#: partial override (``{"weights": {"enabled": true}}``), which a nested-model replacement
+#: would otherwise resolve back onto the generic defaults.
 _SEAM_DEFAULTS: dict[str, dict[str, Any]] = {
     "style": {
-        "provider": "clm",
-        "base_url": "http://design-pattern-clm:8700/v1",
-        "model": "clm-latest",
+        "base_url": "http://design-pattern-tacit:8100",
+        "model": "tacit-4b",
         "timeout_seconds": 10.0,
     },
     "weights": {
-        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 30.0,
     },
     "category": {
-        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 10.0,
     },
     "reasoning_gate": {
-        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 5.0,

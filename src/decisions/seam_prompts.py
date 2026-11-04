@@ -2,7 +2,9 @@
 
 Both sides of the training/serving boundary read these strings:
 
-* the server, through :mod:`src.decisions.tacit` (the J4/J2/J5 seams);
+* the server, through :mod:`src.decisions.tacit` (the Ch2 style, J1 rerank, J2
+  category, J4 weights and J5 gate seams — every seam is served by the AnyJev
+  Tacit-4B gateway);
 * the Tacit image build, which copies this one file into the trainer so the student
   is trained on exactly the prompts it will serve.
 
@@ -10,6 +12,8 @@ Nothing here imports third-party packages: the trainer image has torch, not pyda
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 #: Ordered weight levels for one quality axis (``score`` question, lowest first).
 #: The expected value is ``Σ i·p_i / (len-1)``, i.e. a five-level axis maps to [0, 1].
@@ -47,7 +51,7 @@ CATEGORY_GLOSSES: dict[str, str] = {
 }
 
 #: Fixed one-line gloss per architecture style (the Ch2 style ``choice`` question
-#: shows these as the criterion texts; server and CLM exporter share them so the
+#: shows these as the criterion texts; server and Tacit trainer share them so the
 #: student is trained on exactly the prompt it will serve).
 STYLE_GLOSSES: dict[str, str] = {
     "event-driven": "Components communicate primarily through asynchronous events and message flows",
@@ -98,6 +102,93 @@ STYLE_INSTRUCTIONS = (
     "Which architecture style best characterizes the system described "
     "in the state? Pick 'none' when no listed style applies."
 )
+
+#: §10.1 style → affinity categories, mirrored from ``src/style_affinity.py`` so this
+#: stdlib-only module (copied standalone into the Tacit trainer image) can build the
+#: stage-2 style shortlists without importing the server package. Category order
+#: inside each row follows ``CATEGORY_SLUGS``; a unit test pins the two tables
+#: together (the ``CATEGORY_SLUGS``/``PatternCategory`` precedent).
+STYLE_CATEGORY_AFFINITY: dict[str, tuple[str, ...]] = {
+    "event-driven": ("interaction-boundary", "workflow-messaging"),
+    "broker": ("interaction-boundary", "workflow-messaging"),
+    "enterprise-service-bus": ("interaction-boundary", "workflow-messaging"),
+    "event-sourcing": ("persistence-state",),
+    "command-query-responsibility-segregation": ("domain-modeling", "persistence-state"),
+    "saga": ("workflow-messaging",),
+    "microservices": ("interaction-boundary", "workflow-messaging", "concurrency-resilience"),
+    "service-oriented-architecture": ("interaction-boundary", "workflow-messaging", "concurrency-resilience"),
+    "hexagonal": ("domain-modeling", "behavior-selection", "interaction-boundary"),
+    "layered-monolith": ("domain-modeling", "construction-composition"),
+    "modular-monolith": ("domain-modeling", "construction-composition"),
+    "monolithic": ("domain-modeling", "construction-composition"),
+    "pipe-and-filter": ("behavior-selection", "workflow-messaging"),
+    "model-view-controller": ("specialized-components",),
+    "presentation-abstraction-control": ("specialized-components",),
+    "microkernel-plugin": ("construction-composition", "behavior-selection"),
+    "reflection-architecture": ("construction-composition", "behavior-selection"),
+    "reactive-architecture": ("workflow-messaging", "concurrency-resilience"),
+    "actor-based": ("workflow-messaging", "concurrency-resilience"),
+    "half-sync-half-async": ("workflow-messaging", "concurrency-resilience"),
+    "task-control-architecture": ("workflow-messaging", "concurrency-resilience"),
+    "serverless": ("interaction-boundary", "concurrency-resilience"),
+    "edge-computing": ("interaction-boundary", "concurrency-resilience"),
+    "space-based": ("persistence-state", "concurrency-resilience"),
+    "data-mesh": ("interaction-boundary", "persistence-state"),
+    "lambda-architecture": ("interaction-boundary", "persistence-state"),
+    "kappa-architecture": ("interaction-boundary", "persistence-state"),
+    "api-gateway": ("interaction-boundary",),
+    "backend-for-frontend": ("interaction-boundary",),
+    "service-mesh": ("interaction-boundary",),
+    "rule-based-system": ("domain-modeling", "behavior-selection"),
+    "aiml-centric": ("domain-modeling", "behavior-selection"),
+    "blockchain-based": ("persistence-state", "security-verification"),
+    "hybrid-cloud": ("interaction-boundary", "security-verification"),
+    "multi-cloud": ("interaction-boundary", "security-verification"),
+}
+
+#: AnyJev's letter readout caps ``choice``/``score`` at 26 options (``anyjev``
+#: ``question.py`` ``MAX_OPTIONS``; the gateway answers HTTP 400 beyond). Every stage-2
+#: style shortlist plus ``none`` must fit, so growth past the cap fails loudly here,
+#: not as a 400 mid-request.
+_STYLE_OPTION_CAP = 26
+
+
+def styles_for_category(category: str) -> tuple[str, ...]:
+    """Ch2 stage-2 shortlist: styles with affinity to ``category``, table order."""
+    styles = tuple(style for style in STYLE_CATEGORY_AFFINITY if category in STYLE_CATEGORY_AFFINITY[style])
+    if not styles:
+        raise ValueError(f"no style has affinity with {category!r}")
+    if len(styles) + 1 > _STYLE_OPTION_CAP:
+        raise ValueError(
+            f"style shortlist for {category!r} carries {len(styles)} styles; adding {STYLE_NONE_KEY!r} "
+            f"exceeds the AnyJev {_STYLE_OPTION_CAP}-option cap"
+        )
+    return styles
+
+
+def style_question(styles: Sequence[str]) -> str:
+    """The Ch2 stage-2 style ``choice`` question: instructions plus inline glosses."""
+    glosses = "; ".join(f"{style} = {STYLE_GLOSSES[style]}" for style in styles)
+    return f"{STYLE_INSTRUCTIONS} Options: {glosses}; {STYLE_NONE_KEY} = {STYLE_NONE_GLOSS}"
+
+
+# J1 rerank ---------------------------------------------------------------------
+
+#: Fixed per-candidate relevance question; the candidate document rides in the state.
+RERANK_RELEVANCE_QUESTION = (
+    "Does the pattern described in the state address the decision part in the state? Answer for the pattern as a whole."
+)
+
+#: Cap on one rerank item's state (part statement + document text). The sidecar serves
+#: ``--max-model-len 8192``; 6000 chars ≈ 1.5-2k tokens leaves room for the question,
+#: option labels and chat template.
+RERANK_STATE_MAX_CHARS = 6000
+
+
+def rerank_state(statement: str, document: str) -> str:
+    """One rerank item's state: the part statement, then the pattern document."""
+    return f"{statement}\n\nPattern: {document}"[:RERANK_STATE_MAX_CHARS]
+
 
 #: The pipeline phases that carry a reasoning strategy and can hit the J5 gate
 #: (src/reasoning/config.py::_default_per_phase; payloads at src/pipeline.py:1680-1808).

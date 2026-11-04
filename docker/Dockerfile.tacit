@@ -41,13 +41,20 @@
 # Build args (the Makefile forwards them):
 #   TACIT_MODEL_REPO   HuggingFace checkpoint (default ``morriszjm/Tacit-4B``, Apache-2.0).
 #   VLLM_IMAGE_TAG     vLLM base image tag (default ``v0.17.1``).
-#   TACIT_PROBLEMS / TACIT_EPOCHS / TACIT_LR / TACIT_BATCH / TACIT_ACCUM
-#                      self-distillation knobs of the default target.
+#   TACIT_PROBLEMS / TACIT_STYLE_STATES / TACIT_RERANK_PROBLEMS / TACIT_EPOCHS
+#   TACIT_TEACHER_SHARDS / TACIT_MIN_SEAM_AGREEMENT / TACIT_LR / TACIT_BATCH / TACIT_ACCUM
+#                      self-distillation knobs of the default target. The defaults are
+#                      MAX EFFORT: the fine-tune exists to improve selection consistency and
+#                      quality, so volume and coverage are the levers (one epoch stays).
 #   TACIT_COT_MAX_TOKENS / TACIT_MAX_NEW_TOKENS
-#                      generation bounds (defaults 2048 / 256). The teacher pass issues
-#                      one sequential generate per problem, so the build cost is roughly
-#                      `TACIT_PROBLEMS x TACIT_COT_MAX_TOKENS`: the 2000 x 2048 default is
-#                      single-digit hours on one 3090. Lower both for a fast local build.
+#                      generation bounds (defaults 2048 / 256). The teacher pass is one
+#                      generate per problem, so cost scales with the question count x
+#                      TACIT_COT_MAX_TOKENS: the max-effort default is ~8-9k teacher
+#                      questions (category/weights/gate + ~1k style + all ~1.4k rerank
+#                      pairs) ≈ 4.3x the old 2000-problem baseline — roughly 20-30 h on
+#                      ONE 3090, ~5-8 h with the default auto-sharding on a 4-GPU trainer
+#                      host (TACIT_TEACHER_SHARDS=0 = one shard per visible GPU). Shrink
+#                      TACIT_PROBLEMS / TACIT_RERANK_PROBLEMS for a quick build.
 #
 # If the builder cannot be given a GPU, train out of band against the trainer stage — the
 # runtime stages carry only the entrypoint and ``/models/tacit``, never ``/build``:
@@ -89,8 +96,16 @@ FROM vllm/vllm-openai:${VLLM_IMAGE_TAG} AS self-distill
 # Unbuffered python so phase/progress logs stream to the build log line by line.
 ENV PYTHONUNBUFFERED=1
 ARG TACIT_MODEL_REPO=morriszjm/Tacit-4B
-ARG TACIT_PROBLEMS=2000
+ARG TACIT_PROBLEMS=6000
 ARG TACIT_STATES=0
+# Description-shaped states for the Ch2 style seam; 0 = derive (problems // 12).
+ARG TACIT_STYLE_STATES=0
+# J1 rerank question budget; 0 = ALL train pairs.
+ARG TACIT_RERANK_PROBLEMS=0
+# Teacher answer shards; 0 = one per visible CUDA device, 1 = in-process.
+ARG TACIT_TEACHER_SHARDS=0
+# Fail the build when an answer seam's student-vs-teacher agreement drops below this.
+ARG TACIT_MIN_SEAM_AGREEMENT=0.6
 # Must match the served seam floor (DESIGN_PATTERN_DECISIONS_*_CONFIDENCE_FLOOR): training
 # keeps the rows the deployment would act on, and scores floor accuracy at the same number.
 ARG TACIT_CONFIDENCE_FLOOR=0.5
@@ -102,12 +117,10 @@ ARG TACIT_EPOCHS=1
 ARG TACIT_LR=1e-4
 ARG TACIT_BATCH=4
 ARG TACIT_ACCUM=8
-# Generation bounds. The teacher pass is one SEQUENTIAL `generate` per problem on the
-# transformers engine (not batched), so these two knobs — not the QLoRA epochs — decide
-# how long this stage runs: 2000 problems x up to 2048 CoT tokens is single-digit hours
-# on one 3090, and roughly linear in the product. Shrink `TACIT_PROBLEMS` or
-# `TACIT_COT_MAX_TOKENS` for a quick build; `TACIT_MAX_NEW_TOKENS` bounds the
-# state-writing pass only.
+# Generation bounds. The teacher pass is one `generate` per problem, so these knobs and
+# the question count — not the QLoRA epochs — decide how long this stage runs, roughly
+# linearly in `questions x TACIT_COT_MAX_TOKENS`. `TACIT_MAX_NEW_TOKENS` bounds the
+# state/description writing passes only.
 ARG TACIT_COT_MAX_TOKENS=2048
 ARG TACIT_MAX_NEW_TOKENS=256
 
@@ -121,6 +134,9 @@ COPY scripts/decision_models/tacit_self_distill.py /build/tacit_self_distill.py
 # The server's own prompt vocabulary: the trainer asks exactly what the server asks.
 COPY src/decisions/seam_prompts.py /build/seam_prompts.py
 COPY qa/qa.jsonl /build/qa/qa.jsonl
+# The served rerank pairs: exact stage-2 item bytes (statement x document), both splits.
+# The trainer reads train rows only; `make tacit-payloads-check` guards drift.
+COPY qa/typed/rerank_pairs.jsonl /build/qa/rerank_pairs.jsonl
 
 # CDI mounts libcuda into the build container without refreshing the linker cache,
 # so torch would report cuda.is_available() == False. ldconfig first (verified:
@@ -133,6 +149,11 @@ RUN --device=nvidia.com/gpu=all sh -c 'ldconfig && exec python3 -u /build/tacit_
     --repo "${TACIT_MODEL_REPO}" \
     --problems "${TACIT_PROBLEMS}" \
     --states "${TACIT_STATES}" \
+    --style-states "${TACIT_STYLE_STATES}" \
+    --rerank-pairs /build/qa/rerank_pairs.jsonl \
+    --rerank-problems "${TACIT_RERANK_PROBLEMS}" \
+    --teacher-shards "${TACIT_TEACHER_SHARDS}" \
+    --min-seam-agreement "${TACIT_MIN_SEAM_AGREEMENT}" \
     --confidence-floor "${TACIT_CONFIDENCE_FLOOR}" \
     --gate-confidence-floor "${TACIT_GATE_CONFIDENCE_FLOOR:-${TACIT_CONFIDENCE_FLOOR}}" \
     --min-kind-rows "${TACIT_MIN_KIND_ROWS}" \

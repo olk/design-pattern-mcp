@@ -1,12 +1,12 @@
-"""Build-time decision-model scripts: train/serve prompt parity and the export contract.
+"""Build-time decision-model scripts: train/serve prompt parity and the seam gates.
 
-These scripts run inside the sidecar image builds (``docker/Dockerfile.tacit``,
-``docker/Dockerfile.clm``), where a wiring bug only surfaces after an hour of state
-generation or a 16 GB encoder download. Everything expensive is stubbed here; what is
-asserted is the *wiring*: the trainer asks exactly the questions the server asks
-(``src/decisions/seam_prompts.py``), its ``main()`` walks generate → problems → teacher →
-train → save, and the CLM exporter emits the row shape the pinned ``train/adapters.py``
-reads.
+These scripts run inside the sidecar image build (``docker/Dockerfile.tacit``), where a
+wiring bug only surfaces after hours of state generation and teacher answering. Everything
+expensive is stubbed here; what is asserted is the *wiring*: the trainer asks exactly the
+questions the server asks (``src/decisions/seam_prompts.py``) at every seam, its ``main()``
+walks generate → problems → sharded teacher → train → save, the style/rerank seams cannot
+train on nothing, and the per-seam fidelity gates can fail the build. The calibration
+replay is covered against a stubbed gateway.
 
 The scripts are loaded by path (neither is an importable package), the same way
 ``test_client_examples.py`` loads the example clients.
@@ -20,7 +20,6 @@ import json
 import sys
 import types
 from collections.abc import Iterator
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +36,7 @@ from src.pipeline import (
 )
 from src.reasoning.config import ReasoningConfig
 from src.schemas.enums import QUALITY_AXES
+from src.style_affinity import STYLE_AFFINITY
 from tests.unit.conftest import REPO_ROOT
 
 SCRIPTS = REPO_ROOT / "scripts" / "decision_models"
@@ -304,33 +304,76 @@ def test_retention_floor_is_kind_aware(trainer: types.ModuleType) -> None:
 
 
 def test_fidelity_metrics_hand_computed(trainer: types.ModuleType) -> None:
-    """Agreement, Brier, floor accuracy, and expected-level MAE follow the serving math."""
-    choice = trainer._fidelity_metrics(
-        [([0.9, 0.1], [1.0, 0.0], "choice"), ([0.4, 0.6], [0.5, 0.5], "choice")], 0.5, 0.5
-    )["choice"]
-    assert choice["n"] == 2
-    assert choice["agreement"] == 0.5
-    assert abs(choice["brier"] - 0.02) < 1e-9
-    assert choice["floor_accuracy"] == 0.5
+    """Per SEAM: agreement, Brier, floor accuracy, and expected-level MAE follow serving."""
+    category = trainer._fidelity_metrics(
+        [([0.9, 0.1], [1.0, 0.0], "choice", "category"), ([0.4, 0.6], [0.5, 0.5], "choice", "category")],
+        0.5,
+        0.5,
+    )["category"]
+    assert category["n"] == 2
+    assert category["agreement"] == 0.5
+    assert abs(category["brier"] - 0.02) < 1e-9
+    assert category["floor_accuracy"] == 0.5
+    # The same kind under two seams stays two entries: a seam is the reporting unit now.
+    split = trainer._fidelity_metrics(
+        [([0.9, 0.1], [1.0, 0.0], "choice", "style-stage1"), ([0.9, 0.1], [1.0, 0.0], "choice", "style-stage2")],
+        0.5,
+        0.5,
+    )
+    assert set(split) == {"style-stage1", "style-stage2"}
     teacher = [0.1, 0.3, 0.4, 0.15, 0.05]
     student = [0.0, 0.0, 1.0, 0.0, 0.0]
     expected_teacher = sum(index * value for index, value in enumerate(teacher)) / 4
     expected_student = sum(index * value for index, value in enumerate(student)) / 4
-    score = trainer._fidelity_metrics([(student, teacher, "score")], 0.5, 0.5)["score"]
-    assert abs(score["expected_level_mae"] - abs(expected_student - expected_teacher)) < 1e-9
-    # yes_no floor accuracy is ACT-decision agreement (the gate compares p(Yes) with its
+    weights = trainer._fidelity_metrics([(student, teacher, "score", "weights")], 0.5, 0.5)["weights"]
+    assert abs(weights["expected_level_mae"] - abs(expected_student - expected_teacher)) < 1e-9
+    # The gate seam's floor accuracy is ACT-decision agreement (it compares p(Yes) with its
     # floor): a student that would not act where the teacher would is a miss.
-    yes_no = trainer._fidelity_metrics(
-        [([0.9, 0.1], [1.0, 0.0], "yes_no"), ([0.4, 0.6], [0.55, 0.45], "yes_no")], 0.5, 0.5
-    )["yes_no"]
-    assert yes_no["floor_accuracy"] == 0.5
+    gate = trainer._fidelity_metrics(
+        [([0.9, 0.1], [1.0, 0.0], "yes_no", "gate"), ([0.4, 0.6], [0.55, 0.45], "yes_no", "gate")],
+        0.5,
+        0.5,
+    )["gate"]
+    assert gate["floor_accuracy"] == 0.5
     # At a raised gate floor the act rule bites: argmax agreement (both "Yes") must NOT
     # count as correct when the student fires (0.8 >= 0.7) and the teacher would not.
-    raised = trainer._fidelity_metrics([([0.8, 0.2], [0.6, 0.4], "yes_no")], 0.5, 0.7)["yes_no"]
+    raised = trainer._fidelity_metrics([([0.8, 0.2], [0.6, 0.4], "yes_no", "gate")], 0.5, 0.7)["gate"]
     assert raised["floor_accuracy"] == 0.0
+    # The rerank seam reports agreement alone: serving consumes the whole p(Yes) distribution.
+    rerank = trainer._fidelity_metrics([([0.8, 0.2], [0.6, 0.4], "yes_no", "rerank")], 0.5, 0.7)["rerank"]
+    assert "floor_accuracy" not in rerank
+    assert rerank["agreement"] == 1.0
     # The acting floor is the served one, not a literal: raising it drops the acted cases.
-    assert trainer._fidelity_metrics([([0.9, 0.1], [1.0, 0.0], "choice")], 0.95, 0.5)["choice"]["floor_accuracy"] == 0.0
+    assert (
+        trainer._fidelity_metrics([([0.9, 0.1], [1.0, 0.0], "choice", "category")], 0.95, 0.5)["category"][
+            "floor_accuracy"
+        ]
+        == 0.0
+    )
     assert trainer._fidelity_metrics([], 0.5, 0.5) == {}
+
+
+def test_seam_gate_failures_name_every_under_trained_seam(trainer: types.ModuleType) -> None:
+    """A missing seam or a weak seam fails the build; a clean report produces no failures."""
+    clean = {
+        "category": {"n": 5, "agreement": 0.9},
+        "style-stage1": {"n": 5, "agreement": 0.9},
+        "style-stage2": {"n": 5, "agreement": 0.9},
+        "rerank": {"n": 5, "agreement": 0.9},
+        "gate": {"n": 5, "agreement": 0.9},
+        "weights": {"n": 5, "agreement": 0.9, "expected_level_mae": 0.1},
+    }
+    assert trainer.seam_gate_failures(clean, 0.6, 0.2) == []
+    weak = dict(clean)
+    weak["rerank"] = {"n": 5, "agreement": 0.3}
+    weak["weights"] = {"n": 5, "agreement": 0.9, "expected_level_mae": 0.4}
+    failures = trainer.seam_gate_failures(weak, 0.6, 0.2)
+    assert any("'rerank'" in failure and "agreement" in failure for failure in failures)
+    assert any("expected-level MAE" in failure for failure in failures)
+    missing = {name: entry for name, entry in clean.items() if name != "style-stage2"}
+    assert any("'style-stage2' has no eval rows" in failure for failure in trainer.seam_gate_failures(missing, 0.6, 0.2))
+    # An empty metrics map (no eval rows at all) must name every gate, not pass silently.
+    assert len(trainer.seam_gate_failures({}, 0.6, 0.2)) == 6
 
 
 def test_false_act_rate_counts_clearing_the_floor(trainer: types.ModuleType) -> None:
@@ -359,13 +402,20 @@ class _FakeTeacher:
 
     def __init__(self, results: dict[str, dict[str, Any]]) -> None:
         self._results = results
+        self.sent: list[dict[str, Any]] = []
 
     def decide_batch(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.sent.extend(items)
         return [self._results[item["state"]] for item in items]
 
 
-def test_teacher_examples_keeps_graded_targets_and_rejects_partial_labels(trainer: types.ModuleType) -> None:
-    """Retention is per kind, and a result missing an option is dropped, never rescaled."""
+def test_answer_and_examples_split_reproduces_retention(trainer: types.ModuleType) -> None:
+    """Retention is per kind, and a result missing an option is dropped, never rescaled.
+
+    ``answer_problems`` is the shardable answer phase (wire keys only, order preserved);
+    ``examples_from_results`` is the unchanged retention/example loop, now tagging each row
+    with its seam so the build can gate per seam.
+    """
     labels = list(seam_prompts.CATEGORY_SLUGS)
     unsure = dict.fromkeys(labels, 0.1)
     unsure[labels[0]] = 0.2  # renormalized max 0.2: below the acting floor
@@ -383,14 +433,27 @@ def test_teacher_examples_keeps_graded_targets_and_rejects_partial_labels(traine
     }
     fake = _FakeTeacher(results)
     problems = [
-        {"state": "diffuse", "question": "q", "options": list(seam_prompts.WEIGHT_LEVELS), "kind": "score"},
-        {"state": "unsure", "question": "q", "options": labels, "kind": "choice"},
-        {"state": "sure", "question": "q", "options": labels, "kind": "choice"},
-        {"state": "partial", "question": "q", "options": ["Yes", "No"], "kind": "yes_no"},
-        {"state": "unrouted", "question": "q", "options": ["Yes", "No"], "kind": "yes_no"},
+        {
+            "state": "diffuse",
+            "question": "q",
+            "options": list(seam_prompts.WEIGHT_LEVELS),
+            "kind": "score",
+            "seam": "weights",
+        },
+        {"state": "unsure", "question": "q", "options": labels, "kind": "choice", "seam": "style-stage2"},
+        {"state": "sure", "question": "q", "options": labels, "kind": "choice", "seam": "style-stage2"},
+        {"state": "partial", "question": "q", "options": ["Yes", "No"], "kind": "yes_no", "seam": "gate"},
+        {"state": "unrouted", "question": "q", "options": ["Yes", "No"], "kind": "yes_no", "seam": "rerank"},
     ]
-    examples, dropped, probe = trainer.teacher_examples(fake, problems, 0.5, 0.0)
+    answered = trainer.answer_problems(fake, problems)
+    assert answered == [results[problem["state"]] for problem in problems]
+    # Only the four wire keys cross the gateway: ``seam`` is trainer bookkeeping.
+    assert fake.sent == [
+        {key: problem[key] for key in ("state", "question", "options", "kind")} for problem in problems
+    ]
+    examples, dropped, probe = trainer.examples_from_results(fake, problems, answered, 0.5, 0.0)
     assert [example.kind for example in examples] == ["score", "choice"]
+    assert [example.seam for example in examples] == ["weights", "style-stage2"]
     # Diffuse score rows survive: serving consumes the graded expected level.
     assert abs(sum(examples[0].target) - 1.0) < 1e-9
     assert abs(examples[0].target[2] - 0.4) < 1e-9
@@ -408,12 +471,277 @@ def test_teacher_examples_keeps_graded_targets_and_rejects_partial_labels(traine
     assert abs(max(probe[0].target) - 0.2) < 1e-9
 
 
+def test_build_style_problems_train_both_stages_for_every_shortlist(trainer: types.ModuleType) -> None:
+    """Two questions per state, every category shortlist, always inside the option cap."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    states = [f"description {index}" for index in range(len(seams.CATEGORY_SLUGS))]
+    problems = trainer.build_style_problems(states, seams)
+    assert len(problems) == 2 * len(states)
+    stage1 = problems[0::2]
+    stage2 = problems[1::2]
+    for problem in stage1:
+        assert problem["seam"] == "style-stage1"
+        assert problem["question"] == seams.category_question()
+        assert problem["options"] == list(seams.CATEGORY_SLUGS)
+        assert problem["kind"] == "choice"
+    # The shortlist rotates over ALL nine categories, so every stage-2 option set trains.
+    covered = {problem["options"][0] for problem in stage2}
+    assert covered == {seams.styles_for_category(slug)[0] for slug in seams.CATEGORY_SLUGS}
+    for problem, slug in zip(stage2, seams.CATEGORY_SLUGS, strict=True):
+        styles = seams.styles_for_category(slug)
+        assert problem["seam"] == "style-stage2"
+        assert problem["question"] == seams.style_question(styles)
+        assert problem["options"] == [*styles, seams.STYLE_NONE_KEY]
+        assert len(problem["options"]) <= 26
+
+
+def test_build_style_problems_caps_each_state(trainer: types.ModuleType) -> None:
+    """Serving truncates the description, so the trained bytes are the truncated bytes."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    cap = seams.DECISION_STATE_MAX_CHARS
+    problems = trainer.build_style_problems(["d" * (cap + 100)], seams)
+    assert [problem["state"] for problem in problems] == ["d" * cap, "d" * cap]
+
+
+def test_load_rerank_pairs_keeps_train_rows_only(trainer: types.ModuleType, tmp_path: Path) -> None:
+    """Holdout pairs are eval material: they must never reach the training weights."""
+    path = tmp_path / "rerank_pairs.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"split": "train", "statement": "s1", "document": "d1"}),
+                json.dumps({"split": "holdout", "statement": "s2", "document": "d2"}),
+                json.dumps({"split": "train", "statement": "", "document": "d3"}),
+                "not json",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert trainer.load_rerank_pairs(path) == [{"statement": "s1", "document": "d1"}]
+
+
+def test_build_rerank_problems_use_serving_bytes_and_stride_a_budget(trainer: types.ModuleType) -> None:
+    """One ``yes_no`` per pair with the served state/question; a positive budget strides."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    pairs = [{"statement": f"statement {index}", "document": f"document {index}"} for index in range(10)]
+    full = trainer.build_rerank_problems(pairs, seams, 0)
+    assert len(full) == 10  # 0 = all: the max-effort default
+    assert full[0] == {
+        "state": seams.rerank_state("statement 0", "document 0"),
+        "question": seams.RERANK_RELEVANCE_QUESTION,
+        "options": ["Yes", "No"],
+        "kind": "yes_no",
+        "seam": "rerank",
+    }
+    strided = trainer.build_rerank_problems(pairs, seams, 4)
+    assert len(strided) == 4
+    # A stride, not a prefix: a reduced run still spreads across the corpus.
+    assert strided[0]["state"] == seams.rerank_state("statement 0", "document 0")
+    assert strided[1]["state"] != seams.rerank_state("statement 1", "document 1")
+    assert len({problem["state"] for problem in strided}) == 4
+
+
+def test_shard_command_parses_with_the_real_cli(trainer: types.ModuleType, tmp_path: Path) -> None:
+    """The child argv must satisfy ``parse_args`` — a required flag missing here kills sharding.
+
+    This is the failure mode the fake-Popen tests cannot see: the child re-parses its own
+    argv, so a newly required flag (``--seam-prompts`` did exactly this) makes every shard
+    exit 2 in argparse and the parent abort with "a teacher shard failed" — after the
+    hours-long teacher pass has already started.
+    """
+    args = types.SimpleNamespace(
+        init_dir=tmp_path / "init",
+        out=tmp_path / "out",
+        seam_prompts=SEAM_PROMPTS,
+        repo="morriszjm/Tacit-4B",
+        cot_max_tokens=512,
+        batch=2,
+    )
+    command = trainer._shard_command(args, shard=1, total_shards=3, problems_path=tmp_path / "p.json", out_path=tmp_path / "s.jsonl")
+    # Exactly what the child gets: interpreter, script path, then the flags.
+    parsed = trainer.parse_args(command[2:])
+    assert parsed._answer_shard == 1
+    assert parsed._shard_total == 3
+    assert parsed._shard_problems == str(tmp_path / "p.json")
+    assert parsed._shard_out == str(tmp_path / "s.jsonl")
+    assert parsed.init_dir == str(tmp_path / "init")
+    assert parsed.out == str(tmp_path / "out")
+    assert parsed.seam_prompts == str(SEAM_PROMPTS)
+    assert parsed.cot_max_tokens == 512
+    assert parsed.batch == 2
+
+
+def test_answer_shard_writes_globally_indexed_rows(trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Shard ``i`` of ``n`` answers ``problems[i::n]`` and tags each row with its global index."""
+    problems = [{"state": f"s{index}", "question": "q", "options": ["a"], "kind": "choice"} for index in range(7)]
+    problems_path = tmp_path / "problems.json"
+    problems_path.write_text(json.dumps(problems), encoding="utf-8")
+    monkeypatch.setattr(trainer, "_load_teacher", lambda _args: object())
+    monkeypatch.setattr(
+        trainer, "answer_problems", lambda _teacher, sliced: [{"route": "cot", "state": item["state"]} for item in sliced]
+    )
+    seen: dict[int, int] = {}
+    for shard, total in ((0, 3), (1, 3), (2, 3)):
+        out = tmp_path / f"shard-{shard}.jsonl"
+        args = types.SimpleNamespace(
+            _answer_shard=shard, _shard_total=total, _shard_problems=str(problems_path), _shard_out=str(out)
+        )
+        assert trainer._answer_shard(args) == 0
+        for line in out.read_text(encoding="utf-8").splitlines():
+            entry = json.loads(line)
+            assert entry["result"]["state"] == problems[entry["index"]]["state"]
+            seen[entry["index"]] = seen.get(entry["index"], 0) + 1
+    assert seen == dict.fromkeys(range(7), 1)  # full coverage, no overlap
+
+
+def test_teacher_answers_merges_shards_in_order(trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The parent merges by index and refuses a partial or failed shard set."""
+
+    class _FakeChild:
+        def __init__(
+            self, command: list[str], env: dict[str, str] | None = None, *, code: int = 0, drop_last: bool = False
+        ) -> None:
+            del env  # the child pins CUDA_VISIBLE_DEVICES; the fake only needs the argv
+            out = Path(command[command.index("--_shard-out") + 1])
+            count = int(command[command.index("--_shard-total") + 1])
+            shard = int(command[command.index("--_answer-shard") + 1])
+            problems = json.loads(Path(command[command.index("--_shard-problems") + 1]).read_text(encoding="utf-8"))
+            sliced = problems[shard::count]
+            if drop_last:
+                sliced = sliced[:-1]
+            out.write_text(
+                "\n".join(
+                    json.dumps({"index": shard + offset * count, "result": {"state": item["state"]}})
+                    for offset, item in enumerate(sliced)
+                ),
+                encoding="utf-8",
+            )
+            self._code = code
+
+        def wait(self) -> int:
+            return self._code
+
+    problems = [{"state": f"s{index}", "question": "q", "options": ["a"], "kind": "choice"} for index in range(6)]
+    args = types.SimpleNamespace(
+        teacher_shards=2,
+        seam_prompts=SEAM_PROMPTS,
+        init_dir=Path("/models/tacit-4b"),
+        out=Path("/out/tacit-4b"),
+        repo="morriszjm/Tacit-4B",
+        cot_max_tokens=2048,
+        batch=4,
+    )
+    monkeypatch.setattr(trainer.subprocess, "Popen", _FakeChild)
+    merged, shards = trainer.teacher_answers(object(), args, problems)
+    assert shards == 2
+    assert merged == [{"state": problem["state"]} for problem in problems]
+
+    monkeypatch.setattr(trainer.subprocess, "Popen", lambda command, env=None: _FakeChild(command, env, code=1))
+    with pytest.raises(SystemExit, match="teacher shard failed"):
+        trainer.teacher_answers(object(), args, problems)
+
+    monkeypatch.setattr(
+        trainer.subprocess, "Popen", lambda command, env=None: _FakeChild(command, env, drop_last=True)
+    )
+    with pytest.raises(SystemExit, match="covered"):
+        trainer.teacher_answers(object(), args, problems)
+
+
+def test_assemble_problems_prefers_hints_then_generated_descriptions(
+    trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ch2 states are real serving hint bytes first; generated prose fills the rest."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    monkeypatch.setattr(
+        trainer,
+        "generate_descriptions",
+        lambda _tacit, _hints, count, _max_new, _cap: [f"generated {index}" for index in range(count)],
+    )
+    args = types.SimpleNamespace(
+        problems=36,
+        style_states=0,
+        rerank_pairs=str(_rerank_pairs_file(tmp_path)),
+        rerank_problems=0,
+        max_new_tokens=256,
+    )
+    problems, style_states, style_problems, rerank_problems = trainer._assemble_problems(
+        object(),
+        ["hint one", "hint two"],
+        seams,
+        args,
+        ["System goal: g\nDecision part: p"],
+        ["phase: analyze\ndescription: d"],
+        8,
+    )
+    assert style_states == ["hint one", "hint two", "generated 0"]  # 36 // 12 = 3 states
+    assert len(style_problems) == 6
+    assert len(rerank_problems) == 2
+    assert len(problems) == len(style_problems) + len(rerank_problems) + (1 + 8 + 1)
+    # When the hint corpus already fills the budget, no teacher time is spent generating
+    # descriptions that would be truncated away; every hint is still kept.
+    args.style_states = 1
+    monkeypatch.setattr(
+        trainer,
+        "generate_descriptions",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("generation must be skipped")),
+    )
+    _, hint_only, _, _ = trainer._assemble_problems(
+        object(),
+        ["hint one", "hint two"],
+        seams,
+        args,
+        ["System goal: g\nDecision part: p"],
+        [],
+        8,
+    )
+    assert hint_only == ["hint one", "hint two"]
+
+
+def test_assemble_problems_refuses_an_untrained_seam(
+    trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Style and rerank must both train: an empty seam aborts the build unless --skip."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    # No generated prose: the hint text alone carries the style seam in the passing cases.
+    monkeypatch.setattr(trainer, "generate_descriptions", lambda *_args: [])
+    holdout_only = tmp_path / "holdout_only.jsonl"
+    holdout_only.write_text(
+        json.dumps({"split": "holdout", "statement": "s", "document": "d"}), encoding="utf-8"
+    )
+
+    def assemble(pairs: str) -> Any:
+        args = types.SimpleNamespace(
+            problems=12, style_states=0, rerank_pairs=pairs, rerank_problems=0, max_new_tokens=256
+        )
+        return trainer._assemble_problems(
+            object(), ["hint"], seams, args, ["System goal: g\nDecision part: p"], [], 8
+        )
+
+    with pytest.raises(SystemExit, match="--rerank-pairs"):
+        assemble("")
+    with pytest.raises(SystemExit, match="0 pairs"):
+        assemble(str(holdout_only))
+    # No hints and no generated descriptions: nothing to train the two-stage style seam on.
+    no_hints = types.SimpleNamespace(
+        problems=12,
+        style_states=0,
+        rerank_pairs=str(_rerank_pairs_file(tmp_path)),
+        rerank_problems=0,
+        max_new_tokens=256,
+    )
+    with pytest.raises(SystemExit, match="0 description-shaped states"):
+        trainer._assemble_problems(object(), [], seams, no_hints, ["System goal: g\nDecision part: p"], [], 8)
+    # ``--skip`` needs no clause here: main returns from skip_training before this point.
+    assert "skip" not in trainer._assemble_problems.__code__.co_names
+
+
 def _main_fakes(
     trainer: types.ModuleType,
     seen: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
     *,
     kinds: tuple[str, ...] = ("choice", "score", "yes_no"),
+    descriptions: tuple[str, ...] = ("generated description",),
 ) -> None:
     """Patch the expensive stages of ``main()`` so the wiring is what gets asserted."""
 
@@ -428,17 +756,49 @@ def _main_fakes(
         seen["gate_hints"] = list(hints)
         return [f"phase: analyze\ndescription: g{i}" for i in range(count)]
 
+    def fake_descriptions(
+        _tacit: Any, _hints: Any, count: int, _max_new: int, max_state_chars: int
+    ) -> list[str]:
+        seen["description_cap"] = max_state_chars
+        seen["description_count"] = count
+        return [f"{text} {index}" for index, text in enumerate(descriptions)][:count]
+
     def fake_teacher(
-        _tacit: Any, problems: list[dict[str, Any]], floor: float, score_floor: float
-    ) -> tuple[list[Any], dict[str, dict[str, int]], list[Any]]:
+        _tacit: Any, args: Any, problems: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], int]:
         seen["kinds"] = [problem["kind"] for problem in problems]
+        seen["seams"] = [problem.get("seam") for problem in problems]
+        seen["teacher_shards_arg"] = args.teacher_shards
+        return [{"route": "cot"} for _ in problems], 1
+
+    def fake_examples(
+        _tacit: Any,
+        problems: list[dict[str, Any]],
+        _results: Any,
+        floor: float,
+        score_floor: float,
+    ) -> tuple[list[Any], dict[str, dict[str, int]], list[Any]]:
         seen["floors"] = (floor, score_floor)
+        seen["problem_count"] = len(problems)
+        seam_for_kind = {
+            "choice": ("category", "style-stage1", "style-stage2"),
+            "score": ("weights",),
+            "yes_no": ("gate", "rerank"),
+        }
         rows = [
-            trainer.Example(prompt=f"prompt-{kind}-{repeat}", kind=kind, label_ids=[1, 2], target=[0.6, 0.4])
+            trainer.Example(
+                prompt=f"prompt-{kind}-{repeat}",
+                kind=kind,
+                label_ids=[1, 2],
+                target=[0.6, 0.4],
+                seam=seam_for_kind[kind][repeat % len(seam_for_kind[kind])],
+            )
             for repeat in range(7)  # 21 rows: past the >=20 bar, so the eval split is real
             for kind in kinds
         ]
-        probe = [trainer.Example(prompt="probe-choice", kind="choice", label_ids=[1, 2], target=[0.55, 0.45])]
+        probe = [
+            trainer.Example(prompt="probe-choice", kind="choice", label_ids=[1, 2], target=[0.55, 0.45])
+        ]
         dropped_counts = {kind: {"unrouted": 0, "shape": 0, "unsharp": 0} for kind in ("choice", "score", "yes_no")}
         return rows, dropped_counts, probe
 
@@ -457,7 +817,9 @@ def _main_fakes(
     ) -> dict[str, Any]:
         seen["eval_model"] = _model
         seen["eval_floors"] = (choice_floor, gate_floor)
-        return {"choice": {"n": 0}}
+        return {seam: {"n": 3, "agreement": 0.9, "expected_level_mae": 0.1} for seam in trainer._GATED_SEAMS} | {
+            "weights": {"n": 3, "agreement": 0.9, "expected_level_mae": 0.1}
+        }
 
     def fake_probe(_model: Any, _init: Path, rows: Any, _batch: int, floor: float) -> float:
         seen["probe_model"] = _model
@@ -467,11 +829,48 @@ def _main_fakes(
 
     monkeypatch.setattr(trainer, "generate_states", fake_states)
     monkeypatch.setattr(trainer, "build_gate_states", fake_gate_states)
-    monkeypatch.setattr(trainer, "teacher_examples", fake_teacher)
+    monkeypatch.setattr(trainer, "generate_descriptions", fake_descriptions)
+    monkeypatch.setattr(trainer, "teacher_answers", fake_teacher)
+    monkeypatch.setattr(trainer, "examples_from_results", fake_examples)
     monkeypatch.setattr(trainer, "train_student", fake_train)
     monkeypatch.setattr(trainer, "save_checkpoint", fake_save)
     monkeypatch.setattr(trainer, "evaluate_student", fake_eval)
     monkeypatch.setattr(trainer, "probe_false_act_rate", fake_probe)
+
+
+def _rerank_pairs_file(tmp_path: Path, rows: int = 2) -> Path:
+    """A tiny rerank-pairs artifact: train rows the trainer may use, plus one holdout."""
+    path = tmp_path / "rerank_pairs.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                *[
+                    json.dumps({"split": "train", "statement": f"s{index}", "document": f"d{index}"})
+                    for index in range(rows)
+                ],
+                json.dumps({"split": "holdout", "statement": "hs", "document": "hd"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _main_args(init_dir: Path, out_dir: Path, pairs: Path, *extra: str) -> list[str]:
+    """The mandatory ``main`` argv, with the J1 pairs the seam requires."""
+    return [
+        "--init-dir",
+        str(init_dir),
+        "--out",
+        str(out_dir),
+        "--seam-prompts",
+        str(SEAM_PROMPTS),
+        "--problems",
+        "10",
+        "--rerank-pairs",
+        str(pairs),
+        *extra,
+    ]
 
 
 def test_trainer_main_walks_generate_to_save(
@@ -485,32 +884,41 @@ def test_trainer_main_walks_generate_to_save(
     init_dir.mkdir()
     (init_dir / "config.json").write_text("{}", encoding="utf-8")
     out_dir = tmp_path / "out"
-    code = trainer.main(
-        [
-            "--init-dir",
-            str(init_dir),
-            "--out",
-            str(out_dir),
-            "--seam-prompts",
-            str(SEAM_PROMPTS),
-            "--problems",
-            "10",
-        ]
-    )
+    code = trainer.main(_main_args(init_dir, out_dir, _rerank_pairs_file(tmp_path)))
     assert code == 0
-    assert seen["kinds"] == ["choice"] + ["score"] * 8 + ["yes_no"]
+    # 10 design problems (category + 8 axes + gate), 2 style questions, 2 train rerank pairs.
+    assert seen["kinds"] == ["choice"] + ["score"] * 8 + ["yes_no"] + ["choice"] * 2 + ["yes_no"] * 2
+    assert seen["seams"] == [
+        "category",
+        "weights",
+        "weights",
+        "weights",
+        "weights",
+        "weights",
+        "weights",
+        "weights",
+        "weights",
+        "gate",
+        "style-stage1",
+        "style-stage2",
+        "rerank",
+        "rerank",
+    ]
     assert seen["floors"] == (0.5, 0.0)  # the answer floor defaults to the confidence floor
     assert seen["examples"] == 19  # 21 kept rows minus the 10% eval carve-out (2)
     assert seen["epochs"] == 1
     assert seen["gate_sources"] == 1  # gate states are built FROM the design states
     assert seen["state_cap"] == seam_prompts.DECISION_STATE_MAX_CHARS
+    assert seen["description_cap"] == seam_prompts.DECISION_STATE_MAX_CHARS
+    assert seen["description_count"] == 1  # derived default: problems // 12
+    assert seen["teacher_shards_arg"] == 0  # auto: one shard per visible GPU
     assert seen["eval_floors"] == (0.5, 0.5)  # the gate floor defaults to the confidence floor
     assert seen["probe_floor"] == 0.5
     assert seen["probe_rows"] == 1
     assert seen["eval_model"] is seen["saved_model"]  # fidelity scores the MERGED artifact
     assert seen["probe_model"] is seen["saved_model"]  # and so does the false-act probe
     manifest = json.loads((out_dir / "self-distill.json").read_text(encoding="utf-8"))
-    assert manifest["problems"] == 10
+    assert manifest["problems"] == 14
     assert manifest["examples"] == 19
     assert manifest["kept"] == {"choice": 7, "score": 7, "yes_no": 7}
     assert manifest["repo"] == "morriszjm/Tacit-4B"
@@ -522,7 +930,19 @@ def test_trainer_main_walks_generate_to_save(
     assert manifest["states"] == 1
     assert manifest["gate_states"] == 1
     assert manifest["axes_per_state"] == 8
-    assert manifest["eval"] == {"choice": {"n": 0}}
+    assert manifest["style_states"] == 1
+    assert manifest["style_problems"] == 2
+    assert manifest["rerank_problems"] == 2  # train rows only; the holdout pair never trains
+    assert manifest["teacher_shards"] == 1
+    assert manifest["min_seam_agreement"] == 0.6
+    assert manifest["max_score_mae"] == 0.2
+    # Every seam's kept count and its eval fidelity land in one block.
+    assert set(manifest["seams"]) == {"category", "style-stage1", "style-stage2", "gate", "rerank", "weights"}
+    assert manifest["seams"]["weights"]["expected_level_mae"] == pytest.approx(0.1)
+    # ``yes_no`` rows alternate gate/rerank: 7 rows → 4 gate + 3 rerank.
+    assert manifest["seams"]["rerank"]["kept"] == 3
+    assert manifest["seams"]["gate"]["kept"] == 4
+    assert "n" not in manifest["seams"]["category"]
     assert manifest["false_act"] == {"n": 1, "rate": 0.25}
 
 
@@ -536,18 +956,7 @@ def test_trainer_main_honours_a_raised_confidence_floor(
     init_dir.mkdir()
     (init_dir / "config.json").write_text("{}", encoding="utf-8")
     code = trainer.main(
-        [
-            "--init-dir",
-            str(init_dir),
-            "--out",
-            str(tmp_path / "out"),
-            "--seam-prompts",
-            str(SEAM_PROMPTS),
-            "--problems",
-            "10",
-            "--confidence-floor",
-            "0.7",
-        ]
+        _main_args(init_dir, tmp_path / "out", _rerank_pairs_file(tmp_path), "--confidence-floor", "0.7")
     )
     assert code == 0
     assert seen["floors"] == (0.7, 0.0)
@@ -569,20 +978,15 @@ def test_trainer_main_honours_a_distinct_gate_floor(
     init_dir.mkdir()
     (init_dir / "config.json").write_text("{}", encoding="utf-8")
     code = trainer.main(
-        [
-            "--init-dir",
-            str(init_dir),
-            "--out",
-            str(tmp_path / "out"),
-            "--seam-prompts",
-            str(SEAM_PROMPTS),
-            "--problems",
-            "10",
+        _main_args(
+            init_dir,
+            tmp_path / "out",
+            _rerank_pairs_file(tmp_path),
             "--confidence-floor",
             "0.5",
             "--gate-confidence-floor",
             "0.8",
-        ]
+        )
     )
     assert code == 0
     assert seen["floors"] == (0.5, 0.0)  # choice retention is unchanged
@@ -602,18 +1006,23 @@ def test_trainer_main_refuses_a_kind_with_no_rows(
     init_dir.mkdir()
     (init_dir / "config.json").write_text("{}", encoding="utf-8")
     with pytest.raises(SystemExit, match="too few usable teacher rows"):
-        trainer.main(
-            [
-                "--init-dir",
-                str(init_dir),
-                "--out",
-                str(tmp_path / "out"),
-                "--seam-prompts",
-                str(SEAM_PROMPTS),
-                "--problems",
-                "10",
-            ]
-        )
+        trainer.main(_main_args(init_dir, tmp_path / "out", _rerank_pairs_file(tmp_path)))
+
+
+def test_trainer_main_fails_an_under_trained_seam(
+    trainer: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seam whose student-teacher agreement misses the bar must fail the build."""
+    seen: dict[str, Any] = {}
+    _main_fakes(trainer, seen, monkeypatch)
+    metrics = {seam: {"n": 3, "agreement": 0.9, "expected_level_mae": 0.1} for seam in trainer._GATED_SEAMS}
+    metrics["rerank"] = {"n": 3, "agreement": 0.2, "expected_level_mae": 0.1}
+    monkeypatch.setattr(trainer, "evaluate_student", lambda *_args, **_kwargs: metrics)
+    init_dir = tmp_path / "init"
+    init_dir.mkdir()
+    (init_dir / "config.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit, match="under-trained seam"):
+        trainer.main(_main_args(init_dir, tmp_path / "out", _rerank_pairs_file(tmp_path)))
 
 
 def test_trainer_skip_copies_the_released_checkpoint(trainer: types.ModuleType, tmp_path: Path) -> None:
@@ -628,753 +1037,40 @@ def test_trainer_skip_copies_the_released_checkpoint(trainer: types.ModuleType, 
     assert (out_dir / "config.json").is_file()
 
 
-@pytest.fixture(scope="module")
-def exporter() -> types.ModuleType:
-    return _load("export_clm_dataset", "export_clm_dataset.py")
-
-
-def test_export_row_matches_the_pinned_clm_adapter_contract(exporter: types.ModuleType) -> None:
-    """``typed_decision_examples`` reads {id, state, questions, gold}; so must we write it.
-
-    The row layout was verified against the upstream adapter at one CLM revision:
-    the exporter's default pin, the Dockerfile's ``CLM_REPO_PIN`` default, and
-    this test's constant must all name that same revision, so bumping the pin in
-    either place re-opens the contract check instead of silently invalidating it.
-    """
-    dockerfile = (REPO_ROOT / "docker" / "Dockerfile.clm").read_text(encoding="utf-8")
-    assert "\nARG CLM_REPO_PIN=d5f9ef0\n" in dockerfile
-    assert exporter.parse_args(["--out", "/tmp/x"]).clm_pin == "d5f9ef0"
-    row = exporter.to_typed_row(
-        {
-            "id": "scenario:category",
-            "state": "System goal: x\nDecision part: y",
-            "instructions": "Which category?",
-            "criteria": {"domain-modeling": "entities and invariants", "behavior-selection": "dispatch"},
-            "label": "behavior-selection",
-            "source": {"split": "train"},
-        },
-        exporter.CATEGORY_QUESTION_ID,
-    )
-    assert row["id"] == "scenario:category"
-    questions = json.loads(row["questions"])
-    assert questions["category"]["type"] == "choice"
-    assert questions["category"]["instructions"] == "Which category?"
-    assert set(questions["category"]["criteria"]) == {"domain-modeling", "behavior-selection"}
-    assert json.loads(row["gold"]) == {"category": {"label": "behavior-selection"}}
-
-
-def test_export_refuses_a_label_outside_the_criteria(exporter: types.ModuleType) -> None:
-    with pytest.raises(SystemExit):
-        exporter.to_typed_row(
-            {
-                "id": "bad",
-                "state": "s",
-                "criteria": {"domain-modeling": "x"},
-                "label": "security-verification",
-                "source": {"split": "train"},
-            },
-            exporter.CATEGORY_QUESTION_ID,
-        )
-
-
-def test_export_filters_by_source_split(exporter: types.ModuleType, tmp_path: Path) -> None:
-    """Holdout families must never reach the weights."""
-    path = tmp_path / "choice.jsonl"
+def test_style_corpus_matches_the_served_vocabulary() -> None:
+    """Every style row's criteria are the served gloss table, in affinity order + ``none``."""
     rows = [
-        {
-            "id": "a",
-            "state": "s",
-            "criteria": {"domain-modeling": "x"},
-            "label": "domain-modeling",
-            "source": {"split": "train"},
-        },
-        {
-            "id": "b",
-            "state": "s",
-            "criteria": {"domain-modeling": "x"},
-            "label": "domain-modeling",
-            "source": {"split": "holdout"},
-        },
+        json.loads(line)
+        for line in (REPO_ROOT / "qa" / "typed" / "style.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
-    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
-    exported = exporter.load_rows(path, "train")
-    assert [row["id"] for row in exported] == ["a"]
-
-
-def test_style_row_asks_the_served_question(exporter: types.ModuleType) -> None:
-    """The style export must use the Ch2 qid, not the category one."""
-    row = exporter.to_typed_row(
-        {
-            "id": "scenario:style",
-            "state": "A checkout service with flash sales.",
-            "instructions": "Which style?",
-            "criteria": {"event-driven": "events", "none": "nothing applies"},
-            "label": "event-driven",
-            "source": {"split": "train"},
-        },
-        exporter.STYLE_QUESTION_ID,
-    )
-    questions = json.loads(row["questions"])
-    assert list(questions) == ["architecture_style"]
-    assert questions["architecture_style"]["type"] == "choice"
-    assert questions["architecture_style"]["instructions"] == "Which style?"
-    assert json.loads(row["gold"]) == {"architecture_style": {"label": "event-driven"}}
-
-
-def test_style_corpus_matches_the_served_prompt_bytes() -> None:
-    """Trainer asks exactly what the server asks: qid, instructions, criteria, state."""
-    from src.decisions.client import STYLE_QUESTION_ID, build_style_criteria
-
-    style_path = REPO_ROOT / "qa" / "typed" / "style.jsonl"
-    criteria = build_style_criteria()
-    rows = [json.loads(line) for line in style_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert rows, "qa/typed/style.jsonl must not be empty"
-    corpus = json.loads((REPO_ROOT / "tests" / "benchmark" / "scenarios" / "full.json").read_text(encoding="utf-8"))
-    scenarios = {item["scenario_id"]: item for item in corpus.get("scenarios", corpus)}
+    assert rows
     for row in rows:
-        scenario_id = row["source"]["scenario_id"]
-        assert row["id"] == f"{scenario_id}:style"
-        assert row["state"] == scenarios[scenario_id]["description"]
         assert row["instructions"] == seam_prompts.STYLE_INSTRUCTIONS
-        assert row["criteria"] == criteria
-        assert row["label"] in criteria
-        assert row["source"]["split"] == scenarios[scenario_id]["split"]
-    assert {row["source"]["scenario_id"] for row in rows} == set(scenarios)
-    assert STYLE_QUESTION_ID == "architecture_style"
+        assert list(row["criteria"]) == [*list(STYLE_AFFINITY), seam_prompts.STYLE_NONE_KEY]
+        assert set(row["criteria"]) == set(seam_prompts.STYLE_GLOSSES) | {seam_prompts.STYLE_NONE_KEY}
+        # The label is the stage-2 answer the seam can actually return.
+        assert row["label"] in seam_prompts.STYLE_GLOSSES or row["label"] == seam_prompts.STYLE_NONE_KEY
 
 
-def test_style_criteria_matches_the_shared_vocabulary() -> None:
-    """The served criteria are the shared glosses in affinity order + ``none`` last."""
-    from src.decisions.client import build_style_criteria
-    from src.style_affinity import STYLE_AFFINITY
-
-    criteria = build_style_criteria()
-    assert list(criteria) == [*list(STYLE_AFFINITY), seam_prompts.STYLE_NONE_KEY]
-    glosses = {key: value for key, value in criteria.items() if key != seam_prompts.STYLE_NONE_KEY}
-    assert glosses == seam_prompts.STYLE_GLOSSES
-
-
-@pytest.fixture(scope="module")
-def eval_gate() -> types.ModuleType:
-    return _load("clm_eval_gate", "clm_eval_gate.py")
-
-
-def _gate_manifest(**overrides: Any) -> dict[str, Any]:
-    """A manifest shaped like ``export_clm_dataset.py`` v2: 15 holdout rows per question."""
-    manifest: dict[str, Any] = {
-        "schema_version": 2,
-        "splits": {
-            "train": {
-                "source_split": "train",
-                "rows": 70,
-                "per_question": {"architecture_style": 70, "category": 70},
-                "label_coverage": {
-                    # R6-neutral default: train supports every test label, so tests that do
-                    # not target R6 keep their expectations (R6 tests mutate this block).
-                    "architecture_style": {
-                        "labels": {
-                            "monolithic": 20,
-                            "none": 11,
-                            "broker": 2,
-                            "saga": 1,
-                            "api-gateway": 2,
-                            "sse": 1,
-                            "x": 1,
-                        },
-                        "uncovered": ["hexagonal"],
-                    },
-                    "category": {
-                        "labels": {"domain-modeling": 12, "behavior-selection": 2, "persistence-state": 14},
-                        "uncovered": [],
-                    },
-                },
-            },
-            "test": {
-                "source_split": "holdout",
-                "rows": 30,
-                "per_question": {"architecture_style": 15, "category": 15},
-                "label_coverage": {
-                    "architecture_style": {
-                        "labels": {
-                            "monolithic": 4,
-                            "none": 3,
-                            "broker": 2,
-                            "saga": 2,
-                            "api-gateway": 2,
-                            "sse": 1,
-                            "x": 1,
-                        },
-                        "uncovered": ["saga"],
-                    },
-                    "category": {
-                        "labels": {"domain-modeling": 5, "behavior-selection": 4, "persistence-state": 3},
-                        "uncovered": [],
-                    },
-                },
-            },
-        },
-    }
-    manifest.update(overrides)
-    return manifest
-
-
-def _gate_summary(**overrides: Any) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "best_epoch": 3,
-        "val_acc": 0.8,
-        "test": {"acc": 0.75, "soft_ce": 0.5, "per_question": {"architecture_style": 0.7, "category": 0.8}},
-        "init_test": {
-            "acc": 0.6,
-            "soft_ce": 0.7,
-            "per_question": {"architecture_style": 0.4, "category": 0.5},
-        },
-        "majority_test": 0.3,
-        "train_questions": 70,
-    }
-    summary.update(overrides)
-    return summary
-
-
-@lru_cache(maxsize=1)
-def _gate_module() -> types.ModuleType:
-    return _load("clm_eval_gate", "clm_eval_gate.py")
-
-
-def _served_gate(
-    summary: dict[str, Any],
-    manifest: dict[str, Any] | None = None,
-    questions: tuple[str, ...] = ("architecture_style",),
-    advisory: tuple[str, ...] = ("category",),
-    ledger: dict[str, Any] | None = None,
-    source_digests: dict[str, str | None] | None = None,
-) -> Any:
-    """Run the gate with the served question binding and a v2 manifest.
-
-    R7-neutral by default: the fixture's ``uncovered`` criteria arrive
-    acknowledged at the fixture digest, so tests that do not target R7 keep
-    their expectations (pass ``ledger={}`` to exercise the unacknowledged path).
-    """
-    resolved = _gate_manifest() if manifest is None else manifest
-    digests: dict[str, str | None] = (
-        {"choice": "fixture-choice", "style": "fixture-style"} if source_digests is None else source_digests
-    )
-    active: dict[str, Any] | None
-    if ledger is None:
-        train_cov: dict[str, Any] = ((resolved.get("splits") or {}).get("train") or {}).get("label_coverage") or {}
-        style_cov: dict[str, Any] = train_cov.get("architecture_style") or {}
-        uncovered: list[str] = style_cov.get("uncovered", [])
-        active = {
-            "coverage_ack": {
-                "architecture_style": [
-                    {
-                        "criterion": key,
-                        "reviewer": "fixture",
-                        "note": "R7-neutral default",
-                        "source_sha256": digests["style"],
-                    }
-                    for key in uncovered
-                ]
-            },
-            "reviews": {"choice": [], "style": []},
-        }
-    else:
-        active = ledger
-    return _gate_module().check(
-        summary, resolved, list(questions), list(advisory), active, digests if active is not None else None
-    )
-
-
-def test_eval_gate_passes_an_improved_head() -> None:
-    assert _served_gate(_gate_summary()).failures == []
-
-
-def test_eval_gate_passes_an_equal_head() -> None:
-    """No regression = PASS once some epoch improved val (equal test, best_epoch > 0)."""
-    summary = _gate_summary()
-    summary["test"]["acc"] = summary["init_test"]["acc"]
-    summary["test"]["per_question"] = dict(summary["init_test"]["per_question"])
-    assert _served_gate(summary).failures == []
-
-
-def test_eval_gate_fails_a_no_improvement_run() -> None:
-    """best_epoch 0 ships the released weights — never as ``runtime-finetuned``."""
-    summary = _gate_summary()
-    summary["best_epoch"] = 0
-    summary["test"]["acc"] = summary["init_test"]["acc"]
-    summary["test"]["per_question"] = dict(summary["init_test"]["per_question"])
-    failures = _served_gate(summary).failures
-    assert len(failures) == 1
-    assert "best_epoch is 0" in failures[0]
-
-
-def test_eval_gate_fails_a_regressed_head() -> None:
-    summary = _gate_summary()
-    summary["test"]["acc"] = 0.55
-    failures = _served_gate(summary).failures
-    assert any("regressed below init" in failure for failure in failures)
-
-
-def test_eval_gate_tolerates_exactly_one_row_of_regression() -> None:
-    """15 rows → one flipped row (1/15) is inside the measurement's granularity."""
-    summary = _gate_summary()
-    summary["test"]["per_question"]["architecture_style"] = 7 / 15
-    summary["init_test"]["per_question"]["architecture_style"] = 8 / 15
-    assert _served_gate(summary).failures == []
-    summary["test"]["per_question"]["architecture_style"] = 6 / 15
-    assert any("more than one row" in failure for failure in _served_gate(summary).failures)
-
-
-def test_eval_gate_fails_closed_without_a_per_question_baseline() -> None:
-    """A missing init baseline must fail, never silently disable the regression rule."""
-    summary = _gate_summary()
-    summary["init_test"] = {"acc": 0.6, "soft_ce": 0.7}
-    assert any("no per-question baseline" in failure for failure in _served_gate(summary).failures)
-
-
-def test_eval_gate_fails_when_the_head_only_learned_the_prior() -> None:
-    """14/15 labels monolithic on the test shard → the head must beat 0.9333."""
-    manifest = _gate_manifest()
-    manifest["splits"]["test"]["label_coverage"]["architecture_style"]["labels"] = {"monolithic": 14, "none": 1}
-    failures = _served_gate(_gate_summary(), manifest).failures
-    assert len(failures) == 1
-    assert "majority-label share" in failures[0]
-
-
-def test_eval_gate_skips_the_prior_rule_on_a_single_label_shard() -> None:
-    """A one-label shard makes the prior rule vacuous: SKIP, and never a quiet pass."""
-    manifest = _gate_manifest()
-    manifest["splits"]["test"]["label_coverage"]["architecture_style"]["labels"] = {"monolithic": 15}
-    result = _served_gate(_gate_summary(), manifest)
-    assert result.failures == []
-    assert [entry["rule"] for entry in result.skipped] == ["R5-prior"]
-
-
-def test_eval_gate_fails_closed_without_a_manifest() -> None:
-    """No manifest (absent file, or a layout the gate does not know) blocks the build."""
-    module = _gate_module()
-    assert any(
-        "schema_version" in failure
-        for failure in module.check(_gate_summary(), None, ["architecture_style"], ["category"]).failures
-    )
-    assert any(
-        "no rows for question ids" in failure
-        for failure in module.check(_gate_summary(), {}, ["architecture_style"], ["category"]).failures
-    )
-
-
-def test_eval_gate_load_manifest_rejects_an_unknown_schema(tmp_path: Path) -> None:
-    module = _gate_module()
-    path = tmp_path / "manifest.json"
-    path.write_text(json.dumps({"schema_version": 1, "splits": {}}), encoding="utf-8")
-    assert module.load_manifest(path) is None
-    path.write_text(json.dumps(_gate_manifest()), encoding="utf-8")
-    assert module.load_manifest(path) is not None
-
-
-def test_eval_gate_reports_the_unserved_question_without_gating_it() -> None:
-    """No CLM client sends the category question: a regression there is advisory."""
-    summary = _gate_summary()
-    summary["test"]["per_question"]["category"] = 0.1
-    result = _served_gate(summary)
-    assert result.failures == []
-    assert any(check["rule"] == "R3-advisory" and "test 0.1000" in check["detail"] for check in result.checks)
-
-
-def test_eval_gate_fails_a_missing_question() -> None:
-    """Every manifest question the gate reasons about must have test rows."""
-    manifest = _gate_manifest()
-    del manifest["splits"]["test"]["per_question"]["category"]
-    failures = _served_gate(_gate_summary(), manifest).failures
-    assert any("no rows for question ids" in failure for failure in failures)
-
-
-def test_eval_gate_fails_without_accuracies() -> None:
-    assert _served_gate({}).failures != []
-
-
-def test_eval_gate_fails_a_test_label_without_train_support() -> None:
-    """R6: the fixture's train block lacks saga — a saga test label blocks the build."""
-    manifest = _gate_manifest()
-    manifest["splits"]["train"]["label_coverage"]["architecture_style"]["labels"] = {
-        "monolithic": 20,
-        "none": 11,
-    }
-    result = _served_gate(_gate_summary(), manifest)
-    assert any("R6-support" in failure and "saga" in failure for failure in result.failures)
-
-
-def test_eval_gate_passes_r6_when_train_supports_every_test_label() -> None:
-    """R6 is silent when the train histogram covers every test label."""
-    manifest = _gate_manifest()
-    test_labels = manifest["splits"]["test"]["label_coverage"]["architecture_style"]["labels"]
-    manifest["splits"]["train"]["label_coverage"]["architecture_style"]["labels"] = dict(test_labels)
-    result = _served_gate(_gate_summary(), manifest)
-    assert result.failures == []
-    assert any(check["rule"] == "R6-support" and check["status"] == "pass" for check in result.checks)
-
-
-def test_eval_gate_fails_unacknowledged_train_uncovered_criteria() -> None:
-    """R7: the fixture's uncovered ``hexagonal`` blocks the build with an empty ledger."""
-    result = _served_gate(_gate_summary(), ledger={})
-    assert any("R7-coverage" in failure and "hexagonal" in failure for failure in result.failures)
-
-
-def test_eval_gate_passes_r7_when_coverage_is_acknowledged() -> None:
-    """R7 passes when the ledger acks every uncovered key at the source digest."""
-    result = _served_gate(_gate_summary())
-    assert result.failures == []
-    assert any(check["rule"] == "R7-coverage" and check["status"] == "pass" for check in result.checks)
-
-
-def test_eval_gate_voids_coverage_ack_on_stale_digest() -> None:
-    """An ack recorded against other bytes does not certify the current export."""
-    ledger: dict[str, Any] = {
-        "coverage_ack": {
-            "architecture_style": [
-                {
-                    "criterion": "hexagonal",
-                    "reviewer": "ada",
-                    "note": "reviewed last quarter",
-                    "source_sha256": "stale-digest",
-                }
-            ]
-        },
-        "reviews": {"choice": [], "style": []},
-    }
-    result = _served_gate(_gate_summary(), ledger=ledger)
-    assert any("R7-coverage" in failure for failure in result.failures)
-
-
-def test_eval_gate_reports_unreviewed_category_without_blocking() -> None:
-    """R8: unreviewed category gold is a visible caveat, never a failure."""
-    result = _served_gate(_gate_summary())
-    assert result.failures == []
-    notes = [check for check in result.checks if check["rule"] == "R8-choice-review"]
-    assert len(notes) == 1
-    assert "stays unreviewed" in notes[0]["detail"]
-
-
-def test_eval_gate_reports_reviewed_category_when_certified() -> None:
-    """R8 flips to reviewed once 100 choice rows are certified at the digest."""
-    ledger: dict[str, Any] = {
-        "coverage_ack": {
-            "architecture_style": [
-                {
-                    "criterion": "hexagonal",
-                    "reviewer": "ada",
-                    "note": "ok",
-                    "source_sha256": "fixture-style",
-                }
-            ]
-        },
-        "reviews": {
-            "choice": [
-                {
-                    "scenario_id": f"s{index}",
-                    "label": "domain-modeling",
-                    "reviewer": "ada",
-                    "label_ok": True,
-                    "source_sha256": "fixture-choice",
-                }
-                for index in range(100)
-            ],
-            "style": [],
-        },
-    }
-    result = _served_gate(_gate_summary(), ledger=ledger)
-    assert result.failures == []
-    notes = [check for check in result.checks if check["rule"] == "R8-choice-review"]
-    assert "category gold reviewed" in notes[0]["detail"]
-
-
-def test_eval_gate_main_writes_the_runbook_line_and_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    eval_gate = _load("clm_eval_gate", "clm_eval_gate.py")
-    summary_path = tmp_path / "finetune_summary.json"
-    summary_path.write_text(json.dumps(_gate_summary()), encoding="utf-8")
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(_gate_manifest()), encoding="utf-8")
-    choice_path = tmp_path / "choice.jsonl"
-    choice_path.write_text("{}\n", encoding="utf-8")
-    style_path = tmp_path / "style.jsonl"
-    style_bytes = b"{}\n"
-    style_path.write_bytes(style_bytes)
-    review_path = tmp_path / "review.json"
-    review_path.write_text(
-        json.dumps(
-            {
-                "coverage_ack": {
-                    "architecture_style": [
-                        {
-                            "criterion": "hexagonal",
-                            "reviewer": "fixture",
-                            "note": "R7-neutral default",
-                            "source_sha256": hashlib.sha256(style_bytes).hexdigest(),
-                        }
-                    ]
-                },
-                "reviews": {"choice": [], "style": []},
-            }
-        ),
-        encoding="utf-8",
-    )
-    report_path = tmp_path / "gate.json"
-    args = [
-        "--summary",
-        str(summary_path),
-        "--manifest",
-        str(manifest_path),
-        "--questions",
-        "architecture_style",
-        "--advisory-questions",
-        "category",
-        "--choice",
-        str(choice_path),
-        "--style",
-        str(style_path),
-        "--review",
-        str(review_path),
-        "--report",
-        str(report_path),
+def test_style_corpus_states_are_raw_descriptions() -> None:
+    """Ch2 receives the raw scenario description, so the gold state must be exactly that."""
+    corpus = json.loads((REPO_ROOT / "tests" / "benchmark" / "scenarios" / "full.json").read_text(encoding="utf-8"))
+    scenarios = {item["scenario_id"]: item for item in corpus["scenarios"]}
+    rows = [
+        json.loads(line)
+        for line in (REPO_ROOT / "qa" / "typed" / "style.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
-    assert eval_gate.main(args) == 0
-    assert "clm-eval-gate: PASS" in capsys.readouterr().out
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "pass"
-    assert report["questions"] == ["architecture_style"]
-    assert report["advisory_questions"] == ["category"]
-    with pytest.raises(SystemExit, match="does not exist"):
-        eval_gate.main(["--summary", str(tmp_path / "absent.json")])
-
-
-def test_eval_gate_main_fails_and_still_writes_a_report(tmp_path: Path) -> None:
-    eval_gate = _load("clm_eval_gate", "clm_eval_gate.py")
-    summary = _gate_summary()
-    summary["best_epoch"] = 0
-    summary_path = tmp_path / "finetune_summary.json"
-    summary_path.write_text(json.dumps(summary), encoding="utf-8")
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(_gate_manifest()), encoding="utf-8")
-    report_path = tmp_path / "gate.json"
-    code = eval_gate.main(
-        ["--summary", str(summary_path), "--manifest", str(manifest_path), "--report", str(report_path)]
-    )
-    assert code == 1
-    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == "fail"
-
-
-@pytest.fixture(scope="module")
-def rank_parity() -> types.ModuleType:
-    return _load("clm_rank_parity", "clm_rank_parity.py")
-
-
-def _payload_row(
-    scenario_id: str, answers: list[str], question: str | None = None, relevance: list[int] | None = None
-) -> dict[str, Any]:
-    return {
-        "scenario_id": scenario_id,
-        "family": "family-a",
-        "context": "",
-        "question": question or f"decide {scenario_id}",
-        "answers": answers,
-        "answer_names": [f"pattern-{index}" for index in range(len(answers))],
-        "relevance": relevance if relevance is not None else [3] + [0] * (len(answers) - 1),
-    }
-
-
-def _write_payloads(path: Path, payloads: list[dict[str, Any]]) -> Path:
-    path.write_text("\n".join(json.dumps(payload) for payload in payloads), encoding="utf-8")
-    return path
-
-
-def test_rank_payloads_load_in_order(rank_parity: types.ModuleType, tmp_path: Path) -> None:
-    """The artifact is replayed as written: one served-shape payload per scenario."""
-    path = _write_payloads(
-        tmp_path / "payloads.jsonl",
-        [_payload_row("s2", ["a", "b"]), _payload_row("s1", ["a", "b"])],
-    )
-    payloads = rank_parity.load_payloads(path)
-    assert [payload["scenario_id"] for payload in payloads] == ["s2", "s1"]
-    assert payloads[0]["answers"] == ["a", "b"]
-
-
-def test_rank_payloads_refuse_a_single_answer_payload(rank_parity: types.ModuleType, tmp_path: Path) -> None:
-    """A one-answer payload has no ranking to measure — refuse rather than score it."""
-    path = _write_payloads(tmp_path / "payloads.jsonl", [_payload_row("s1", ["only"])])
-    with pytest.raises(SystemExit, match="fewer than two answers"):
-        rank_parity.load_payloads(path)
-
-
-def test_rank_payloads_refuse_an_empty_file(rank_parity: types.ModuleType, tmp_path: Path) -> None:
-    path = tmp_path / "payloads.jsonl"
-    path.write_text("", encoding="utf-8")
-    with pytest.raises(SystemExit, match="no payloads"):
-        rank_parity.load_payloads(path)
-
-
-def test_rank_payloads_refuse_a_payload_without_relevance(rank_parity: types.ModuleType, tmp_path: Path) -> None:
-    """nDCG is a gate now: a payload without aligned grades stops the build."""
-    row = _payload_row("s1", ["a", "b"])
-    del row["relevance"]
-    path = _write_payloads(tmp_path / "payloads.jsonl", [row])
-    with pytest.raises(SystemExit, match="no relevance grades"):
-        rank_parity.load_payloads(path)
-
-
-def test_ndcg_scores_graded_rankings(rank_parity: types.ModuleType) -> None:
-    """Ideal ordering is 1.0; burying the primary below a negative costs DCG."""
-    answers = ["best", "mid", "junk"]
-    relevance = [3.0, 1.0, 0.0]
-    assert rank_parity.ndcg_at(["best", "mid", "junk"], answers, relevance, 10) == pytest.approx(1.0)
-    buried = 1.0 + 3.0 / 1.584962500721156  # gain-1 at rank 1, gain-3 demoted to rank 2 (log2(3))
-    ideal = 3.0 + 1.0 / 1.584962500721156
-    assert rank_parity.ndcg_at(["mid", "best", "junk"], answers, relevance, 10) == pytest.approx(buried / ideal)
-    assert rank_parity.ndcg_at(["junk", "junk"], answers, relevance, 10) == pytest.approx(0.0)
-    # All-negative payload: there is nothing to rank, so any ordering is perfect.
-    assert rank_parity.ndcg_at(["junk"], ["junk"], [0.0], 10) == pytest.approx(1.0)
-
-
-def test_top5_overlap_measures_head_survival(rank_parity: types.ModuleType) -> None:
-    """Identity is 1.0, a disjoint head is 0.0, and only the first five count."""
-    head = ["a", "b", "c", "d", "e"]
-    assert rank_parity.top5_overlap(head, head) == pytest.approx(1.0)
-    assert rank_parity.top5_overlap(head, ["f", "g"]) == pytest.approx(0.0)
-    assert rank_parity.top5_overlap(head, ["b", "a"]) == pytest.approx(0.4)
-    assert rank_parity.top5_overlap(["a"], ["b"]) == pytest.approx(0.0)
-
-
-def test_rank_gate_requires_an_explicit_budget(rank_parity: types.ModuleType, tmp_path: Path) -> None:
-    """The budget is a reviewed constant at the call site, never a hidden default."""
-    path = _write_payloads(tmp_path / "payloads.jsonl", [_payload_row("s1", ["a", "b"])])
-    with pytest.raises(SystemExit, match="--max-flip-rate is required"):
-        rank_parity.main(
-            [
-                "--payloads",
-                str(path),
-                "--released",
-                "r.pt",
-                "--trained",
-                "t.pt",
-                "--clm-src",
-                str(tmp_path),
-                "--emb-url",
-                "http://127.0.0.1:8090/v1/embeddings",
-            ]
-        )
-
-
-def test_rank_gate_counts_flips_and_writes_the_report(
-    rank_parity: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The gate compares released vs trained through the served rank call and reports."""
-    path = _write_payloads(
-        tmp_path / "payloads.jsonl",
-        # Uniform gains: nDCG is 1.0 under any ordering, so this test isolates the flip budget.
-        [
-            _payload_row(f"s{index}", ["p0", "p1", "p2", "p3", "p4", "p5"], relevance=[1, 1, 1, 1, 1, 1])
-            for index in range(4)
-        ],
-    )
-
-    class _StubEngine:
-        def rank(self, context: str, candidates: list[str], instructions: Any, model: str) -> list[dict[str, Any]]:
-            assert context == ""
-            order = candidates if model == "released" or instructions != "decide s0" else candidates[::-1]
-            return [{"rank": index + 1, "candidate": text, "prob": 0.9} for index, text in enumerate(order)]
-
-    class _StubEmbedder:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-    stub_engine = types.ModuleType("clm.engine")
-    stub_engine.Engine = lambda *args, **kwargs: _StubEngine()  # type: ignore[attr-defined]
-    stub_embedder = types.ModuleType("clm.embedder")
-    stub_embedder.Embedder = _StubEmbedder  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "clm.engine", stub_engine)
-    monkeypatch.setitem(sys.modules, "clm.embedder", stub_embedder)
-    report = tmp_path / "parity.json"
-    base = [
-        "--payloads",
-        str(path),
-        "--released",
-        "released.pt",
-        "--trained",
-        "trained.pt",
-        "--clm-src",
-        str(tmp_path),
-        "--emb-url",
-        "http://127.0.0.1:8090/v1/embeddings",
-        "--report",
-        str(report),
-    ]
-    assert rank_parity.main([*base, "--max-flip-rate", "0.25"]) == 0
-    written = json.loads(report.read_text(encoding="utf-8"))
-    assert written["status"] == "pass"
-    assert written["flip_rate"] == pytest.approx(0.25)
-    assert [flip["scenario_id"] for flip in written["flips"]] == ["s0"]
-    # Names, not answer texts: document_text runs to kilobytes and the report is sha-pinned.
-    assert written["flips"][0] == {"scenario_id": "s0", "released": "pattern-0", "trained": "pattern-5"}
-    # Reversing a six-answer list keeps four of the five released head entries.
-    assert written["mean_top5_overlap"] == pytest.approx((3 * 1.0 + 0.8) / 4)
-    assert written["mean_trained_ndcg10"] == pytest.approx(1.0)
-    assert written["mean_released_ndcg10"] == pytest.approx(1.0)
-    assert rank_parity.main([*base, "--max-flip-rate", "0.24"]) == 1
-
-
-def test_rank_gate_fails_a_rank_regression_within_flip_budget(
-    rank_parity: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A flip toward a worse ranking fails even when the flip count is inside budget."""
-    path = _write_payloads(
-        tmp_path / "payloads.jsonl",
-        [_payload_row("s0", ["best", "junk"], relevance=[3, 0])],
-    )
-
-    class _StubEngine:
-        def rank(self, context: str, candidates: list[str], instructions: Any, model: str) -> list[dict[str, Any]]:
-            del context, instructions
-            order = candidates if model == "released" else candidates[::-1]
-            return [{"rank": index + 1, "candidate": text, "prob": 0.9} for index, text in enumerate(order)]
-
-    class _StubEmbedder:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-    stub_engine = types.ModuleType("clm.engine")
-    stub_engine.Engine = lambda *args, **kwargs: _StubEngine()  # type: ignore[attr-defined]
-    stub_embedder = types.ModuleType("clm.embedder")
-    stub_embedder.Embedder = _StubEmbedder  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "clm.engine", stub_engine)
-    monkeypatch.setitem(sys.modules, "clm.embedder", stub_embedder)
-    report = tmp_path / "parity.json"
-    code = rank_parity.main(
-        [
-            "--payloads",
-            str(path),
-            "--released",
-            "released.pt",
-            "--trained",
-            "trained.pt",
-            "--clm-src",
-            str(tmp_path),
-            "--emb-url",
-            "http://127.0.0.1:8090/v1/embeddings",
-            "--max-flip-rate",
-            "1.0",
-            "--report",
-            str(report),
-        ]
-    )
-    assert code == 1
-    written = json.loads(report.read_text(encoding="utf-8"))
-    assert written["status"] == "fail"
-    assert written["mean_released_ndcg10"] == pytest.approx(1.0)
-    # Reversed: the gain-3 answer sits at rank 2, so nDCG = (3/log2(3)) / 3.
-    assert written["mean_trained_ndcg10"] == pytest.approx(1 / 1.584962500721156)
+    for row in rows:
+        scenario = scenarios[row["source"]["scenario_id"]]
+        assert row["state"] == scenario["description"]
+        assert row["source"]["split"] == scenario["split"]
 
 
 @pytest.fixture(scope="module")
 def calibrator() -> types.ModuleType:
-    return _load("clm_calibrate", "clm_calibrate.py")
+    return _load("tacit_calibrate", "tacit_calibrate.py")
 
 
 def test_calibration_metrics_match_definitions(calibrator: types.ModuleType) -> None:
@@ -1386,12 +1082,16 @@ def test_calibration_metrics_match_definitions(calibrator: types.ModuleType) -> 
 
 
 def test_calibration_table_reports_override_accuracy(calibrator: types.ModuleType) -> None:
-    """Acted accuracy is over overrides only; confident ``none`` answers are stratified out."""
+    """Acted accuracy is over overrides only; confident ``none`` answers are stratified out.
+
+    Each pair is ``(stage-2 confidence, acted confidence, correct, choice)``: the acted
+    number is ``min(stage1, stage2)``, the value the two-stage seam compares with its floor.
+    """
     pairs = [
-        (0.9, True, "hexagonal"),
-        (0.8, True, "hexagonal"),
-        (0.4, False, "hexagonal"),
-        (0.2, False, "hexagonal"),
+        (0.9, 0.9, True, "hexagonal"),
+        (0.8, 0.8, True, "hexagonal"),
+        (0.4, 0.4, False, "hexagonal"),
+        (0.2, 0.2, False, "hexagonal"),
     ]
     report = calibrator.summarize(pairs, [0.5, 0.85], 10)
     assert report["n"] == 4
@@ -1407,7 +1107,7 @@ def test_calibration_table_reports_override_accuracy(calibrator: types.ModuleTyp
 
 def test_calibration_table_stratifies_abstentions(calibrator: types.ModuleType) -> None:
     """A confident ``none`` is a seam no-op: counted separately, never in the enable bar."""
-    pairs = [(0.9, True, "hexagonal"), (0.9, True, "none"), (0.9, False, "none")]
+    pairs = [(0.9, 0.9, True, "hexagonal"), (0.9, 0.9, True, "none"), (0.9, 0.9, False, "none")]
     by_floor = {row["floor"]: row for row in calibrator.summarize(pairs, [0.5], 10)["floors"]}
     row = by_floor[0.5]
     assert row["acted"] == 1
@@ -1421,7 +1121,7 @@ def test_calibration_table_stratifies_abstentions(calibrator: types.ModuleType) 
 
 def test_calibration_table_bands_small_samples(calibrator: types.ModuleType) -> None:
     """Every floor row carries a 95% Wilson interval; an empty override set spans [0, 1]."""
-    pairs = [(0.9, True, "none")]
+    pairs = [(0.9, 0.9, True, "none")]
     by_floor = {row["floor"]: row for row in calibrator.summarize(pairs, [0.5], 10)["floors"]}
     row = by_floor[0.5]
     assert row["acted"] == 0
@@ -1431,10 +1131,72 @@ def test_calibration_table_bands_small_samples(calibrator: types.ModuleType) -> 
     assert 0.0 < low < 0.8 < high < 1.0
 
 
-def test_calibration_metric_selects_the_floored_number(calibrator: types.ModuleType) -> None:
-    answer = {"choice": "x", "confidence": 0.3, "probabilities": {"x": 0.6, "y": 0.4}}
-    assert calibrator.metric_of(answer, "confidence") == pytest.approx(0.3)
-    assert calibrator.metric_of(answer, "top_prob") == pytest.approx(0.6)
+def test_calibration_acted_rule_needs_both_stages(calibrator: types.ModuleType) -> None:
+    """A confident stage 2 behind a weak stage 1 is NOT acted: the seam would not override."""
+    pairs = [
+        (0.95, 0.95, True, "hexagonal"),  # both stages confident → acted and right
+        (0.95, 0.30, False, "hexagonal"),  # stage 1 below the floor → never acted
+    ]
+    row = next(row for row in calibrator.summarize(pairs, [0.5], 10)["floors"] if row["floor"] == 0.5)
+    assert row["acted"] == 1
+    assert row["acted_accuracy"] == pytest.approx(1.0)
+    assert row["acted_rate"] == pytest.approx(0.5)
+    # ECE/Brier stay over the stage-2 probability of every row, not the acted number.
+    summary = calibrator.summarize(pairs, [0.5], 10)
+    assert summary["n"] == 2
+    assert summary["replay_failures"] == 0
+    # A broken replay (no usable answer) is reported as a FAILURE at every floor: a failed
+    # row is never "acted", so a per-floor count would read 0 and look like abstention.
+    broken = calibrator.summarize([*pairs, (0.0, 0.0, False, None)], [0.0, 0.5], 10)
+    assert broken["replay_failures"] == 1
+    assert all("replay_failures" not in row for row in broken["floors"])
+
+
+def test_calibration_ask_replays_the_served_two_stage_bytes(calibrator: types.ModuleType) -> None:
+    """Stage 1 is the category question/cap; stage 2 the shortlist question; both cap the state."""
+    seams = seam_prompts
+    calls: list[dict[str, Any]] = []
+
+    def _fake_decide(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
+        calls.append(item)
+        if len(calls) == 1:
+            return {"answer": "domain-modeling", "probs": {"domain-modeling": 0.8, "saga": 0.2}}
+        options = [str(option) for option in item["options"]]
+        return {"answer": options[0], "probs": dict.fromkeys(options, 0.5 / max(1, len(options) - 1)) | {options[0]: 0.5}}
+
+    original = calibrator._decide
+    calibrator._decide = _fake_decide  # type: ignore[assignment]
+    try:
+        answer = calibrator.ask(
+            "http://x:18100", {"state": "y" * (seams.DECISION_STATE_MAX_CHARS + 10)}, seams, 5.0
+        )
+    finally:
+        calibrator._decide = original  # type: ignore[assignment]
+    assert answer["stage1"] == pytest.approx(0.8)
+    assert answer["choice"] == seams.styles_for_category("domain-modeling")[0]
+    assert answer["confidence"] == pytest.approx(0.5)
+    assert [call["kind"] for call in calls] == ["choice", "choice"]
+    assert calls[0]["question"] == seams.category_question()
+    assert calls[0]["options"] == list(seams.CATEGORY_SLUGS)
+    assert calls[1]["question"] == seams.style_question(seams.styles_for_category("domain-modeling"))
+    assert calls[1]["options"] == [*seams.styles_for_category("domain-modeling"), seams.STYLE_NONE_KEY]
+    assert len(calls[1]["options"]) <= 26
+    # Serving truncates the description at the shared cap before asking either question.
+    assert all(call["state"] == "y" * seams.DECISION_STATE_MAX_CHARS for call in calls)
+
+
+def test_calibration_ask_never_acts_on_a_broken_stage_one(calibrator: types.ModuleType) -> None:
+    """An off-taxonomy stage-1 answer yields a never-acted row instead of aborting the replay."""
+    original = calibrator._decide
+    calibrator._decide = lambda base_url, item, timeout: {  # type: ignore[assignment]
+        "answer": "not-a-category",
+        "probs": {"not-a-category": 1.0},
+    }
+    try:
+        answer = calibrator.ask("http://x", {"state": "s"}, seam_prompts, 5.0)
+    finally:
+        calibrator._decide = original  # type: ignore[assignment]
+    assert answer == {"choice": None, "probabilities": {}, "confidence": 0.0, "stage1": 0.0}
 
 
 def test_calibration_replays_holdout_only_by_default(
@@ -1463,24 +1225,26 @@ def test_calibration_replays_holdout_only_by_default(
     ]
     path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
 
-    def _fake_ask(base_url: str, model: str, row: dict[str, Any], question_id: str, timeout: float) -> dict[str, Any]:
-        seen.append({"model": model, "state": row["state"], "qid": question_id})
-        return {"choice": "a", "confidence": 0.7, "probabilities": {"a": 0.7, "b": 0.3}}
+    def _fake_ask(base_url: str, row: dict[str, Any], seams: Any, timeout: float) -> dict[str, Any]:
+        seen.append({"base_url": base_url, "state": row["state"], "category": seams.CATEGORY_SLUGS[0]})
+        return {"choice": "a", "confidence": 0.7, "probabilities": {"a": 0.7, "b": 0.3}, "stage1": 0.7}
 
     monkeypatch.setattr(calibrator, "ask", _fake_ask)
-    assert calibrator.main(["--style", str(path), "--base-url", "http://x/v1", "--floors", "0.5"]) == 0
+    assert calibrator.main(["--style", str(path), "--base-url", "http://x:18100", "--floors", "0.5"]) == 0
+    # Holdout only, and the replay gets the SEAM vocabulary module (serving bytes).
     assert [entry["state"] for entry in seen] == ["system one"]
-    assert seen[0]["qid"] == "architecture_style"
+    assert seen[0]["base_url"] == "http://x:18100"
+    assert seen[0]["category"] == "domain-modeling"
 
 
 def test_recommend_picks_the_lowest_qualifying_floor(calibrator: types.ModuleType) -> None:
     """The recommendation is the lowest floor clearing both bars, not the most accurate one."""
     pairs = [
-        (0.9, True, "hexagonal"),
-        (0.8, True, "hexagonal"),
-        (0.7, False, "hexagonal"),
-        (0.6, False, "hexagonal"),
-        (0.2, False, "hexagonal"),
+        (0.9, 0.9, True, "hexagonal"),
+        (0.8, 0.8, True, "hexagonal"),
+        (0.7, 0.7, False, "hexagonal"),
+        (0.6, 0.6, False, "hexagonal"),
+        (0.2, 0.2, False, "hexagonal"),
     ]
     table = calibrator.summarize(pairs, [0.5, 0.65, 0.85], 10)["floors"]
     # 0.5 acts on four rows at 0.50 accuracy (fails the 0.6 bar); 0.65 acts on two of
@@ -1493,7 +1257,7 @@ def test_recommend_picks_the_lowest_qualifying_floor(calibrator: types.ModuleTyp
 
 def test_recommend_refuses_a_floor_below_the_min_acted_count(calibrator: types.ModuleType) -> None:
     """A perfect floor on too few overrides never qualifies, however accurate."""
-    pairs = [(0.9, True, "hexagonal"), (0.9, True, "hexagonal")]
+    pairs = [(0.9, 0.9, True, "hexagonal"), (0.9, 0.9, True, "hexagonal")]
     table = calibrator.summarize(pairs, [0.5], 10)["floors"]
     assert calibrator.recommend(table, 0.8, 0.1, 10)["floor"] is None
     assert calibrator.recommend(table, 0.8, 0.1, 2)["floor"] == pytest.approx(0.5)
@@ -1503,7 +1267,11 @@ def test_recommend_refuses_a_floor_below_the_min_acted_count(calibrator: types.M
 
 
 def test_recommend_reports_nothing_when_no_floor_qualifies(calibrator: types.ModuleType) -> None:
-    pairs = [(0.9, False, "hexagonal"), (0.8, False, "hexagonal"), (0.7, False, "hexagonal")]
+    pairs = [
+        (0.9, 0.9, False, "hexagonal"),
+        (0.8, 0.8, False, "hexagonal"),
+        (0.7, 0.7, False, "hexagonal"),
+    ]
     table = calibrator.summarize(pairs, [0.5, 0.85], 10)["floors"]
     recommended = calibrator.recommend(table, 0.9, 0.3)
     assert recommended["floor"] is None
@@ -1511,7 +1279,7 @@ def test_recommend_reports_nothing_when_no_floor_qualifies(calibrator: types.Mod
 
 
 def test_recommend_reports_only_without_thresholds(calibrator: types.ModuleType) -> None:
-    table = calibrator.summarize([(0.9, True, "hexagonal")], [0.5], 10)["floors"]
+    table = calibrator.summarize([(0.9, 0.9, True, "hexagonal")], [0.5], 10)["floors"]
     assert calibrator.recommend(table, None, None)["floor"] is None
     assert calibrator.recommend(table, 0.5, None)["floor"] is None
 
@@ -1537,7 +1305,7 @@ def test_calibration_main_fails_when_no_floor_qualifies(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "b", "confidence": 0.9, "probabilities": {"a": 0.1, "b": 0.9}},
+        lambda *args, **kwargs: {"choice": "b", "confidence": 0.9, "probabilities": {"a": 0.1, "b": 0.9}, "stage1": 0.9},
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1601,7 +1369,7 @@ def test_calibration_main_refuses_to_recommend_without_human_review(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}},
+        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}, "stage1": 0.9},
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1664,7 +1432,7 @@ def test_calibration_main_recommends_once_the_ledger_certifies(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}},
+        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}, "stage1": 0.9},
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1725,7 +1493,7 @@ def test_calibration_main_voids_coverage_when_labels_change(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}},
+        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}, "stage1": 0.9},
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1753,203 +1521,14 @@ def test_calibration_main_voids_coverage_when_labels_change(
     assert written["recommended"]["floor"] is None
 
 
-def test_label_coverage_names_histograms_and_gaps(exporter: types.ModuleType) -> None:
-    """The manifest records per-QUESTION label counts and the criteria keys with zero rows."""
-    rows = [
-        {
-            "id": "s1:category",
-            "state": "s",
-            "questions": json.dumps({"category": {"criteria": {"a": "A", "b": "B"}}}),
-            "gold": json.dumps({"category": {"label": "a"}}),
-        },
-        {
-            "id": "s2:category",
-            "state": "s",
-            "questions": json.dumps({"category": {"criteria": {"a": "A", "b": "B"}}}),
-            "gold": json.dumps({"category": {"label": "a"}}),
-        },
-        {
-            "id": "s1:style",
-            "state": "s",
-            "questions": json.dumps({"architecture_style": {"criteria": {"x": "X", "y": "Y"}}}),
-            "gold": json.dumps({"architecture_style": {"label": "y"}}),
-        },
-    ]
-    coverage = exporter.label_coverage(rows)
-    assert coverage["category"] == {"labels": {"a": 2}, "uncovered": ["b"]}
-    assert coverage["architecture_style"] == {"labels": {"y": 1}, "uncovered": ["x"]}
-    assert exporter.per_question_counts(rows) == {"architecture_style": 1, "category": 2}
-
-
-def test_manifest_schema_matches_the_gate(exporter: types.ModuleType) -> None:
-    """Exporter and gate must agree on the manifest layout, or the gate fails closed."""
-    assert exporter.MANIFEST_SCHEMA_VERSION == _gate_module().SUPPORTED_MANIFEST_SCHEMA
-
-
-def test_manifest_records_the_clm_pin_the_exporter_assumes(exporter: types.ModuleType) -> None:
-    """The pin selects which upstream adapter revision the row layout must match."""
-    args = exporter.parse_args(["--out", "/tmp/x", "--clm-pin", "abc1234"])
-    assert args.clm_pin == "abc1234"
-    assert exporter.parse_args(["--out", "/tmp/x"]).clm_pin == "d5f9ef0"
-
-
 def test_calibrator_none_choice_matches_the_served_vocabulary(calibrator: types.ModuleType) -> None:
     """The stratified ``none`` must be the seam's own abstention key, not a lookalike."""
     assert calibrator.NONE_CHOICE == seam_prompts.STYLE_NONE_KEY
 
 
-def test_split_summary_carries_counts_and_coverage(exporter: types.ModuleType) -> None:
-    rows = [
-        {
-            "id": "s1:style",
-            "state": "s",
-            "questions": json.dumps({"architecture_style": {"criteria": {"x": "X", "y": "Y"}}}),
-            "gold": json.dumps({"architecture_style": {"label": "x"}}),
-        }
-    ]
-    summary = exporter.split_summary(rows, "holdout")
-    assert summary["source_split"] == "holdout"
-    assert summary["rows"] == 1
-    assert summary["per_question"] == {"architecture_style": 1}
-    assert summary["label_coverage"]["architecture_style"]["uncovered"] == ["y"]
-
-
-def _typed_source_row(row_id: str, split: str, label: str = "a") -> dict[str, Any]:
-    return {
-        "id": row_id,
-        "state": f"state for {row_id}",
-        "type": "choice",
-        "criteria": {"a": "A", "b": "B"},
-        "label": label,
-        "source": {"split": split, "scenario_id": row_id},
-    }
-
-
-def _stub_parquet(monkeypatch: pytest.MonkeyPatch, exporter: types.ModuleType) -> list[list[str]]:
-    """Record the shard each row lands in without needing pyarrow."""
-    shards: list[list[str]] = []
-
-    def _write(rows: list[dict[str, Any]], path: Path) -> str:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shards.append([str(row["id"]) for row in rows])
-        return f"sha-{path.name}-{len(rows)}"
-
-    monkeypatch.setattr(exporter, "write_parquet", _write)
-    return shards
-
-
-def test_export_routes_the_holdout_split_to_the_test_shard(
-    exporter: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The gate's evidence is the family-disjoint holdout shard, not a train carve-out."""
-    choice = tmp_path / "choice.jsonl"
-    choice.write_text(
-        "\n".join(
-            json.dumps(row) for row in [_typed_source_row("s1", "train"), _typed_source_row("s2", "holdout", label="b")]
-        ),
-        encoding="utf-8",
-    )
-    style = tmp_path / "style.jsonl"
-    style.write_text(
-        "\n".join(
-            json.dumps(row) for row in [_typed_source_row("s3", "train", label="b"), _typed_source_row("s4", "holdout")]
-        ),
-        encoding="utf-8",
-    )
-    out = tmp_path / "data"
-    shards = _stub_parquet(monkeypatch, exporter)
-    assert exporter.main(["--choice", str(choice), "--style", str(style), "--out", str(out), "--workflow", "all"]) == 0
-    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == exporter.MANIFEST_SCHEMA_VERSION
-    assert manifest["splits"]["train"]["source_split"] == "train"
-    assert manifest["splits"]["test"]["source_split"] == "holdout"
-    assert manifest["splits"]["train"]["per_question"] == {"architecture_style": 1, "category": 1}
-    assert manifest["splits"]["test"]["per_question"] == {"architecture_style": 1, "category": 1}
-    assert shards == [["s1", "s3"], ["s2", "s4"]]
-
-
-def test_export_refuses_the_same_id_in_both_shards(
-    exporter: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Train and eval must never share a row; a corpus bug must stop the build."""
-    choice = tmp_path / "choice.jsonl"
-    choice.write_text(
-        "\n".join(json.dumps(row) for row in [_typed_source_row("dup", "train"), _typed_source_row("dup", "holdout")]),
-        encoding="utf-8",
-    )
-    style = tmp_path / "style.jsonl"
-    style.write_text(
-        "\n".join(
-            json.dumps(row) for row in [_typed_source_row("s1", "train"), _typed_source_row("s2", "holdout", label="b")]
-        ),
-        encoding="utf-8",
-    )
-    _stub_parquet(monkeypatch, exporter)
-    with pytest.raises(SystemExit, match="both splits"):
-        exporter.main(["--choice", str(choice), "--style", str(style), "--out", str(tmp_path / "data")])
-
-
-def test_rank_payload_artifact_is_served_shaped() -> None:
-    """The committed artifact carries served bytes: document_text answers, holdout only."""
-    payloads = [
-        json.loads(line)
-        for line in (REPO_ROOT / "qa" / "typed" / "rank_payloads.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    corpus = json.loads((REPO_ROOT / "tests" / "benchmark" / "scenarios" / "full.json").read_text(encoding="utf-8"))
-    scenarios = {item["scenario_id"]: item for item in corpus["scenarios"]}
-    holdout = {sid for sid, item in scenarios.items() if item["split"] == "holdout"}
-    assert {payload["scenario_id"] for payload in payloads} == holdout
-    for payload in payloads:
-        assert payload["context"] == ""
-        assert payload["question"] == scenarios[payload["scenario_id"]]["decision_statement"]
-        assert len(payload["answers"]) == len(payload["answer_names"]) == 20
-        # document_text, not the noul "name: intent" short string.
-        assert all(len(answer) > 1000 and "\n" in answer for answer in payload["answers"])
-        assert all(isinstance(name, str) and name for name in payload["answer_names"])
-        # Graded relevance travels with the payload: aligned gains, at least one positive.
-        assert len(payload["relevance"]) == 20
-        assert all(gain in (0, 1, 2, 3) for gain in payload["relevance"])
-        assert any(gain > 0 for gain in payload["relevance"])
-
-
-@pytest.fixture(scope="module")
-def preflight() -> types.ModuleType:
-    return _load("clm_preflight", "clm_preflight.py")
-
-
 @pytest.fixture(scope="module")
 def shell_check() -> types.ModuleType:
     return _load("check_dockerfile_shell", "check_dockerfile_shell.py")
-
-
-def test_preflight_pin_matches_and_rejects_a_mismatch(preflight: types.ModuleType, tmp_path: Path) -> None:
-    """The pin check is what stops a dataset exported for another CLM revision."""
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"clm_pin": "d5f9ef0"}), encoding="utf-8")
-    assert "d5f9ef0" in preflight.check_pin(manifest, "d5f9ef0")
-    with pytest.raises(SystemExit, match="adapter layout may have moved"):
-        preflight.check_pin(manifest, "deadbee")
-    manifest.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
-    with pytest.raises(SystemExit, match="dataset exported for CLM None"):
-        preflight.check_pin(manifest, "d5f9ef0")
-
-
-def test_preflight_refuses_a_served_alias_instead_of_a_snapshot(preflight: types.ModuleType, tmp_path: Path) -> None:
-    """A bare alias is the 401 bug: it is not a local directory, so the build must stop."""
-    with pytest.raises(SystemExit, match="not a local directory"):
-        preflight.check_entity(tmp_path / "qwen3-8b")
-
-
-def test_preflight_requires_consistent_arguments(preflight: types.ModuleType) -> None:
-    """Neither flag alone may silently no-op a check."""
-    with pytest.raises(SystemExit):
-        preflight.parse_args([])
-    with pytest.raises(SystemExit):
-        preflight.parse_args(["--manifest", "m.json"])
-    with pytest.raises(SystemExit):
-        preflight.parse_args(["--expect-pin", "d5f9ef0"])
-
 
 def test_shell_check_flags_an_embedded_single_quote(shell_check: types.ModuleType) -> None:
     """The exact defect that produced 'Syntax error: \"(\" unexpected'."""
@@ -1990,9 +1569,9 @@ def test_shell_check_passes_a_clean_payload(shell_check: types.ModuleType) -> No
 
 
 def test_shell_check_reads_the_real_dockerfile(shell_check: types.ModuleType) -> None:
-    """The fat CLM RUN must be discovered and carry no hazard."""
-    text = (REPO_ROOT / "docker" / "Dockerfile.clm").read_text(encoding="utf-8")
-    fat = [p for p in shell_check.payloads(text) if "clm-finetune" in p.command]
-    assert fat, "the fine-tune RUN must be discoverable"
+    """The fat self-distill RUN (the ``ldconfig && exec`` shape) must carry no hazard."""
+    text = (REPO_ROOT / "docker" / "Dockerfile.tacit").read_text(encoding="utf-8")
+    fat = [p for p in shell_check.payloads(text) if "tacit_self_distill.py" in p.command]
+    assert fat, "the self-distill RUN must be discoverable"
     for payload in fat:
         assert shell_check.problems(payload) == []

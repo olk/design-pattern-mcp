@@ -57,11 +57,9 @@ class TestDefaults:
         for seam in (decisions.style, decisions.weights, decisions.category, decisions.reasoning_gate):
             assert seam.enabled is False
             assert seam.api_key_env is None
-        assert decisions.style.provider == "clm"
-        assert decisions.style.model == "clm-latest"
-        assert decisions.style.base_url == "http://design-pattern-clm:8700/v1"
+        assert decisions.style.model == "tacit-4b"
+        assert decisions.style.base_url == "http://design-pattern-tacit:8100"
         assert decisions.style.timeout_seconds == 10.0
-        assert decisions.weights.provider == "tacit"
         assert decisions.weights.model == "tacit-4b"
         assert decisions.weights.base_url == "http://design-pattern-tacit:8100"
         assert decisions.weights.timeout_seconds == 30.0
@@ -69,22 +67,25 @@ class TestDefaults:
         assert decisions.reasoning_gate.timeout_seconds == 5.0
 
     def test_partial_seam_override_keeps_that_seams_own_endpoint(self) -> None:
-        """A partial override must not fall back onto the generic (CLM) seam defaults."""
+        """A partial override must not fall back onto the generic seam defaults."""
         decisions = ServerConfig.model_validate({"decisions": {"weights": {"enabled": True}}}).decisions
         assert decisions.weights.enabled is True
-        assert decisions.weights.provider == "tacit"
         assert decisions.weights.base_url == "http://design-pattern-tacit:8100"
         assert decisions.weights.model == "tacit-4b"
         assert decisions.weights.timeout_seconds == 30.0
-        # The siblings keep their own defaults untouched.
-        assert decisions.style.provider == "clm"
-        assert decisions.style.model == "clm-latest"
+        # The siblings keep their own per-seam timeouts untouched.
+        assert decisions.style.timeout_seconds == 10.0
         assert decisions.reasoning_gate.timeout_seconds == 5.0
+
+    def test_a_seam_rejects_an_unknown_key(self) -> None:
+        """The seam wire is single-stack: a leftover ``provider`` key must fail loudly."""
+        with pytest.raises(ValidationError):
+            ServerConfig.model_validate({"decisions": {"style": {"provider": "clm"}}})
 
     def test_decisions_snapshot_values(self) -> None:
         snapshot = ServerConfig.model_validate({}).effective_parameters()
         assert snapshot["decisions_style_enabled"] is False
-        assert snapshot["decisions_style_model"] == "clm-latest"
+        assert snapshot["decisions_style_model"] == "tacit-4b"
         assert snapshot["decisions_weights_enabled"] is False
         assert snapshot["decisions_category_enabled"] is False
         assert snapshot["decisions_reasoning_gate_enabled"] is False
@@ -93,8 +94,8 @@ class TestDefaults:
     def test_reranker_provider_defaults_to_tei(self) -> None:
         reranker = ServerConfig.model_validate({}).reranker
         assert reranker.provider == "tei"
-        assert reranker.clm_base_url == "http://design-pattern-clm:8700/v1"
-        assert reranker.clm_timeout_seconds == 60.0
+        assert reranker.tacit_base_url == "http://design-pattern-tacit:8100"
+        assert reranker.tacit_timeout_seconds == 60.0
 
     def test_reranker_provider_rejects_unknown_value(self) -> None:
         with pytest.raises(ValidationError):

@@ -5,10 +5,18 @@
 **Evidence cutoff:** 2026-10-27. **Consumer:** `/home/graemer/Projekte/Python/design-pattern-mcp` (catalog 486 main records, 6,804 language files, 9 categories, 7 scopes). **Hardware:** CPUs and GPUs; training limited to 4× RTX 3090 (24 GB each, 96 GB total).
 
 **Status:** recommendation complete, and **implemented** (2026-10-27): the four decision seams and the
-rerank provider switch ship in `src/decisions/`, `src/patterns/clm_rerank.py` and the two
-`docker/Dockerfile.{tacit,clm}` sidecars, all default-off — see README §"Decision models
-(CLM-8B + AnyJev Tacit-4B)" and `docs/implementation-guide.md` §6/§7.1/§14. The one-line answer is
-in §0; the evidence is in §1–§6; the adoption plan is in §7.
+rerank provider switch ship in `src/decisions/`, `src/patterns/tacit_rerank.py` and the one
+`docker/Dockerfile.tacit` sidecar, all default-off — see README §"Decision models (AnyJev
+Tacit-4B)" and `docs/implementation-guide.md` §6/§7.1/§14. The one-line answer is in §0; the
+evidence is in §1–§6; the adoption plan is in §7.
+
+**Status amendment (2026-11-04):** the CLM lane was removed. CLM-8B answered the two *ranking*
+seams (Ch2 style, J1 rerank) and is gone from the repo; both now run on AnyJev/Tacit with the
+two-stage procedures §6.7 called for — style as category → ≤26-style shortlist, rerank as the
+deterministic fused pool → one `yes_no` relevance question per candidate. Everything below that
+describes CLM as a *candidate* (§1–§5) is the research record that led to the decision and is kept
+as evidence; the CLM build lane, heads and sidecar no longer exist. This document is history, not
+a build instruction.
 
 ---
 

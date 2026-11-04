@@ -1,4 +1,4 @@
-"""AnyJev Tacit decision client — the J4 (weights), J2 (category) and J5 (gate) seams.
+"""AnyJev Tacit decision client — the Ch2 style, J1 rerank, J4 weights, J2 category and J5 gate seams.
 
 The AnyJev gateway (``python -m anyjev.serve``) answers ``POST /v1/decide`` with one
 decision per request (``{"state", "question", "options", "kind"}``) or a batch
@@ -10,9 +10,12 @@ renormalised over the option labels only, ``route`` is ``"one_forward"`` or ``"c
 Wire facts pinned from ``anyjev==0.3.0`` (``anyjev/serve.py``, ``anyjev/tacit.py``):
 kinds are ``choice`` / ``yes_no`` (alias ``noul``) / ``score``; a ``score`` question
 takes its ordered level labels as ``options`` (lowest first, 2-10 levels) and answers
-with the winning level *label*, so the expected value is computed here.
+with the winning level *label*, so the expected value is computed here. ``choice`` and
+``score`` are hard-capped at 26 options (``anyjev/question.py`` ``MAX_OPTIONS``) and
+``yes_no`` is exempt (its labels are fixed) — which is why the 36-way Ch2 style choice
+is served as TWO stages here (category → shortlist) instead of one question.
 
-Contract (mirrors DecisionModelClient):
+Contract (mirrors a well-behaved seam client):
 - Silent per-call degradation: any transport, status or shape failure logs a warning
   and yields ``None`` — the caller's non-model path stands, no tool call fails.
 - Cancellation is not a failure: ``asyncio.CancelledError`` propagates.
@@ -36,11 +39,15 @@ import httpx
 from src.decisions.seam_prompts import (
     CATEGORY_GLOSSES,
     CATEGORY_SLUGS,
+    DECISION_STATE_MAX_CHARS,
     GATE_STATE_MAX_CHARS,
+    STYLE_NONE_KEY,
     WEIGHT_LEVELS,
     axis_question,
     category_question,
     gate_question,
+    style_question,
+    styles_for_category,
 )
 from src.schemas.enums import QUALITY_AXES, PatternCategory
 
@@ -115,6 +122,15 @@ class TacitDecision:
     route: str = "one_forward"
 
 
+@dataclass(frozen=True)
+class StyleDecision:
+    """One resolved two-stage style choice: a style key, or ``None`` when ``none`` won."""
+
+    style: str | None
+    confidence: float
+    probabilities: dict[str, float] = field(default_factory=dict)
+
+
 class TacitClient:
     """AnyJev ``/v1/decide`` client: cache-first, degrade-on-failure semantics."""
 
@@ -139,6 +155,43 @@ class TacitClient:
             self._client = None
 
     # -- the three seams ---------------------------------------------------------
+
+    async def choose_style(self, description: str) -> StyleDecision | None:
+        """Ch2 substitution: category → shortlist; ``None`` degrades to the LLM style.
+
+        Stage 1 narrows the 36-way style question to one category's shortlist (the
+        largest is 16 styles + ``none`` = 17 ≤ the AnyJev 26-option cap); stage 2 picks
+        within it. Both stages must clear ``confidence_floor``; ``none`` winning, an
+        off-shortlist answer, or any transport/shape failure returns ``None`` so the
+        pipeline keeps the LLM-sampled style.
+        """
+        state = description[:DECISION_STATE_MAX_CHARS]
+        category, stage1 = await self.choose_category(state)
+        if category is None or stage1 < self._config.confidence_floor:
+            return None
+        styles = styles_for_category(category)
+        options = [*styles, STYLE_NONE_KEY]
+        decision = await self.decide(state, style_question(styles), options, kind="choice")
+        if decision is None or decision.answer is None or decision.answer not in options:
+            return None
+        confidence = decision.probabilities.get(decision.answer, 0.0)
+        if confidence < self._config.confidence_floor:
+            return None
+        style = None if decision.answer == STYLE_NONE_KEY else decision.answer
+        logger.info(
+            "Decision-model style choice",
+            extra={
+                "model": self._config.model,
+                "style": style or STYLE_NONE_KEY,
+                "confidence": confidence,
+                "category": category,
+            },
+        )
+        return StyleDecision(
+            style=style,
+            confidence=confidence,
+            probabilities={key: value for key, value in decision.probabilities.items() if key in options},
+        )
 
     async def choose_category(self, state: str) -> tuple[str | None, float]:
         """J2: soft 9-way category choice → ``(slug, confidence)``; ``(None, 0.0)`` degrades."""

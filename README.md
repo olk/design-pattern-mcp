@@ -27,7 +27,7 @@ An MCP (Model Context Protocol) server that provides design-pattern selection ex
   - [Docker (manual)](#docker-manual)
   - [Local Development (uv)](#local-development-uv)
 - [Configuration](#configuration)
-  - [Decision models (CLM-8B + AnyJev Tacit-4B)](#decision-models-clm-8b--anyjev-tacit-4b)
+  - [Decision models (AnyJev Tacit-4B)](#decision-models-anyjev-tacit-4b)
 - [Structured Reasoning](#structured-reasoning)
 - [Long-running tools & timeouts](#long-running-tools--timeouts)
 - [Benchmarks & Verification](#benchmarks--verification)
@@ -565,20 +565,35 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
   `make embed-cache` snapshot is reused, or point it at
   `~/.config/design-pattern-mcp/dense-cache` and let the first start write it.
 
-### Decision models (CLM-8B + AnyJev Tacit-4B)
+### Decision models (AnyJev Tacit-4B)
 
-An optional, self-hosted decision layer: two GPU sidecars answer the bounded judgments the
+An optional, self-hosted decision layer: one GPU sidecar answers the bounded judgments the
 pipeline would otherwise ask the generator, so selection stops paying LLM latency (and
 variance) for closed-set questions. **Every seam is default-off** — the base compose stack
-never starts these containers, and `config/config.json` defaults all four to `false`.
+never starts the sidecar, and `config/config.json` defaults all of them to `false`.
 
 | Seam | Model / wire | Substitutes | Degrades to |
 |---|---|---|---|
-| Ch2 style | CLM `POST /v1/systemone` (36-way `choice`) | the LLM-sampled `brief.architecture_style`, when confidence ≥ `DECISIONS_STYLE_CONFIDENCE_FLOOR` | the LLM style |
-| J1 rerank | CLM `POST /v1/rank` | the TEI cross-encoder pass over the fused pool (`RERANKER_PROVIDER=clm`) | the TEI reranker (identical call) |
+| Ch2 style | Tacit `POST /v1/decide`, **two stages** (category → ≤26-style shortlist) | the LLM-sampled `brief.architecture_style`, when BOTH stages clear `DECISIONS_STYLE_CONFIDENCE_FLOOR` | the LLM style |
+| J1 rerank | Tacit `POST /v1/decide`, one `yes_no` per fused-pool candidate (`RERANKER_PROVIDER=tacit`) | the TEI cross-encoder pass over the fused pool | the TEI reranker (identical call) |
 | J4 weights | Tacit `POST /v1/decide` (`score`, 8 axes per part) | the one batched weights LLM call, part by part | the LLM weights call |
 | J2 category | Tacit `POST /v1/decide` (`choice`, 9 categories) | one part's retrieved pool, narrowed after retrieval, and that part's effective category for scoring/fallback | no narrowing (unfiltered pool, LLM hypothesis) |
 | J5 gate | Tacit `POST /v1/decide` (`yes_no`) | whether a phase deliberates first | reasoning runs |
+
+Two procedures are worth stating because they shape the wire:
+
+- **Style is a two-stage choice.** AnyJev caps `choice` at 26 options, and the style
+  question has 36 candidates (35 styles + `none`). Stage 1 asks the served category
+  question; stage 2 asks the style question over that category's shortlist from the §10.1
+  affinity table (the largest is 16 styles + `none` = 17). A wrong or low-confidence stage 1
+  keeps the LLM style, so a stage-1 mistake can only cost an override, never inject one.
+- **Rerank is retrieve-then-rerank.** Stage 1 is the deterministic fused pool hybrid
+  retrieval already produces (already capped at `rerank_top_n` survivors); stage 2 asks one
+  `yes_no` relevance question per unique candidate document, in ONE batched request, and
+  orders the pool by `p(Yes)`. `yes_no` is exempt from the 26-option cap, so pool size is
+  unconstrained. Scores are absolute per-document probabilities, so they compare across
+  pools — at the cost of one forward per candidate, which is why `rerank_text: capsule` is
+  the recommended pairing for this provider.
 
 The invariant is the same one `docs/JEV_DECISION_MODEL_ANALYSIS_PLAN.md` §7 pins: **an
 outage never fails a tool call.** Every client returns `None`/falls back on HTTP errors,
@@ -587,31 +602,32 @@ that would empty the pool is discarded; a weights vector that comes back unusabl
 all-zero after one retry) sends that part down the LLM path; the reasoning gate fails open.
 
 ```bash
-make docker-build-decision-models   # trained in-image; needs a GPU + CDI on the builder
-make docker-up-decisions            # stack + both sidecars (one GPU each)
-make decisions-smoke                # curl the three wire endpoints on 18100 / 18700
+make docker-build-decision-models   # self-distilled in-image; needs a GPU + CDI on the builder
+make docker-up-decisions            # stack + the sidecar (one GPU)
+make decisions-smoke                # assert the three wire contracts on 18100
 make docker-down-decisions
 ```
 
-Both images bake their weights (no Hub access at start, `HF_HUB_OFFLINE=1`) and both
-*train in the build*: the Tacit image self-distils the model on this server's own seam
-prompts (`src/decisions/seam_prompts.py`, shared by trainer and server), and the CLM image
-fine-tunes its contrastive heads on `qa/typed/choice.jsonl` (train split only). Each needs a
-GPU on the builder, granted through a CDI device entitlement:
+The image bakes its weights (no Hub access at start, `HF_HUB_OFFLINE=1`) and *trains in the
+build*: it self-distils the model on this server's own seam prompts
+(`src/decisions/seam_prompts.py`, shared by trainer and server) over every seam — category,
+weights, gate, both style stages and the rerank pairs — with the teacher pass sharded across
+the visible GPUs. An under-trained seam fails the build (per-seam agreement and weights-MAE
+gates). It needs a GPU on the builder, granted through a CDI device entitlement:
 
 ```bash
 docker build --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit --target runtime-distilled .
 ```
 
-No GPU builder? `make docker-build-tacit-base` / `make docker-build-clm-base` build the
-`runtime-released` target instead (`:base` tags) — released weights, untrained, no GPU
-anywhere. Start that variant by pointing compose at it:
+No GPU builder? `make docker-build-tacit-base` builds the `runtime-released` target
+instead (a `:base` tag) — released weights, untrained, no GPU anywhere. Start that variant by
+pointing compose at it:
 
 ```bash
-TACIT_IMAGE=design-pattern-tacit:base CLM_IMAGE=design-pattern-clm:base make docker-up-decisions
+TACIT_IMAGE=design-pattern-tacit:base make docker-up-decisions
 ```
 
-On a single 24 GB card start one sidecar at a time: Tacit ≈ 8 GB, CLM ≈ 16-18 GB.
+The sidecar serves from one 24 GB card (Tacit-4B ≈ 8 GB in vLLM plus the gateway).
 
 ### Key environment variables
 
@@ -638,13 +654,13 @@ On a single 24 GB card start one sidecar at a time: Tacit ≈ 8 GB, CLM ≈ 16-1
 | `RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the CPU TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
 | `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
 | `RERANK_TOP_N` | `10` | Rerank top N |
-| `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) or `clm` (`clm-serve POST /v1/rank`; any failure re-issues the identical TEI call) |
-| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: CLM `choice` over the 36 style criteria replaces the LLM-sampled style |
+| `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) or `tacit` (per-candidate `yes_no` over `/v1/decide`; any failure re-issues the identical TEI call) |
+| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: the two-stage Tacit style choice replaces the LLM-sampled style |
 | `DECISIONS_WEIGHTS_ENABLED` | `false` | J4 seam: Tacit `score` questions replace the batched weights LLM call |
 | `DECISIONS_CATEGORY_ENABLED` | `false` | J2 seam: Tacit category `choice` narrows the retrieved pool (never a hard router) |
 | `DECISIONS_REASONING_GATE_ENABLED` | `false` | J5 seam: Tacit `yes_no` can skip a phase's deliberation |
 | `DECISIONS_{STYLE,WEIGHTS,CATEGORY,REASONING_GATE}_BASE_URL` | sidecar service names | Per-seam endpoint (any provider speaking the same wire, e.g. hosted Jev for judging) |
-| `DECISIONS_{...}_PROVIDER` / `_MODEL` | `clm`/`clm-latest`, `tacit`/`tacit-4b` | Served model identity, recorded in the startup log |
+| `DECISIONS_{...}_MODEL` | `tacit-4b` | Served model identity, recorded in the startup log |
 | `DECISIONS_{STYLE,CATEGORY,REASONING_GATE}_CONFIDENCE_FLOOR` | `0.5` | Minimum confidence/probability to act on the answer |
 | `DECISIONS_{...}_API_KEY_ENV` | unset | Name of the env var holding a bearer key; unset = no `Authorization` header (local sidecars) |
 | `DECISIONS_{...}_TIMEOUT_SECONDS` | `10` (`weights` `30`, `reasoning_gate` `5`) | Per-call bound; expiry degrades to the non-model path |

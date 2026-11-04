@@ -49,7 +49,6 @@ from src.patterns.safe_tei_rerank import LexicalReranker, build_reranker
 from src.tools import create_all_tools
 from src.reasoning import ReasoningConfig
 from src.reasoning.client import ReasoningClient
-from src.decisions.client import DecisionModelClient
 from src.decisions.tacit import TacitClient, reasoning_gate
 
 ERROR_SERVER_INIT = "ERR_013"
@@ -64,15 +63,16 @@ def _seam_status(seam: DecisionSeamConfig) -> str:
     """Offline status of one decision-model seam; pure, no network call.
 
     ``disabled`` when the seam switch is off, ``unconfigured`` when it is on but its
-    credential env var is unset, else ``ok (provider=..., model=...)``. A configured
-    but unreachable endpoint still reports ``ok`` here — reachability surfaces per
-    call as silent degradation into the non-model path.
+    credential env var is unset, else ``ok (tacit, model=...)`` — every seam is served
+    by the one AnyJev Tacit gateway. A configured but unreachable endpoint still
+    reports ``ok`` here — reachability surfaces per call as silent degradation into
+    the non-model path.
     """
     if not seam.enabled:
         return "disabled"
     if seam.api_key_env is not None and not os.environ.get(seam.api_key_env):
         return f"unconfigured ({seam.api_key_env} unset)"
-    return f"ok (provider={seam.provider}, model={seam.model})"
+    return f"ok (tacit, model={seam.model})"
 
 
 def _decisions_status(config: ServerConfig) -> dict[str, str]:
@@ -268,9 +268,9 @@ class DesignPatternServer:
         # exist from construction (otherwise startup dies with AttributeError).
         self._reasoning_client: ReasoningClient | None = None
         self._reasoning_health: dict[str, str] = {}
-        self._decision_client: DecisionModelClient | None = None
-        # One TacitClient per Tacit seam (weights / category / reasoning gate): separate
+        # One TacitClient per seam (style / weights / category / reasoning gate): separate
         # instances keep each seam's timeout and cache exact instead of sharing one knob.
+        self._style_client: TacitClient | None = None
         self._weights_client: TacitClient | None = None
         self._category_client: TacitClient | None = None
         self._gate_client: TacitClient | None = None
@@ -429,8 +429,8 @@ class DesignPatternServer:
             return
         style = self._config.decisions.style
         if self._decisions_status["style"].startswith("ok"):
-            self._decision_client = DecisionModelClient(style)
-            self._pipeline._decision_client = self._decision_client
+            self._style_client = TacitClient(style)
+            self._pipeline._style_client = self._style_client
         weights = self._config.decisions.weights
         if self._decisions_status["weights"].startswith("ok"):
             self._weights_client = TacitClient(weights)
@@ -464,7 +464,7 @@ class DesignPatternServer:
                 await self._reasoning_client.close()
                 logger.debug("Cleaned up ReasoningClient")
             for name, client in (
-                ("DecisionModelClient", self._decision_client),
+                ("TacitClient(style)", self._style_client),
                 ("TacitClient(weights)", self._weights_client),
                 ("TacitClient(category)", self._category_client),
                 ("TacitClient(reasoning_gate)", self._gate_client),
@@ -507,7 +507,7 @@ class DesignPatternServer:
                 "variants": self._variants,
                 "reasoning_client": self._reasoning_client,
                 "reasoning_health": self._reasoning_health,
-                "decision_client": self._decision_client,
+                "style_client": self._style_client,
                 "decisions_status": self._decisions_status,
             }
         finally:

@@ -16,7 +16,7 @@
 ## 2026-10-27 regen (decision-model integration)
 
 The decision-model seams landed as transport/shape-parsing clients under a
-silent-degradation contract, so `src/decisions/*` and `src/patterns/clm_rerank.py`
+silent-degradation contract, so `src/decisions/*` and `src/patterns/tacit_rerank.py`
 joined `do_not_mutate` (rows in the *Model-checked* table below) and the scratch
 tree was reset before the sweep. Two clean sweeps were taken on an otherwise idle
 box; the second one followed the test work that killed the new clusters:
@@ -132,8 +132,8 @@ checklist rows hold; it leaves scope only through a row edit here.
 | `src/design_validation.py` | `evaluate_design_integrity`, `_duplicate_id_violations`, `_relationship_violations`, `_event_violations`, `_api_contract_violations` | the INV-2..5 cross-reference gate runs on the LLM output *inside* `assemble_result`, which is itself mutated (`src/pipeline.py` is in scope); a second mutation layer over the same rule mostly re-tests the schema validators | L1 `test_adapters.py::TestDesignIntegrityFindings` + schema enforcement at the tool boundary |
 | `src/patterns/embedder.py` | `_normalize` (row normalisation, zero-vector guard) | the zero-vector → NaN guard is the decision and is pinned directly; the wrapper classes around it have no branches. NaN embeddings are also caught downstream by the dense-cache cosine probe (mutated via `src/patterns/dense_cache.py`) | L1 `test_retrieval.py` / `test_dense_cache.py` + L0 |
 | `src/patterns/safe_tei_rerank.py` | `_safe_tei_rerank_call`, `SafeTEIReranker._call_api` | error verdicts must stay pure signals — a partial result masquerading as REAL is the RET-1 kill class, and the fallback decision is a single `except` whose branches are pinned by the generated status/body matrix | L1 `test_retrieval.py` HTTP-error tests + L4 `tei_fallback.fizz` (FG-23/24) |
-| `src/decisions/*` (`client.py`, `tacit.py`, `seam_prompts.py`) | `DecisionModelClient.choose_style` / `_parse_choice`, `TacitClient.decide` / `decide_batch` / `score_axes_many` / `_expected_level`, the category/gate wrappers | transport + shape-parsing under the silent-degradation contract: an outage must never fail a tool call, so every mutant here is either a `logger.`/formatting line or a branch of the same degrade rule. The wire matrices (status × payload × timeout × cancellation, both map and list shapes, batch envelopes) are exhaustive L1 coverage, and the `seam_prompts` half is declarative prompt text | L1 `test_decisions_client.py`, `test_tacit_client.py` (MockTransport matrices) + L1 `test_decision_seams.py` (pipeline-level: retry, fallback, narrowing) |
-| `src/patterns/clm_rerank.py` | `CLMReranker.rerank` (dedupe/restore, cap, sort) and `_request` (status/JSON/shape verdicts) | same RET-1 contract as `safe_tei_rerank.py`: a degraded CLM leg must re-issue the identical TEI call, never a partial list. The verdict matrix is generated in L1 and the dedupe/restore arithmetic is index-exact there | L1 `test_clm_rerank.py` (protocol conformance, dedupe, every degrade path) |
+| `src/decisions/*` (`tacit.py`, `seam_prompts.py`) | `TacitClient.choose_style` (the two-stage category→shortlist path) / `decide` / `decide_batch` / `score_axes_many` / `_expected_level`, the category and gate wrappers, and the shortlist guard in `styles_for_category` | transport + shape-parsing under the silent-degradation contract: an outage must never fail a tool call, so every mutant here is either a `logger.`/formatting line or a branch of the same degrade rule. The wire matrices (status × payload × timeout × cancellation, batch envelopes, both style stages) are exhaustive L1 coverage, the option-cap guard is asserted for all nine shortlists, and the `seam_prompts` half is declarative prompt text | L1 `test_tacit_client.py` (MockTransport matrices) + L1 `test_decision_seams.py` (pipeline-level: retry, fallback, missing keys)
+| `src/patterns/tacit_rerank.py` | `TacitReranker.rerank` (dedupe/restore, cap, sort) and `_request` (status/JSON/shape verdicts) | same RET-1 contract as `safe_tei_rerank.py`: a degraded Tacit leg must re-issue the identical TEI call, never a partial list. The verdict matrix is generated in L1 and the dedupe/restore arithmetic is index-exact there | L1 `test_tacit_rerank.py` (protocol conformance, dedupe, every degrade path) |
 
 > **`src/pipeline.py` is IN the mutmut scope** (62 functions / 2687 mutants — the
 > largest mutated module; see the module ledger). The four `src/pipeline.py`
@@ -211,11 +211,14 @@ checklist rows hold; it leaves scope only through a row edit here.
    is unaffected). Done 2026-09-11 after the round-2 scope expansion,
    2026-09-12 after adding `pattern/` to `also_copy`, 2026-09-12 after
    the consecutive-run cache warning ("pyproject.toml changed … cached
-   results were kept"), and 2026-10-27 after excluding `src/decisions/*` +
-   `src/patterns/clm_rerank.py` (the decision-model seam clients) — the scratch
+   results were kept"), 2026-10-27 after excluding `src/decisions/*` +
+   `src/patterns/tacit_rerank.py` (the decision-model seam clients) — the scratch
    tree still carried `src/decisions/client.py.meta` from the run that had
    mutated it, so a sweep without the reset would have distilled an
-   out-of-scope module into the gate.
+   out-of-scope module into the gate — and 2026-11-04 after adding `qa/` to
+   `also_copy` (the L1 oracle reads `qa/typed/style.jsonl` and
+   `qa/typed/rerank_pairs.jsonl` by path; without the copy the stats run aborted
+   at collection with `FileNotFoundError`).
 9. Dependency-change policy: `on_dependency_change = "rerun"` +
    `cache_invalidation_files = ["docs/design-patterns.md",
    "docs/pattern-schema.json", "pattern/*.json"]` (both keys verified

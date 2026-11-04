@@ -24,6 +24,20 @@ descriptions plus per-part aggregate payloads — in the exact ``tacit.gate_stat
 (phase line, then every declared payload key in order, capped identically), because the
 server never sends any other shape.
 
+Two more seams train from the same single checkpoint:
+
+* **Ch2 style** (``build_style_problems``) — the SERVED two-stage choice over
+  description-shaped states: stage 1 is the category question on the capped description,
+  stage 2 the style question over one category's shortlist (the gateway caps ``choice`` at
+  26 options, so the 36-way style question never exists as one item). The shortlist rotates
+  over the nine categories so every option set trains. States are the corpus train hints
+  first, then model-written descriptions (``generate_descriptions``) — the seam serves raw
+  user prose.
+* **J1 rerank** (``load_rerank_pairs`` / ``build_rerank_problems``) — one ``yes_no``
+  relevance question per (statement, document) pair from ``qa/typed/rerank_pairs.jsonl``,
+  whose bytes are exactly the serving items. Train-split rows only; the holdout pairs are
+  eval material.
+
 Retention is kind-aware. ``choice`` rows keep only teacher distributions whose max
 clears the acting floor (``--answer-mass-floor``, defaulting to ``--confidence-floor``,
 the category seam's ``confidence_floor``); ``score`` rows are kept unfiltered
@@ -41,6 +55,17 @@ against its floor.
 
 Topic hints come from train-split rows only.
 
+Sizing is max-effort by default: the fine-tune's aim is pattern-selection consistency and
+quality, so the defaults spend the whole 4x3090 envelope on VOLUME and COVERAGE (all train
+rerank pairs, ~1k style questions) rather than epochs — one epoch over self-distilled
+targets is the recipe, and repeating it memorizes teacher noise. The teacher pass shards
+across the visible GPUs (``teacher_answers``); retention and example construction stay
+single-process, so sharding never changes the training set. An under-trained seam cannot
+ship: the build fails when style or rerank problems are empty, when a serving kind keeps
+fewer than ``--min-kind-rows`` rows, when any answer seam's student-vs-teacher agreement
+drops below ``--min-seam-agreement``, or when the weights seam's expected-level MAE exceeds
+``--max-score-mae``.
+
 Output layout is what ``anyjev.serve`` expects: a HF causal-LM directory
 (``config.json``, weights, tokenizer) that ``vllm serve`` can load.
 """
@@ -51,9 +76,12 @@ import argparse
 import importlib.util
 import json
 import logging
+import os
 import random
 import shutil
+import subprocess
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -91,9 +119,27 @@ Constraints: <optional: zero to four constraints, semicolon separated>
 
 State:"""
 
+#: Description-shaped states for the Ch2 seam. Serving sends the RAW user description
+#: (``_apply_decision_style(text, ...)``), so the style seam must not train only on the
+#: corpus hint texts — the model writes more of them in the same shape.
+DESCRIPTION_PROMPT = """You write short, concrete software system descriptions.
+
+Topic: {hint}
+
+Write one description in exactly this shape, with no other text: one paragraph of
+2-5 sentences describing a software system a user wants design-pattern advice for —
+what it must do, its main components, and one design concern. Plain prose, no lists,
+no headings.
+
+Description:"""
+
 #: One gate question per this many teacher questions: the pipeline asks the gate once
 #: per phase per run, the design questions once per decision part.
 _GATE_SHARE = 10
+
+#: Description-shaped states derived per this many teacher questions when
+#: ``--style-states`` is left at its derived default (two style questions per state).
+_STYLE_SHARE = 12
 
 #: Mirrors ``DecisionSeamConfig.confidence_floor`` (the acting floor the seams gate on).
 #: Pinned by ``tests/unit/test_decision_model_scripts.py``; override with
@@ -113,6 +159,7 @@ class Example:
     kind: str
     label_ids: list[int]
     target: list[float]
+    seam: str = ""  # category | weights | gate | style-stage1 | style-stage2 | rerank
 
 
 class _Progress:
@@ -202,12 +249,65 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--cot-max-tokens", type=int, default=2048)
     parser.add_argument(
+        "--rerank-pairs",
+        default="",
+        help="qa/typed/rerank_pairs.jsonl — the served (statement, document) pairs. Required for "
+        "the J1 seam: an under-trained seam must not ship (an empty value refuses the run "
+        "unless --skip).",
+    )
+    parser.add_argument(
+        "--rerank-problems",
+        type=int,
+        default=0,
+        help="J1 teacher question budget; 0 = ALL train pairs (the max-effort default).",
+    )
+    parser.add_argument(
+        "--style-states",
+        type=int,
+        default=0,
+        help="Description-shaped states for the Ch2 seam; 0 = derive (problems // 12). Corpus "
+        "train hints are always used first, generated descriptions fill the rest.",
+    )
+    parser.add_argument(
+        "--teacher-shards",
+        type=int,
+        default=0,
+        help="Teacher answer shards; 0 = auto (one per visible CUDA device), 1 = in-process.",
+    )
+    parser.add_argument(
+        "--min-seam-agreement",
+        type=float,
+        default=0.6,
+        help="Fail the build when an answer seam's (category/style-stage1/style-stage2/rerank/"
+        "gate) student-vs-teacher eval agreement drops below this. Raise to the first "
+        "max-effort run's achieved-minus-margin when it lands.",
+    )
+    parser.add_argument(
+        "--max-score-mae",
+        type=float,
+        default=0.2,
+        help="Fail the build when the weights seam's expected-level MAE exceeds this (the "
+        "shipped artifact measured 0.110).",
+    )
+    parser.add_argument(
         "--skip",
         action="store_true",
         help="Copy the released checkpoint to --out without training (out-of-band runs only; "
         "the image's no-GPU path is the runtime-released build target).",
     )
+    # Hidden shard group: only teacher_answers' children pass these (see that function).
+    parser.add_argument("--_answer-shard", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_shard-total", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--_shard-problems", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--_shard-out", default="", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    _validate_numeric_args(args)
+    _validate_shard_args(args)
+    return args
+
+
+def _validate_numeric_args(args: argparse.Namespace) -> None:
+    """Range-check every numeric knob and fill the two floor defaults."""
     if not 0.0 <= args.eval_frac < 1.0:
         raise SystemExit(f"--eval-frac {args.eval_frac} out of range [0.0, 1.0)")
     if not 0.0 <= args.confidence_floor <= 1.0:
@@ -218,11 +318,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.gate_confidence_floor = args.confidence_floor
     if not 0.0 <= args.gate_confidence_floor <= 1.0:
         raise SystemExit(f"--gate-confidence-floor {args.gate_confidence_floor} out of range [0.0, 1.0]")
-    if args.states < 0:
-        raise SystemExit(f"--states {args.states} must be >= 0")
-    if args.min_kind_rows < 0:
-        raise SystemExit(f"--min-kind-rows {args.min_kind_rows} must be >= 0")
-    return args
+    for name in ("states", "min_kind_rows", "style_states", "teacher_shards"):
+        if getattr(args, name) < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} {getattr(args, name)} must be >= 0")
+    if not 0.0 <= args.min_seam_agreement <= 1.0:
+        raise SystemExit(f"--min-seam-agreement {args.min_seam_agreement} out of range [0.0, 1.0]")
+    if args.max_score_mae < 0.0:
+        raise SystemExit(f"--max-score-mae {args.max_score_mae} must be >= 0")
+
+
+def _validate_shard_args(args: argparse.Namespace) -> None:
+    """Validate the hidden shard group (only a teacher shard child passes it)."""
+    if args._answer_shard is None:
+        return
+    if args._shard_total is None or args._shard_total < 1:
+        raise SystemExit("--_answer-shard needs a positive --_shard-total")
+    if not 0 <= args._answer_shard < args._shard_total:
+        raise SystemExit("--_answer-shard must be within [0, --_shard-total)")
+    if not args._shard_problems or not args._shard_out:
+        raise SystemExit("--_answer-shard needs --_shard-problems and --_shard-out")
 
 
 def _seed_everything(seed: int) -> None:
@@ -389,6 +503,61 @@ def _normalise_state(text: str, max_chars: int) -> str | None:
     if not state.startswith("System goal:"):
         return None
     return state if "Decision part:" in state and len(state) >= 40 else None
+
+
+def generate_descriptions(
+    tacit: Any,
+    hints: Sequence[str],
+    count: int,
+    max_new_tokens: int,
+    max_state_chars: int,
+) -> list[str]:
+    """Prompt the model for ``count`` DISTINCT description-shaped states (serving bytes).
+
+    Mirrors :func:`generate_states` (same batching, temperature 0.9, dedupe, cap) but for
+    free prose: the Ch2 seam serves the raw user description capped at
+    ``DECISION_STATE_MAX_CHARS``, so its training states must be raw prose in that shape,
+    not header-line part states. Topic hints come from train-split rows only (the
+    :func:`load_topic_hints` rule).
+    """
+    import torch
+
+    prompts = [
+        DESCRIPTION_PROMPT.format(hint=hints[i % len(hints)][:400] if hints else "a web service") for i in range(count)
+    ]
+    model = tacit.engine.model
+    tokenizer = tacit.tok
+    batch_size = max(1, getattr(tacit, "batch_size", 8))
+    descriptions: list[str] = []
+    progress = _Progress(len(prompts), "description-writing")
+    with torch.no_grad():
+        for start in range(0, len(prompts), batch_size):
+            chunk = prompts[start : start + batch_size]
+            rendered = [
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
+                )
+                for p in chunk
+            ]
+            encoded = tokenizer(rendered, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
+            generated = model.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.9,
+                top_p=0.95,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            flat = tokenizer.batch_decode(generated[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True)
+            for text in flat:
+                description = text.strip()[:max_state_chars]
+                if len(description) >= 80:
+                    descriptions.append(description)
+            progress.advance(start + len(chunk))
+    unique = list(dict.fromkeys(descriptions))
+    if len(unique) < len(descriptions):
+        logger.info("dropped %d duplicate descriptions", len(descriptions) - len(unique))
+    return unique[:count]
 
 
 def _state_fields(state: str) -> dict[str, str]:
@@ -600,7 +769,13 @@ def build_problems(
     window = max(1, min(axes_per_state, len(QUALITY_AXES)))
     for index, state in enumerate(states):
         problems.append(
-            {"state": state, "question": category_question, "options": list(seams.CATEGORY_SLUGS), "kind": "choice"}
+            {
+                "state": state,
+                "question": category_question,
+                "options": list(seams.CATEGORY_SLUGS),
+                "kind": "choice",
+                "seam": "category",
+            }
         )
         for offset in range(window):
             axis = QUALITY_AXES[(index + offset) % len(QUALITY_AXES)]
@@ -610,12 +785,92 @@ def build_problems(
                     "question": seams.axis_question(axis),
                     "options": list(seams.WEIGHT_LEVELS),
                     "kind": "score",
+                    "seam": "weights",
                 }
             )
     gate_question = seams.gate_question()
     for state in gate_states:
-        problems.append({"state": state, "question": gate_question, "options": ["Yes", "No"], "kind": "yes_no"})
+        problems.append(
+            {"state": state, "question": gate_question, "options": ["Yes", "No"], "kind": "yes_no", "seam": "gate"}
+        )
     return problems
+
+
+def build_style_problems(states: Sequence[str], seams: ModuleType) -> list[dict[str, Any]]:
+    """Ch2 two-stage style questions over description-shaped states.
+
+    Stage 1 is the served category question on the capped description; stage 2 is the
+    served style question over one category's shortlist. The shortlist rotates
+    deterministically over the nine categories so every stage-2 option set is trained,
+    independent of the teacher's own stage-1 answers (which would couple training to
+    teacher errors and cost a sequential second pass).
+    """
+    problems: list[dict[str, Any]] = []
+    category_question = seams.category_question()
+    slugs = seams.CATEGORY_SLUGS
+    for index, raw_state in enumerate(states):
+        state = raw_state[: seams.DECISION_STATE_MAX_CHARS]
+        problems.append(
+            {
+                "state": state,
+                "question": category_question,
+                "options": list(slugs),
+                "kind": "choice",
+                "seam": "style-stage1",
+            }
+        )
+        category = slugs[index % len(slugs)]
+        styles = seams.styles_for_category(category)
+        problems.append(
+            {
+                "state": state,
+                "question": seams.style_question(styles),
+                "options": [*styles, seams.STYLE_NONE_KEY],
+                "kind": "choice",
+                "seam": "style-stage2",
+            }
+        )
+    return problems
+
+
+def load_rerank_pairs(path: Path) -> list[dict[str, Any]]:
+    """Train-split (statement, document) pairs in serving bytes; holdout never trains."""
+    pairs: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except ValueError:
+                continue
+            if row.get("split") != "train":
+                continue
+            statement, document = row.get("statement"), row.get("document")
+            if isinstance(statement, str) and isinstance(document, str) and statement and document:
+                pairs.append({"statement": statement, "document": document})
+    return pairs
+
+
+def build_rerank_problems(pairs: Sequence[dict[str, Any]], seams: ModuleType, budget: int) -> list[dict[str, Any]]:
+    """J1 relevance questions: one ``yes_no`` per (statement, document) pair.
+
+    ``budget <= 0`` keeps every train pair (the max-effort default); a positive budget
+    takes a deterministic stride over file order (scenario-major) so a reduced run still
+    spreads across scenarios instead of exhausting the first ten.
+    """
+    selected = pairs if budget <= 0 else pairs[:: max(1, len(pairs) // budget)][:budget]
+    return [
+        {
+            "state": seams.rerank_state(pair["statement"], pair["document"]),
+            "question": seams.RERANK_RELEVANCE_QUESTION,
+            "options": ["Yes", "No"],
+            "kind": "yes_no",
+            "seam": "rerank",
+        }
+        for pair in selected
+    ]
 
 
 def retention_floor(kind: str, answer_floor: float, score_floor: float) -> float:
@@ -635,24 +890,42 @@ def retention_floor(kind: str, answer_floor: float, score_floor: float) -> float
     return 0.0
 
 
-def teacher_examples(
+def answer_problems(tacit: Any, problems: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Answer phase: raw ``decide_batch`` results, in problem order (no retention).
+
+    Only the four wire keys are sent — ``seam`` is trainer bookkeeping and the gateway
+    validates its items. Split from example construction so the pass can be sharded
+    across GPUs (see :func:`teacher_answers`) without changing the training set.
+    """
+    results: list[dict[str, Any]] = []
+    batch_size = max(1, getattr(tacit, "batch_size", 8))
+    progress = _Progress(len(problems), "teacher")
+    for start in range(0, len(problems), batch_size):
+        chunk = problems[start : start + batch_size]
+        wire = [{key: item[key] for key in ("state", "question", "options", "kind")} for item in chunk]
+        answers = tacit.decide_batch(wire)
+        if len(answers) != len(wire):
+            raise SystemExit(f"teacher returned {len(answers)} decisions for {len(wire)} problems")
+        results.extend(dict(result) for result in answers)
+        progress.advance(start + len(chunk))
+    return results
+
+
+def examples_from_results(
     tacit: Any,
     problems: Sequence[dict[str, Any]],
+    results: Sequence[dict[str, Any]],
     answer_mass_floor: float,
     score_mass_floor: float,
 ) -> tuple[list[Example], dict[str, dict[str, int]], list[Example]]:
-    """Answer every problem with thinking on; keep the sharp label distributions.
-
-    ``Tacit(adaptive=True, tau=<huge>, max_cot_share=None)`` escalates every decision to
-    the model's own reasoning, so each ``probs`` is the reasoning-conditioned distribution
-    over the option labels — the teacher target for the one-forward student.
+    """Turn answered problems into supervised rows, keeping the sharp distributions.
 
     A result that omits any option is dropped (``shape``), never padded with zeros and
     rescaled: the renormalized target would silently fabricate the label — certainty on
     ``yes_no``, inflated confidence on ``choice`` — and the row would still be counted as
-    kept. Serving tolerates the same omission (``_expected_level`` renormalizes by the mass
-    it saw, ``gate`` returns ``None``), which is why the trainer must not convert it into
-    a supervision signal.
+    kept. Serving tolerates the same omission (``_expected_level`` renormalizes by the
+    mass it saw, ``gate`` returns ``None``), which is why the trainer must not convert it
+    into a supervision signal.
 
     The third return value is the false-act probe: below-floor ``choice`` rows (route and
     shape intact) carried as full Examples, so one forward per row can later measure how
@@ -664,46 +937,40 @@ def teacher_examples(
     examples: list[Example] = []
     probe: list[Example] = []
     dropped: dict[str, dict[str, int]] = {kind: {"unrouted": 0, "shape": 0, "unsharp": 0} for kind in _SEAM_KINDS}
-    batch_size = max(1, getattr(tacit, "batch_size", 8))
-    logger.info("phase 2/3: teacher answering %d problems (sequential CoT)", len(problems))
-    progress = _Progress(len(problems), "teacher")
-    for start in range(0, len(problems), batch_size):
-        chunk = problems[start : start + batch_size]
-        results = tacit.decide_batch([dict(item) for item in chunk])
-        for item, result in zip(chunk, results, strict=True):
-            kind = item["kind"]
-            if result.get("route") != "cot":
-                dropped[kind]["unrouted"] += 1
-                continue
-            probabilities: dict[str, float] = result.get("probs") or {}
-            if any(option not in probabilities for option in item["options"]):
-                dropped[kind]["shape"] += 1
-                continue
-            target = [float(probabilities[option]) for option in item["options"]]
-            total = sum(target)
-            if total <= 0.0:
-                dropped[kind]["unrouted"] += 1
-                continue
-            target = [value / total for value in target]
-            question = make_question(item["question"], item["options"], item["kind"])
-            labels, ids = resolve_labels(tacit.tok, question)
-            permutation = list(range(question.k))
-            spec = build_prompt(item["state"], question, permutation, DEFAULT_SYSTEM, labels)
-            example = Example(
-                prompt=render_chat(tacit.tok, spec),
-                kind=kind,
-                label_ids=[int(token) for token in label_ids_for_perm(question, ids, permutation)],
-                target=target,
-            )
-            if max(target) < retention_floor(kind, answer_mass_floor, score_mass_floor):
-                dropped[kind]["unsharp"] += 1
-                if kind == "choice":
-                    # Below-floor choice territory is where serving falls back to the
-                    # LLM; keep the row to measure the student's false-act rate there.
-                    probe.append(example)
-                continue
-            examples.append(example)
-        progress.advance(start + len(chunk))
+    for item, result in zip(problems, results, strict=True):
+        kind = item["kind"]
+        if result.get("route") != "cot":
+            dropped[kind]["unrouted"] += 1
+            continue
+        probabilities: dict[str, float] = result.get("probs") or {}
+        if any(option not in probabilities for option in item["options"]):
+            dropped[kind]["shape"] += 1
+            continue
+        target = [float(probabilities[option]) for option in item["options"]]
+        total = sum(target)
+        if total <= 0.0:
+            dropped[kind]["unrouted"] += 1
+            continue
+        target = [value / total for value in target]
+        question = make_question(item["question"], item["options"], item["kind"])
+        labels, ids = resolve_labels(tacit.tok, question)
+        permutation = list(range(question.k))
+        spec = build_prompt(item["state"], question, permutation, DEFAULT_SYSTEM, labels)
+        example = Example(
+            prompt=render_chat(tacit.tok, spec),
+            kind=kind,
+            label_ids=[int(token) for token in label_ids_for_perm(question, ids, permutation)],
+            target=target,
+            seam=str(item.get("seam", "")),
+        )
+        if max(target) < retention_floor(kind, answer_mass_floor, score_mass_floor):
+            dropped[kind]["unsharp"] += 1
+            if kind == "choice":
+                # Below-floor choice territory is where serving falls back to the
+                # LLM; keep the row to measure the student's false-act rate there.
+                probe.append(example)
+            continue
+        examples.append(example)
     logger.info(
         "teacher kept %d of %d problems %s (%d below-floor choice probes)",
         len(examples),
@@ -712,6 +979,139 @@ def teacher_examples(
         len(probe),
     )
     return examples, dropped, probe
+
+
+def _load_teacher(args: argparse.Namespace) -> Any:
+    """The deliberating teacher: every decision escalates to the model's own thinking.
+
+    ``Tacit(adaptive=True, tau=<huge>, max_cot_share=None)`` makes each ``probs`` the
+    reasoning-conditioned distribution over the option labels — the teacher target for the
+    one-forward student. Loaded by the parent process and, with sharding, by each child.
+    """
+    from anyjev import Tacit
+
+    return Tacit.from_pretrained(
+        str(args.init_dir),
+        engine="transformers",
+        adaptive=True,
+        tau=float("inf"),  # every decision escalates: the teacher must think
+        max_cot_share=None,
+        cot_window=None,
+        cot_max_tokens=args.cot_max_tokens,
+        batch_size=max(1, args.batch),
+        device_map={"": 0},
+    )
+
+
+def _shard_command(
+    args: argparse.Namespace, shard: int, total_shards: int, problems_path: Path, out_path: Path
+) -> list[str]:
+    """The child argv for one teacher shard.
+
+    Carries EVERY required flag (``--init-dir``/``--out``/``--seam-prompts``) plus the
+    teacher's generation knobs, because the child re-parses this argv with the parent's own
+    ``parse_args``: a required flag missing here aborts the child in argparse (exit 2) and
+    the parent refuses the partial answer set. ``--seam-prompts`` is unused by the child
+    (it answers problems, it does not build them) and is passed only to satisfy that
+    contract. Pinned by a test that runs the real ``parse_args`` over this argv.
+    """
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--_answer-shard",
+        str(shard),
+        "--_shard-total",
+        str(total_shards),
+        "--_shard-problems",
+        str(problems_path),
+        "--_shard-out",
+        str(out_path),
+        "--init-dir",
+        str(args.init_dir),
+        "--out",
+        str(args.out),
+        "--seam-prompts",
+        str(args.seam_prompts),
+        "--repo",
+        str(args.repo),
+        "--cot-max-tokens",
+        str(args.cot_max_tokens),
+        "--batch",
+        str(args.batch),
+    ]
+
+
+def teacher_answers(
+    tacit: Any, args: argparse.Namespace, problems: Sequence[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    """Answer every problem, sharded across GPUs when more than one is visible.
+
+    Each shard re-invokes this script with ``--_answer-shard``: the child pins
+    ``CUDA_VISIBLE_DEVICES`` to its device, loads its own teacher replica, answers the
+    strided slice ``problems[i::n]``, and writes ``{"index": <global>, "result": {...}}``
+    JSONL. The parent merges by index and verifies full coverage — retention and example
+    construction stay single-process, so sharding changes only wall time, never the
+    training set. ``--teacher-shards 1`` (or one visible device) keeps the in-process pass,
+    which reuses the teacher already resident for state writing. A child exiting non-zero
+    aborts the build (no partial answer set).
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        total_shards = 1
+    else:
+        total_shards = args.teacher_shards or min(torch.cuda.device_count(), 8)
+    if total_shards <= 1:
+        return answer_problems(tacit, problems), 1
+    logger.info("answering %d problems with %d teacher shards", len(problems), total_shards)
+    workdir = Path(tempfile.mkdtemp(prefix="tacit-shards-"))
+    problems_path = workdir / "problems.json"
+    problems_path.write_text(json.dumps(list(problems)), encoding="utf-8")
+    children: list[subprocess.Popen[bytes]] = []
+    try:
+        for shard in range(total_shards):
+            out_path = workdir / f"shard-{shard}.jsonl"
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)}
+            children.append(subprocess.Popen(_shard_command(args, shard, total_shards, problems_path, out_path), env=env))
+        for child in children:
+            if child.wait() != 0:
+                raise SystemExit("a teacher shard failed — refusing to train on a partial answer set")
+        merged: dict[int, dict[str, Any]] = {}
+        for shard in range(total_shards):
+            shard_path = workdir / f"shard-{shard}.jsonl"
+            for raw_line in shard_path.read_text(encoding="utf-8").splitlines():
+                if not raw_line.strip():
+                    continue
+                entry = json.loads(raw_line)
+                merged[int(entry["index"])] = dict(entry["result"])
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if sorted(merged) != list(range(len(problems))):
+        raise SystemExit(f"teacher shards covered {len(merged)}/{len(problems)} problems — aborting")
+    return [merged[index] for index in range(len(problems))], total_shards
+
+
+def _answer_shard(args: argparse.Namespace) -> int:
+    """Child path: answer ``problems[shard::total]`` and write index-tagged JSONL."""
+    problems: list[dict[str, Any]] = json.loads(Path(args._shard_problems).read_text(encoding="utf-8"))
+    slice_ = problems[args._answer_shard :: args._shard_total]
+    logger.info(
+        "teacher shard %d/%d: answering %d of %d problems",
+        args._answer_shard + 1,
+        args._shard_total,
+        len(slice_),
+        len(problems),
+    )
+    results = answer_problems(_load_teacher(args), slice_)
+    if len(results) != len(slice_):
+        raise SystemExit(f"shard answered {len(results)} of {len(slice_)} problems")
+    out = Path(args._shard_out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as handle:
+        for offset, result in enumerate(results):
+            index = args._answer_shard + offset * args._shard_total
+            handle.write(json.dumps({"index": index, "result": result}) + "\n")
+    return 0
 
 
 def train_student(init_dir: Path, examples: Sequence[Example], args: argparse.Namespace) -> Any:
@@ -799,45 +1199,92 @@ def _expected_level(probs: Sequence[float]) -> float:
     return sum(index * value for index, value in enumerate(probs)) / top
 
 
-def _fidelity_metrics(
-    samples: Sequence[tuple[list[float], list[float], str]], choice_floor: float, gate_floor: float
-) -> dict[str, dict[str, float]]:
-    """Distillation fidelity per kind: student-vs-teacher agreement, Brier, act metrics.
+#: Seams whose student-vs-teacher agreement the build gates on (every ANSWER seam; the
+#: weights seam is gated on its expected-level MAE instead).
+_GATED_SEAMS: tuple[str, ...] = ("category", "style-stage1", "style-stage2", "rerank", "gate")
 
-    ``choice`` ``floor_accuracy`` answers "would the seam act on the student's answer,
-    and be right" — retained rows always clear the teacher floor, so the student must
-    agree AND clear ``choice_floor``. ``yes_no`` ``floor_accuracy`` is agreement on the
-    ACT decision, because the gate compares ``p(Yes)`` with its floor (options[0] is
-    ``"Yes"`` on both sides): a student that fires where the teacher would not is a
-    false act even when the labels agree.
+
+def _fidelity_metrics(
+    samples: Sequence[tuple[list[float], list[float], str, str]], choice_floor: float, gate_floor: float
+) -> dict[str, dict[str, Any]]:
+    """Distillation fidelity per SEAM: agreement, Brier, and the seam's own decision metric.
+
+    ``choice`` rows (category and both style stages) also report ``floor_accuracy``: the
+    student agrees AND clears the acting floor, which is what those seams act on. The
+    ``gate`` seam reports agreement on the ACT decision at ``gate_floor`` (options[0] is
+    ``"Yes"`` on both sides) — a student that fires where the teacher would not is a false
+    act even when the labels agree. The ``weights`` seam reports ``expected_level_mae``;
+    ``rerank`` reports agreement alone, because serving consumes the whole ``p(Yes)``
+    distribution rather than a thresholded answer.
     """
-    by_kind: dict[str, list[tuple[list[float], list[float]]]] = {}
-    for student_probs, teacher_target, kind in samples:
-        by_kind.setdefault(kind, []).append((student_probs, teacher_target))
-    metrics: dict[str, dict[str, float]] = {}
-    for kind, rows in by_kind.items():
+    by_seam: dict[str, list[tuple[list[float], list[float], str]]] = {}
+    for student_probs, teacher_target, kind, seam in samples:
+        by_seam.setdefault(seam, []).append((student_probs, teacher_target, kind))
+    metrics: dict[str, dict[str, Any]] = {}
+    for seam, rows in by_seam.items():
         n = len(rows)
         if n == 0:
-            metrics[kind] = {"n": 0}
+            metrics[seam] = {"n": 0}
             continue
-        agreements = sum(1 for student, teacher in rows if student.index(max(student)) == teacher.index(max(teacher)))
-        brier = sum(sum((s - t) ** 2 for s, t in zip(student, teacher, strict=True)) for student, teacher in rows) / n
-        entry: dict[str, float] = {"n": n, "agreement": agreements / n, "brier": brier}
-        if kind == "choice":
+        agreements = sum(
+            1 for student, teacher, _kind in rows if student.index(max(student)) == teacher.index(max(teacher))
+        )
+        brier = (
+            sum(sum((s - t) ** 2 for s, t in zip(student, teacher, strict=True)) for student, teacher, _kind in rows)
+            / n
+        )
+        entry: dict[str, Any] = {"n": n, "agreement": agreements / n, "brier": brier}
+        kinds = {kind for _student, _teacher, kind in rows}
+        if kinds == {"choice"}:
             floored = sum(
                 1
-                for student, teacher in rows
+                for student, teacher, _kind in rows
                 if student.index(max(student)) == teacher.index(max(teacher)) and max(student) >= choice_floor
             )
             entry["floor_accuracy"] = floored / n
-        elif kind == "yes_no":
-            acted = sum(1 for student, teacher in rows if (student[0] >= gate_floor) == (teacher[0] >= gate_floor))
+        elif kinds == {"yes_no"} and seam == "gate":
+            acted = sum(
+                1 for student, teacher, _kind in rows if (student[0] >= gate_floor) == (teacher[0] >= gate_floor)
+            )
             entry["floor_accuracy"] = acted / n
-        elif kind == "score":
-            mae = sum(abs(_expected_level(student) - _expected_level(teacher)) for student, teacher in rows) / n
+        elif kinds == {"score"}:
+            mae = sum(abs(_expected_level(student) - _expected_level(teacher)) for student, teacher, _kind in rows) / n
             entry["expected_level_mae"] = mae
-        metrics[kind] = entry
+        metrics[seam] = entry
     return metrics
+
+
+def seam_gate_failures(
+    metrics: dict[str, dict[str, Any]], min_agreement: float, max_score_mae: float
+) -> list[str]:
+    """Reasons the trained student must not ship; empty when every seam clears its bar.
+
+    Every answer seam must be present in the eval split and clear
+    ``--min-seam-agreement``; the weights seam must also stay under ``--max-score-mae``.
+    A missing seam is a failure, not a skip: an eval split that lost a seam cannot certify
+    it.
+    """
+    failures: list[str] = []
+    for seam in _GATED_SEAMS:
+        entry = metrics.get(seam)
+        if entry is None or not entry.get("n"):
+            failures.append(f"seam {seam!r} has no eval rows — the eval split lost a seam")
+            continue
+        agreement = float(entry["agreement"])
+        if agreement < min_agreement:
+            failures.append(
+                f"seam {seam!r} student-teacher agreement {agreement:.3f} < --min-seam-agreement {min_agreement}"
+            )
+    weights = metrics.get("weights")
+    if weights is None or not weights.get("n"):
+        failures.append("seam 'weights' has no eval rows — the eval split lost a seam")
+    else:
+        mae = weights.get("expected_level_mae")
+        if mae is None:
+            failures.append("seam 'weights' eval carries no expected_level_mae")
+        elif float(mae) > max_score_mae:
+            failures.append(f"weights seam expected-level MAE {float(mae):.3f} > --max-score-mae {max_score_mae}")
+    return failures
 
 
 def _eval_tokenizer(init_dir: Path) -> Any:
@@ -878,10 +1325,10 @@ def evaluate_student(
     batch_size: int,
     choice_floor: float,
     gate_floor: float,
-) -> dict[str, dict[str, float]]:
-    """One forward per eval row; student-vs-teacher fidelity per kind, at the served floors."""
+) -> dict[str, dict[str, Any]]:
+    """One forward per eval row; student-vs-teacher fidelity per seam, at the served floors."""
     probs = _forward_probs(model, _eval_tokenizer(init_dir), rows, batch_size)
-    samples = [(prob, list(row.target), row.kind) for prob, row in zip(probs, rows, strict=True)]
+    samples = [(prob, list(row.target), row.kind, row.seam) for prob, row in zip(probs, rows, strict=True)]
     return _fidelity_metrics(samples, choice_floor, gate_floor)
 
 
@@ -932,13 +1379,60 @@ def skip_training(init_dir: Path, out_dir: Path) -> None:
     logger.info("skipped self-distillation; copied %s -> %s", init_dir, out_dir)
 
 
+def _assemble_problems(
+    teacher: Any,
+    hints: Sequence[str],
+    seams: ModuleType,
+    args: argparse.Namespace,
+    states: Sequence[str],
+    gate_states: Sequence[str],
+    axes_per_state: int,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """The full serving question set: category/weights/gate, both style stages, rerank.
+
+    Ch2 style states are the corpus train hints first (real serving bytes), then generated
+    descriptions until the budget is met — the seam serves raw user prose, not header-line
+    part states, so a few dozen hints cannot train it. A seam that would train on nothing
+    aborts the run: an under-trained seam must not ship. (``--skip`` needs no clause here —
+    ``main`` returns from ``skip_training`` long before this runs.)
+    """
+    problems = build_problems(states, seams, gate_states, axes_per_state)
+    style_state_count = args.style_states or max(1, args.problems // _STYLE_SHARE)
+    # Only generate what the hint corpus does not already cover: a generation pass whose
+    # output would be truncated away is pure teacher cost (70 train hints at today's corpus).
+    needed = max(0, style_state_count - len(hints))
+    descriptions = (
+        generate_descriptions(teacher, hints, needed, args.max_new_tokens, seams.DECISION_STATE_MAX_CHARS)
+        if needed
+        else []
+    )
+    style_states = [*hints, *descriptions][: max(style_state_count, len(hints))]
+    style_problems = build_style_problems(style_states, seams)
+    if not style_problems:
+        raise SystemExit("the Ch2 style seam trained on 0 description-shaped states — check --seed-texts")
+    if not args.rerank_pairs:
+        raise SystemExit("the J1 rerank seam needs --rerank-pairs (make tacit-payloads)")
+    rerank_pairs = load_rerank_pairs(Path(args.rerank_pairs)) if args.rerank_pairs else []
+    rerank_problems = build_rerank_problems(rerank_pairs, seams, args.rerank_problems)
+    if not rerank_problems:
+        raise SystemExit("the J1 rerank seam trained on 0 pairs — check the rerank-pairs file")
+    logger.info(
+        "problems: category/score/gate %d, style %d (states %d), rerank %d",
+        len(problems),
+        len(style_problems),
+        len(style_states),
+        len(rerank_problems),
+    )
+    return [*problems, *style_problems, *rerank_problems], style_states, style_problems, rerank_problems
+
+
 def _post_train_metrics(
     merged: Any,
     init_dir: Path,
     eval_rows: Sequence[Example],
     probe_rows: Sequence[Example],
     args: argparse.Namespace,
-) -> tuple[dict[str, dict[str, float]], dict[str, float | int | None]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, float | int | None]]:
     """Fidelity on the shipped weights, plus the below-floor false-act rate.
 
     Both run on the MERGED checkpoint (the weights just serialized), not the
@@ -957,19 +1451,58 @@ def _post_train_metrics(
     return metrics, false_act
 
 
+def _split_examples(
+    examples: Sequence[Example], eval_frac: float, seed: int
+) -> tuple[list[Example], list[Example]]:
+    """Deterministic train/eval split; a corpus under 20 rows keeps every row for training."""
+    rng = random.Random(seed)
+    indices = list(range(len(examples)))
+    rng.shuffle(indices)
+    n_eval = int(len(examples) * eval_frac) if len(examples) >= 20 else 0
+    return [examples[i] for i in indices[n_eval:]], [examples[i] for i in indices[:n_eval]]
+
+
+def _seam_report(
+    metrics: dict[str, dict[str, Any]],
+    examples: Sequence[Example],
+    eval_rows: Sequence[Example],
+    args: argparse.Namespace,
+) -> dict[str, dict[str, Any]]:
+    """Enforce the per-seam fidelity gates and build the manifest's per-seam block.
+
+    A build with too few rows to hold out any eval row (a stub or quick-smoke run, never the
+    image build) cannot certify a seam, so it skips the gates with a warning instead of
+    claiming a pass; every real build fails here rather than shipping an under-trained seam.
+    """
+    if not eval_rows:
+        logger.warning("no eval rows (fewer than 20 kept rows) — per-seam fidelity gates skipped")
+    else:
+        failures = seam_gate_failures(metrics, args.min_seam_agreement, args.max_score_mae)
+        if failures:
+            raise SystemExit("; ".join(failures) + " — an under-trained seam must not ship")
+    kept_by_seam = Counter(example.seam for example in examples)
+    block: dict[str, dict[str, Any]] = {}
+    for seam, count in kept_by_seam.items():
+        entry = {key: value for key, value in metrics.get(seam, {}).items() if key != "n"}
+        entry["kept"] = count
+        block[seam] = entry
+    return block
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point: generate → teach → distill → save (or copy with ``--skip``)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
     init_dir = Path(args.init_dir)
     out_dir = Path(args.out)
+    if args._answer_shard is not None:
+        # Teacher shard child (spawned by teacher_answers): answer, write, exit.
+        return _answer_shard(args)
     if not init_dir.is_dir():
         raise SystemExit(f"--init-dir {init_dir} does not exist; download the checkpoint first")
     if args.skip:
         skip_training(init_dir, out_dir)
         return 0
-
-    from anyjev import Tacit
 
     _seed_everything(args.seed)
     device_name = _require_cuda()
@@ -980,17 +1513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # torch.cuda.is_available(), and "auto" may also shard. Verified against the
     # anyjev 0.3.0 wheel (tacit.py): device_map is forwarded to
     # AutoModelForCausalLM.from_pretrained, which accepts the {"": 0} dict form.
-    teacher = Tacit.from_pretrained(
-        str(init_dir),
-        engine="transformers",
-        adaptive=True,
-        tau=float("inf"),  # every decision escalates: the teacher must think
-        max_cot_share=None,
-        cot_window=None,
-        cot_max_tokens=args.cot_max_tokens,
-        batch_size=max(1, args.batch),
-        device_map={"": 0},
-    )
+    teacher = _load_teacher(args)
     teacher_device = str(getattr(getattr(getattr(teacher, "engine", None), "model", None), "device", "unknown"))
     logger.info("teacher resident on %s", teacher_device)
     if "cuda" not in teacher_device:
@@ -1025,8 +1548,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         axes_per_state + 1,
     )
     gate_states = build_gate_states(states, hints, seams, gate_count)
-    problems = build_problems(states, seams, gate_states, axes_per_state)
-    examples, dropped, probe = teacher_examples(teacher, problems, args.answer_mass_floor, args.score_mass_floor)
+    problems, style_states, style_problems, rerank_problems = _assemble_problems(
+        teacher, hints, seams, args, states, gate_states, axes_per_state
+    )
+    results, teacher_shards = teacher_answers(teacher, args, problems)
+    examples, dropped, probe = examples_from_results(
+        teacher, problems, results, args.answer_mass_floor, args.score_mass_floor
+    )
     if not examples:
         raise SystemExit(f"no usable teacher examples (dropped {dropped}); lower --answer-mass-floor")
     kept = Counter(example.kind for example in examples)
@@ -1037,12 +1565,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"dropped {dropped}); lower --answer-mass-floor / --confidence-floor or raise --problems"
         )
     logger.info("retained rows per kind: %s", dict(kept))
-    rng = random.Random(args.seed)
-    indices = list(range(len(examples)))
-    rng.shuffle(indices)
-    n_eval = int(len(examples) * args.eval_frac) if len(examples) >= 20 else 0
-    eval_rows = [examples[i] for i in indices[:n_eval]]
-    train_rows = [examples[i] for i in indices[n_eval:]]
+    train_rows, eval_rows = _split_examples(examples, args.eval_frac, args.seed)
     student = train_student(init_dir, train_rows, args)
     logger.info("saving merged checkpoint to %s", out_dir)
     merged = save_checkpoint(student, init_dir, out_dir)
@@ -1050,6 +1573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the merged weights are different numbers — and the below-floor probe rows quantify
     # the false-act rate that retention-filtered eval cannot show.
     metrics, false_act = _post_train_metrics(merged, init_dir, eval_rows, probe, args)
+    seams_block = _seam_report(metrics, examples, eval_rows, args)
     # "eval" is distillation fidelity (student vs teacher), not task quality:
     # external quality stays with the serving-side benchmark.
     (out_dir / "self-distill.json").write_text(
@@ -1074,6 +1598,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "states": len(states),
                 "gate_states": len(gate_states),
                 "axes_per_state": axes_per_state,
+                "style_states": len(style_states),
+                "style_problems": len(style_problems),
+                "rerank_problems": len(rerank_problems),
+                "teacher_shards": teacher_shards,
+                "min_seam_agreement": args.min_seam_agreement,
+                "max_score_mae": args.max_score_mae,
+                "seams": seams_block,
                 "eval": metrics,
                 "false_act": false_act,
             },

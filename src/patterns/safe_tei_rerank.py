@@ -18,7 +18,7 @@ import httpx
 
 from src.config import RerankerConfig
 from src.errors import ERROR_RETRIEVAL_UNAVAILABLE, DesignPatternError
-from src.patterns.clm_rerank import CLMReranker
+from src.patterns.tacit_rerank import TacitReranker
 from src.patterns.nodes import tokenize
 
 
@@ -139,9 +139,10 @@ def build_reranker(config: RerankerConfig) -> RerankerProtocol:
     """The reranker for ``config`` (§6 step 4).
 
     ``provider="tei"`` (default) is the mandatory cross-encoder pass and refuses an
-    empty ``base_url`` at construction. ``provider="clm"`` wraps ``clm-serve
-    /v1/rank`` around exactly that TEI reranker, so an unreachable CLM stack
-    degrades to the same cross-encoder pass instead of failing retrieval.
+    empty ``base_url`` at construction. ``provider="tacit"`` wraps the AnyJev
+    ``POST /v1/decide`` per-candidate leg around exactly that TEI reranker, so an
+    unreachable Tacit stack degrades to the same cross-encoder pass instead of failing
+    retrieval.
     """
     if not config.config.base_url.strip():
         raise DesignPatternError(
@@ -150,12 +151,12 @@ def build_reranker(config: RerankerConfig) -> RerankerProtocol:
             hint="set RERANKER_BASE_URL or config/config.json reranker.config.base_url",
         )
     tei = TEIReranker(config)
-    if config.provider == "clm":
-        if not config.clm_base_url.strip():
+    if config.provider == "tacit":
+        if not config.tacit_base_url.strip():
             raise DesignPatternError(
                 ERROR_RETRIEVAL_UNAVAILABLE,
-                "reranker.provider is 'clm' but clm_base_url is empty",
-                hint="set RERANKER_CLM_BASE_URL or config/config.json reranker.clm_base_url",
+                "reranker.provider is 'tacit' but tacit_base_url is empty",
+                hint="set RERANKER_TACIT_BASE_URL or config/config.json reranker.tacit_base_url",
             )
-        return CLMReranker(config.clm_base_url, config.clm_timeout_seconds, fallback=tei)
+        return TacitReranker(config.tacit_base_url, config.tacit_timeout_seconds, fallback=tei)
     return tei

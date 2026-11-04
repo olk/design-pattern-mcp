@@ -1,48 +1,50 @@
 #!/usr/bin/env python
 """Calibrate the Ch2 style seam's confidence floor against held-out style rows.
 
-Replays the holdout-split rows of ``qa/typed/style.jsonl`` through a running
-``clm-serve`` (``POST /v1/systemone`` with the served question verbatim) and
-reports, per candidate floor: acted rate, acted accuracy, ECE and Brier score —
-plus the confidence distribution. The operator picks the floor from that table
+Replays the holdout-split rows of ``qa/typed/style.jsonl`` through a RUNNING AnyJev
+gateway, using the served two-stage style procedure verbatim (stage 1 = the category
+question on the capped description, stage 2 = the style question over that category's
+shortlist), and reports per candidate floor: acted rate, acted accuracy, ECE and Brier
+score — plus the confidence distribution. The operator picks the floor from that table
 and sets ``decisions.style.confidence_floor`` (env
 ``DECISIONS_STYLE_CONFIDENCE_FLOOR``), per
 ``docs/JEV_DECISION_MODEL_ANALYSIS_PLAN.md`` §7 ("ECE/Brier on held-out
 families before trusting any threshold").
 
-``confidence`` here is TypeSafe-style (top prob − mean of rest,
-``src/clm/schema.py::confidence`` at the pinned upstream revision), NOT the top
-probability — the ``--metric`` flag replays the table under either definition so
-the choice is explicit. Holdout rows only: ``--split holdout`` is the default
-and training rows are refused unless ``--split`` says otherwise.
+``confidence`` here is the STAGE-2 top probability — the number the seam gates on. The
+seam acts only when BOTH stages clear the floor (``src/decisions/tacit.py::choose_style``),
+so a row is *acted* at floor ``f`` iff ``min(stage1, stage2) >= f`` and stage 2 answered a
+real option: a wrong stage-1 category that excludes the gold style counts as a miss, not
+as an abstention. ECE/Brier stay over the stage-2 probability among acted rows. Holdout
+rows only: ``--split holdout`` is the default and training rows are refused unless
+``--split`` says otherwise.
 
-Acted accuracy is stratified, because the seam acts on the two answer kinds
-differently (``src/pipeline.py::_apply_decision_style``): a confident ``none``
-is a no-op that keeps the LLM style, while a confident wrong non-``none`` style
-is an INJECTED override error. ``acted_accuracy`` (the recommendation bar) is
-over non-``none`` choices only; ``none_accuracy`` is reported beside it.
+Acted accuracy is stratified, because the seam acts on the two answer kinds differently
+(``src/pipeline.py::_apply_decision_style``): a confident ``none`` is a no-op that keeps
+the LLM style, while a confident wrong non-``none`` style is an INJECTED override error.
+``acted_accuracy`` (the recommendation bar) is over non-``none`` choices only;
+``none_accuracy`` is reported beside it.
 
-Each floor row also carries a 95% Wilson interval on its acted accuracy, so a
-floor recommended on 30 rows is auditable as an estimate, not a point claim.
+Each floor row also carries a 95% Wilson interval on its acted accuracy, so a floor
+recommended on 30 rows is auditable as an estimate, not a point claim.
 
-The ``--labels`` input (``derive_style_labels.py``) is the enable-path gate for
-label provenance: ``main`` refuses to recommend a floor until
-``qa/typed/review.json`` records human review of exactly the labels being
-calibrated against (same file bytes, every labeled scenario's label+rationale
-covered, reviewer named). Printing the table always works — only the
-recommendation, and the exit code it drives, is gated.
+The ``--labels`` input (``derive_style_labels.py``) is the enable-path gate for label
+provenance: ``main`` refuses to recommend a floor until ``qa/typed/review.json`` records
+human review of exactly the labels being calibrated against (same file bytes, every
+labeled scenario's label+rationale covered, reviewer named). Printing the table always
+works — only the recommendation, and the exit code it drives, is gated.
 
-With ``--min-acted-accuracy`` and ``--min-acted-rate`` the report also names the
-lowest floor that clears both bars (``recommended``), which is the value
-``decisions.style.confidence_floor`` should take; with no floor qualifying it exits 2
-so the release step fails instead of enabling a seam the measurements do not support.
+With ``--min-acted-accuracy`` and ``--min-acted-rate`` the report also names the lowest
+floor that clears both bars (``recommended``), which is the value
+``decisions.style.confidence_floor`` should take; with no floor qualifying it exits 2 so
+the release step fails instead of enabling a seam the measurements do not support.
 
 Run it against a serving container (stdlib only, no torch)::
 
-    python scripts/decision_models/clm_calibrate.py \\
-        --style qa/typed/style.jsonl --base-url http://127.0.0.1:18700/v1 \\
-        --floors 0.3 0.4 0.5 0.6 --metric confidence \\
-        --min-acted-accuracy 0.8 --min-acted-rate 0.3 --report models/clm-calibration.json
+    python scripts/decision_models/tacit_calibrate.py \\
+        --style qa/typed/style.jsonl --base-url http://127.0.0.1:18100 \\
+        --floors 0.3 0.4 0.5 0.6 \\
+        --min-acted-accuracy 0.8 --min-acted-rate 0.3 --report models/tacit-calibration.json
 """
 
 from __future__ import annotations
@@ -50,23 +52,26 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import math
 import sys
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
-#: The abstention criterion: a confident ``none`` keeps the LLM style (a no-op),
-#: so override accuracy is measured over non-``none`` choices only. Must match
+#: The abstention criterion: a confident ``none`` keeps the LLM style (a no-op), so
+#: override accuracy is measured over non-``none`` choices only. Must match
 #: ``src/decisions/seam_prompts.py::STYLE_NONE_KEY`` (pinned by unit test).
-DEFAULT_QUESTION_ID = "architecture_style"
-
 NONE_CHOICE = "none"
 
 #: Wilson score interval z for the 95% acted-accuracy bands (two-sided).
 _WILSON_Z = 1.96
+
+#: The acted rule, recorded in the report so a consumer never has to infer it.
+ACTED_RULE = "min(stage1_category, stage2_style) >= floor"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -74,22 +79,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Calibrate decisions.style.confidence_floor on held-out style rows.")
     parser.add_argument("--style", default="qa/typed/style.jsonl", help="qa/typed/style.jsonl")
     parser.add_argument("--split", default="holdout", help="qa/ source split to replay (default: holdout).")
-    parser.add_argument("--base-url", required=True, help="clm-serve /v1 root (e.g. http://127.0.0.1:18700/v1).")
-    parser.add_argument("--model", default="clm-latest", help="Served model name.")
-    parser.add_argument("--question-id", default=DEFAULT_QUESTION_ID, help="Question id to ask and score.")
+    parser.add_argument(
+        "--base-url",
+        required=True,
+        help="AnyJev gateway ROOT (e.g. http://127.0.0.1:18100; the client appends /v1/decide).",
+    )
     parser.add_argument("--timeout", type=float, default=120.0, help="Per-request timeout in seconds.")
+    parser.add_argument(
+        "--seam-prompts",
+        default="src/decisions/seam_prompts.py",
+        help="The served prompt vocabulary, loaded by path (the trainer's rule).",
+    )
     parser.add_argument(
         "--floors",
         type=float,
         nargs="+",
         default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
         help="Candidate floors to tabulate.",
-    )
-    parser.add_argument(
-        "--metric",
-        choices=["confidence", "top_prob"],
-        default="confidence",
-        help="Which answer number the floor applies to (the seam gates on confidence).",
     )
     parser.add_argument("--bins", type=int, default=10, help="ECE bins.")
     parser.add_argument(
@@ -111,7 +117,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Recommend only a floor with at least this many acted overrides (small-n guard).",
     )
     parser.add_argument(
-        "--report", default="", help="Write the full report JSON here (e.g. models/clm-calibration.json)."
+        "--report", default="", help="Write the full report JSON here (e.g. models/tacit-calibration.json)."
     )
     parser.add_argument(
         "--labels",
@@ -144,22 +150,21 @@ def load_rows(path: Path, split: str) -> list[dict[str, Any]]:
     return rows
 
 
-def ask(base_url: str, model: str, row: dict[str, Any], question_id: str, timeout: float) -> dict[str, Any]:
-    """One served-shape /v1/systemone call; returns the raw answer object."""
-    body = {
-        "model": model,
-        "state": row["state"],
-        "questions": {
-            question_id: {
-                "type": "choice",
-                "instructions": row["instructions"],
-                "criteria": row["criteria"],
-            }
-        },
-    }
+def load_seam_prompts(path: Path) -> ModuleType:
+    """Import the served prompt vocabulary by path (stdlib-only, no package needed)."""
+    spec = importlib.util.spec_from_file_location("seam_prompts", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load seam prompts from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _decide(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """One ``POST /v1/decide``; returns the raw decision object."""
     request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/systemone",
-        data=json.dumps(body).encode("utf-8"),
+        f"{base_url.rstrip('/')}/v1/decide",
+        data=json.dumps(item).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -167,25 +172,58 @@ def ask(base_url: str, model: str, row: dict[str, Any], question_id: str, timeou
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload: dict[str, Any] = json.load(response)
     except OSError as exc:
-        raise SystemExit(f"clm-serve request failed for row {row.get('id')!r}: {exc}") from exc
-    answers: dict[str, Any] = payload.get("answers") or {}
-    answer = answers.get(question_id)
-    if not isinstance(answer, dict):
-        raise SystemExit(f"clm-serve answer for row {row.get('id')!r} carries no {question_id!r} entry: {payload!r}")
-    return answer
+        raise SystemExit(f"anyjev gateway request failed: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("probs"), dict):
+        raise SystemExit(f"anyjev gateway answer is not a decision: {payload!r}")
+    return payload
 
 
-def metric_of(answer: dict[str, Any], metric: str) -> float:
-    """The floored number: served confidence, or the top probability for comparison."""
-    if metric == "confidence":
-        value = answer.get("confidence")
-        if not isinstance(value, (int, float)):
-            raise SystemExit(f"answer carries no numeric confidence: {answer!r}")
-        return float(value)
-    probabilities: dict[str, Any] = answer.get("probabilities") or {}
-    if not probabilities:
-        raise SystemExit(f"answer carries no probabilities: {answer!r}")
-    return float(max(probabilities.values()))
+def ask(base_url: str, row: dict[str, Any], seams: Any, timeout: float) -> dict[str, Any]:
+    """Replay the served two-stage style choice; returns the replay's answer summary.
+
+    ``confidence`` is the stage-2 top probability (the number the seam gates on);
+    ``stage1`` rides along so the acted rule can require BOTH stages to clear the floor.
+    A failed stage 1 (transport/shape/off-taxonomy) yields a never-acted answer instead of
+    aborting the replay.
+    """
+    state = str(row["state"])[: seams.DECISION_STATE_MAX_CHARS]
+    stage1 = _decide(
+        base_url,
+        {
+            "state": state,
+            "question": seams.category_question(),
+            "options": list(seams.CATEGORY_SLUGS),
+            "kind": "choice",
+        },
+        timeout,
+    )
+    answer1 = stage1.get("answer")
+    probs1: dict[str, Any] = stage1.get("probs") or {}
+    if not isinstance(answer1, str) or answer1 not in probs1 or answer1 not in seams.CATEGORY_SLUGS:
+        return {"choice": None, "probabilities": {}, "confidence": 0.0, "stage1": 0.0}
+    stage1_conf = float(probs1[answer1])
+    styles = seams.styles_for_category(answer1)
+    options = [*styles, seams.STYLE_NONE_KEY]
+    stage2 = _decide(
+        base_url,
+        {"state": state, "question": seams.style_question(styles), "options": options, "kind": "choice"},
+        timeout,
+    )
+    answer2 = stage2.get("answer")
+    probs2_all: dict[str, Any] = stage2.get("probs") or {}
+    probs2 = {
+        key: float(value)
+        for key, value in probs2_all.items()
+        if key in options and isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    if not isinstance(answer2, str) or answer2 not in probs2:
+        return {"choice": None, "probabilities": {}, "confidence": 0.0, "stage1": stage1_conf}
+    return {
+        "choice": answer2,
+        "probabilities": probs2,
+        "confidence": probs2[answer2],
+        "stage1": stage1_conf,
+    }
 
 
 def expected_calibration_error(pairs: Sequence[tuple[float, bool]], bins: int) -> float:
@@ -362,7 +400,7 @@ def recommend(
         "floor": None,
         "reason": (
             f"no floor yields acted accuracy >= {min_acted_accuracy:.4f} at acted rate >= "
-            f"{min_acted_rate:.4f} on >= {min_acted} overrides — the head cannot be enabled safely on this corpus"
+            f"{min_acted_rate:.4f} on >= {min_acted} overrides — the seam cannot be enabled safely on this corpus"
         ),
         "min_acted_accuracy": min_acted_accuracy,
         "min_acted_rate": min_acted_rate,
@@ -371,24 +409,37 @@ def recommend(
 
 
 def summarize(
-    pairs: Sequence[tuple[float, bool, str]],
+    pairs: Sequence[tuple[float, float, bool, str | None]],
     floors: Sequence[float],
     bins: int,
 ) -> dict[str, Any]:
     """Floor-candidate table plus distribution and calibration summaries.
 
-    Each pair is ``(confidence, correct, choice)``. The seam only overrides on a
-    confident non-``none`` choice, so per-floor ``acted_accuracy`` is over those
-    override answers alone (with a 95% Wilson interval); confident ``none``
-    answers are reported as ``none_accuracy`` instead of feeding the enable bar.
+    Each pair is ``(confidence, acted_confidence, correct, choice)``: ``confidence`` is the
+    stage-2 probability the calibration curves are computed over, ``acted_confidence`` is
+    ``min(stage1, stage2)`` — the number the seam actually compares with its floor — and
+    ``choice`` is ``None`` when the replay produced no usable answer. Per-floor
+    ``acted_accuracy`` is over non-``none`` overrides alone (with a 95% Wilson interval);
+    confident ``none`` answers are reported as ``none_accuracy`` instead of feeding the
+    enable bar. ``replay_failures`` is the number of rows the replay could not answer at
+    all — floor-INVARIANT by construction (a failed row is never "acted", so a per-floor
+    count would read 0 at every floor the operator would consider), which keeps a dead or
+    broken sidecar from masquerading as abstention.
     """
-    scored = [(confidence, correct) for confidence, correct, _ in pairs]
+    scored = [(confidence, correct) for confidence, _acted, correct, _choice in pairs]
     table: list[dict[str, Any]] = []
     for floor in floors:
-        acted = [(confidence, correct, choice) for confidence, correct, choice in pairs if confidence >= floor]
-        overridden = [(correct, choice) for _, correct, choice in acted if choice != NONE_CHOICE]
-        abstained = [correct for _, correct, choice in acted if choice == NONE_CHOICE]
-        hits = sum(1 for correct, _ in overridden if correct)
+        overridden = [
+            correct
+            for _confidence, acted_confidence, correct, choice in pairs
+            if acted_confidence >= floor and choice is not None and choice != NONE_CHOICE
+        ]
+        abstained = [
+            correct
+            for _confidence, acted_confidence, correct, choice in pairs
+            if acted_confidence >= floor and choice == NONE_CHOICE
+        ]
+        hits = sum(1 for correct in overridden if correct)
         accuracy = (hits / len(overridden)) if overridden else None
         low, high = wilson_interval(hits, len(overridden))
         table.append(
@@ -402,11 +453,18 @@ def summarize(
                 "none_accuracy": (sum(1 for correct in abstained if correct) / len(abstained)) if abstained else None,
             }
         )
-    confidences = sorted(confidence for confidence, _, _ in pairs)
+    confidences = sorted(confidence for confidence, _acted, _correct, _choice in pairs)
     return {
         "n": len(pairs),
-        "accuracy": (sum(correct for _, correct, _ in pairs) / len(pairs)) if pairs else 0.0,
-        "override_rate": (sum(1 for _, _, choice in pairs if choice != NONE_CHOICE) / len(pairs) if pairs else 0.0),
+        # Floor-invariant: failed replays are excluded from every acted bucket, so one
+        # number here is the only honest way to report a broken gateway.
+        "replay_failures": sum(1 for _c, _a, _r, choice in pairs if choice is None),
+        "accuracy": (sum(correct for _c, _a, correct, _choice in pairs) / len(pairs)) if pairs else 0.0,
+        "override_rate": (
+            sum(1 for _c, _a, _r, choice in pairs if choice is not None and choice != NONE_CHOICE) / len(pairs)
+            if pairs
+            else 0.0
+        ),
         "ece": expected_calibration_error(scored, bins),
         "brier": brier_score(scored) if scored else 0.0,
         "confidence": {
@@ -422,13 +480,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Replay → score → print the table; recommend a floor when thresholds pass."""
     args = parse_args(argv)
     rows = load_rows(Path(args.style), args.split)
-    pairs: list[tuple[float, bool, str]] = []
+    seams = load_seam_prompts(Path(args.seam_prompts))
+    pairs: list[tuple[float, float, bool, str | None]] = []
     for row in rows:
-        answer = ask(args.base_url, args.model, row, args.question_id, args.timeout)
-        choice = answer.get("choice")
-        if not isinstance(choice, str):
-            raise SystemExit(f"clm-serve answer for row {row.get('id')!r} carries no string choice: {answer!r}")
-        pairs.append((metric_of(answer, args.metric), choice == row["label"], choice))
+        answer = ask(args.base_url, row, seams, args.timeout)
+        choice = answer["choice"]
+        confidence = float(answer["confidence"])
+        acted_confidence = min(float(answer["stage1"]), confidence) if choice is not None else 0.0
+        pairs.append((confidence, acted_confidence, choice == row["label"], choice))
     summary = summarize(pairs, list(args.floors), args.bins)
     recommended = recommend(summary["floors"], args.min_acted_accuracy, args.min_acted_rate, args.min_acted)
     reviewed, review_reason = review_status(Path(args.labels), Path(args.review))
@@ -441,9 +500,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "min_acted": args.min_acted,
         }
     report = {
-        "metric": args.metric,
+        "acted_rule": ACTED_RULE,
         "split": args.split,
-        "question_id": args.question_id,
         "label_review": {"certified": reviewed, "reason": review_reason},
         **summary,
         "recommended": recommended,
@@ -455,7 +513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_path.write_text(text + "\n", encoding="utf-8")
     print(text)
     if args.min_acted_accuracy is not None and report["recommended"]["floor"] is None:
-        print(f"clm-calibrate: FAIL: {report['recommended']['reason']}", file=sys.stderr)
+        print(f"tacit-calibrate: FAIL: {report['recommended']['reason']}", file=sys.stderr)
         return 2
     return 0
 

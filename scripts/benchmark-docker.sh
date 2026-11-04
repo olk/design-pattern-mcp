@@ -153,7 +153,7 @@ if [ -n "${BENCH_DECISION_OVERLAY:-}" ]; then
     COMPOSE_FILES+=(-f "$BENCH_DECISION_OVERLAY")
 fi
 # Teardown must use the SAME file set as bring-up: services defined only in the overlay
-# (design-pattern-clm / design-pattern-tacit) are invisible to a two-file `compose down`,
+# (design-pattern-tacit) are invisible to a two-file `compose down`,
 # so `--remove-orphans` would be evaluated against the wrong project.
 compose() { docker compose "${COMPOSE_FILES[@]}" "$@"; }
 
