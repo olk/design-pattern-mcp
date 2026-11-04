@@ -353,27 +353,56 @@ def test_fidelity_metrics_hand_computed(trainer: types.ModuleType) -> None:
     assert trainer._fidelity_metrics([], 0.5, 0.5) == {}
 
 
-def test_seam_gate_failures_name_every_under_trained_seam(trainer: types.ModuleType) -> None:
-    """A missing seam or a weak seam fails the build; a clean report produces no failures."""
+def test_seam_gate_failures_certify_only_sampled_seams(trainer: types.ModuleType) -> None:
+    """Certified seams are gated; thin or missing seams are skipped, not failed."""
     clean = {
-        "category": {"n": 5, "agreement": 0.9},
-        "style-stage1": {"n": 5, "agreement": 0.9},
-        "style-stage2": {"n": 5, "agreement": 0.9},
-        "rerank": {"n": 5, "agreement": 0.9},
-        "gate": {"n": 5, "agreement": 0.9},
-        "weights": {"n": 5, "agreement": 0.9, "expected_level_mae": 0.1},
+        "category": {"n": 50, "agreement": 0.9},
+        "style-stage1": {"n": 50, "agreement": 0.9},
+        "style-stage2": {"n": 50, "agreement": 0.9},
+        "rerank": {"n": 50, "agreement": 0.9},
+        "gate": {"n": 50, "agreement": 0.9},
+        "weights": {"n": 50, "agreement": 0.9, "expected_level_mae": 0.1},
     }
     assert trainer.seam_gate_failures(clean, 0.6, 0.2) == []
     weak = dict(clean)
-    weak["rerank"] = {"n": 5, "agreement": 0.3}
-    weak["weights"] = {"n": 5, "agreement": 0.9, "expected_level_mae": 0.4}
+    weak["rerank"] = {"n": 50, "agreement": 0.3}
+    weak["weights"] = {"n": 50, "agreement": 0.9, "expected_level_mae": 0.4}
     failures = trainer.seam_gate_failures(weak, 0.6, 0.2)
     assert any("'rerank'" in failure and "agreement" in failure for failure in failures)
     assert any("expected-level MAE" in failure for failure in failures)
+    # A thin sample cannot certify: 2 rows at 0.5 is noise, not an under-trained seam.
+    thin = dict(clean)
+    thin["gate"] = {"n": 2, "agreement": 0.5}
+    assert trainer.seam_gate_failures(thin, 0.6, 0.2) == []
+    # A seam absent from the eval split is skipped for the same reason.
     missing = {name: entry for name, entry in clean.items() if name != "style-stage2"}
-    assert any("'style-stage2' has no eval rows" in failure for failure in trainer.seam_gate_failures(missing, 0.6, 0.2))
-    # An empty metrics map (no eval rows at all) must name every gate, not pass silently.
-    assert len(trainer.seam_gate_failures({}, 0.6, 0.2)) == 6
+    assert trainer.seam_gate_failures(missing, 0.6, 0.2) == []
+    # No eval rows at all (stub/quick-smoke run): nothing is certified, nothing fails.
+    assert trainer.seam_gate_failures({}, 0.6, 0.2) == []
+    # The evidence threshold is a parameter, so a caller can certify at a smaller sample.
+    assert trainer.seam_gate_failures(thin, 0.6, 0.2, min_eval_rows=2) != []
+
+
+def test_split_examples_stratifies_by_seam(trainer: types.ModuleType) -> None:
+    """Every certifiable seam keeps eval rows; thin seams and tiny corpora stay in training."""
+
+    def rows(seam: str, count: int) -> list[Any]:
+        return [
+            trainer.Example(prompt=f"{seam}-{index}", kind="choice", label_ids=[1, 2], target=[0.5, 0.5], seam=seam)
+            for index in range(count)
+        ]
+
+    examples = rows("category", 100) + rows("rerank", 100) + rows("gate", 5) + rows("weights", 100)
+    train, eval_rows = trainer._split_examples(examples, 0.1, 13)
+    assert len(train) + len(eval_rows) == len(examples)
+    # gate has 5 rows — too thin to certify, so it must not lose training rows to eval.
+    assert {row.seam for row in eval_rows} == {"category", "rerank", "weights"}
+    # Deterministic for a fixed seed.
+    _, again = trainer._split_examples(examples, 0.1, 13)
+    assert [row.prompt for row in eval_rows] == [row.prompt for row in again]
+    # A corpus under 20 rows keeps every row for training.
+    tiny = rows("gate", 19)
+    assert trainer._split_examples(tiny, 0.1, 13) == (tiny, [])
 
 
 def test_false_act_rate_counts_clearing_the_floor(trainer: types.ModuleType) -> None:
@@ -557,7 +586,9 @@ def test_shard_command_parses_with_the_real_cli(trainer: types.ModuleType, tmp_p
         cot_max_tokens=512,
         batch=2,
     )
-    command = trainer._shard_command(args, shard=1, total_shards=3, problems_path=tmp_path / "p.json", out_path=tmp_path / "s.jsonl")
+    command = trainer._shard_command(
+        args, shard=1, total_shards=3, problems_path=tmp_path / "p.json", out_path=tmp_path / "s.jsonl"
+    )
     # Exactly what the child gets: interpreter, script path, then the flags.
     parsed = trainer.parse_args(command[2:])
     assert parsed._answer_shard == 1
@@ -571,14 +602,18 @@ def test_shard_command_parses_with_the_real_cli(trainer: types.ModuleType, tmp_p
     assert parsed.batch == 2
 
 
-def test_answer_shard_writes_globally_indexed_rows(trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_answer_shard_writes_globally_indexed_rows(
+    trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Shard ``i`` of ``n`` answers ``problems[i::n]`` and tags each row with its global index."""
     problems = [{"state": f"s{index}", "question": "q", "options": ["a"], "kind": "choice"} for index in range(7)]
     problems_path = tmp_path / "problems.json"
     problems_path.write_text(json.dumps(problems), encoding="utf-8")
     monkeypatch.setattr(trainer, "_load_teacher", lambda _args: object())
     monkeypatch.setattr(
-        trainer, "answer_problems", lambda _teacher, sliced: [{"route": "cot", "state": item["state"]} for item in sliced]
+        trainer,
+        "answer_problems",
+        lambda _teacher, sliced: [{"route": "cot", "state": item["state"]} for item in sliced],
     )
     seen: dict[int, int] = {}
     for shard, total in ((0, 3), (1, 3), (2, 3)):
@@ -640,9 +675,7 @@ def test_teacher_answers_merges_shards_in_order(trainer: types.ModuleType, monke
     with pytest.raises(SystemExit, match="teacher shard failed"):
         trainer.teacher_answers(object(), args, problems)
 
-    monkeypatch.setattr(
-        trainer.subprocess, "Popen", lambda command, env=None: _FakeChild(command, env, drop_last=True)
-    )
+    monkeypatch.setattr(trainer.subprocess, "Popen", lambda command, env=None: _FakeChild(command, env, drop_last=True))
     with pytest.raises(SystemExit, match="covered"):
         trainer.teacher_answers(object(), args, problems)
 
@@ -705,17 +738,13 @@ def test_assemble_problems_refuses_an_untrained_seam(
     # No generated prose: the hint text alone carries the style seam in the passing cases.
     monkeypatch.setattr(trainer, "generate_descriptions", lambda *_args: [])
     holdout_only = tmp_path / "holdout_only.jsonl"
-    holdout_only.write_text(
-        json.dumps({"split": "holdout", "statement": "s", "document": "d"}), encoding="utf-8"
-    )
+    holdout_only.write_text(json.dumps({"split": "holdout", "statement": "s", "document": "d"}), encoding="utf-8")
 
     def assemble(pairs: str) -> Any:
         args = types.SimpleNamespace(
             problems=12, style_states=0, rerank_pairs=pairs, rerank_problems=0, max_new_tokens=256
         )
-        return trainer._assemble_problems(
-            object(), ["hint"], seams, args, ["System goal: g\nDecision part: p"], [], 8
-        )
+        return trainer._assemble_problems(object(), ["hint"], seams, args, ["System goal: g\nDecision part: p"], [], 8)
 
     with pytest.raises(SystemExit, match="--rerank-pairs"):
         assemble("")
@@ -756,16 +785,12 @@ def _main_fakes(
         seen["gate_hints"] = list(hints)
         return [f"phase: analyze\ndescription: g{i}" for i in range(count)]
 
-    def fake_descriptions(
-        _tacit: Any, _hints: Any, count: int, _max_new: int, max_state_chars: int
-    ) -> list[str]:
+    def fake_descriptions(_tacit: Any, _hints: Any, count: int, _max_new: int, max_state_chars: int) -> list[str]:
         seen["description_cap"] = max_state_chars
         seen["description_count"] = count
         return [f"{text} {index}" for index, text in enumerate(descriptions)][:count]
 
-    def fake_teacher(
-        _tacit: Any, args: Any, problems: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], int]:
+    def fake_teacher(_tacit: Any, args: Any, problems: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
         seen["kinds"] = [problem["kind"] for problem in problems]
         seen["seams"] = [problem.get("seam") for problem in problems]
         seen["teacher_shards_arg"] = args.teacher_shards
@@ -796,9 +821,7 @@ def _main_fakes(
             for repeat in range(7)  # 21 rows: past the >=20 bar, so the eval split is real
             for kind in kinds
         ]
-        probe = [
-            trainer.Example(prompt="probe-choice", kind="choice", label_ids=[1, 2], target=[0.55, 0.45])
-        ]
+        probe = [trainer.Example(prompt="probe-choice", kind="choice", label_ids=[1, 2], target=[0.55, 0.45])]
         dropped_counts = {kind: {"unrouted": 0, "shape": 0, "unsharp": 0} for kind in ("choice", "score", "yes_no")}
         return rows, dropped_counts, probe
 
@@ -1015,6 +1038,9 @@ def test_trainer_main_fails_an_under_trained_seam(
     """A seam whose student-teacher agreement misses the bar must fail the build."""
     seen: dict[str, Any] = {}
     _main_fakes(trainer, seen, monkeypatch)
+    # Certify at 3 eval rows so the fake metrics exercise the failure path, not the
+    # thin-sample skip (production certifies at _MIN_EVAL_ROWS_PER_SEAM).
+    monkeypatch.setattr(trainer, "_MIN_EVAL_ROWS_PER_SEAM", 1)
     metrics = {seam: {"n": 3, "agreement": 0.9, "expected_level_mae": 0.1} for seam in trainer._GATED_SEAMS}
     metrics["rerank"] = {"n": 3, "agreement": 0.2, "expected_level_mae": 0.1}
     monkeypatch.setattr(trainer, "evaluate_student", lambda *_args, **_kwargs: metrics)
@@ -1162,14 +1188,15 @@ def test_calibration_ask_replays_the_served_two_stage_bytes(calibrator: types.Mo
         if len(calls) == 1:
             return {"answer": "domain-modeling", "probs": {"domain-modeling": 0.8, "saga": 0.2}}
         options = [str(option) for option in item["options"]]
-        return {"answer": options[0], "probs": dict.fromkeys(options, 0.5 / max(1, len(options) - 1)) | {options[0]: 0.5}}
+        return {
+            "answer": options[0],
+            "probs": dict.fromkeys(options, 0.5 / max(1, len(options) - 1)) | {options[0]: 0.5},
+        }
 
     original = calibrator._decide
     calibrator._decide = _fake_decide  # type: ignore[assignment]
     try:
-        answer = calibrator.ask(
-            "http://x:18100", {"state": "y" * (seams.DECISION_STATE_MAX_CHARS + 10)}, seams, 5.0
-        )
+        answer = calibrator.ask("http://x:18100", {"state": "y" * (seams.DECISION_STATE_MAX_CHARS + 10)}, seams, 5.0)
     finally:
         calibrator._decide = original  # type: ignore[assignment]
     assert answer["stage1"] == pytest.approx(0.8)
@@ -1305,7 +1332,12 @@ def test_calibration_main_fails_when_no_floor_qualifies(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "b", "confidence": 0.9, "probabilities": {"a": 0.1, "b": 0.9}, "stage1": 0.9},
+        lambda *args, **kwargs: {
+            "choice": "b",
+            "confidence": 0.9,
+            "probabilities": {"a": 0.1, "b": 0.9},
+            "stage1": 0.9,
+        },
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1369,7 +1401,12 @@ def test_calibration_main_refuses_to_recommend_without_human_review(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}, "stage1": 0.9},
+        lambda *args, **kwargs: {
+            "choice": "a",
+            "confidence": 0.9,
+            "probabilities": {"a": 0.9, "b": 0.1},
+            "stage1": 0.9,
+        },
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1432,7 +1469,12 @@ def test_calibration_main_recommends_once_the_ledger_certifies(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}, "stage1": 0.9},
+        lambda *args, **kwargs: {
+            "choice": "a",
+            "confidence": 0.9,
+            "probabilities": {"a": 0.9, "b": 0.1},
+            "stage1": 0.9,
+        },
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1493,7 +1535,12 @@ def test_calibration_main_voids_coverage_when_labels_change(
     monkeypatch.setattr(
         calibrator,
         "ask",
-        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}, "stage1": 0.9},
+        lambda *args, **kwargs: {
+            "choice": "a",
+            "confidence": 0.9,
+            "probabilities": {"a": 0.9, "b": 0.1},
+            "stage1": 0.9,
+        },
     )
     report = tmp_path / "calibration.json"
     code = calibrator.main(
@@ -1530,6 +1577,7 @@ def test_calibrator_none_choice_matches_the_served_vocabulary(calibrator: types.
 def shell_check() -> types.ModuleType:
     return _load("check_dockerfile_shell", "check_dockerfile_shell.py")
 
+
 def test_shell_check_flags_an_embedded_single_quote(shell_check: types.ModuleType) -> None:
     """The exact defect that produced 'Syntax error: \"(\" unexpected'."""
 
@@ -1561,7 +1609,7 @@ def test_shell_check_passes_a_clean_payload(shell_check: types.ModuleType) -> No
     class _P:
         line = 1
         instruction = "RUN"
-        command = "sh -c 'set -eu; echo \"a (b)\"; python3 -u /build/x.py --pin \"${P}\"'"
+        command = 'sh -c \'set -eu; echo "a (b)"; python3 -u /build/x.py --pin "${P}"\''
         payload = 'set -eu; echo "a (b)"; python3 -u /build/x.py --pin "${P}"'
 
     assert shell_check.problems(_P()) == []

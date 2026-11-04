@@ -56,6 +56,10 @@ TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
 # docker-publish-all: the image is ~29 GB, so a server release must not force that upload.
 TACIT_HUB_REPO   := olkowa/design-pattern-tacit
 TACIT_GHCR_REPO  := ghcr.io/olk/design-pattern-tacit
+# Publish refuses weights whose manifest does not certify every seam (>= 10 eval rows each):
+# the build gate lets a quick-smoke run through with warnings, and the marker hashes inputs,
+# not knobs, so this is the last check that a smoke artifact cannot ship by accident.
+TACIT_ALLOW_UNCERTIFIED ?= 0
 # Self-distillation knobs, sized to MAX EFFORT: the fine-tune's aim is pattern-selection
 # consistency and quality, so the defaults spend the available GPU envelope on volume and
 # coverage (all train rerank pairs, ~1k style questions) and keep the recipe's single epoch.
@@ -556,6 +560,7 @@ docker-publish-tacit: docker-build-tacit ## Push the Tacit sidecar image to Dock
 	@echo "Publishing $(TACIT_IMAGE):$(DOCKER_TAG) distilled from:"
 	@python3 -c "import json;d=json.load(open('$(TACIT_HOST_MANIFEST)'));\
 print({k: d.get(k) for k in ('repo','problems','examples','kept','epochs','lr')})"
+	@python3 -c 'import json,sys;m=json.load(open("$(TACIT_HOST_MANIFEST)"));g=("category","style-stage1","style-stage2","rerank","gate","weights");e=m.get("eval") or {};thin=[s for s in g if int((e.get(s) or {}).get("n") or 0)<10];allow="$(TACIT_ALLOW_UNCERTIFIED)"=="1";print("ERROR: uncertified seams",thin,"- fewer than 10 eval rows each; run the full build or pass TACIT_ALLOW_UNCERTIFIED=1") if thin and not allow else (print("WARNING: publishing uncertified seams",thin) if thin else None);sys.exit(1 if thin and not allow else 0)'
 	docker login -u olkowa
 	docker login ghcr.io -u olk
 	$(call publish-image,$(TACIT_IMAGE),$(TACIT_HUB_REPO),$(TACIT_GHCR_REPO))

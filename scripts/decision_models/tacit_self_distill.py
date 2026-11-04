@@ -1072,7 +1072,9 @@ def teacher_answers(
         for shard in range(total_shards):
             out_path = workdir / f"shard-{shard}.jsonl"
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)}
-            children.append(subprocess.Popen(_shard_command(args, shard, total_shards, problems_path, out_path), env=env))
+            children.append(
+                subprocess.Popen(_shard_command(args, shard, total_shards, problems_path, out_path), env=env)
+            )
         for child in children:
             if child.wait() != 0:
                 raise SystemExit("a teacher shard failed — refusing to train on a partial answer set")
@@ -1203,6 +1205,13 @@ def _expected_level(probs: Sequence[float]) -> float:
 #: weights seam is gated on its expected-level MAE instead).
 _GATED_SEAMS: tuple[str, ...] = ("category", "style-stage1", "style-stage2", "rerank", "gate")
 
+#: Minimum eval rows before a seam's fidelity is *certified*. Agreement on a handful of rows
+#: is binomial noise — at the 0.6 bar, ten rows is the smallest sample that can distinguish a
+#: passing seam from a failing one — so a thinner seam is skipped with a warning instead of
+#: failing the build. A full build holds ~10% of 800+ rows per seam and certifies all of them;
+#: the quick-smoke shape cannot reach this and is therefore never certified.
+_MIN_EVAL_ROWS_PER_SEAM = 10
+
 
 def _fidelity_metrics(
     samples: Sequence[tuple[list[float], list[float], str, str]], choice_floor: float, gate_floor: float
@@ -1255,30 +1264,33 @@ def _fidelity_metrics(
 
 
 def seam_gate_failures(
-    metrics: dict[str, dict[str, Any]], min_agreement: float, max_score_mae: float
+    metrics: dict[str, dict[str, Any]],
+    min_agreement: float,
+    max_score_mae: float,
+    min_eval_rows: int | None = None,
 ) -> list[str]:
-    """Reasons the trained student must not ship; empty when every seam clears its bar.
+    """Reasons the trained student must not ship; empty when every certified seam clears its bar.
 
-    Every answer seam must be present in the eval split and clear
-    ``--min-seam-agreement``; the weights seam must also stay under ``--max-score-mae``.
-    A missing seam is a failure, not a skip: an eval split that lost a seam cannot certify
-    it.
+    A seam is certified only with at least ``min_eval_rows`` eval rows (default
+    ``_MIN_EVAL_ROWS_PER_SEAM``): below that the agreement is noise, so the seam is skipped
+    (and warned about by ``_seam_report``) rather than failed. Certified answer seams must
+    clear ``--min-seam-agreement``; a certified weights seam must stay under
+    ``--max-score-mae``. A full build certifies every seam — the eval split is stratified by
+    seam, so none can vanish from it.
     """
+    threshold = _MIN_EVAL_ROWS_PER_SEAM if min_eval_rows is None else min_eval_rows
     failures: list[str] = []
     for seam in _GATED_SEAMS:
-        entry = metrics.get(seam)
-        if entry is None or not entry.get("n"):
-            failures.append(f"seam {seam!r} has no eval rows — the eval split lost a seam")
+        entry = metrics.get(seam) or {}
+        if int(entry.get("n") or 0) < threshold:
             continue
         agreement = float(entry["agreement"])
         if agreement < min_agreement:
             failures.append(
                 f"seam {seam!r} student-teacher agreement {agreement:.3f} < --min-seam-agreement {min_agreement}"
             )
-    weights = metrics.get("weights")
-    if weights is None or not weights.get("n"):
-        failures.append("seam 'weights' has no eval rows — the eval split lost a seam")
-    else:
+    weights = metrics.get("weights") or {}
+    if int(weights.get("n") or 0) >= threshold:
         mae = weights.get("expected_level_mae")
         if mae is None:
             failures.append("seam 'weights' eval carries no expected_level_mae")
@@ -1451,15 +1463,36 @@ def _post_train_metrics(
     return metrics, false_act
 
 
-def _split_examples(
-    examples: Sequence[Example], eval_frac: float, seed: int
-) -> tuple[list[Example], list[Example]]:
-    """Deterministic train/eval split; a corpus under 20 rows keeps every row for training."""
+def _split_examples(examples: Sequence[Example], eval_frac: float, seed: int) -> tuple[list[Example], list[Example]]:
+    """Deterministic, seam-stratified train/eval split.
+
+    Stratified by seam so a low-frequency seam cannot vanish from the eval split — losing
+    one fails the build on a sample too small to certify it. A seam with fewer than
+    ``_MIN_EVAL_ROWS_PER_SEAM`` rows keeps every row for training (it cannot be certified
+    anyway), and a corpus under 20 rows keeps every row for training. When no seam is
+    individually certifiable, the split still holds out ``eval_frac`` of the corpus globally,
+    preserving the invariant that a build with 20+ rows has eval rows (the gates skip thin
+    samples).
+    """
+    if len(examples) < 20:
+        return list(examples), []
     rng = random.Random(seed)
-    indices = list(range(len(examples)))
-    rng.shuffle(indices)
-    n_eval = int(len(examples) * eval_frac) if len(examples) >= 20 else 0
-    return [examples[i] for i in indices[n_eval:]], [examples[i] for i in indices[:n_eval]]
+    by_seam: dict[str, list[int]] = {}
+    for index, example in enumerate(examples):
+        by_seam.setdefault(example.seam, []).append(index)
+    eval_indices: set[int] = set()
+    for indices in by_seam.values():
+        rng.shuffle(indices)
+        n_eval = int(len(indices) * eval_frac)
+        if n_eval == 0 and len(indices) >= _MIN_EVAL_ROWS_PER_SEAM:
+            n_eval = 1
+        eval_indices.update(indices[:n_eval])
+    if not eval_indices:
+        order = list(range(len(examples)))
+        rng.shuffle(order)
+        eval_indices.update(order[: int(len(examples) * eval_frac)])
+    train = [example for index, example in enumerate(examples) if index not in eval_indices]
+    return train, [examples[index] for index in sorted(eval_indices)]
 
 
 def _seam_report(
@@ -1470,13 +1503,25 @@ def _seam_report(
 ) -> dict[str, dict[str, Any]]:
     """Enforce the per-seam fidelity gates and build the manifest's per-seam block.
 
-    A build with too few rows to hold out any eval row (a stub or quick-smoke run, never the
-    image build) cannot certify a seam, so it skips the gates with a warning instead of
-    claiming a pass; every real build fails here rather than shipping an under-trained seam.
+    Only certified seams are gated: a seam with fewer than ``_MIN_EVAL_ROWS_PER_SEAM`` eval
+    rows (a stub or quick-smoke run, never the image build) cannot certify anything, so it is
+    skipped with a warning instead of claiming a pass — and instead of failing on noise. The
+    eval split is stratified by seam, so a real build certifies every seam.
     """
     if not eval_rows:
         logger.warning("no eval rows (fewer than 20 kept rows) — per-seam fidelity gates skipped")
     else:
+        thin = [
+            seam
+            for seam in (*_GATED_SEAMS, "weights")
+            if int((metrics.get(seam) or {}).get("n") or 0) < _MIN_EVAL_ROWS_PER_SEAM
+        ]
+        if thin:
+            logger.warning(
+                "eval too thin to certify %s (< %d rows per seam) — skipped, not failed",
+                thin,
+                _MIN_EVAL_ROWS_PER_SEAM,
+            )
         failures = seam_gate_failures(metrics, args.min_seam_agreement, args.max_score_mae)
         if failures:
             raise SystemExit("; ".join(failures) + " — an under-trained seam must not ship")
