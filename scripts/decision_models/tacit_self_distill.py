@@ -1205,12 +1205,16 @@ def _expected_level(probs: Sequence[float]) -> float:
 #: weights seam is gated on its expected-level MAE instead).
 _GATED_SEAMS: tuple[str, ...] = ("category", "style-stage1", "style-stage2", "rerank", "gate")
 
-#: Minimum eval rows before a seam's fidelity is *certified*. Agreement on a handful of rows
-#: is binomial noise — at the 0.6 bar, ten rows is the smallest sample that can distinguish a
-#: passing seam from a failing one — so a thinner seam is skipped with a warning instead of
-#: failing the build. A full build holds ~10% of 800+ rows per seam and certifies all of them;
-#: the quick-smoke shape cannot reach this and is therefore never certified.
-_MIN_EVAL_ROWS_PER_SEAM = 10
+#: Minimum eval rows before a seam's fidelity is *certified*. This is an evidence floor,
+#: not a power guarantee: a true-0.5 seam still clears the 0.6 bar 25% of the time at 20
+#: rows (38% at 10), so the gate's real power lives in the full build's row counts, where a
+#: true-0.5 seam passes ~8% of the time on the 60-eval-row low-frequency seams and ~1% on
+#: rerank's 140. The floor's job is to keep under-sampled builds honest instead of noisy:
+#: the quick-smoke shape (100 rerank pairs → 10 eval rows, its largest seam) lands below
+#: the bar and certifies nothing, while a full build (~600 category/gate rows, ~500 per
+#: style stage, ~1.4k rerank, ~4.8k weights → 60/60/50/50/140/480 eval rows) certifies all
+#: six. Thinner seams are skipped with a warning, never failed on noise.
+_MIN_EVAL_ROWS_PER_SEAM = 20
 
 
 def _fidelity_metrics(
@@ -1649,6 +1653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "teacher_shards": teacher_shards,
                 "min_seam_agreement": args.min_seam_agreement,
                 "max_score_mae": args.max_score_mae,
+                "min_eval_rows": _MIN_EVAL_ROWS_PER_SEAM,
                 "seams": seams_block,
                 "eval": metrics,
                 "false_act": false_act,

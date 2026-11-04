@@ -5,7 +5,7 @@ How to self-distil the AnyJev Tacit-4B decision model, bake the result into
 
 The entry point is one make rule — `make docker-build-tacit`. Training runs inside the
 image build (BuildKit `RUN --device`), not on the host; the shipped image only serves.
-`Makefile:386` drives `docker/Dockerfile.tacit`, whose `self-distill` stage runs
+`Makefile:390` drives `docker/Dockerfile.tacit`, whose `self-distill` stage runs
 `scripts/decision_models/tacit_self_distill.py`.
 
 Related documents: `docs/trainer-build-plan.md` (Proxmox LXC runbook, host prep),
@@ -97,7 +97,7 @@ All are `?=` variables on the make rule and are forwarded as Docker build args.
 | `TACIT_EPOCHS` / `TACIT_LR` / `TACIT_BATCH` / `TACIT_ACCUM` | `1` / `1e-4` / `4` / `8` | QLoRA recipe |
 | `TACIT_COT_MAX_TOKENS` | `2048` | Teacher CoT bound; cost scales ≈ questions × this |
 | `TACIT_MAX_NEW_TOKENS` | `256` | Bound for the state/description writing passes only |
-| `TACIT_MIN_SEAM_AGREEMENT` | `0.6` | Build fails when a *certified* seam (≥10 eval rows) drops below this |
+| `TACIT_MIN_SEAM_AGREEMENT` | `0.6` | Build fails when a *certified* seam (≥20 eval rows) drops below this |
 | `TACIT_CONFIDENCE_FLOOR` | `0.5` | Must equal the served `DESIGN_PATTERN_DECISIONS_*_CONFIDENCE_FLOOR` |
 | `TACIT_GATE_CONFIDENCE_FLOOR` | `$(TACIT_CONFIDENCE_FLOOR)` | The reasoning gate's own floor |
 | `TACIT_MIN_KIND_ROWS` | `1` | Build fails when a serving kind keeps fewer rows |
@@ -116,15 +116,15 @@ make docker-build-tacit \
 ```
 
 This exercises the entitlement, the CDI/`ldconfig` handshake, the teacher pass, QLoRA, the
-gates and the extraction marker. Expect `too thin to certify [...]` warnings for the
-low-frequency seams — a smoke build cannot certify them, and that is not a failure. Only the
-full build produces a certifiable artifact.
+gates and the extraction marker. Expect `too thin to certify [...]` warnings — a smoke build
+certifies nothing (its largest seam, rerank, holds ~10 eval rows), and that is not a failure.
+Only the full build certifies every seam.
 
 ### 4.2 Drop the smoke artifact — mandatory
 
 The cache marker (`.extract-complete`) hashes **the train inputs only** — trainer script,
 `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl`,
-`docker/Dockerfile.tacit` (`Makefile:117-119`). It does **not** hash the knob values.
+`docker/Dockerfile.tacit` (`Makefile:121-123`). It does **not** hash the knob values.
 A smoke build therefore leaves a marker that validates, and the next run takes the
 `runtime-distilled-cached` path and silently ships the 200-problem weights.
 
@@ -140,7 +140,7 @@ make docker-build-tacit 2>&1 | tee build-tacit.log
 grep -E "teacher kept .* of .* problems|wrote distilled checkpoint" build-tacit.log
 ```
 
-`DOCKER_BUILD_PROGRESS` already defaults to `plain` (`Makefile:131`), so the trainer's
+`DOCKER_BUILD_PROGRESS` already defaults to `plain` (`Makefile:135`), so the trainer's
 `logger.info` lines land in the log. `set -o pipefail` is required: without it `tee`'s exit
 status masks a failed multi-hour build, and the `grep` is the proof-of-training gate — a
 cached rebuild never prints either line.
@@ -175,12 +175,12 @@ seed, `states`/`gate_states`/`style_states`/`style_problems`/`rerank_problems`,
 `teacher_shards`, both gate thresholds, the per-seam `seams` block and the `eval` metrics.
 
 The build refuses to ship an under-trained seam, but certifies only what it has evidence for:
-the eval split is **stratified by seam**, and a seam needs ≥10 eval rows before its agreement
-(or the weights MAE) is enforced — below that the number is binomial noise, so the seam is
-skipped with a `too thin to certify` warning instead of failing the build. A full build holds
-~10% of 800+ rows per seam and certifies all six; the smoke shape cannot certify the
-low-frequency seams (`category`, `gate`, the two style stages) and logs them as skipped.
-`TACIT_MIN_KIND_ROWS` is independent and always enforced.
+the eval split is **stratified by seam**, and a seam needs ≥20 eval rows before its agreement
+(or the weights MAE) is enforced — an evidence floor, not a power guarantee (a true-0.5 seam
+still clears the 0.6 bar 25% of the time at 20 rows). A full build holds ~60/60/50/50/140/480
+eval rows across `category`/`gate`/style-stage1/style-stage2/`rerank`/`weights`, where the
+gate has real power, and certifies all six; the smoke shape certifies nothing and logs every
+seam as skipped. `TACIT_MIN_KIND_ROWS` is independent and always enforced.
 
 ### 4.5 Rebuild without a GPU (optional)
 
@@ -277,7 +277,8 @@ make docker-publish-tacit
 Builds first (so the pushed bytes are the ones pinned by `.extract-complete`), prints the
 manifest provenance, then pushes `design-pattern-tacit:$(DOCKER_TAG)` and `:latest` to
 `olkowa/design-pattern-tacit` (Docker Hub) and `ghcr.io/olk/design-pattern-tacit` (GHCR).
-It refuses a manifest that does not certify every seam (≥10 eval rows each), so a smoke
+It refuses a manifest that does not certify every seam (the trainer records the threshold,
+`min_eval_rows: 20`, in `self-distill.json` and the guard reads it from there), so a smoke
 build cannot ship by accident; `TACIT_ALLOW_UNCERTIFIED=1` overrides with a warning.
 It is deliberately **not** part of `docker-publish-all`: the image is ~29 GB. Bump
 `pyproject.toml` version first if the release is versioned — the tag comes from there.
@@ -298,7 +299,7 @@ TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 make docker-up-decisions
 | `torch.cuda.is_available() is false: no GPU visible to the trainer` | CDI device not mounted into the RUN | Confirm `--allow device=nvidia.com/gpu=all` and the `ldconfig` prefix in `docker/Dockerfile.tacit:144` |
 | `teacher landed on cpu, not CUDA` | accelerate fell back to CPU | Check the CDI mount; the run refuses an hours-long CPU train |
 | `too few usable teacher rows for [...]` | Floors too strict or budget too small | Lower `--answer-mass-floor`/floor, raise `TACIT_PROBLEMS` |
-| `too thin to certify [...]` warning | A seam has fewer than 10 eval rows (smoke-sized build) | Not a failure — certification needs the full build |
+| `too thin to certify [...]` warning | A seam has fewer than 20 eval rows (smoke-sized build) | Not a failure — certification needs the full build |
 | Seam gate failure (`under-trained seam must not ship`) | A *certified* seam's agreement is below `TACIT_MIN_SEAM_AGREEMENT` or its MAE above 0.2 | Raise volume, not the threshold |
 | `runc create ... open sysctl net.ipv4.ip_unprivileged_port_start ... permission denied` | Unprivileged Proxmox LXC: `docker build` works, `docker run`/compose cannot start | Train on that host via this make rule; serve elsewhere, or use `--network host` with `TACIT_BIND_HOST=127.0.0.1` |
 | First container start takes minutes | vLLM loads ~8 GB of weights; healthcheck `start_period` is 300 s | Wait for `healthy` |
@@ -307,9 +308,9 @@ TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 make docker-up-decisions
 
 | Path | Role |
 |---|---|
-| `Makefile:386` (`docker-build-tacit`) | The rule: payload check, cache switch, build, extract, marker |
-| `Makefile:65-88` | Knob defaults |
-| `Makefile:117-119` | `TACIT_TRAIN_INPUTS` — the only bytes the marker hashes |
+| `Makefile:390` (`docker-build-tacit`) | The rule: payload check, cache switch, build, extract, marker |
+| `Makefile:69-92` | Knob defaults |
+| `Makefile:121-123` | `TACIT_TRAIN_INPUTS` — the only bytes the marker hashes |
 | `docker/Dockerfile.tacit:94-165` | `self-distill` stage and the GPU `RUN` |
 | `docker/Dockerfile.tacit:196-213` | `runtime-released` / `runtime-distilled-cached` / `runtime-distilled` |
 | `scripts/decision_models/tacit_self_distill.py` | The trainer |

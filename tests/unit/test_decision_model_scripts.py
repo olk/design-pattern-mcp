@@ -959,6 +959,7 @@ def test_trainer_main_walks_generate_to_save(
     assert manifest["teacher_shards"] == 1
     assert manifest["min_seam_agreement"] == 0.6
     assert manifest["max_score_mae"] == 0.2
+    assert manifest["min_eval_rows"] == 20  # the publish guard reads this, never a hardcoded copy
     # Every seam's kept count and its eval fidelity land in one block.
     assert set(manifest["seams"]) == {"category", "style-stage1", "style-stage2", "gate", "rerank", "weights"}
     assert manifest["seams"]["weights"]["expected_level_mae"] == pytest.approx(0.1)

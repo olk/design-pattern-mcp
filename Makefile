@@ -554,13 +554,19 @@ docker-publish-tei: docker-build-tei ## Push both TEI images to Docker Hub + GHC
 # TACIT_TRAIN_INPUTS through models/tacit-4b/.extract-complete. No clean-tree gate
 # (unlike docker-publish): the trained checkpoint is deliberately untracked, so a real
 # train output would always trip it. The manifest is echoed as the provenance record.
+# Publish also refuses a manifest that does not certify every seam: the trainer records
+# the certification threshold (min_eval_rows, 20) in self-distill.json and the guard
+# below reads it from there, so the two can never drift. The build gate lets a
+# quick-smoke run through with warnings, and the marker hashes inputs, not knobs — this
+# is the last check that a smoke artifact cannot ship by accident
+# (TACIT_ALLOW_UNCERTIFIED=1 overrides).
 docker-publish-tacit: docker-build-tacit ## Push the Tacit sidecar image to Docker Hub + GHCR
 	@test -s "$(TACIT_HOST_MANIFEST)" || { \
 		echo "ERROR: $(TACIT_HOST_MANIFEST) is missing - the image has no train provenance"; exit 1; }
 	@echo "Publishing $(TACIT_IMAGE):$(DOCKER_TAG) distilled from:"
 	@python3 -c "import json;d=json.load(open('$(TACIT_HOST_MANIFEST)'));\
 print({k: d.get(k) for k in ('repo','problems','examples','kept','epochs','lr')})"
-	@python3 -c 'import json,sys;m=json.load(open("$(TACIT_HOST_MANIFEST)"));g=("category","style-stage1","style-stage2","rerank","gate","weights");e=m.get("eval") or {};thin=[s for s in g if int((e.get(s) or {}).get("n") or 0)<10];allow="$(TACIT_ALLOW_UNCERTIFIED)"=="1";print("ERROR: uncertified seams",thin,"- fewer than 10 eval rows each; run the full build or pass TACIT_ALLOW_UNCERTIFIED=1") if thin and not allow else (print("WARNING: publishing uncertified seams",thin) if thin else None);sys.exit(1 if thin and not allow else 0)'
+	@python3 -c 'import json,sys;m=json.load(open("$(TACIT_HOST_MANIFEST)"));g=("category","style-stage1","style-stage2","rerank","gate","weights");e=m.get("eval") or {};t=m.get("min_eval_rows");thin=g if t is None else [s for s in g if int((e.get(s) or {}).get("n") or 0)<int(t)];allow="$(TACIT_ALLOW_UNCERTIFIED)"=="1";print("ERROR: manifest records no min_eval_rows - legacy uncertified artifact; retrain or pass TACIT_ALLOW_UNCERTIFIED=1") if t is None and not allow else (print("ERROR: uncertified seams",thin,"- fewer than",t,"eval rows each; run the full build or pass TACIT_ALLOW_UNCERTIFIED=1") if thin and not allow else (print("WARNING: publishing uncertified seams",thin) if thin else None));sys.exit(1 if thin and not allow else 0)'
 	docker login -u olkowa
 	docker login ghcr.io -u olk
 	$(call publish-image,$(TACIT_IMAGE),$(TACIT_HUB_REPO),$(TACIT_GHCR_REPO))
