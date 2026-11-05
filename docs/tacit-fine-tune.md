@@ -21,14 +21,21 @@ reasoning-conditioned label distribution in a single forward pass.
 
 The questions come from `src/decisions/seam_prompts.py` — the same module the server asks
 with at serving time, loaded by path so the trainer sees the exact production bytes
-(`tacit_self_distill.py:391`). A prompt-vocabulary change therefore invalidates the cached
+(`tacit_self_distill.py:409`). A prompt-vocabulary change therefore invalidates the cached
 weights (it is one of `TACIT_TRAIN_INPUTS`).
 
-Phases, all in one process (`tacit_self_distill.py:1492-1616`):
+Phases, all in one process (`tacit_self_distill.py:1575-1700`):
 
 1. **Phase 1/3 — write states.** `problems // 10` design states plus gate states
    (`_GATE_SHARE = 10`), and `problems // 12` description-shaped style states
    (`_STYLE_SHARE = 12`; corpus train hints first, generated descriptions fill the rest).
+   Each state prompt pairs a train hint with a rotating focus (`_STATE_FOCUSES`, one
+   focus per hint cycle) so repeated hints never see a byte-identical prompt — the
+   collapse mode behind the 96-of-600 build in §4.4. The phase log separates the two
+   loss channels — `dropped N non-serving-shaped design states` (shape filter; fix with
+   `TACIT_MAX_NEW_TOKENS=512`) and `dropped N duplicate design states` (convergence;
+   fix with more hints or a higher `TACIT_STATES`) — so any shortfall in `states` is
+   attributable from the log alone.
 2. **Teach.** One sequential CoT `generate` per problem, sharded across the visible GPUs
    (`teacher_answers`; `TACIT_TEACHER_SHARDS=0` = one shard per device). This is the
    dominant cost.
@@ -53,7 +60,7 @@ Phases, all in one process (`tacit_self_distill.py:1492-1616`):
 | `style-stage2` | `choice` | Ch2 style stage 2: ≤26-style shortlist + `none` |
 | `rerank` | `yes_no` | J1 rerank stage 2: one relevance question per candidate (stage 1 is the deterministic fused pool) |
 
-Gated seams (`_GATED_SEAMS`, `tacit_self_distill.py:1204`) are `category`, `style-stage1`,
+Gated seams (`_GATED_SEAMS`, `tacit_self_distill.py:1240`) are `category`, `style-stage1`,
 `style-stage2`, `rerank`, `gate`; `weights` is judged by MAE instead of agreement.
 
 ## 2. Prerequisites (GPU builder)
@@ -90,7 +97,7 @@ All are `?=` variables on the make rule and are forwarded as Docker build args.
 | `TACIT_MODEL_REPO` | `morriszjm/Tacit-4B` | Teacher/base checkpoint |
 | `VLLM_IMAGE_TAG` | `v0.17.1` | vLLM base image tag |
 | `TACIT_PROBLEMS` | `6000` | Teacher question budget; state, gate and style counts derive from it |
-| `TACIT_STATES` | `0` | Design states; 0 = `problems // 10` |
+| `TACIT_STATES` | `0` | Design states; 0 = `problems // 10`. Raise past the derived default to over-provision state diversity at the same teacher budget — each state then trains on a narrower rotating axis window (all eight axes still covered across states) |
 | `TACIT_STYLE_STATES` | `0` | Ch2 description states; 0 = `problems // 12` |
 | `TACIT_RERANK_PROBLEMS` | `0` | J1 questions; 0 = **all** train pairs in `qa/typed/rerank_pairs.jsonl` |
 | `TACIT_TEACHER_SHARDS` | `0` | 0 = one shard per visible CUDA device (capped at 8); 1 = in-process |
@@ -354,7 +361,7 @@ are copied verbatim from the file; the `seams` and `eval` blocks are shown per s
 
 | Field | Example Value Pattern | Meaning | How to Interpret |
 |---|---|---|---|
-| `states` | `96` | Design states actually written — distinct and serving-shaped | Expected: `TACIT_STATES` when set, else `--problems // 10`, minus states lost to shape filtering or deduplication (`generate_states` drops non-serving-shaped output silently and logs `dropped N duplicate design states`). `96` is far below the 600 a 6000-question budget derives, so either `TACIT_STATES=96` was set or most generations were dropped — the build log distinguishes the two. Anomalous: a realized count far below the request with no corresponding log line. |
+| `states` | `96` | Design states actually written — distinct and serving-shaped | Expected: `TACIT_STATES` when set, else `--problems // 10`, minus states lost to shape filtering or deduplication. `generate_states` logs both loss channels — `dropped N non-serving-shaped design states` (shape filter; fix with `TACIT_MAX_NEW_TOKENS=512`) and `dropped N duplicate design states` (convergence; fix with more hints or a higher `TACIT_STATES`) — and each prompt is sampled once, so `wanted − non-serving − duplicates = states` attributes any shortfall exactly. `96` is far below the 600 a 6000-question budget derives, so either `TACIT_STATES=96` was set or most generations were dropped — the two log lines separate the causes. Anomalous: a realized count far below the request with no corresponding log line. |
 | `gate_states` | `599` | Gate states kept after serving-shape normalization | Expected: close to the gate budget (`--problems // 10` = 600), minus non-serving-shaped drops. Anomalous: far below the budget — the gate trained on a narrow phase/part spread. |
 | `axes_per_state` | `8` | Quality axes asked per design state | Expected: `8` = all `QUALITY_AXES` when the budget allows; `1–7` is the budget-constrained rotating window. Anomalous: `1` on a full budget (per-axis coverage collapses). |
 | `style_states` | `500` | Description-shaped states for Ch2 (hints first, generated descriptions fill the rest) | Expected: `TACIT_STYLE_STATES` or `--problems // 12` (500), floored at the hint-corpus size. Anomalous: `0` (the builder aborts) or below the hint count. |

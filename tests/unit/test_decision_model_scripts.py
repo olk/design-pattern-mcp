@@ -147,6 +147,21 @@ def test_load_topic_hints_filters_holdout(trainer: types.ModuleType, tmp_path: P
     assert trainer.load_topic_hints(seed, 10) == ["train q"]
 
 
+def test_state_prompts_stay_distinct_across_hint_cycles(trainer: types.ModuleType) -> None:
+    """Repeats of a hint must not be byte-identical prompts (96-of-600 state collapse)."""
+    fresh = trainer._state_prompts([f"topic {i}" for i in range(139)], 600)
+    assert len(fresh) == 600
+    assert len(set(fresh)) == 600  # 139 hints x 8 focuses: every (hint, focus) pair unique
+    assert "topic 5" in fresh[5]  # hint indexing unchanged
+    # A stale 70-hint pool still yields 70 x 8 distinct prompts before pairs repeat.
+    stale = trainer._state_prompts([f"topic {i}" for i in range(70)], 600)
+    assert len(set(stale)) == 560
+    # No seed texts: the fallback topic rotates the focus instead of collapsing to one prompt.
+    fallback = trainer._state_prompts([], 24)
+    assert len(fallback) == 24
+    assert len(set(fallback)) == 8
+
+
 def test_normalise_state_keeps_serving_shape(trainer: types.ModuleType) -> None:
     """Scope/Constraints kept, junk dropped, goal line required, cap mirrored exactly."""
     cap = seam_prompts.DECISION_STATE_MAX_CHARS

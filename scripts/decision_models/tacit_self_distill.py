@@ -109,6 +109,8 @@ STATE_PROMPT = """You write short, concrete software design decision states.
 
 Topic: {hint}
 
+Focus: {focus}
+
 Write one state in exactly this shape, with no other text:
 
 System goal: <one sentence about what the system must achieve>
@@ -118,6 +120,22 @@ Scope: <optional: one short sentence bounding the decision>
 Constraints: <optional: zero to four constraints, semicolon separated>
 
 State:"""
+
+#: Focus variants rotated once per hint cycle in :func:`_state_prompts`. Without them
+#: every repeat of a hint is a byte-identical prompt and temperature-0.9 sampling still
+#: collapses to ~1.4 distinct serving-shaped states per hint (observed: 96 of 600 wanted
+#: on the 70-hint corpus, which left the category seam at 9 eval rows). Distinct
+#: (hint, focus) prompts hold while ``problems <= len(hints) * len(_STATE_FOCUSES)``.
+_STATE_FOCUSES: tuple[str, ...] = (
+    "failure handling and error paths",
+    "performance and resource budgets",
+    "concurrency, ordering, and timing",
+    "extension points and planned variation",
+    "testability and observability",
+    "startup, shutdown, and migration",
+    "security and trust boundaries",
+    "team ownership and interface contracts",
+)
 
 #: Description-shaped states for the Ch2 seam. Serving sends the RAW user description
 #: (``_apply_decision_style(text, ...)``), so the style seam must not train only on the
@@ -426,6 +444,24 @@ def load_topic_hints(seed_texts: Path, limit: int, max_chars: int = 1500) -> lis
     return hints
 
 
+def _state_prompts(hints: Sequence[str], problems: int) -> list[str]:
+    """One prompt per wanted state: the hint cycles, the focus rotates once per cycle.
+
+    Prompt ``i`` pairs hint ``i % len(hints)`` with focus ``(i // len(hints)) %
+    len(_STATE_FOCUSES)``. The divmod pair is unique, so a repeated hint never reuses
+    a focus while ``problems <= len(hints) * len(_STATE_FOCUSES)`` — the prompt set
+    stays distinct instead of collapsing to one byte-identical prompt per hint.
+    """
+    span = max(1, len(hints))
+    return [
+        STATE_PROMPT.format(
+            hint=hints[i % len(hints)][:400] if hints else "a web service",
+            focus=_STATE_FOCUSES[(i // span) % len(_STATE_FOCUSES)],
+        )
+        for i in range(problems)
+    ]
+
+
 def generate_states(
     tacit: Any,
     hints: Sequence[str],
@@ -438,12 +474,11 @@ def generate_states(
     import torch
 
     rng = random.Random(seed)
-    prompts = [
-        STATE_PROMPT.format(hint=hints[i % len(hints)][:400] if hints else "a web service") for i in range(problems)
-    ]
+    prompts = _state_prompts(hints, problems)
     model = tacit.engine.model
     tokenizer = tacit.tok
     states: list[str] = []
+    non_serving = 0
     batch_size = max(1, getattr(tacit, "batch_size", 8))
     logger.info("phase 1/3: writing %d design states", len(prompts))
     progress = _Progress(len(prompts), "state-writing")
@@ -468,9 +503,13 @@ def generate_states(
             flat = tokenizer.batch_decode(generated[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True)
             for text in flat:
                 state = _normalise_state(text, max_state_chars)
-                if state is not None:
+                if state is None:
+                    non_serving += 1
+                else:
                     states.append(state)
             progress.advance(start + len(chunk))
+    if non_serving:
+        logger.info("dropped %d non-serving-shaped design states", non_serving)
     # Distinct states only: a repeated state would teach the same nine questions twice
     # while the build is paying for state diversity.
     unique = list(dict.fromkeys(states))
@@ -1415,7 +1454,7 @@ def _assemble_problems(
     problems = build_problems(states, seams, gate_states, axes_per_state)
     style_state_count = args.style_states or max(1, args.problems // _STYLE_SHARE)
     # Only generate what the hint corpus does not already cover: a generation pass whose
-    # output would be truncated away is pure teacher cost (70 train hints at today's corpus).
+    # output would be truncated away is pure teacher cost (139 train hints at today's corpus).
     needed = max(0, style_state_count - len(hints))
     descriptions = (
         generate_descriptions(teacher, hints, needed, args.max_new_tokens, seams.DECISION_STATE_MAX_CHARS)
