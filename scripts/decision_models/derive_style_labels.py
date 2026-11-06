@@ -807,6 +807,16 @@ def to_style_row(scenario: dict[str, Any], criteria: dict[str, str], corpus: str
     label, rationale = STYLE_LABELS[scenario_id]
     if label not in criteria:
         raise SystemExit(f"scenario {scenario_id!r}: label {label!r} is not among the served criteria keys")
+    # The served answer space is the style vocabulary, and serving asks it in shards that
+    # together cover it exactly — so a label outside it could never be produced. This is the
+    # invariant whose absence let 16 of 22 holdout labels sit outside the shortlist the seam
+    # actually offered (guide §10.1: affinity is a prior, never a filter).
+    if label != seam_prompts.STYLE_NONE_KEY and label not in seam_prompts.STYLE_VOCABULARY:
+        raise SystemExit(f"scenario {scenario_id!r}: label {label!r} is outside the served style vocabulary")
+    if set(criteria) - {seam_prompts.STYLE_NONE_KEY} != set(seam_prompts.STYLE_VOCABULARY):
+        raise SystemExit(
+            f"scenario {scenario_id!r}: criteria keys drifted from the served style vocabulary (re-derive the rows)"
+        )
     return {
         "id": f"{scenario_id}:style",
         "state": scenario["description"],

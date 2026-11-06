@@ -2,20 +2,22 @@
 """Calibrate the Ch2 style seam's confidence floor against held-out style rows.
 
 Replays the holdout-split rows of ``qa/typed/style.jsonl`` through a RUNNING AnyJev
-gateway, using the served two-stage style procedure verbatim (stage 1 = the category
-question on the capped description, stage 2 = the style question over that category's
-shortlist), and reports per candidate floor: acted rate, acted accuracy, ECE and Brier
+gateway, using the served sharded style procedure verbatim (``style_shards``: the whole
+35-style vocabulary in balanced questions of at most 25 styles plus ``none``, every shard
+asked, the most confident named style winning), and reports per candidate floor: acted rate, acted accuracy, ECE and Brier
 score — plus the confidence distribution. The operator picks the floor from that table
 and sets ``decisions.style.confidence_floor`` (env
 ``DECISIONS_STYLE_CONFIDENCE_FLOOR``), per
 ``docs/JEV_DECISION_MODEL_ANALYSIS_PLAN.md`` §7 ("ECE/Brier on held-out
 families before trusting any threshold").
 
-``confidence`` here is the STAGE-2 top probability — the number the seam gates on. The
-seam acts only when BOTH stages clear the floor (``src/decisions/tacit.py::choose_style``),
-so a row is *acted* at floor ``f`` iff ``min(stage1, stage2) >= f`` and stage 2 answered a
-real option: a wrong stage-1 category that excludes the gold style counts as a miss, not
-as an abstention. ECE/Brier stay over the stage-2 probability among acted rows. Holdout
+``confidence`` here is the winning option's probability across the style shards — the
+number the seam gates on. Serving asks the 35-way style question in cap-sized shards
+(``style_shards``; AnyJev takes 26 options at most) and keeps the highest-probability
+option across them, ``none`` included (``src/decisions/tacit.py::choose_style``). So a
+row is *acted* at floor ``f`` iff that probability ``>= f`` and the winner is a real
+style: a confident wrong style is an injected override error, not an abstention, and no
+shard narrows the answer space. ECE/Brier stay over that probability among acted rows. Holdout
 rows only: ``--split holdout`` is the default and training rows are refused unless
 ``--split`` says otherwise.
 
@@ -78,7 +80,7 @@ NONE_CHOICE = "none"
 _WILSON_Z = 1.96
 
 #: The acted rule, recorded in the report so a consumer never has to infer it.
-ACTED_RULE = "min(stage1_category, stage2_style) >= floor"
+ACTED_RULE = "max_over_style_shards(top) >= floor"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -211,51 +213,49 @@ def _decide(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, An
 
 
 def ask(base_url: str, row: dict[str, Any], seams: Any, timeout: float) -> dict[str, Any]:
-    """Replay the served two-stage style choice; returns the replay's answer summary.
+    """Replay the served sharded style choice; returns the replay's answer summary.
 
-    ``confidence`` is the stage-2 top probability (the number the seam gates on);
-    ``stage1`` rides along so the acted rule can require BOTH stages to clear the floor.
-    A failed stage 1 (transport/shape/off-taxonomy) yields a never-acted answer instead of
-    aborting the replay.
+    ``confidence`` is the winning named style's probability across the shards — the number
+    the seam gates on (``ACTED_RULE``). Every shard is asked, so no style is unofferable; a
+    shard's ``none`` means only "not from my list", so it never vetoes another shard's style
+    and the row abstains only when no shard names one. A shard with an unusable reply is
+    skipped, and no usable shard leaves the row never-acted instead of aborting the replay.
     """
     state = str(row["state"])[: seams.DECISION_STATE_MAX_CHARS]
-    stage1 = _decide(
-        base_url,
-        {
-            "state": state,
-            "question": seams.category_question(),
-            "options": list(seams.CATEGORY_SLUGS),
-            "kind": "choice",
-        },
-        timeout,
-    )
-    answer1 = stage1.get("answer")
-    probs1: dict[str, Any] = stage1.get("probs") or {}
-    if not isinstance(answer1, str) or answer1 not in probs1 or answer1 not in seams.CATEGORY_SLUGS:
-        return {"choice": None, "probabilities": {}, "confidence": 0.0, "stage1": 0.0}
-    stage1_conf = float(probs1[answer1])
-    styles = seams.styles_for_category(answer1)
-    options = [*styles, seams.STYLE_NONE_KEY]
-    stage2 = _decide(
-        base_url,
-        {"state": state, "question": seams.style_question(styles), "options": options, "kind": "choice"},
-        timeout,
-    )
-    answer2 = stage2.get("answer")
-    probs2_all: dict[str, Any] = stage2.get("probs") or {}
-    probs2 = {
-        key: float(value)
-        for key, value in probs2_all.items()
-        if key in options and isinstance(value, (int, float)) and not isinstance(value, bool)
-    }
-    if not isinstance(answer2, str) or answer2 not in probs2:
-        return {"choice": None, "probabilities": {}, "confidence": 0.0, "stage1": stage1_conf}
-    return {
-        "choice": answer2,
-        "probabilities": probs2,
-        "confidence": probs2[answer2],
-        "stage1": stage1_conf,
-    }
+    winner: str | None = None
+    confidence = 0.0
+    probabilities: dict[str, float] = {}
+    abstained = False
+    abstain_confidence = 0.0
+    for styles in seams.style_shards():
+        options = [*styles, seams.STYLE_NONE_KEY]
+        reply = _decide(
+            base_url,
+            {"state": state, "question": seams.style_question(styles), "options": options, "kind": "choice"},
+            timeout,
+        )
+        answer = reply.get("answer")
+        raw_probs: dict[str, Any] = reply.get("probs") or {}
+        probs = {
+            key: float(value)
+            for key, value in raw_probs.items()
+            if key in options and isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        if not isinstance(answer, str) or answer not in probs:
+            continue
+        if answer == seams.STYLE_NONE_KEY:
+            abstained = True
+            abstain_confidence = max(abstain_confidence, probs[answer])
+            continue
+        if probs[answer] > confidence:
+            winner = answer
+            confidence = probs[answer]
+            probabilities = probs
+    # ``none`` is an ABSTENTION, not a failed replay: the report scores it as ``none_accuracy``,
+    # while ``None`` means no shard produced a usable answer at all.
+    if winner is None and abstained:
+        return {"choice": seams.STYLE_NONE_KEY, "probabilities": {}, "confidence": abstain_confidence}
+    return {"choice": winner, "probabilities": probabilities, "confidence": confidence}
 
 
 def expected_calibration_error(pairs: Sequence[tuple[float, bool]], bins: int) -> float:
@@ -447,9 +447,9 @@ def summarize(
 ) -> dict[str, Any]:
     """Floor-candidate table plus distribution and calibration summaries.
 
-    Each pair is ``(confidence, acted_confidence, correct, choice)``: ``confidence`` is the
-    stage-2 probability the calibration curves are computed over, ``acted_confidence`` is
-    ``min(stage1, stage2)`` — the number the seam actually compares with its floor — and
+    Each pair is ``(confidence, acted_confidence, correct, choice)``: both numbers are the
+    winning shard probability — ``confidence`` feeds the calibration curves and
+    ``acted_confidence`` is the value the seam compares with its floor — and
     ``choice`` is ``None`` when the replay produced no usable answer. Per-floor
     ``acted_accuracy`` is over non-``none`` overrides alone (with a 95% Wilson interval);
     confident ``none`` answers are reported as ``none_accuracy`` instead of feeding the
@@ -518,8 +518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         answer = ask(args.base_url, row, seams, args.timeout)
         choice = answer["choice"]
         confidence = float(answer["confidence"])
-        acted_confidence = min(float(answer["stage1"]), confidence) if choice is not None else 0.0
-        pairs.append((confidence, acted_confidence, choice == row["label"], choice))
+        pairs.append((confidence, confidence, choice == row["label"], choice))
     summary = summarize(pairs, list(args.floors), args.bins)
     recommended = recommend(summary["floors"], args.min_acted_accuracy, args.min_acted_rate, args.min_acted)
     reviewed, review_reason = review_status(Path(args.labels), Path(args.review))

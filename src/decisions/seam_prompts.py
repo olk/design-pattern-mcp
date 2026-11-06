@@ -103,67 +103,81 @@ STYLE_INSTRUCTIONS = (
     "in the state? Pick 'none' when no listed style applies."
 )
 
-#: §10.1 style → affinity categories, mirrored from ``src/style_affinity.py`` so this
-#: stdlib-only module (copied standalone into the Tacit trainer image) can build the
-#: stage-2 style shortlists without importing the server package. Category order
-#: inside each row follows ``CATEGORY_SLUGS``; a unit test pins the two tables
-#: together (the ``CATEGORY_SLUGS``/``PatternCategory`` precedent).
-STYLE_CATEGORY_AFFINITY: dict[str, tuple[str, ...]] = {
-    "event-driven": ("interaction-boundary", "workflow-messaging"),
-    "broker": ("interaction-boundary", "workflow-messaging"),
-    "enterprise-service-bus": ("interaction-boundary", "workflow-messaging"),
-    "event-sourcing": ("persistence-state",),
-    "command-query-responsibility-segregation": ("domain-modeling", "persistence-state"),
-    "saga": ("workflow-messaging",),
-    "microservices": ("interaction-boundary", "workflow-messaging", "concurrency-resilience"),
-    "service-oriented-architecture": ("interaction-boundary", "workflow-messaging", "concurrency-resilience"),
-    "hexagonal": ("domain-modeling", "behavior-selection", "interaction-boundary"),
-    "layered-monolith": ("domain-modeling", "construction-composition"),
-    "modular-monolith": ("domain-modeling", "construction-composition"),
-    "monolithic": ("domain-modeling", "construction-composition"),
-    "pipe-and-filter": ("behavior-selection", "workflow-messaging"),
-    "model-view-controller": ("specialized-components",),
-    "presentation-abstraction-control": ("specialized-components",),
-    "microkernel-plugin": ("construction-composition", "behavior-selection"),
-    "reflection-architecture": ("construction-composition", "behavior-selection"),
-    "reactive-architecture": ("workflow-messaging", "concurrency-resilience"),
-    "actor-based": ("workflow-messaging", "concurrency-resilience"),
-    "half-sync-half-async": ("workflow-messaging", "concurrency-resilience"),
-    "task-control-architecture": ("workflow-messaging", "concurrency-resilience"),
-    "serverless": ("interaction-boundary", "concurrency-resilience"),
-    "edge-computing": ("interaction-boundary", "concurrency-resilience"),
-    "space-based": ("persistence-state", "concurrency-resilience"),
-    "data-mesh": ("interaction-boundary", "persistence-state"),
-    "lambda-architecture": ("interaction-boundary", "persistence-state"),
-    "kappa-architecture": ("interaction-boundary", "persistence-state"),
-    "api-gateway": ("interaction-boundary",),
-    "backend-for-frontend": ("interaction-boundary",),
-    "service-mesh": ("interaction-boundary",),
-    "rule-based-system": ("domain-modeling", "behavior-selection"),
-    "aiml-centric": ("domain-modeling", "behavior-selection"),
-    "blockchain-based": ("persistence-state", "security-verification"),
-    "hybrid-cloud": ("interaction-boundary", "security-verification"),
-    "multi-cloud": ("interaction-boundary", "security-verification"),
-}
+#: The Ch2 style answer space: every architecture style the seam may name, in the order the
+#: implementation guide lists them (§10.1). Deliberately a flat vocabulary: ``src/style_affinity.py``
+#: owns the style→category PRIOR, and this module (copied standalone into the trainer image, so it
+#: cannot import the server package) must not restate that prior — reading it backwards as a
+#: filter is exactly what made 16 of 22 labelled holdout rows unanswerable. A unit test pins this
+#: set to that table's keys so a style can neither appear here nor vanish unnoticed.
+STYLE_VOCABULARY: tuple[str, ...] = (
+    "event-driven",
+    "broker",
+    "enterprise-service-bus",
+    "event-sourcing",
+    "command-query-responsibility-segregation",
+    "saga",
+    "microservices",
+    "service-oriented-architecture",
+    "hexagonal",
+    "layered-monolith",
+    "modular-monolith",
+    "monolithic",
+    "pipe-and-filter",
+    "model-view-controller",
+    "presentation-abstraction-control",
+    "microkernel-plugin",
+    "reflection-architecture",
+    "reactive-architecture",
+    "actor-based",
+    "half-sync-half-async",
+    "task-control-architecture",
+    "serverless",
+    "edge-computing",
+    "space-based",
+    "data-mesh",
+    "lambda-architecture",
+    "kappa-architecture",
+    "api-gateway",
+    "backend-for-frontend",
+    "service-mesh",
+    "rule-based-system",
+    "aiml-centric",
+    "blockchain-based",
+    "hybrid-cloud",
+    "multi-cloud",
+)
 
 #: AnyJev's letter readout caps ``choice``/``score`` at 26 options (``anyjev``
-#: ``question.py`` ``MAX_OPTIONS``; the gateway answers HTTP 400 beyond). Every stage-2
-#: style shortlist plus ``none`` must fit, so growth past the cap fails loudly here,
-#: not as a 400 mid-request.
+#: ``question.py`` ``MAX_OPTIONS``; the gateway answers HTTP 400 beyond). A shard keeps a
+#: slot free for ``none``, so one question carries at most this many styles.
 _STYLE_OPTION_CAP = 26
+_STYLE_SHARD_CAP = _STYLE_OPTION_CAP - 1
 
 
-def styles_for_category(category: str) -> tuple[str, ...]:
-    """Ch2 stage-2 shortlist: styles with affinity to ``category``, table order."""
-    styles = tuple(style for style in STYLE_CATEGORY_AFFINITY if category in STYLE_CATEGORY_AFFINITY[style])
-    if not styles:
-        raise ValueError(f"no style has affinity with {category!r}")
-    if len(styles) + 1 > _STYLE_OPTION_CAP:
-        raise ValueError(
-            f"style shortlist for {category!r} carries {len(styles)} styles; adding {STYLE_NONE_KEY!r} "
-            f"exceeds the AnyJev {_STYLE_OPTION_CAP}-option cap"
-        )
-    return styles
+def style_shards() -> tuple[tuple[str, ...], ...]:
+    """The Ch2 style shortlists: the whole vocabulary split into BALANCED shards.
+
+    The question is 35-way and AnyJev takes at most 25 styles plus ``none`` per ask, so
+    serving asks one question per shard and keeps the most confident named style across them
+    (``src/decisions/tacit.py::choose_style``). Every shard is a legal question on its own and
+    their union IS :data:`STYLE_VOCABULARY`, so no style is ever unanswerable.
+
+    Shards are EQUAL WIDTH by construction (18 + 17 today, not 25 + 10): a softmax over 10
+    options concentrates more mass than one over 25, so an uneven split would let the narrow
+    shard win cross-shard comparisons for free and bias the very floor the calibration fits.
+
+    Deriving the shards from category affinity was a defect, not a shortcut: the §10.1 table
+    lists the styles that *favour* a pattern category, not every style a system in that
+    category may have. It crams ``security-verification`` into three cloud styles, so a
+    security scenario answered ``layered-monolith`` could not be expressed at all — and
+    16 of 22 labelled holdout rows became unwinnable before the model was consulted.
+    """
+    total = len(STYLE_VOCABULARY)
+    count = -(-total // _STYLE_SHARD_CAP)  # ceil: shards needed at the widest legal width
+    width = -(-total // count)  # ceil: equalising them keeps the softmaxes comparable
+    shards = tuple(STYLE_VOCABULARY[start : start + width] for start in range(0, total, width))
+    assert all(len(shard) + 1 <= _STYLE_OPTION_CAP for shard in shards), shards  # noqa: S101
+    return shards
 
 
 def style_question(styles: Sequence[str]) -> str:

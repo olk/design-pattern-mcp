@@ -5,7 +5,7 @@ Three probes, each with the SERVING bytes (``src/decisions/seam_prompts.py`` ans
 question, so a drift in the vocabulary fails here before it reaches a tool call):
 
 1. J2 category ``choice`` — 9 options, a probabilities map comes back;
-2. Ch2 stage 2 — the ``domain-modeling`` style shortlist plus ``none``, inside AnyJev's
+2. Ch2 style — one shard of the style vocabulary plus ``none``, inside AnyJev's
    26-option ``choice`` cap;
 3. J1 rerank — ONE batched request of ``yes_no`` items, one decision per item, each
    carrying ``p(Yes)``.
@@ -80,9 +80,9 @@ def probe_category(base_url: str, timeout: float) -> None:
         raise SystemExit(f"category: probabilities carry options that were never offered: {sorted(decision['probs'])}")
 
 
-def probe_style_stage2(base_url: str, timeout: float) -> None:
-    """Ch2 stage 2: one shortlist + ``none`` stays inside the option cap."""
-    styles = seam_prompts.styles_for_category("domain-modeling")
+def probe_style_shard(base_url: str, timeout: float) -> None:
+    """Ch2 style: one shard plus ``none`` stays inside the option cap."""
+    styles = seam_prompts.style_shards()[0]
     options = [*styles, seam_prompts.STYLE_NONE_KEY]
     if len(options) > OPTION_CAP:
         raise SystemExit(f"style shortlist carries {len(options)} options, over the {OPTION_CAP} cap")
@@ -135,7 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     for label, probe in (
         ("Tacit category choice (J2)", probe_category),
-        ("Tacit two-stage style (Ch2 stage 2, domain-modeling shortlist)", probe_style_stage2),
+        ("Tacit style shard (Ch2, shard 1 of the vocabulary)", probe_style_shard),
         ("Tacit rerank batch (J1, yes_no items)", probe_rerank_batch),
     ):
         probe(args.base_url, args.timeout)

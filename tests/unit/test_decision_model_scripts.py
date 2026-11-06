@@ -331,11 +331,11 @@ def test_fidelity_metrics_hand_computed(trainer: types.ModuleType) -> None:
     assert category["floor_accuracy"] == 0.5
     # The same kind under two seams stays two entries: a seam is the reporting unit now.
     split = trainer._fidelity_metrics(
-        [([0.9, 0.1], [1.0, 0.0], "choice", "style-stage1"), ([0.9, 0.1], [1.0, 0.0], "choice", "style-stage2")],
+        [([0.9, 0.1], [1.0, 0.0], "choice", "seam-a"), ([0.9, 0.1], [1.0, 0.0], "choice", "seam-b")],
         0.5,
         0.5,
     )
-    assert set(split) == {"style-stage1", "style-stage2"}
+    assert set(split) == {"seam-a", "seam-b"}
     teacher = [0.1, 0.3, 0.4, 0.15, 0.05]
     student = [0.0, 0.0, 1.0, 0.0, 0.0]
     expected_teacher = sum(index * value for index, value in enumerate(teacher)) / 4
@@ -372,7 +372,6 @@ def test_seam_gate_failures_certify_only_sampled_seams(trainer: types.ModuleType
     """Certified seams are gated; thin or missing seams are skipped, not failed."""
     clean = {
         "category": {"n": 50, "agreement": 0.9},
-        "style-stage1": {"n": 50, "agreement": 0.9},
         "style-stage2": {"n": 50, "agreement": 0.9},
         "rerank": {"n": 50, "agreement": 0.9},
         "gate": {"n": 50, "agreement": 0.9},
@@ -515,28 +514,32 @@ def test_answer_and_examples_split_reproduces_retention(trainer: types.ModuleTyp
     assert abs(max(probe[0].target) - 0.2) < 1e-9
 
 
-def test_build_style_problems_train_both_stages_for_every_shortlist(trainer: types.ModuleType) -> None:
-    """Two questions per state, every category shortlist, always inside the option cap."""
+def test_build_style_problems_emit_only_the_served_shard_questions(trainer: types.ModuleType) -> None:
+    """One question per state: the shard serving asks, never a question serving skips.
+
+    The category question used to be paired with every description state so it could narrow
+    the style shortlist. Serving asks it of PART states only (the J2 seam), so certifying a
+    ``style-stage1`` seam measured a question no request ever carries.
+    """
     seams = trainer.load_seam_prompts(SEAM_PROMPTS)
     states = [f"description {index}" for index in range(len(seams.CATEGORY_SLUGS))]
     problems = trainer.build_style_problems(states, seams)
-    assert len(problems) == 2 * len(states)
-    stage1 = problems[0::2]
-    stage2 = problems[1::2]
-    for problem in stage1:
-        assert problem["seam"] == "style-stage1"
-        assert problem["question"] == seams.category_question()
-        assert problem["options"] == list(seams.CATEGORY_SLUGS)
-        assert problem["kind"] == "choice"
-    # The shortlist rotates over ALL nine categories, so every stage-2 option set trains.
+    assert len(problems) == len(states)
+    stage2 = problems
+    assert {problem["seam"] for problem in stage2} == {"style-stage2"}
+    assert seams.category_question() not in {problem["question"] for problem in stage2}
+    # The shards rotate, so every served style question is trained.
+    shards = seams.style_shards()
     covered = {problem["options"][0] for problem in stage2}
-    assert covered == {seams.styles_for_category(slug)[0] for slug in seams.CATEGORY_SLUGS}
-    for problem, slug in zip(stage2, seams.CATEGORY_SLUGS, strict=True):
-        styles = seams.styles_for_category(slug)
+    assert covered == {shard[0] for shard in shards}
+    for problem, styles in zip(stage2, [shards[index % len(shards)] for index in range(len(states))], strict=True):
         assert problem["seam"] == "style-stage2"
         assert problem["question"] == seams.style_question(styles)
         assert problem["options"] == [*styles, seams.STYLE_NONE_KEY]
         assert len(problem["options"]) <= 26
+    # Every style the seam may name is trained exactly once across the rotation.
+    trained = {style for problem in stage2 for style in problem["options"] if style != seams.STYLE_NONE_KEY}
+    assert trained == set(seams.STYLE_VOCABULARY)
 
 
 def test_build_style_problems_caps_each_state(trainer: types.ModuleType) -> None:
@@ -544,7 +547,7 @@ def test_build_style_problems_caps_each_state(trainer: types.ModuleType) -> None
     seams = trainer.load_seam_prompts(SEAM_PROMPTS)
     cap = seams.DECISION_STATE_MAX_CHARS
     problems = trainer.build_style_problems(["d" * (cap + 100)], seams)
-    assert [problem["state"] for problem in problems] == ["d" * cap, "d" * cap]
+    assert [problem["state"] for problem in problems] == ["d" * cap]
 
 
 def test_load_rerank_pairs_keeps_train_rows_only(trainer: types.ModuleType, tmp_path: Path) -> None:
@@ -722,7 +725,7 @@ def test_assemble_problems_prefers_hints_then_generated_descriptions(
         8,
     )
     assert style_states == ["hint one", "hint two", "generated 0"]  # 36 // 12 = 3 states
-    assert len(style_problems) == 6
+    assert len(style_problems) == 3  # one shard question per state
     assert len(rerank_problems) == 2
     assert len(problems) == len(style_problems) + len(rerank_problems) + (1 + 8 + 1)
     # When the hint corpus already fills the budget, no teacher time is spent generating
@@ -821,7 +824,7 @@ def _main_fakes(
         seen["floors"] = (floor, score_floor)
         seen["problem_count"] = len(problems)
         seam_for_kind = {
-            "choice": ("category", "style-stage1", "style-stage2"),
+            "choice": ("category", "style-stage2"),
             "score": ("weights",),
             "yes_no": ("gate", "rerank"),
         }
@@ -924,8 +927,8 @@ def test_trainer_main_walks_generate_to_save(
     out_dir = tmp_path / "out"
     code = trainer.main(_main_args(init_dir, out_dir, _rerank_pairs_file(tmp_path)))
     assert code == 0
-    # 10 design problems (category + 8 axes + gate), 2 style questions, 2 train rerank pairs.
-    assert seen["kinds"] == ["choice"] + ["score"] * 8 + ["yes_no"] + ["choice"] * 2 + ["yes_no"] * 2
+    # 10 design problems (category + 8 axes + gate), 1 style question, 2 train rerank pairs.
+    assert seen["kinds"] == ["choice"] + ["score"] * 8 + ["yes_no"] + ["choice"] + ["yes_no"] * 2
     assert seen["seams"] == [
         "category",
         "weights",
@@ -937,7 +940,6 @@ def test_trainer_main_walks_generate_to_save(
         "weights",
         "weights",
         "gate",
-        "style-stage1",
         "style-stage2",
         "rerank",
         "rerank",
@@ -956,7 +958,7 @@ def test_trainer_main_walks_generate_to_save(
     assert seen["eval_model"] is seen["saved_model"]  # fidelity scores the MERGED artifact
     assert seen["probe_model"] is seen["saved_model"]  # and so does the false-act probe
     manifest = json.loads((out_dir / "self-distill.json").read_text(encoding="utf-8"))
-    assert manifest["problems"] == 14
+    assert manifest["problems"] == 13  # 10 design + 1 style shard + 2 rerank
     assert manifest["examples"] == 19
     assert manifest["kept"] == {"choice": 7, "score": 7, "yes_no": 7}
     assert manifest["repo"] == "morriszjm/Tacit-4B"
@@ -969,14 +971,14 @@ def test_trainer_main_walks_generate_to_save(
     assert manifest["gate_states"] == 1
     assert manifest["axes_per_state"] == 8
     assert manifest["style_states"] == 1
-    assert manifest["style_problems"] == 2
+    assert manifest["style_problems"] == 1
     assert manifest["rerank_problems"] == 2  # train rows only; the holdout pair never trains
     assert manifest["teacher_shards"] == 1
     assert manifest["min_seam_agreement"] == 0.6
     assert manifest["max_score_mae"] == 0.2
     assert manifest["min_eval_rows"] == 20  # the publish guard reads this, never a hardcoded copy
     # Every seam's kept count and its eval fidelity land in one block.
-    assert set(manifest["seams"]) == {"category", "style-stage1", "style-stage2", "gate", "rerank", "weights"}
+    assert set(manifest["seams"]) == {"category", "style-stage2", "gate", "rerank", "weights"}
     assert manifest["seams"]["weights"]["expected_level_mae"] == pytest.approx(0.1)
     # ``yes_no`` rows alternate gate/rerank: 7 rows → 4 gate + 3 rerank.
     assert manifest["seams"]["rerank"]["kept"] == 3
@@ -1173,11 +1175,16 @@ def test_calibration_table_bands_small_samples(calibrator: types.ModuleType) -> 
     assert 0.0 < low < 0.8 < high < 1.0
 
 
-def test_calibration_acted_rule_needs_both_stages(calibrator: types.ModuleType) -> None:
-    """A confident stage 2 behind a weak stage 1 is NOT acted: the seam would not override."""
+def test_calibration_summarize_gates_on_the_acted_confidence(calibrator: types.ModuleType) -> None:
+    """``summarize`` gates on the acted number, not the calibration number.
+
+    Serving compares ONE probability with its floor (``ACTED_RULE``); the tuple's first
+    element is what the ECE/Brier curves are computed over, the second is what the floor
+    sees. They coincide in ``main`` and must not be conflated here.
+    """
     pairs = [
-        (0.95, 0.95, True, "hexagonal"),  # both stages confident → acted and right
-        (0.95, 0.30, False, "hexagonal"),  # stage 1 below the floor → never acted
+        (0.95, 0.95, True, "hexagonal"),  # acted and right
+        (0.95, 0.30, False, "hexagonal"),  # below the floor → never acted
     ]
     row = next(row for row in calibrator.summarize(pairs, [0.5], 10)["floors"] if row["floor"] == 0.5)
     assert row["acted"] == 1
@@ -1194,20 +1201,18 @@ def test_calibration_acted_rule_needs_both_stages(calibrator: types.ModuleType) 
     assert all("replay_failures" not in row for row in broken["floors"])
 
 
-def test_calibration_ask_replays_the_served_two_stage_bytes(calibrator: types.ModuleType) -> None:
-    """Stage 1 is the category question/cap; stage 2 the shortlist question; both cap the state."""
+def test_calibration_ask_replays_the_served_shard_bytes(calibrator: types.ModuleType) -> None:
+    """Every shard is asked in serving bytes: the shard question, its options + ``none``, capped state."""
     seams = seam_prompts
     calls: list[dict[str, Any]] = []
+    shards = seams.style_shards()
 
     def _fake_decide(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
         calls.append(item)
-        if len(calls) == 1:
-            return {"answer": "domain-modeling", "probs": {"domain-modeling": 0.8, "saga": 0.2}}
         options = [str(option) for option in item["options"]]
-        return {
-            "answer": options[0],
-            "probs": dict.fromkeys(options, 0.5 / max(1, len(options) - 1)) | {options[0]: 0.5},
-        }
+        # First shard answers its first option confidently; the others answer ``none``.
+        winner = options[0] if len(calls) == 1 else seams.STYLE_NONE_KEY
+        return {"answer": winner, "probs": dict.fromkeys(options, 0.1) | {winner: 0.7}}
 
     original = calibrator._decide
     calibrator._decide = _fake_decide  # type: ignore[assignment]
@@ -1215,31 +1220,30 @@ def test_calibration_ask_replays_the_served_two_stage_bytes(calibrator: types.Mo
         answer = calibrator.ask("http://x:18100", {"state": "y" * (seams.DECISION_STATE_MAX_CHARS + 10)}, seams, 5.0)
     finally:
         calibrator._decide = original  # type: ignore[assignment]
-    assert answer["stage1"] == pytest.approx(0.8)
-    assert answer["choice"] == seams.styles_for_category("domain-modeling")[0]
-    assert answer["confidence"] == pytest.approx(0.5)
-    assert [call["kind"] for call in calls] == ["choice", "choice"]
-    assert calls[0]["question"] == seams.category_question()
-    assert calls[0]["options"] == list(seams.CATEGORY_SLUGS)
-    assert calls[1]["question"] == seams.style_question(seams.styles_for_category("domain-modeling"))
-    assert calls[1]["options"] == [*seams.styles_for_category("domain-modeling"), seams.STYLE_NONE_KEY]
-    assert len(calls[1]["options"]) <= 26
-    # Serving truncates the description at the shared cap before asking either question.
-    assert all(call["state"] == "y" * seams.DECISION_STATE_MAX_CHARS for call in calls)
+    assert answer["choice"] == shards[0][0]
+    assert answer["confidence"] == pytest.approx(0.7)
+    assert set(answer["probabilities"]) == {*shards[0], seams.STYLE_NONE_KEY}
+    assert len(calls) == len(shards)
+    for call, styles in zip(calls, shards, strict=True):
+        assert call["kind"] == "choice"
+        assert call["question"] == seams.style_question(styles)
+        assert call["options"] == [*styles, seams.STYLE_NONE_KEY]
+        assert len(call["options"]) <= 26
+        assert call["state"] == "y" * seams.DECISION_STATE_MAX_CHARS
 
 
-def test_calibration_ask_never_acts_on_a_broken_stage_one(calibrator: types.ModuleType) -> None:
-    """An off-taxonomy stage-1 answer yields a never-acted row instead of aborting the replay."""
+def test_calibration_ask_never_acts_on_an_unusable_shard(calibrator: types.ModuleType) -> None:
+    """An off-offer shard answer yields a never-acted row instead of aborting the replay."""
     original = calibrator._decide
     calibrator._decide = lambda base_url, item, timeout: {  # type: ignore[assignment]
-        "answer": "not-a-category",
-        "probs": {"not-a-category": 1.0},
+        "answer": "not-an-offered-style",
+        "probs": {"not-an-offered-style": 1.0},
     }
     try:
         answer = calibrator.ask("http://x", {"state": "s"}, seam_prompts, 5.0)
     finally:
         calibrator._decide = original  # type: ignore[assignment]
-    assert answer == {"choice": None, "probabilities": {}, "confidence": 0.0, "stage1": 0.0}
+    assert answer == {"choice": None, "probabilities": {}, "confidence": 0.0}
 
 
 def test_calibration_replays_holdout_only_by_default(
@@ -1725,3 +1729,88 @@ def test_shell_check_reads_the_real_dockerfile(shell_check: types.ModuleType) ->
     assert fat, "the self-distill RUN must be discoverable"
     for payload in fat:
         assert shell_check.problems(payload) == []
+
+
+# -- style label derivation: the served answer space is the invariant -------------------
+
+
+@pytest.fixture(scope="module")
+def labeler() -> types.ModuleType:
+    return _load("derive_style_labels", "derive_style_labels.py")
+
+
+def test_style_rows_accept_a_label_inside_the_served_vocabulary(labeler: types.ModuleType) -> None:
+    """The derivation accepts the shipped corpus: criteria keys ARE the served vocabulary."""
+    scenario_id = next(iter(labeler.STYLE_LABELS))
+    scenario = {"scenario_id": scenario_id, "description": "a system", "split": "holdout"}
+    criteria = {style: seam_prompts.STYLE_GLOSSES[style] for style in seam_prompts.STYLE_VOCABULARY}
+    criteria[seam_prompts.STYLE_NONE_KEY] = seam_prompts.STYLE_NONE_GLOSS
+    row = labeler.to_style_row(scenario, criteria, "qa/qa.jsonl", "abc123")
+    assert row["id"] == f"{scenario_id}:style"
+    assert row["label"] == labeler.STYLE_LABELS[scenario_id][0]
+    assert set(row["criteria"]) - {seam_prompts.STYLE_NONE_KEY} == set(seam_prompts.STYLE_VOCABULARY)
+
+
+def test_style_rows_reject_a_label_outside_the_served_vocabulary(
+    labeler: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A style the seam can never offer must fail at derivation, not three runs later.
+
+    Deriving the stage-2 shortlist from a §10.1 category left 16 of 22 holdout labels
+    unofferable; the labels themselves were never checked against the served answer space.
+    """
+    scenario_id = next(iter(labeler.STYLE_LABELS))
+    monkeypatch.setitem(labeler.STYLE_LABELS, scenario_id, ("not-a-served-style", "because"))
+    scenario = {"scenario_id": scenario_id, "description": "a system", "split": "holdout"}
+    criteria = {style: seam_prompts.STYLE_GLOSSES[style] for style in seam_prompts.STYLE_VOCABULARY}
+    criteria["not-a-served-style"] = "a style the gateway never offers"
+    criteria[seam_prompts.STYLE_NONE_KEY] = seam_prompts.STYLE_NONE_GLOSS
+    with pytest.raises(SystemExit, match="outside the served style vocabulary"):
+        labeler.to_style_row(scenario, criteria, "qa/qa.jsonl", "abc123")
+
+
+def test_style_rows_reject_criteria_drifted_from_the_served_vocabulary(labeler: types.ModuleType) -> None:
+    """The row's criteria must restate the served vocabulary exactly, not a subset."""
+    scenario_id = next(iter(labeler.STYLE_LABELS))
+    scenario = {"scenario_id": scenario_id, "description": "a system", "split": "holdout"}
+    criteria = {style: seam_prompts.STYLE_GLOSSES[style] for style in seam_prompts.STYLE_VOCABULARY}
+    criteria[seam_prompts.STYLE_NONE_KEY] = seam_prompts.STYLE_NONE_GLOSS
+    label = labeler.STYLE_LABELS[scenario_id][0]
+    dropped = next(style for style in seam_prompts.STYLE_VOCABULARY if style != label)
+    criteria.pop(dropped)
+    with pytest.raises(SystemExit, match="criteria keys drifted"):
+        labeler.to_style_row(scenario, criteria, "qa/qa.jsonl", "abc123")
+
+
+def test_calibration_ask_abstains_from_none_rather_than_failing(calibrator: types.ModuleType) -> None:
+    """A shard's ``none`` is "not from my list": it never vetoes a named style, and all-none
+    is an abstention the report scores — not a replay failure."""
+    original = calibrator._decide
+    shards = seam_prompts.style_shards()
+
+    def _all_none(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
+        options = [str(option) for option in item["options"]]
+        return {"answer": seam_prompts.STYLE_NONE_KEY, "probs": dict.fromkeys(options, 0.1) | {seam_prompts.STYLE_NONE_KEY: 0.9}}
+
+    calibrator._decide = _all_none  # type: ignore[assignment]
+    try:
+        answer = calibrator.ask("http://x", {"state": "s"}, seam_prompts, 5.0)
+    finally:
+        calibrator._decide = original  # type: ignore[assignment]
+    assert answer["choice"] == seam_prompts.STYLE_NONE_KEY
+    assert answer["confidence"] == pytest.approx(0.9)
+
+    # A ``none`` in one shard does not veto a named style in another, whatever its confidence.
+    def _none_then_style(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
+        options = [str(option) for option in item["options"]]
+        if item["options"] == [*shards[0], seam_prompts.STYLE_NONE_KEY]:
+            return {"answer": seam_prompts.STYLE_NONE_KEY, "probs": dict.fromkeys(options, 0.01) | {seam_prompts.STYLE_NONE_KEY: 0.99}}
+        return {"answer": options[0], "probs": dict.fromkeys(options, 0.1) | {options[0]: 0.6}}
+
+    calibrator._decide = _none_then_style  # type: ignore[assignment]
+    try:
+        answer = calibrator.ask("http://x", {"state": "s"}, seam_prompts, 5.0)
+    finally:
+        calibrator._decide = original  # type: ignore[assignment]
+    assert answer["choice"] == shards[1][0]
+    assert answer["confidence"] == pytest.approx(0.6)

@@ -53,14 +53,13 @@ Phases, all in one process (`tacit_self_distill.py:1575-1700`):
 
 | Seam label | Kind | Served by |
 |---|---|---|
-| `category` | `choice` | J2 category filter on part states — the same question as `style-stage1`, on a different state distribution |
+| `category` | `choice` | J2 category filter on part states — the only state distribution serving asks it of |
 | `weights` | `score` | J4 quality-axis weights |
 | `gate` | `yes_no` | J5 reasoning gate |
-| `style-stage1` | `choice` | Ch2 style stage 1: the category question on description states |
-| `style-stage2` | `choice` | Ch2 style stage 2: ≤26-style shortlist + `none` |
+| `style-stage2` | `choice` | Ch2 style shard: one `style_shards()` subset of the 35-style vocabulary (≤25) + `none` |
 | `rerank` | `yes_no` | J1 rerank stage 2: one relevance question per candidate (stage 1 is the deterministic fused pool) |
 
-Gated seams (`_GATED_SEAMS`, `tacit_self_distill.py:1240`) are `category`, `style-stage1`,
+Gated seams (`_GATED_SEAMS`, `tacit_self_distill.py:1236`) are `category`,
 `style-stage2`, `rerank`, `gate`; `weights` is judged by MAE instead of agreement.
 
 ## 2. Prerequisites (GPU builder)
@@ -148,7 +147,7 @@ sha256sum -c models/tacit-4b/.extract-complete          # must print five OK lin
 python3 - <<'PY'
 import json
 m = json.load(open("models/tacit-4b/self-distill.json"))
-for s in ("category", "style-stage1", "style-stage2", "rerank", "gate", "weights"):
+for s in ("category", "style-stage2", "rerank", "gate", "weights"):
     n = int((m["eval"].get(s) or {}).get("n") or 0)
     print(f"{s:13} n={n:<4} {'certified' if n >= m['min_eval_rows'] else 'UNCERTIFIED'}")
 PY
@@ -329,7 +328,7 @@ are copied verbatim from the file; the `seams` and `eval` blocks are shown per s
 
 | Field | Example Value Pattern | Meaning | How to Interpret |
 |---|---|---|---|
-| `kept.choice` | `1095` | Choice rows kept: category plus both style stages | Expected: `states + style_problems − dropped.choice.*` (96+1000−1). Anomalous: `0`, or below `TACIT_MIN_KIND_ROWS` (the build aborts, so such a manifest cannot exist). |
+| `kept.choice` | `1095` | Choice rows kept: category plus the style shards | Expected: `states + style_problems − dropped.choice.*` (96+1000−1 on a pre-shard build; a sharded build carries `style_problems = style_states`). Anomalous: `0`, or below `TACIT_MIN_KIND_ROWS` (the build aborts, so such a manifest cannot exist). |
 | `kept.score` | `768` | Score rows kept (J4 weights) | Expected: `states*axes_per_state` while `score_mass_floor` is `0.0`. Anomalous: a shortfall with a `0.0` floor — impossible unless the floor was raised. |
 | `kept.yes_no` | `1999` | Yes/no rows kept (gate plus rerank) | Expected: `gate_states + rerank_problems` (599+1400); `retention_floor` returns `0.0` for `yes_no`, so these rows are never cut for sharpness. Anomalous: any shortfall, which then means unrouted or shape failures. |
 | `dropped.choice.unrouted` | `0` | Choice rows the teacher answered without a CoT route, or with zero total mass | Expected: `0` or a handful. Anomalous: more than a few percent — teacher routing/mass failure; the seam trains on a biased subset. |
@@ -365,7 +364,7 @@ are copied verbatim from the file; the `seams` and `eval` blocks are shown per s
 | `gate_states` | `599` | Gate states kept after serving-shape normalization | Expected: close to the gate budget (`--problems // 10` = 600), minus non-serving-shaped drops. Anomalous: far below the budget — the gate trained on a narrow phase/part spread. |
 | `axes_per_state` | `8` | Quality axes asked per design state | Expected: `8` = all `QUALITY_AXES` when the budget allows; `1–7` is the budget-constrained rotating window. Anomalous: `1` on a full budget (per-axis coverage collapses). |
 | `style_states` | `500` | Description-shaped states for Ch2 (hints first, generated descriptions fill the rest) | Expected: `TACIT_STYLE_STATES` or `--problems // 12` (500), floored at the hint-corpus size. Anomalous: `0` (the builder aborts) or below the hint count. |
-| `style_problems` | `1000` | Ch2 questions, stage 1 plus stage 2 | Expected: exactly `2 * style_states`. Anomalous: not `2×` — the builder changed and the seam mix differs from what §1 describes. |
+| `style_problems` | `1000` | Ch2 style questions — one shard question per style state | Expected: exactly `style_states` on a sharded build. The pre-shard builder emitted `2 × style_states` (a category question plus a category-narrowed shortlist); that shape certifies a menu serving no longer asks, so a `2×` count means the trainer was reverted. |
 | `rerank_problems` | `1400` | J1 relevance questions | Expected: all **train** pairs (`TACIT_RERANK_PROBLEMS=0`; the pair file holds 1400 train + 600 holdout rows) or the explicit budget, clamped to the train pairs. Anomalous: `0` (the builder aborts) or more than the train-pair count. |
 | `teacher_shards` | `4` | Teacher answer shards actually used | Expected: visible CUDA devices capped at 8, or `TACIT_TEACHER_SHARDS`. Anomalous: `1` on a multi-GPU host (serial, slower, same training set) or more than the device count (impossible). |
 
@@ -389,8 +388,7 @@ are copied verbatim from the file; the `seams` and `eval` blocks are shown per s
 | `seams.weights.kept` | `768` | Total weights rows kept | Expected: `states*axes_per_state`. Anomalous: shortfall with a `0.0` score floor. |
 | `seams.gate.agreement`, `seams.gate.brier`, `seams.gate.floor_accuracy` | `0.8135593220338984`, `0.2029293395733144`, `0.8135593220338984` | Copy of `eval.gate`'s metrics | `floor_accuracy` is act-decision agreement at `gate_confidence_floor`. Anomalous: `floor_accuracy` > `agreement` (impossible). |
 | `seams.gate.kept` | `599` | Total gate rows kept | Expected: `gate_states`. Anomalous: mismatch with `gate_states`. |
-| `seams.style-stage1.agreement`, `seams.style-stage1.brier`, `seams.style-stage1.floor_accuracy` | `0.8163265306122449`, `0.27022813044057387`, `0.7346938775510204` | Copy of `eval.style-stage1`'s metrics | `floor_accuracy` ≤ `agreement` by construction. Anomalous: the inequality reversed. |
-| `seams.style-stage1.kept` | `499` | Total stage-1 rows kept (one below `style_states` because the dropped choice row was a stage-1 row) | Expected: `style_states` minus any stage-1 row dropped by retention (here 500−1). Anomalous: more than `style_states`. |
+| `seams.style-stage1.*` | retired | **No build emits this seam any more.** Serving asks the category question of part states only (the `category` seam), so the description-state copy certified a question no request carries; artifacts built before the sharded style seam still carry it (`agreement 0.816`, `n = 49`) and are read as history, not as a gate | Ignore it. A *new* build that emits `style-stage1` means the trainer was reverted — the style seam must never re-acquire a category gate |
 | `seams.style-stage2.agreement`, `seams.style-stage2.brier`, `seams.style-stage2.floor_accuracy` | `0.76`, `0.3113958998357724`, `0.66` | Copy of `eval.style-stage2`'s metrics | Same rule as stage 1. Anomalous: same. |
 | `seams.style-stage2.kept` | `500` | Total stage-2 rows kept | Expected: `style_states` on a clean run. Anomalous: more than `style_states`. |
 | `seams.rerank.agreement`, `seams.rerank.brier` | `0.7071428571428572`, `0.44858291846689347` | Copy of `eval.rerank`'s metrics; no `floor_accuracy` because the seam has no thresholded act — the pipeline ranks candidates by `p(Yes)` and discards the score (`src/patterns/retriever.py:442`), fusing ranks by RRF (`:474-475`) | Agreement is the only gate. The `brier` cannot reach a served result: only the induced ordering survives, so a monotone miscalibration is unobservable downstream — ordering quality (the J1 A/B) is the real check. Anomalous: a `floor_accuracy` key here — the trainer changed. |
@@ -400,8 +398,8 @@ are copied verbatim from the file; the `seams` and `eval` blocks are shown per s
 fidelity measurements at the served floors. `brier` is the mean sum of squared probability
 differences over the seam's option set (0 = identical distributions; range 0–2), so it is
 **not comparable across seams**: the option counts differ — 9 for `category` and
-`style-stage1`, 5 for `weights` (`WEIGHT_LEVELS`), 2 for `gate` and `rerank`, and 3–17 for
-`style-stage2` (shortlists of 2–16 styles plus `none`; 26 is the AnyJev cap, not the width).
+5 for `weights` (`WEIGHT_LEVELS`), 2 for `gate` and `rerank`, and 18 or 19 for
+`style-stage2` (one shard of 18 or 17 styles plus `none`; 26 is the AnyJev cap, not the width).
 Compare it within a seam across builds. Anomalous: a brier that rises while agreement holds
 (miscalibration), or a brier of 0 with agreement below 1 (impossible).
 
@@ -410,7 +408,7 @@ Compare it within a seam across builds. Anomalous: a brier that rises while agre
 | `eval.category.n`, `eval.category.agreement`, `eval.category.brier`, `eval.category.floor_accuracy` | `9`, `0.7777777777777778`, `0.23419330951125505`, `0.7777777777777778` | Held-out rows for J2 category and its fidelity | Certified only when `n ≥ min_eval_rows`. Here `n = 9 < 20` → **uncertified**; the agreement is 7 of 9 rows and carries no gate weight. Anomalous: `n` far from `kept × eval_frac` (here 96 × 0.1). |
 | `eval.weights.n`, `eval.weights.agreement`, `eval.weights.brier`, `eval.weights.expected_level_mae` | `76`, `0.618421052631579`, `0.39205952062543536`, `0.1164207177937293` | Held-out rows for J4 weights and their fidelity | Certified (`76 ≥ 20`); gated on `expected_level_mae ≤ max_score_mae` (0.116 ≤ 0.2), not on agreement. Anomalous: MAE above `max_score_mae` on a certified seam — the build refuses it. |
 | `eval.gate.n`, `eval.gate.agreement`, `eval.gate.brier`, `eval.gate.floor_accuracy` | `59`, `0.8135593220338984`, `0.2029293395733144`, `0.8135593220338984` | Held-out rows for J5 and its fidelity | Certified; `agreement ≥ 0.6` passes. Anomalous: `agreement < min_seam_agreement` on a certified seam — the build refuses it. |
-| `eval.style-stage1.n`, `eval.style-stage1.agreement`, `eval.style-stage1.brier`, `eval.style-stage1.floor_accuracy` | `49`, `0.8163265306122449`, `0.27022813044057387`, `0.7346938775510204` | Held-out rows for Ch2 stage 1 | Certified; `0.816 ≥ 0.6` passes. Anomalous: `floor_accuracy > agreement` (impossible). |
+| `eval.style-stage1.*` | retired | Same retirement as `seams.style-stage1` above: the description-state category question is gone, so there is no held-out set for it. Old artifacts carry `n = 49` | Ignore. Certifying it would certify a question serving never asks |
 | `eval.style-stage2.n`, `eval.style-stage2.agreement`, `eval.style-stage2.brier`, `eval.style-stage2.floor_accuracy` | `50`, `0.76`, `0.3113958998357724`, `0.66` | Held-out rows for Ch2 stage 2 | Certified; `0.76 ≥ 0.6` passes. Anomalous: `n` below 20 — then the seam is skipped, not failed. |
 | `eval.rerank.n`, `eval.rerank.agreement`, `eval.rerank.brier` | `140`, `0.7071428571428572`, `0.44858291846689347` | Held-out rows for J1 stage 2 | Certified; `0.707 ≥ 0.6` passes. Anomalous: `agreement < 0.6` — the build refuses it. |
 
@@ -455,7 +453,7 @@ python3 - <<'PY'
 import json
 m = json.load(open("models/tacit-4b/self-distill.json"))
 floor = m["min_eval_rows"]
-for seam in ("category", "style-stage1", "style-stage2", "rerank", "gate", "weights"):
+for seam in ("category", "style-stage2", "rerank", "gate", "weights"):
     n = int((m["eval"].get(seam) or {}).get("n") or 0)
     print(f"{seam:13} n={n:<4} {'certified' if n >= floor else 'UNCERTIFIED'}")
 PY
@@ -465,7 +463,6 @@ This repository's artifact prints:
 
 ```
 category      n=9    UNCERTIFIED
-style-stage1  n=49   certified
 style-stage2  n=50   certified
 rerank        n=140  certified
 gate          n=59   certified
@@ -483,9 +480,9 @@ The build refuses to ship an under-trained seam, but certifies only what it has 
 the eval split is **stratified by seam**, and a seam needs ≥20 eval rows before its agreement
 (or the weights MAE) is enforced — an evidence floor, not a power guarantee (a true-0.5 seam
 still clears the 0.6 bar 25% of the time at 20 rows). A full default-shape build (600 design
-states) holds ~60/60/50/50/140/480 eval rows across
-`category`/`gate`/style-stage1/style-stage2/`rerank`/`weights`, where the gate has real
-power, and certifies all six; the smoke shape certifies nothing and logs every seam as
+states) holds ~60/59/50/140/480 eval rows across
+`category`/`gate`/`style-stage2`/`rerank`/`weights`, where the gate has real
+power, and certifies all five; the smoke shape certifies nothing and logs every seam as
 skipped. `TACIT_MIN_KIND_ROWS` is independent and always enforced.
 
 Fidelity is not task quality: `eval` compares the student with the teacher it was distilled
@@ -592,7 +589,7 @@ Every seam ships uncalibrated. The Ch2 style seam stays off until the floor is m
 
 ```bash
 make docker-up-decisions
-make tacit-calibrate          # two-stage replay over qa/typed/style.jsonl
+make tacit-calibrate          # sharded style replay over qa/typed/style.jsonl
 ```
 
 `models/tacit-calibration.json` either recommends a floor — set
@@ -604,7 +601,7 @@ make tacit-calibrate          # two-stage replay over qa/typed/style.jsonl
 `make tacit-calibrate` (`Makefile:504`) replays the **holdout** rows of
 `qa/typed/style.jsonl` — 30 of the file's 169; `load_rows` keeps `source.split ==
 "holdout"` and refuses training rows (`tacit_calibrate.py:167-182`) — through the served
-two-stage style path of a **running** gateway, reports acted rate, acted accuracy, ECE and
+sharded style path of a **running** gateway, reports acted rate, acted accuracy, ECE and
 Brier per candidate floor, and recommends the lowest floor that clears the
 accuracy/acted-rate bars (`Makefile:490-494`). The prerequisite is a live gateway:
 `make docker-up-decisions` (the default `TACIT_BASE_URL` is the overlay's loopback

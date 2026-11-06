@@ -23,12 +23,13 @@ from src.decisions.seam_prompts import (
     STYLE_INSTRUCTIONS,
     STYLE_NONE_GLOSS,
     STYLE_NONE_KEY,
+    STYLE_VOCABULARY,
     WEIGHT_LEVELS,
     axis_question,
     category_question,
     gate_question,
     style_question,
-    styles_for_category,
+    style_shards,
 )
 from src.decisions.tacit import StyleDecision, TacitClient, TacitDecision, category_options
 
@@ -39,6 +40,7 @@ __all__ = [
     "STYLE_INSTRUCTIONS",
     "STYLE_NONE_GLOSS",
     "STYLE_NONE_KEY",
+    "STYLE_VOCABULARY",
     "WEIGHT_LEVELS",
     "StyleDecision",
     "TacitClient",
@@ -48,5 +50,5 @@ __all__ = [
     "category_question",
     "gate_question",
     "style_question",
-    "styles_for_category",
+    "style_shards",
 ]

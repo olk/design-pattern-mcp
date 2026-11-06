@@ -17,16 +17,14 @@ import pytest
 
 from src.config import DecisionSeamConfig
 from src.decisions.seam_prompts import (
-    CATEGORY_SLUGS,
     DECISION_STATE_MAX_CHARS,
-    STYLE_CATEGORY_AFFINITY,
     STYLE_GLOSSES,
     STYLE_INSTRUCTIONS,
     STYLE_NONE_GLOSS,
     STYLE_NONE_KEY,
-    category_question,
+    STYLE_VOCABULARY,
     style_question,
-    styles_for_category,
+    style_shards,
 )
 from src.decisions.tacit import (
     CATEGORY_GLOSSES,
@@ -327,25 +325,27 @@ def test_category_glosses_cover_the_taxonomy() -> None:
     assert all(gloss for gloss in CATEGORY_GLOSSES.values())
 
 
-def test_style_shortlists_match_the_affinity_table_and_fit_the_option_cap() -> None:
-    """``seam_prompts``' literal table must mirror ``src/style_affinity.py``, and every
-    stage-2 shortlist plus ``none`` must stay inside AnyJev's 26-option choice cap."""
-    assert set(STYLE_CATEGORY_AFFINITY) == set(STYLE_GLOSSES) == set(STYLE_AFFINITY)
-    for style, categories in STYLE_CATEGORY_AFFINITY.items():
-        assert set(categories) == set(STYLE_AFFINITY[style]), style
-    for category in CATEGORY_SLUGS:
-        styles = styles_for_category(category)
-        assert len(styles) + 1 <= 26, category
-        assert all(style in STYLE_GLOSSES for style in styles)
+def test_style_vocabulary_matches_the_prior_and_shards_are_legal_and_balanced() -> None:
+    """The served vocabulary is exactly the styles §10.1 knows, split into legal shards.
 
-
-def test_styles_for_category_rejects_an_unknown_category() -> None:
-    with pytest.raises(ValueError, match="no style has affinity"):
-        styles_for_category("not-a-category")
+    The affinity table stays in ``src/style_affinity.py`` as the pipeline PRIOR; the prompt
+    module carries only the flat vocabulary, because reading the prior backwards as a filter
+    is what made 16 of 22 labelled holdout rows unanswerable.
+    """
+    assert set(STYLE_VOCABULARY) == set(STYLE_GLOSSES) == set(STYLE_AFFINITY)
+    shards = style_shards()
+    assert sum(len(shard) for shard in shards) == len(STYLE_VOCABULARY)
+    assert {style for shard in shards for style in shard} == set(STYLE_VOCABULARY)
+    # Equal width: a narrow shard's softmax concentrates more mass, so an uneven split would
+    # win cross-shard comparisons for free and bias the floor the calibration fits.
+    assert max(map(len, shards)) - min(map(len, shards)) <= 1
+    for shard in shards:
+        assert len(shard) + 1 <= 26
+        assert all(style in STYLE_GLOSSES for style in shard)
 
 
 def test_style_question_carries_the_instructions_and_every_gloss() -> None:
-    styles = styles_for_category("domain-modeling")
+    styles = style_shards()[0]
     question = style_question(styles)
     assert question.startswith(STYLE_INSTRUCTIONS)
     assert f"{STYLE_NONE_KEY} = {STYLE_NONE_GLOSS}" in question
@@ -353,142 +353,131 @@ def test_style_question_carries_the_instructions_and_every_gloss() -> None:
         assert f"{style} = {STYLE_GLOSSES[style]}" in question
 
 
-# -- Ch2 style: two stages over the AnyJev 26-option cap -------------------------------
+# -- Ch2 style: the 35-way question, sharded under the AnyJev 26-option cap ------------
 
 
-def _two_stage_client(
+def _sharded_client(
     calls: list[httpx.Request],
     *,
-    category: str = "domain-modeling",
-    category_confidence: float = 0.9,
     style_index: int = 0,
     style_confidence: float = 0.9,
     style_answer: str | None = None,
     fail_on_call: int | None = None,
+    fail_every_call: bool = False,
     **overrides: Any,
 ) -> TacitClient:
-    """A gateway that answers the category question, then the shortlist question."""
+    """A gateway that answers every style shard question the same way."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        if fail_on_call is not None and len(calls) == fail_on_call:
+        if fail_every_call or (fail_on_call is not None and len(calls) == fail_on_call):
             raise httpx.ConnectError("unreachable")
         body = json.loads(request.content.decode("utf-8"))
         options = [str(option) for option in body["options"]]
-        if body["question"] == category_question():
-            confidence = category_confidence
-            winner = category
-        else:
-            confidence = style_confidence
-            winner = style_answer if style_answer is not None else options[style_index]
-        rest = (1.0 - confidence) / (len(options) - 1)
+        winner = style_answer if style_answer is not None else options[style_index]
+        rest = (1.0 - style_confidence) / (len(options) - 1)
         probs = dict.fromkeys(options, rest)
-        probs[winner] = confidence
-        return httpx.Response(
-            200, json={"answer": winner, "probs": probs, "route": "one_forward"}
-        )
+        probs[winner] = style_confidence
+        return httpx.Response(200, json={"answer": winner, "probs": probs, "route": "one_forward"})
 
     return TacitClient(_config(**overrides), transport=httpx.MockTransport(handler))
 
 
-async def test_choose_style_runs_category_then_shortlist() -> None:
+async def test_choose_style_asks_every_shard_and_keeps_the_best_answer() -> None:
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, style_index=1)
-    first = await client.choose_style("A payments platform with adapters around every provider.")
-    second = await client.choose_style("A payments platform with adapters around every provider.")
-    styles = styles_for_category("domain-modeling")
+    client = _sharded_client(calls, style_index=1)
+    description = "A payments platform with adapters around every provider."
+    first = await client.choose_style(description)
+    second = await client.choose_style(description)
+    shards = style_shards()
     assert isinstance(first, StyleDecision)
-    assert first.style == styles[1]
+    assert first.style == shards[0][1]
     assert first.confidence == pytest.approx(0.9)
-    assert set(first.probabilities) == {*styles, STYLE_NONE_KEY}
+    assert set(first.probabilities) == {*shards[0], STYLE_NONE_KEY}
     assert second == first
-    # Two wire calls for the first description, none for the cached repeat (both
-    # questions are served from the client's exact-match decision cache).
-    assert len(calls) == 2
-    stage1, stage2 = (json.loads(call.content.decode("utf-8")) for call in calls)
-    assert stage1 == {
-        "state": "A payments platform with adapters around every provider.",
-        "question": category_question(),
-        "options": category_options(),
-        "kind": "choice",
-    }
-    assert stage2["question"] == style_question(styles)
-    assert stage2["options"] == [*styles, STYLE_NONE_KEY]
-    assert stage2["kind"] == "choice"
+    # One question per shard, and none for the cached repeat (the client's exact-match
+    # decision cache covers the shard questions too).
+    assert len(calls) == len(shards)
+    for call, styles in zip(calls, shards, strict=True):
+        body = json.loads(call.content.decode("utf-8"))
+        assert body["state"] == description
+        assert body["question"] == style_question(styles)
+        assert body["options"] == [*styles, STYLE_NONE_KEY]
+        assert body["kind"] == "choice"
     await client.close()
 
 
-async def test_choose_style_degrades_when_stage_one_stays_below_the_floor() -> None:
+async def test_choose_style_offers_the_whole_vocabulary_across_shards() -> None:
+    """The regression that matters: no affinity filter may narrow the style answer space.
+
+    Deriving the shortlist from a stage-1 category left most styles unanswerable — 16 of 22
+    labelled holdout rows named a style their scenario's category could never offer.
+    """
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, category_confidence=0.4)
+    client = _sharded_client(calls)
+    await client.choose_style("some description")
+    offered: set[str] = set()
+    for call in calls:
+        offered |= set(json.loads(call.content.decode("utf-8"))["options"])
+    assert offered == {*STYLE_VOCABULARY, STYLE_NONE_KEY}
+    await client.close()
+
+
+async def test_choose_style_degrades_when_no_shard_clears_the_floor() -> None:
+    calls: list[httpx.Request] = []
+    client = _sharded_client(calls, style_confidence=0.4)
     assert await client.choose_style("some description") is None
-    assert len(calls) == 1  # the shortlist question is never asked
+    assert len(calls) == len(style_shards())
     await client.close()
 
 
-async def test_choose_style_degrades_when_stage_two_stays_below_the_floor() -> None:
+async def test_choose_style_abstains_when_none_wins() -> None:
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, style_confidence=0.4)
+    client = _sharded_client(calls, style_index=-1)
+    assert await client.choose_style("a bare algorithm inside one service") is None
+    await client.close()
+
+
+async def test_choose_style_skips_a_shard_that_answers_off_offer() -> None:
+    calls: list[httpx.Request] = []
+    client = _sharded_client(calls, style_answer="not-a-served-style")
     assert await client.choose_style("some description") is None
-    assert len(calls) == 2
+    assert len(calls) == len(style_shards())
     await client.close()
 
 
-async def test_choose_style_none_winning_returns_a_none_style_with_its_confidence() -> None:
+async def test_choose_style_survives_one_shard_failing() -> None:
+    """One dead shard must not kill the seam: the other shard still answers."""
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, style_index=-1)
-    decision = await client.choose_style("a bare algorithm inside one service")
+    client = _sharded_client(calls, fail_on_call=1)
+    decision = await client.choose_style("some description")
     assert isinstance(decision, StyleDecision)
-    assert decision.style is None
-    assert decision.confidence == pytest.approx(0.9)
+    assert len(calls) == len(style_shards())
     await client.close()
 
 
-async def test_choose_style_rejects_an_off_shortlist_answer() -> None:
+async def test_choose_style_degrades_when_every_shard_fails() -> None:
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, style_answer="microservices")
-    # ``microservices`` has no affinity with domain-modeling, so stage 2 never offers it.
+    client = _sharded_client(calls, fail_every_call=True)
     assert await client.choose_style("some description") is None
-    await client.close()
-
-
-@pytest.mark.parametrize("stage", [1, 2])
-async def test_choose_style_transport_failure_degrades(stage: int) -> None:
-    calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, fail_on_call=stage)
-    assert await client.choose_style("some description") is None
-    assert len(calls) == stage
+    assert len(calls) == len(style_shards())
     await client.close()
 
 
 async def test_choose_style_caps_the_state_like_serving() -> None:
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls)
+    client = _sharded_client(calls)
     description = "x" * (DECISION_STATE_MAX_CHARS + 500)
     await client.choose_style(description)
-    assert len(calls) == 2
+    assert len(calls) == len(style_shards())
     for call in calls:
         assert json.loads(call.content.decode("utf-8"))["state"] == description[:DECISION_STATE_MAX_CHARS]
     await client.close()
 
 
-async def test_choose_style_shortlists_stay_inside_the_option_cap() -> None:
-    """Every stage-2 question is a legal AnyJev choice: shortlist + 'none' <= 26."""
-    for category in CATEGORY_SLUGS:
-        calls: list[httpx.Request] = []
-        client = _two_stage_client(calls, category=category)
-        decision = await client.choose_style("some description")
-        assert decision is not None, category
-        options = json.loads(calls[1].content.decode("utf-8"))["options"]
-        assert len(options) <= 26, category
-        assert options[-1] == STYLE_NONE_KEY
-        assert options[:-1] == list(styles_for_category(category))
-        await client.close()
-
-
 async def test_choose_style_disabled_never_calls_the_wire() -> None:
     calls: list[httpx.Request] = []
-    client = _two_stage_client(calls, enabled=False)
+    client = _sharded_client(calls, enabled=False)
     assert await client.choose_style("some description") is None
     assert calls == []
     await client.close()

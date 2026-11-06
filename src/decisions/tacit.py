@@ -47,7 +47,7 @@ from src.decisions.seam_prompts import (
     category_question,
     gate_question,
     style_question,
-    styles_for_category,
+    style_shards,
 )
 from src.schemas.enums import QUALITY_AXES, PatternCategory
 
@@ -157,41 +157,41 @@ class TacitClient:
     # -- the three seams ---------------------------------------------------------
 
     async def choose_style(self, description: str) -> StyleDecision | None:
-        """Ch2 substitution: category → shortlist; ``None`` degrades to the LLM style.
+        """Ch2 substitution: sharded 35-way style question; ``None`` degrades to the LLM style.
 
-        Stage 1 narrows the 36-way style question to one category's shortlist (the
-        largest is 16 styles + ``none`` = 17 ≤ the AnyJev 26-option cap); stage 2 picks
-        within it. Both stages must clear ``confidence_floor``; ``none`` winning, an
-        off-shortlist answer, or any transport/shape failure returns ``None`` so the
-        pipeline keeps the LLM-sampled style.
+        AnyJev's choice readout caps a question at 26 options while the style answer space is
+        35 patterns, so serving asks one question per shard (``style_shards``) and keeps the
+        most confident *named* style across them. Abstention is per-shard by construction: a
+        shard whose list does not contain the answer returns ``none``, which says "not from my
+        list", never "no style exists" — so ``none`` never vetoes another shard's answer, and
+        the seam abstains only when no shard names a style. Nothing filters the shards: the
+        §10.1 affinity table is a pipeline prior, and narrowing by it left most legitimate
+        styles unanswerable. The winner must clear ``confidence_floor``; an unparseable shard
+        is skipped, and no usable shard returns ``None`` so the pipeline keeps the LLM style.
         """
         state = description[:DECISION_STATE_MAX_CHARS]
-        category, stage1 = await self.choose_category(state)
-        if category is None or stage1 < self._config.confidence_floor:
+        winner: str | None = None
+        confidence = 0.0
+        probabilities: dict[str, float] = {}
+        for styles in style_shards():
+            options = [*styles, STYLE_NONE_KEY]
+            decision = await self.decide(state, style_question(styles), options, kind="choice")
+            if decision is None or decision.answer is None or decision.answer not in options:
+                continue
+            if decision.answer == STYLE_NONE_KEY:
+                continue
+            shard_confidence = decision.probabilities.get(decision.answer, 0.0)
+            if shard_confidence > confidence:
+                winner = decision.answer
+                confidence = shard_confidence
+                probabilities = {key: value for key, value in decision.probabilities.items() if key in options}
+        if winner is None or confidence < self._config.confidence_floor:
             return None
-        styles = styles_for_category(category)
-        options = [*styles, STYLE_NONE_KEY]
-        decision = await self.decide(state, style_question(styles), options, kind="choice")
-        if decision is None or decision.answer is None or decision.answer not in options:
-            return None
-        confidence = decision.probabilities.get(decision.answer, 0.0)
-        if confidence < self._config.confidence_floor:
-            return None
-        style = None if decision.answer == STYLE_NONE_KEY else decision.answer
         logger.info(
             "Decision-model style choice",
-            extra={
-                "model": self._config.model,
-                "style": style or STYLE_NONE_KEY,
-                "confidence": confidence,
-                "category": category,
-            },
+            extra={"model": self._config.model, "style": winner, "confidence": confidence},
         )
-        return StyleDecision(
-            style=style,
-            confidence=confidence,
-            probabilities={key: value for key, value in decision.probabilities.items() if key in options},
-        )
+        return StyleDecision(style=winner, confidence=confidence, probabilities=probabilities)
 
     async def choose_category(self, state: str) -> tuple[str | None, float]:
         """J2: soft 9-way category choice → ``(slug, confidence)``; ``(None, 0.0)`` degrades."""

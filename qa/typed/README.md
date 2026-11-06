@@ -19,7 +19,7 @@ Corpus labels are agent-curated, **human expert review pending**.
 
 - Choice: 1 per scenario, criteria = the 9 catalog categories with a one-line
   gloss each, label = the scenario's category.
-- Style: 1 per scenario, criteria/instructions = the served Ch2 prompt verbatim
+- Style: 1 per scenario, criteria/instructions = the served Ch2 vocabulary verbatim
   (`src/decisions/seam_prompts.py` shared vocabulary), `state` = the raw scenario
   description bytes the seam receives, label = the reviewed dominant
   architecture style with a quoted rationale. Train split: 139 rows over all 36
@@ -70,10 +70,10 @@ Per `docs/recommendation_design-pattern-mcp_decision-models.md` §4/§7.5:
   the released checkpoint writes states, answers its own questions with thinking,
   and a QLoRA student reproduces the label distribution in one forward. The
   training problems are the served questions — category, weights and gate from
-  `build_problems`, the two Ch2 style stages from `build_style_problems`, and the
+  `build_problems`, the Ch2 style shards from `build_style_problems`, and the
   J1 `yes_no` items from `rerank_pairs.jsonl`. These typed labels are therefore
   **evaluation and calibration** data: `make tacit-calibrate` replays the holdout
-  style rows through the served two-stage path to produce the seam's floor, and the
+  style rows through the served sharded path to produce the seam's floor, and the
   holdout rerank pairs score the leg (nDCG) without touching the weights.
 - **Eikos-4B** (LoRA r64), **Clef-flash-9B** (QLoRA), **Kev-4B**
   (`kev.train --init_from`) each want 500–2,000 labeled decisions — this

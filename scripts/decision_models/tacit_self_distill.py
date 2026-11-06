@@ -26,13 +26,14 @@ server never sends any other shape.
 
 Two more seams train from the same single checkpoint:
 
-* **Ch2 style** (``build_style_problems``) — the SERVED two-stage choice over
-  description-shaped states: stage 1 is the category question on the capped description,
-  stage 2 the style question over one category's shortlist (the gateway caps ``choice`` at
-  26 options, so the 36-way style question never exists as one item). The shortlist rotates
-  over the nine categories so every option set trains. States are the corpus train hints
-  first, then model-written descriptions (``generate_descriptions``) — the seam serves raw
-  user prose.
+* **Ch2 style** (``build_style_problems``) — the SERVED sharded choice over
+  description-shaped states: the 35-style vocabulary split into balanced questions of at
+  most 25 styles plus ``none`` (the gateway caps ``choice`` at 26 options, so the 35-way
+  question never exists as one item), the shards rotating over the states so each trains.
+  States are the corpus train hints first, then model-written descriptions
+  (``generate_descriptions``) — the seam serves raw user prose. The category question is
+  NOT paired with these states: serving asks it of part states only (the J2 ``category``
+  seam), and narrowing the style menu by it is what made most styles unanswerable.
 * **J1 rerank** (``load_rerank_pairs`` / ``build_rerank_problems``) — one ``yes_no``
   relevance question per (statement, document) pair from ``qa/typed/rerank_pairs.jsonl``,
   whose bytes are exactly the serving items. Train-split rows only; the holdout pairs are
@@ -177,7 +178,7 @@ class Example:
     kind: str
     label_ids: list[int]
     target: list[float]
-    seam: str = ""  # category | weights | gate | style-stage1 | style-stage2 | rerank
+    seam: str = ""  # category | weights | gate | style-stage2 | rerank
 
 
 class _Progress:
@@ -296,9 +297,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--min-seam-agreement",
         type=float,
         default=0.6,
-        help="Fail the build when an answer seam's (category/style-stage1/style-stage2/rerank/"
-        "gate) student-vs-teacher eval agreement drops below this. Raise to the first "
-        "max-effort run's achieved-minus-margin when it lands.",
+        help="Fail the build when an answer seam's (category/style-stage2/rerank/gate) "
+        "student-vs-teacher eval agreement drops below this. Raise to the first max-effort "
+        "run's achieved-minus-margin when it lands.",
     )
     parser.add_argument(
         "--max-score-mae",
@@ -836,30 +837,21 @@ def build_problems(
 
 
 def build_style_problems(states: Sequence[str], seams: ModuleType) -> list[dict[str, Any]]:
-    """Ch2 two-stage style questions over description-shaped states.
+    """Ch2 style questions over description-shaped states, in the served shape.
 
-    Stage 1 is the served category question on the capped description; stage 2 is the
-    served style question over one category's shortlist. The shortlist rotates
-    deterministically over the nine categories so every stage-2 option set is trained,
-    independent of the teacher's own stage-1 answers (which would couple training to
-    teacher errors and cost a sequential second pass).
+    The style question is 35-way and AnyJev caps one ask at 26 options, so serving splits the
+    vocabulary into shards and asks every one of them (``seams.style_shards``). Training asks
+    the same shards, rotated deterministically over the states so each shard is trained at the
+    same rate. Only these shard questions are emitted: the category question is NOT paired with
+    them any more, because serving asks it of part states (the J2 ``category`` seam) and never
+    of a description — that pairing existed only to narrow the style shortlist, which made most
+    styles unanswerable (guide §10.1: the affinity table is a prior, never a filter).
     """
     problems: list[dict[str, Any]] = []
-    category_question = seams.category_question()
-    slugs = seams.CATEGORY_SLUGS
+    shards = seams.style_shards()
     for index, raw_state in enumerate(states):
         state = raw_state[: seams.DECISION_STATE_MAX_CHARS]
-        problems.append(
-            {
-                "state": state,
-                "question": category_question,
-                "options": list(slugs),
-                "kind": "choice",
-                "seam": "style-stage1",
-            }
-        )
-        category = slugs[index % len(slugs)]
-        styles = seams.styles_for_category(category)
+        styles = shards[index % len(shards)]
         problems.append(
             {
                 "state": state,
@@ -1242,7 +1234,7 @@ def _expected_level(probs: Sequence[float]) -> float:
 
 #: Seams whose student-vs-teacher agreement the build gates on (every ANSWER seam; the
 #: weights seam is gated on its expected-level MAE instead).
-_GATED_SEAMS: tuple[str, ...] = ("category", "style-stage1", "style-stage2", "rerank", "gate")
+_GATED_SEAMS: tuple[str, ...] = ("category", "style-stage2", "rerank", "gate")
 
 #: Minimum eval rows before a seam's fidelity is *certified*. This is an evidence floor,
 #: not a power guarantee: a true-0.5 seam still clears the 0.6 bar 25% of the time at 20
