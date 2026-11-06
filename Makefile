@@ -492,6 +492,8 @@ TACIT_CAL_FLOORS           ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7
 TACIT_CAL_MIN_ACTED_ACCURACY ?= 0.8
 TACIT_CAL_MIN_ACTED_RATE   ?= 0.3
 TACIT_CAL_MIN_ACTED        ?= 10
+# The container whose identity the calibration report records (docker/docker-compose.decision-models.yml).
+TACIT_SERVED_CONTAINER     ?= design-pattern-tacit-dev
 TACIT_CAL_REPORT           := models/tacit-calibration.json
 # Floor the style A/B runs with: read from the calibration artifact, never hand-copied, so an
 # arm cannot run a threshold the measurements did not produce. Override only to re-test a
@@ -506,7 +508,12 @@ tacit-calibrate: ## Calibrate decisions.style.confidence_floor against a running
 		--min-acted-accuracy $(TACIT_CAL_MIN_ACTED_ACCURACY) \
 		--min-acted-rate $(TACIT_CAL_MIN_ACTED_RATE) \
 		--min-acted $(TACIT_CAL_MIN_ACTED) \
-		--report $(TACIT_CAL_REPORT)
+		--report $(TACIT_CAL_REPORT) \
+		--served-container "$(TACIT_SERVED_CONTAINER)" \
+		--served-image "$$(docker inspect -f '{{.Image}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \
+		--served-image-tag "$$(docker inspect -f '{{.Config.Image}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \
+		--served-container-started-at "$$(docker inspect -f '{{.State.StartedAt}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \
+		--served-model-repo "$(TACIT_MODEL_REPO)"
 
 # Tag and push a local image to both Docker Hub and GHCR.
 # Args: local_image hub_repo ghcr_repo

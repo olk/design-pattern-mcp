@@ -34,6 +34,13 @@ human review of exactly the labels being calibrated against (same file bytes, ev
 labeled scenario's label+rationale covered, reviewer named). Printing the table always
 works — only the recommendation, and the exit code it drives, is gated.
 
+The report also records what served the replay (``served``: container, image ID, image tag,
+container start time, model repo, base URL) so a 30-row measurement is self-attributing and a
+stale container cannot be mistaken for a fresh one. That identity is captured by the make rule
+via ``docker inspect`` — ``anyjev.serve``'s ``GET /v1/stats`` exposes no identity over the wire,
+and the flags are recorded verbatim rather than validated, so the script still runs against a
+remote gateway on a host with no docker.
+
 With ``--min-acted-accuracy`` and ``--min-acted-rate`` the report also names the lowest
 floor that clears both bars (``recommended``), which is the value
 ``decisions.style.confidence_floor`` should take; with no floor qualifying it exits 2 so
@@ -118,6 +125,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--report", default="", help="Write the full report JSON here (e.g. models/tacit-calibration.json)."
+    )
+    parser.add_argument(
+        "--served-container",
+        default="",
+        help="Name of the container that served the replay (the make rule fills this via docker inspect).",
+    )
+    parser.add_argument(
+        "--served-image",
+        default="",
+        help="Image ID of the serving container (sha256:...), captured by the make rule — never hand-typed.",
+    )
+    parser.add_argument(
+        "--served-image-tag",
+        default="",
+        help="Image tag the serving container requested (docker inspect .Config.Image).",
+    )
+    parser.add_argument(
+        "--served-container-started-at",
+        default="",
+        help="docker inspect .State.StartedAt of the serving container — proves the container outlived a rebuild.",
+    )
+    parser.add_argument(
+        "--served-model-repo",
+        default="",
+        help="HF repo of the served checkpoint (the make rule passes TACIT_MODEL_REPO).",
     )
     parser.add_argument(
         "--labels",
@@ -502,6 +534,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = {
         "acted_rule": ACTED_RULE,
         "split": args.split,
+        "served": {
+            "base_url": args.base_url,
+            "container": args.served_container or None,
+            "image_id": args.served_image or None,
+            "image_tag": args.served_image_tag or None,
+            "container_started_at": args.served_container_started_at or None,
+            "model_repo": args.served_model_repo or None,
+        },
         "label_review": {"certified": reviewed, "reason": review_reason},
         **summary,
         "recommended": recommended,

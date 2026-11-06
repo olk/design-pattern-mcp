@@ -1280,6 +1280,92 @@ def test_calibration_replays_holdout_only_by_default(
     assert seen[0]["category"] == "domain-modeling"
 
 
+def test_calibration_report_records_serving_provenance(
+    calibrator: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The report names the container/image that served the replay, so a FAIL is attributable.
+
+    Provenance is recorded, never gated: an unset flag becomes ``null`` and a run without any
+    docker-derived flag still exits on its measurements alone.
+    """
+    path = tmp_path / "style.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "s1:style",
+                "state": "system one",
+                "instructions": "Which style?",
+                "criteria": {"a": "A", "b": "B"},
+                "label": "a",
+                "source": {"split": "holdout", "scenario_id": "s1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    served_flags = [
+        "--served-container",
+        "tacit-dev",
+        "--served-image",
+        "sha256:abc",
+        "--served-image-tag",
+        "design-pattern-tacit:latest",
+        "--served-container-started-at",
+        "2026-11-06T16:00:00Z",
+        "--served-model-repo",
+        "morriszjm/Tacit-4B",
+    ]
+    served = {
+        "base_url": "http://x:18100",
+        "container": "tacit-dev",
+        "image_id": "sha256:abc",
+        "image_tag": "design-pattern-tacit:latest",
+        "container_started_at": "2026-11-06T16:00:00Z",
+        "model_repo": "morriszjm/Tacit-4B",
+    }
+
+    def _answering(choice: str) -> Any:
+        def _fake_ask(base_url: str, row: dict[str, Any], seams: Any, timeout: float) -> dict[str, Any]:
+            return {"choice": choice, "confidence": 0.7, "probabilities": {choice: 0.7}, "stage1": 0.7}
+
+        return _fake_ask
+
+    # Every flag set: the whole provenance lands in the written report.
+    monkeypatch.setattr(calibrator, "ask", _answering("a"))
+    report_a = tmp_path / "a.json"
+    argv_a = [
+        "--style", str(path), "--base-url", "http://x:18100", "--floors", "0.5",
+        "--report", str(report_a), *served_flags,
+    ]
+    assert calibrator.main(argv_a) == 0
+    assert json.loads(report_a.read_text(encoding="utf-8"))["served"] == served
+
+    # No flags (remote-gateway lane): nulls, except the endpoint the replay actually asked.
+    monkeypatch.setattr(calibrator, "ask", _answering("a"))
+    report_b = tmp_path / "b.json"
+    argv_b = ["--style", str(path), "--base-url", "http://x:18100", "--floors", "0.5", "--report", str(report_b)]
+    assert calibrator.main(argv_b) == 0
+    missing = json.loads(report_b.read_text(encoding="utf-8"))["served"]
+    assert missing["base_url"] == "http://x:18100"
+    assert {key: value for key, value in missing.items() if key != "base_url"} == {
+        "container": None,
+        "image_id": None,
+        "image_tag": None,
+        "container_started_at": None,
+        "model_repo": None,
+    }
+
+    # A failing run is the one that most needs provenance: it is written before the exit 2.
+    monkeypatch.setattr(calibrator, "ask", _answering("b"))
+    report_c = tmp_path / "c.json"
+    argv_c = [
+        "--style", str(path), "--base-url", "http://x:18100", "--floors", "0.5",
+        "--min-acted-accuracy", "0.8", "--min-acted-rate", "0.3", "--min-acted", "10",
+        "--report", str(report_c), *served_flags,
+    ]
+    assert calibrator.main(argv_c) == 2
+    assert json.loads(report_c.read_text(encoding="utf-8"))["served"] == served
+
+
 def test_recommend_picks_the_lowest_qualifying_floor(calibrator: types.ModuleType) -> None:
     """The recommendation is the lowest floor clearing both bars, not the most accurate one."""
     pairs = [

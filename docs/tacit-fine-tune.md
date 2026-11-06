@@ -127,10 +127,10 @@ flowchart TD
     C --> D["Calibrate the style floor (§4.7)"]
     D --> E{"Floor recommended?"}
     E -- "null (exit 2)" --> F["Style seam stays off"]
-    E -- "floor" --> G["Style A/B (Makefile:680):<br/>holdout p95 ≥ +15%"]
+    E -- "floor" --> G["Style A/B (Makefile:687):<br/>holdout p95 ≥ +15%"]
     G -- "loses" --> F
     G -- "wins" --> H["Enable style with that floor"]
-    I["A/B the always-on seams<br/>(rerank non-inferior, Makefile:705)"]
+    I["A/B the always-on seams<br/>(rerank non-inferior, Makefile:712)"]
     F --> I
     H --> I
     I --> J["Publish (§7)"]
@@ -375,7 +375,7 @@ are copied verbatim from the file; the `seams` and `eval` blocks are shown per s
 |---|---|---|---|
 | `min_seam_agreement` | `0.6` | Agreement bar for a *certified* answer seam | Expected: `0.6`. Anomalous: lowered to let a build pass — raise volume instead (§8). |
 | `max_score_mae` | `0.2` | Expected-level MAE bar for a certified `weights` seam | Expected: `0.2`. Anomalous: raised to accommodate a worse fit. |
-| `min_eval_rows` | `20` | Evidence floor for certification; `make docker-publish-tacit` reads **this** field (`Makefile:569`) | Expected: `20` (the trainer constant; `Makefile:59`'s comment still says 10 — the field is authoritative). Anomalous: absent (legacy manifest — the publish guard refuses it) or below `20` (weakened evidence). |
+| `min_eval_rows` | `20` | Evidence floor for certification; `make docker-publish-tacit` reads **this** field (`Makefile:576`) | Expected: `20` (the trainer constant; `Makefile:59`'s comment still says 10 — the field is authoritative). Anomalous: absent (legacy manifest — the publish guard refuses it) or below `20` (weakened evidence). |
 
 **`seams` block** — a restatement, not the certification record: each entry copies the
 `eval` metrics with `n` stripped and adds the seam's total kept rows, which are **pre-split**
@@ -448,7 +448,7 @@ reconciles to 3863 problems, 3862 kept rows and 3479 training examples.
 #### Certification check
 
 `min_eval_rows` decides which seams count, and the publish guard applies exactly this rule
-(`Makefile:569`):
+(`Makefile:576`):
 
 ```bash
 python3 - <<'PY'
@@ -601,12 +601,12 @@ make tacit-calibrate          # two-stage replay over qa/typed/style.jsonl
 
 #### The calibrate step in detail
 
-`make tacit-calibrate` (`Makefile:502`) replays the **holdout** rows of
+`make tacit-calibrate` (`Makefile:504`) replays the **holdout** rows of
 `qa/typed/style.jsonl` — 30 of the file's 169; `load_rows` keeps `source.split ==
-"holdout"` and refuses training rows (`tacit_calibrate.py:135-150`) — through the served
+"holdout"` and refuses training rows (`tacit_calibrate.py:167-182`) — through the served
 two-stage style path of a **running** gateway, reports acted rate, acted accuracy, ECE and
 Brier per candidate floor, and recommends the lowest floor that clears the
-accuracy/acted-rate bars (`Makefile:490-495`). The prerequisite is a live gateway:
+accuracy/acted-rate bars (`Makefile:490-494`). The prerequisite is a live gateway:
 `make docker-up-decisions` (the default `TACIT_BASE_URL` is the overlay's loopback
 `http://127.0.0.1:18100`), or on a build-only LXC the host-networked sidecar
 (`docs/trainer-build-plan-baremetal.md:296-305`): `docker run -d --name
@@ -614,19 +614,28 @@ design-pattern-tacit-host --network host <image>`, then `make tacit-calibrate
 TACIT_BASE_URL=http://127.0.0.1:8100`.
 
 It writes exactly one file — `models/tacit-calibration.json` (`TACIT_CAL_REPORT`,
-`Makefile:495`) — and alters nothing else. The file belongs to a serving run, not to the
+`Makefile:497`) — and alters nothing else. The file belongs to a serving run, not to the
 checkpoint: it is not one of `TACIT_TRAIN_INPUTS` (`Makefile:121-123`) and never enters
-the image. It records the split, the label-review state and the recommendation.
+the image. It records the split, the label-review state, the recommendation and a `served`
+block: gateway URL, container name, image ID, image tag, container start time and
+`TACIT_MODEL_REPO`. The recipe fills all five (`Makefile:512-516`): image ID, image tag and
+container start time from `docker inspect`, the container name and model repo from make
+variables — never typed by hand, because `anyjev.serve` reports no identity over the wire
+(`tacit_calibrate.py:129-153`). So a 30-row measurement names the checkpoint that produced it,
+and a container left running across a rebuild is visible in `container_started_at`. An unset
+flag is `null`: provenance is recorded, never gated, which is why the script still runs against
+a remote gateway on a host with no docker. On a build-only LXC run the target on the serving
+host, where those container names resolve.
 
 | Consumer | Reads the file? | How the floor reaches it |
 |---|---|---|
 | The sidecar container | No | as an env var at stack start: `DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=<floor> make docker-up-decisions` |
-| `make benchmark-style-ab` | Yes — `TACIT_STYLE_FLOOR` is derived from it (`Makefile:499-500`); the target exits 1 with no usable floor (`Makefile:681`) | the style-on arm runs the measured threshold, never a hand-copied one (override `TACIT_STYLE_FLOOR=<v>` only to re-test deliberately) |
+| `make benchmark-style-ab` | Yes — `TACIT_STYLE_FLOOR` is derived from it (`Makefile:501-502`); the target exits 1 with no usable floor (`Makefile:688`) | the style-on arm runs the measured threshold, never a hand-copied one (override `TACIT_STYLE_FLOOR=<v>` only to re-test deliberately) |
 | `make docker-build-tacit` | No — not baked, not hashed | only a **future deliberate retrain** couples to it: if the floor differs from `0.5`, pass `TACIT_CONFIDENCE_FLOOR=<floor>` so the fidelity eval replays the threshold serving actually uses (knobs are not hashed — pair the retrain with `rm -rf models/tacit-4b`, §4.2) |
 
 Expect a refusal until the label review lands: the calibrator recommends nothing while
 `qa/typed/review.json` has not certified the style label source byte-for-byte — the
-report carries that state as `label_review.certified` (`tacit_calibrate.py:505`) — and the
+report carries that state as `label_review.certified` (`tacit_calibrate.py:545`) — and the
 corpus is human-expert-review pending. Exit 2 with a `FAIL:` reason is that gate working:
 the style seam stays dark, and the remedy is completing the review and recording it in
 the ledger (`qa/typed/README.md:30-33`), never hand-picking a floor. The other five seams
@@ -836,4 +845,4 @@ TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 make docker-up-decisions
 | `models/tacit-4b/` | Extracted checkpoint + `self-distill.json` + `.extract-complete` |
 | `scripts/decision_models/tacit_calibrate.py` | Floor calibration for the style seam |
 | `scripts/decision_models/decision_smoke.py` | Wire-contract smoke test |
-| `Makefile:680` / `Makefile:705` (`benchmark-style-ab` / `benchmark-rerank-ab`) | Pre-registered seam A/Bs — the deployment verdict each enabled seam must pass |
+| `Makefile:687` / `Makefile:712` (`benchmark-style-ab` / `benchmark-rerank-ab`) | Pre-registered seam A/Bs — the deployment verdict each enabled seam must pass |
