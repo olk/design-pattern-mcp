@@ -252,7 +252,7 @@ succeeds on a host where `docker run` does not.
 
 ### Classify the host before changing anything
 
-Three different causes produce that identical message, so run the write test first:
+Five different causes produce that identical message, so run the write test first:
 
 ```bash
 # 1. can this host's root write the sysctl at all?
@@ -261,6 +261,9 @@ echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start   # → permission denied
 docker info --format '{{json .SecurityOptions}} rootless={{.Rootless}}'
 grep -o '"userns-remap"[^,}]*' /etc/docker/daemon.json 2>/dev/null
 uname -r                                                 # a '-pve'/'-lxc' suffix = guest
+# 3. is the guest itself confined by a generated LXC profile?
+cat /proc/self/attr/current                              # an 'lxc-…' label, not 'unconfined' = cause D
+docker version --format '{{.Server.Version}}'; runc --version | head -1
 ```
 
 - **A. The host itself is namespaced** (`/proc/sys/net/**` read-only for root: an
@@ -268,7 +271,9 @@ uname -r                                                 # a '-pve'/'-lxc' suffi
   net-namespace sysctls are writable only by a root whose user namespace owns that netns,
   so nothing inside such a guest can grant it: fix it on the Proxmox host
   (`unprivileged: 0`), or run Docker on the physical host, or use the workaround below.
-  Verified on the first host (step 1 → `Keine Berechtigung`).
+  Verified on the first host (step 1 → `Keine Berechtigung`). Note the converse does not
+  hold: `unprivileged: 0` alone does not make `docker run` work on a current PVE host —
+  that is cause D, which is denied by path, not by capability.
 - **B. Rootless `dockerd`** (`rootless=true`, `DOCKER_HOST=unix:///run/user/<uid>/docker.sock`).
   Not verified here; the check is one line, and the fix is to run the system daemon
   (`systemctl enable --now docker`) instead of `dockerd-rootless`.
@@ -276,18 +281,108 @@ uname -r                                                 # a '-pve'/'-lxc' suffi
   either — treat it as a suspect the one-line check clears cheaply, not as a diagnosis.
   The fix is to drop the remap for this host, or run these services with
   `--userns=host` / `userns_mode: host`, or use the workaround below.
+- **D. The sysctl write is path-denied by the guest's LXC AppArmor profile** — Docker
+  ≥ 20.10 with runc ≥ 1.3, on a Proxmox CT, **privileged (`unprivileged: 0`) included**.
+  The engine injects `net.ipv4.ip_unprivileged_port_start=0` into every container it gives a
+  **new** net namespace (`daemon/oci_linux.go`: `if c.HostConfig.NetworkMode.IsPrivate()`,
+  "only if we create a new net namespace" — moby PR #41030; no daemon option turns it off).
+  runc applies it by *reopening the procfs node through a detached procfs mount*
+  (`internal/sys/sysctl_linux.go`: `procfs.OpenUnsafeProcRoot` → `pathrs.Reopen(…, O_WRONLY|O_TRUNC|O_CLOEXEC)`,
+  which is where the "fd 8" in the message comes from). AppArmor
+  resolves paths inside a detached mount from `d_name`, so
+  `/proc/sys/net/ipv4/ip_unprivileged_port_start` is mediated as
+  `/sys/net/ipv4/ip_unprivileged_port_start`. Proxmox confines every CT with a *generated*
+  profile — the rules live in the `lxc-pve` binary, not in `/etc/apparmor.d/`, and the `/sys`
+  write denials sit in an audit-quiet block, so **no `dmesg` DENIED line appears** and the
+  write returns EACCES. Tracking: opencontainers/runc#4968 ("CVE-2025-52881: fd reopening
+  causes issues with AppArmor profiles"), lxc/lxc#4606 (Proxmox: the restrictions are dropped
+  in the *nesting* case).
+  Ordering is what makes it unfixable from the container side: runc registers the container's
+  profile as a **change on exec** (`libcontainer/apparmor/apparmor_linux.go`:
+  `ApplyProfile` → `changeOnExec`, writing `/proc/self/attr/apparmor/exec`) and only then
+  calls `sys.WriteSysctls` (`libcontainer/standard_init_linux.go`), so at the moment of the
+  write the label is still the **inherited** one — the CT's generated profile. That is why
+  `--security-opt apparmor=unconfined`, a compose `security_opt`, `--privileged` and
+  `--sysctl` all change nothing, and why the same daemon on bare metal (inherited label
+  `unconfined`) works.
+  This is the one cause where the write test in step 1 is **not** a discriminator: a
+  privileged CT owns its netns, so `echo 0 > …` succeeds while `docker run` still fails
+  identically. Distinguish D from B/C by step 3 — an `lxc-…` label from
+  `/proc/self/attr/current` plus a passing write test means profile-level.
+- **E. The runtime's own reopen of the sysctl handle is denied** — runc 1.2.x and
+  1.4.0+ (1.5.2 is the current upstream release) fail, **runc 1.3.0 passes**, and the
+  failure is independent of AppArmor and of capabilities. Reproduced on the 3090 CT with a
+  20-line OCI bundle (a new netns plus `linux.sysctl: {net.ipv4.ip_unprivileged_port_start:
+  "0"}`, rootfs = one static binary): the same bundle *without* the sysctl starts; with it,
+  it fails with the message above. `strace -y` shows the failing pair — the sysctl write is
+  never attempted:
 
-Whichever of A/B/C applies, the discriminator is the same: step 1 failing means the cause
+  ```
+  openat2(11</>, "./sys/net/ipv4/ip_unprivileged_port_start",
+          {O_PATH, RESOLVE_NO_XDEV|RESOLVE_NO_MAGICLINKS|RESOLVE_BENEATH}) = 8
+  openat(12</1/task/1/fd>, "8", O_WRONLY|O_TRUNC|O_CLOEXEC) = -1 EACCES
+  ```
+
+  Version matrix on that bundle: 1.3.0 passes; 1.2.8, 1.4.0, 1.5.0, 1.5.1, 1.5.2 fail; the
+  key does not matter (`net.ipv4.ping_group_range` fails identically), nor does the pid
+  namespace (dropping `pid` from `linux.namespaces` still fails) or `noNewPrivileges`. On
+  the same CT `/proc/self/attr/current` is `unconfined` for PID 1 and every shell, and root
+  **can** write the sysctl directly (`echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start`
+  → rc 0), so causes A and D do not apply there: do not "fix" this with a profile, a
+  capability or a privileged conversion.
+  Fix: run the containers under an OCI runtime that writes the sysctl without the detached
+  reopen — **crun** (verified 1.21: the failing bundle exits 0 and `docker run` on a bridge
+  network then reads `net.ipv4.ip_unprivileged_port_start = 0` inside the container). With
+  docker, register it and make it the default runtime, then recreate the containers:
+
+  ```bash
+  # /etc/docker/daemon.json (merge, keep any existing keys)
+  #   "runtimes": {"crun": {"path": "/usr/bin/crun"}}, "default-runtime": "crun"
+  systemctl restart docker
+  docker compose … down && docker compose … up -d   # stored runtime is part of the container
+  ```
+
+  Containers created before the switch keep `HostConfig.Runtime: runc` and fail exactly as
+  before — a daemon change alone looks like it did nothing until they are recreated.
+
+Whichever of A–E applies, the discriminator is the same: step 1 failing means the cause
 is host-level and no daemon or compose setting can fix it; step 1 succeeding while
-`docker run` still fails means the cause is daemon-level (B or C), and `privileged: 0`
-on a Proxmox guest is then the wrong lever.
+`docker run` still fails means the cause is daemon-level (B or C), profile-level (D) or
+runtime-level (E) — read step 3 and the runc version before touching `privileged:`.
 
-Two ways out, in order of preference:
+Three ways out, in order of preference:
 
-1. **Run Docker where the netns is owned by the container's user namespace** — a
-   privileged LXC (`unprivileged: 0`), bare metal, a root daemon, or a daemon without
-   `userns-remap`. Nothing in this repo needs to change, and the compose overlay works
-   as written.
+1. **Run Docker where the netns the engine configures is not denied** — bare metal, a
+   root daemon, or a daemon without `userns-remap`; on a Proxmox CT, cause D has to be
+   cleared host-side first, and `unprivileged: 0` is *not* the lever that clears it:
+   - Preferred: update the host's `lxc-pve` (fixed in `6.0.5-2`, shipped with PVE 9.1; the
+     8.4 line takes its newest package) and keep `features: nesting=1,keyctl=1` — the fixed
+     generated profile drops the `/sys` denials **only in the nesting case**.
+   - If the host cannot be updated: add the documented per-CT AppArmor off switch to
+     `/etc/pve/lxc/<CTID>.conf`, then do a full stop/start (the profile is generated at CT
+     start; `pct reboot` does not re-read it):
+
+     ```bash
+     pct set <CTID> -features nesting=1,keyctl=1
+     grep -q '^lxc\.apparmor\.profile' /etc/pve/lxc/<CTID>.conf || \
+       echo 'lxc.apparmor.profile: unconfined' >> /etc/pve/lxc/<CTID>.conf
+     pct stop <CTID> && pct start <CTID>
+     # verified by: pct exec <CTID> -- docker run --rm alpine sysctl net.ipv4.ip_unprivileged_port_start
+     #   → prints "… = 0" on a fixed host, the OCI/runc error above on an unfixed one
+     ```
+
+     `pct` prints `explicitly configured lxc.apparmor.profile overrides the following
+     settings: features:nesting` — expected, `unconfined` is a superset. If dockerd then
+     reports `Could not check if docker-default AppArmor profile was loaded: … open
+     /sys/kernel/security/apparmor/profiles: permission denied`, also add
+     `lxc.mount.entry: /dev/null sys/module/apparmor/parameters/enabled none bind 0 0` and
+     stop/start again. Both lines are a workaround: drop them and re-verify once the host
+     runs a fixed `lxc-pve`. Do **not** edit `/etc/apparmor.d/abstractions/lxc/*` on a PVE
+     host — the generated profile ignores it. Converting an unprivileged CT in place
+     (`pct set <CTID> --unprivileged 0`) still bricks its uid-shifted rootfs (cause A's
+     `vzdump` → `pct restore` sequence is the only safe conversion) and is not needed for D.
+
+   Nothing in this repo changes either way, and the compose overlay works as written.
 2. **Run the sidecar with `--network host` and bind it to loopback.** Host networking
    has no sandbox netns, so no sysctl write, but it also removes the port publish that
    the overlay's loopback-only rule depends on — the gateway listens on `0.0.0.0` and
@@ -306,14 +401,43 @@ make tacit-calibrate TACIT_BASE_URL=http://127.0.0.1:8100
 ```
 
 `docker-up-decisions` itself cannot be rescued by the knobs: compose publishes
-`127.0.0.1:18100` from a bridge network, so the stack needs cause A/B/C
-fixed. The host-network recipe is the sidecar-only path, and it is what calibration
-needs. With host networking the MCP service would reach the sidecar at
+`127.0.0.1:18100` from a bridge network, so the stack needs cause A/B/C/D fixed, or the
+runtime lever below. The host-network recipe is the sidecar-only path, and it is what
+calibration needs. With host networking the MCP service would reach the sidecar at
 `127.0.0.1:8100` instead of the compose service name, so a full
 host-network stack would need `DECISIONS_STYLE_BASE_URL`,
 `DECISIONS_WEIGHTS_BASE_URL`, `DECISIONS_CATEGORY_BASE_URL` and
 `DECISIONS_REASONING_GATE_BASE_URL` overridden — a four-URL overlay rewrite, which
 is why we did not ship one.
+
+3. **Change the OCI runtime (cause E only, verified on the 3090 CT).** `crun` writes the
+   sysctl without runc's detached reopen, so a bridge stack starts where runc cannot:
+
+   ```bash
+   # /etc/docker/daemon.json — merge into the existing object, keep "runtimes.nvidia"
+   #   "runtimes": { "crun": { "path": "/usr/bin/crun" } }, "default-runtime": "crun"
+   systemctl restart docker
+   docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml down
+   make docker-up-decisions          # stored runtime is per container: `down` is required
+   ```
+
+   The catch is GPU delivery. The legacy reservation (`deploy.resources.reservations.devices`
+   with `driver: nvidia`) only injects `/dev/nvidia*` and the driver libraries when the
+   container's runtime is `nvidia-container-runtime` (a runc shim); under crun the sidecar
+   starts with no CUDA and vLLM dies with `CUDA unknown error`. The overlay therefore asks
+   for the GPU by **CDI device name** (`devices: ["nvidia.com/gpu=0"]`), which the daemon
+   resolves into the OCI spec and which works under runc *and* crun (both verified). A GPU
+   that is bound into the CT but missing from its device allowlist fails the same way —
+   check the node inside the CT before blaming the runtime:
+
+   ```bash
+   pct exec <CTID> -- sh -c 'head -c0 /dev/nvidia-uvm; echo uvm_rc=$?'   # EPERM = allowlist gap
+   # the CT config needs BOTH majors, not just the 195 (GPU) one:
+   #   lxc.cgroup2.devices.allow: c 195:* rwm     # nvidiactl / nvidiaN
+   #   lxc.cgroup2.devices.allow: c 511:* rwm     # nvidia-uvm / nvidia-uvm-tools
+   #   lxc.cgroup2.devices.allow: c 237:* rwm     # nvidia-caps
+   # a legacy `lxc.cgroup.devices.allow: a` (cgroup v1 syntax) is a no-op under cgroup v2
+   ```
 
 ## Calibrate Before Enabling the Style Seam
 
