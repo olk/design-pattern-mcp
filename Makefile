@@ -509,7 +509,7 @@ tacit-calibrate: ## Calibrate decisions.style.confidence_floor against a running
 		--min-acted-rate $(TACIT_CAL_MIN_ACTED_RATE) \
 		--min-acted $(TACIT_CAL_MIN_ACTED) \
 		--report $(TACIT_CAL_REPORT) \
-		--served-container "$(TACIT_SERVED_CONTAINER)" \
+		--served-container "$$(docker inspect -f '{{.Name}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null | sed 's|^/||')" \
 		--served-image "$$(docker inspect -f '{{.Image}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \
 		--served-image-tag "$$(docker inspect -f '{{.Config.Image}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \
 		--served-container-started-at "$$(docker inspect -f '{{.State.StartedAt}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \

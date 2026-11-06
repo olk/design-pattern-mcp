@@ -397,8 +397,14 @@ docker run -d --name design-pattern-tacit-host --network host \
     design-pattern-tacit:${DOCKER_TAG:-1.0.1}
 # the gateway binds 18100 only if you also pass -e TACIT_PORT=18100;
 # the image default is 8100
-make tacit-calibrate TACIT_BASE_URL=http://127.0.0.1:8100
+make tacit-calibrate TACIT_BASE_URL=http://127.0.0.1:8100 \
+    TACIT_SERVED_CONTAINER=design-pattern-tacit-host
 ```
+
+`TACIT_SERVED_CONTAINER` is what `docker inspect` names for the report's `served` block; it
+defaults to the compose service's `design-pattern-tacit-dev`, so this lane must pass the
+`docker run` name above — otherwise the report records null provenance for a perfectly good
+run.
 
 `docker-up-decisions` itself cannot be rescued by the knobs: compose publishes
 `127.0.0.1:18100` from a bridge network, so the stack needs cause A/B/C/D fixed, or the

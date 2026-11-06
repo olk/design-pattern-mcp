@@ -611,7 +611,9 @@ accuracy/acted-rate bars (`Makefile:490-494`). The prerequisite is a live gatewa
 `http://127.0.0.1:18100`), or on a build-only LXC the host-networked sidecar
 (`docs/trainer-build-plan-baremetal.md:296-305`): `docker run -d --name
 design-pattern-tacit-host --network host <image>`, then `make tacit-calibrate
-TACIT_BASE_URL=http://127.0.0.1:8100`.
+TACIT_BASE_URL=http://127.0.0.1:8100 TACIT_SERVED_CONTAINER=design-pattern-tacit-host`
+— the container name differs from the compose default, and it is what the report's
+`served.image_id` is read from.
 
 It writes exactly one file — `models/tacit-calibration.json` (`TACIT_CAL_REPORT`,
 `Makefile:497`) — and alters nothing else. The file belongs to a serving run, not to the
@@ -624,8 +626,10 @@ variables — never typed by hand, because `anyjev.serve` reports no identity ov
 (`tacit_calibrate.py:129-153`). So a 30-row measurement names the checkpoint that produced it,
 and a container left running across a rebuild is visible in `container_started_at`. An unset
 flag is `null`: provenance is recorded, never gated, which is why the script still runs against
-a remote gateway on a host with no docker. On a build-only LXC run the target on the serving
-host, where those container names resolve.
+a remote gateway on a host with no docker. There `docker inspect` cannot see the container, so
+the block is null unless the target itself runs on the serving host — which is why the LXC
+lane above passes the `docker run` name explicitly (`TACIT_SERVED_CONTAINER`), its sidecar
+being `design-pattern-tacit-host` rather than the compose service's `design-pattern-tacit-dev`.
 
 | Consumer | Reads the file? | How the floor reaches it |
 |---|---|---|
