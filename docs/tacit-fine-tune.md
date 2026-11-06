@@ -500,8 +500,8 @@ artifact. A GPU-free host can *build* and *inspect* the image (§4.6), not serve
 1. **The runtime is CUDA vLLM.** `runtime-base` is `FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`
    (`docker/Dockerfile.tacit:168`, default `v0.17.1`), the entrypoint starts
    `vllm serve "${MODEL_DIR}"` (`docker/tacit-entrypoint.sh:34`), and the compose overlay
-   reserves an NVIDIA device — `driver: nvidia`, `count: 1`, `capabilities: [gpu]`
-   (`docker/docker-compose.decision-models.yml:38-40`). The overlay calls the sidecar GPU-only
+   reserves an NVIDIA device by CDI name — `nvidia.com/gpu=0`
+   (`docker/docker-compose.decision-models.yml:41-42`). The overlay calls the sidecar GPU-only
    (`docker/docker-compose.decision-models.yml:7`), and the Dockerfile scopes the GPU-free
    variant to "build and inspect the image" (`docker/Dockerfile.tacit:23`).
 2. **The artifact is a bitsandbytes 4-bit checkpoint.** `models/tacit-4b/config.json` declares
@@ -598,6 +598,41 @@ make tacit-calibrate          # two-stage replay over qa/typed/style.jsonl
 `models/tacit-calibration.json` either recommends a floor — set
 `decisions.style.confidence_floor` to it and `DECISIONS_STYLE_ENABLED=true` — or recommends
 `null` (exit 2), in which case the seam stays off. Do not hand-pick a floor to make it pass.
+
+#### The calibrate step in detail
+
+`make tacit-calibrate` (`Makefile:502`) replays the **holdout** rows of
+`qa/typed/style.jsonl` — 30 of the file's 169; `load_rows` keeps `source.split ==
+"holdout"` and refuses training rows (`tacit_calibrate.py:135-150`) — through the served
+two-stage style path of a **running** gateway, reports acted rate, acted accuracy, ECE and
+Brier per candidate floor, and recommends the lowest floor that clears the
+accuracy/acted-rate bars (`Makefile:490-495`). The prerequisite is a live gateway:
+`make docker-up-decisions` (the default `TACIT_BASE_URL` is the overlay's loopback
+`http://127.0.0.1:18100`), or on a build-only LXC the host-networked sidecar
+(`docs/trainer-build-plan-baremetal.md:296-305`): `docker run -d --name
+design-pattern-tacit-host --network host <image>`, then `make tacit-calibrate
+TACIT_BASE_URL=http://127.0.0.1:8100`.
+
+It writes exactly one file — `models/tacit-calibration.json` (`TACIT_CAL_REPORT`,
+`Makefile:495`) — and alters nothing else. The file belongs to a serving run, not to the
+checkpoint: it is not one of `TACIT_TRAIN_INPUTS` (`Makefile:121-123`) and never enters
+the image. It records the split, the label-review state and the recommendation.
+
+| Consumer | Reads the file? | How the floor reaches it |
+|---|---|---|
+| The sidecar container | No | as an env var at stack start: `DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=<floor> make docker-up-decisions` |
+| `make benchmark-style-ab` | Yes — `TACIT_STYLE_FLOOR` is derived from it (`Makefile:499-500`); the target exits 1 with no usable floor (`Makefile:681`) | the style-on arm runs the measured threshold, never a hand-copied one (override `TACIT_STYLE_FLOOR=<v>` only to re-test deliberately) |
+| `make docker-build-tacit` | No — not baked, not hashed | only a **future deliberate retrain** couples to it: if the floor differs from `0.5`, pass `TACIT_CONFIDENCE_FLOOR=<floor>` so the fidelity eval replays the threshold serving actually uses (knobs are not hashed — pair the retrain with `rm -rf models/tacit-4b`, §4.2) |
+
+Expect a refusal until the label review lands: the calibrator recommends nothing while
+`qa/typed/review.json` has not certified the style label source byte-for-byte — the
+report carries that state as `label_review.certified` (`tacit_calibrate.py:505`) — and the
+corpus is human-expert-review pending. Exit 2 with a `FAIL:` reason is that gate working:
+the style seam stays dark, and the remedy is completing the review and recording it in
+the ledger (`qa/typed/README.md:30-33`), never hand-picking a floor. The other five seams
+are unaffected: they act on their own floors — category and the reasoning gate at the
+default `0.5`, which already matches the trained `TACIT_CONFIDENCE_FLOOR`, and `weights`
+gates on expected-level MAE, not a floor.
 
 ### 4.8 Production: serving the verified artifact (GPU only)
 
