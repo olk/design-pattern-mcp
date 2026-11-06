@@ -238,7 +238,7 @@ docker info | grep -i -E "cdi|runtime"   # cdi serves RUN --device; nvidia runti
 '
 ```
 
-4. Pass criteria: the `HEALTHCHECK` green within `start-period` (300 s + up to 900 s entrypoint timeout), the gateway wire returns 200 with a choice payload, loopback-only publish (`127.0.0.1:18100` — the gateway is unauthenticated). After the `nvidia-ctk runtime configure` line in Build Step 4, `make docker-up-decisions` works unchanged against the compose `driver: nvidia` reservations.
+4. Pass criteria: the `HEALTHCHECK` green within `start-period` (300 s + up to 900 s entrypoint timeout), the gateway wire returns 200 with a choice payload, loopback-only publish (`127.0.0.1:18100` — the gateway is unauthenticated). With the CDI spec from Build Step 4, `make docker-up-decisions` works unchanged: the overlay requests the GPU by CDI device name, so no `nvidia` runtime is required.
 
 ## Cached-Checkpoint Provenance
 

@@ -77,7 +77,7 @@ set -euxo pipefail
 nvidia-smi -L   # must list 4x 3090 + driver >= 575.x before proceeding
 ```
 
-3. Install Docker ≥ 25 + buildx + NVIDIA Container Toolkit, then register BOTH the CDI spec (serves `RUN --device` at build) and the `nvidia` runtime (serves compose `driver: nvidia` at run).
+3. Install Docker ≥ 25 + buildx + NVIDIA Container Toolkit, then generate the CDI spec (`nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). CDI serves **both** sides: `RUN --device=nvidia.com/gpu=all` at build time and the overlay's `devices: ["nvidia.com/gpu=N"]` request at run time — the legacy `nvidia` runtime is no longer needed by this stack.
 
 ```bash
 set -euxo pipefail
@@ -207,7 +207,7 @@ docker inspect design-pattern-tacit:latest --format "{{.Config.Env}}" | grep -o 
 docker info | grep -i -E "cdi|runtime"   # cdi serves RUN --device; nvidia runtime serves compose driver:nvidia
 ```
 
-4. Pass criteria: the `HEALTHCHECK` green within `start-period` (300 s + up to 900 s entrypoint timeout), the gateway wire returns 200 with a choice payload, loopback-only publish (`127.0.0.1:18100` — the gateway is unauthenticated). `make docker-up-decisions` is a dev-stack command, not part of this plan's proof: it also starts the MCP server + TEI services, whose images this plan never builds (`make docker-build-all`), so only the sidecar smoke in Step 2 gates the build — the compose `driver: nvidia` path is proven separately by the `nvidia-ctk runtime configure` line in Build Step 3 plus `docker info` showing the `nvidia` runtime.
+4. Pass criteria: the `HEALTHCHECK` green within `start-period` (300 s + up to 900 s entrypoint timeout), the gateway wire returns 200 with a choice payload, loopback-only publish (`127.0.0.1:18100` — the gateway is unauthenticated). `make docker-up-decisions` is a dev-stack command, not part of this plan's proof: it also starts the MCP server + TEI services, whose images this plan never builds (`make docker-build-all`), so only the sidecar smoke in Step 2 gates the build — the compose GPU path is proven separately by the CDI spec from Build Step 3 plus `docker info` showing `cdi: nvidia.com/gpu=…`.
 
 ## Cached-Checkpoint Provenance
 
