@@ -193,7 +193,11 @@ make benchmark-style-ab TACIT_STYLE_FLOOR=<floor>   # only with a floor from ste
 
 Rerank must come out non-inferior (holdout p95 within +15% of TEI) — otherwise leave
 `RERANKER_PROVIDER=tei`. Enable style only if its A/B wins; the previous verdict was
-candidate-loss (`docs/JEV_BENCHMARK_REPORT.md`). A certified-but-harmful seam is worse
+candidate-loss (`docs/JEV_BENCHMARK_REPORT.md`). The style A/B also gates on repeat
+stability (`REQUIRE_REPEAT_STABILITY=1`): the candidate's holdout
+`final_pattern_repeat_agreement` must be at least the baseline's, because the seam adds
+two sequential gateway calls after the LLM brief and must not make the selection less
+repeatable. A certified-but-harmful seam is worse
 than an absent one — a losing seam stays off in the overlay.
 
 **Step 5 — publish.** Bump `pyproject.toml` first — `DOCKER_TAG` comes from there (if the
@@ -643,6 +647,20 @@ the ledger (`qa/typed/README.md:30-33`), never hand-picking a floor. The other f
 are unaffected: they act on their own floors — category and the reasoning gate at the
 default `0.5`, which already matches the trained `TACIT_CONFIDENCE_FLOOR`, and `weights`
 gates on expected-level MAE, not a floor.
+
+The report is per-row attributable, not only aggregate: `rows` carries every replayed row
+(label, gold shard and rank, the chosen style, each shard's answer and probabilities),
+`diagnostics` says whether the bars are reachable on these answers at all —
+`gate_ceiling` (the best accuracy a perfect re-ranking could reach at the smallest
+gate-feasible acted count), `dense_floor_sweep` over every observed confidence, the
+cross-shard and gold-`none` breakdowns, AUROC and the information the floor carries — and
+`consistency` records repeat agreement (`--repeats`, default 5 via `TACIT_CAL_REPEATS`).
+A failing report with `diagnostics.gate_ceiling.attainable_with_perfect_ranking: false`
+has no passing floor to find: the answers are the binding constraint, not the threshold.
+A recommendation is also refused when the served choice changes between identical replays
+— serving is one temperature-0 forward per shard, so measure against a WARM sidecar: vLLM
+0.17.1 ships no batch-invariant switch, and the first replay after a cold start can differ
+on a near-tie row.
 
 ### 4.8 Production: serving the verified artifact (GPU only)
 
