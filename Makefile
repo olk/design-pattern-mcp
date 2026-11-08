@@ -488,10 +488,13 @@ check-dockerfile-shell: ## Validate Dockerfile shell payloads (dash) before a bu
 # checkpoint and ships uncalibrated: run this against a live gateway (docker-up-decisions)
 # and set the floor it recommends — DECISIONS_STYLE_ENABLED stays false until it passes.
 TACIT_BASE_URL             ?= http://127.0.0.1:18100
-TACIT_CAL_FLOORS           ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7
+TACIT_CAL_FLOORS           ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.75 0.8 0.85 0.9 0.95
 TACIT_CAL_MIN_ACTED_ACCURACY ?= 0.8
 TACIT_CAL_MIN_ACTED_RATE   ?= 0.3
 TACIT_CAL_MIN_ACTED        ?= 10
+# Replays per held-out row: >1 measures repeat consistency and refuses a floor that is not
+# stable (serving is one temperature-0 forward per shard, so identical requests must agree).
+TACIT_CAL_REPEATS          ?= 5
 # The container whose identity the calibration report records (docker/docker-compose.decision-models.yml).
 TACIT_SERVED_CONTAINER     ?= design-pattern-tacit-dev
 TACIT_CAL_REPORT           := models/tacit-calibration.json
@@ -508,6 +511,7 @@ tacit-calibrate: ## Calibrate decisions.style.confidence_floor against a running
 		--min-acted-accuracy $(TACIT_CAL_MIN_ACTED_ACCURACY) \
 		--min-acted-rate $(TACIT_CAL_MIN_ACTED_RATE) \
 		--min-acted $(TACIT_CAL_MIN_ACTED) \
+		--repeats $(TACIT_CAL_REPEATS) \
 		--report $(TACIT_CAL_REPORT) \
 		--served-container "$$(docker inspect -f '{{.Name}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null | sed 's|^/||')" \
 		--served-image "$$(docker inspect -f '{{.Image}}' $(TACIT_SERVED_CONTAINER) 2>/dev/null || true)" \
@@ -649,6 +653,7 @@ BENCH_ENV := BENCH_SCENARIOS="$(BENCH_SCENARIOS)" OUT="$(OUT)" RUN_ID="$(RUN_ID)
 	SPLIT="$(SPLIT)" REPEAT="$(REPEAT)" NO_WARMUP="$(NO_WARMUP)" LOG_LEVEL="$(LOG_LEVEL)" \
 	FLIP="$(FLIP)" CLIENT_URL="$(CLIENT_URL)" CALL_TIMEOUT="$(CALL_TIMEOUT)" A="$(A)" B="$(B)" \
 	ALLOW_MISMATCH="$(ALLOW_MISMATCH)" DRY_RUN="$(DRY_RUN)" PER_FAMILY="$(PER_FAMILY)" \
+	REQUIRE_REPEAT_STABILITY="$(REQUIRE_REPEAT_STABILITY)" \
 	FAMILIES="$(FAMILIES)" DRAFT_OUT="$(DRAFT_OUT)" BENCH_DECISION_OVERLAY="$(BENCH_DECISION_OVERLAY)" \
 	DECISIONS_STYLE_ENABLED="$(DECISIONS_STYLE_ENABLED)" \
 	DECISIONS_STYLE_CONFIDENCE_FLOOR="$(DECISIONS_STYLE_CONFIDENCE_FLOOR)"
@@ -696,9 +701,9 @@ benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the s
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
 		RUN_ID=$(STYLE_AB_STAMP)-style-on BENCH_DECISION_OVERLAY=docker/docker-compose.decision-models.yml \
 		DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=$(TACIT_STYLE_FLOOR) $(BENCH_DOCKER) e2e
-	@echo "==> compare against the pre-registered rule (holdout p95 >= +15%)"
-	@$(BENCH_ENV) A=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-off B=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-on \
-		$(BENCH_DOCKER) compare
+	@echo "==> compare against the pre-registered rule (holdout p95 >= +15% AND repeat non-inferiority)"
+	@$(BENCH_ENV) REQUIRE_REPEAT_STABILITY=1 A=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-off \
+		B=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-on $(BENCH_DOCKER) compare
 
 # Selection-level acceptance for the J1 rerank leg: same overlay stack, corpus, split and
 # repeat, only RERANKER_PROVIDER differs. Keep the Tacit leg as the overlay default only if

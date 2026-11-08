@@ -14,20 +14,22 @@ The scripts are loaded by path (neither is an importable package), the same way
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
 import sys
 import types
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from src.config import DecisionSeamConfig
 from src.decisions import seam_prompts
-from src.decisions.tacit import category_options, gate_state
+from src.decisions.tacit import TacitClient, category_options, gate_state
 from src.pipeline import (
     _gate_payload_analyze,
     _gate_payload_evaluate,
@@ -1243,7 +1245,277 @@ def test_calibration_ask_never_acts_on_an_unusable_shard(calibrator: types.Modul
         answer = calibrator.ask("http://x", {"state": "s"}, seam_prompts, 5.0)
     finally:
         calibrator._decide = original  # type: ignore[assignment]
-    assert answer == {"choice": None, "probabilities": {}, "confidence": 0.0}
+    assert answer == {
+        "choice": None,
+        "probabilities": {},
+        "confidence": 0.0,
+        "shards": [{"answer": None, "probs": {}, "route": None} for _shard in seam_prompts.style_shards()],
+    }
+
+
+def test_row_record_locates_the_gold_shard_and_rank(calibrator: types.ModuleType) -> None:
+    """A miss says which shard held the gold and how far the model ranked it there."""
+    shards = seam_prompts.style_shards()
+    label = shards[1][2]
+    first, second = shards[1][0], shards[1][1]
+    quiet = dict.fromkeys([*shards[0], seam_prompts.STYLE_NONE_KEY], 0.01)
+    probs = {**quiet, first: 0.5, second: 0.3, label: 0.15}
+    row = {"state": "system", "label": label, "source": {"split": "holdout", "scenario_id": "s1"}}
+    answer = {
+        "choice": first,
+        "confidence": 0.5,
+        "probabilities": probs,
+        "shards": [
+            {"answer": shards[0][0], "probs": quiet, "route": "one_forward"},
+            {"answer": first, "probs": probs, "route": None},
+        ],
+    }
+    record = calibrator.row_record(row, answer, seam_prompts)
+    assert record["scenario_id"] == "s1"
+    assert record["gold_shard"] == 1
+    assert record["winner_shard"] == 1
+    assert record["correct"] is False
+    assert record["shards"][0]["p_gold"] is None
+    assert record["shards"][1]["p_gold"] == pytest.approx(0.15)
+    assert record["shards"][1]["gold_rank"] == 3
+    assert record["shards"][1]["p_answer"] == pytest.approx(0.5)
+    assert record["shards"][1]["p_none"] == pytest.approx(0.01)
+
+
+def _committed_failure_records() -> list[dict[str, Any]]:
+    """The committed FAIL's exact confusion: 26 named (5 hits) over 8 gold-``none`` rows."""
+    records: list[dict[str, Any]] = []
+
+    def add(label: str, choice: str | None, confidence: float) -> None:
+        records.append(
+            {
+                "scenario_id": f"r{len(records)}",
+                "label": label,
+                "gold_shard": None,
+                "choice": choice,
+                "confidence": confidence,
+                "correct": choice == label,
+                "winner_shard": None,
+                "shards": [],
+            }
+        )
+
+    for index in range(5):
+        add("api-gateway", "api-gateway", 0.72 + index * 0.05)
+    for index in range(11):
+        add("api-gateway", "layered-monolith", 0.70 + index * 0.02)
+    for confidence in (0.35, 0.45, 0.55, 0.58):
+        add("api-gateway", "event-driven", confidence)
+    for index in range(6):
+        add("none", "microservices", 0.70 + index * 0.02)
+    add("none", "none", 0.9)
+    add("none", "none", 0.8)
+    add("broker", "none", 0.6)
+    add("pipe-and-filter", "none", 0.5)
+    return records
+
+
+def test_diagnostics_proves_the_committed_failure_unattainable(calibrator: types.ModuleType) -> None:
+    """The committed FAIL is a fact about the answers: no floor reaches the 8 hits of 10."""
+    result = calibrator.diagnostics(_committed_failure_records(), [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7], 0.8, 0.3, 10)
+    assert result["n"] == 30
+    assert result["named"] == 26
+    assert result["named_hits"] == 5
+    ceiling = result["gate_ceiling"]
+    assert ceiling["min_rows"] == 10
+    assert ceiling["required_hits"] == 8
+    assert ceiling["attainable_with_perfect_ranking"] is False
+    assert ceiling["best_accuracy_with_perfect_ranking"] == pytest.approx(0.5)
+    assert result["dense_floor_sweep"]["lowest_passing_floor"] is None
+    assert result["none_rows"] == {"gold_none": 8, "abstained": 2, "acted": 6}
+
+
+def test_diagnostics_counts_cross_shard_losses(calibrator: types.ModuleType) -> None:
+    """Gold named by its own shard but outvoted is the combination rule's loss, not the model's."""
+
+    def row(scenario_id: str) -> dict[str, Any]:
+        return {
+            "scenario_id": scenario_id,
+            "label": "api-gateway",
+            "gold_shard": 1,
+            "choice": "layered-monolith",
+            "confidence": 0.9,
+            "correct": False,
+            "winner_shard": 0,
+            "shards": [
+                {
+                    "shard": 0,
+                    "answer": "layered-monolith",
+                    "p_answer": 0.9,
+                    "p_none": 0.05,
+                    "p_gold": None,
+                    "gold_rank": None,
+                    "route": None,
+                },
+                {
+                    "shard": 1,
+                    "answer": "api-gateway",
+                    "p_answer": 0.6,
+                    "p_none": 0.3,
+                    "p_gold": 0.6,
+                    "gold_rank": 1,
+                    "route": None,
+                },
+            ],
+        }
+
+    result = calibrator.diagnostics([row("a"), row("b")], [0.5], 0.8, 0.3, 10)
+    assert result["shards"]["gold_shard_hits"] == 2
+    assert result["named_hits"] == 0
+    assert result["shards"]["cross_shard_losses"] == 2
+    assert result["shards"]["both_named_rows"] == 2
+    assert result["auroc"] is None
+
+
+def test_diagnostics_information_matches_definitions(calibrator: types.ModuleType) -> None:
+    """AUROC 1.0, and a floor that splits right from wrong carries the full outcome entropy."""
+    records = [
+        {"label": "api-gateway", "choice": "api-gateway", "confidence": 0.9, "correct": True},
+        {"label": "broker", "choice": "broker", "confidence": 0.9, "correct": True},
+        {"label": "api-gateway", "choice": "broker", "confidence": 0.3, "correct": False},
+        {"label": "broker", "choice": "api-gateway", "confidence": 0.3, "correct": False},
+    ]
+    for index, record in enumerate(records):
+        record.update({"scenario_id": f"r{index}", "gold_shard": 0, "winner_shard": 0, "shards": []})
+    result = calibrator.diagnostics(records, [0.5], 0.8, 0.3, 10)
+    assert result["auroc"] == pytest.approx(1.0)
+    assert result["information_bits"]["override_outcome_entropy"] == pytest.approx(1.0)
+    assert result["information_bits"]["floor_information"]["0.5"] == pytest.approx(1.0)
+
+
+def _parity_payload(
+    styles: Sequence[str], winner: str, probability: float, *, omit_winner: bool = False
+) -> dict[str, Any]:
+    """One gateway decision whose mass sits on ``winner`` (optionally absent from ``probs``)."""
+    options = [*styles, seam_prompts.STYLE_NONE_KEY]
+    rest = (1.0 - probability) / (len(options) - 1)
+    probs = dict.fromkeys(options, rest)
+    if omit_winner:
+        probs.pop(winner)
+    else:
+        probs[winner] = probability
+    return {"answer": winner, "probs": probs, "route": "one_forward"}
+
+
+def test_calibration_replay_matches_served_choose_style(
+    calibrator: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The calibrator replays the SERVED combination rule, not a lookalike.
+
+    Five scripted cases cover the rule's corners: the other shard answering more confidently,
+    one shard abstaining, both abstaining, an off-offer answer, and an offered answer missing
+    from ``probs`` (the client reads 0.0, the calibrator skips the shard — a 0.0 can never beat
+    the 0.0 start under the strict ``>``, so both must keep the other shard's answer).
+    """
+    shards = seam_prompts.style_shards()
+    first, second = shards[0], shards[1]
+    none = seam_prompts.STYLE_NONE_KEY
+    scripted: dict[tuple[str, str], dict[str, Any]] = {}
+    expected: dict[str, tuple[str, float]] = {
+        "case-i": (second[2], 0.90),
+        "case-ii": (second[0], 0.60),
+        "case-iv": (first[2], 0.80),
+        "case-v": (second[1], 0.60),
+    }
+    scripted[("case-i", first[0])] = _parity_payload(first, first[1], 0.70)
+    scripted[("case-i", second[0])] = _parity_payload(second, second[2], 0.90)
+    scripted[("case-ii", first[0])] = _parity_payload(first, none, 0.80)
+    scripted[("case-ii", second[0])] = _parity_payload(second, second[0], 0.60)
+    scripted[("case-iii", first[0])] = _parity_payload(first, none, 0.80)
+    scripted[("case-iii", second[0])] = _parity_payload(second, none, 0.70)
+    scripted[("case-iv", first[0])] = _parity_payload(first, first[2], 0.80)
+    scripted[("case-iv", second[0])] = {
+        "answer": "not-a-style",
+        "probs": dict.fromkeys([*second, none], 0.05),
+        "route": "one_forward",
+    }
+    scripted[("case-v", first[0])] = _parity_payload(first, first[1], 0.80, omit_winner=True)
+    scripted[("case-v", second[0])] = _parity_payload(second, second[1], 0.60)
+
+    def reply(item: dict[str, Any]) -> dict[str, Any]:
+        return scripted[(str(item["state"]), str(item["options"][0]))]
+
+    monkeypatch.setattr(calibrator, "_decide", lambda base_url, item, timeout: reply(item))
+    client = TacitClient(
+        DecisionSeamConfig.model_validate(
+            {
+                "enabled": True,
+                "base_url": "http://tacit.test:8100",
+                "model": "tacit-4b",
+                "timeout_seconds": 5.0,
+                "confidence_floor": 0.0,
+            }
+        ),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply(json.loads(request.content)))),
+    )
+
+    async def served() -> dict[str, Any]:
+        decisions: dict[str, Any] = {}
+        try:
+            for state in ("case-i", "case-ii", "case-iii", "case-iv", "case-v"):
+                decisions[state] = await client.choose_style(state)
+        finally:
+            await client.close()
+        return decisions
+
+    decisions = asyncio.run(served())
+    for state, (style, confidence) in expected.items():
+        answer = calibrator.ask("http://tacit.test:8100", {"state": state}, seam_prompts, 5.0)
+        assert answer["choice"] == style
+        assert answer["confidence"] == pytest.approx(confidence)
+        decision = decisions[state]
+        assert decision is not None
+        assert decision.style == style
+        assert decision.confidence == pytest.approx(confidence)
+    abstained = calibrator.ask("http://tacit.test:8100", {"state": "case-iii"}, seam_prompts, 5.0)
+    assert abstained["choice"] == none
+    assert decisions["case-iii"] is None
+
+
+def test_calibration_oracle_clears_the_gate_on_the_real_holdout(
+    calibrator: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oracle that names the gold from its own shard clears the bars on the real holdout.
+
+    Guards the instrument itself: if the served shards could not offer every label, or the
+    calibrator could not see a correct answer, no model could ever pass and a FAIL would say
+    nothing about the checkpoint.
+    """
+    rows = calibrator.load_rows(REPO_ROOT / "qa" / "typed" / "style.jsonl", "holdout")
+    gold = {str(row["state"])[: seam_prompts.DECISION_STATE_MAX_CHARS]: row["label"] for row in rows}
+
+    def oracle(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
+        options = [str(option) for option in item["options"]]
+        label = gold.get(str(item["state"]))
+        winner = label if label is not None and label in options else seam_prompts.STYLE_NONE_KEY
+        rest = (1.0 - 0.95) / (len(options) - 1)
+        probs = dict.fromkeys(options, rest)
+        probs[winner] = 0.95
+        return {"answer": winner, "probs": probs, "route": "one_forward"}
+
+    monkeypatch.setattr(calibrator, "_decide", oracle)
+    pairs: list[tuple[float, float, bool, str | None]] = []
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        answer = calibrator.ask("http://oracle:8100", row, seam_prompts, 5.0)
+        choice = answer["choice"]
+        confidence = float(answer["confidence"])
+        pairs.append((confidence, confidence, choice == row["label"], choice))
+        records.append(calibrator.row_record(row, answer, seam_prompts))
+    table = calibrator.summarize(pairs, [0.1, 0.5, 0.9], 10)["floors"]
+    recommended = calibrator.recommend(table, 0.8, 0.3, 10)
+    assert recommended["floor"] == pytest.approx(0.1)
+    chosen = next(row for row in table if row["floor"] == 0.1)
+    assert chosen["acted"] == sum(1 for row in rows if row["label"] != seam_prompts.STYLE_NONE_KEY)
+    assert chosen["acted_accuracy"] == pytest.approx(1.0)
+    assert chosen["acted_rate"] >= 0.3
+    ceiling = calibrator.diagnostics(records, [0.1, 0.5, 0.9], 0.8, 0.3, 10)["gate_ceiling"]
+    assert ceiling["attainable_with_perfect_ranking"] is True
 
 
 def test_calibration_replays_holdout_only_by_default(
@@ -1337,8 +1609,15 @@ def test_calibration_report_records_serving_provenance(
     monkeypatch.setattr(calibrator, "ask", _answering("a"))
     report_a = tmp_path / "a.json"
     argv_a = [
-        "--style", str(path), "--base-url", "http://x:18100", "--floors", "0.5",
-        "--report", str(report_a), *served_flags,
+        "--style",
+        str(path),
+        "--base-url",
+        "http://x:18100",
+        "--floors",
+        "0.5",
+        "--report",
+        str(report_a),
+        *served_flags,
     ]
     assert calibrator.main(argv_a) == 0
     assert json.loads(report_a.read_text(encoding="utf-8"))["served"] == served
@@ -1362,9 +1641,21 @@ def test_calibration_report_records_serving_provenance(
     monkeypatch.setattr(calibrator, "ask", _answering("b"))
     report_c = tmp_path / "c.json"
     argv_c = [
-        "--style", str(path), "--base-url", "http://x:18100", "--floors", "0.5",
-        "--min-acted-accuracy", "0.8", "--min-acted-rate", "0.3", "--min-acted", "10",
-        "--report", str(report_c), *served_flags,
+        "--style",
+        str(path),
+        "--base-url",
+        "http://x:18100",
+        "--floors",
+        "0.5",
+        "--min-acted-accuracy",
+        "0.8",
+        "--min-acted-rate",
+        "0.3",
+        "--min-acted",
+        "10",
+        "--report",
+        str(report_c),
+        *served_flags,
     ]
     assert calibrator.main(argv_c) == 2
     assert json.loads(report_c.read_text(encoding="utf-8"))["served"] == served
@@ -1674,6 +1965,49 @@ def test_calibration_main_voids_coverage_when_labels_change(
     assert written["recommended"]["floor"] is None
 
 
+def test_calibration_main_refuses_an_unstable_floor(
+    calibrator: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serving is one temperature-0 forward: a choice that flips between replays voids the floor."""
+    style = tmp_path / "style.jsonl"
+    _write_style_row(style, rows=12)
+    calls: list[int] = []
+
+    def _flaky(base_url: str, row: dict[str, Any], seams: Any, timeout: float) -> dict[str, Any]:
+        calls.append(1)
+        choice = "a" if len(calls) % 2 else "b"
+        return {"choice": choice, "confidence": 0.9, "probabilities": {choice: 0.9}, "shards": []}
+
+    monkeypatch.setattr(calibrator, "ask", _flaky)
+    report = tmp_path / "calibration.json"
+    code = calibrator.main(
+        [
+            "--style",
+            str(style),
+            "--base-url",
+            "http://x/v1",
+            "--floors",
+            "0.5",
+            "--min-acted-accuracy",
+            "0.8",
+            "--min-acted-rate",
+            "0.3",
+            "--min-acted",
+            "10",
+            "--repeats",
+            "2",
+            "--report",
+            str(report),
+        ]
+    )
+    assert code == 2
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert written["recommended"]["floor"] is None
+    assert "not repeat-stable" in written["recommended"]["reason"]
+    assert written["consistency"]["style_choice_repeat_agreement"] == pytest.approx(0.0)
+    assert written["rows"][0]["choice"] == "a"
+
+
 def test_calibrator_none_choice_matches_the_served_vocabulary(calibrator: types.ModuleType) -> None:
     """The stratified ``none`` must be the seam's own abstention key, not a lookalike."""
     assert calibrator.NONE_CHOICE == seam_prompts.STYLE_NONE_KEY
@@ -1790,7 +2124,10 @@ def test_calibration_ask_abstains_from_none_rather_than_failing(calibrator: type
 
     def _all_none(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
         options = [str(option) for option in item["options"]]
-        return {"answer": seam_prompts.STYLE_NONE_KEY, "probs": dict.fromkeys(options, 0.1) | {seam_prompts.STYLE_NONE_KEY: 0.9}}
+        return {
+            "answer": seam_prompts.STYLE_NONE_KEY,
+            "probs": dict.fromkeys(options, 0.1) | {seam_prompts.STYLE_NONE_KEY: 0.9},
+        }
 
     calibrator._decide = _all_none  # type: ignore[assignment]
     try:
@@ -1804,7 +2141,10 @@ def test_calibration_ask_abstains_from_none_rather_than_failing(calibrator: type
     def _none_then_style(base_url: str, item: dict[str, Any], timeout: float) -> dict[str, Any]:
         options = [str(option) for option in item["options"]]
         if item["options"] == [*shards[0], seam_prompts.STYLE_NONE_KEY]:
-            return {"answer": seam_prompts.STYLE_NONE_KEY, "probs": dict.fromkeys(options, 0.01) | {seam_prompts.STYLE_NONE_KEY: 0.99}}
+            return {
+                "answer": seam_prompts.STYLE_NONE_KEY,
+                "probs": dict.fromkeys(options, 0.01) | {seam_prompts.STYLE_NONE_KEY: 0.99},
+            }
         return {"answer": options[0], "probs": dict.fromkeys(options, 0.1) | {options[0]: 0.6}}
 
     calibrator._decide = _none_then_style  # type: ignore[assignment]

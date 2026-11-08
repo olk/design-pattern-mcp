@@ -17,7 +17,8 @@
 # artifacts.
 #
 # Knobs (env, all optional): BENCH_SCENARIOS OUT RUN_ID LIMIT SPLIT REPEAT NO_WARMUP
-# LOG_LEVEL FLIP CLIENT_URL CALL_TIMEOUT A B ALLOW_MISMATCH DRY_RUN PER_FAMILY FAMILIES
+# LOG_LEVEL FLIP CLIENT_URL CALL_TIMEOUT A B ALLOW_MISMATCH REQUIRE_REPEAT_STABILITY
+# DRY_RUN PER_FAMILY FAMILIES
 # DRAFT_OUT MCP_IMAGE TEI_IMAGE TEI_RERANK_IMAGE BENCH_DECISION_OVERLAY BENCH_STACK_TIMEOUT (2100) BENCH_READY_TIMEOUT
 # (300) BENCH_PROBE_URL (http://127.0.0.1:8822/mcp).
 
@@ -47,6 +48,7 @@ OUT="${OUT:-}" LIMIT="${LIMIT:-}" SPLIT="${SPLIT:-}" REPEAT="${REPEAT:-}"
 NO_WARMUP="${NO_WARMUP:-}" LOG_LEVEL="${LOG_LEVEL:-}" FLIP="${FLIP:-}"
 CALL_TIMEOUT="${CALL_TIMEOUT:-}" A="${A:-}" B="${B:-}"
 ALLOW_MISMATCH="${ALLOW_MISMATCH:-}" DRY_RUN="${DRY_RUN:-}" BENCH_DECISION_OVERLAY="${BENCH_DECISION_OVERLAY:-}"
+REQUIRE_REPEAT_STABILITY="${REQUIRE_REPEAT_STABILITY:-}"
 PER_FAMILY="${PER_FAMILY:-}" FAMILIES="${FAMILIES:-}"
 
 case "$BENCH_SCENARIOS" in
@@ -139,6 +141,7 @@ case "$MODE" in
     [ -f "$b_abs/manifest.json" ] || die "B is not a run directory (manifest.json missing): $B"
     args=(-m tests.benchmark.harness.compare /mnt/a /mnt/b)
     if [ -n "$ALLOW_MISMATCH" ]; then args+=(--allow-mismatch); fi
+    if [ -n "$REQUIRE_REPEAT_STABILITY" ]; then args+=(--require-repeat-stability); fi
     ;;
 esac
 

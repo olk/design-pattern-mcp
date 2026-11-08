@@ -39,6 +39,15 @@ P95_IMPROVEMENT_THRESHOLD = 0.15
 #: Percentile helper needs this many samples before p95 is defined (see probes).
 MIN_P95_SAMPLES = 4
 
+#: Rule text recorded in every verdict block.
+_RULE = (
+    "candidate wins iff holdout p95 e2e improves >= 15% AND candidate overall "
+    "acceptable-primary hit rate >= baseline overall Wilson lower bound"
+)
+
+#: The style A/B's rule: the additive seam must also not make selection less repeatable.
+_RULE_REPEAT_STABILITY = _RULE + " AND candidate holdout final-pattern repeat agreement >= baseline"
+
 #: Mode pairs whose quality observables are directly comparable although the arms run different
 #: phase scopes. ``analyze`` is the analysis prefix of ``live``: hit/recall are computed from
 #: exactly the selection the full arm's ANALYZE phase produced (its final pattern is the §9
@@ -232,6 +241,31 @@ def _split_metric_mean(arm: Arm, path: tuple[str, ...], split: str) -> float | N
     return scoring.mean_or_none(values)
 
 
+def _repeat_stability(arm: Arm) -> dict[str, dict[str, Any]]:
+    """Per-split agreement of ``quality.final_pattern`` across repeats of the same scenario.
+
+    Only scenarios with at least two records can be unstable: a single-record scenario (or a
+    ``REPEAT=1`` run) is no evidence either way, so it stays out of the denominator and the
+    split reads ``None`` instead of a fabricated 1.0.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for split in ("overall", "train", "holdout"):
+        records = arm.records if split == "overall" else [r for r in arm.records if r["scenario"]["split"] == split]
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            groups.setdefault(str(record["scenario"]["scenario_id"]), []).append(record)
+        repeated = [group for group in groups.values() if len(group) >= 2]
+        stable = sum(
+            1 for group in repeated if len({json.dumps(record["quality"]["final_pattern"]) for record in group}) == 1
+        )
+        result[split] = {
+            "scenarios": len(repeated),
+            "stable": stable,
+            "final_pattern_repeat_agreement": (stable / len(repeated)) if repeated else None,
+        }
+    return result
+
+
 def _quality_metrics(a: Arm, b: Arm) -> dict[str, Any]:
     """Per-split absolute metric means for both arms plus their candidate−baseline delta.
 
@@ -269,8 +303,15 @@ def _hit_rate_difference(a: Arm, b: Arm) -> dict[str, Any]:
     return result
 
 
-def _verdict(a: Arm, b: Arm, holdout_p95_a: dict[str, Any], holdout_p95_b: dict[str, Any]) -> dict[str, Any]:
+def _verdict(
+    a: Arm,
+    b: Arm,
+    holdout_p95_a: dict[str, Any],
+    holdout_p95_b: dict[str, Any],
+    require_repeat_stability: bool = False,
+) -> dict[str, Any]:
     """Apply the pre-registered rule to the holdout split."""
+    rule = _RULE_REPEAT_STABILITY if require_repeat_stability else _RULE
     conditions: dict[str, Any] = {}
     reasons: list[str] = []
     modes = frozenset({str(a.manifest.get("mode")), str(b.manifest.get("mode"))})
@@ -284,7 +325,7 @@ def _verdict(a: Arm, b: Arm, holdout_p95_a: dict[str, Any], holdout_p95_b: dict[
             "generate/evaluate work by construction, so the pre-registered p95 latency rule is not "
             "applicable; read the hit-rate Newcombe interval, the selection metric deltas and the hit flips"
         )
-        return _verdict_block("inconclusive", conditions, reasons)
+        return _verdict_block("inconclusive", conditions, reasons, rule)
     samples_a = int(holdout_p95_a["samples"])
     samples_b = int(holdout_p95_b["samples"])
     conditions["holdout_samples"] = {"baseline": samples_a, "candidate": samples_b}
@@ -293,7 +334,7 @@ def _verdict(a: Arm, b: Arm, holdout_p95_a: dict[str, Any], holdout_p95_b: dict[
             f"fewer than {MIN_P95_SAMPLES} holdout e2e samples per arm "
             f"(baseline {samples_a}, candidate {samples_b}): p95 is undefined"
         )
-        return _verdict_block("inconclusive", conditions, reasons)
+        return _verdict_block("inconclusive", conditions, reasons, rule)
     p95_a, p95_b = float(holdout_p95_a["p95_ms"]), float(holdout_p95_b["p95_ms"])
     improvement = (p95_a - p95_b) / p95_a if p95_a > 0 else None
     conditions["holdout_p95_ms"] = {"baseline": p95_a, "candidate": p95_b}
@@ -301,7 +342,7 @@ def _verdict(a: Arm, b: Arm, holdout_p95_a: dict[str, Any], holdout_p95_b: dict[
     conditions["p95_improvement_threshold"] = P95_IMPROVEMENT_THRESHOLD
     if improvement is None:
         reasons.append("baseline holdout p95 is zero: improvement ratio undefined")
-        return _verdict_block("inconclusive", conditions, reasons)
+        return _verdict_block("inconclusive", conditions, reasons, rule)
     # Quality floor from the FULL corpus (overall), never a tiny split: at Stage-0 sizes the
     # holdout has n=6, whose Wilson lower bound collapses to ~0.10 even for a weak arm and lets a
     # candidate pass while its selection quality collapses (benchmarks/base-noreasoning,
@@ -325,24 +366,42 @@ def _verdict(a: Arm, b: Arm, holdout_p95_a: dict[str, Any], holdout_p95_b: dict[
         reasons.append(
             f"candidate overall hit rate {candidate_rate:.3f} is below the baseline overall Wilson lower bound {baseline_floor:.3f}"
         )
+    if require_repeat_stability:
+        baseline_stability = _repeat_stability(a)["holdout"]["final_pattern_repeat_agreement"]
+        candidate_stability = _repeat_stability(b)["holdout"]["final_pattern_repeat_agreement"]
+        conditions["holdout_final_pattern_repeat_agreement"] = {
+            "baseline": baseline_stability,
+            "candidate": candidate_stability,
+        }
+        if baseline_stability is None or candidate_stability is None:
+            reasons.append("repeat stability needs >= 2 repeats per holdout scenario on both arms")
+        elif candidate_stability < baseline_stability:
+            reasons.append(
+                f"candidate holdout final-pattern repeat agreement {candidate_stability:.3f} < "
+                f"baseline {baseline_stability:.3f}"
+            )
     outcome = "candidate-win" if not reasons else "candidate-loss"
-    return _verdict_block(outcome, conditions, reasons)
+    return _verdict_block(outcome, conditions, reasons, rule)
 
 
-def _verdict_block(outcome: str, conditions: dict[str, Any], reasons: list[str]) -> dict[str, Any]:
+def _verdict_block(outcome: str, conditions: dict[str, Any], reasons: list[str], rule: str = _RULE) -> dict[str, Any]:
     """Assemble the verdict block with the rule text."""
     return {
         "outcome": outcome,
-        "rule": (
-            "candidate wins iff holdout p95 e2e improves >= 15% AND candidate overall "
-            "acceptable-primary hit rate >= baseline overall Wilson lower bound"
-        ),
+        "rule": rule,
         "conditions": conditions,
         "reasons": reasons or ["every pre-registered condition held"],
     }
 
 
-def compare_arms(a: Arm, b: Arm, *, allow_mismatch: bool = False, out_dir: Path | None = None) -> dict[str, Any]:
+def compare_arms(
+    a: Arm,
+    b: Arm,
+    *,
+    allow_mismatch: bool = False,
+    out_dir: Path | None = None,
+    require_repeat_stability: bool = False,
+) -> dict[str, Any]:
     """Compare two arms and write ``comparison.json`` + ``comparison.md``."""
     warnings: list[str] = []
     first_hash = (a.manifest.get("scenario_file") or {}).get("sha256")
@@ -400,6 +459,7 @@ def compare_arms(a: Arm, b: Arm, *, allow_mismatch: bool = False, out_dir: Path 
         "paired": paired,
         "quality": _hit_rate_difference(a, b),
         "quality_metrics": _quality_metrics(a, b),
+        "repeat_stability": {"baseline": _repeat_stability(a), "candidate": _repeat_stability(b)},
         "latency": {
             "e2e_ms": {
                 "baseline": a.summary["latency"]["e2e_ms"],
@@ -408,7 +468,7 @@ def compare_arms(a: Arm, b: Arm, *, allow_mismatch: bool = False, out_dir: Path 
             "holdout_e2e_ms": {"baseline": holdout_p95_a, "candidate": holdout_p95_b},
             "stage_deltas": _stage_deltas(a, b),
         },
-        "verdict": _verdict(a, b, holdout_p95_a, holdout_p95_b),
+        "verdict": _verdict(a, b, holdout_p95_a, holdout_p95_b, require_repeat_stability),
     }
     target_dir = out_dir or (b.root / "comparison")
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -510,6 +570,7 @@ def render_comparison(payload: dict[str, Any]) -> str:
         ]
     else:
         lines.append("- none")
+    lines += _stability_section(payload.get("repeat_stability"))
     lines += ["", "## Stage deltas", ""]
     stage_deltas = payload["latency"]["stage_deltas"]
     if not stage_deltas["available"]:
@@ -525,6 +586,19 @@ def render_comparison(payload: dict[str, Any]) -> str:
         lines += ["", "## Warnings", ""] + [f"- {warning}" for warning in payload["integrity"]["warnings"]]
     lines.append("")
     return "\n".join(lines)
+
+
+def _stability_section(stability: dict[str, Any] | None) -> list[str]:
+    """Markdown block for the repeat-stability table (empty when the payload predates it)."""
+    if not stability:
+        return []
+    lines = ["", "## Repeat stability", "", "| split | baseline | candidate |", "|---|---|---|"]
+    for split in ("overall", "train", "holdout"):
+        lines.append(
+            f"| {split} | {_rate(stability['baseline'][split]['final_pattern_repeat_agreement'])} | "
+            f"{_rate(stability['candidate'][split]['final_pattern_repeat_agreement'])} |"
+        )
+    return lines
 
 
 def _rate(value: Any) -> str:
@@ -556,6 +630,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="compare even when the scenario files or modes differ (records a warning)",
     )
+    parser.add_argument(
+        "--require-repeat-stability",
+        action="store_true",
+        help="add the holdout final-pattern repeat-agreement leg to the verdict (style A/B)",
+    )
     parser.add_argument("--quiet", action="store_true", help="print only the verdict line")
     return parser
 
@@ -569,6 +648,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             Arm.load(args.candidate, "candidate"),
             allow_mismatch=args.allow_mismatch,
             out_dir=args.out,
+            require_repeat_stability=args.require_repeat_stability,
         )
     except ValueError as exc:
         print(f"compare refused: {exc}", file=sys.stderr)
