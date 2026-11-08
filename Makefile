@@ -119,7 +119,7 @@ TACIT_BUILD_TARGET  := $(if $(and $(wildcard $(TACIT_HOST_CONFIG)),$(wildcard $(
 # the cached path refuses to build when the marker's shas no longer match, so a stale
 # host dir can never be re-baked against a changed prompt vocabulary or pair artifact.
 TACIT_TRAIN_INPUTS  := scripts/decision_models/tacit_self_distill.py \
-	src/decisions/seam_prompts.py qa/qa.jsonl qa/typed/rerank_pairs.jsonl \
+	src/decisions/seam_prompts.py qa/qa.jsonl qa/typed/rerank_pairs.jsonl qa/typed/style.jsonl \
 	docker/Dockerfile.tacit
 # HF Hub token for authenticated model downloads (higher rate limits, gated repos).
 # File holds the raw token only, no key=value. Empty/missing file = anonymous
