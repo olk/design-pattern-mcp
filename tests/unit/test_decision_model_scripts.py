@@ -66,6 +66,9 @@ def trainer() -> Iterator[types.ModuleType]:
         def __init__(self) -> None:
             engine = types.SimpleNamespace(model=types.SimpleNamespace(device="cuda:0"))
             self.engine = engine  # noqa: F841 - read by main()'s teacher-device check
+            # ``_example`` passes the tokenizer to the anyjev readout helpers, which are
+            # stubbed here; any object satisfies them.
+            self.tok = object()
 
         @classmethod
         def from_pretrained(cls, *_args: Any, **_kwargs: Any) -> _StubTacit:
@@ -749,6 +752,136 @@ def test_assemble_problems_prefers_hints_then_generated_descriptions(
     )
     assert hint_only == ["hint one", "hint two"]
     assert len(hint_problems) == 2 * len(seams.style_shards())
+
+
+def test_load_style_gold_keeps_train_rows_and_checks_the_vocabulary(
+    trainer: types.ModuleType, tmp_path: Path
+) -> None:
+    """Gold rows are train-only, one per shard, and the label must be offerable."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    path = tmp_path / "style.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"label": "broker", "state": "train state", "source": {"split": "train", "scenario_id": "s1"}}),
+                json.dumps({"label": "none", "state": "holdout state", "source": {"split": "holdout", "scenario_id": "s2"}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    problems = trainer.load_style_gold(path, seams)
+    shards = seams.style_shards()
+    assert len(problems) == len(shards)
+    assert {problem["state"] for problem in problems} == {"train state"}
+    targets = {problem["seam"]: problem["target"] for problem in problems}
+    assert targets == {"style-gold": "broker", "style-gold-none": seams.STYLE_NONE_KEY}
+    assert all(problem["kind"] == "choice" for problem in problems)
+
+    path.write_text(
+        json.dumps({"label": "not-a-style", "state": "x", "source": {"split": "train", "scenario_id": "s9"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="not-a-style"):
+        trainer.load_style_gold(path, seams)
+
+
+def test_gold_examples_put_the_mass_on_the_gold_option(trainer: types.ModuleType) -> None:
+    """The gold target is the label, not the teacher: 0.9 on it, the rest shared."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    shards = seams.style_shards()
+    tacit = types.SimpleNamespace(tok=object())
+    problems = [
+        {
+            "state": "s",
+            "question": seams.style_question(shards[0]),
+            "options": [*shards[0], seams.STYLE_NONE_KEY],
+            "kind": "choice",
+            "target": shards[0][0],
+            "seam": "style-gold",
+        },
+        {
+            "state": "s",
+            "question": seams.style_question(shards[1]),
+            "options": [*shards[1], seams.STYLE_NONE_KEY],
+            "kind": "choice",
+            "target": seams.STYLE_NONE_KEY,
+            "seam": "style-gold-none",
+        },
+    ]
+    examples = trainer.gold_examples(tacit, problems)
+    assert [example.seam for example in examples] == ["style-gold", "style-gold-none"]
+    assert examples[0].target[0] == pytest.approx(0.9)
+    assert sum(examples[0].target) == pytest.approx(1.0)
+    assert examples[1].target[-1] == pytest.approx(0.9)  # ``none`` is the last option
+    assert sum(examples[1].target) == pytest.approx(1.0)
+
+
+def test_assemble_problems_gold_mode_generates_every_style_state(
+    trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Gold mode drops the hint states: one state must carry one target, not two."""
+    seams = trainer.load_seam_prompts(SEAM_PROMPTS)
+    seen: dict[str, int] = {}
+
+    def fake_generate(_tacit: Any, _hints: Any, count: int, _max_new: int, _cap: int) -> list[str]:
+        seen["count"] = count
+        return [f"generated {index}" for index in range(count)]
+
+    monkeypatch.setattr(trainer, "generate_descriptions", fake_generate)
+    args = types.SimpleNamespace(
+        problems=36,
+        style_states=0,
+        rerank_pairs=str(_rerank_pairs_file(tmp_path)),
+        rerank_problems=0,
+        max_new_tokens=384,
+        style_gold="qa/typed/style.jsonl",
+    )
+    _, style_states, _, _ = trainer._assemble_problems(
+        object(),
+        ["hint one\n\nDecision: d1"],
+        seams,
+        args,
+        ["System goal: g\nDecision part: p"],
+        [],
+        8,
+    )
+    assert seen["count"] == 3  # every style state generated; no hint is reused
+    assert style_states == ["generated 0", "generated 1", "generated 2"]
+
+
+def test_trainer_main_feeds_gold_rows_without_the_teacher(
+    trainer: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--style-gold`` adds supervised rows after retention, never teacher questions."""
+    seen: dict[str, Any] = {}
+    _main_fakes(trainer, seen, monkeypatch)
+    style_gold = tmp_path / "style.jsonl"
+    style_gold.write_text(
+        "\n".join(
+            [
+                json.dumps({"label": "broker", "state": "train state", "source": {"split": "train", "scenario_id": "s1"}}),
+                json.dumps({"label": "none", "state": "holdout state", "source": {"split": "holdout", "scenario_id": "s2"}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    init_dir = tmp_path / "init"
+    init_dir.mkdir()
+    (init_dir / "config.json").write_text("{}", encoding="utf-8")
+    code = trainer.main(
+        _main_args(init_dir, tmp_path / "out", _rerank_pairs_file(tmp_path), "--style-gold", str(style_gold))
+    )
+    assert code == 0
+    assert "style-gold" not in seen["seams"]
+    assert "style-gold-none" not in seen["seams"]
+    shards = len(seam_prompts.style_shards())
+    manifest = json.loads((tmp_path / "out" / "self-distill.json").read_text(encoding="utf-8"))
+    assert manifest["style_gold_problems"] == shards  # one train row, every shard
+    assert manifest["style_gold_rows"] == shards
+    # ``broker`` is offered by exactly one shard: that shard's gold row keeps the label and
+    # every other shard's row keeps ``none``.
+    assert manifest["seams"]["style-gold"]["kept"] == 1
+    assert manifest["seams"]["style-gold-none"]["kept"] == shards - 1
 
 
 def test_assemble_problems_refuses_an_untrained_seam(

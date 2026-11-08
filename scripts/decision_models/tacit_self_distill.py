@@ -290,6 +290,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "train hints are always used first, generated descriptions fill the rest.",
     )
     parser.add_argument(
+        "--style-gold",
+        default="",
+        help="qa/typed/style.jsonl — reviewed gold style labels for the TRAIN split; adds one "
+        "gold-supervised row per shard per labelled state (no teacher call), and the teacher "
+        "style states become generated descriptions only.",
+    )
+    parser.add_argument(
         "--teacher-shards",
         type=int,
         default=0,
@@ -455,6 +462,68 @@ def _served_description(text: str) -> str:
     Training on the whole question would be a state shape the server never sends.
     """
     return text.split("\n\nDecision: ", 1)[0]
+
+
+def load_style_gold(path: Path, seams: ModuleType) -> list[dict[str, Any]]:
+    """Gold style questions from the labelled TRAIN rows, one per shard per state.
+
+    The seam is gated on reviewed labels (``qa/typed/style.jsonl``), but self-distillation
+    only imitates the teacher's own answers; this supplies the labelled signal as a SECOND
+    target, so the gold's shard learns the label and every other shard learns ``none``.
+    Holdout rows never train. The two seam names keep the gold-shard agreement equal to gold
+    accuracy instead of pooling it with the ``none``-target questions.
+    """
+    problems: list[dict[str, Any]] = []
+    if not path.is_file():
+        raise SystemExit(f"--style-gold {path} does not exist")
+    vocabulary = set(seams.STYLE_VOCABULARY)
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip():
+            continue
+        row = json.loads(raw_line)
+        source = row.get("source") or {}
+        if source.get("split") != "train":
+            continue
+        label = str(row.get("label", ""))
+        if label != seams.STYLE_NONE_KEY and label not in vocabulary:
+            raise SystemExit(
+                f"style-gold row {source.get('scenario_id')!r} has label {label!r}, "
+                "which is not in the served style vocabulary"
+            )
+        state = str(row["state"])[: seams.DECISION_STATE_MAX_CHARS]
+        for styles in seams.style_shards():
+            offered = label in styles
+            problems.append(
+                {
+                    "state": state,
+                    "question": seams.style_question(styles),
+                    "options": [*styles, seams.STYLE_NONE_KEY],
+                    "kind": "choice",
+                    "target": label if offered else seams.STYLE_NONE_KEY,
+                    "seam": "style-gold" if offered else "style-gold-none",
+                }
+            )
+    if not problems:
+        raise SystemExit(f"--style-gold {path} has no train-split rows")
+    return problems
+
+
+def gold_examples(tacit: Any, problems: Sequence[dict[str, Any]], smoothing: float = 0.1) -> list[Example]:
+    """Gold-supervised style rows: ``1 - smoothing`` on the gold option, the rest shared.
+
+    No teacher call and no retention: the target IS the label, so the row is kept whether or
+    not the teacher would have agreed — that disagreement is the signal the self-distilled
+    student never received.
+    """
+    examples: list[Example] = []
+    for item in problems:
+        target_option = str(item["target"])
+        options = [str(option) for option in item["options"]]
+        others = len(options) - 1
+        share = smoothing / others if others else 0.0
+        target = [1.0 - smoothing if option == target_option else share for option in options]
+        examples.append(_example(tacit, item, target))
+    return examples
 
 
 def _state_prompts(hints: Sequence[str], problems: int) -> list[str]:
@@ -962,6 +1031,24 @@ def answer_problems(tacit: Any, problems: Sequence[dict[str, Any]]) -> list[dict
     return results
 
 
+def _example(tacit: Any, item: dict[str, Any], target: list[float]) -> Example:
+    """One supervised row: the serving prompt for ``item`` plus its target distribution."""
+    from anyjev.readout import DEFAULT_SYSTEM, build_prompt, label_ids_for_perm, render_chat, resolve_labels
+    from anyjev.tacit import make_question
+
+    question = make_question(item["question"], item["options"], item["kind"])
+    labels, ids = resolve_labels(tacit.tok, question)
+    permutation = list(range(question.k))
+    spec = build_prompt(item["state"], question, permutation, DEFAULT_SYSTEM, labels)
+    return Example(
+        prompt=render_chat(tacit.tok, spec),
+        kind=item["kind"],
+        label_ids=[int(token) for token in label_ids_for_perm(question, ids, permutation)],
+        target=target,
+        seam=str(item.get("seam", "")),
+    )
+
+
 def examples_from_results(
     tacit: Any,
     problems: Sequence[dict[str, Any]],
@@ -982,9 +1069,6 @@ def examples_from_results(
     shape intact) carried as full Examples, so one forward per row can later measure how
     often the student clears the acting floor where the deliberating teacher did not.
     """
-    from anyjev.readout import DEFAULT_SYSTEM, build_prompt, label_ids_for_perm, render_chat, resolve_labels
-    from anyjev.tacit import make_question
-
     examples: list[Example] = []
     probe: list[Example] = []
     dropped: dict[str, dict[str, int]] = {kind: {"unrouted": 0, "shape": 0, "unsharp": 0} for kind in _SEAM_KINDS}
@@ -1003,17 +1087,7 @@ def examples_from_results(
             dropped[kind]["unrouted"] += 1
             continue
         target = [value / total for value in target]
-        question = make_question(item["question"], item["options"], item["kind"])
-        labels, ids = resolve_labels(tacit.tok, question)
-        permutation = list(range(question.k))
-        spec = build_prompt(item["state"], question, permutation, DEFAULT_SYSTEM, labels)
-        example = Example(
-            prompt=render_chat(tacit.tok, spec),
-            kind=kind,
-            label_ids=[int(token) for token in label_ids_for_perm(question, ids, permutation)],
-            target=target,
-            seam=str(item.get("seam", "")),
-        )
+        example = _example(tacit, item, target)
         if max(target) < retention_floor(kind, answer_mass_floor, score_mass_floor):
             dropped[kind]["unsharp"] += 1
             if kind == "choice":
@@ -1460,25 +1534,31 @@ def _assemble_problems(
     Ch2 style states are the corpus train hints first — as the description bytes serving
     actually sends (``_served_description``: the qa question minus its ``Decision:`` tail) —
     then generated descriptions until the budget is met: the seam serves raw user prose, not
-    header-line part states, so a few dozen hints cannot train it. Every state gets every
-    shard (``build_style_problems``). A seam that would train on nothing aborts the run: an
-    under-trained seam must not ship. (``--skip`` needs no clause here — ``main`` returns
+    header-line part states, so a few dozen hints cannot train it. With ``--style-gold`` the
+    states are generated descriptions only (hints would otherwise carry both a teacher and a
+    gold target). Every state gets every shard (``build_style_problems``). A seam that would
+    train on nothing aborts the run: an under-trained seam must not ship. (``--skip`` needs no clause here — ``main`` returns
     from ``skip_training`` long before this runs.)
     """
     problems = build_problems(states, seams, gate_states, axes_per_state)
     style_state_count = args.style_states or max(1, args.problems // _STYLE_SHARE)
-    # Only generate what the hint corpus does not already cover: a generation pass whose
-    # output would be truncated away is pure teacher cost (139 train hints at today's corpus).
-    needed = max(0, style_state_count - len(hints))
+    # Gold mode replaces the hint states with generated descriptions: a hint would otherwise
+    # carry BOTH a teacher target and a gold target for the same state, and the two
+    # supervision signals would fight. Non-gold builds keep the cheap, real-bytes hints.
+    gold_mode = bool(getattr(args, "style_gold", ""))
+    needed = style_state_count if gold_mode else max(0, style_state_count - len(hints))
     descriptions = (
         generate_descriptions(teacher, hints, needed, args.max_new_tokens, seams.DECISION_STATE_MAX_CHARS)
         if needed
         else []
     )
-    style_states = [
-        *(_served_description(hint) for hint in hints),
-        *descriptions,
-    ][: max(style_state_count, len(hints))]
+    if gold_mode:
+        style_states = list(descriptions)[:style_state_count]
+    else:
+        style_states = [
+            *(_served_description(hint) for hint in hints),
+            *descriptions,
+        ][: max(style_state_count, len(hints))]
     style_problems = build_style_problems(style_states, seams)
     if not style_problems:
         raise SystemExit("the Ch2 style seam trained on 0 description-shaped states — check --seed-texts")
@@ -1594,6 +1674,19 @@ def _seam_report(
     return block
 
 
+def _append_gold_rows(examples: list[Example], teacher: Any, style_gold: Sequence[dict[str, Any]]) -> int:
+    """Append the gold-supervised style rows to ``examples``; returns how many were added.
+
+    Appended AFTER teacher retention (so retained counts stay comparable across builds) and
+    BEFORE the stratified split, so the gold seams get eval rows of their own.
+    """
+    rows = gold_examples(teacher, style_gold) if style_gold else []
+    if rows:
+        examples.extend(rows)
+        logger.info("gold-supervised style rows appended: %d over %d problems", len(rows), len(style_gold))
+    return len(rows)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point: generate → teach → distill → save (or copy with ``--skip``)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1614,6 +1707,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("loading teacher %s onto CUDA (this takes minutes, no progress yet)", args.repo)
     seams = load_seam_prompts(Path(args.seam_prompts))
     hints = load_topic_hints(Path(args.seed_texts), limit=max(8, args.problems // 4)) if args.seed_texts else []
+    # Fail fast on a missing/malformed gold file, before the hours-long teacher pass.
+    style_gold = load_style_gold(Path(args.style_gold), seams) if args.style_gold else []
     # Explicit cuda:0 placement: the default device_map="auto" only uses CUDA when
     # torch.cuda.is_available(), and "auto" may also shard. Verified against the
     # anyjev 0.3.0 wheel (tacit.py): device_map is forwarded to
@@ -1670,6 +1765,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"dropped {dropped}); lower --answer-mass-floor / --confidence-floor or raise --problems"
         )
     logger.info("retained rows per kind: %s", dict(kept))
+    gold_rows = _append_gold_rows(examples, teacher, style_gold)
     train_rows, eval_rows = _split_examples(examples, args.eval_frac, args.seed)
     student = train_student(init_dir, train_rows, args)
     logger.info("saving merged checkpoint to %s", out_dir)
@@ -1705,6 +1801,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "axes_per_state": axes_per_state,
                 "style_states": len(style_states),
                 "style_problems": len(style_problems),
+                "style_gold_problems": len(style_gold),
+                "style_gold_rows": gold_rows,
                 "rerank_problems": len(rerank_problems),
                 "teacher_shards": teacher_shards,
                 "min_seam_agreement": args.min_seam_agreement,
