@@ -29,8 +29,10 @@ Two more seams train from the same single checkpoint:
 * **Ch2 style** (``build_style_problems``) — the SERVED sharded choice over
   description-shaped states: the 35-style vocabulary split into balanced questions of at
   most 25 styles plus ``none`` (the gateway caps ``choice`` at 26 options, so the 35-way
-  question never exists as one item), the shards rotating over the states so each trains.
-  States are the corpus train hints first, then model-written descriptions
+  question never exists as one item), and every shard is asked for every state — serving
+  asks all of them, so training must let the student compare them. States are the corpus
+  train hints first — reduced to their description bytes (``_served_description``), never
+  the qa question's ``Decision:`` tail — then model-written descriptions
   (``generate_descriptions``) — the seam serves raw user prose. The category question is
   NOT paired with these states: serving asks it of part states only (the J2 ``category``
   seam), and narrowing the style menu by it is what made most styles unanswerable.
@@ -141,14 +143,14 @@ _STATE_FOCUSES: tuple[str, ...] = (
 #: Description-shaped states for the Ch2 seam. Serving sends the RAW user description
 #: (``_apply_decision_style(text, ...)``), so the style seam must not train only on the
 #: corpus hint texts — the model writes more of them in the same shape.
-DESCRIPTION_PROMPT = """You write short, concrete software system descriptions.
+DESCRIPTION_PROMPT = """You write concrete software system descriptions.
 
 Topic: {hint}
 
 Write one description in exactly this shape, with no other text: one paragraph of
-2-5 sentences describing a software system a user wants design-pattern advice for —
-what it must do, its main components, and one design concern. Plain prose, no lists,
-no headings.
+6-9 sentences (about 800-1300 characters) describing a software system a user wants
+design-pattern advice for — what it must do, its main components, and one design
+concern. Plain prose, no lists, no headings.
 
 Description:"""
 
@@ -265,7 +267,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--eval-frac", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=384)
     parser.add_argument("--cot-max-tokens", type=int, default=2048)
     parser.add_argument(
         "--rerank-pairs",
@@ -445,6 +447,16 @@ def load_topic_hints(seed_texts: Path, limit: int, max_chars: int = 1500) -> lis
     return hints
 
 
+def _served_description(text: str) -> str:
+    """The description bytes the Ch2 seam serves: the qa question minus its ``Decision:`` tail.
+
+    ``qa/qa.jsonl`` questions are ``<description>\\n\\nDecision: <decision>``, while the
+    style seam is handed only the description (``src/pipeline.py::_apply_decision_style``).
+    Training on the whole question would be a state shape the server never sends.
+    """
+    return text.split("\n\nDecision: ", 1)[0]
+
+
 def _state_prompts(hints: Sequence[str], problems: int) -> list[str]:
     """One prompt per wanted state: the hint cycles, the focus rotates once per cycle.
 
@@ -597,6 +609,12 @@ def generate_descriptions(
     unique = list(dict.fromkeys(descriptions))
     if len(unique) < len(descriptions):
         logger.info("dropped %d duplicate descriptions", len(descriptions) - len(unique))
+    if unique:
+        lengths = sorted(len(text) for text in unique)
+        p25 = lengths[int(0.25 * (len(lengths) - 1))]
+        p50 = lengths[int(0.5 * (len(lengths) - 1))]
+        p75 = lengths[int(0.75 * (len(lengths) - 1))]
+        logger.info("description lengths p25/p50/p75: %d/%d/%d chars over %d", p25, p50, p75, len(unique))
     return unique[:count]
 
 
@@ -840,27 +858,29 @@ def build_style_problems(states: Sequence[str], seams: ModuleType) -> list[dict[
     """Ch2 style questions over description-shaped states, in the served shape.
 
     The style question is 35-way and AnyJev caps one ask at 26 options, so serving splits the
-    vocabulary into shards and asks every one of them (``seams.style_shards``). Training asks
-    the same shards, rotated deterministically over the states so each shard is trained at the
-    same rate. Only these shard questions are emitted: the category question is NOT paired with
-    them any more, because serving asks it of part states (the J2 ``category`` seam) and never
-    of a description — that pairing existed only to narrow the style shortlist, which made most
-    styles unanswerable (guide §10.1: the affinity table is a prior, never a filter).
+    vocabulary into shards and asks EVERY one of them (``seams.style_shards``), keeping the
+    most confident named style. Training asks exactly the same set: every shard for every
+    state, states outer and shards inner — a student that only ever saw one shard per state
+    never learned to compare two shards' answers, which is the served decision. Only these
+    shard questions are emitted: the category question is NOT paired with them, because
+    serving asks it of part states (the J2 ``category`` seam) and never of a description —
+    that pairing existed only to narrow the style shortlist, which made most styles
+    unanswerable (guide §10.1: the affinity table is a prior, never a filter).
     """
     problems: list[dict[str, Any]] = []
     shards = seams.style_shards()
-    for index, raw_state in enumerate(states):
+    for raw_state in states:
         state = raw_state[: seams.DECISION_STATE_MAX_CHARS]
-        styles = shards[index % len(shards)]
-        problems.append(
-            {
-                "state": state,
-                "question": seams.style_question(styles),
-                "options": [*styles, seams.STYLE_NONE_KEY],
-                "kind": "choice",
-                "seam": "style-stage2",
-            }
-        )
+        for styles in shards:
+            problems.append(
+                {
+                    "state": state,
+                    "question": seams.style_question(styles),
+                    "options": [*styles, seams.STYLE_NONE_KEY],
+                    "kind": "choice",
+                    "seam": "style-stage2",
+                }
+            )
     return problems
 
 
@@ -1435,13 +1455,15 @@ def _assemble_problems(
     gate_states: Sequence[str],
     axes_per_state: int,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
-    """The full serving question set: category/weights/gate, both style stages, rerank.
+    """The full serving question set: category/weights/gate, every style shard, rerank.
 
-    Ch2 style states are the corpus train hints first (real serving bytes), then generated
-    descriptions until the budget is met — the seam serves raw user prose, not header-line
-    part states, so a few dozen hints cannot train it. A seam that would train on nothing
-    aborts the run: an under-trained seam must not ship. (``--skip`` needs no clause here —
-    ``main`` returns from ``skip_training`` long before this runs.)
+    Ch2 style states are the corpus train hints first — as the description bytes serving
+    actually sends (``_served_description``: the qa question minus its ``Decision:`` tail) —
+    then generated descriptions until the budget is met: the seam serves raw user prose, not
+    header-line part states, so a few dozen hints cannot train it. Every state gets every
+    shard (``build_style_problems``). A seam that would train on nothing aborts the run: an
+    under-trained seam must not ship. (``--skip`` needs no clause here — ``main`` returns
+    from ``skip_training`` long before this runs.)
     """
     problems = build_problems(states, seams, gate_states, axes_per_state)
     style_state_count = args.style_states or max(1, args.problems // _STYLE_SHARE)
@@ -1453,7 +1475,10 @@ def _assemble_problems(
         if needed
         else []
     )
-    style_states = [*hints, *descriptions][: max(style_state_count, len(hints))]
+    style_states = [
+        *(_served_description(hint) for hint in hints),
+        *descriptions,
+    ][: max(style_state_count, len(hints))]
     style_problems = build_style_problems(style_states, seams)
     if not style_problems:
         raise SystemExit("the Ch2 style seam trained on 0 description-shaped states — check --seed-texts")

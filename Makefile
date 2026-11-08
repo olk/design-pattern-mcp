@@ -89,7 +89,7 @@ TACIT_LR             ?= 1e-4
 TACIT_BATCH          ?= 4
 TACIT_ACCUM          ?= 8
 TACIT_COT_MAX_TOKENS ?= 2048
-TACIT_MAX_NEW_TOKENS ?= 256
+TACIT_MAX_NEW_TOKENS ?= 384
 VLLM_IMAGE_TAG   ?= v0.17.1
 
 # Host-persisted trained artifacts (extract-then-rebuild).

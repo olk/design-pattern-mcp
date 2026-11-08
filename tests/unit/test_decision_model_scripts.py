@@ -516,31 +516,30 @@ def test_answer_and_examples_split_reproduces_retention(trainer: types.ModuleTyp
     assert abs(max(probe[0].target) - 0.2) < 1e-9
 
 
-def test_build_style_problems_emit_only_the_served_shard_questions(trainer: types.ModuleType) -> None:
-    """One question per state: the shard serving asks, never a question serving skips.
+def test_build_style_problems_ask_every_shard_for_every_state(trainer: types.ModuleType) -> None:
+    """Every shard is asked for every state: serving compares the shards, so training must too.
 
-    The category question used to be paired with every description state so it could narrow
-    the style shortlist. Serving asks it of PART states only (the J2 seam), so certifying a
-    ``style-stage1`` seam measured a question no request ever carries.
+    One rotated shard per state trained the student on a decision it never makes (its own
+    shard's argmax), not on the served one (which of two shards' answers wins). The category
+    question is still never paired: serving asks it of PART states only (the J2 seam).
     """
     seams = trainer.load_seam_prompts(SEAM_PROMPTS)
     states = [f"description {index}" for index in range(len(seams.CATEGORY_SLUGS))]
-    problems = trainer.build_style_problems(states, seams)
-    assert len(problems) == len(states)
-    stage2 = problems
-    assert {problem["seam"] for problem in stage2} == {"style-stage2"}
-    assert seams.category_question() not in {problem["question"] for problem in stage2}
-    # The shards rotate, so every served style question is trained.
     shards = seams.style_shards()
-    covered = {problem["options"][0] for problem in stage2}
-    assert covered == {shard[0] for shard in shards}
-    for problem, styles in zip(stage2, [shards[index % len(shards)] for index in range(len(states))], strict=True):
-        assert problem["seam"] == "style-stage2"
-        assert problem["question"] == seams.style_question(styles)
-        assert problem["options"] == [*styles, seams.STYLE_NONE_KEY]
-        assert len(problem["options"]) <= 26
-    # Every style the seam may name is trained exactly once across the rotation.
-    trained = {style for problem in stage2 for style in problem["options"] if style != seams.STYLE_NONE_KEY}
+    assert len(shards) == 2  # balanced 18 + 17 → two questions per state
+    problems = trainer.build_style_problems(states, seams)
+    assert len(problems) == len(states) * len(shards)
+    assert {problem["seam"] for problem in problems} == {"style-stage2"}
+    assert seams.category_question() not in {problem["question"] for problem in problems}
+    for index, state in enumerate(states):
+        pair = problems[2 * index : 2 * index + 2]
+        for problem, styles in zip(pair, shards, strict=True):
+            assert problem["state"] == state
+            assert problem["question"] == seams.style_question(styles)
+            assert problem["options"] == [*styles, seams.STYLE_NONE_KEY]
+            assert len(problem["options"]) <= 26
+    # Every style the seam may name is trained, once per state.
+    trained = {style for problem in problems for style in problem["options"] if style != seams.STYLE_NONE_KEY}
     assert trained == set(seams.STYLE_VOCABULARY)
 
 
@@ -549,7 +548,7 @@ def test_build_style_problems_caps_each_state(trainer: types.ModuleType) -> None
     seams = trainer.load_seam_prompts(SEAM_PROMPTS)
     cap = seams.DECISION_STATE_MAX_CHARS
     problems = trainer.build_style_problems(["d" * (cap + 100)], seams)
-    assert [problem["state"] for problem in problems] == ["d" * cap]
+    assert [problem["state"] for problem in problems] == ["d" * cap] * len(seams.style_shards())
 
 
 def test_load_rerank_pairs_keeps_train_rows_only(trainer: types.ModuleType, tmp_path: Path) -> None:
@@ -703,7 +702,7 @@ def test_teacher_answers_merges_shards_in_order(trainer: types.ModuleType, monke
 def test_assemble_problems_prefers_hints_then_generated_descriptions(
     trainer: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Ch2 states are real serving hint bytes first; generated prose fills the rest."""
+    """Ch2 states are real serving description bytes first; generated prose fills the rest."""
     seams = trainer.load_seam_prompts(SEAM_PROMPTS)
     monkeypatch.setattr(
         trainer,
@@ -715,19 +714,20 @@ def test_assemble_problems_prefers_hints_then_generated_descriptions(
         style_states=0,
         rerank_pairs=str(_rerank_pairs_file(tmp_path)),
         rerank_problems=0,
-        max_new_tokens=256,
+        max_new_tokens=384,
     )
     problems, style_states, style_problems, rerank_problems = trainer._assemble_problems(
         object(),
-        ["hint one", "hint two"],
+        ["hint one\n\nDecision: d1", "hint two\n\nDecision: d2"],
         seams,
         args,
         ["System goal: g\nDecision part: p"],
         ["phase: analyze\ndescription: d"],
         8,
     )
+    # The qa question carries the decision, the seam does not: only the description trains.
     assert style_states == ["hint one", "hint two", "generated 0"]  # 36 // 12 = 3 states
-    assert len(style_problems) == 3  # one shard question per state
+    assert len(style_problems) == 3 * len(seams.style_shards())
     assert len(rerank_problems) == 2
     assert len(problems) == len(style_problems) + len(rerank_problems) + (1 + 8 + 1)
     # When the hint corpus already fills the budget, no teacher time is spent generating
@@ -738,9 +738,9 @@ def test_assemble_problems_prefers_hints_then_generated_descriptions(
         "generate_descriptions",
         lambda *_args: (_ for _ in ()).throw(AssertionError("generation must be skipped")),
     )
-    _, hint_only, _, _ = trainer._assemble_problems(
+    _, hint_only, hint_problems, _ = trainer._assemble_problems(
         object(),
-        ["hint one", "hint two"],
+        ["hint one\n\nDecision: d1", "hint two\n\nDecision: d2"],
         seams,
         args,
         ["System goal: g\nDecision part: p"],
@@ -748,6 +748,7 @@ def test_assemble_problems_prefers_hints_then_generated_descriptions(
         8,
     )
     assert hint_only == ["hint one", "hint two"]
+    assert len(hint_problems) == 2 * len(seams.style_shards())
 
 
 def test_assemble_problems_refuses_an_untrained_seam(
@@ -929,8 +930,8 @@ def test_trainer_main_walks_generate_to_save(
     out_dir = tmp_path / "out"
     code = trainer.main(_main_args(init_dir, out_dir, _rerank_pairs_file(tmp_path)))
     assert code == 0
-    # 10 design problems (category + 8 axes + gate), 1 style question, 2 train rerank pairs.
-    assert seen["kinds"] == ["choice"] + ["score"] * 8 + ["yes_no"] + ["choice"] + ["yes_no"] * 2
+    # 10 design problems (category + 8 axes + gate), 2 style shards, 2 train rerank pairs.
+    assert seen["kinds"] == ["choice"] + ["score"] * 8 + ["yes_no"] + ["choice"] * 2 + ["yes_no"] * 2
     assert seen["seams"] == [
         "category",
         "weights",
@@ -942,6 +943,7 @@ def test_trainer_main_walks_generate_to_save(
         "weights",
         "weights",
         "gate",
+        "style-stage2",
         "style-stage2",
         "rerank",
         "rerank",
@@ -960,7 +962,7 @@ def test_trainer_main_walks_generate_to_save(
     assert seen["eval_model"] is seen["saved_model"]  # fidelity scores the MERGED artifact
     assert seen["probe_model"] is seen["saved_model"]  # and so does the false-act probe
     manifest = json.loads((out_dir / "self-distill.json").read_text(encoding="utf-8"))
-    assert manifest["problems"] == 13  # 10 design + 1 style shard + 2 rerank
+    assert manifest["problems"] == 14  # 10 design + 2 style shards + 2 rerank
     assert manifest["examples"] == 19
     assert manifest["kept"] == {"choice": 7, "score": 7, "yes_no": 7}
     assert manifest["repo"] == "morriszjm/Tacit-4B"
@@ -973,7 +975,7 @@ def test_trainer_main_walks_generate_to_save(
     assert manifest["gate_states"] == 1
     assert manifest["axes_per_state"] == 8
     assert manifest["style_states"] == 1
-    assert manifest["style_problems"] == 1
+    assert manifest["style_problems"] == 2
     assert manifest["rerank_problems"] == 2  # train rows only; the holdout pair never trains
     assert manifest["teacher_shards"] == 1
     assert manifest["min_seam_agreement"] == 0.6

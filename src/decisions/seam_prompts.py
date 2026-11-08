@@ -65,7 +65,10 @@ STYLE_GLOSSES: dict[str, str] = {
     "hexagonal": "Domain logic sits at the core behind ports, with adapters for all external concerns",
     "layered-monolith": "A single deployable is organized in strict horizontal layers",
     "modular-monolith": "A single deployable is organized in well-separated vertical modules",
-    "monolithic": "The whole system is built, deployed, and scaled as one unit",
+    "monolithic": (
+        "The whole system is built, deployed, and scaled as one unit; "
+        "also the answer for one deployable with no other style signal"
+    ),
     "pipe-and-filter": "Data flows through a chain of independent processing stages",
     "model-view-controller": "UI concerns split into model, view, and controller responsibilities",
     "presentation-abstraction-control": "Each UI unit pairs presentation, abstraction, and control cooperating agents",
@@ -95,7 +98,13 @@ STYLE_GLOSSES: dict[str, str] = {
 STYLE_NONE_KEY = "none"
 
 #: The ``none`` criterion text, shared so train and serve never drift the abstention candidate.
-STYLE_NONE_GLOSS = "No listed architecture style applies"
+#: Carries the labeling rubric's default rule (``derive_style_labels.py``): a bare
+#: library/algorithm/code-shape decision with no system topology is ``none``, exactly as the
+#: gold was drawn — the served question must ask what the label answers.
+STYLE_NONE_GLOSS = (
+    "No listed architecture style applies, or the state describes only a library, "
+    "algorithm, or code-shape decision with no system topology"
+)
 
 #: The Ch2 style ``choice`` instructions, verbatim on both sides of the boundary.
 STYLE_INSTRUCTIONS = (
