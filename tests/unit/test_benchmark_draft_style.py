@@ -124,8 +124,23 @@ def test_compose_scenario_id_respects_the_schema_cap() -> None:
     assert draft_mod._compose_scenario_id("saga-trip-holds", "saga") == "saga-trip-holds"
 
 
+#: Served styles whose only train labels the 2026-11 audit corrected away. Recorded, never
+#: silently dropped: the list must stay an exact, reasoned exception, so a NEW gap fails the
+#: coverage test below. Closing it needs new api-gateway train exemplars (data requirement).
+_UNCOVERED_TRAIN_STYLES: dict[str, str] = {
+    "api-gateway": (
+        "audited 2026-11: remote-contracts-audit-traversal and remote-contracts-order-submission "
+        "were labelled api-gateway by mistake (one service's export endpoint and one coarse "
+        "SubmitOrder operation, not a gateway fronting backend services) and are now monolithic"
+    ),
+}
+
+
 def test_corpus_style_exemplars_carry_one_train_positive_per_criterion() -> None:
-    """Every served style has a train positive; holdout stays the untouched 30 scenarios."""
+    """Every served style has a train positive, except the recorded audit exceptions.
+
+    Holdout stays the untouched 30 scenarios.
+    """
     styles = [
         line for line in (REPO_ROOT / "qa" / "typed" / "style.jsonl").read_text(encoding="utf-8").splitlines() if line
     ]
@@ -133,5 +148,6 @@ def test_corpus_style_exemplars_carry_one_train_positive_per_criterion() -> None
 
     rows = [json.loads(line) for line in styles]
     train = {row["label"] for row in rows if row["source"]["split"] == "train"}
-    assert set(seam_prompts.STYLE_GLOSSES) <= train
+    uncovered = set(seam_prompts.STYLE_GLOSSES) - train
+    assert uncovered <= set(_UNCOVERED_TRAIN_STYLES), f"new styles without a train positive: {uncovered}"
     assert sum(1 for row in rows if row["source"]["split"] == "holdout") == 30

@@ -176,8 +176,8 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "One back-office import flow (controller -> staging -> live table) with no distribution named",
     ),
     "domain-logic-supplier-update": (
-        "layered-monolith",
-        "One web endpoint with controller steps over a shared store; the team explicitly rejects extra business objects",
+        "monolithic",
+        "One web endpoint with ~10 straight-line controller steps in a one-screen application; no indirection, so no horizontal layers",
     ),
     "functional-data-modeling-expression-evaluation": (
         "none",
@@ -232,8 +232,8 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "Browser/mobile/service requests normalized to one acting-user representation at the gateway trust boundary",
     ),
     "identity-pluggable-credential-verification": (
-        "layered-monolith",
-        "One tenant portal whose login controller delegates to deployment-selected verifiers behind a boundary",
+        "hexagonal",
+        "A deployment-selected verifier registry behind a boundary the controller and domain must not change — ports and adapters",
     ),
     "regression-boundary-independent-mobile-api": (
         "microservices",
@@ -273,8 +273,8 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "A test-responder decision for one policy service; the classifier is a remote dependency, not a style signal",
     ),
     "security-verification-admin-ui": (
-        "model-view-controller",
-        "Admin console screens behind per-screen test wrappers — UI screen/view separation is the shape",
+        "none",
+        "Selenium page-object wrappers around console screens: test-code shape, no M/V/C roles, no topology",
     ),
     "security-verification-focused-user-setup": (
         "none",
@@ -325,8 +325,8 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "A checkout screen deriving one immutable snapshot from explicit gesture transitions",
     ),
     "local-search-field-state": (
-        "model-view-controller",
-        "A search page whose query state moves from page level to the owning field component",
+        "none",
+        "Component-local state ownership on a search page; no model, view, or controller roles, no topology",
     ),
     "workflow-messaging-module-event-wiring": (
         "broker",
@@ -361,12 +361,12 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "Checkout and inventory coupled through a request-reply broker topic with correlation and reply addresses",
     ),
     "remote-contracts-audit-traversal": (
-        "api-gateway",
-        "Compliance clients reaching a growing event table through one bounded paged export endpoint",
+        "monolithic",
+        "One service's paged export endpoint with an opaque continuation; no gateway fronting backend services",
     ),
     "remote-contracts-order-submission": (
-        "api-gateway",
-        "A desktop client completing checkout through one coarse SubmitOrder operation instead of dozens of calls",
+        "monolithic",
+        "One coarse SubmitOrder operation inside the Merchandise service: a facade on a single deployable, not a gateway",
     ),
     "server-presentation-multichannel-invoice": (
         "model-view-controller",
@@ -447,8 +447,8 @@ STYLE_LABELS: dict[str, tuple[str, str]] = {
         "Privileged activity as an attributable verifiable event sequence validated independently of the writer",
     ),
     "audit-sensitive-payment-boundary": (
-        "event-driven",
-        "Checkout/Ledger/Gateway payment attempts captured as uniform security events at one invocation boundary",
+        "microservices",
+        "Checkout, Funds and Ledger are separately deployable services behind synchronous calls; audit events are a side channel",
     ),
     "capabilities-isolation-plugin-control": (
         "microkernel-plugin",

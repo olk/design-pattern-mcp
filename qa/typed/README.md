@@ -25,12 +25,18 @@ Corpus labels are agent-curated, **human expert review pending**.
   architecture style with a quoted rationale. Train split: 139 rows over all 36
   criterion keys — every served style has at least one train positive (the 69
   train-only style-exemplar scenarios added 2026-11 closed the last 23 gaps;
-  largest classes are monolithic 20, none 11, layered-monolith 10); the 30
-  holdout rows are labeled for eval only and never reach training weights.
-  Review state is machine-readable: `review.json` (currently `unreviewed`)
-  records per-scenario human certification, and `make tacit-calibrate` refuses to
-  recommend a confidence floor until the ledger certifies the label source
-  byte-for-byte — no calibrated floor exists for unreviewed labels.
+  largest classes are monolithic 20, none 11, layered-monolith 10), with one
+  recorded audit exception: `api-gateway` lost its only two train labels when the
+  2026-11 review corrected them to monolithic, so new gateway exemplars are a
+  data requirement (`tests/unit/test_benchmark_draft_style.py::
+  _UNCOVERED_TRAIN_STYLES` fails if the gap grows); the 30 holdout rows are
+  labeled for eval only and never reach training weights.
+  Review state is machine-readable: `review.json` records per-scenario review
+  (reviewer identity, label, `labels_sha256`, `rationale_ok`) plus a
+  `human_review` block — a model review pass is recorded as such, never as
+  expert sign-off — and `make tacit-calibrate` refuses to recommend a confidence
+  floor until the ledger certifies the label source byte-for-byte — no calibrated
+  floor exists for unreviewed labels.
 - Noul: 20 per scenario over the 100 scenarios authored 2026-10-27 (the 2026-11
   style-exemplar scenarios added no noul rows) — every labeled pattern is a
   positive (`label_tier`: `primary` / `acceptable_primary` / `supporting`),
