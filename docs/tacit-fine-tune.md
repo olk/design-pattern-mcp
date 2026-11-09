@@ -662,6 +662,48 @@ A recommendation is also refused when the served choice changes between identica
 0.17.1 ships no batch-invariant switch, and the first replay after a cold start can differ
 on a near-tie row.
 
+### 4.7.1 Enablement status after the 2026-11 style-seam review
+
+The seam is **disabled** (`DECISIONS_STYLE_ENABLED=false`). The label ledger now certifies
+(an independent model review pass over all 169 labels, 7 corrected; `human_review: pending`,
+so expert sign-off is still outstanding), which means `make tacit-calibrate` can recommend —
+and it still returns no floor on the current corpus.
+
+Measured on the 30-row holdout with the audited labels, bars 0.80 accuracy / 0.30 rate /
+10 acted:
+
+| checkpoint | named | named hits | required | ceiling attainable | best floor (acted >= 10) |
+|---|---|---|---|---|---|
+| `88069de0…` first distilled (pre-audit labels) | 26 | 5 | 8 | false | 0.7 (21 acted, 0.238) |
+| `b022aebf…` served-bytes + every-shard, re-scored on audited labels | 27 | 7 | 8 | false | 0.1 (27 acted, 0.259) |
+| `afeb2116…` gold-supervised (audited labels) | 27 | 7 | 8 | false | 0.75 (15 acted, 0.267) |
+
+Three levers were measured against the unchanged bars: rubric rules in the served prompt
+(diagnostic replays), train/serve parity plus every-shard training, and gold supervision
+(`--style-gold`, 278 supervised rows). None lifts the answer link to the 8 required hits, and
+the dense threshold sweep over every observed confidence finds no passing floor. The gold
+seam's own held-out fidelity is the reason: `style-gold` agreement 0.333 on the held-out gold
+rows while teacher fidelity (`style-stage2`) is 0.778 — the student imitates the teacher, and
+128 gold-style train labels are below the label budget that would change that. Pre-registered
+combination-rule selection (max / exclusive / margin on the train split) also found no rule
+better than max + 0.10, so the served rule is unchanged.
+
+**The gates cannot be met without more data.** The requirement, before any further
+enablement attempt: >= 500 reviewed train style labels (from 139) and >= 100 holdout rows
+(from 30), family-disjoint; organic scenarios >= 70 % of new train rows and 100 % of new
+holdout rows; every row labelled by two blind annotators under the adjudicated rubric (a
+batch is accepted at raw agreement >= 0.80, kappa recorded) with third-party adjudication;
+plus new `api-gateway` train exemplars (the audit found the only two were mislabelled).
+
+Rollback triggers stay unchanged: a calibration FAIL on the deployed image, an A/B whose
+reasons cite hit rate or repeat stability, a re-calibration of the deployed image below 0.80
+acted accuracy at its floor, or `style_choice_repeat_agreement < 1.0`. The style A/B rule
+itself cannot certify an additive seam: it requires the holdout p95 to *improve* by >= 15 %,
+which two extra gateway calls cannot do, so a `candidate-win` would be a noise event.
+Enabling needs a seam-appropriate non-inferiority rule (candidate hit rate >= baseline Wilson
+lower bound, holdout p95 within +15 %, repeat agreement non-inferior) approved and
+implemented first.
+
 ### 4.8 Production: serving the verified artifact (GPU only)
 
 §4.1–§4.7 produce, verify and smoke the artifact; this section is what a serving host runs.
