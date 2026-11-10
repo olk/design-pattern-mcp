@@ -664,13 +664,8 @@ on a near-tie row.
 
 ### 4.7.1 Enablement status after the 2026-11 style-seam review
 
-The seam is **disabled** (`DECISIONS_STYLE_ENABLED=false`). The label ledger now certifies
-(an independent model review pass over all 169 labels, 7 corrected; `human_review: pending`,
-so expert sign-off is still outstanding), which means `make tacit-calibrate` can recommend —
-and it still returns no floor on the current corpus.
-
-Measured on the 30-row holdout with the audited labels, bars 0.80 accuracy / 0.30 rate /
-10 acted:
+The seam is **disabled** (`DECISIONS_STYLE_ENABLED=false`). The table below was measured on the
+30-row holdout with the audited labels, bars 0.80 accuracy / 0.30 rate / 10 acted:
 
 | checkpoint | named | named hits | required | ceiling attainable | best floor (acted >= 10) |
 |---|---|---|---|---|---|
@@ -688,12 +683,105 @@ rows while teacher fidelity (`style-stage2`) is 0.778 — the student imitates t
 combination-rule selection (max / exclusive / margin on the train split) also found no rule
 better than max + 0.10, so the served rule is unchanged.
 
-**The gates cannot be met without more data.** The requirement, before any further
-enablement attempt: >= 500 reviewed train style labels (from 139) and >= 100 holdout rows
-(from 30), family-disjoint; organic scenarios >= 70 % of new train rows and 100 % of new
-holdout rows; every row labelled by two blind annotators under the adjudicated rubric (a
-batch is accepted at raw agreement >= 0.80, kappa recorded) with third-party adjudication;
-plus new `api-gateway` train exemplars (the audit found the only two were mislabelled).
+**The gates could not be met on that corpus, so the data gate came first — and it is now
+closed.** The requirement was: >= 500 reviewed train style labels (from 139), >= 100
+family-disjoint holdout rows (from 30), organic scenarios >= 70 % of new train rows and 100 %
+of new holdout rows, every row labelled by two blind annotators under the adjudicated rubric
+(a batch accepted at raw agreement >= 0.80, kappa recorded) with third-party adjudication,
+plus new `api-gateway` train exemplars. Status, measured 2026-11:
+
+| precondition | target | measured |
+|---|---|---|
+| reviewed train style labels | >= 500 | **719** (every class >= 13 rows) |
+| family-disjoint holdout rows | >= 100 | **138** (every class >= 2 rows) |
+| organic share of new train rows | >= 70 % | **75.3 %** (540 organic, 179 synthetic of 719) |
+| new `api-gateway` train exemplars | 25-30 | **25** (the audit's zero is closed) |
+| two blind annotators + adjudication | every row | 688 rows in 6 batches; kappa 0.978-0.993 (train), 0.981 and 1.000 (holdout); 10 disagreements adjudicated in writing |
+| certification | ledger covers the label source | `review.json` = 857 entries at the source's sha256 |
+
+The corpus work is `qa/typed/style-rubric.md` (the frozen annotation rubric), the machinery in
+`scripts/decision_models/style_label_gap.py` (authoring briefs, pool validation, the word 5-gram
+`>= 0.8` / 50-token-substring leakage gate, application) and `style_label_review.py` (opaque-id
+blind packs, per-batch agreement and kappa, certification), with 832 authored candidates of
+which 688 reached review. Two measurement notes belong with the numbers:
+
+- **Blindness is id blindness.** Scenario ids are `<style>-<topic>`, so the first packs handed
+  the answer to the annotators; packs now carry opaque hash tokens with a sidecar map, and
+  every batch reported here was labelled that way.
+- **Agreement is not correctness.** The rubric reproduces the audited 30-row gold at *0.70* per
+  annotator (raw 0.90, kappa 0.863) while two annotators agree at 0.98 on the new pool, i.e.
+  the pair shares blind spots. The ledger records `human_review: signed` on a 47-row audit sheet
+  sampled across all 36 labels, accepted by the project owner, and states in the same block that
+  this is not a row-by-row expert review: a model pass is never promoted to expert sign-off. Three gold rows remain recorded rubric
+  tensions (`enforcement-owned-secret-vault`, `regression-boundary-independent-mobile-api`, and
+  `language-implementation-handwritten-grammar`), kept in the holdout unrelabelled so the
+  instrument is not edited to fit its reader.
+
+What this unblocks, and what it does not: `make tacit-calibrate` can now recommend a floor for
+any checkpoint served against this corpus, but the served artifact has *not* been retrained on
+the 580 new train labels, and the holdout it is measured on changed from 30 rows to 138, so the
+table above is a record of the old instrument, not a comparison. Re-enablement still needs, in
+order: a retrain that consumes the new train shards, a calibration on the 138-row holdout, and
+the seam-appropriate non-inferiority A/B rule below approved and implemented first.
+
+**The gate was re-run on the new instrument.** With the 857-label corpus certified
+(`review_status: certified at 8b1bc3313211`, which the run records in its `label_review` block),
+`make tacit-calibrate` was replayed against the deployed gold-supervised artifact
+(`design-pattern-tacit:1.0.1` = image `afeb2116…`, served with `TACIT_ADAPTIVE=false`,
+5 repeats per row, 138 holdout rows over all 36 served classes):
+
+| floor | acted | acted rate | acted accuracy | 95 % CI |
+|---|---|---|---|---|
+| 0.1-0.3 | 131 | 0.949 | 0.450 | 0.368-0.536 |
+| 0.5 | 119 | 0.862 | 0.471 | 0.383-0.560 |
+| 0.7 | 91 | 0.659 | 0.505 | 0.405-0.606 |
+| 0.85 | 54 | 0.391 | 0.593 | 0.460-0.713 |
+| 0.9 | 36 | 0.261 | 0.722 | 0.560-0.842 |
+| 0.95 | 23 | 0.167 | 0.913 | 0.732-0.976 |
+
+Verdict: **FAIL — no floor clears acted accuracy 0.80 at an acted rate of 0.30.** The two bars cross
+past each other: accuracy only reaches 0.91 where the seam acts on 17 % of rows, and at the 30 %
+rate point (floor 0.85) accuracy is 0.593. Whole-holdout accuracy is 0.442 over 36 classes (chance
+0.028), so the checkpoint carries signal; it is not close to the bar. Confidence is also
+poorly calibrated (ECE 0.322, Brier 0.332), and five repeats flip acted rows at every floor from
+0.5 up (`max_confidence_spread` 0.031), so the repeat-consistency rollback trigger would fire too.
+
+What this means: the §4.7.1 **data** preconditions are met and provably fed into the gate
+(`label_review: certified`), and the answer link is still the binding constraint — now measured on
+138 balanced rows instead of 30 skewed ones. The next lever is not more labels: it is a retrain
+that consumes the 580 new train shards, then this same command re-run against the new artifact.
+
+**Next step: one gold-supervised retrain, with a stop rule.** The measured reason to retrain is
+not hope that more tuning helps, it is that the *signal is in the labels and the artifact is not
+extracting it*. A plain TF-IDF (1-2 gram) + logistic-regression baseline trained on the same 719
+train labels scores **0.833 on the 138-row holdout** (1.000 at the top 30 % by confidence), while
+the served 4B artifact scores 0.442 overall and 0.593 at the 39 % it acts on. The 4B's failures are
+also structured rather than diffuse: seven classes sit at 0.00 accuracy on 3-6 rows each and
+abstention is 2/13, i.e. exactly the classes the old 128-row gold set barely covered — the thing
+719 gold rows per class-coverage fix. Sequence and gates, in order:
+
+1. Retrain the style shards **gold-supervised** (`--style-gold`, 719 rows, not the 128 of the last
+   attempt), so no teacher pass is needed (≈1.5-2 h QLoRA + merge + extract on the 4x3090 host).
+2. Build-internal gate: `self-distill.json`'s `seams.style-gold.agreement` must move well above the
+   old 0.333. If it does not, the distillation is compressing the student back to the teacher's prior
+   again — stop there, before deploying.
+3. Serve the artifact and re-run `make tacit-calibrate` on the 138-row holdout; PASS needs a floor at
+   ≥ 0.80 acted accuracy and ≥ 0.30 acted rate.
+4. Enablement still needs the non-inferiority A/B rule above; calibration PASS is necessary, not
+   sufficient.
+
+If (3) fails again, the conclusion is not "tune more". Four retrains, a five-fold label increase and
+a linear baseline that beats the 4B together say the sidecar is the wrong instrument for a 36-way
+lexical read: either drop the style seam, or change the serving path (a dedicated abstention head, a
+shortlist-then-discriminate serving layout, or a linear style head — each its own decision, with its
+own review). Re-tuning a fifth time would be unfalsifiable.
+
+To reproduce, on a host that can serve the artifact:
+
+```
+ssh -L 18100:127.0.0.1:8100 <gpu-host>     # or pass --base-url at the tunnel's port
+make tacit-calibrate                        # writes models/tacit-calibration.json
+```
 
 Rollback triggers stay unchanged: a calibration FAIL on the deployed image, an A/B whose
 reasons cite hit rate or repeat stability, a re-calibration of the deployed image below 0.80
@@ -703,6 +791,7 @@ which two extra gateway calls cannot do, so a `candidate-win` would be a noise e
 Enabling needs a seam-appropriate non-inferiority rule (candidate hit rate >= baseline Wilson
 lower bound, holdout p95 within +15 %, repeat agreement non-inferior) approved and
 implemented first.
+
 
 ### 4.8 Production: serving the verified artifact (GPU only)
 

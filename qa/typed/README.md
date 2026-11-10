@@ -1,18 +1,32 @@
 # Typed labels for decision-model finetuning
 
-2,338 typed labels derived from `tests/benchmark/scenarios/full.json`
-(the 2,169 script-derived rows plus 169 reviewed style rows): the choice/noul
-labels are script-derived from the 169 reviewed scenarios (no new review burden);
-the style labels are per-scenario reviewed judgments with a quoted rationale each
+3,914 typed labels derived from `tests/benchmark/scenarios/full.json`
+(the 2,169 script-derived rows over the original 169 scenarios, plus 857 reviewed
+style rows and 857 mirrored choice rows): the noul labels are script-derived from
+the 169 original scenarios (no new review burden); the style labels are per-scenario
+reviewed judgments with a quoted rationale each
 (`scripts/decision_models/derive_style_labels.py`).
 Corpus labels are agent-curated, **human expert review pending**.
+
+The 2026-11 style-label gap work (§4.7.1 of `docs/tacit-fine-tune.md`) took the
+corpus from 169 to 857 scenarios: 688 candidates were labelled by **two blind
+model annotators** under `qa/typed/style-rubric.md` with opaque row ids, Cohen's
+kappa recorded per batch (0.978-0.993 train, 0.981 and 1.000 holdout), and every
+disagreement adjudicated in writing (each adjudicated row carries the adjudicator's reason in
+`review.json`). Candidate selection was **stratified by served class with a per-class floor**, not
+uncertainty-sampled: the plan's least-confidence ranking needs a served base checkpoint, and no
+gateway was reachable from the workspace that built this corpus, so class coverage is guaranteed
+by construction instead (`style_label_gap.py`'s pool report records the method). `review.json` certifies all 857 labels at the
+label source's current bytes, and `human_review` now records the project owner's acceptance of
+a 47-row audit sheet spanning all 36 labels (sampled, not a row-by-row expert review — the block
+says so explicitly).
 
 ## Files
 
 | file | n | shape | seam |
 |---|---|---|---|
-| `choice.jsonl` | 169 | `state` + 9 `criteria` + `label` (category) | J2 category |
-| `style.jsonl` | 169 | `state` + 36 `criteria` + `label` (style) | Ch2 style |
+| `choice.jsonl` | 857 | `state` + 9 `criteria` + `label` (category) | J2 category |
+| `style.jsonl` | 857 | `state` + 36 `criteria` + `label` (style) | Ch2 style |
 | `noul.jsonl` | 2000 | `state` + `proposition` + boolean `label` (+ `candidate_text`) | J1 per-candidate relevance |
 | `rerank_pairs.jsonl` | 2000 | `statement` + `document` (+ `gain`, `split`, `name`) | J1 serving bytes (train + eval) |
 | `review.json` | — | per-scenario human review ledger | Ch2 enable-path gate |
@@ -22,15 +36,16 @@ Corpus labels are agent-curated, **human expert review pending**.
 - Style: 1 per scenario, criteria/instructions = the served Ch2 vocabulary verbatim
   (`src/decisions/seam_prompts.py` shared vocabulary), `state` = the raw scenario
   description bytes the seam receives, label = the reviewed dominant
-  architecture style with a quoted rationale. Train split: 139 rows over all 36
-  criterion keys — every served style has at least one train positive (the 69
-  train-only style-exemplar scenarios added 2026-11 closed the last 23 gaps;
-  largest classes are monolithic 20, none 11, layered-monolith 10), with one
-  recorded audit exception: `api-gateway` lost its only two train labels when the
-  2026-11 review corrected them to monolithic, so new gateway exemplars are a
-  data requirement (`tests/unit/test_benchmark_draft_style.py::
-  _UNCOVERED_TRAIN_STYLES` fails if the gap grows); the 30 holdout rows are
-  labeled for eval only and never reach training weights.
+  architecture style with a quoted rationale. Train split: 719 rows over all 36
+  criterion keys — every served style has at least 13 train positives, so no
+  class is starved and the 2026-11 audit exception is closed: `api-gateway` lost
+  its only two train labels when that review corrected them to monolithic, and
+  the gap work added 25 reviewed gateway train rows (Spring Cloud Gateway and
+  Kong routes, an MCP gateway endpoint, and deliberately negative rows that are
+  NOT gateways). `tests/unit/test_benchmark_draft_style.py` fails if the
+  uncovered-styles set, the 500-label train floor, the per-class floor or the
+  100-row holdout floor regresses. The 138 holdout rows are labeled for eval only
+  and never reach training weights.
   Review state is machine-readable: `review.json` records per-scenario review
   (reviewer identity, label, `labels_sha256`, `rationale_ok`) plus a
   `human_review` block — a model review pass is recorded as such, never as
@@ -60,9 +75,14 @@ Corpus labels are agent-curated, **human expert review pending**.
 
 ## Split
 
-Train = 1,678, holdout = 660 (choice + style: 139/30 each; noul: 1,400/600).
+Train = 2,258, holdout = 768 (choice + style: 719/138 each; noul: 1,400/600).
 Families never cross the split. Train on `source.split == "train"`; fit thresholds
 / temperature on held-out **families**, not training rows (recommendation §6.6).
+
+The style split is the §4.7.1 instrument: 719 train labels (>= the 500 floor, every
+class >= 13 rows) and 138 family-disjoint holdout rows (>= the 100 floor, every class
+>= 2 rows) so a confidence floor is measured over the whole served vocabulary
+instead of the 11 classes the 30-row holdout happened to contain.
 
 The rerank pairs keep the same rule: `tacit_self_distill.load_rerank_pairs` reads
 `split == "train"` rows only, so the holdout pairs can never reach the weights.
@@ -83,7 +103,7 @@ Per `docs/recommendation_design-pattern-mcp_decision-models.md` §4/§7.5:
   holdout rerank pairs score the leg (nDCG) without touching the weights.
 - **Eikos-4B** (LoRA r64), **Clef-flash-9B** (QLoRA), **Kev-4B**
   (`kev.train --init_from`) each want 500–2,000 labeled decisions — this
-  export (1,678 train) is in budget. Kev's data shape is the API shape plus
+  export (2,258 train) is in budget. Kev's data shape is the API shape plus
   `label`, exactly these records.
 
 Label tiers double as sample weights: `primary` > `acceptable_primary` >

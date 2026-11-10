@@ -10,6 +10,8 @@ asserted here against the real catalog (a namespace check, no LLM call, no side 
 
 from __future__ import annotations
 
+from collections import Counter
+
 from typing import Any
 
 import pytest
@@ -124,30 +126,33 @@ def test_compose_scenario_id_respects_the_schema_cap() -> None:
     assert draft_mod._compose_scenario_id("saga-trip-holds", "saga") == "saga-trip-holds"
 
 
-#: Served styles whose only train labels the 2026-11 audit corrected away. Recorded, never
-#: silently dropped: the list must stay an exact, reasoned exception, so a NEW gap fails the
-#: coverage test below. Closing it needs new api-gateway train exemplars (data requirement).
-_UNCOVERED_TRAIN_STYLES: dict[str, str] = {
-    "api-gateway": (
-        "audited 2026-11: remote-contracts-audit-traversal and remote-contracts-order-submission "
-        "were labelled api-gateway by mistake (one service's export endpoint and one coarse "
-        "SubmitOrder operation, not a gateway fronting backend services) and are now monolithic"
-    ),
-}
+#: Served styles whose only train labels the 2026-11 audit corrected away, and the review that
+#: closed the gap. The dict must stay empty now: the style-gap corpus work (docs/tacit-fine-tune.md
+#: §4.7.1) added 25 reviewed api-gateway train exemplars, so any remaining gap is a regression.
+_UNCOVERED_TRAIN_STYLES: dict[str, str] = {}
+
+#: §4.7.1 data precondition on the holdout: `>= 100` family-disjoint rows, so a lowered holdout
+#: fails here rather than silently weakening every calibration against the seam.
+_HOLDOUT_FLOOR = 100
+#: §4.7.1 precondition on train volume, and the floor every single class must clear.
+_TRAIN_FLOOR = 500
+_TRAIN_PER_CLASS_FLOOR = 10
 
 
 def test_corpus_style_exemplars_carry_one_train_positive_per_criterion() -> None:
-    """Every served style has a train positive, except the recorded audit exceptions.
-
-    Holdout stays the untouched 30 scenarios.
-    """
+    """Every served style has a train positive, and the corpus meets the §4.7.1 volume floors."""
     styles = [
         line for line in (REPO_ROOT / "qa" / "typed" / "style.jsonl").read_text(encoding="utf-8").splitlines() if line
     ]
     import json
 
     rows = [json.loads(line) for line in styles]
-    train = {row["label"] for row in rows if row["source"]["split"] == "train"}
-    uncovered = set(seam_prompts.STYLE_GLOSSES) - train
+    train = [row for row in rows if row["source"]["split"] == "train"]
+    holdout = [row for row in rows if row["source"]["split"] == "holdout"]
+    uncovered = set(seam_prompts.STYLE_GLOSSES) - {row["label"] for row in train}
     assert uncovered <= set(_UNCOVERED_TRAIN_STYLES), f"new styles without a train positive: {uncovered}"
-    assert sum(1 for row in rows if row["source"]["split"] == "holdout") == 30
+    assert len(train) >= _TRAIN_FLOOR, f"train style labels {len(train)} < {_TRAIN_FLOOR}"
+    assert len(holdout) >= _HOLDOUT_FLOOR, f"holdout rows {len(holdout)} < {_HOLDOUT_FLOOR}"
+    per_class = Counter(row["label"] for row in train)
+    thin = {label: count for label, count in per_class.items() if count < _TRAIN_PER_CLASS_FLOOR}
+    assert thin == {}, f"train styles below {_TRAIN_PER_CLASS_FLOOR} rows: {thin}"
