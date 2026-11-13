@@ -137,6 +137,35 @@ The candidate arm is the seam **ON**. So this is not a non-inferiority gate: the
 make holdout p95 at least 15 % *better* than the LLM-sampled baseline while not losing hit rate
 or repeatability. The earlier run of this same rule on this seam returned +9.2 % and
 `candidate-loss` (`docs/JEV_BENCHMARK_REPORT.md` §3.1), which is the number to beat.
+**Verdict: `candidate-loss`, decided by the repeat-stability leg.** The run finished on
+`2026-11-13` (arms `20261113-153156-style-off` 15:47→17:01 and `…-style-on` 17:17→18:07 UTC).
+`make benchmark-style-ab` exited 1 from the compare step — that is the verdict's own signal,
+loud by design, not a crash.
+
+| rule leg | baseline (seam OFF) | candidate (seam ON) | outcome |
+|---|---|---|---|
+| holdout p95 e2e | 349.32 s | **218.45 s** (+37.5 %) | **PASS** (bar +15 %) |
+| overall acceptable-primary hit rate | 0.389 (7/18; Wilson LB 0.203) | 0.389 (7/18) — identical | **PASS** (≥ LB) |
+| holdout final-pattern repeat agreement | **0.667** (4/6 scenarios stable) | **0.167** (1/6 stable) | **FAIL** (≥ baseline) |
+
+The compare's only `reasons` entry:
+`"candidate holdout final-pattern repeat agreement 0.167 < baseline 0.667"`.
+
+What each leg says:
+
+* **Latency: the seam is genuinely cheaper.** p95 improved 37.5 % — more than double the
+  +15 % bar — and the paired delta is decisive (faster 16 / slower 2, sign test p = 0.0013).
+  This is the expected shape of the gain: the ~8 ms head call replaces one LLM-sampled field
+  in the analyze call, and one generator round goes away per scenario.
+* **Hit rate: no quality regression, and no quality gain.** 7/18 on both arms, Newcombe
+  difference +0.000 [−0.292, +0.292]. Acceptable-primary F1 is also tied (0.1944), and the
+  recall legs move down slightly (recall@5 0.167 → 0.100) with medians at 0 — noise at
+  n=18, not a signal.
+* **Repeatability: the seam destabilizes the final pattern.** 1/6 stable scenarios against the
+  baseline's 4/6. The head itself is fully deterministic (repeat agreement 1.0 on the style
+  question, §5), so the flips are *downstream* of a correct answer: an injected style that
+  sharpens one run's selection tips its final pattern differently on each repeat — see the
+  hit flips (`ib-admin-controller#2`, `ps-mapping-layer#1`/`#3`, `sv-order-double-tests#2`).
 
 One cost is known before the arms finish, and it bounds how a delta may be read: the head's own
 call is ~8 ms. The calibration replay made `4140` requests (138 rows × 5 repeats × (1 + 5 permutations)) in 35 s against the served container,
@@ -188,20 +217,45 @@ Provenance of the measured image: the arms run the `design-pattern-mcp` image bu
 into `src/server.py::style_client_for` (identical body, now pinned per provider by
 `tests/unit/test_decisions_wiring.py`), so the verdict applies to the current branch unchanged.
 
-**Generator substitution, and why it is not optional.** The shipped default generator is
-`opencode-go` / `muse-spark-1.3-contributor` on `https://opencode.ai/zen/go/v1`. On this key
-the Go gateway answers *"An active OpenCode Go subscription is required to use OpenCode Go
-models"*, and the non-Go Zen base answers *"Insufficient balance"* — so every scenario would
-have run the documented degraded paths (ERR_009 → minimal single-part brief, E12 retries, an
-open circuit breaker) and the arms would have differed by noise. The first attempt at this run
-did exactly that and was thrown away; `scripts/benchmark-docker.sh` now refuses a stack whose
-rendered `GENERATOR_API_KEY` is empty (`72d6866`), because an unauthenticated stack still
-"completes". Both arms therefore run `deepseek/deepseek-chat` on
-`https://api.deepseek.com/v1` — **the same generator in both arms**, so the comparison stays
-internally valid, but its absolute latencies are not the shipped default's and are not
-comparable with `docs/JEV_BENCHMARK_REPORT.md` §3.1's numbers.
+**Generator: the shipped default, after an abandoned substitution.** The run that produced
+this verdict used `opencode-go` / `muse-spark-1.3-contributor` on the Go gateway — the
+shipped default, now with an enabled account, verified live (`finish_reason stop`, content
+`OK`, billed usage) before the relaunch. That makes these latencies comparable with
+`docs/JEV_BENCHMARK_REPORT.md` §3.1's numbers, and the earlier "generator substitution" note in this section applied only to
+the abandoned DeepSeek attempt, never to this run.
 
-_Result recorded below._
+The earlier plan for this run was `deepseek/deepseek-chat` in both arms, forced by an
+unusable credential (Go gateway: *"An active OpenCode Go subscription is required to use
+OpenCode Go models"*; non-Go Zen base: *"Insufficient balance"*). The DeepSeek run started,
+measured 0/18 records, and was abandoned when the account was enabled. Its would-have-been
+caveat — same generator in both arms keeps the comparison internally valid, but absolute
+latencies are not the shipped default's — never applied, and the substitution is history, not
+method. Two permanent guards came out of that episode: `scripts/benchmark-docker.sh` refuses
+a stack whose rendered `GENERATOR_API_KEY` is empty (`72d6866`), because an unauthenticated
+stack still "completes" down the degraded paths; and both arms must carry the floor
+(`6a28ef5`) so `ENABLED` is the only variable that differs.
+
+Provenance of the verdict: both manifests agree on `seed.json` at sha `ebfa882dce2b`, `e2e`
+mode, `holdout` split, no limit, 3 repeats, one excluded warmup record, 18 measured records
+and 0 errors per arm. The `env` block in each manifest shows only `DECISIONS_STYLE_ENABLED`
+(false vs true) differing, with `PROVIDER=linear`, the `:8800/v1` base URL, `MODEL=style-linear`
+and `FLOOR=0.1` identical — the premise the rule requires.
+
+### Consequence — recorded, not deferred
+
+Per the plan's pre-committed stop rule (stated here before the run finished): the linear head
+is **measured-and-rejected**, exactly like the CLM arm. The seam stays default-off
+(`provider = "tacit"`, `enabled = false`), `linear-style-seam` is **not merged into `tacit`**,
+and no further provider is attempted here.
+
+That is a loss of a specific, informative shape, and it reframes the remaining question. The
+head is right about the style question (0.8333 top-1 on the family-disjoint 138-row holdout,
+and the only provider with a qualifying operating point) — what fails is not perception but
+actuation: the pipeline's `_apply_decision_style` turns a correct confident answer into a
+*less* repeatable selection. Reopening this would mean changing the act path (a narrower act
+condition than the fitted floor, or treating the head's answer as a prior rather than an
+override) — a design decision about the seam's semantics, not a fourth model family, and it is
+out of scope for this plan.
 
 ## 7. Operating it
 
