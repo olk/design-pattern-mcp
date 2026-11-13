@@ -432,6 +432,13 @@ docker-build-tacit: tacit-payloads-check check-dockerfile-shell ## Fine-tune Tac
 	@# the current train inputs — BEFORE docker build, so a stale cache never
 	@# re-tags the image and the failure is loud, not a silent old-weights rebuild.
 	@if [ "$(TACIT_BUILD_TARGET)" = "$(TACIT_CACHED_TARGET)" ]; then \
+		if ! ls -A "$(TACIT_HOST_DIR)"/*.safetensors >/dev/null 2>&1; then \
+			echo "ERROR: $(TACIT_HOST_DIR)/ holds the COMMITTED sentinels but no weight shards."; \
+			echo "       A fresh clone looks exactly like this: config.json + self-distill.json are in git,"; \
+			echo "       the multi-GB weights are not. The cached stage would COPY a dir vLLM cannot load."; \
+			echo "Run 'rm -rf $(TACIT_HOST_DIR)' so the train path rebuilds the weights."; \
+			exit 1; \
+		fi; \
 		if ! (cd "$(CURDIR)" && sha256sum -c "$(TACIT_HOST_COMPLETE)" --quiet --status 2>/dev/null); then \
 			echo "ERROR: $(TACIT_HOST_DIR)/ is stale — a train input changed since the weights were extracted."; \
 			echo "Run 'rm -rf $(TACIT_HOST_DIR)' and rebuild to retrain, or restore the inputs."; \
