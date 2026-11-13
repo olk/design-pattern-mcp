@@ -272,3 +272,41 @@ on ≥ 10 acted rows. One controlled retry only, with a stated hypothesis (val f
 falls → overfit: lr 2.5e-4 or 10 epochs; both poor → underfit: 40 epochs). A second failure
 stops the effort and is recorded here — the `docs/tacit-fine-tune.md` §4.7.1 lesson is that an
 unfalsifiable fourth attempt is not a plan.
+
+## 9. Measured results
+
+Same instrument for every arm: the 138-row family-disjoint holdout, 36 classes, chance
+`1/36 ≈ 0.028`.
+
+| arm | holdout top-1 | notes |
+|---|---|---|
+| released CLM-v0.1-8B heads | **0.036** | the `init` baseline, in-build |
+| AnyJev Tacit-4B (committed report) | **0.420** | `models/tacit-calibration.json`, n=138 |
+| CLM-8B heads-only, run 1 | **0.507** | this branch, 719 train labels |
+| TF-IDF(1-2gram) + LogReg | **0.833** | `docs/tacit-fine-tune.md` §4.7.1, same 719 labels |
+
+### Run 1 — `lr 5e-4` (upstream default)
+
+Built on `tacit-clm-ft` (4× RTX 3090) from `2244590`'s parent. Train 1438 rows / test 276
+(719 + 138 per question), batch 32, `--targets hard --loss infonce`, embeddings from the
+in-build Qwen3-8B pooling server.
+
+- epochs to early stop **14**, best epoch **9**, val acc **0.632**, train loss still falling
+  (0.44) — the plan's overfit signature, not underfit;
+- **eval gate `[4/6]`: PASS.** `architecture_style` test **0.5072** vs released init 0.0362
+  (tolerance 1/138), majority share 0.0942; R6 all 36 test labels have train positives; R7
+  nothing to acknowledge; R8 reports the unreviewed category training as advisory;
+- **rank-parity gate `[5/6]`: FAIL**, and this is what stopped the build — **8/30 top-1
+  flips (0.267) against the 0.250 budget**, with mean nDCG@10 0.8108 trained vs 0.8052
+  released and mean top-5 overlap 0.827. The trained head is not ranking *worse*, it is
+  ranking differently: one payload fewer would have cleared the budget.
+
+So the primary objective is missed on the absolute bar: **0.507 < 0.65** (the delta bar is
+cleared comfortably, +0.471 over the released heads). Per the plan this triggers its single
+pre-registered retry — lr `2.5e-4` — and a second failure stops the effort.
+
+An important shape to the result: CLM-8B beats Tacit-4B on this seam (0.507 vs 0.420) and
+beats the released heads by 14×, yet both sidecars remain far below a linear lexical model
+on the same 719 labels (0.833). The gap is modelling, not data, exactly as §4.7.1 of the
+Tacit document argues — a heads-only contrastive adapter over a frozen encoder is not the
+instrument that extracts this signal.
