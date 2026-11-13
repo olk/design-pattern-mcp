@@ -127,8 +127,16 @@ label on 115 of 138 (`0.8333`), so there is no train/serve skew in the label map
 ## 6. A/B verdict
 
 `make benchmark-style-ab STYLE_PROVIDER=linear STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml`
-— the pre-registered rule (`tests/benchmark/README.md`): holdout p95 within +15 % of the
-baseline arm **and** repeat non-inferiority, with `REQUIRE_REPEAT_STABILITY=1`.
+— the pre-registered rule, verbatim from `tests/benchmark/harness/compare.py`:
+
+> candidate wins iff holdout p95 e2e improves >= 15% AND candidate overall acceptable-primary hit
+> rate >= baseline overall Wilson lower bound AND candidate holdout final-pattern repeat
+> agreement >= baseline
+
+The candidate arm is the seam **ON**. So this is not a non-inferiority gate: the seam has to
+make holdout p95 at least 15 % *better* than the LLM-sampled baseline while not losing hit rate
+or repeatability. The earlier run of this same rule on this seam returned +9.2 % and
+`candidate-loss` (`docs/JEV_BENCHMARK_REPORT.md` §3.1), which is the number to beat.
 
 **Instrument: `tests/benchmark/scenarios/seed.json`, holdout split, `REPEAT=3` — 6 scenarios,
 18 records per arm.** That is the corpus this seam's own documented A/B used
