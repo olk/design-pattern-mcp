@@ -244,69 +244,112 @@ captures the checkpoint AND both reports, which the Makefile then hashes into
 `.extract-complete`; `runtime-released` places `CLM_v0.1-8B.pt` at exactly `/clm/heads/best_head.pt`,
 the path `CLM_CKPT` serves.
 
-NOT yet measured — the GPU host (`192.168.1.153`, 4× RTX 3090) was unreachable (`No route to
-host`, and its Proxmox parent with it) when this branch was cut. The remaining steps are
-gated on that host. The branch travels as `~/clm-style-seam.bundle` (complete history;
-`git bundle verify` names the tip it carries, so this paragraph cannot go stale):
+MERGED AND RUN, on `tacit-clm-ft` (4× RTX 3090) from this branch. Every step executed:
 
-1. `scp ~/clm-style-seam.bundle <host>:/tmp/`, then on the host
-   `git fetch /tmp/clm-style-seam.bundle clm-style-seam:clm-style-seam && git checkout clm-style-seam`,
-   then `make docker-build-clm-base` (no GPU; verify `/clm/heads/best_head.pt` exists in the
-   image). Both build targets run `clm-payloads-check` first, so the host needs `uv` — the
-   same prerequisite the Tacit lane already satisfies;
-2. `make docker-build-clm` (GPU: free card 0 first — the in-build pooling encoder lands
-   there, so `docker stop design-pattern-tacit-dev` and never build Tacit and CLM
-   concurrently); the build writes `clm-eval-gate: PASS` and the rank-parity report;
-3. `rsync` `models/clm-heads/` back, then `sha256sum -c models/clm-heads/.extract-complete`;
-4. baseline replay E1 against the `:base` image → `models/clm-calibration-base.json`;
-5. tuned replay E2 against the trained image → `models/clm-calibration.json`.
+1. `docker-build-clm-base` — succeeded once `docker/clm-entrypoint.sh` and the four CLM
+   scripts were whitelisted in `.dockerignore` (they were not; the build failed at that COPY
+   in 3 s, and `docker build --check` does NOT validate COPY sources against the context);
+   verified `/clm/heads/best_head.pt` = 75 557 149 B in the `:base` image;
+2. `docker-build-clm` — run 1 stopped at the rank-parity gate (8/30 vs a 0.250 budget, with
+   nDCG slightly BETTER trained); run 2, the plan's single retry at `lr 2.5e-4`, passed both
+   gates and produced `design-pattern-clm:1.0.1` (image `7e186c051de9`);
+3. heads + both gate reports extracted to `models/clm-heads/`, marker verified
+   (`sha256sum -c .extract-complete` clean on the workstation);
+4. E1 baseline replay against `:base` → `models/clm-calibration-base.json`;
+5. E2 tuned replay against `:1.0.1` → `models/clm-calibration.json`.
 
-The `tacit-clm-ft` ssh alias does not exist on this workstation (no `~/.ssh/config` stanza);
-use the IP, or add the stanza before running the plan's commands verbatim.
+The host needs `uv` for `clm-payloads-check` / `check-dockerfile-shell`; it did not have it,
+installed from astral.sh. `rsync` is also absent — use `tar -c host | tar -x` over ssh.
+Free GPU 0 first: the in-build pooling encoder defaults to `cuda:0`, and the Tacit dev
+container holds it. Restart `design-pattern-tacit-dev` afterwards.
 
-Acceptance (absolute AND delta, so the unmeasured baseline cannot be gamed):
+Acceptance (absolute AND delta, so the baseline cannot be gamed):
 holdout top-1 ≥ 0.65 and ≥ `init_test + 0.10`; no regression vs the released heads (one
 flipped row tolerated); majority-prior beat; `C_order ≥ 0.95`; `C_repeat ≥ 0.99`; tuned
 consistency ≥ baseline − 0.02; a qualifying floor at acted-accuracy ≥ 0.8 / acted-rate ≥ 0.3
-on ≥ 10 acted rows. One controlled retry only, with a stated hypothesis (val flat while train
-falls → overfit: lr 2.5e-4 or 10 epochs; both poor → underfit: 40 epochs). A second failure
-stops the effort and is recorded here — the `docs/tacit-fine-tune.md` §4.7.1 lesson is that an
-unfalsifiable fourth attempt is not a plan.
+on ≥ 10 acted rows. One controlled retry only, with a stated hypothesis — used.
+
+**Both runs miss the absolute bar and neither E1 nor E2 yields a qualifying floor, so the
+seam stays off. The numbers and the verdict are in §9.**
 
 ## 9. Measured results
+
+**Verdict: REJECT.** The seam stays off. Measured on `tacit-clm-ft` (4× RTX 3090) from this
+branch; every number below is from a committed artifact.
 
 Same instrument for every arm: the 138-row family-disjoint holdout, 36 classes, chance
 `1/36 ≈ 0.028`.
 
-| arm | holdout top-1 | notes |
+| arm | holdout top-1 | source |
 |---|---|---|
-| released CLM-v0.1-8B heads | **0.036** | the `init` baseline, in-build |
-| AnyJev Tacit-4B (committed report) | **0.420** | `models/tacit-calibration.json`, n=138 |
-| CLM-8B heads-only, run 1 | **0.507** | this branch, 719 train labels |
+| released CLM-v0.1-8B heads | **0.0362** | `models/clm-calibration-base.json` |
+| AnyJev Tacit-4B (committed report) | **0.4203** | `models/tacit-calibration.json`, n=138 |
+| CLM-8B heads-only, run 1 (`lr 5e-4`) | **0.5072** | in-build eval gate (build stopped at rank parity, heads not extracted) |
+| CLM-8B heads-only, run 2 (`lr 2.5e-4`) | **0.4565** | `models/clm-calibration.json` (served replay) |
 | TF-IDF(1-2gram) + LogReg | **0.833** | `docs/tacit-fine-tune.md` §4.7.1, same 719 labels |
 
-### Run 1 — `lr 5e-4` (upstream default)
+### The two builds
 
-Built on `tacit-clm-ft` (4× RTX 3090) from `2244590`'s parent. Train 1438 rows / test 276
-(719 + 138 per question), batch 32, `--targets hard --loss infonce`, embeddings from the
-in-build Qwen3-8B pooling server.
+| | run 1 (`lr 5e-4`) | run 2 (`lr 2.5e-4`) |
+|---|---|---|
+| best epoch / early stop | 9 / 14 | 14 / 19 |
+| val accuracy | 0.6319 | 0.5833 |
+| `architecture_style` test | **0.5072** | **0.4493** |
+| rank parity (budget 0.25) | **FAIL** 8/30 = 0.267 | **PASS** 7/30 = 0.233 |
+| mean nDCG@10 trained vs released | 0.8108 vs 0.8052 | 0.8305 vs 0.8049 |
+| mean top-5 overlap | 0.827 | 0.847 |
 
-- epochs to early stop **14**, best epoch **9**, val acc **0.632**, train loss still falling
-  (0.44) — the plan's overfit signature, not underfit;
-- **eval gate `[4/6]`: PASS.** `architecture_style` test **0.5072** vs released init 0.0362
-  (tolerance 1/138), majority share 0.0942; R6 all 36 test labels have train positives; R7
-  nothing to acknowledge; R8 reports the unreviewed category training as advisory;
-- **rank-parity gate `[5/6]`: FAIL**, and this is what stopped the build — **8/30 top-1
-  flips (0.267) against the 0.250 budget**, with mean nDCG@10 0.8108 trained vs 0.8052
-  released and mean top-5 overlap 0.827. The trained head is not ranking *worse*, it is
-  ranking differently: one payload fewer would have cleared the budget.
+Run 1 passed every eval-gate rule (R0–R7) and was stopped only by rank parity, one payload
+over budget. That is what triggered the plan's single pre-registered retry (train loss still
+falling while val plateaued → overfit → `lr 2.5e-4`). The retry bought rank parity and paid
+for it in accuracy: **0.5072 → 0.4493**. Neither run reaches 0.65.
 
-So the primary objective is missed on the absolute bar: **0.507 < 0.65** (the delta bar is
-cleared comfortably, +0.471 over the released heads). Per the plan this triggers its single
-pre-registered retry — lr `2.5e-4` — and a second failure stops the effort.
+### The two replays
 
-An important shape to the result: CLM-8B beats Tacit-4B on this seam (0.507 vs 0.420) and
-beats the released heads by 14×, yet both sidecars remain far below a linear lexical model
-on the same 719 labels (0.833). The gap is modelling, not data, exactly as §4.7.1 of the
-Tacit document argues — a heads-only contrastive adapter over a frozen encoder is not the
-instrument that extracts this signal.
+`make clm-calibrate` with the plan's protocol (`--floors 0.1…0.7`, `--metric confidence`,
+`--repeats 5`, `--permutations 5`), each against a live `clm-serve` container:
+
+| | E1 (`:base`, released heads) | E2 (`:1.0.1`, trained) |
+|---|---|---|
+| holdout accuracy | 0.0362 | **0.4565** |
+| ECE / Brier | 0.7132 / 0.5621 | — |
+| repeat agreement (5 replays) | 1.0 | 1.0 |
+| order agreement (5 permutations) | 1.0 | 1.0 |
+| qualifying floor (≥0.8 acted at ≥0.3 rate) | none | **none** |
+
+Two cross-checks worth noting. E1's served accuracy (0.0362) equals the in-build
+`init_test.per_question.architecture_style` (0.0362) exactly — the calibration harness and the
+trainer's eval agree to four decimals on the same rows. And E2's served 0.4565 sits within
+0.007 of the trainer's in-process 0.4493, so the served wire reproduces the training-time
+measurement.
+
+E2's acted accuracy never reaches 0.8 at any floor: 0.443 @0.1, 0.450 @0.2, 0.466 @0.3,
+0.500 @0.4, 0.519 @0.5, 0.548 @0.6. The head carries real signal — 16× the released heads,
+and it beats Tacit-4B — but it has no confident region worth handing the seam.
+
+### Why it fails, and what that means
+
+The gate arithmetic against the plan's objectives:
+
+- **FAIL** absolute holdout accuracy ≥ 0.65 (0.4565)
+- PASS delta over the released baseline ≥ +0.10 (+0.4203)
+- PASS repeat agreement ≥ 0.99 (1.0 both arms)
+- PASS order agreement ≥ 0.95 (1.0 both arms)
+- PASS consistency not worse by > 0.02
+- **FAIL** a qualifying floor exists (none)
+
+So the seam would have to act on every row and still be wrong a third of the time. Per the
+plan's stop rule the effort ends here; this document is the verdict.
+
+The shape of the result is the same one `docs/tacit-fine-tune.md` §4.7.1 reached from the other
+direction: a fine-tuned sidecar over a frozen encoder scores 0.46–0.51 on this 36-way task
+while a TF-IDF(1-2gram) + logistic-regression model over the *same 719 labels* scores 0.833,
+and the released heads score 0.036. Twenty times the parameters, ten times the compute, less
+than two thirds of the accuracy. This is not a case for another retrain — the plan allows one
+retry and it made things worse. It is evidence that the task is a lexical read the encoder
+adapters are the wrong instrument for.
+
+What a future attempt would have to change is the *instrument*, not the hyperparameters
+options already measured out: a shortlist-then-discriminate head, a linear style head served
+directly, or a genuinely different fine-tune objective. Those are design decisions for the
+owner of this seam, not continuations of this experiment.
