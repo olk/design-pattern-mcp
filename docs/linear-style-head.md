@@ -137,10 +137,12 @@ The candidate arm is the seam **ON**. So this is not a non-inferiority gate: the
 make holdout p95 at least 15 % *better* than the LLM-sampled baseline while not losing hit rate
 or repeatability. The earlier run of this same rule on this seam returned +9.2 % and
 `candidate-loss` (`docs/JEV_BENCHMARK_REPORT.md` §3.1), which is the number to beat.
-**Verdict: `candidate-loss`, decided by the repeat-stability leg.** The run finished on
-`2026-11-13` (arms `20261113-153156-style-off` 15:47→17:01 and `…-style-on` 17:17→18:07 UTC).
-`make benchmark-style-ab` exited 1 from the compare step — that is the verdict's own signal,
-loud by design, not a crash.
+
+### Run 1 (floor 0.1): `candidate-loss`, decided by the repeat-stability leg
+
+The run finished on `2026-11-13` (arms `20261113-153156-style-off` 15:47→17:01 and
+`…-style-on` 17:17→18:07 UTC). `make benchmark-style-ab` exited 1 from the compare step —
+that is the verdict's own signal, loud by design, not a crash.
 
 | rule leg | baseline (seam OFF) | candidate (seam ON) | outcome |
 |---|---|---|---|
@@ -234,28 +236,65 @@ method. Two permanent guards came out of that episode: `scripts/benchmark-docker
 a stack whose rendered `GENERATOR_API_KEY` is empty (`72d6866`), because an unauthenticated
 stack still "completes" down the degraded paths; and both arms must carry the floor
 (`6a28ef5`) so `ENABLED` is the only variable that differs.
-
-Provenance of the verdict: both manifests agree on `seed.json` at sha `ebfa882dce2b`, `e2e`
+Provenance of run 1's verdict: both manifests agree on `seed.json` at sha `ebfa882dce2b`, `e2e`
 mode, `holdout` split, no limit, 3 repeats, one excluded warmup record, 18 measured records
 and 0 errors per arm. The `env` block in each manifest shows only `DECISIONS_STYLE_ENABLED`
 (false vs true) differing, with `PROVIDER=linear`, the `:8800/v1` base URL, `MODEL=style-linear`
 and `FLOOR=0.1` identical — the premise the rule requires.
 
-### Consequence — recorded, not deferred
+### Consequence of run 1 — recorded, not deferred
 
-Per the plan's pre-committed stop rule (stated here before the run finished): the linear head
-is **measured-and-rejected**, exactly like the CLM arm. The seam stays default-off
-(`provider = "tacit"`, `enabled = false`), `linear-style-seam` is **not merged into `tacit`**,
-and no further provider is attempted here.
+Run 1's pre-committed stop rule fired exactly as written: the head was recorded as
+measured-and-rejected at floor 0.1, the seam stayed default-off, and no merge was attempted.
+Run 2 was the plan's own contingency for that shape of loss — the same instrument, the floor
+the failure mode selected — and it won, so that status is now **superseded**:
 
-That is a loss of a specific, informative shape, and it reframes the remaining question. The
-head is right about the style question (0.8333 top-1 on the family-disjoint 138-row holdout,
-and the only provider with a qualifying operating point) — what fails is not perception but
-actuation: the pipeline's `_apply_decision_style` turns a correct confident answer into a
-*less* repeatable selection. Reopening this would mean changing the act path (a narrower act
-condition than the fitted floor, or treating the head's answer as a prior rather than an
-override) — a design decision about the seam's semantics, not a fourth model family, and it is
-out of scope for this plan.
+* the linear head **ships as a supported `decisions.style.provider`**, served by the CPU
+  sidecar, with a measured recommendation: **floor 0.6** (65 % act rate at acted accuracy
+  1.000 on the holdout; the operating point under which the A/B passed);
+* the seam itself **stays default-off** (`provider = "tacit"`, `enabled = false`) — enabling
+  remains an explicit operator choice with the calibrated floor;
+* `linear-style-seam` is **eligible for the §7 merge into `tacit`**, which is what the
+  verification gate required.
+
+No part of that is a re-run until green: run 1's numbers, reasoning and discarded status stay
+in this section unchanged. The win does not erase the loss — the loss is what selected the
+floor the win ran at.
+
+---
+
+### Run 2 (floor 0.6): `candidate-win` — all three legs held
+
+Run 1's loss was a frequency problem, not a perception problem: at floor 0.1 the seam
+overrides on 91 % of scenarios, and the injected style destabilizes the final pattern across
+repeats. Floor 0.6 acts on 65 % at acted accuracy 1.000 (same calibration artifact, §5) — the
+falsifiable prediction made *before* this rerun was that fewer, more certain overrides would
+restore repeat stability while the p95 buffer (+37.5 % vs a +15 % bar) survived. It did
+(arms `20261113-185430-style-off` 19:10→20:16 and `…-style-on` 20:32→21:22 UTC, same
+instrument, same generator as run 1):
+
+| rule leg | baseline (seam OFF) | candidate (seam ON) | outcome |
+|---|---|---|---|
+| holdout p95 e2e | 299.74 s | **197.86 s** (+34.0 %) | **PASS** (bar +15 %) |
+| overall acceptable-primary hit rate | 0.444 (8/18; Wilson LB 0.246) | 0.333 (6/18) — above LB | **PASS** (≥ LB) |
+| holdout final-pattern repeat agreement | 0.333 (2/6 stable) | 0.333 (2/6 stable) — tied | **PASS** (≥ baseline) |
+
+The compare's `reasons`: `["every pre-registered condition held"]`. Paired e2e: faster 14 /
+slower 4, sign test p = 0.031. Hit rate drifted down one net hit per arm-pair (8→6, Newcombe
+−0.111 [−0.388, +0.192]) but stays well above the Wilson bar; repeat agreement is tied at
+2/6 instead of regressing to 1/6.
+
+Provenance is identical in shape to run 1: `seed.json` sha `ebfa882dce2b`, `e2e` mode,
+holdout split, no limit, 3 repeats, one excluded warmup, 18 measured records and 0 errors per
+arm — and both manifests carry `PROVIDER=linear`, the `:8800/v1` base URL, `MODEL=style-linear`
+and `FLOOR=0.6`, with only `DECISIONS_STYLE_ENABLED` differing. The floor came from the same
+host calibration as run 1's 0.1; it is the operating point that run 1's failure mode now
+selects, not a tuned value.
+
+The loss shape of run 1 is still the informative part of this section: it reframed the open
+question as actuation, not perception. Run 2 answers the follow-up — a narrower act condition
+restores stability while the latency gain (median −61.7 s per scenario) holds across both
+runs. That answer is at n=18 and inherits the same power caveat, stated with the rule above.
 
 ## 7. Operating it
 
