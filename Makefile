@@ -875,8 +875,14 @@ BENCH_ENV := BENCH_SCENARIOS="$(BENCH_SCENARIOS)" OUT="$(OUT)" RUN_ID="$(RUN_ID)
 	ALLOW_MISMATCH="$(ALLOW_MISMATCH)" DRY_RUN="$(DRY_RUN)" PER_FAMILY="$(PER_FAMILY)" \
 	REQUIRE_REPEAT_STABILITY="$(REQUIRE_REPEAT_STABILITY)" \
 	FAMILIES="$(FAMILIES)" DRAFT_OUT="$(DRAFT_OUT)" BENCH_DECISION_OVERLAY="$(BENCH_DECISION_OVERLAY)" \
-	DECISIONS_STYLE_ENABLED="$(DECISIONS_STYLE_ENABLED)" \
-	DECISIONS_STYLE_CONFIDENCE_FLOOR="$(DECISIONS_STYLE_CONFIDENCE_FLOOR)"
+	$(if $(DECISIONS_STYLE_ENABLED),DECISIONS_STYLE_ENABLED="$(DECISIONS_STYLE_ENABLED)") \
+	$(if $(DECISIONS_STYLE_CONFIDENCE_FLOOR),DECISIONS_STYLE_CONFIDENCE_FLOOR="$(DECISIONS_STYLE_CONFIDENCE_FLOOR)")
+# The two style forwards above are CONDITIONAL on purpose. Unconditional, an unset make
+# variable exports the name with an EMPTY value, and the benchmark container's ServerConfig
+# load rejects '' for a bool and a float — so every target that loads the config in-container
+# (`benchmark-selfcheck`, `benchmark-live`, `benchmark-analyze`) failed before it started, and
+# an A/B arm died after its whole stack was warm. The arms that DO want a value pass it
+# explicitly after BENCH_ENV, which still wins on the command line.
 
 benchmark-selfcheck: ## Benchmark: metric self-check, hand-computed anchors (in Docker; no stack)
 	@$(BENCH_ENV) $(BENCH_DOCKER) selfcheck
