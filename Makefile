@@ -101,6 +101,8 @@ CLM_HEADS_REPO   ?= Contrastive-LM/CLM-v0.1-8B
 CLM_REPO_PIN     ?= d5f9ef0
 # choice-head batch size; embeddings are precomputed, so this is the only batching knob.
 CLM_FINETUNE_BATCH ?= 32
+# Head learning rate (upstream default 5e-4 for --task choice).
+CLM_FINETUNE_LR ?= 5e-4
 VLLM_IMAGE_TAG   ?= v0.17.1
 
 # Which sidecar answers the Ch2 style seam. This is the ONE switch: the endpoint, model
@@ -515,6 +517,7 @@ docker-build-clm: clm-payloads-check check-dockerfile-shell ## Fine-tune the CLM
 		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
 		--build-arg CLM_REPO_PIN=$(CLM_REPO_PIN) \
 		--build-arg CLM_FINETUNE_BATCH=$(CLM_FINETUNE_BATCH) \
+		--build-arg CLM_FINETUNE_LR=$(CLM_FINETUNE_LR) \
 		-t $(CLM_IMAGE):$(DOCKER_TAG) -t $(CLM_IMAGE):latest .
 	@# Train path only: extract the shipped heads to $(CLM_HOST_DIR)/ via
 	@# `docker create` (never started) + `docker cp`; the next run builds cached.
