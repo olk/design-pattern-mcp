@@ -576,7 +576,7 @@ never starts the sidecar, and `config/config.json` defaults all of them to `fals
 
 | Seam | Model / wire | Substitutes | Degrades to |
 |---|---|---|---|
-| Ch2 style | Tacit `POST /v1/decide`, **two stages** (category → ≤26-style shortlist) | the LLM-sampled `brief.architecture_style`, when BOTH stages clear `DECISIONS_STYLE_CONFIDENCE_FLOOR` | the LLM style |
+| Ch2 style | Tacit `POST /v1/decide`, **two stages** (category → ≤26-style shortlist); providers `clm`/`linear` ask ONE 36-criterion `choice` over `/v1/systemone` instead | the LLM-sampled `brief.architecture_style`, when the serving path clears `DECISIONS_STYLE_CONFIDENCE_FLOOR` (both stages under Tacit) | the LLM style |
 | J1 rerank | Tacit `POST /v1/decide`, one `yes_no` per fused-pool candidate (`RERANKER_PROVIDER=tacit`) | the TEI cross-encoder pass over the fused pool | the TEI reranker (identical call) |
 | J4 weights | Tacit `POST /v1/decide` (`score`, 8 axes per part) | the one batched weights LLM call, part by part | the LLM weights call |
 | J2 category | Tacit `POST /v1/decide` (`choice`, 9 categories) | one part's retrieved pool, narrowed after retrieval, and that part's effective category for scoring/fallback | no narrowing (unfiltered pool, LLM hypothesis) |
@@ -706,7 +706,8 @@ Measurement, the recipe correction it forced, and the operating procedure:
 | `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
 | `RERANK_TOP_N` | `10` | Rerank top N |
 | `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) or `tacit` (per-candidate `yes_no` over `/v1/decide`; any failure re-issues the identical TEI call) |
-| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: the two-stage Tacit style choice replaces the LLM-sampled style |
+| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: a decision model replaces the LLM-sampled style; which one is `DECISIONS_STYLE_PROVIDER` |
+| `DECISIONS_STYLE_PROVIDER` | `tacit` | Ch2 wire: `tacit` (two-stage choice, gateway ROOT), `clm` (CLM heads, `/v1` root) or `linear` (CPU linear head, same `/v1/systemone` wire). Provider, endpoint and model must move together — the config refuses a half-switched pair |
 | `DECISIONS_WEIGHTS_ENABLED` | `false` | J4 seam: Tacit `score` questions replace the batched weights LLM call |
 | `DECISIONS_CATEGORY_ENABLED` | `false` | J2 seam: Tacit category `choice` narrows the retrieved pool (never a hard router) |
 | `DECISIONS_REASONING_GATE_ENABLED` | `false` | J5 seam: Tacit `yes_no` can skip a phase's deliberation |
