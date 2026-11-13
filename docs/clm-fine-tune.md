@@ -121,15 +121,26 @@ A floor fitted on a head that does not answer the same question the same way twi
 threshold on noise. `clm_calibrate.py` runs two probes beside the floor table:
 
 - `--repeats N` replays the same bytes N times. Serving is one temperature-0 forward per
-  question, so every row's choice MUST be identical across replays; **any flip refuses the
-  recommendation** (the report still prints). Reported: `style_choice_repeat_agreement`, the
-  per-floor acted-set flips, and the max confidence spread.
+  question, so every row's choice MUST be identical across replays; the recommendation is
+  refused when agreement drops below `MIN_REPEAT_AGREEMENT = 0.99`. That number is the
+  seam's own `C_repeat` target, not 1.0, deliberately: with 138 holdout rows 0.99 tolerates
+  one flipped row, and a script stricter than the gate it feeds would report FAIL on an arm
+  the objective calls PASS — two contradicting verdicts on one measurement. On a
+  temperature-0 head the expected flip count is 0, so any flip is still listed in
+  `consistency.unstable_rows`. Reported: `style_choice_repeat_agreement`, the per-floor
+  acted-set flips, and the max confidence spread.
 - `--permutations K` replays each row K times under a seeded random ordering of its same
   36-criterion map. The criteria are an unordered answer set, so the argmax must not depend on
   the order they were written in. Reported: `style_choice_order_agreement` (the gated number)
   and `canonical_agreement` (drift from the served order, i.e. a head that is order-stable but
   systematically wrong). NOT gated in the script — order invariance is a property of the head
   measured for the arm comparison, whereas a repeat flip is a determinism defect.
+
+The report also pins **which artifact produced these numbers** (`served`): container name,
+image ID, requested tag, container start time and the heads repo. A docker TAG is not a
+served artifact — a long-running container survives the tag being moved onto a newer image,
+which is exactly how an earlier Tacit calibration measured a stale checkpoint — so the image
+ID and start time travel with the measurement instead of being re-derived afterwards.
 
 ## 7. Rollout and rollback
 
@@ -159,23 +170,41 @@ Landed and verified on the workstation:
 - provider switch (`DecisionSeamConfig.provider`, env `DECISIONS_STYLE_PROVIDER`), both
   clients wired per provider, `DecisionModelClient` restored from `tacit-clm`;
 - `build_style_criteria()` re-keyed to `STYLE_VOCABULARY` + ordered byte-parity test;
-- the CLM scripts, both Dockerfile builds (base and trained), the compose sidecar, the
-  `clm-*` Makefile targets, the consistency probes;
+- the CLM scripts and their two Dockerfile targets (`runtime-released` and
+  `runtime-finetuned` exist and pass `docker build --check` — statically only, neither image
+  has been BUILT yet), the compose sidecar, the `clm-*` Makefile targets, the consistency
+  probes;
+- `make clm-calibrate` proved end to end against an oracle stub on this workstation (138
+  rows, 7 floors, both probes populated, `served` provenance recorded, exit 0). That is a
+  PLUMBING check, not a measurement: the stub knows the gold labels, so its 1.0 accuracy says
+  nothing about the head.
+- every in-build script invocation is argv-checked against its own parser
+  (`test_clm_scripts_accept_the_argv_the_image_build_passes`), because a mistyped option
+  otherwise only surfaces hours into a GPU build — `docker build --check` cannot see inside
+  a `RUN`, and `make -n` only prints the recipe;
 - corpus re-adopted at 857 rows (719/138, min 13 per class, zero shared ids), export smoke
   clean (`architecture_style` train 719 / test 138, `uncovered: []`);
 - `make check-all` + `make test-unit` green; `docker build --check` clean on both targets.
 
 NOT yet measured — the GPU host (`192.168.1.153`, 4× RTX 3090) was unreachable (`No route to
-host`) when this branch was cut. The remaining steps are gated on that host:
+host`, and its Proxmox parent with it) when this branch was cut. The remaining steps are
+gated on that host. The branch travels as `~/clm-style-seam.bundle` (`git bundle verify`
+passes; complete history, tip `85daf07` + the follow-up commits):
 
-1. `git bundle` → host → `git checkout clm-style-seam` → `make docker-build-clm-base`
-   (no GPU; verify `/clm/heads/best_head.pt` exists in the image);
+1. `scp ~/clm-style-seam.bundle <host>:/tmp/`, then on the host
+   `git fetch /tmp/clm-style-seam.bundle clm-style-seam:clm-style-seam && git checkout clm-style-seam`,
+   then `make docker-build-clm-base` (no GPU; verify `/clm/heads/best_head.pt` exists in the
+   image). Both build targets run `clm-payloads-check` first, so the host needs `uv` — the
+   same prerequisite the Tacit lane already satisfies;
 2. `make docker-build-clm` (GPU: free card 0 first — the in-build pooling encoder lands
    there, so `docker stop design-pattern-tacit-dev` and never build Tacit and CLM
    concurrently); the build writes `clm-eval-gate: PASS` and the rank-parity report;
 3. `rsync` `models/clm-heads/` back, then `sha256sum -c models/clm-heads/.extract-complete`;
 4. baseline replay E1 against the `:base` image → `models/clm-calibration-base.json`;
 5. tuned replay E2 against the trained image → `models/clm-calibration.json`.
+
+The `tacit-clm-ft` ssh alias does not exist on this workstation (no `~/.ssh/config` stanza);
+use the IP, or add the stanza before running the plan's commands verbatim.
 
 Acceptance (absolute AND delta, so the unmeasured baseline cannot be gamed):
 holdout top-1 ≥ 0.65 and ≥ `init_test + 0.10`; no regression vs the released heads (one

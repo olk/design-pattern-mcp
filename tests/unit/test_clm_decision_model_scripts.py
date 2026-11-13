@@ -1560,3 +1560,274 @@ def test_calibration_main_refuses_a_floor_on_a_nondeterministic_head(
     assert "flip choice across identical replays" in written["recommended"]["reason"]
     assert written["consistency"]["stable_rows"] < written["consistency"]["rows"]
     assert code == 2
+
+
+def test_calibration_main_tolerates_one_flip_where_the_gate_does(
+    calibrator: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal bar is the seam's 0.99 target, not 1.0 — a PASSING arm must exit 0.
+
+    Two contradicting verdicts on one measurement are worse than either alone: if the script
+    refused on any flip, a 199/200 arm (agreement 0.995, objective PASS) would exit 2 and fail
+    ``make clm-calibrate``'s exit-0 requirement. The bar is inclusive, so on 200 rows it
+    admits 2 flips (exactly 0.99) and rejects 3. On the real 138-row instrument it admits 1.
+    """
+    style = tmp_path / "style.jsonl"
+    rows = 200
+    _write_style_row(style, rows=rows)
+    digest = _write_labels_source(tmp_path / "labels.py")
+    review = tmp_path / "review.json"
+    review.write_text(
+        json.dumps(
+            {
+                "status": "reviewed",
+                "reviewers": ["ada"],
+                "reviews": {
+                    "style": [
+                        {
+                            "scenario_id": "s1",
+                            "label": "a",
+                            "reviewer": "ada",
+                            "rationale_ok": True,
+                            "labels_sha256": digest,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _run(flips: int) -> tuple[int, dict[str, Any]]:
+        calls = {"n": 0}
+
+        def _ask(base_url: str, model: str, row: dict[str, Any], question_id: str, timeout: float, criteria: Any = None) -> dict[str, Any]:
+            # Replay 1 is perfect (the floor table is computed from it); replay 2 flips
+            # ``flips`` rows.
+            calls["n"] += 1
+            positional = calls["n"] - rows
+            flip = 0 < positional <= flips
+            return {
+                "choice": "b" if flip else "a",
+                "confidence": 0.9,
+                "probabilities": {"a": 0.9, "b": 0.1},
+            }
+
+        monkeypatch.setattr(calibrator, "ask", _ask)
+        report_path = tmp_path / f"calibration-{flips}.json"
+        code = calibrator.main(
+            [
+                "--style",
+                str(style),
+                "--base-url",
+                "http://x/v1",
+                "--floors",
+                "0.5",
+                "--min-acted-accuracy",
+                "0.8",
+                "--min-acted-rate",
+                "0.1",
+                "--labels",
+                str(tmp_path / "labels.py"),
+                "--review",
+                str(review),
+                "--repeats",
+                "2",
+                "--report",
+                str(report_path),
+            ]
+        )
+        return code, json.loads(report_path.read_text(encoding="utf-8"))
+
+    code, written = _run(1)
+    assert written["consistency"]["style_choice_repeat_agreement"] == pytest.approx(199 / 200)
+    assert written["recommended"]["floor"] == pytest.approx(0.5)
+    assert code == 0
+
+    # Exactly at the bar (198/200 == 0.99) still recommends: the comparison is inclusive.
+    code, written = _run(2)
+    assert written["consistency"]["style_choice_repeat_agreement"] == pytest.approx(0.99)
+    assert written["recommended"]["floor"] == pytest.approx(0.5)
+    assert code == 0
+
+    code, written = _run(3)
+    assert written["consistency"]["style_choice_repeat_agreement"] == pytest.approx(197 / 200)
+    assert written["recommended"]["floor"] is None
+    assert "flip choice across identical replays" in written["recommended"]["reason"]
+    assert code == 2
+
+
+def test_calibration_accepts_exactly_the_argv_the_make_rule_passes(calibrator: types.ModuleType) -> None:
+    """The ``clm-calibrate`` recipe must parse — including the inspected provenance flags.
+
+    A ``make -n`` run only PRINTS the recipe, so an option the script never defined is
+    invisible until the first real run, hours into a GPU session. This pins the contract:
+    every flag in the Makefile's ``clm-calibrate`` target parses, and the provenance values
+    land in the report instead of being dropped.
+    """
+    argv = [
+        "--style",
+        "qa/typed/style.jsonl",
+        "--base-url",
+        "http://127.0.0.1:18700/v1",
+        "--floors",
+        *["0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7"],  # unquoted in the recipe: shell-split
+        "--metric",
+        "confidence",
+        "--min-acted-accuracy",
+        "0.8",
+        "--min-acted-rate",
+        "0.3",
+        "--min-acted",
+        "10",
+        "--repeats",
+        "5",
+        "--permutations",
+        "5",
+        "--report",
+        "models/clm-calibration.json",
+        "--served-container",
+        "design-pattern-clm-dev",
+        "--served-image",
+        "sha256:abc",
+        "--served-image-tag",
+        "design-pattern-clm:1.0.2",
+        "--served-container-started-at",
+        "2026-11-13T10:00:00Z",
+        "--served-model-repo",
+        "Contrastive-LM/CLM-v0.1-8B",
+    ]
+    args = calibrator.parse_args(argv)
+    assert args.repeats == 5
+    assert args.permutations == 5
+    assert args.floors == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    assert args.served_image == "sha256:abc"
+    assert args.served_model_repo == "Contrastive-LM/CLM-v0.1-8B"
+
+
+def test_calibration_report_carries_the_served_artifact(
+    calibrator: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A docker TAG is not a served artifact; the report pins the image ID and start time."""
+    style = tmp_path / "style.jsonl"
+    _write_style_row(style, rows=2)
+    monkeypatch.setattr(
+        calibrator,
+        "ask",
+        lambda *args, **kwargs: {"choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9, "b": 0.1}},
+    )
+    report_path = tmp_path / "calibration.json"
+    calibrator.main(
+        [
+            "--style",
+            str(style),
+            "--base-url",
+            "http://127.0.0.1:18700/v1",
+            "--floors",
+            "0.5",
+            "--report",
+            str(report_path),
+            "--served-container",
+            "design-pattern-clm-dev",
+            "--served-image",
+            "sha256:deadbeef",
+            "--served-image-tag",
+            "design-pattern-clm:1.0.2",
+            "--served-container-started-at",
+            "2026-11-13T10:00:00Z",
+            "--served-model-repo",
+            "Contrastive-LM/CLM-v0.1-8B",
+        ]
+    )
+    served = json.loads(report_path.read_text(encoding="utf-8"))["served"]
+    assert served == {
+        "base_url": "http://127.0.0.1:18700/v1",
+        "container": "design-pattern-clm-dev",
+        "image_id": "sha256:deadbeef",
+        "image_tag": "design-pattern-clm:1.0.2",
+        "container_started_at": "2026-11-13T10:00:00Z",
+        "model_repo": "Contrastive-LM/CLM-v0.1-8B",
+    }
+
+
+#: The argv each CLM script is invoked with inside ``docker/Dockerfile.clm``. Mirrored here
+#: on purpose: the build only reveals a mistyped option HOURS in (after the 16 GB encoder
+#: download), and ``make -n``/``docker build --check`` cannot see inside a RUN. A parser that
+#: loses a flag must fail here, in seconds, instead.
+_DOCKERFILE_ARGV: list[tuple[str, str, list[str]]] = [
+    (
+        "export_clm_dataset",
+        "export_clm_dataset.py",
+        [
+            "--choice",
+            "/build/qa/typed/choice.jsonl",
+            "--style",
+            "/build/qa/typed/style.jsonl",
+            "--clm-pin",
+            "d5f9ef0",
+            "--out",
+            "/clm/data/typed-choice",
+        ],
+    ),
+    (
+        "clm_eval_gate",
+        "clm_eval_gate.py",
+        [
+            "--summary",
+            "/clm/heads-trained/finetune_summary.json",
+            "--manifest",
+            "/clm/data/typed-choice/manifest.json",
+            "--questions",
+            "architecture_style",
+            "--advisory-questions",
+            "category",
+            "--choice",
+            "/build/qa/typed/choice.jsonl",
+            "--style",
+            "/build/qa/typed/style.jsonl",
+            "--review",
+            "/build/qa/typed/review.json",
+            "--report",
+            "/clm/heads-trained/clm-eval-gate.json",
+        ],
+    ),
+    (
+        "clm_rank_parity",
+        "clm_rank_parity.py",
+        [
+            "--payloads",
+            "/build/qa/typed/rank_payloads.jsonl",
+            "--released",
+            "/clm/heads-released/CLM_v0.1-8B.pt",
+            "--trained",
+            "/clm/heads-trained/best_head.pt",
+            "--clm-src",
+            "/opt/CLM/src",
+            "--emb-url",
+            "http://127.0.0.1:8090/v1/embeddings",
+            "--emb-model",
+            "qwen3-8b",
+            "--max-flip-rate",
+            "0.25",
+            "--report",
+            "/clm/heads-trained/clm-rank-parity.json",
+        ],
+    ),
+    ("clm_preflight_entity", "clm_preflight.py", ["--entity", "/models/qwen3-8b"]),
+    (
+        "clm_preflight_manifest",
+        "clm_preflight.py",
+        ["--manifest", "/clm/data/typed-choice/manifest.json", "--expect-pin", "d5f9ef0"],
+    ),
+    ("derive_rank_payloads", "derive_rank_payloads.py", ["--out", "/tmp/x.jsonl"]),
+]
+
+
+@pytest.mark.parametrize(("module_name", "filename", "argv"), _DOCKERFILE_ARGV)
+def test_clm_scripts_accept_the_argv_the_image_build_passes(
+    module_name: str, filename: str, argv: list[str]
+) -> None:
+    """Every in-build invocation parses against its own parser."""
+    module = _load(f"{module_name}_argv", filename)
+    parsed = module.parse_args(argv)
+    assert parsed is not None

@@ -42,8 +42,11 @@ a head that does not answer the same question the same way twice is a threshold 
 noise:
 
 * ``--repeats N`` replays the same bytes N times. Serving is one temperature-0 forward
-  per question, so every row's choice MUST be identical across replays; any flip
-  refuses the recommendation outright (the report still prints).
+  per question, so every row's choice MUST be identical across replays; the
+  recommendation is refused when agreement drops below :data:`MIN_REPEAT_AGREEMENT`
+  (0.99 — the seam's documented ``C_repeat`` target, which tolerates one flipped row on
+  138; a script stricter than the gate it feeds would report FAIL on a PASSING arm).
+  The report still prints, and every flipped row is listed for diagnosis.
 * ``--permutations K`` replays each row K times with a seeded random ordering of its
   same 36-criterion map. The criteria are an unordered answer set — CLM embeds each
   criterion independently — so the argmax must not depend on the order they were
@@ -82,6 +85,14 @@ NONE_CHOICE = "none"
 
 #: Wilson score interval z for the 95% acted-accuracy bands (two-sided).
 _WILSON_Z = 1.96
+
+#: Repeat-consistency bar a recommendation must clear. This is the seam's documented
+#: acceptance target (``C_repeat >= 0.99``), NOT 1.0: with 138 holdout rows 0.99 tolerates
+#: one flipped row, and a script stricter than the gate it exists to feed produces two
+#: contradicting verdicts — a measurement that passes the objective but fails ``make
+#: clm-calibrate``. On a temperature-0 head the expected number of flips is 0, so any flip
+#: at all is still visible in ``consistency.unstable_rows`` for diagnosis.
+MIN_REPEAT_AGREEMENT = 0.99
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -145,6 +156,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--seed", type=int, default=1234, help="Seed for the criteria-map permutations (reproducible runs)."
+    )
+    parser.add_argument(
+        "--served-container",
+        default="",
+        help="Name of the container that served the replay (the make rule fills this via docker inspect).",
+    )
+    parser.add_argument(
+        "--served-image",
+        default="",
+        help="Image ID of the serving container (sha256:...), captured by the make rule — never hand-typed.",
+    )
+    parser.add_argument(
+        "--served-image-tag",
+        default="",
+        help="Image tag the serving container requested (docker inspect .Config.Image).",
+    )
+    parser.add_argument(
+        "--served-container-started-at",
+        default="",
+        help="docker inspect .State.StartedAt of the serving container — proves the container outlived a rebuild.",
+    )
+    parser.add_argument(
+        "--served-model-repo",
+        default="",
+        help="HF repo of the served checkpoint (the make rule passes CLM_HEADS_REPO).",
     )
     parser.add_argument(
         "--labels",
@@ -603,14 +639,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if (
         recommended["floor"] is not None
         and repeat_consistency is not None
-        and repeat_consistency["stable_rows"] != repeat_consistency["rows"]
+        and (repeat_consistency["style_choice_repeat_agreement"] or 0.0) < MIN_REPEAT_AGREEMENT
     ):
         recommended = {
             "floor": None,
             "reason": (
                 f"refusing to recommend: {len(repeat_consistency['unstable_rows'])}/"
-                f"{repeat_consistency['rows']} rows flip choice across identical replays — a floor on a "
-                "non-deterministic head is a threshold on noise"
+                f"{repeat_consistency['rows']} rows flip choice across identical replays "
+                f"({repeat_consistency['style_choice_repeat_agreement']:.4f} agreement < "
+                f"{MIN_REPEAT_AGREEMENT:.4f}) — a floor on a non-deterministic head is a threshold on noise"
             ),
             "min_acted_accuracy": args.min_acted_accuracy,
             "min_acted_rate": args.min_acted_rate,
@@ -620,6 +657,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "metric": args.metric,
         "split": args.split,
         "question_id": args.question_id,
+        # Which artifact produced these numbers. A docker TAG is not a served artifact (a
+        # container can outlive the tag being moved onto a newer image), so the image ID and
+        # the container's start time travel with the measurement instead of being re-derived.
+        "served": {
+            "base_url": args.base_url,
+            "container": args.served_container or None,
+            "image_id": args.served_image or None,
+            "image_tag": args.served_image_tag or None,
+            "container_started_at": args.served_container_started_at or None,
+            "model_repo": args.served_model_repo or None,
+        },
         "label_review": {"certified": reviewed, "reason": review_reason},
         "consistency": repeat_consistency,
         "order_invariance": order_stability,
