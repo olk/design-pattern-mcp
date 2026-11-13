@@ -1,0 +1,55 @@
+# CPU-only style-seam overlay: the linear Ch2 head plus its seam env, and nothing GPU.
+#
+# docker/docker-compose.decision-models.yml is the FULL decision stack (Tacit on gpu0, CLM on
+# gpu1, plus this head) and its design-pattern-mcp depends_on the Tacit gateway, so it cannot
+# come up on a host without an Ampere-class card. This overlay is the same style seam with the
+# GPU sidecars absent. The other three seams (weights, category, reasoning gate) stay OFF:
+# the base file carries no decision env and config/config.json defaults them to false — which
+# isolates the seam under test more cleanly than the full overlay does.
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.style-head.yml up -d
+#   make benchmark-style-ab STYLE_PROVIDER=linear
+#
+# The style env block below MUST agree with the same block in
+# docker/docker-compose.decision-models.yml; the only intended difference is the default
+# provider (this stack has no Tacit gateway to fall back to). Every make entry point passes
+# STYLE_PROVIDER_ENV explicitly, so the defaults only decide what a bare compose run does.
+name: design-pattern-mcp-dev
+
+services:
+  # The Ch2 style seam's third provider: a TF-IDF + calibrated-SVM head trained in its own
+  # image build. CPU only — no devices entry, no GPU runtime — and deliberately NOT in
+  # design-pattern-mcp's depends_on: the seam degrades to the LLM style when it is down, and
+  # a hard dependency would fail every stack whose operator never built this image.
+  design-pattern-style-head:
+    image: ${STYLE_HEAD_IMAGE:-design-pattern-style-head:latest}
+    container_name: design-pattern-style-head-dev
+    restart: unless-stopped
+    ports:
+      # Loopback only, for the same reason as the two GPU sidecars: the service has no auth
+      # of its own. The publish is what confines it — the container listens on 0.0.0.0 so
+      # the bridge can forward (see docker/Dockerfile.style-head's CMD).
+      - "127.0.0.1:18800:8800" # dev host port; container 8800 = style_head_serve
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  design-pattern-mcp:
+    environment:
+      # Ch2 style under the linear provider: /v1/systemone on the CPU head. Default OFF — the
+      # seam only acts on a floor from models/style-head-calibration.json, and this stack
+      # carries no other decision-model seam.
+      - DECISIONS_STYLE_ENABLED=${DECISIONS_STYLE_ENABLED:-false}
+      - DECISIONS_STYLE_PROVIDER=${DECISIONS_STYLE_PROVIDER:-linear}
+      - DECISIONS_STYLE_BASE_URL=${DECISIONS_STYLE_BASE_URL:-http://design-pattern-style-head:8800/v1}
+      - DECISIONS_STYLE_MODEL=${DECISIONS_STYLE_MODEL:-style-linear}
+      - DECISIONS_STYLE_CONFIDENCE_FLOOR=${DECISIONS_STYLE_CONFIDENCE_FLOOR:-0.5}

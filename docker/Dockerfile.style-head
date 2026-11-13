@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+# Linear style head sidecar for design-pattern-mcp: the Ch2 style seam's CPU provider.
+#
+# Why this head exists: both neural providers of the Ch2 seam were measured on the same
+# 138-row family-disjoint holdout and rejected — CLM-8B heads-only fine-tune scored 0.507
+# and 0.457 against a 0.65 bar (docs/clm-fine-tune.md §9), while TF-IDF(1-2gram) + logistic
+# regression over the SAME 719 train labels scored 0.833 (docs/tacit-fine-tune.md §4.7.1).
+# The task is a lexical read that a frozen encoder's contrastive heads do not extract.
+#
+# The head is TRAINED IN THIS BUILD, and the training run is also the gate: a head below the
+# bar exits 2, so the failing RUN is the whole build. There is deliberately no build arg for
+# the bar — the pre-registered 0.65 / 0.10 values live in train_style_head.py, where the
+# report records them, and an operator cannot lower them per build.
+#
+# Runtime needs no GPU and no network: ~50 MB of CPU wheels, one joblib artifact, and the
+# stdlib HTTP server. It speaks the same POST /v1/systemone wire as clm-serve, which the
+# server's DecisionModelClient already implements, so the provider is a config value.
+#
+#   docker build -f docker/Dockerfile.style-head -t design-pattern-style-head:latest .
+#   make docker-build-style-head
+#
+# Run it with ``--host 0.0.0.0`` (the CMD) so the compose bridge can forward; the loopback
+# publish in docker/docker-compose.decision-models.yml is what confines it, the same rule
+# docker/clm-entrypoint.sh follows.
+
+# -- Stage 1: fit the head on the typed style corpus (the RUN is the gate) ---------------
+FROM python:3.12-slim-bookworm AS build
+
+RUN pip install --no-cache-dir "scikit-learn>=1.5,<2" "joblib>=1.4"
+
+COPY scripts/decision_models/train_style_head.py /build/train_style_head.py
+COPY src/decisions/seam_prompts.py /build/seam_prompts.py
+COPY qa/typed/style.jsonl /build/style.jsonl
+
+# The class order comes from seam_prompts.py (the exact file the server serves), never from
+# a vocabulary restated here. The gate's PASS/FAIL line is the build log's evidence; both
+# artifacts it writes are copied into the runtime stage.
+RUN python /build/train_style_head.py \
+    --style /build/style.jsonl \
+    --seam-prompts /build/seam_prompts.py \
+    --split holdout \
+    --out-dir /model
+
+# -- Stage 2: serve it (default target; must stay the last stage) --------------------------
+FROM python:3.12-slim-bookworm AS runtime
+
+# Same pins as the build stage: the artifact is a pickled sklearn Pipeline, so the runtime
+# must be able to unpickle what the builder wrote. The trainer records the resolved
+# ``sklearn.__version__`` in style-head-report.json for exactly this reason.
+RUN pip install --no-cache-dir "scikit-learn>=1.5,<2" "joblib>=1.4"
+
+COPY --from=build /model /model
+COPY scripts/decision_models/style_head_serve.py /app/style_head_serve.py
+
+# Unbuffered so every request line and 500 reaches the container log immediately.
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8800
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/health', timeout=5)"
+
+CMD ["python3", "/app/style_head_serve.py", "--model-dir", "/model", "--host", "0.0.0.0", "--port", "8800"]

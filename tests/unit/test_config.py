@@ -100,12 +100,28 @@ class TestDefaults:
         ).decisions.style
         assert clm.provider == "clm"
         assert clm.base_url.endswith("/v1")
+        linear = ServerConfig.model_validate(
+            {
+                "decisions": {
+                    "style": {
+                        "provider": "linear",
+                        "base_url": "http://design-pattern-style-head:8800/v1",
+                        "model": "style-linear",
+                    }
+                }
+            }
+        ).decisions.style
+        assert linear.provider == "linear"
+        assert linear.base_url.endswith("/v1")
 
     @pytest.mark.parametrize(
         "payload",
         [
             pytest.param({"provider": "clm", "base_url": "http://design-pattern-tacit:8100"}, id="clm-on-gateway"),
             pytest.param({"provider": "tacit", "base_url": "http://design-pattern-clm:8700/v1"}, id="tacit-on-v1"),
+            pytest.param(
+                {"provider": "linear", "base_url": "http://design-pattern-tacit:8100"}, id="linear-on-gateway"
+            ),
         ],
     )
     def test_a_half_switched_style_seam_fails_at_load(self, payload: dict[str, object]) -> None:
@@ -117,11 +133,12 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             ServerConfig.model_validate({"decisions": {"style": payload}})
 
-    def test_clm_is_rejected_on_every_seam_but_style(self) -> None:
-        """No CLM client exists for the other four seams, so claiming one would be a lie."""
+    @pytest.mark.parametrize("provider", ["clm", "linear"])
+    def test_a_heads_model_is_rejected_on_every_seam_but_style(self, provider: str) -> None:
+        """No heads-model client exists for the other four seams, so claiming one would be a lie."""
         with pytest.raises(ValidationError):
             ServerConfig.model_validate(
-                {"decisions": {"weights": {"provider": "clm", "base_url": "http://design-pattern-clm:8700/v1"}}}
+                {"decisions": {"weights": {"provider": provider, "base_url": "http://design-pattern-clm:8700/v1"}}}
             )
 
     def test_decisions_snapshot_values(self) -> None:

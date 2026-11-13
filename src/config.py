@@ -331,15 +331,17 @@ class DecisionSeamConfig(BaseModel):
     """
 
     enabled: bool = Field(default=False, description="Opt-in seam switch.")
-    provider: Literal["tacit", "clm"] = Field(
+    provider: Literal["tacit", "clm", "linear"] = Field(
         default="tacit",
-        description="Serving stack behind the seam: tacit (/v1/decide) or clm (/v1/systemone).",
+        description=(
+            "Serving stack behind the seam: tacit (/v1/decide), clm (/v1/systemone), or linear (/v1/systemone, CPU)."
+        ),
     )
     base_url: str = Field(
         default="http://design-pattern-tacit:8100",
-        description="anyjev gateway root (no /v1 suffix), or the clm-serve /v1 root when provider=clm.",
+        description=("anyjev gateway root (no /v1 suffix), or the /v1 root when provider=clm or linear."),
     )
-    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b | clm-latest).")
+    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b | clm-latest | style-linear).")
     api_key_env: str | None = Field(
         default=None,
         description="Optional env var holding a bearer key; None = no Authorization header.",
@@ -351,7 +353,7 @@ class DecisionSeamConfig(BaseModel):
         description=(
             "Minimum confidence to act on the answer (ignored by the weights seam). The Ch2 "
             "style seam gates on TWO stages under Tacit (category and shortlist questions) but "
-            "on ONE under CLM (top probability minus mean of the rest). Set it from "
+            "on ONE under CLM and linear (top probability minus mean of the rest). Set it from "
             "scripts/decision_models/{tacit,clm}_calibrate.py, not the default."
         ),
     )
@@ -381,8 +383,8 @@ class DecisionSeamConfig(BaseModel):
         misconfiguration is a startup error instead.
         """
         root = self.base_url.rstrip("/")
-        if self.provider == "clm" and not root.endswith("/v1"):
-            raise ValueError(f"provider=clm needs the clm-serve /v1 root, got base_url={self.base_url!r}")
+        if self.provider in ("clm", "linear") and not root.endswith("/v1"):
+            raise ValueError(f"provider={self.provider} needs the /v1 root, got base_url={self.base_url!r}")
         if self.provider == "tacit" and root.endswith("/v1"):
             raise ValueError(f"provider=tacit needs the gateway ROOT (no /v1 suffix), got base_url={self.base_url!r}")
         return self
@@ -452,8 +454,8 @@ class DecisionsConfig(BaseModel):
         return merged
 
     @model_validator(mode="after")
-    def _only_the_style_seam_may_use_clm(self) -> DecisionsConfig:
-        """Reject ``provider=clm`` on any seam but ``style``: there is no client for it.
+    def _only_the_style_seam_may_use_a_heads_model(self) -> DecisionsConfig:
+        """Reject ``provider=clm``/``linear`` on any seam but ``style``: there is no client for it.
 
         The other four seams have exactly one implementation (``TacitClient``). Allowing the
         field to say otherwise would make the startup report claim a provider that never
@@ -461,7 +463,7 @@ class DecisionsConfig(BaseModel):
         """
         for name, seam in self._seams().items():
             if name != "style" and seam.provider != "tacit":
-                raise ValueError(f"decisions.{name}.provider={seam.provider!r}: only 'style' may use clm")
+                raise ValueError(f"decisions.{name}.provider={seam.provider!r}: only 'style' may use clm/linear")
         return self
 
     def _seams(self) -> dict[str, DecisionSeamConfig]:

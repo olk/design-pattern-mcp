@@ -430,9 +430,10 @@ class DesignPatternServer:
             return
         style = self._config.decisions.style
         if self._decisions_status["style"].startswith("ok"):
-            # One seam, two wires: everything but the Ch2 style is Tacit's /v1/decide, while
-            # the style seam may be the CLM-8B heads' /v1/systemone.
-            if style.provider == "clm":
+            # One seam, one wire for both model families: everything but the Ch2 style is
+            # Tacit's /v1/decide, while the style seam may be the CLM-8B heads (clm) or the
+            # CPU logistic-regression head (linear) — both speak /v1/systemone.
+            if style.provider in ("clm", "linear"):
                 self._style_client = DecisionModelClient(style)
             else:
                 self._style_client = TacitClient(style)
