@@ -115,6 +115,18 @@ served by the SAME `state_head`/`action_head`/`logit_scale` triple that `--task 
 with the loaded `HeadPair`). Training moves the rank surface by construction; the gate bounds
 it.
 
+Both gates' INPUTS were rehearsed on the real corpus on the workstation, so a FAIL at `[4/6]`
+or `[5/6]` on the host attributes to the trained head, not to the data:
+
+- `clm_eval_gate.py` against the real `manifest.json` (138 rows per question) reports
+  `R6-support: all 36 test labels have train positives` and `R7-coverage: every criterion has
+  a train positive` — no acknowledgment is needed, and the R5 majority share is `0.0942`
+  (13/138 `none`), so the 0.65 accuracy target clears the prior bar by a wide margin.
+  `R8-choice-review` reports the category training as uncertified — advisory, non-blocking,
+  and correctly so: no served CLM consumer asks that question.
+- `clm_rank_parity.load_payloads` accepts all 30 committed payloads (20 answers each,
+  relevance aligned, at least one positive gain, empty context).
+
 ## 6. Selection-consistency probes
 
 A floor fitted on a head that does not answer the same question the same way twice is a
