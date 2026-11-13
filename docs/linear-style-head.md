@@ -138,6 +138,14 @@ make holdout p95 at least 15 % *better* than the LLM-sampled baseline while not 
 or repeatability. The earlier run of this same rule on this seam returned +9.2 % and
 `candidate-loss` (`docs/JEV_BENCHMARK_REPORT.md` §3.1), which is the number to beat.
 
+One cost is known before the arms finish, and it bounds how a delta may be read: the head's own
+call is ~8 ms. The calibration replay made `4140` requests (138 rows × 5 repeats × (1 + 5 permutations)) in 35 s against the served container,
+i.e. ≈ 8.4 ms per style decision, and that is before the local-network hop the server pays. A
+p95 shift of the size this rule asks for can
+therefore only come from what the seam *replaces* — one LLM-sampled `architecture_style` field
+in the analyze call — not from the model's own latency. If the arm comes back at ±2 %, that is
+generator variance, not the head being cheap or expensive.
+
 **Instrument: `tests/benchmark/scenarios/seed.json`, holdout split, `REPEAT=3` — 6 scenarios,
 18 records per arm.** That is the corpus this seam's own documented A/B used
 (`docs/JEV_BENCHMARK_REPORT.md` §3), so the numbers are comparable to it. The `full.json`
