@@ -940,11 +940,16 @@ benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the s
 	@test -n "$(STYLE_AB_FLOOR)" || { \
 		echo "ERROR: no usable floor in $(STYLE_AB_FLOOR_FILE) for provider=$(STYLE_PROVIDER)"; \
 		echo "       run 'make $(STYLE_CALIBRATE_TARGET)' first (or pass a floor to re-test a threshold)"; exit 1; }
+	@# BOTH arms carry the floor, not just the candidate: BENCH_ENV forwards
+	@# DECISIONS_STYLE_CONFIDENCE_FLOOR, and an arm that leaves it unset exports it EMPTY —
+	@# which the benchmark container's ServerConfig load rejects ('input_value=""'), failing
+	@# the arm after the whole stack is already warm. Passing the same value in both also makes
+	@# the arms differ in exactly one variable, which is what the rule requires.
 	@echo "==> arm 1/2: DECISIONS_STYLE_ENABLED=false (the LLM-sampled style stands)"
 	@if [ "$(STYLE_PROVIDER)" = "linear" ]; then $(STYLE_HEAD_UP); fi
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
 		RUN_ID=$(STYLE_AB_STAMP)-style-off BENCH_DECISION_OVERLAY=$(STYLE_AB_OVERLAY) \
-		$(STYLE_PROVIDER_ENV) DECISIONS_STYLE_ENABLED=false $(BENCH_DOCKER) e2e
+		$(STYLE_PROVIDER_ENV) DECISIONS_STYLE_ENABLED=false DECISIONS_STYLE_CONFIDENCE_FLOOR=$(STYLE_AB_FLOOR) $(BENCH_DOCKER) e2e
 	@echo "==> arm 2/2: DECISIONS_STYLE_ENABLED=true provider=$(STYLE_PROVIDER) (floor from $(STYLE_AB_FLOOR_FILE))"
 	@if [ "$(STYLE_PROVIDER)" = "linear" ]; then $(STYLE_HEAD_UP); fi
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
