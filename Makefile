@@ -579,6 +579,13 @@ decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docke
 	@curl -fsS http://127.0.0.1:18700/v1/systemone -H 'Content-Type: application/json' \
 		-d '{"model":"clm-latest","state":"A checkout service with flash sales.","questions":{"style":{"type":"choice","instructions":"Which style fits?","criteria":{"event-driven":"Event flow and reactions","layered":"Tiered separation"}}}}' \
 		| python3 -m json.tool
+	@# The linear head is criteria-blind, so this payload deliberately carries NO criteria: any
+	@# criteria map it is sent must equal its 36 trained labels exactly, and a partial one is
+	@# refused with 422 (that refusal is the drift guard, exercised by test_style_head.py).
+	@echo "==> linear head /v1/systemone"
+	@curl -fsS http://127.0.0.1:18800/v1/systemone -H 'Content-Type: application/json' \
+		-d '{"model":"style-linear","state":"A checkout service with flash sales.","questions":{"architecture_style":{"type":"choice","instructions":"Which architecture style best characterizes the system described in the state?"}}}' \
+		| python3 -c "import json,sys; a=json.load(sys.stdin)['answers']['architecture_style']; print(f\"choice={a['choice']} confidence={a['confidence']:.4f} classes={len(a['probabilities'])}\")"
 
 # Served-shape rank payloads for the build's parity gate. Re-run after any corpus, noul or
 # catalog change: the artifact carries the candidates' document_text, which the CLM image
