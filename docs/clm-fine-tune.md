@@ -184,7 +184,12 @@ Landed and verified on the workstation:
 - `build_style_criteria()` re-keyed to `STYLE_VOCABULARY` + ordered byte-parity test;
 - the CLM scripts and their two Dockerfile targets (`runtime-released` and
   `runtime-finetuned` exist and pass `docker build --check` — statically only, neither image
-  has been BUILT yet), the compose sidecar, the `clm-*` Makefile targets, the consistency
+  has been BUILT yet). `:base` was deliberately not built locally while the host is down:
+  this branch's only `Dockerfile.clm` changes are header comments plus `--targets hard`/
+  `--loss infonce` inside the `finetune` stage, so `runtime-released` is byte-identical to
+  the branch that already built and served the sidecar — and the build costs ~25 GB plus a
+  16 GB encoder download on a 69 GB-free disk to produce an image this box cannot serve
+  (Pascal, CC 6.1). The compose sidecar, the `clm-*` Makefile targets, the consistency
   probes;
 - `make clm-calibrate` proved end to end against an oracle stub on this workstation (138
   rows, 7 floors, both probes populated, `served` provenance recorded, exit 0). That is a
