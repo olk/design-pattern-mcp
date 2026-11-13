@@ -188,6 +188,19 @@ Provenance of the measured image: the arms run the `design-pattern-mcp` image bu
 into `src/server.py::style_client_for` (identical body, now pinned per provider by
 `tests/unit/test_decisions_wiring.py`), so the verdict applies to the current branch unchanged.
 
+**Generator substitution, and why it is not optional.** The shipped default generator is
+`opencode-go` / `muse-spark-1.3-contributor` on `https://opencode.ai/zen/go/v1`. On this key
+the Go gateway answers *"An active OpenCode Go subscription is required to use OpenCode Go
+models"*, and the non-Go Zen base answers *"Insufficient balance"* — so every scenario would
+have run the documented degraded paths (ERR_009 → minimal single-part brief, E12 retries, an
+open circuit breaker) and the arms would have differed by noise. The first attempt at this run
+did exactly that and was thrown away; `scripts/benchmark-docker.sh` now refuses a stack whose
+rendered `GENERATOR_API_KEY` is empty (`72d6866`), because an unauthenticated stack still
+"completes". Both arms therefore run `deepseek/deepseek-chat` on
+`https://api.deepseek.com/v1` — **the same generator in both arms**, so the comparison stays
+internally valid, but its absolute latencies are not the shipped default's and are not
+comparable with `docs/JEV_BENCHMARK_REPORT.md` §3.1's numbers.
+
 _Result recorded below._
 
 ## 7. Operating it
