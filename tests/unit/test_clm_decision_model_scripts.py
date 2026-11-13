@@ -1831,3 +1831,30 @@ def test_clm_scripts_accept_the_argv_the_image_build_passes(
     module = _load(f"{module_name}_argv", filename)
     parsed = module.parse_args(argv)
     assert parsed is not None
+
+
+def test_calibration_report_carries_per_row_decisions(
+    calibrator: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm comparison is PAIRED per row; aggregates cannot reconstruct which rows moved.
+
+    ``E2 - E1`` has to name flipped rows and per-class deltas, so each report must carry the
+    decision it made for each scenario — with the identity to pair on, the label to score
+    against, and the number the floor was fitted on.
+    """
+    style = tmp_path / "style.jsonl"
+    _write_style_row(style, rows=3)
+    monkeypatch.setattr(
+        calibrator,
+        "ask",
+        lambda *args, **kwargs: {"choice": "a", "confidence": 0.8, "probabilities": {"a": 0.8, "b": 0.2}},
+    )
+    report_path = tmp_path / "calibration.json"
+    calibrator.main(["--style", str(style), "--base-url", "http://x/v1", "--floors", "0.5", "--report", str(report_path)])
+    rows = json.loads(report_path.read_text(encoding="utf-8"))["rows"]
+    assert len(rows) == 3
+    assert [row["scenario_id"] for row in rows] == ["s1", "s2", "s3"]
+    for row in rows:
+        assert set(row) == {"scenario_id", "label", "choice", "confidence"}
+        assert row["label"] == "a" and row["choice"] == "a"
+        assert row["confidence"] == pytest.approx(0.8)

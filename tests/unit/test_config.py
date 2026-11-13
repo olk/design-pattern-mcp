@@ -78,9 +78,51 @@ class TestDefaults:
         assert decisions.reasoning_gate.timeout_seconds == 5.0
 
     def test_a_seam_rejects_an_unknown_key(self) -> None:
-        """The seam wire is single-stack: a leftover ``provider`` key must fail loudly."""
+        """Seams are closed: a misspelt knob must fail loudly instead of being ignored."""
         with pytest.raises(ValidationError):
-            ServerConfig.model_validate({"decisions": {"style": {"provider": "clm"}}})
+            ServerConfig.model_validate({"decisions": {"style": {"confidence_flor": 0.5}}})
+
+    def test_style_seam_accepts_both_providers_with_their_own_wire_root(self) -> None:
+        """Each provider has exactly one legal URL shape, and the pair must agree."""
+        tacit = ServerConfig.model_validate({"decisions": {"style": {"provider": "tacit"}}}).decisions.style
+        assert tacit.provider == "tacit"
+        assert tacit.base_url == "http://design-pattern-tacit:8100"
+        clm = ServerConfig.model_validate(
+            {
+                "decisions": {
+                    "style": {
+                        "provider": "clm",
+                        "base_url": "http://design-pattern-clm:8700/v1",
+                        "model": "clm-latest",
+                    }
+                }
+            }
+        ).decisions.style
+        assert clm.provider == "clm"
+        assert clm.base_url.endswith("/v1")
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param({"provider": "clm", "base_url": "http://design-pattern-tacit:8100"}, id="clm-on-gateway"),
+            pytest.param({"provider": "tacit", "base_url": "http://design-pattern-clm:8700/v1"}, id="tacit-on-v1"),
+        ],
+    )
+    def test_a_half_switched_style_seam_fails_at_load(self, payload: dict[str, object]) -> None:
+        """Flipping ``provider`` without its endpoint (or the reverse) is a startup error.
+
+        Left interchangeable the mismatch 404s, and the degrade-never-raise contract turns it
+        into a silently dead seam — exactly the state a hurried rollback produces.
+        """
+        with pytest.raises(ValidationError):
+            ServerConfig.model_validate({"decisions": {"style": payload}})
+
+    def test_clm_is_rejected_on_every_seam_but_style(self) -> None:
+        """No CLM client exists for the other four seams, so claiming one would be a lie."""
+        with pytest.raises(ValidationError):
+            ServerConfig.model_validate(
+                {"decisions": {"weights": {"provider": "clm", "base_url": "http://design-pattern-clm:8700/v1"}}}
+            )
 
     def test_decisions_snapshot_values(self) -> None:
         snapshot = ServerConfig.model_validate({}).effective_parameters()

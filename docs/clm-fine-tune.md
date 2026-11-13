@@ -154,6 +154,12 @@ served artifact — a long-running container survives the tag being moved onto a
 which is exactly how an earlier Tacit calibration measured a stale checkpoint — so the image
 ID and start time travel with the measurement instead of being re-derived afterwards.
 
+Each report also carries **every row's decision** (`rows`: scenario id, gold label, chosen
+criterion, confidence). The E1/E2 comparison is paired per row — which rows flipped, per-class
+deltas — and that cannot be reconstructed from aggregate accuracies, so the decisions travel
+with the report rather than being re-derived from a container that may since have been
+replaced.
+
 ## 7. Rollout and rollback
 
 The seam is default-off (`decisions.style.enabled = false`) and stays off until the paired
@@ -164,16 +170,24 @@ make docker-up-decisions STYLE_PROVIDER=clm
 make benchmark-style-ab STYLE_PROVIDER=clm
 ```
 
-`STYLE_PROVIDER` moves provider, endpoint and model together (a `clm` provider on a Tacit
-gateway URL is unexpressible: `DecisionSeamConfig` rejects `provider=clm` without the `/v1`
-root, and `DecisionsConfig` rejects `clm` on any seam but `style`). The A/B reads its floor
-from the calibration artifact of the provider under test — never hand-copied.
+`STYLE_PROVIDER` moves provider, endpoint and model together. A mismatched pair is
+unexpressible rather than merely discouraged: `DecisionSeamConfig` rejects a `provider` and
+`base_url` shape that disagree in EITHER direction (clm without the `/v1` root, or tacit on a
+`/v1` root), and `DecisionsConfig` rejects `clm` on any seam but `style`. The A/B reads its
+floor from the calibration artifact of the provider under test — never hand-copied.
 
-Rollback is a config flip, no schema or data migration:
-`DECISIONS_STYLE_PROVIDER=tacit` (or `DECISIONS_STYLE_ENABLED=false`), restart the compose,
-then `docker compose … down design-pattern-clm` to free the card. Keep
-`models/clm-heads/` + both calibration reports as evidence; `rm -rf models/clm-heads` only if
-the cached-heads path is itself implicated (that forces a retrain instead of re-baking).
+Rollback is a config flip, no schema or data migration. Move the provider, endpoint and model
+TOGETHER — use the same knob as the forward path, because flipping `provider` alone would
+leave a clm-serve URL on a Tacit client (the config validator rejects that pairing, so it
+fails at startup rather than serving a dead seam):
+
+```
+make docker-up-decisions STYLE_PROVIDER=tacit      # or DECISIONS_STYLE_ENABLED=false
+```
+
+Then `docker compose … down design-pattern-clm` to free the card. Keep `models/clm-heads/` +
+both calibration reports as evidence; `rm -rf models/clm-heads` only if the cached-heads path
+is itself implicated (that forces a retrain instead of re-baking).
 
 ## 8. State of this branch
 

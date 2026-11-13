@@ -672,6 +672,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "consistency": repeat_consistency,
         "order_invariance": order_stability,
         **summary,
+        # Every row's decision, canonical criteria order. The arm comparison is PAIRED per
+        # row (which rows flipped, per-class deltas), and that cannot be reconstructed from
+        # aggregate accuracies — so the decisions travel with the report rather than being
+        # re-derived from a container that may since have been replaced.
+        "rows": canonical,
         "recommended": recommended,
     }
     text = json.dumps(report, indent=2, sort_keys=True)

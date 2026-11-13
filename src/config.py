@@ -370,15 +370,21 @@ class DecisionSeamConfig(BaseModel):
         return value or None
 
     @model_validator(mode="after")
-    def _clm_base_url_is_the_v1_root(self) -> DecisionSeamConfig:
-        """A ``clm`` seam must carry the ``/v1`` root: the client appends ``/systemone``.
+    def _base_url_matches_the_provider_wire(self) -> DecisionSeamConfig:
+        """``provider`` and the ``base_url`` shape must agree, in BOTH directions.
 
-        Without this the two wires' ``base_url`` shapes are interchangeable strings, and a
-        Tacit gateway root left on a ``clm`` seam produces 404s that the degrade-never-raise
-        contract turns into a silently dead seam — the failure mode a config check prevents.
+        Each wire has one URL shape: Tacit's gateway root (the client appends ``/v1/decide``)
+        and clm-serve's ``/v1`` root (the client appends ``/systemone``). Leaving them
+        interchangeable makes a half-switched deployment — a rollback that moves only
+        ``provider``, or a flip that moves only the URL — into a 404 that the
+        degrade-never-raise contract turns into a silently dead seam. Checked here so the
+        misconfiguration is a startup error instead.
         """
-        if self.provider == "clm" and not self.base_url.rstrip("/").endswith("/v1"):
+        root = self.base_url.rstrip("/")
+        if self.provider == "clm" and not root.endswith("/v1"):
             raise ValueError(f"provider=clm needs the clm-serve /v1 root, got base_url={self.base_url!r}")
+        if self.provider == "tacit" and root.endswith("/v1"):
+            raise ValueError(f"provider=tacit needs the gateway ROOT (no /v1 suffix), got base_url={self.base_url!r}")
         return self
 
 
