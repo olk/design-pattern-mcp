@@ -183,6 +183,11 @@ completes either way and the comparison then reads "no difference" against the h
 * the sidecar is re-started inside EACH arm: the harness tears its compose project down at the
   end of every arm, so a single bring-up before arm 1 would leave arm 2 with a dead seam.
 
+Provenance of the measured image: the arms run the `design-pattern-mcp` image built from
+`6a28ef5`. The only later server-side change is the extraction of the provider→client branch
+into `src/server.py::style_client_for` (identical body, now pinned per provider by
+`tests/unit/test_decisions_wiring.py`), so the verdict applies to the current branch unchanged.
+
 _Result recorded below._
 
 ## 7. Operating it
