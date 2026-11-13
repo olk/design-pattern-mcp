@@ -19,8 +19,10 @@
 	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
 	docker-build-tei-rerank dense-cache \
 	docker-build-tacit docker-build-tacit-base \
+	docker-build-clm docker-build-clm-base \
 	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
-	tacit-payloads tacit-payloads-check tacit-calibrate check-dockerfile-shell \
+	tacit-payloads tacit-payloads-check tacit-calibrate \
+	clm-payloads clm-payloads-check clm-calibrate check-dockerfile-shell \
 	docker-publish docker-publish-tei docker-publish-tacit docker-publish-all \
 	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
 	embed-cache
@@ -90,7 +92,24 @@ TACIT_BATCH          ?= 4
 TACIT_ACCUM          ?= 8
 TACIT_COT_MAX_TOKENS ?= 2048
 TACIT_MAX_NEW_TOKENS ?= 384
+# CLM-8B sidecar (the Ch2 style seam's other provider). Frozen Qwen3-8B encoder + two
+# ~20M projection heads; the heads-only fine-tune needs one GPU on the builder, the
+# *-base target bakes the released heads and needs none.
+CLM_IMAGE        := design-pattern-clm
+CLM_ENCODER_REPO ?= Qwen/Qwen3-8B
+CLM_HEADS_REPO   ?= Contrastive-LM/CLM-v0.1-8B
+CLM_REPO_PIN     ?= d5f9ef0
+# choice-head batch size; embeddings are precomputed, so this is the only batching knob.
+CLM_FINETUNE_BATCH ?= 32
 VLLM_IMAGE_TAG   ?= v0.17.1
+
+# Which sidecar answers the Ch2 style seam. This is the ONE switch: the endpoint, model
+# name and wire shape all follow from it, so a `clm` run cannot inherit a Tacit gateway URL
+# (the config validator rejects that pairing outright, and this keeps it unexpressible).
+STYLE_PROVIDER ?= tacit
+STYLE_PROVIDER_ENV = DECISIONS_STYLE_PROVIDER=$(STYLE_PROVIDER) \
+	DECISIONS_STYLE_BASE_URL=$(if $(filter clm,$(STYLE_PROVIDER)),http://design-pattern-clm:8700/v1,http://design-pattern-tacit:8100) \
+	DECISIONS_STYLE_MODEL=$(if $(filter clm,$(STYLE_PROVIDER)),clm-latest,tacit-4b)
 
 # Host-persisted trained artifacts (extract-then-rebuild).
 # First run of docker-build-tacit trains on the GPU builder,
@@ -121,6 +140,27 @@ TACIT_BUILD_TARGET  := $(if $(and $(wildcard $(TACIT_HOST_CONFIG)),$(wildcard $(
 TACIT_TRAIN_INPUTS  := scripts/decision_models/tacit_self_distill.py \
 	src/decisions/seam_prompts.py qa/qa.jsonl qa/typed/rerank_pairs.jsonl qa/typed/style.jsonl \
 	docker/Dockerfile.tacit
+#   CLM:   models/clm-heads <- /clm/heads (finetune.py --out-dir contents, incl.
+#          best_head.pt served via CLM_CKPT) + both in-build gate reports.
+CLM_HOST_DIR        := models/clm-heads
+CLM_HOST_CKPT       := $(CLM_HOST_DIR)/best_head.pt
+CLM_HOST_COMPLETE   := $(CLM_HOST_DIR)/.extract-complete
+CLM_TRAIN_TARGET    := runtime-finetuned
+CLM_CACHED_TARGET   := runtime-finetuned-cached
+CLM_BUILD_TARGET    := $(if $(and $(wildcard $(CLM_HOST_CKPT)),$(wildcard $(CLM_HOST_COMPLETE))),$(CLM_CACHED_TARGET),$(CLM_TRAIN_TARGET))
+# Content provenance for the cached heads: the files whose bytes the fine-tune consumed.
+# The train path records their shas in the completion marker; the cached path refuses to
+# build when the marker's shas no longer match, so a stale host dir can never be re-baked
+# against a changed corpus, exporter or gate script.
+CLM_TRAIN_INPUTS    := qa/typed/choice.jsonl qa/typed/style.jsonl \
+	qa/typed/rank_payloads.jsonl tests/benchmark/scenarios/full.json \
+	scripts/decision_models/export_clm_dataset.py scripts/decision_models/clm_eval_gate.py \
+	scripts/decision_models/clm_rank_parity.py scripts/decision_models/derive_rank_payloads.py \
+	scripts/decision_models/clm_preflight.py \
+	docker/Dockerfile.clm
+# The gate outputs that admitted the extracted heads; the marker pins their bytes too, so a
+# cached rebuild can be audited against the evidence that produced the checkpoint.
+CLM_GATE_REPORTS    := $(CLM_HOST_DIR)/clm-eval-gate.json $(CLM_HOST_DIR)/clm-rank-parity.json
 # HF Hub token for authenticated model downloads (higher rate limits, gated repos).
 # File holds the raw token only, no key=value. Empty/missing file = anonymous
 # download (fine for the pinned public repos, just the huggingface_hub warning).
@@ -442,16 +482,139 @@ docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (n
 		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
 		-t $(TACIT_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_IMAGE):base .
 
-docker-build-decision-models: docker-build-tacit ## Fine-tune + build the decision-model sidecar, in-image
+docker-build-clm: clm-payloads-check check-dockerfile-shell ## Fine-tune the CLM heads in the image build (GPU once; later runs reuse models/clm-heads, no GPU)
+	@# Cached path first: refuse a stale host dir whose marker shas no longer match the
+	@# current train inputs — BEFORE docker build, so a stale cache never re-tags the image
+	@# and the failure is loud, not a silent old-heads rebuild.
+	@if [ "$(CLM_BUILD_TARGET)" = "$(CLM_CACHED_TARGET)" ]; then \
+		for report in $(CLM_GATE_REPORTS); do \
+			if [ ! -s "$$report" ]; then \
+				echo "ERROR: $$report missing — the cached heads carry no gate evidence."; \
+				echo "       Delete $(CLM_HOST_DIR)/ and rebuild with a GPU so the gates can write their evidence."; \
+				exit 1; \
+			fi; \
+		done; \
+		if ! (cd "$(CURDIR)" && sha256sum -c "$(CLM_HOST_COMPLETE)" --quiet --status 2>/dev/null); then \
+			echo "ERROR: $(CLM_HOST_DIR)/ is stale — a train input changed since the heads were extracted."; \
+			echo "Run 'rm -rf $(CLM_HOST_DIR)' and rebuild to retrain, or restore the inputs."; \
+			(cd "$(CURDIR)" && sha256sum -c "$(CLM_HOST_COMPLETE)" 2>&1 | grep -v ': OK' || true); \
+			exit 1; \
+		fi; \
+	fi
+	docker build --progress=$(DOCKER_BUILD_PROGRESS) --allow device=nvidia.com/gpu=all $(HF_SECRET_ARG) \
+		-f docker/Dockerfile.clm --target $(CLM_BUILD_TARGET) \
+		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
+		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
+		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
+		--build-arg CLM_REPO_PIN=$(CLM_REPO_PIN) \
+		--build-arg CLM_FINETUNE_BATCH=$(CLM_FINETUNE_BATCH) \
+		-t $(CLM_IMAGE):$(DOCKER_TAG) -t $(CLM_IMAGE):latest .
+	@# Train path only: extract the shipped heads to $(CLM_HOST_DIR)/ via
+	@# `docker create` (never started) + `docker cp`; the next run builds cached.
+	@# The .extract-complete marker is written LAST, only after a successful copy with
+	@# non-empty sentinels and both gate reports present — a partial copy never leaves a
+	@# reusable dir. It carries the sha256 of every train input so the check above can
+	@# refuse a stale dir, and of the gate reports so the cached image stays auditable.
+	@if [ "$(CLM_BUILD_TARGET)" = "$(CLM_TRAIN_TARGET)" ]; then \
+		mkdir -p "$(CLM_HOST_DIR)"; \
+		cid=$$(docker create "$(CLM_IMAGE):$(DOCKER_TAG)"); \
+		docker cp "$$cid:/clm/heads/." "$(CLM_HOST_DIR)/"; rc=$$?; \
+		docker rm "$$cid" >/dev/null; \
+		if [ $$rc -ne 0 ]; then rm -f "$(CLM_HOST_COMPLETE)"; exit $$rc; fi; \
+		test -s "$(CLM_HOST_CKPT)" || exit 1; \
+		for report in $(CLM_GATE_REPORTS); do \
+			test -s "$$report" || { echo "ERROR: $$report missing — the build gates did not write their evidence" >&2; rm -f "$(CLM_HOST_COMPLETE)"; exit 1; }; \
+		done; \
+		{ echo "# $(CLM_IMAGE):$(DOCKER_TAG) $$(date -u +%FT%TZ)"; \
+		  sha256sum $(CLM_TRAIN_INPUTS); \
+		  echo "# gate reports"; \
+		  sha256sum $(CLM_GATE_REPORTS); } > "$(CLM_HOST_COMPLETE)"; \
+	fi
+	@test -s $(CLM_HOST_CKPT) && test -f $(CLM_HOST_COMPLETE)
 
-docker-up-decisions: ## Start the dev stack with the decision-model sidecar (one GPU)
-	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) up -d
+docker-build-clm-base: ## Build the CLM sidecar with the released heads (no GPU needed; tag :base)
+	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.clm --target runtime-released $(HF_SECRET_ARG) \
+		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
+		--build-arg CLM_ENCODER_REPO=$(CLM_ENCODER_REPO) \
+		--build-arg CLM_HEADS_REPO=$(CLM_HEADS_REPO) \
+		--build-arg CLM_REPO_PIN=$(CLM_REPO_PIN) \
+		-t $(CLM_IMAGE):$(DOCKER_TAG)-base -t $(CLM_IMAGE):base .
 
-docker-down-decisions: ## Stop the whole dev stack including the decision-model sidecar
-	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) down
+docker-build-decision-models: docker-build-tacit docker-build-clm ## Fine-tune + build both decision-model sidecars, in-image
 
-decisions-smoke: ## Smoke-test the running sidecar's wire contract (needs docker-up-decisions)
+docker-up-decisions: ## Start the dev stack with both decision-model sidecars (one GPU each)
+	$(STYLE_PROVIDER_ENV) TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) CLM_IMAGE=$(CLM_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) up -d
+
+docker-down-decisions: ## Stop the whole dev stack including the decision-model sidecars
+	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) CLM_IMAGE=$(CLM_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) down
+
+decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docker-up-decisions)
+	@echo "==> Tacit /v1/decide"
 	@uv run python scripts/decision_models/decision_smoke.py --base-url $(TACIT_BASE_URL)
+	@echo "==> CLM /v1/systemone"
+	@curl -fsS http://127.0.0.1:18700/v1/systemone -H 'Content-Type: application/json' \
+		-d '{"model":"clm-latest","state":"A checkout service with flash sales.","questions":{"style":{"type":"choice","instructions":"Which style fits?","criteria":{"event-driven":"Event flow and reactions","layered":"Tiered separation"}}}}' \
+		| python3 -m json.tool
+
+# Served-shape rank payloads for the build's parity gate. Re-run after any corpus, noul or
+# catalog change: the artifact carries the candidates' document_text, which the CLM image
+# cannot derive (it has no pattern catalog).
+CLM_PAYLOAD_CHECK    := /tmp/clm-rank-payloads.check.jsonl
+
+clm-payloads: ## Regenerate qa/typed/rank_payloads.jsonl from the corpus + catalog
+	uv run python scripts/decision_models/derive_rank_payloads.py
+
+# The catalog is not hashed in CLM_TRAIN_INPUTS (7290 files), so a catalog edit that was
+# never re-derived would otherwise leave a byte-identical payload file and a valid cache:
+# the rank gate would replay document_text the server no longer sends. Regenerate to a temp
+# path and byte-compare instead of trusting the marker.
+clm-payloads-check: ## Fail when qa/typed/rank_payloads.jsonl drifts from the corpus + catalog
+	@uv run python scripts/decision_models/derive_rank_payloads.py --out $(CLM_PAYLOAD_CHECK) >/dev/null
+	@if ! cmp -s $(CLM_PAYLOAD_CHECK) qa/typed/rank_payloads.jsonl; then \
+		echo "ERROR: qa/typed/rank_payloads.jsonl is stale — the corpus, noul or catalog changed since it was derived."; \
+		echo "       Run 'make clm-payloads' and commit the new artifact (the rank gate replays these bytes)."; \
+		rm -f $(CLM_PAYLOAD_CHECK); exit 1; \
+	fi
+	@rm -f $(CLM_PAYLOAD_CHECK)
+
+# Floor calibration for the Ch2 style seam under the CLM provider. The fine-tuned heads
+# ship uncalibrated: run this against a live clm-serve (docker-up-decisions) and set the
+# floor it recommends — DECISIONS_STYLE_ENABLED stays false until this passes.
+CLM_BASE_URL               ?= http://127.0.0.1:18700/v1
+CLM_CAL_FLOORS             ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7
+CLM_CAL_MIN_ACTED_ACCURACY ?= 0.8
+CLM_CAL_MIN_ACTED_RATE     ?= 0.3
+CLM_CAL_MIN_ACTED          ?= 10
+# Replays per held-out row: >1 measures repeat consistency and refuses a floor that is not
+# stable (serving is one temperature-0 forward per question, so identical requests must agree).
+CLM_CAL_REPEATS            ?= 5
+# Seeded criteria-map permutations per row: >1 measures order invariance (the served map is
+# one ordering of an unordered answer set, so the argmax must not depend on it).
+CLM_CAL_PERMUTATIONS       ?= 5
+# The container whose identity the calibration report records.
+CLM_SERVED_CONTAINER       ?= design-pattern-clm-dev
+CLM_CAL_REPORT             := models/clm-calibration.json
+# Floor the style A/B runs with: read from the calibration artifact, never hand-copied, so an
+# arm cannot run a threshold the measurements did not produce. Override only to re-test a
+# specific value deliberately: `make benchmark-style-ab STYLE_AB_PROVIDER=clm CLM_STYLE_FLOOR=0.6`.
+CLM_STYLE_FLOOR            ?= $(shell python3 -c "import json;d=json.load(open('$(CLM_CAL_REPORT)'));\
+f=d.get('recommended',{}).get('floor');print('' if f is None else f)" 2>/dev/null)
+
+clm-calibrate: ## Calibrate decisions.style.confidence_floor against a running clm-serve
+	uv run python scripts/decision_models/clm_calibrate.py \
+		--style qa/typed/style.jsonl --base-url $(CLM_BASE_URL) \
+		--floors $(CLM_CAL_FLOORS) --metric confidence \
+		--min-acted-accuracy $(CLM_CAL_MIN_ACTED_ACCURACY) \
+		--min-acted-rate $(CLM_CAL_MIN_ACTED_RATE) \
+		--min-acted $(CLM_CAL_MIN_ACTED) \
+		--repeats $(CLM_CAL_REPEATS) \
+		--permutations $(CLM_CAL_PERMUTATIONS) \
+		--report $(CLM_CAL_REPORT) \
+		--served-container "$$(docker inspect -f '{{.Name}}' $(CLM_SERVED_CONTAINER) 2>/dev/null | sed 's|^/||')" \
+		--served-image "$$(docker inspect -f '{{.Image}}' $(CLM_SERVED_CONTAINER) 2>/dev/null || true)" \
+		--served-image-tag "$$(docker inspect -f '{{.Config.Image}}' $(CLM_SERVED_CONTAINER) 2>/dev/null || true)" \
+		--served-container-started-at "$$(docker inspect -f '{{.State.StartedAt}}' $(CLM_SERVED_CONTAINER) 2>/dev/null || true)" \
+		--served-model-repo "$(CLM_HEADS_REPO)"
 
 # Served rerank pairs (statement x candidate document) for the Ch2/J1 training seams.
 # Re-run after any corpus, noul or catalog change: the artifact carries the candidates'
@@ -482,7 +645,7 @@ tacit-payloads-check: ## Fail when qa/typed/rerank_pairs.jsonl drifts from the c
 DOCKERFILE_SHELL_CHECK := $(UV) run python scripts/decision_models/check_dockerfile_shell.py
 
 check-dockerfile-shell: ## Validate Dockerfile shell payloads (dash) before a build
-	@$(DOCKERFILE_SHELL_CHECK) docker/Dockerfile.tacit
+	@$(DOCKERFILE_SHELL_CHECK) docker/Dockerfile.clm docker/Dockerfile.tacit
 
 # Floor calibration for the Ch2 style seam. Every seam shares the one self-distilled
 # checkpoint and ships uncalibrated: run this against a live gateway (docker-up-decisions)
@@ -680,27 +843,34 @@ benchmark-draft: ## Benchmark: draft full.json candidates from the catalog (in D
 	@$(BENCH_ENV) $(BENCH_DOCKER) draft
 
 # Exits 1 on a candidate-loss verdict (pre-registered rule in tests/benchmark/README.md).
-# Pre-registered A/B of the Ch2 style seam with the Tacit sidecar in the loop. The decision
-# overlay renders without a GPU (`docker compose ... config`), but the runs need the card and
-# the trained image (`make docker-build-decision-models`). The seam is off in the baseline arm
-# and on in the candidate arm; everything else (corpus, split, repeat, image) is identical,
-# which is what `benchmark-compare`'s +15% p95 rule requires.
+# Pre-registered A/B of the Ch2 style seam with a decision-model sidecar in the loop. The
+# decision overlay renders without a GPU (`docker compose ... config`), but the runs need the
+# card and the trained image (`make docker-build-decision-models`). The seam is off in the
+# baseline arm and on in the candidate arm; everything else (corpus, split, repeat, image) is
+# identical, which is what `benchmark-compare`'s +15% p95 rule requires.
+#
+# STYLE_PROVIDER (defined with the CLM knobs) names which sidecar serves the seam, and
+# therefore which calibration artifact supplies the floor: `tacit` (default) reads the
+# gateway's two-stage choice, `clm` reads the 36-criterion /v1/systemone. The floor is always
+# read from the artifact of the provider actually under test, never hand-copied from the other.
 STYLE_AB_SCENARIOS ?= tests/benchmark/scenarios/full.json
 STYLE_AB_REPEAT    ?= 3
 STYLE_AB_STAMP     ?= $(shell date -u +%Y%m%d-%H%M%S)
+STYLE_AB_FLOOR      = $(if $(filter clm,$(STYLE_PROVIDER)),$(CLM_STYLE_FLOOR),$(TACIT_STYLE_FLOOR))
+STYLE_AB_FLOOR_FILE = $(if $(filter clm,$(STYLE_PROVIDER)),$(CLM_CAL_REPORT),$(TACIT_CAL_REPORT))
 
 benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the sidecar + GPU)
-	@test -n "$(TACIT_STYLE_FLOOR)" || { \
-		echo "ERROR: no usable floor in $(TACIT_CAL_REPORT) — run 'make tacit-calibrate' first"; \
-		echo "       (or pass TACIT_STYLE_FLOOR=<value> to re-test a specific threshold)"; exit 1; }
+	@test -n "$(STYLE_AB_FLOOR)" || { \
+		echo "ERROR: no usable floor in $(STYLE_AB_FLOOR_FILE) for provider=$(STYLE_PROVIDER)"; \
+		echo "       run 'make $(STYLE_PROVIDER)-calibrate' first (or pass a floor to re-test a threshold)"; exit 1; }
 	@echo "==> arm 1/2: DECISIONS_STYLE_ENABLED=false (the LLM-sampled style stands)"
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
 		RUN_ID=$(STYLE_AB_STAMP)-style-off BENCH_DECISION_OVERLAY=docker/docker-compose.decision-models.yml \
-		DECISIONS_STYLE_ENABLED=false $(BENCH_DOCKER) e2e
-	@echo "==> arm 2/2: DECISIONS_STYLE_ENABLED=true (floor from models/tacit-calibration.json)"
+		$(STYLE_PROVIDER_ENV) DECISIONS_STYLE_ENABLED=false $(BENCH_DOCKER) e2e
+	@echo "==> arm 2/2: DECISIONS_STYLE_ENABLED=true provider=$(STYLE_PROVIDER) (floor from $(STYLE_AB_FLOOR_FILE))"
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
 		RUN_ID=$(STYLE_AB_STAMP)-style-on BENCH_DECISION_OVERLAY=docker/docker-compose.decision-models.yml \
-		DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=$(TACIT_STYLE_FLOOR) $(BENCH_DOCKER) e2e
+		$(STYLE_PROVIDER_ENV) DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=$(STYLE_AB_FLOOR) $(BENCH_DOCKER) e2e
 	@echo "==> compare against the pre-registered rule (holdout p95 >= +15% AND repeat non-inferiority)"
 	@$(BENCH_ENV) REQUIRE_REPEAT_STABILITY=1 A=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-off \
 		B=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-on $(BENCH_DOCKER) compare

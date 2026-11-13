@@ -631,6 +631,29 @@ The sidecar serves from one 24 GB card (Tacit-4B ≈ 8 GB in vLLM plus the gatew
 
 Fine-tuning procedure (fine-tune → image → publish): [docs/tacit-fine-tune.md](docs/tacit-fine-tune.md).
 
+### Decision models (CLM-8B, the Ch2 style seam's other provider)
+
+`design-pattern-clm` serves the Ch2 architecture-style substitution over the
+TypeSafe-compatible `POST /v1/systemone`: one unsharded 36-criterion `choice` question over a
+frozen Qwen3-8B encoder plus two ~20 M projection heads fine-tuned on this repo's audited
+style labels. It is the alternative to the Tacit two-stage choice and is selected per
+deployment — the seam's provider, endpoint and model move together through one knob:
+
+```bash
+make docker-build-clm-base            # released heads, no GPU anywhere (:base tag)
+make docker-build-clm                 # heads fine-tuned in the build (GPU builder)
+make docker-up-decisions STYLE_PROVIDER=clm
+make clm-calibrate                    # floor + repeat/order consistency probes
+make benchmark-style-ab STYLE_PROVIDER=clm
+```
+
+The sidecar wants its own card (encoder ≈ 16 GB); `CLM_GPU_DEVICE` selects the CDI device
+(`nvidia.com/gpu=1` by default, so Tacit keeps card 0). The seam stays default-off until
+`benchmark-style-ab` clears the pre-registered rule.
+
+Fine-tuning procedure and the measured gate record:
+[docs/clm-fine-tune.md](docs/clm-fine-tune.md).
+
 ### Key environment variables
 
 | Variable | Default | Description |

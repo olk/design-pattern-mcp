@@ -319,21 +319,27 @@ class PromptConfig(BaseModel):
 
 
 class DecisionSeamConfig(BaseModel):
-    """One decision-model seam: the AnyJev gateway endpoint plus the knobs that bound it.
+    """One decision-model seam: the provider endpoint plus the knobs that bound it.
 
-    Every seam is default-off and every seam speaks the one wire,
-    ``POST /v1/decide`` (``base_url`` is the gateway ROOT — no ``/v1`` suffix; the
-    client appends the path). ``api_key_env`` is the only credential path: it stays
-    reachable for a hosted gateway, and ``None`` means no ``Authorization`` header at
-    all.
+    Every seam is default-off. ``provider`` names which serving stack answers the seam and
+    therefore which wire it speaks: ``tacit`` (default) = the AnyJev gateway's
+    ``POST /v1/decide`` and ``base_url`` is the gateway ROOT; ``clm`` = the TypeSafe-
+    compatible ``POST /v1/systemone`` and ``base_url`` is the ``/v1`` root. Only the Ch2
+    style seam honours ``clm`` — the other seams stay on Tacit. ``api_key_env`` is the
+    only credential path: it stays reachable for a hosted endpoint with the same wire,
+    and ``None`` means no ``Authorization`` header at all.
     """
 
     enabled: bool = Field(default=False, description="Opt-in seam switch.")
+    provider: Literal["tacit", "clm"] = Field(
+        default="tacit",
+        description="Serving stack behind the seam: tacit (/v1/decide) or clm (/v1/systemone).",
+    )
     base_url: str = Field(
         default="http://design-pattern-tacit:8100",
-        description="anyjev gateway root (no /v1 suffix; the client appends /v1/decide).",
+        description="anyjev gateway root (no /v1 suffix), or the clm-serve /v1 root when provider=clm.",
     )
-    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b).")
+    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b | clm-latest).")
     api_key_env: str | None = Field(
         default=None,
         description="Optional env var holding a bearer key; None = no Authorization header.",
@@ -343,9 +349,10 @@ class DecisionSeamConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Minimum top probability to act on the answer (ignored by the weights seam). The Ch2 "
-            "style seam gates on TWO stages: both the category question and the shortlist question "
-            "must clear it. Set it from scripts/decision_models/tacit_calibrate.py, not the default."
+            "Minimum confidence to act on the answer (ignored by the weights seam). The Ch2 "
+            "style seam gates on TWO stages under Tacit (category and shortlist questions) but "
+            "on ONE under CLM (top probability minus mean of the rest). Set it from "
+            "scripts/decision_models/{tacit,clm}_calibrate.py, not the default."
         ),
     )
     timeout_seconds: float = Field(
@@ -362,6 +369,18 @@ class DecisionSeamConfig(BaseModel):
         """Treat an empty placeholder (``""``) as "no auth", not as "look up ''"."""
         return value or None
 
+    @model_validator(mode="after")
+    def _clm_base_url_is_the_v1_root(self) -> DecisionSeamConfig:
+        """A ``clm`` seam must carry the ``/v1`` root: the client appends ``/systemone``.
+
+        Without this the two wires' ``base_url`` shapes are interchangeable strings, and a
+        Tacit gateway root left on a ``clm`` seam produces 404s that the degrade-never-raise
+        contract turns into a silently dead seam — the failure mode a config check prevents.
+        """
+        if self.provider == "clm" and not self.base_url.rstrip("/").endswith("/v1"):
+            raise ValueError(f"provider=clm needs the clm-serve /v1 root, got base_url={self.base_url!r}")
+        return self
+
 
 #: Per-seam defaults. The seams share one gateway but not one timeout (the weights seam
 #: asks 8 questions per part); a seam must keep ITS timeout when a caller supplies only a
@@ -369,21 +388,25 @@ class DecisionSeamConfig(BaseModel):
 #: would otherwise resolve back onto the generic defaults.
 _SEAM_DEFAULTS: dict[str, dict[str, Any]] = {
     "style": {
+        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 10.0,
     },
     "weights": {
+        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 30.0,
     },
     "category": {
+        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 10.0,
     },
     "reasoning_gate": {
+        "provider": "tacit",
         "base_url": "http://design-pattern-tacit:8100",
         "model": "tacit-4b",
         "timeout_seconds": 5.0,
@@ -421,6 +444,28 @@ class DecisionsConfig(BaseModel):
             if isinstance(value, dict):
                 merged[name] = {**defaults, **value}
         return merged
+
+    @model_validator(mode="after")
+    def _only_the_style_seam_may_use_clm(self) -> DecisionsConfig:
+        """Reject ``provider=clm`` on any seam but ``style``: there is no client for it.
+
+        The other four seams have exactly one implementation (``TacitClient``). Allowing the
+        field to say otherwise would make the startup report claim a provider that never
+        answers — and misconfiguration that reads as configuration is worse than a crash.
+        """
+        for name, seam in self._seams().items():
+            if name != "style" and seam.provider != "tacit":
+                raise ValueError(f"decisions.{name}.provider={seam.provider!r}: only 'style' may use clm")
+        return self
+
+    def _seams(self) -> dict[str, DecisionSeamConfig]:
+        """Every seam by name, in the order the startup report lists them."""
+        return {
+            "style": self.style,
+            "weights": self.weights,
+            "category": self.category,
+            "reasoning_gate": self.reasoning_gate,
+        }
 
 
 class ServerConfig(BaseModel):
