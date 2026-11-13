@@ -35,10 +35,15 @@ this instrument.
 | `train` | 719 | 36, min 13 positives (`event-sourcing`), max 53 (`monolithic`) | head fine-tune |
 | `holdout` | 138 | 36, min 2 (`edge-computing`, `enterprise-service-bus`, `modular-monolith`) | generalization instrument |
 
-Family-disjoint by construction: zero shared `source.scenario_id` between the splits (checked
-in the run log; the exporter loads exactly one split and refuses the other). The val slice
-that drives checkpoint selection is carved from train ids only (10 %, `random.Random(1234)`),
-so the holdout families never reach a weight or a checkpoint choice.
+Family-disjoint, and now MEASURED rather than asserted. The corpus carries a `family` field;
+the split is 35 train-only families and 17 holdout-only families with **zero straddling**, so
+the holdout scenarios belong to families the head never sees. Zero shared
+`source.scenario_id` across the splits, and no paraphrase leakage either: the highest 5-gram
+Jaccard between any of the 99 222 train×holdout description pairs is **0.148** (none reaches
+0.60, let alone the 0.80 that would flag a paraphrase), and there are no exact duplicate
+descriptions. The exporter loads exactly one split and refuses the other. The val slice that
+drives checkpoint selection is carved from train ids only (10 %, `random.Random(1234)`), so
+the holdout families never reach a weight or a checkpoint choice.
 
 The category question (`qa/typed/choice.jsonl`, 719/138) is exported alongside and trained,
 but it is **advisory, never gating** — no CLM client asks it on this branch; J2 stays on

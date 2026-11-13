@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 import types
 from functools import lru_cache
@@ -1858,3 +1859,56 @@ def test_calibration_report_carries_per_row_decisions(
         assert set(row) == {"scenario_id", "label", "choice", "confidence"}
         assert row["label"] == "a" and row["choice"] == "a"
         assert row["confidence"] == pytest.approx(0.8)
+
+
+def test_style_corpus_holdout_is_family_disjoint_and_not_paraphrased() -> None:
+    """The holdout only means something if it is uncontaminated.
+
+    The gate's central claim is "this head generalizes to unseen families". That is a
+    property of the DATA, not of the trainer, so a later re-split could silently destroy it
+    while every other test stayed green. Three separate leakage routes are checked:
+
+    1. family — the corpus carries a ``family`` field; a family spanning the split means the
+       head was trained on siblings of the rows it is scored on;
+    2. scenario identity — the same scenario must not appear twice;
+    3. paraphrase — a near-identical description is leakage even under a different id, so the
+       highest 5-gram Jaccard between any train x holdout pair must stay well below the
+       duplication threshold (it measures 0.148; 0.80 is a generous ceiling).
+    """
+    rows = [
+        json.loads(line)
+        for line in (REPO_ROOT / "qa" / "typed" / "style.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    train = [row for row in rows if row["source"]["split"] == "train"]
+    holdout = [row for row in rows if row["source"]["split"] == "holdout"]
+    assert (len(train), len(holdout)) == (719, 138)
+
+    corpus = json.loads((REPO_ROOT / "tests" / "benchmark" / "scenarios" / "full.json").read_text(encoding="utf-8"))
+    scenarios = {item["scenario_id"]: item for item in corpus.get("scenarios", corpus)}
+
+    # 1. No family may straddle the split.
+    train_families = {scenarios[row["source"]["scenario_id"]]["family"] for row in train}
+    holdout_families = {scenarios[row["source"]["scenario_id"]]["family"] for row in holdout}
+    assert not (train_families & holdout_families), f"families straddle the split: {train_families & holdout_families}"
+
+    # 2. No shared scenario identity.
+    train_ids = {row["source"]["scenario_id"] for row in train}
+    assert not (train_ids & {row["source"]["scenario_id"] for row in holdout})
+
+    # 3. No paraphrase duplication.
+    def shingles(text: str, width: int = 5) -> set[str]:
+        words = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).split()
+        return {" ".join(words[index : index + width]) for index in range(max(0, len(words) - width + 1))}
+
+    train_shingles = [shingles(row["state"]) for row in train]
+    holdout_shingles = [shingles(row["state"]) for row in holdout]
+    worst = 0.0
+    for held in holdout_shingles:
+        for seen in train_shingles:
+            if not held or not seen:
+                continue
+            intersection = len(held & seen)
+            if intersection:
+                worst = max(worst, intersection / len(held | seen))
+    assert worst < 0.80, f"a holdout state paraphrases a train state (5-gram Jaccard {worst:.3f})"
