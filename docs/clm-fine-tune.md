@@ -198,7 +198,19 @@ Landed and verified on the workstation:
   clean (`architecture_style` train 719 / test 138, `uncovered: []`);
 - `make check-all` + `make test-unit` green; `docker build --check` clean on both targets.
 
-`:base` was deliberately NOT built locally while the host was down. This branch's only
+Every deterministic link in the build→serve path was rehearsed here, so what remains on the
+host is GPU compute and nothing else:
+
+| Link | Status |
+|---|---|
+| `[2/6]` export → manifest | 719 train / 138 test, `uncovered: []` |
+| `[2/6]` preflight pin vs manifest | PASS on the real manifest; fails closed on a wrong pin |
+| `[4/6]` eval gate on the real manifest | PASS (R6 all 36 test labels supported, R7 nothing to acknowledge) |
+| `[5/6]` rank-parity payload loader | accepts all 30 committed payloads |
+| extract chain (trainer → COPY → `docker cp` → marker) | filenames and paths match at the pin |
+| `clm-entrypoint.sh` ↔ training ↔ serving | 2048 token budget, `qwen3-8b` served name, `/v1/embeddings` upstream and `/clm/heads/best_head.pt` all agree |
+
+The `:base` build was deliberately NOT run locally while the host is down. This branch's only
 `Dockerfile.clm` changes are header comments plus `--targets hard` / `--loss infonce` inside
 the `finetune` stage, so `runtime-released` is byte-identical to the branch that already built
 and served the sidecar; building it here would spend ~25 GB plus a 16 GB encoder download on a
