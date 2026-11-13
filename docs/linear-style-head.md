@@ -199,3 +199,36 @@ image, and the seam already degrades to the LLM style.
 Set `provider = "tacit"` (the shipped default) to revert. Nothing changes for an existing
 deployment until `DECISIONS_STYLE_PROVIDER` is set: `config/config.json` still defaults the
 seam to Tacit and off.
+
+### Reproducing the A/B on a GPU host
+
+The arms need the Tacit gateway, so they run where a card can serve vLLM (here
+`tacit-clm-ft`, 4× RTX 3090). From a workstation checkout of this branch:
+
+```bash
+git bundle create /tmp/lsh.bundle 22445902..linear-style-seam      # base = clm-style-seam tip
+ssh host 'cat > /tmp/lsh.bundle' < /tmp/lsh.bundle
+ssh host 'cd design-pattern-mcp && git fetch /tmp/lsh.bundle linear-style-seam:linear-style-seam &&
+          git checkout linear-style-seam'
+# the host carries UNCOMMITTED CLM evidence (models/clm-heads extras, calibration JSONs):
+# copy it aside before the first checkout — the branch's tracked copies are not the whole story
+ssh host 'cd design-pattern-mcp && cp -a models/clm-heads models/clm-calibration*.json /tmp/host-uncommitted/'
+ssh host 'cd design-pattern-mcp && make docker-build-style-head &&
+          docker build --target production -f Dockerfile -t design-pattern-mcp:latest .'
+ssh host 'cd design-pattern-mcp && make style-head-calibrate'      # floor from the served head
+ssh host 'cd design-pattern-mcp && setsid nohup make benchmark-style-ab \
+  STYLE_PROVIDER=linear STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml \
+  STYLE_AB_SCENARIOS=tests/benchmark/scenarios/seed.json > /tmp/style-ab.log 2>&1 &'
+```
+
+Two costs to budget, both fixed per arm and both by design: Tacit's vLLM load (~2-3 min) and
+the catalog embed, because `docker-compose.benchmark.yml` forces `DENSE_CACHE_MODE=off` so an
+arm can never measure a warm cache (an MCP image built without a baked cache also starts empty
+— `make docker-build` needs `uv` on the host to generate one). Only then do the records run.
+`make style-head-calibrate` needs `uv`; install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`
+if the host (like this one) does not ship it.
+
+Abort criterion that was actually used: watch the first records' wall time against the
+`STYLE_AB_SCENARIOS` count before committing hours — a corpus whose arm time exceeds the
+session is a corpus that produces no verdict.
+
