@@ -28,6 +28,8 @@ An MCP (Model Context Protocol) server that provides design-pattern selection ex
   - [Local Development (uv)](#local-development-uv)
 - [Configuration](#configuration)
   - [Decision models (AnyJev Tacit-4B)](#decision-models-anyjev-tacit-4b)
+  - [Decision models (CLM-8B, the Ch2 style seam's other provider)](#decision-models-clm-8b-the-ch2-style-seams-other-provider)
+  - [Decision models (linear, the Ch2 style seam's CPU provider)](#decision-models-linear-the-ch2-style-seams-cpu-provider)
 - [Structured Reasoning](#structured-reasoning)
 - [Long-running tools & timeouts](#long-running-tools--timeouts)
 - [Benchmarks & Verification](#benchmarks--verification)
@@ -653,6 +655,30 @@ The sidecar wants its own card (encoder ≈ 16 GB); `CLM_GPU_DEVICE` selects the
 
 Fine-tuning procedure and the measured gate record:
 [docs/clm-fine-tune.md](docs/clm-fine-tune.md).
+
+### Decision models (linear, the Ch2 style seam's CPU provider)
+
+`design-pattern-style-head` answers the *same* `POST /v1/systemone` wire as the CLM heads, but
+with a TF-IDF(1-2gram) + calibrated linear SVM instead of an encoder stack: ~450 MB, **no GPU
+and no network at run time**, ~8 ms per decision. It exists because the task turned out to be a
+lexical read — measured on the same 138-row family-disjoint holdout as both neural providers,
+it scores **0.8333** top-1 where they scored 0.5072 / 0.4565, and it is the only arm that
+yields a qualifying confidence floor.
+
+```bash
+make docker-build-style-head            # CPU, ~20 s; the training RUN *is* the accuracy gate
+make docker-up-decisions STYLE_PROVIDER=linear
+make style-head-calibrate               # floor + repeat/order probes -> models/style-head-calibration.json
+make benchmark-style-ab STYLE_PROVIDER=linear
+```
+
+The seam, endpoint, model name and floor all follow from the provider. Provider `linear` also
+has a CPU-only overlay, `docker/docker-compose.style-head.yml`, for hosts whose card cannot
+serve vLLM at all — the full decision overlay's server depends on the Tacit gateway, this one
+does not. The seam stays default-off until `benchmark-style-ab` clears the pre-registered rule.
+
+Measurement, the recipe correction it forced, and the operating procedure:
+[docs/linear-style-head.md](docs/linear-style-head.md).
 
 ### Key environment variables
 
