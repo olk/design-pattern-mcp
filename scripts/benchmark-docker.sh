@@ -185,6 +185,19 @@ case "$stack" in
     require_image "$MCP_IMAGE"
     require_image "$TEI_IMAGE"
     require_image "$TEI_RERANK_IMAGE"
+    # A stack whose generator credential is EMPTY still "works": every scenario falls down the
+    # documented degraded paths (ERR_009 → minimal single-part brief, E12 retries, open circuit
+    # breaker) and the arm completes with numbers. The arms would then differ by noise instead
+    # of by the seam under test — a verdict about nothing. Compose reads its environment from
+    # the PROJECT DIRECTORY (the dir of the first -f file, i.e. docker/), so an `.env` at the
+    # repo root is invisible here; assert the value that will actually reach the container
+    # instead of the one the operator believes they exported.
+    rendered_key="$(docker compose "${COMPOSE_FILES[@]}" config 2>/dev/null \
+      | sed -n 's/^ *GENERATOR_API_KEY: *//p' | head -1)"
+    case "$rendered_key" in
+      "" | "''" | '""')
+        die "GENERATOR_API_KEY renders EMPTY in the stack — the arm would measure degraded paths, not the seam. Put it in docker/.env (the compose project dir), not the repo root." ;;
+    esac
     started=1 # set before `up`: a failed bring-up may leave partial services behind
     timeout "${BENCH_STACK_TIMEOUT:-2100}" docker compose "${COMPOSE_FILES[@]}" up -d --wait design-pattern-mcp
     # MCP-level readiness: the documented systemd probe (POST /mcp initialize → 200).
