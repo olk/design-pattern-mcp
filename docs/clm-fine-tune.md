@@ -286,7 +286,7 @@ Same instrument for every arm: the 138-row family-disjoint holdout, 36 classes, 
 | AnyJev Tacit-4B (committed report) | **0.4203** | `models/tacit-calibration.json`, n=138 |
 | CLM-8B heads-only, run 1 (`lr 5e-4`) | **0.5072** | in-build eval gate (build stopped at rank parity, heads not extracted) |
 | CLM-8B heads-only, run 2 (`lr 2.5e-4`) | **0.4565** | `models/clm-calibration.json` (served replay) |
-| TF-IDF(1-2gram) + LogReg | **0.833** | `docs/tacit-fine-tune.md` §4.7.1, same 719 labels |
+| TF-IDF(1-2gram) + calibrated LinearSVC | **0.833** | `models/style-head-calibration.json`, n=138 (`docs/linear-style-head.md` §2) |
 
 ### The two builds
 
@@ -343,11 +343,15 @@ plan's stop rule the effort ends here; this document is the verdict.
 
 The shape of the result is the same one `docs/tacit-fine-tune.md` §4.7.1 reached from the other
 direction: a fine-tuned sidecar over a frozen encoder scores 0.46–0.51 on this 36-way task
-while a TF-IDF(1-2gram) + logistic-regression model over the *same 719 labels* scores 0.833,
+while a TF-IDF(1-2gram) + max-margin linear model over the *same 719 labels* scores 0.833,
 and the released heads score 0.036. Twenty times the parameters, ten times the compute, less
 than two thirds of the accuracy. This is not a case for another retrain — the plan allows one
 retry and it made things worse. It is evidence that the task is a lexical read the encoder
-adapters are the wrong instrument for.
+adapters are the wrong instrument for. (`docs/linear-style-head.md` §2 measures that baseline
+per classifier: the *logistic-regression* form of it scores 0.4348 on the same bytes, so §4.7.1's
+"0.833" is the max-margin arm, not the softmax one. The conclusion is unchanged — a linear
+model reads this task and the 8B heads do not — but the recipe that reaches 0.833 is a
+calibrated `LinearSVC`.)
 
 What a future attempt would have to change is the *instrument*, not the hyperparameters
 options already measured out: a shortlist-then-discriminate head, a linear style head served

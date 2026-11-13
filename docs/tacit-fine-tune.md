@@ -753,8 +753,10 @@ that consumes the 580 new train shards, then this same command re-run against th
 
 **Next step: one gold-supervised retrain, with a stop rule.** The measured reason to retrain is
 not hope that more tuning helps, it is that the *signal is in the labels and the artifact is not
-extracting it*. A plain TF-IDF (1-2 gram) + logistic-regression baseline trained on the same 719
-train labels scores **0.833 on the 138-row holdout** (1.000 at the top 30 % by confidence), while
+extracting it*. A plain TF-IDF (1-2 gram) + max-margin linear baseline trained on the same 719
+train labels scores **0.833 on the 138-row holdout** (1.000 at the top 30 % by confidence;
+`docs/linear-style-head.md` §2 re-measures it per classifier — the calibrated `LinearSVC` form
+0.8333, the logistic-regression form 0.4348), while
 the served 4B artifact scores 0.442 overall and 0.593 at the 39 % it acts on. The 4B's failures are
 also structured rather than diffuse: seven classes sit at 0.00 accuracy on 3-6 rows each and
 abstention is 2/13, i.e. exactly the classes the old 128-row gold set barely covered — the thing
