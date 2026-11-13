@@ -184,12 +184,7 @@ Landed and verified on the workstation:
 - `build_style_criteria()` re-keyed to `STYLE_VOCABULARY` + ordered byte-parity test;
 - the CLM scripts and their two Dockerfile targets (`runtime-released` and
   `runtime-finetuned` exist and pass `docker build --check` — statically only, neither image
-  has been BUILT yet). `:base` was deliberately not built locally while the host is down:
-  this branch's only `Dockerfile.clm` changes are header comments plus `--targets hard`/
-  `--loss infonce` inside the `finetune` stage, so `runtime-released` is byte-identical to
-  the branch that already built and served the sidecar — and the build costs ~25 GB plus a
-  16 GB encoder download on a 69 GB-free disk to produce an image this box cannot serve
-  (Pascal, CC 6.1). The compose sidecar, the `clm-*` Makefile targets, the consistency
+  has been BUILT yet), the compose sidecar, the `clm-*` Makefile targets, the consistency
   probes;
 - `make clm-calibrate` proved end to end against an oracle stub on this workstation (138
   rows, 7 floors, both probes populated, `served` provenance recorded, exit 0). That is a
@@ -203,10 +198,25 @@ Landed and verified on the workstation:
   clean (`architecture_style` train 719 / test 138, `uncovered: []`);
 - `make check-all` + `make test-unit` green; `docker build --check` clean on both targets.
 
+`:base` was deliberately NOT built locally while the host was down. This branch's only
+`Dockerfile.clm` changes are header comments plus `--targets hard` / `--loss infonce` inside
+the `finetune` stage, so `runtime-released` is byte-identical to the branch that already built
+and served the sidecar; building it here would spend ~25 GB plus a 16 GB encoder download on a
+69 GB-free disk to produce an image this box cannot serve (Pascal, CC 6.1).
+
+The extract chain was verified statically, link by link, because a mismatch anywhere in it
+costs a finished 10-hour build: the trainer writes `best_head.pt` and `finetune_summary.json`
+into `--out-dir /clm/heads-trained` (`train/finetune.py:323,743` at the pin); the two gates
+write `clm-eval-gate.json` and `clm-rank-parity.json` beside them; `runtime-finetuned` is
+`COPY --from=finetune /clm/heads-trained /clm/heads`, so `docker cp "$cid:/clm/heads/."`
+captures the checkpoint AND both reports, which the Makefile then hashes into
+`.extract-complete`; `runtime-released` places `CLM_v0.1-8B.pt` at exactly `/clm/heads/best_head.pt`,
+the path `CLM_CKPT` serves.
+
 NOT yet measured — the GPU host (`192.168.1.153`, 4× RTX 3090) was unreachable (`No route to
 host`, and its Proxmox parent with it) when this branch was cut. The remaining steps are
-gated on that host. The branch travels as `~/clm-style-seam.bundle` (`git bundle verify`
-passes; complete history, tip `85daf07` + the follow-up commits):
+gated on that host. The branch travels as `~/clm-style-seam.bundle` (complete history;
+`git bundle verify` names the tip it carries, so this paragraph cannot go stale):
 
 1. `scp ~/clm-style-seam.bundle <host>:/tmp/`, then on the host
    `git fetch /tmp/clm-style-seam.bundle clm-style-seam:clm-style-seam && git checkout clm-style-seam`,
