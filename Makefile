@@ -921,18 +921,20 @@ STYLE_AB_FLOOR_FILE = $(if $(filter linear,$(STYLE_PROVIDER)),$(LINEAR_CAL_REPOR
 # does not exist.
 STYLE_CALIBRATE_TARGET = $(if $(filter linear,$(STYLE_PROVIDER)),style-head-calibrate,$(STYLE_PROVIDER)-calibrate)
 # Which overlay the A/B stack carries. `tacit`/`clm` need the GPU overlay (their sidecar is
-# inside it); `linear` is CPU-only and uses the style-seam-only overlay, because the GPU
-# overlay's design-pattern-mcp depends_on the Tacit gateway and therefore cannot come up on a
-# host whose card predates Ampere. Both overlays declare the same style env; the CPU one just
-# has no GPU service in the project.
+# inside it); `linear` defaults to the CPU-only style-seam overlay, because the GPU overlay's
+# design-pattern-mcp depends_on the Tacit gateway and therefore cannot come up on a host whose
+# card predates Ampere. On a GPU host, run the full stack instead by overriding the overlay:
+#   make benchmark-style-ab STYLE_PROVIDER=linear \
+#     STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml
 STYLE_HEAD_OVERLAY  := docker/docker-compose.style-head.yml
 STYLE_AB_OVERLAY     = $(if $(filter linear,$(STYLE_PROVIDER)),$(STYLE_HEAD_OVERLAY),docker/docker-compose.decision-models.yml)
 # Bring the linear head up inside the A/B project. The harness tears its whole compose project
 # down at the end of EVERY arm, so this runs before each arm — starting it once would leave
 # arm 2 with a dead seam (and a dead seam is silent: the LLM style stands, the arm still
-# completes, and the comparison would quietly measure nothing).
+# completes, and the comparison would quietly measure nothing). It uses the SAME overlay as the
+# arm, so the sidecar is part of the project's file set either way.
 STYLE_HEAD_UP = STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) \
-	docker compose -f docker/docker-compose.yml -f $(STYLE_HEAD_OVERLAY) up -d --wait design-pattern-style-head
+	docker compose -f docker/docker-compose.yml -f $(STYLE_AB_OVERLAY) up -d --wait design-pattern-style-head
 
 benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the sidecar + GPU)
 	@test -n "$(STYLE_AB_FLOOR)" || { \
