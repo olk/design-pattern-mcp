@@ -27,7 +27,7 @@ committed sentinels (weights untracked). Run Tacit on a GPU host instead
 
 ```bash
 # From the repo root (server + TEI pair + style head):
-make docker-build docker-build-tei docker-build-style-head
+make docker-build-base
 ```
 
 Or pull published images and retag to `:local` so the `ExecStartPre` guard passes.
@@ -43,9 +43,9 @@ sudo systemctl enable --now pattern-tei-infra.service
 # 1. Create deployment directory.
 sudo install -d /etc/design-pattern-mcp/config
 
-# 2. Copy the production compose file.
+# 2. Copy the production compose files (base + decision overlay).
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
-
+sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
 # 3. Copy application config.
 sudo install -m 644 ~/.config/design-pattern-mcp/config.json \
                 /etc/design-pattern-mcp/config/
@@ -83,84 +83,72 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8812/mcp" \
 |---|---|---|
 | TEI embed / rerank | external `pattern-tei-infra` (`pattern-tei-shared`) | shared GPU/CPU infra, one copy for all pattern servers |
 | style head (Ch2) | in this stack (`design-pattern-style-head`) | CPU-only, no GPU, no port — the seam ships on and must resolve |
-| Tacit gateway (J1/J2/J4/J5) | GPU host via `tacit-tunnel` service (`--profile tacit`) | needs a card; gateway has no auth and container loopback is its own, so ssh runs in-stack |
+| Tacit gateway (J1/J2/J4/J5) | GPU host, plain HTTP (`http://tacit:8100` by default) | needs a card; `anyjev.serve` has no auth, so trusted networks only |
 
 ## Decision models
 
-The Ch2 style seam ships **on** (linear head, floor 0.6), served by the in-stack
-`design-pattern-style-head` service. Step 0 builds it locally
-(`make docker-build-style-head`); to run a published build instead, set
-`STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:<tag>` in
-`/etc/design-pattern-mcp/.env`. Set `DECISIONS_STYLE_ENABLED=false` there to stand
-the seam down to the LLM style.
+Two files, two stacks: `docker-compose.yml` runs MCP + style head (Ch2 on, floor 0.6)
+with TEI external; `docker-compose.decision-models.yml` adds the env that points the
+Tacit seams at the gateway. Enable the overlay persistently in
+`/etc/design-pattern-mcp/.env`:
 
-The Tacit seams (J1 rerank, J2 category, J4 weights, J5 gate) are **off** and their
-gateway lives on a GPU host — reached through the opt-in `tacit-tunnel` service
-(below), never directly: the gateway has no auth, so it binds loopback on its own
-host, and the production container's `127.0.0.1` is itself, so a host-level tunnel
-would be invisible to it. The sidecar runs the ssh client on `pattern-tei-shared`
-and forwards the gateway as `tacit-tunnel:8100`.
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.decision-models.yml
+```
 
-1. **GPU host** — run the gateway on loopback:
+then `sudo systemctl reload design-pattern-mcp`. To run a published head build
+instead of the local one, set `STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:<tag>`
+in the same `.env`.
+
+The Tacit seams (J1 rerank, J2 category, J4 weights, J5 gate) stay **off** until the
+overlay is on AND the switches below are set. The gateway lives on a GPU host and is
+reached over plain HTTP.
+
+1. **GPU host** — run the gateway on a trusted-network address (it has no auth of its
+   own — never a publicly reachable port):
 
    ```bash
    make docker-build-tacit            # tags :1.0.1 and :latest
    docker run -d --name design-pattern-tacit --restart unless-stopped \
-     --device nvidia.com/gpu=0 -p 127.0.0.1:8100:8100 \
+     --device nvidia.com/gpu=0 -p 10.0.0.5:8100:8100 \
      design-pattern-tacit:latest
    ```
 
-2. **This host** — deployment key + pinned host key (key auth only, no passwords,
-   no trust-on-first-use — the entrypoint refuses to run without both files):
+   (Replace `10.0.0.5` with the host's firewalled private address; the entrypoint
+   listens on `0.0.0.0` inside the container, so the publish is what confines it.)
 
-   ```bash
-   sudo install -o root -g docker -m 750 -d /etc/design-pattern-mcp/ssh
-   sudo install -o root -g docker -m 640 ~/.ssh/tacit_tunnel_ed25519 \
-     /etc/design-pattern-mcp/ssh/id_ed25519
-   ssh-keyscan -t ed25519 gpu-host | sudo tee /etc/design-pattern-mcp/ssh/known_hosts
-   sudo chmod 640 /etc/design-pattern-mcp/ssh/known_hosts
-   ```
-
-   Verify the `known_hosts` line against the GPU host's key fingerprint before
-   proceeding — `ssh-keyscan` output is unverified bytes until you do.
-
-3. **`/etc/design-pattern-mcp/.env`** — tunnel target plus the seam switches
+2. **`/etc/design-pattern-mcp/.env`** — gateway address plus the seam switches
    (all default off):
 
    ```
-   TACIT_TUNNEL_SSH_HOST=gpu-host
-   TACIT_TUNNEL_SSH_USER=graemer
+   COMPOSE_FILE=docker-compose.yml:docker-compose.decision-models.yml
+   TACIT_GATEWAY_URL=http://10.0.0.5:8100
    DECISIONS_WEIGHTS_ENABLED=true
    DECISIONS_CATEGORY_ENABLED=true
    DECISIONS_REASONING_GATE_ENABLED=true
    RERANKER_PROVIDER=tacit
    ```
 
-   The four `*_BASE_URL`s already default to `http://tacit-tunnel:8100` in the
-   compose file — set them only to override. Then bring the tunnel up alongside
-   the stack:
+   `TACIT_GATEWAY_URL` feeds all four Tacit endpoints (each `*_BASE_URL` still wins
+   individually when set). The overlay default assumes a host named `tacit`.
 
    ```bash
-   sudo systemctl reload design-pattern-mcp   # compose up without the tunnel
-   docker compose --profile tacit up -d       # from /etc/design-pattern-mcp
+   sudo systemctl reload design-pattern-mcp
    ```
 
-   (Or add `--profile tacit` to the unit's `ExecStart`/`ExecReload` lines if the
-   tunnel should always run with the stack.) Startup log shows
-   `ok (tacit, model=tacit-4b)` per seam; any transport failure degrades silently to
+   Startup log shows `ok (tacit, model=tacit-4b)` per seam; any transport failure degrades silently to
    the non-model path, so check the logs for `degraded` warnings if a seam reports
    `ok` but behaves like the baseline.
 
-Never by including the dev `docker-compose.decision-models.yml`: its
+Never by including the dev overlay `docker/docker-compose.decision-models.yml` (a
+different file from the systemd overlay above): its
 `depends_on: design-pattern-tacit: service_healthy` would make the production server
-unstartable without a local healthy gateway. (Alternative to the tunnel: publish the
-gateway on a firewalled private address — an unauthenticated gateway on the wire by
-explicit operator choice, trusted nets only.)
+unstartable without a local healthy gateway.
 
 ## Updating
 
 ```bash
-make docker-build docker-build-tei docker-build-style-head
+make docker-build-base
 sudo systemctl reload design-pattern-mcp
 ```
 

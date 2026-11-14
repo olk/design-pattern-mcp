@@ -205,11 +205,12 @@ floor itself was re-derived on that host against the served head before the run 
 same report shape, `recommended.floor = 0.1`), so the arm did not inherit a threshold from a
 different machine's sidecar.
 
-The head is also runnable with no GPU at all: `docker/docker-compose.style-head.yml` is a
-CPU-only overlay (the head plus the style seam env, no GPU services) that brings the seam up on
-a workstation whose card is below vLLM's compute-capability floor — that is how the wire, the
-`/health` probe and the 422 drift refusal were verified on the GTX 1080 Ti development box
-before this run.
+The head is also runnable with no GPU at all: at the time this was a CPU-only overlay
+(`docker/docker-compose.style-head.yml`, since merged into the base compose file) that
+brought the seam up on a workstation whose card is below vLLM's compute-capability floor
+— that is how the wire, the `/health` probe and the 422 drift refusal were verified on
+the GTX 1080 Ti development box before this run. Today the same lane is
+`make docker-up`.
 
 Two wiring facts were proved before the runs, because both failure modes are silent — the arm
 completes either way and the comparison then reads "no difference" against the head:
@@ -309,7 +310,8 @@ runs. That answer is at n=18 and inherits the same power caveat, stated with the
 
 ```bash
 make docker-build-style-head                    # ~20 s; the build gates the head
-make docker-up-decisions                        # or: docker compose -f docker/docker-compose.style-head.yml
+make docker-up                                  # base stack, style head included, no GPU
+# or: make docker-up-decisions                  # full stack with the Tacit gateway
 ```
 
 The seam ships on at floor 0.6 — no per-deployment step. `make style-head-calibrate`
@@ -318,13 +320,12 @@ is the maintainer tool for corpus/head changes: it rewrites
 bar-clearing floor, not the shipped default — 0.1 lost run 1 on repeat stability, so
 re-shipping still means re-winning the A/B at the new point (§6).
 
-`docker/docker-compose.style-head.yml` is the CPU-only overlay (the head plus the style seam
-env, no GPU services). The full decision stack includes the same service — it is defined once
-there and `include:`d by `docker-compose.decision-models.yml` — but its `design-pattern-mcp`
-depends on the Tacit gateway, so the full stack needs an Ampere-class card while this overlay
-does not. The head is deliberately not in `design-pattern-mcp`'s `depends_on` in the full
-stack: a hard dependency would fail every Tacit-only deployment whose operator never built the
-image, and the seam already degrades to the LLM style.
+The head runs in the base compose file, so `make docker-up` needs no GPU at
+all — but the full decision stack's `design-pattern-mcp` depends on the Tacit gateway,
+so that lane needs an Ampere-class card. The head is deliberately not in
+`design-pattern-mcp`'s `depends_on` in either stack: a hard dependency would fail every
+deployment whose operator never built the image, and the seam already degrades to the
+LLM style.
 
 There is no other Ch2 provider to revert to: `decisions.style.provider` is pinned to `linear`
 and `config/config.json` defaults the seam to the style head (on, floor 0.6). To stand the

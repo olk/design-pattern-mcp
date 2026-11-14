@@ -15,12 +15,12 @@
 	health client-analyze client-design client-async \
 	benchmark-selfcheck benchmark-offline benchmark-live benchmark-analyze benchmark-e2e benchmark-compare \
 	benchmark-sidecars-up benchmark-draft benchmark-style-ab benchmark-rerank-ab \
-	docker-build docker-build-all docker-build-cached docker-build-nocache \
+	docker-build docker-build-all docker-build-base docker-build-cached docker-build-nocache \
 	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
 	docker-build-tei-rerank dense-cache \
-	docker-build-tacit docker-build-tacit-base docker-build-tacit-tunnel \
+	docker-build-tacit docker-build-tacit-base \
 	docker-build-style-head \
-	docker-build-decision docker-up-decisions docker-down-decisions docker-up-style docker-down-style decisions-smoke \
+	docker-build-decision docker-up-decisions docker-down-decisions decisions-smoke \
 	tacit-payloads tacit-payloads-check \
 	style-head-calibrate check-dockerfile-shell \
 	docker-publish docker-publish-tei docker-publish-tacit docker-publish-style-head docker-publish-all \
@@ -54,11 +54,6 @@ DENSE_CACHE_DIR    ?= data/dense-cache
 # run time; the *-base target builds the released-weights variant and needs no GPU.
 TACIT_IMAGE      := design-pattern-tacit
 TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
-# SSH-tunnel sidecar for the systemd stack (alpine + openssh-client, no model):
-# it forwards the GPU host's loopback-bound gateway onto the shared network, so the
-# production container — whose 127.0.0.1 is its own — can reach it as tacit-tunnel:8100.
-# Local-only image, never published: it carries no artifact, only the ssh client.
-TACIT_TUNNEL_IMAGE := design-pattern-tacit-tunnel
 # Registry pair for the sidecar. Ships in docker-publish-all (and on demand via
 # docker-publish-tacit): the image is ~29 GB, so budget time/bandwidth for the upload.
 TACIT_HUB_REPO   := olkowa/design-pattern-tacit
@@ -397,6 +392,12 @@ docker-build-tei-rerank: ## Build the TEI rerank sidecar image
 
 docker-build-tei: docker-build-tei-embed docker-build-tei-rerank ## Build both TEI sidecar images
 
+# The runnable base stack in one command (server + TEI pair + style head): everything
+# `docker-up` and the systemd base file start, with no GPU anywhere. `docker-build`
+# stays server-only on purpose — it feeds `docker-publish`, which must not drag in
+# sidecars.
+docker-build-base: docker-build docker-build-tei docker-build-style-head ## Build the base stack images (server + TEI pair + style head, no GPU)
+
 # Sequential prerequisites on purpose: docker-build-tacit holds the GPU for its
 # self-distill RUN, so parallel make must not overlap it with another GPU build.
 docker-build-all: docker-build docker-build-tei docker-build-decision ## Build every image: server (+dense cache), TEI pair, Tacit, style head
@@ -474,10 +475,6 @@ docker-build-style-head: ## Build the linear style head sidecar (CPU; the build 
 	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.style-head \
 		-t $(STYLE_HEAD_IMAGE):$(DOCKER_TAG) -t $(STYLE_HEAD_IMAGE):latest .
 
-docker-build-tacit-tunnel: ## Build the Tacit SSH-tunnel sidecar (alpine + openssh-client)
-	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.tacit-tunnel \
-		-t $(TACIT_TUNNEL_IMAGE):$(DOCKER_TAG) -t $(TACIT_TUNNEL_IMAGE):latest .
-
 docker-build-decision: docker-build-tacit docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
 
 docker-up-decisions: ## Start the dev stack with the decision-model sidecars (one GPU, one CPU)
@@ -488,18 +485,6 @@ docker-down-decisions: ## Stop the whole dev stack including the decision-model 
 	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) \
 		STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) down
 
-# Style-only lane: the base stack plus the CPU head, no GPU anywhere. This is what a
-# GPU-less host runs — plain `docker-up` starts no sidecar, and the default-on style
-# seam would degrade silently against a dead endpoint. Same project as COMPOSE_DM (the
-# last -f file's `name:` wins in both), so switching lanes is down + up, never a
-# second stack.
-COMPOSE_STYLE := docker compose -f docker/docker-compose.yml -f docker/docker-compose.style-head.yml
-
-docker-up-style: ## Start the dev stack with the CPU style head only (no GPU)
-	$(STYLE_PROVIDER_ENV) STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_STYLE) up -d
-
-docker-down-style: ## Stop the dev stack including the CPU style head
-	STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_STYLE) down
 
 decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docker-up-decisions)
 	@echo "==> Tacit /v1/decide"
@@ -786,21 +771,20 @@ STYLE_AB_STAMP     ?= $(shell date -u +%Y%m%d-%H%M%S)
 STYLE_AB_FLOOR      = $(LINEAR_STYLE_FLOOR)
 STYLE_AB_FLOOR_FILE = $(STYLE_HEAD_CAL_REPORT)
 STYLE_CALIBRATE_TARGET = style-head-calibrate
-# Which overlay the A/B stack carries. The default is the CPU-only style-seam overlay,
-# because the GPU overlay's design-pattern-mcp depends_on the Tacit gateway and therefore
-# cannot come up on a host whose card predates Ampere. On a GPU host, run the full stack
-# instead by overriding the overlay:
+# Which overlay the A/B stack carries. The default is none — the style head lives in
+# the base file, so the base stack alone is the CPU-only instrument. The GPU overlay's
+# design-pattern-mcp depends_on the Tacit gateway and therefore cannot come up on a
+# host whose card predates Ampere. On a GPU host, run the full stack instead by
+# overriding the overlay:
 #   make benchmark-style-ab \
 #     STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml
-STYLE_HEAD_OVERLAY  := docker/docker-compose.style-head.yml
-STYLE_AB_OVERLAY     = $(STYLE_HEAD_OVERLAY)
+STYLE_AB_OVERLAY     ?=
 # Bring the linear head up inside the A/B project. The harness tears its whole compose project
 # down at the end of EVERY arm, so this runs before each arm — starting it once would leave
 # arm 2 with a dead seam (and a dead seam is silent: the LLM style stands, the arm still
-# completes, and the comparison would quietly measure nothing). It uses the SAME overlay as the
-# arm, so the sidecar is part of the project's file set either way.
+# completes, and the comparison would quietly measure nothing).
 STYLE_HEAD_UP = STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) \
-	docker compose -f docker/docker-compose.yml -f $(STYLE_AB_OVERLAY) up -d --wait design-pattern-style-head
+	docker compose -f docker/docker-compose.yml $(if $(STYLE_AB_OVERLAY),-f $(STYLE_AB_OVERLAY)) up -d --wait design-pattern-style-head
 
 benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the sidecar + GPU)
 	@test -n "$(STYLE_AB_FLOOR)" || { \

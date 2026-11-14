@@ -1,19 +1,20 @@
 # Production Compose for systemd deployment.
 #
 # This file is a deployment variant of docker/docker-compose.yml:
-#   - No `build:` sections (images must be pre-built from the dev compose
-#     via `make docker-build-all` before enabling the service).
+#   - No `build:` sections (images must be pre-built via `make docker-build-base`
+#     — never `make docker-build-all`, whose Tacit self-distill aborts on this
+#     GPU-less host — before enabling the service).
 #   - Absolute paths everywhere.
 #   - The systemd unit injects COMPOSE_PROJECT_NAME=dpml-systemd so this
 #     stack is distinct from the dev compose.
 #   - TEI sidecars are NOT defined here — they live in the shared
 #     `pattern-tei-infra` stack (https://github.com/olk/pattern-tei-infra).
 #     This stack joins the `pattern-tei-shared` external network to reach them.
-#   - The Ch2 style head IS defined here: it is a CPU-only sidecar (local build tag,
-#     no ports, no GPU), and the style seam ships on. The Tacit gateway lives on a GPU
-#     host and is reached through the opt-in tacit-tunnel service (`--profile tacit`),
-#     which forwards it as tacit-tunnel:8100; the Tacit seams (J1 rerank, J2 category,
-#     J4 weights, J5 gate) stay off unless the tunnel runs and the operator enables them.
+#   - The Ch2 style head IS defined here (CPU-only sidecar, no ports, no GPU):
+#     the style seam ships on. The Tacit gateway lives on a GPU host and is reached
+#     over plain HTTP through the opt-in overlay (`docker-compose.decision-models.yml`),
+#     which points the seam URLs at it. Enable persistently with
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.decision-models.yml in .env.
 #
 # Every environment name set here must match a `{env:...}` placeholder in
 # config/config.json. A name that does not is SILENTLY IGNORED (the server falls
@@ -63,12 +64,6 @@ services:
       - EMBEDDER_API_KEY=${EMBEDDER_API_KEY:-not-needed}
 
       - RERANKER_BASE_URL=http://pattern-tei-rerank:8080
-      # Rerank scorer switch (default tei). Tacit needs the tacit-tunnel service below
-      # (`--profile tacit`, see README "Decision models"); without it, leave provider=tei
-      # and the URL below is inert.
-      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-tei}
-      - RERANKER_TACIT_BASE_URL=${RERANKER_TACIT_BASE_URL:-http://tacit-tunnel:8100}
-      - RERANKER_TACIT_TIMEOUT_SECONDS=${RERANKER_TACIT_TIMEOUT_SECONDS:-60}
 
       # Dense embedding cache: /app/data/dense-cache ships baked into the image
       # and is backed by the NAMED volume below, so the reloaded snapshot (zero
@@ -101,29 +96,13 @@ services:
       # below (CPU, no published port — internal on pattern-tei-shared, like the TEI
       # sidecars it joins). If the sidecar is unreachable the seam degrades
       # to the LLM style. Set DECISIONS_STYLE_ENABLED=false to stand it down.
+      # The Tacit seams live in the opt-in overlay (plain-HTTP gateway URLs):
+      # config.json already defaults them to false, and nothing here turns them on.
       - DECISIONS_STYLE_ENABLED=${DECISIONS_STYLE_ENABLED:-true}
       - DECISIONS_STYLE_PROVIDER=${DECISIONS_STYLE_PROVIDER:-linear}
       - DECISIONS_STYLE_BASE_URL=${DECISIONS_STYLE_BASE_URL:-http://design-pattern-style-head:8800/v1}
       - DECISIONS_STYLE_MODEL=${DECISIONS_STYLE_MODEL:-style-linear}
       - DECISIONS_STYLE_CONFIDENCE_FLOOR=${DECISIONS_STYLE_CONFIDENCE_FLOOR:-0.6}
-      # Tacit seams (J4 weights, J2 category, J5 gate). All off by default; the gateway
-      # lives on a GPU host and is reached through the tacit-tunnel service below, so the
-      # URLs point at tacit-tunnel:8100 (see README "Decision models"). The timeouts match
-      # the dev overlay; weights has no confidence floor (expected-level MAE path).
-      - DECISIONS_WEIGHTS_ENABLED=${DECISIONS_WEIGHTS_ENABLED:-false}
-      - DECISIONS_WEIGHTS_BASE_URL=${DECISIONS_WEIGHTS_BASE_URL:-http://tacit-tunnel:8100}
-      - DECISIONS_WEIGHTS_MODEL=${DECISIONS_WEIGHTS_MODEL:-tacit-4b}
-      - DECISIONS_WEIGHTS_TIMEOUT_SECONDS=${DECISIONS_WEIGHTS_TIMEOUT_SECONDS:-30}
-      - DECISIONS_CATEGORY_ENABLED=${DECISIONS_CATEGORY_ENABLED:-false}
-      - DECISIONS_CATEGORY_BASE_URL=${DECISIONS_CATEGORY_BASE_URL:-http://tacit-tunnel:8100}
-      - DECISIONS_CATEGORY_MODEL=${DECISIONS_CATEGORY_MODEL:-tacit-4b}
-      - DECISIONS_CATEGORY_CONFIDENCE_FLOOR=${DECISIONS_CATEGORY_CONFIDENCE_FLOOR:-0.5}
-      - DECISIONS_CATEGORY_TIMEOUT_SECONDS=${DECISIONS_CATEGORY_TIMEOUT_SECONDS:-10}
-      - DECISIONS_REASONING_GATE_ENABLED=${DECISIONS_REASONING_GATE_ENABLED:-false}
-      - DECISIONS_REASONING_GATE_BASE_URL=${DECISIONS_REASONING_GATE_BASE_URL:-http://tacit-tunnel:8100}
-      - DECISIONS_REASONING_GATE_MODEL=${DECISIONS_REASONING_GATE_MODEL:-tacit-4b}
-      - DECISIONS_REASONING_GATE_CONFIDENCE_FLOOR=${DECISIONS_REASONING_GATE_CONFIDENCE_FLOOR:-0.5}
-      - DECISIONS_REASONING_GATE_TIMEOUT_SECONDS=${DECISIONS_REASONING_GATE_TIMEOUT_SECONDS:-5}
 
       - TASKS_HEARTBEAT_ENABLED=true
       - TASKS_HEARTBEAT_INTERVAL_SECONDS=30
@@ -187,46 +166,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
-
-  # SSH tunnel to the GPU host's loopback-bound Tacit gateway. The production
-  # container's 127.0.0.1 is its own, so a host-level tunnel is invisible to it —
-  # this sidecar runs the ssh client itself and listens on 0.0.0.0:8100 INSIDE the
-  # container, reachable only as tacit-tunnel:8100 on pattern-tei-shared (no
-  # published port, exactly like the style head). Opt-in: enable with a compose
-  # profile (`--profile tacit`) so a bare `up` never requires the key material.
-  # Auth is a read-only bind-mounted key + pinned known_hosts; the entrypoint
-  # refuses to run without both, and without StrictHostKeyChecking there is no TOFU.
-  tacit-tunnel:
-    image: ${TACIT_TUNNEL_IMAGE:-design-pattern-tacit-tunnel:latest}
-    container_name: "design-pattern-tacit-tunnel"
-    networks: [pattern-tei-shared]
-    profiles: [tacit]
-    restart: unless-stopped
-    environment:
-      # No `:?` guards here on purpose: required-var interpolation fires even when the
-      # profile is inactive, which would break a bare `up`. The entrypoint enforces both
-      # vars fail-loud at container start instead — and the container only starts with
-      # `--profile tacit`.
-      - TACIT_TUNNEL_SSH_HOST=${TACIT_TUNNEL_SSH_HOST:-}
-      - TACIT_TUNNEL_SSH_USER=${TACIT_TUNNEL_SSH_USER:-}
-    volumes:
-      - /etc/design-pattern-mcp/ssh/id_ed25519:/ssh/id_ed25519:ro
-      - /etc/design-pattern-mcp/ssh/known_hosts:/ssh/known_hosts:ro
-    healthcheck:
-      # TCP probe: the forward is up when something answers on 8100. It cannot
-      # distinguish ssh's listener from the gateway — /v1/stats on the MCP side
-      # is the real gateway check — but a dead tunnel fails here, not silently.
-      test:
-        [
-          "CMD",
-          "python3",
-          "-c",
-          "import socket; socket.create_connection(('127.0.0.1', 8100), timeout=5).close()",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
       start_period: 30s
 
 networks:

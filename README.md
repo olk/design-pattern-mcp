@@ -52,11 +52,12 @@ export OPENCODE_API_KEY=your_key_here
 
 # 3. Build + start. The GPU lane runs everything; the CPU lane runs everything
 #    except Tacit (run that where a card exists — systemd/README.md "Decision models").
-#    Plain `docker-up` starts no decision sidecar at all.
+#    The style seam is on in both: the head is in the base file and config.json
+#    enables it. `DECISIONS_STYLE_ENABLED=false` stands it down to the LLM style.
 make docker-build-all                       # GPU builder
 make docker-up-decisions                    # GPU host: server + TEI + Tacit + style head
-# make docker-build docker-build-tei docker-build-style-head   # no GPU builder
-# make docker-up-style                                          # no GPU host
+# make docker-build-base   # no GPU builder
+# make docker-up                                              # no GPU host
 
 # 4. Demo (analyze-only: fast. For the full design: make client-design)
 make client-analyze
@@ -401,28 +402,25 @@ Run both servers side by side (dev host ports `:8060` architecture, `:8822` desi
 # untracked), so build the CPU images instead and pick the matching start command
 # ([Which stack to run](#which-stack-to-run) for the full matrix):
 make docker-build-all                       # GPU builder
-# make docker-build docker-build-tei docker-build-style-head   # no GPU builder
+# make docker-build-base   # no GPU builder
 
-# Run with your API key (GPU host shown; CPU lane starts with `make docker-up-style`)
+# Run with your API key (GPU host shown; without a GPU start with plain `make docker-up`,
+# whose base file already includes the style head)
 OPENCODE_API_KEY=your_key make docker-up-decisions
 ```
 
 ### Which stack to run
 
-| You have | Build | Start | What runs |
-|---|---|---|---|
 | GPU builder + GPU host | `make docker-build-all` | `make docker-up-decisions` | server + TEI pair + Tacit gateway + style head — every seam live |
-| No GPU | `make docker-build docker-build-tei docker-build-style-head` | `make docker-up-style` | server + TEI pair + style head — Ch2 on, Tacit seams off |
-| No decisions (TEI only) | `make docker-build` | `make docker-up` | server + TEI pair in-stack, no decision sidecars — style degrades to the LLM sample |
-| Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external, Tacit via `--profile tacit` tunnel |
+| No GPU | `make docker-build-base` | `make docker-up` | server + TEI pair + style head — Ch2 on (config.json default), Tacit seams off |
+| Style off | same as above | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
+| Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external; decisions overlay points Tacit seams at the HTTP gateway |
 
-Switching lanes is down + up, with the matching down: the two sidecar lanes share the
-`design-pattern-mcp-dev` project (`make docker-down-decisions` / `make docker-down-style`
-stop either), but plain `make docker-up` is its own `design-pattern-mcp` project — and
-every lane reuses the fixed `container_name: design-pattern-mcp-dev`, so going base →
-sidecar lane without `make docker-down` first fails with "container name already in
-use". `make decisions-smoke` asserts the sidecar wire contracts on 18100 (Tacit) and
-18800 (style head).
+Switching between `docker-up` and `docker-up-decisions` is down + up with the matching
+down: the base lane runs the `design-pattern-mcp` project, the decisions lane its own
+`design-pattern-mcp-dev` project — and both reuse fixed `container_name`s, so switching
+without `make docker-down` first fails with "container name already in use".
+`make decisions-smoke` asserts the sidecar wire contracts on 18100 (Tacit) and 18800 (style head).
 
 Both compose stacks back that cache directory with a **named Docker volume**
 (`design-pattern-mcp-dev-dense-cache` / `design-pattern-mcp-systemd-dense-cache`,
@@ -664,16 +662,15 @@ arm that yields a qualifying confidence floor.
 
 ```bash
 make docker-build-style-head            # CPU, ~20 s; the training RUN *is* the accuracy gate
-make docker-up-style                    # base + style head, no GPU
+make docker-up                          # base stack, style head included, no GPU
 make style-head-calibrate               # floor + repeat/order probes -> models/style-head-calibration.json
 make benchmark-style-ab
-```
 
 The seam, endpoint, model name and floor all follow from the provider (always `linear` now).
-The head also has a CPU-only overlay, `docker/docker-compose.style-head.yml`, for hosts whose
-card cannot serve vLLM at all — the full decision overlay's server depends on the Tacit
-gateway, this one does not. The seam ships on (`DECISIONS_STYLE_ENABLED=true`): set it to
-`false` to stand it down to the LLM style.
+The head runs in the base compose file (`make docker-up`), so hosts whose card
+cannot serve vLLM at all still get the seam — the full decision overlay's server depends
+on the Tacit gateway, the base stack does not. The seam ships on
+(`DECISIONS_STYLE_ENABLED=true`): set it to `false` to stand it down to the LLM style.
 
 Measurement, the recipe correction it forced, and the operating procedure:
 [docs/linear-style-head.md](docs/linear-style-head.md).
@@ -1004,6 +1001,7 @@ The server can run as a systemd service on any systemd-based Linux host. It star
 |---|---|
 | `systemd/design-pattern-mcp.service` | The systemd unit |
 | `systemd/docker-compose.yml` | Production compose variant (no `build:`, absolute paths, container port 8050) |
+| `systemd/docker-compose.decision-models.yml` | Opt-in overlay: Tacit gateway URLs over plain HTTP (enabled via `COMPOSE_FILE` in `.env`) |
 | `systemd/README.md` | Full runbook: install, verify, troubleshooting |
 
 The production compose is the deployment variant of the dev file: pre-built images only, absolute paths, deployable to `/etc/design-pattern-mcp/`. The TEI sidecars live in the shared [pattern-tei-infra](https://github.com/olk/pattern-tei-infra) stack; this stack joins its Docker network and reaches them by DNS name. Start the service only after the shared TEI infra is `active (running)`.
@@ -1013,8 +1011,11 @@ The production compose is the deployment variant of the dev file: pre-built imag
 VERSION=$(grep -m 1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
 docker pull "olkowa/design-pattern-mcp:${VERSION}"
 docker tag "olkowa/design-pattern-mcp:${VERSION}" design-pattern-mcp:latest
+docker pull "olkowa/design-pattern-style-head:${VERSION}"
+docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-head:latest
 sudo install -d /etc/design-pattern-mcp/config
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
+sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
 sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
 sudo install -m 644 systemd/design-pattern-mcp.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now design-pattern-mcp

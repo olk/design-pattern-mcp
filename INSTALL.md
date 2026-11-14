@@ -17,11 +17,13 @@ deep-dive).
 | MCP server | `olkowa/design-pattern-mcp` | Tool server, streamable-http (container port 8050 both stacks) |
 | TEI embedder | `olkowa/pattern-tei-embed` | Qwen3-Embedding-0.6B sidecar; required for retrieval |
 | TEI reranker | `olkowa/pattern-tei-rerank` | Reranker sidecar (`gte-reranker-modernbert-base`); required for retrieval |
+| Style head | `olkowa/design-pattern-style-head` | Ch2 style seam (TF-IDF + linear SVM, CPU); versions with the MCP release |
 
 Tags: `latest` plus a pinned release tag per image — TEI embed/rerank `1.1.1`
 (the TEI images change rarely and are shared with the sibling
 `architecture-pattern-mcp` server). Use Docker Hub. Images are
-**linux/amd64 only**; on arm64 hosts build locally instead: `make docker-build-all`.
+**linux/amd64 only**; on arm64 hosts build locally instead:
+`make docker-build-base`.
 
 Pick exactly ONE path:
 
@@ -76,10 +78,14 @@ docker pull "olkowa/design-pattern-mcp:${VERSION}"
 # If the MCP pull 404s (no published release yet — confirm at
 # https://hub.docker.com/r/olkowa/design-pattern-mcp/tags), build it
 # locally instead (the TEI pulls below still work; those images are published):
-#   make docker-build-all
+#   make docker-build-base
 # and in step A2 use MCP_IMAGE=design-pattern-mcp:latest (the local build tag).
 docker pull "olkowa/pattern-tei-embed:${TEI_VERSION}"
 docker pull "olkowa/pattern-tei-rerank:${TEI_VERSION}"
+docker pull "olkowa/design-pattern-style-head:${VERSION}"
+# If the style-head pull 404s (unpublished), build it locally instead:
+#   make docker-build-style-head
+# and in step A2 use STYLE_HEAD_IMAGE=design-pattern-style-head:latest.
 # If a pull fails (tag not published), list available tags and use latest:
 #   curl -fsS 'https://hub.docker.com/v2/repositories/olkowa/design-pattern-mcp/tags'
 
@@ -88,12 +94,14 @@ cat > docker/.env <<EOF
 MCP_IMAGE=olkowa/design-pattern-mcp:${VERSION}
 TEI_IMAGE=olkowa/pattern-tei-embed:${TEI_VERSION}
 TEI_RERANK_IMAGE=olkowa/pattern-tei-rerank:${TEI_VERSION}
+STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:${VERSION}
 OPENCODE_API_KEY=sk-REPLACE-ME
 EOF
 
 # A3. Sanity check: interpolation resolved to the Hub refs (each printed image:
 #     olkowa/design-pattern-mcp:…, olkowa/pattern-tei-embed:…,
-#     olkowa/pattern-tei-rerank:…). Empty OPENCODE_API_KEY warning is expected
+#     olkowa/pattern-tei-rerank:…, olkowa/design-pattern-style-head:…). Empty
+#     OPENCODE_API_KEY warning is expected
 docker compose --env-file docker/.env -f docker/docker-compose.yml config | grep 'image:'
 
 # A4. Start. TEI sidecars cold-start model weights; first start takes ~2 min.
@@ -171,25 +179,29 @@ Note: this stack is shared with the sibling `architecture-pattern-mcp`,
 `agent-pattern-mcp`, and `blockchain-pattern-mcp` servers. If any of them
 has it already installed and running on the host, skip B0 entirely.
 
-### B1 — MCP image under the local name the unit checks
+### B1 — images under the local names the unit checks
 
 ```bash
 VERSION=$(grep -m 1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
 docker pull "olkowa/design-pattern-mcp:${VERSION}"
 docker tag "olkowa/design-pattern-mcp:${VERSION}" design-pattern-mcp:latest
-# (If the pull 404s — no published MCP release yet — `make docker-build-all`
-# locally and skip the retag: the unit inspects `design-pattern-mcp:latest`,
-# which the local build already tags.)
+docker pull "olkowa/design-pattern-style-head:${VERSION}"
+docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-head:latest
+# (If a pull 404s — no published release yet — build locally and skip the retag:
+# `make docker-build-base`; the unit inspects
+# the `:latest` tags, which the local builds already tag. Never `make docker-build-all`
+# here: Tacit's self-distill aborts on this GPU-less host.)
 ```
 
-(`design-pattern-mcp.service` runs `ExecStartPre=docker image inspect
-design-pattern-mcp:latest` — the retag is what makes that pass.)
+(`design-pattern-mcp.service` runs `ExecStartPre=docker image inspect` on both
+`:latest` tags — the retags are what make that pass.)
 
 ### B2 — configuration files under `/etc/design-pattern-mcp/`
 
 ```bash
 sudo install -d /etc/design-pattern-mcp/config
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
+sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
 # The repo config is the canonical template ({env:VAR:-default} expansion;
 # compose-provided env vars override it).
 sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
@@ -240,7 +252,7 @@ sudo systemctl reload   design-pattern-mcp   # recreate containers after editing
 sudo systemctl reload design-pattern-mcp
 # Logs
 journalctl -u design-pattern-mcp -n 50
-docker compose -p dpml-systemd -f /etc/design-pattern-mcp/docker-compose.yml logs -f
+COMPOSE_FILE=/etc/design-pattern-mcp/docker-compose.yml:/etc/design-pattern-mcp/docker-compose.decision-models.yml docker compose -p dpml-systemd logs -f
 ```
 
 ## Dense-embedding cache (restart durability)
@@ -296,8 +308,8 @@ probe embedding instead of a full corpus pass.
   systemd use separate volumes).
 - **Upgrading from a pre-volume deployment**: the older compose file has no mount — the
   cache then lives in the container layer and dies with the container. Re-install the
-  compose file for your path — Path B:
-  `sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/` (B2);
+  compose files for your path — Path B:
+  `sudo install -m 644 systemd/docker-compose.yml systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/` (B2);
   Path A: `make docker-build` — then recreate the container
   (`docker compose up -d` / `sudo systemctl reload design-pattern-mcp`). Path B runs
   compose from `/etc`, so without that install the deployed stack keeps the old
@@ -336,7 +348,7 @@ B: `sudo systemctl restart design-pattern-mcp`). Full provider list:
 | `docker image inspect design-pattern-mcp:latest` failed (unit start) | B1 retag step missed or used a different tag. |
 | `network pattern-tei-shared not found` | TEI infra not running: `sudo systemctl start pattern-tei-infra.service`. |
 | MCP container unhealthy; logs show TEI connection errors | TEI still cold-starting (start_period 120 s) — recheck health after ~2 min; if persistent, verify B0 (Path B) or the dev sidecars (Path A). |
-| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build-all` (bakes the cache). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
+| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build` (bakes the cache; `docker-build-all` does the same but additionally runs Tacit's GPU self-distill — GPU builder only). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
 | Dense cache seems missing on the host although the log shows a cache hit | Expected — the logged path is the *in-container* view of the named volume. Inspect `docker exec <container> ls -l /app/data/dense-cache`, or `docker volume inspect --format '{{.Mountpoint}}' design-pattern-mcp-dev-dense-cache` (resp. `-systemd-`); verify the mount with `docker inspect -f '{{json .Mounts}}' <container>`. |
 | Log shows `Dense cache write failed` but startup continues | By design (best-effort write-back): the cache directory is read-only/root-owned or full. Fix ownership or point `DENSE_CACHE_PATH` at a writable directory; the run keeps the vectors it just embedded. |
 | Container healthy but design tool calls fail with 401/502, or every LLM call returns `ERR_009` | Generator API key wrong/missing in the env file, or provider env block mismatched — see generator section. An env file written for an older release still uses the removed `DESIGN_PATTERN_` prefix (`DESIGN_PATTERN_GENERATOR_API_KEY`, `DESIGN_PATTERN_DENSE_CACHE_MODE`, …): strip it from every key, and reinstall `config/config.json` in the same step — its `{env:...}` placeholders carry the variable names. |
