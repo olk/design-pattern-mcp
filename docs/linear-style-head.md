@@ -8,9 +8,9 @@ a bag-of-n-grams head served on CPU behind the `/v1/systemone` wire, and the mea
 that decided it ships.
 
 Status: **the linear head is the Ch2 seam's only provider** (`decisions.style.provider` is
-pinned to `linear`; the Tacit/CLM style wirings are removed). The seam ships on, served by
-the CPU sidecar; the calibrated floor lives in `models/style-head-calibration.json`
-(recommended 0.6, §6 — the shipped 0.5 is the placeholder until the operator sets it).
+pinned to `linear`; the Tacit/CLM style wirings are removed). The seam ships on at floor 0.6
+(the run-2 A/B winner, §6); the artifact's `recommended.floor` of 0.1 is the lowest
+bar-clearing floor, not the shipped default.
 **Historical note:** the `models/clm-calibration*.json` citations in
 §1 and the `models/tacit-calibration.json` citation beside them name artifacts that no longer
 exist — they were removed with their lanes, and the numbers they carried survive only here.
@@ -310,11 +310,13 @@ runs. That answer is at n=18 and inherits the same power caveat, stated with the
 ```bash
 make docker-build-style-head                    # ~20 s; the build gates the head
 make docker-up-decisions                        # or: docker compose -f docker/docker-compose.style-head.yml
-make style-head-calibrate                       # writes models/style-head-calibration.json
-# the seam ships on; set the floor the report recommends:
-DECISIONS_STYLE_CONFIDENCE_FLOOR=0.6 \
-  make docker-up-decisions
 ```
+
+The seam ships on at floor 0.6 — no per-deployment step. `make style-head-calibrate`
+is the maintainer tool for corpus/head changes: it rewrites
+`models/style-head-calibration.json` and its `recommended.floor` (0.1) is the lowest
+bar-clearing floor, not the shipped default — 0.1 lost run 1 on repeat stability, so
+re-shipping still means re-winning the A/B at the new point (§6).
 
 `docker/docker-compose.style-head.yml` is the CPU-only overlay (the head plus the style seam
 env, no GPU services). The full decision stack includes the same service — it is defined once
@@ -325,9 +327,9 @@ stack: a hard dependency would fail every Tacit-only deployment whose operator n
 image, and the seam already degrades to the LLM style.
 
 There is no other Ch2 provider to revert to: `decisions.style.provider` is pinned to `linear`
-and `config/config.json` defaults the seam to the style head (on). To stand the seam down,
-set `DECISIONS_STYLE_ENABLED=false` — the LLM-sampled style stands, as in the A/B's baseline
-arm.
+and `config/config.json` defaults the seam to the style head (on, floor 0.6). To stand the
+seam down, set `DECISIONS_STYLE_ENABLED=false` — the LLM-sampled style stands, as in the
+A/B's baseline arm.
 
 ### Reproducing the A/B on a GPU host
 

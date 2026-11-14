@@ -687,7 +687,8 @@ Measurement, the recipe correction it forced, and the operating procedure:
 | `DECISIONS_REASONING_GATE_ENABLED` | `false` | J5 seam: Tacit `yes_no` can skip a phase's deliberation |
 | `DECISIONS_{STYLE,WEIGHTS,CATEGORY,REASONING_GATE}_BASE_URL` | sidecar service names | Per-seam endpoint (any provider speaking the same wire, e.g. hosted Jev for judging) |
 | `DECISIONS_{...}_MODEL` | `style-linear` (style) / `tacit-4b` (others) | Served model identity, recorded in the startup log |
-| `DECISIONS_{STYLE,CATEGORY,REASONING_GATE}_CONFIDENCE_FLOOR` | `0.5` | Minimum confidence/probability to act on the answer |
+| `DECISIONS_STYLE_CONFIDENCE_FLOOR` | `0.6` | Ch2 act threshold: the A/B-winning operating point (65 % act @ 1.000 on the holdout) |
+| `DECISIONS_{CATEGORY,REASONING_GATE}_CONFIDENCE_FLOOR` | `0.5` | Minimum confidence/probability to act on the answer |
 | `DECISIONS_{...}_API_KEY_ENV` | unset | Name of the env var holding a bearer key; unset = no `Authorization` header (local sidecars) |
 | `DECISIONS_{...}_TIMEOUT_SECONDS` | `10` (`weights` `30`, `reasoning_gate` `5`) | Per-call bound; expiry degrades to the non-model path |
 | `REASONING_ENABLED` | `true` | Master switch for the pre-LLM reasoning layer |

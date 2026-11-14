@@ -491,9 +491,9 @@ decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docke
 		-d '{"model":"style-linear","state":"A checkout service with flash sales.","questions":{"architecture_style":{"type":"choice","instructions":"Which architecture style best characterizes the system described in the state?"}}}' \
 		| python3 -c "import json,sys; a=json.load(sys.stdin)['answers']['architecture_style']; print(f\"choice={a['choice']} confidence={a['confidence']:.4f} classes={len(a['probabilities'])}\")"
 
-# Floor calibration for the Ch2 style seam. The shipped floor (0.5) is a placeholder: run
-# this against a live style head (docker-up-decisions) and set the floor it recommends —
-# DECISIONS_STYLE_CONFIDENCE_FLOOR=<recommended.floor>.
+# Floor calibration for the Ch2 style seam (maintainer tool for corpus/head changes). The
+# seam ships at the A/B-winning 0.6, not at the report's `recommended.floor` of 0.1 — that
+# point lost run 1 on repeat stability, so re-shipping still means re-winning the A/B.
 STYLE_HEAD_BASE_URL            ?= http://127.0.0.1:18800/v1
 STYLE_HEAD_CAL_FLOORS          ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7
 STYLE_HEAD_CAL_MIN_ACTED_ACCURACY ?= 0.8
@@ -511,11 +511,14 @@ STYLE_HEAD_CAL_REPORT          := models/style-head-calibration.json
 # Provenance of the head: it is fitted inside the image from this corpus, so there is no
 # upstream repo to name — the image tag is captured by --served-image-tag beside this.
 STYLE_HEAD_SERVED_REPO         ?= built-in-image (qa/typed/style.jsonl)
-# Floor the style A/B runs with: read from the artifact, never hand-copied, so an arm cannot
-# run a threshold the measurements did not produce. Override only to re-test a value:
-# `make benchmark-style-ab LINEAR_STYLE_FLOOR=0.6`.
+# Floor the style A/B runs with: the shipped operating point (0.6, the run-2 winner from
+# docs/linear-style-head.md §6) — guarded by the artifact's floors table, so an arm cannot
+# run a threshold the measurements did not produce. The artifact's own `recommended.floor`
+# is 0.1 (the lowest bar-clearing floor); that point LOST run 1 on repeat stability, so the
+# A/B must not default to it. Override only to re-test a value:
+# `make benchmark-style-ab LINEAR_STYLE_FLOOR=0.5`.
 LINEAR_STYLE_FLOOR         ?= $(shell python3 -c "import json;d=json.load(open('$(STYLE_HEAD_CAL_REPORT)'));\
-f=d.get('recommended',{}).get('floor');print('' if f is None else f)" 2>/dev/null)
+floors={r.get('floor') for r in d.get('floors',[])};print('0.6' if 0.6 in floors else '')" 2>/dev/null)
 
 style-head-calibrate: ## Calibrate decisions.style.confidence_floor against a running linear style head
 	uv run python scripts/decision_models/style_head_calibrate.py \

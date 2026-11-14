@@ -312,6 +312,7 @@ class TestRepositoryConfig:
         assert config.decisions.style.provider == "linear"
         assert config.decisions.style.base_url == "http://design-pattern-style-head:8800/v1"
         assert config.decisions.style.model == "style-linear"
+        assert config.decisions.style.confidence_floor == 0.6
         for seam in (config.decisions.weights, config.decisions.category, config.decisions.reasoning_gate):
             assert seam.enabled is False
 
