@@ -1,14 +1,15 @@
-"""Decision-model client — the Ch2 style-substitution seam (CLM ``/v1/systemone``).
+"""Decision-model client — the Ch2 style-substitution seam (linear head ``/v1/systemone``).
 
 ``select_design_patterns`` samples ``brief.architecture_style`` from the A+B LLM call
 (entropy channel 2 in docs/SELECTION_VARIABILITY_ANALYSIS.md §2.2). This client
 replaces that prose sample with one ``choice`` question over the 35
 ``STYLE_VOCABULARY`` styles plus ``none``, behind the default-off
-``decisions.style`` seam (``decisions.style.provider = "clm"``).
+``decisions.style`` seam (``decisions.style.provider = "linear"``).
 
 The wire is the TypeSafe-compatible ``POST /v1/systemone`` shape, served locally by
-``clm-serve`` (the CLM-8B heads stack) and still reachable for hosted judging by
-pointing ``base_url`` + ``api_key_env`` at any provider that speaks it.
+``scripts/decision_models/style_head_serve.py`` in the ``design-pattern-style-head``
+sidecar (the TF-IDF + calibrated-SVM CPU head) and still reachable for hosted judging
+by pointing ``base_url`` + ``api_key_env`` at any provider that speaks it.
 
 Contract (mirrors ReasoningClient):
 - Silent per-call degradation: any failure yields ``None`` (the LLM-extracted
@@ -45,14 +46,14 @@ logger = logging.getLogger(__name__)
 #: Question id under which the style choice is requested and answered.
 STYLE_QUESTION_ID = "architecture_style"
 
-#: ``none`` criterion key: no listed style applies (shared with the CLM exporter).
+#: ``none`` criterion key: no listed style applies (shared with the style-label derivation).
 _NONE_KEY = STYLE_NONE_KEY
 
 #: LRU cap of the exact-match description cache (bounded memory over a long-lived server).
 _CACHE_MAX_ENTRIES = 256
 
 #: Criterion id → one-line gloss, sourced from the shared prompt vocabulary so the
-#: CLM fine-tune trains on exactly the criteria text this seam serves. If the guide
+#: linear head labels derive from exactly the criteria text this seam serves. If the guide
 #: later grows canonical style descriptions (§10.1), derive from there instead.
 _STYLE_GLOSSES: dict[str, str] = STYLE_GLOSSES
 
@@ -63,9 +64,9 @@ def build_style_criteria() -> dict[str, str]:
     Keyed and ordered by :data:`STYLE_VOCABULARY` — the answer space the seam may name,
     which is also the order the audited corpus was exported in — NOT by
     ``src.style_affinity.STYLE_AFFINITY``: that table is the style→category PRIOR, a
-    different concern, and reading its order here coupled the served bytes to it. CLM
-    embeds each criterion independently and has no option cap, so the whole 36-entry map
-    is one question (the AnyJev shard exists for a 26-option wire this client never uses).
+    different concern, and reading its order here coupled the served bytes to it. The
+    head scores each label against the state independently and has no option cap, so
+    the whole 36-entry map is one question.
     """
     criteria = dict(_STYLE_GLOSSES)
     criteria[_NONE_KEY] = STYLE_NONE_GLOSS
@@ -86,7 +87,7 @@ class StyleDecision:
 
 
 class DecisionModelClient:
-    """CLM ``/v1/systemone`` choice-question client: cache-first, degrade-on-failure."""
+    """Linear-head ``/v1/systemone`` choice-question client: cache-first, degrade-on-failure."""
 
     def __init__(self, config: DecisionSeamConfig, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._config = config

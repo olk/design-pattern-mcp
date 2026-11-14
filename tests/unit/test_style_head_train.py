@@ -147,7 +147,7 @@ def test_accuracy_and_majority_are_scored_on_the_eval_shard(trainer: types.Modul
     ("accuracy", "majority", "gate", "margin", "clears"),
     [
         pytest.param(0.833, 0.094, 0.65, 0.10, True, id="measured-linear"),
-        pytest.param(0.507, 0.094, 0.65, 0.10, False, id="clm-run-1-below-bar"),
+        pytest.param(0.507, 0.094, 0.65, 0.10, False, id="rejected-neural-run-below-bar"),
         pytest.param(0.70, 0.62, 0.65, 0.10, False, id="clears-the-bar-not-the-margin"),
     ],
 )

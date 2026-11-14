@@ -7,7 +7,7 @@ silently in production (the seam's degrade-never-raise contract turns a mis-answ
 injected wrong style). The pipeline is a stub because the assertions are about the mapping,
 not about scikit-learn.
 
-Loaded by path, like the other image-build scripts (``test_clm_decision_model_scripts.py``).
+Loaded by path, like the other image-build scripts (``test_style_head_calibrate.py``).
 """
 
 from __future__ import annotations

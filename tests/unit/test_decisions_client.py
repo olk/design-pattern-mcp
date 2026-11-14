@@ -1,8 +1,8 @@
-"""CLM ``/v1/systemone`` style-seam contract: cache, dual-shape parse, degrade-on-failure.
+"""Linear-head ``/v1/systemone`` style-seam contract: cache, dual-shape parse, degrade-on-failure.
 
 All transport is mocked (httpx.MockTransport) — no network. The map-shape happy path
-asserts against a committed fixture of the documented ``clm-serve`` answer shape
-(``tests/unit/fixtures/clm_systemone_choice_response.json``); a synthetic list-shape
+asserts against a committed fixture of the documented ``style-head-serve`` answer shape
+(``tests/unit/fixtures/systemone_choice_response.json``); a synthetic list-shape
 variant proves the gateway-tolerant parser.
 """
 
@@ -19,15 +19,16 @@ import pytest
 
 from src.config import DecisionSeamConfig
 from src.decisions.client import DecisionModelClient, StyleDecision, build_style_criteria
-from src.decisions.seam_prompts import STYLE_NONE_GLOSS, STYLE_NONE_KEY, STYLE_VOCABULARY
+from src.decisions.seam_prompts import STYLE_GLOSSES, STYLE_NONE_GLOSS, STYLE_NONE_KEY, STYLE_VOCABULARY
+from src.style_affinity import STYLE_AFFINITY
 
-FIXTURE_PATH = Path(__file__).parent / "fixtures" / "clm_systemone_choice_response.json"
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "systemone_choice_response.json"
 DESCRIPTION = "Event-driven IoT ingestion with Kafka and worker pool"
-BASE_URL = "http://clm.test:8700/v1"
+BASE_URL = "http://style-head.test:8800/v1"
 
 
 def _enabled_config(**overrides: Any) -> DecisionSeamConfig:
-    payload: dict[str, Any] = {"enabled": True, "provider": "clm", "base_url": BASE_URL, "model": "clm-latest"}
+    payload: dict[str, Any] = {"enabled": True, "provider": "linear", "base_url": BASE_URL, "model": "style-linear"}
     payload.update(overrides)
     return DecisionSeamConfig.model_validate(payload)
 
@@ -70,7 +71,7 @@ async def test_happy_path_returns_decision_and_caches() -> None:
     assert second is first
     assert len(calls) == 1
     body = json.loads(calls[0].content.decode("utf-8"))
-    assert body["model"] == "clm-latest"
+    assert body["model"] == "style-linear"
     assert body["state"] == DESCRIPTION
     criteria = body["questions"]["architecture_style"]["criteria"]
     # ORDER matters: the served map is serialised in STYLE_VOCABULARY order with ``none``
@@ -82,7 +83,7 @@ async def test_happy_path_returns_decision_and_caches() -> None:
 
 
 async def test_local_seam_sends_no_authorization_header() -> None:
-    """A clm-serve seam without ``api_key_env`` talks to the sidecar with no credential."""
+    """A style-head seam without ``api_key_env`` talks to the sidecar with no credential."""
     calls: list[httpx.Request] = []
     client = _mock_client(_map_answer("event-driven", 0.9), calls)
     await client.choose_style(DESCRIPTION)
@@ -122,7 +123,7 @@ async def test_style_choice_logs_decision_on_fresh_and_cached_paths(caplog: pyte
     assert second is first
     records = [r for r in caplog.records if r.getMessage() == "Decision-model style choice"]
     assert len(records) == 2
-    assert records[0].model == "clm-latest"  # type: ignore[attr-defined]
+    assert records[0].model == "style-linear"  # type: ignore[attr-defined]
     assert records[0].style == "event-driven"  # type: ignore[attr-defined]
     assert records[0].confidence == pytest.approx(0.9)  # type: ignore[attr-defined]
     assert records[0].cached is False  # type: ignore[attr-defined]
@@ -209,7 +210,7 @@ async def test_committed_fixture_parses() -> None:
 
 
 async def test_unprocessable_status_degrades() -> None:
-    """A 422 (clm-serve rejects an unparseable question) degrades to the LLM style."""
+    """A 422 (style-head-serve rejects an unparseable question) degrades to the LLM style."""
     calls: list[httpx.Request] = []
     client = _mock_client(_map_answer("event-driven", 0.9), calls, status=422)
     assert await client.choose_style(DESCRIPTION) is None
@@ -271,3 +272,13 @@ def test_criteria_covers_the_whole_vocabulary_in_order() -> None:
     criteria = build_style_criteria()
     assert list(criteria) == [*STYLE_VOCABULARY, STYLE_NONE_KEY]
     assert all(isinstance(gloss, str) and gloss for gloss in criteria.values())
+
+
+def test_style_vocabulary_matches_the_glosses_and_the_prior() -> None:
+    """The served vocabulary is exactly the styles §10.1 knows, glossed exactly once each.
+
+    The affinity table stays in ``src/style_affinity.py`` as the pipeline PRIOR; the prompt
+    module carries only the flat vocabulary, because reading the prior backwards as a filter
+    is what made 16 of 22 labelled holdout rows unanswerable.
+    """
+    assert set(STYLE_VOCABULARY) == set(STYLE_GLOSSES) == set(STYLE_AFFINITY)

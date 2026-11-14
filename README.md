@@ -28,8 +28,7 @@ An MCP (Model Context Protocol) server that provides design-pattern selection ex
   - [Local Development (uv)](#local-development-uv)
 - [Configuration](#configuration)
   - [Decision models (AnyJev Tacit-4B)](#decision-models-anyjev-tacit-4b)
-  - [Decision models (CLM-8B, the Ch2 style seam's other provider)](#decision-models-clm-8b-the-ch2-style-seams-other-provider)
-  - [Decision models (linear, the Ch2 style seam's CPU provider)](#decision-models-linear-the-ch2-style-seams-cpu-provider)
+  - [Decision models (linear style head, the Ch2 seam)](#decision-models-linear-style-head-the-ch2-seam)
 - [Structured Reasoning](#structured-reasoning)
 - [Long-running tools & timeouts](#long-running-tools--timeouts)
 - [Benchmarks & Verification](#benchmarks--verification)
@@ -576,19 +575,14 @@ never starts the sidecar, and `config/config.json` defaults all of them to `fals
 
 | Seam | Model / wire | Substitutes | Degrades to |
 |---|---|---|---|
-| Ch2 style | Tacit `POST /v1/decide`, **two stages** (category → ≤26-style shortlist); providers `clm`/`linear` ask ONE 36-criterion `choice` over `/v1/systemone` instead | the LLM-sampled `brief.architecture_style`, when the serving path clears `DECISIONS_STYLE_CONFIDENCE_FLOOR` (both stages under Tacit) | the LLM style |
+| Ch2 style | linear head `POST /v1/systemone`, ONE 36-criterion `choice` (35 styles + `none`) | the LLM-sampled `brief.architecture_style`, when the answer clears `DECISIONS_STYLE_CONFIDENCE_FLOOR` | the LLM style |
 | J1 rerank | Tacit `POST /v1/decide`, one `yes_no` per fused-pool candidate (`RERANKER_PROVIDER=tacit`) | the TEI cross-encoder pass over the fused pool | the TEI reranker (identical call) |
 | J4 weights | Tacit `POST /v1/decide` (`score`, 8 axes per part) | the one batched weights LLM call, part by part | the LLM weights call |
 | J2 category | Tacit `POST /v1/decide` (`choice`, 9 categories) | one part's retrieved pool, narrowed after retrieval, and that part's effective category for scoring/fallback | no narrowing (unfiltered pool, LLM hypothesis) |
 | J5 gate | Tacit `POST /v1/decide` (`yes_no`) | whether a phase deliberates first | reasoning runs |
 
-Two procedures are worth stating because they shape the wire:
+One procedure is worth stating because it shapes the wire:
 
-- **Style is a two-stage choice.** AnyJev caps `choice` at 26 options, and the style
-  question has 36 candidates (35 styles + `none`). Stage 1 asks the served category
-  question; stage 2 asks the style question over that category's shortlist from the §10.1
-  affinity table (the largest is 16 styles + `none` = 17). A wrong or low-confidence stage 1
-  keeps the LLM style, so a stage-1 mistake can only cost an override, never inject one.
 - **Rerank is retrieve-then-rerank.** Stage 1 is the deterministic fused pool hybrid
   retrieval already produces (already capped at `rerank_top_n` survivors); stage 2 asks one
   `yes_no` relevance question per unique candidate document, in ONE batched request, and
@@ -604,16 +598,16 @@ that would empty the pool is discarded; a weights vector that comes back unusabl
 all-zero after one retry) sends that part down the LLM path; the reasoning gate fails open.
 
 ```bash
-make docker-build-decision-models   # self-distilled in-image; needs a GPU + CDI on the builder
-make docker-up-decisions            # stack + the sidecar (one GPU)
-make decisions-smoke                # assert the three wire contracts on 18100
+make docker-build-decision-models   # Tacit self-distilled in-image (GPU + CDI) + the CPU style head
+make docker-up-decisions            # stack + the sidecars (one GPU, one CPU)
+make decisions-smoke                # assert the wire contracts on 18100 (Tacit) and 18800 (style head)
 make docker-down-decisions
 ```
 
-The image bakes its weights (no Hub access at start, `HF_HUB_OFFLINE=1`) and *trains in the
+The Tacit image bakes its weights (no Hub access at start, `HF_HUB_OFFLINE=1`) and *trains in the
 build*: it self-distils the model on this server's own seam prompts
-(`src/decisions/seam_prompts.py`, shared by trainer and server) over every seam — category,
-weights, gate, both style stages and the rerank pairs — with the teacher pass sharded across
+(`src/decisions/seam_prompts.py`, shared by trainer and server) over the category, weights,
+gate and rerank seams — with the teacher pass sharded across
 the visible GPUs. An under-trained seam fails the build (per-seam agreement and weights-MAE
 gates). It needs a GPU on the builder, granted through a CDI device entitlement:
 
@@ -633,49 +627,28 @@ The sidecar serves from one 24 GB card (Tacit-4B ≈ 8 GB in vLLM plus the gatew
 
 Fine-tuning procedure (fine-tune → image → publish): [docs/tacit-fine-tune.md](docs/tacit-fine-tune.md).
 
-### Decision models (CLM-8B, the Ch2 style seam's other provider)
+### Decision models (linear style head, the Ch2 seam)
 
-`design-pattern-clm` serves the Ch2 architecture-style substitution over the
-TypeSafe-compatible `POST /v1/systemone`: one unsharded 36-criterion `choice` question over a
-frozen Qwen3-8B encoder plus two ~20 M projection heads fine-tuned on this repo's audited
-style labels. It is the alternative to the Tacit two-stage choice and is selected per
-deployment — the seam's provider, endpoint and model move together through one knob:
-
-```bash
-make docker-build-clm-base            # released heads, no GPU anywhere (:base tag)
-make docker-build-clm                 # heads fine-tuned in the build (GPU builder)
-make docker-up-decisions STYLE_PROVIDER=clm
-make clm-calibrate                    # floor + repeat/order consistency probes
-make benchmark-style-ab STYLE_PROVIDER=clm
-```
-
-The sidecar wants its own card (encoder ≈ 16 GB); `CLM_GPU_DEVICE` selects the CDI device
-(`nvidia.com/gpu=1` by default, so Tacit keeps card 0). The seam stays default-off until
-`benchmark-style-ab` clears the pre-registered rule.
-
-Fine-tuning procedure and the measured gate record:
-[docs/clm-fine-tune.md](docs/clm-fine-tune.md).
-
-### Decision models (linear, the Ch2 style seam's CPU provider)
-
-`design-pattern-style-head` answers the *same* `POST /v1/systemone` wire as the CLM heads, but
-with a TF-IDF(1-2gram) + calibrated linear SVM instead of an encoder stack: ~450 MB, **no GPU
+`design-pattern-style-head` serves the Ch2 architecture-style substitution over the
+TypeSafe-compatible `POST /v1/systemone`: one unsharded 36-criterion `choice` question over
+a TF-IDF(1-2gram) + CalibratedClassifierCV(LinearSVC) head — ~450 MB, **no GPU
 and no network at run time**, ~8 ms per decision. It exists because the task turned out to be a
-lexical read — measured on the same 138-row family-disjoint holdout as both neural providers,
-it scores **0.8333** top-1 where they scored 0.5072 / 0.4565, and it is the only arm that
-yields a qualifying confidence floor.
+lexical read — measured on the same 138-row family-disjoint holdout as both removed neural
+providers, it scores **0.8333** top-1 where they scored 0.5072 / 0.4565, and it is the only
+arm that yields a qualifying confidence floor.
 
 ```bash
 make docker-build-style-head            # CPU, ~20 s; the training RUN *is* the accuracy gate
-make docker-up-decisions STYLE_PROVIDER=linear
+make docker-up-decisions
 make style-head-calibrate               # floor + repeat/order probes -> models/style-head-calibration.json
-make benchmark-style-ab STYLE_PROVIDER=linear
+make benchmark-style-ab
 ```
 
-The seam, endpoint, model name and floor all follow from the provider. Provider `linear` also
-has a CPU-only overlay, `docker/docker-compose.style-head.yml`, for hosts whose card cannot
-serve vLLM at all — the full decision overlay's server depends on the Tacit gateway, this one
-does not. The seam stays default-off until `benchmark-style-ab` clears the pre-registered rule.
+The seam, endpoint, model name and floor all follow from the provider (always `linear` now).
+The head also has a CPU-only overlay, `docker/docker-compose.style-head.yml`, for hosts whose
+card cannot serve vLLM at all — the full decision overlay's server depends on the Tacit
+gateway, this one does not. The seam stays default-off until `benchmark-style-ab` clears the
+pre-registered rule.
 
 Measurement, the recipe correction it forced, and the operating procedure:
 [docs/linear-style-head.md](docs/linear-style-head.md).
@@ -706,13 +679,13 @@ Measurement, the recipe correction it forced, and the operating procedure:
 | `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
 | `RERANK_TOP_N` | `10` | Rerank top N |
 | `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) or `tacit` (per-candidate `yes_no` over `/v1/decide`; any failure re-issues the identical TEI call) |
-| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: a decision model replaces the LLM-sampled style; which one is `DECISIONS_STYLE_PROVIDER` |
-| `DECISIONS_STYLE_PROVIDER` | `tacit` | Ch2 wire: `tacit` (two-stage choice, gateway ROOT), `clm` (CLM heads, `/v1` root) or `linear` (CPU linear head, same `/v1/systemone` wire). Provider, endpoint and model must move together — the config refuses a half-switched pair |
+| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: the linear head replaces the LLM-sampled style when its answer clears the floor |
+| `DECISIONS_STYLE_PROVIDER` | `linear` | Ch2 wire: pinned to `linear` (CPU linear head, `/v1/systemone` on the `/v1` root). Provider, endpoint and model must move together — the config refuses a half-switched pair |
 | `DECISIONS_WEIGHTS_ENABLED` | `false` | J4 seam: Tacit `score` questions replace the batched weights LLM call |
 | `DECISIONS_CATEGORY_ENABLED` | `false` | J2 seam: Tacit category `choice` narrows the retrieved pool (never a hard router) |
 | `DECISIONS_REASONING_GATE_ENABLED` | `false` | J5 seam: Tacit `yes_no` can skip a phase's deliberation |
 | `DECISIONS_{STYLE,WEIGHTS,CATEGORY,REASONING_GATE}_BASE_URL` | sidecar service names | Per-seam endpoint (any provider speaking the same wire, e.g. hosted Jev for judging) |
-| `DECISIONS_{...}_MODEL` | `tacit-4b` | Served model identity, recorded in the startup log |
+| `DECISIONS_{...}_MODEL` | `style-linear` (style) / `tacit-4b` (others) | Served model identity, recorded in the startup log |
 | `DECISIONS_{STYLE,CATEGORY,REASONING_GATE}_CONFIDENCE_FLOOR` | `0.5` | Minimum confidence/probability to act on the answer |
 | `DECISIONS_{...}_API_KEY_ENV` | unset | Name of the env var holding a bearer key; unset = no `Authorization` header (local sidecars) |
 | `DECISIONS_{...}_TIMEOUT_SECONDS` | `10` (`weights` `30`, `reasoning_gate` `5`) | Per-call bound; expiry degrades to the non-model path |

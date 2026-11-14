@@ -24,18 +24,9 @@ descriptions plus per-part aggregate payloads — in the exact ``tacit.gate_stat
 (phase line, then every declared payload key in order, capped identically), because the
 server never sends any other shape.
 
-Two more seams train from the same single checkpoint:
+One more seam trains from the same single checkpoint (the Ch2 style seam moved to the
+linear TF-IDF head in 2026-11 and no longer trains here):
 
-* **Ch2 style** (``build_style_problems``) — the SERVED sharded choice over
-  description-shaped states: the 35-style vocabulary split into balanced questions of at
-  most 25 styles plus ``none`` (the gateway caps ``choice`` at 26 options, so the 35-way
-  question never exists as one item), and every shard is asked for every state — serving
-  asks all of them, so training must let the student compare them. States are the corpus
-  train hints first — reduced to their description bytes (``_served_description``), never
-  the qa question's ``Decision:`` tail — then model-written descriptions
-  (``generate_descriptions``) — the seam serves raw user prose. The category question is
-  NOT paired with these states: serving asks it of part states only (the J2 ``category``
-  seam), and narrowing the style menu by it is what made most styles unanswerable.
 * **J1 rerank** (``load_rerank_pairs`` / ``build_rerank_problems``) — one ``yes_no``
   relevance question per (statement, document) pair from ``qa/typed/rerank_pairs.jsonl``,
   whose bytes are exactly the serving items. Train-split rows only; the holdout pairs are
@@ -60,11 +51,11 @@ Topic hints come from train-split rows only.
 
 Sizing is max-effort by default: the fine-tune's aim is pattern-selection consistency and
 quality, so the defaults spend the whole 4x3090 envelope on VOLUME and COVERAGE (all train
-rerank pairs, ~1k style questions) rather than epochs — one epoch over self-distilled
+rerank pairs) rather than epochs — one epoch over self-distilled
 targets is the recipe, and repeating it memorizes teacher noise. The teacher pass shards
 across the visible GPUs (``teacher_answers``); retention and example construction stay
 single-process, so sharding never changes the training set. An under-trained seam cannot
-ship: the build fails when style or rerank problems are empty, when a serving kind keeps
+ship: the build fails when rerank problems are empty, when a serving kind keeps
 fewer than ``--min-kind-rows`` rows, when any answer seam's student-vs-teacher agreement
 drops below ``--min-seam-agreement``, or when the weights seam's expected-level MAE exceeds
 ``--max-score-mae``.
@@ -140,27 +131,9 @@ _STATE_FOCUSES: tuple[str, ...] = (
     "team ownership and interface contracts",
 )
 
-#: Description-shaped states for the Ch2 seam. Serving sends the RAW user description
-#: (``_apply_decision_style(text, ...)``), so the style seam must not train only on the
-#: corpus hint texts — the model writes more of them in the same shape.
-DESCRIPTION_PROMPT = """You write concrete software system descriptions.
-
-Topic: {hint}
-
-Write one description in exactly this shape, with no other text: one paragraph of
-6-9 sentences (about 800-1300 characters) describing a software system a user wants
-design-pattern advice for — what it must do, its main components, and one design
-concern. Plain prose, no lists, no headings.
-
-Description:"""
-
 #: One gate question per this many teacher questions: the pipeline asks the gate once
 #: per phase per run, the design questions once per decision part.
 _GATE_SHARE = 10
-
-#: Description-shaped states derived per this many teacher questions when
-#: ``--style-states`` is left at its derived default (two style questions per state).
-_STYLE_SHARE = 12
 
 #: Mirrors ``DecisionSeamConfig.confidence_floor`` (the acting floor the seams gate on).
 #: Pinned by ``tests/unit/test_decision_model_scripts.py``; override with
@@ -180,7 +153,7 @@ class Example:
     kind: str
     label_ids: list[int]
     target: list[float]
-    seam: str = ""  # category | weights | gate | style-stage2 | rerank
+    seam: str = ""  # category | weights | gate | rerank
 
 
 class _Progress:
@@ -283,20 +256,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="J1 teacher question budget; 0 = ALL train pairs (the max-effort default).",
     )
     parser.add_argument(
-        "--style-states",
-        type=int,
-        default=0,
-        help="Description-shaped states for the Ch2 seam; 0 = derive (problems // 12). Corpus "
-        "train hints are always used first, generated descriptions fill the rest.",
-    )
-    parser.add_argument(
-        "--style-gold",
-        default="",
-        help="qa/typed/style.jsonl — reviewed gold style labels for the TRAIN split; adds one "
-        "gold-supervised row per shard per labelled state (no teacher call), and the teacher "
-        "style states become generated descriptions only.",
-    )
-    parser.add_argument(
         "--teacher-shards",
         type=int,
         default=0,
@@ -306,7 +265,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--min-seam-agreement",
         type=float,
         default=0.6,
-        help="Fail the build when an answer seam's (category/style-stage2/rerank/gate) "
+        help="Fail the build when an answer seam's (category/rerank/gate) "
         "student-vs-teacher eval agreement drops below this. Raise to the first max-effort "
         "run's achieved-minus-margin when it lands.",
     )
@@ -346,7 +305,7 @@ def _validate_numeric_args(args: argparse.Namespace) -> None:
         args.gate_confidence_floor = args.confidence_floor
     if not 0.0 <= args.gate_confidence_floor <= 1.0:
         raise SystemExit(f"--gate-confidence-floor {args.gate_confidence_floor} out of range [0.0, 1.0]")
-    for name in ("states", "min_kind_rows", "style_states", "teacher_shards"):
+    for name in ("states", "min_kind_rows", "teacher_shards"):
         if getattr(args, name) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} {getattr(args, name)} must be >= 0")
     if not 0.0 <= args.min_seam_agreement <= 1.0:
@@ -454,78 +413,6 @@ def load_topic_hints(seed_texts: Path, limit: int, max_chars: int = 1500) -> lis
     return hints
 
 
-def _served_description(text: str) -> str:
-    """The description bytes the Ch2 seam serves: the qa question minus its ``Decision:`` tail.
-
-    ``qa/qa.jsonl`` questions are ``<description>\\n\\nDecision: <decision>``, while the
-    style seam is handed only the description (``src/pipeline.py::_apply_decision_style``).
-    Training on the whole question would be a state shape the server never sends.
-    """
-    return text.split("\n\nDecision: ", 1)[0]
-
-
-def load_style_gold(path: Path, seams: ModuleType) -> list[dict[str, Any]]:
-    """Gold style questions from the labelled TRAIN rows, one per shard per state.
-
-    The seam is gated on reviewed labels (``qa/typed/style.jsonl``), but self-distillation
-    only imitates the teacher's own answers; this supplies the labelled signal as a SECOND
-    target, so the gold's shard learns the label and every other shard learns ``none``.
-    Holdout rows never train. The two seam names keep the gold-shard agreement equal to gold
-    accuracy instead of pooling it with the ``none``-target questions.
-    """
-    problems: list[dict[str, Any]] = []
-    if not path.is_file():
-        raise SystemExit(f"--style-gold {path} does not exist")
-    vocabulary = set(seams.STYLE_VOCABULARY)
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        if not raw_line.strip():
-            continue
-        row = json.loads(raw_line)
-        source = row.get("source") or {}
-        if source.get("split") != "train":
-            continue
-        label = str(row.get("label", ""))
-        if label != seams.STYLE_NONE_KEY and label not in vocabulary:
-            raise SystemExit(
-                f"style-gold row {source.get('scenario_id')!r} has label {label!r}, "
-                "which is not in the served style vocabulary"
-            )
-        state = str(row["state"])[: seams.DECISION_STATE_MAX_CHARS]
-        for styles in seams.style_shards():
-            offered = label in styles
-            problems.append(
-                {
-                    "state": state,
-                    "question": seams.style_question(styles),
-                    "options": [*styles, seams.STYLE_NONE_KEY],
-                    "kind": "choice",
-                    "target": label if offered else seams.STYLE_NONE_KEY,
-                    "seam": "style-gold" if offered else "style-gold-none",
-                }
-            )
-    if not problems:
-        raise SystemExit(f"--style-gold {path} has no train-split rows")
-    return problems
-
-
-def gold_examples(tacit: Any, problems: Sequence[dict[str, Any]], smoothing: float = 0.1) -> list[Example]:
-    """Gold-supervised style rows: ``1 - smoothing`` on the gold option, the rest shared.
-
-    No teacher call and no retention: the target IS the label, so the row is kept whether or
-    not the teacher would have agreed — that disagreement is the signal the self-distilled
-    student never received.
-    """
-    examples: list[Example] = []
-    for item in problems:
-        target_option = str(item["target"])
-        options = [str(option) for option in item["options"]]
-        others = len(options) - 1
-        share = smoothing / others if others else 0.0
-        target = [1.0 - smoothing if option == target_option else share for option in options]
-        examples.append(_example(tacit, item, target))
-    return examples
-
-
 def _state_prompts(hints: Sequence[str], problems: int) -> list[str]:
     """One prompt per wanted state: the hint cycles, the focus rotates once per cycle.
 
@@ -624,67 +511,6 @@ def _normalise_state(text: str, max_chars: int) -> str | None:
     if not state.startswith("System goal:"):
         return None
     return state if "Decision part:" in state and len(state) >= 40 else None
-
-
-def generate_descriptions(
-    tacit: Any,
-    hints: Sequence[str],
-    count: int,
-    max_new_tokens: int,
-    max_state_chars: int,
-) -> list[str]:
-    """Prompt the model for ``count`` DISTINCT description-shaped states (serving bytes).
-
-    Mirrors :func:`generate_states` (same batching, temperature 0.9, dedupe, cap) but for
-    free prose: the Ch2 seam serves the raw user description capped at
-    ``DECISION_STATE_MAX_CHARS``, so its training states must be raw prose in that shape,
-    not header-line part states. Topic hints come from train-split rows only (the
-    :func:`load_topic_hints` rule).
-    """
-    import torch
-
-    prompts = [
-        DESCRIPTION_PROMPT.format(hint=hints[i % len(hints)][:400] if hints else "a web service") for i in range(count)
-    ]
-    model = tacit.engine.model
-    tokenizer = tacit.tok
-    batch_size = max(1, getattr(tacit, "batch_size", 8))
-    descriptions: list[str] = []
-    progress = _Progress(len(prompts), "description-writing")
-    with torch.no_grad():
-        for start in range(0, len(prompts), batch_size):
-            chunk = prompts[start : start + batch_size]
-            rendered = [
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
-                )
-                for p in chunk
-            ]
-            encoded = tokenizer(rendered, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
-            generated = model.generate(
-                **encoded,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.9,
-                top_p=0.95,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            flat = tokenizer.batch_decode(generated[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True)
-            for text in flat:
-                description = text.strip()[:max_state_chars]
-                if len(description) >= 80:
-                    descriptions.append(description)
-            progress.advance(start + len(chunk))
-    unique = list(dict.fromkeys(descriptions))
-    if len(unique) < len(descriptions):
-        logger.info("dropped %d duplicate descriptions", len(descriptions) - len(unique))
-    if unique:
-        lengths = sorted(len(text) for text in unique)
-        p25 = lengths[int(0.25 * (len(lengths) - 1))]
-        p50 = lengths[int(0.5 * (len(lengths) - 1))]
-        p75 = lengths[int(0.75 * (len(lengths) - 1))]
-        logger.info("description lengths p25/p50/p75: %d/%d/%d chars over %d", p25, p50, p75, len(unique))
-    return unique[:count]
 
 
 def _state_fields(state: str) -> dict[str, str]:
@@ -920,36 +746,6 @@ def build_problems(
         problems.append(
             {"state": state, "question": gate_question, "options": ["Yes", "No"], "kind": "yes_no", "seam": "gate"}
         )
-    return problems
-
-
-def build_style_problems(states: Sequence[str], seams: ModuleType) -> list[dict[str, Any]]:
-    """Ch2 style questions over description-shaped states, in the served shape.
-
-    The style question is 35-way and AnyJev caps one ask at 26 options, so serving splits the
-    vocabulary into shards and asks EVERY one of them (``seams.style_shards``), keeping the
-    most confident named style. Training asks exactly the same set: every shard for every
-    state, states outer and shards inner — a student that only ever saw one shard per state
-    never learned to compare two shards' answers, which is the served decision. Only these
-    shard questions are emitted: the category question is NOT paired with them, because
-    serving asks it of part states (the J2 ``category`` seam) and never of a description —
-    that pairing existed only to narrow the style shortlist, which made most styles
-    unanswerable (guide §10.1: the affinity table is a prior, never a filter).
-    """
-    problems: list[dict[str, Any]] = []
-    shards = seams.style_shards()
-    for raw_state in states:
-        state = raw_state[: seams.DECISION_STATE_MAX_CHARS]
-        for styles in shards:
-            problems.append(
-                {
-                    "state": state,
-                    "question": seams.style_question(styles),
-                    "options": [*styles, seams.STYLE_NONE_KEY],
-                    "kind": "choice",
-                    "seam": "style-stage2",
-                }
-            )
     return problems
 
 
@@ -1328,17 +1124,16 @@ def _expected_level(probs: Sequence[float]) -> float:
 
 #: Seams whose student-vs-teacher agreement the build gates on (every ANSWER seam; the
 #: weights seam is gated on its expected-level MAE instead).
-_GATED_SEAMS: tuple[str, ...] = ("category", "style-stage2", "rerank", "gate")
+_GATED_SEAMS: tuple[str, ...] = ("category", "rerank", "gate")
 
 #: Minimum eval rows before a seam's fidelity is *certified*. This is an evidence floor,
 #: not a power guarantee: a true-0.5 seam still clears the 0.6 bar 25% of the time at 20
 #: rows (38% at 10), so the gate's real power lives in the full build's row counts, where a
 #: true-0.5 seam passes ~8% of the time on the 60-eval-row low-frequency seams and ~1% on
 #: rerank's 140. The floor's job is to keep under-sampled builds honest instead of noisy:
-#: the quick-smoke shape (100 rerank pairs → 10 eval rows, its largest seam) lands below
-#: the bar and certifies nothing, while a full build (~600 category/gate rows, ~500 per
-#: style stage, ~1.4k rerank, ~4.8k weights → 60/60/50/50/140/480 eval rows) certifies all
-#: six. Thinner seams are skipped with a warning, never failed on noise.
+#: the bar and certifies nothing, while a full build (~600 category/gate rows,
+#: ~1.4k rerank, ~4.8k weights → 60/60/140/480 eval rows) certifies all four.
+#: Thinner seams are skipped with a warning, never failed on noise.
 _MIN_EVAL_ROWS_PER_SEAM = 20
 
 
@@ -1347,8 +1142,8 @@ def _fidelity_metrics(
 ) -> dict[str, dict[str, Any]]:
     """Distillation fidelity per SEAM: agreement, Brier, and the seam's own decision metric.
 
-    ``choice`` rows (category and both style stages) also report ``floor_accuracy``: the
-    student agrees AND clears the acting floor, which is what those seams act on. The
+    ``choice`` rows (category) also report ``floor_accuracy``: the
+    student agrees AND clears the acting floor, which is what that seam acts on. The
     ``gate`` seam reports agreement on the ACT decision at ``gate_floor`` (options[0] is
     ``"Yes"`` on both sides) — a student that fires where the teacher would not is a false
     act even when the labels agree. The ``weights`` seam reports ``expected_level_mae``;
@@ -1528,40 +1323,14 @@ def _assemble_problems(
     states: Sequence[str],
     gate_states: Sequence[str],
     axes_per_state: int,
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
-    """The full serving question set: category/weights/gate, every style shard, rerank.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The full serving question set: category/weights/gate plus rerank.
 
-    Ch2 style states are the corpus train hints first — as the description bytes serving
-    actually sends (``_served_description``: the qa question minus its ``Decision:`` tail) —
-    then generated descriptions until the budget is met: the seam serves raw user prose, not
-    header-line part states, so a few dozen hints cannot train it. With ``--style-gold`` the
-    states are generated descriptions only (hints would otherwise carry both a teacher and a
-    gold target). Every state gets every shard (``build_style_problems``). A seam that would
-    train on nothing aborts the run: an under-trained seam must not ship. (``--skip`` needs no clause here — ``main`` returns
-    from ``skip_training`` long before this runs.)
+    A seam that would train on nothing aborts the run: an under-trained seam must not
+    ship. (``--skip`` needs no clause here — ``main`` returns from ``skip_training``
+    long before this runs.)
     """
     problems = build_problems(states, seams, gate_states, axes_per_state)
-    style_state_count = args.style_states or max(1, args.problems // _STYLE_SHARE)
-    # Gold mode replaces the hint states with generated descriptions: a hint would otherwise
-    # carry BOTH a teacher target and a gold target for the same state, and the two
-    # supervision signals would fight. Non-gold builds keep the cheap, real-bytes hints.
-    gold_mode = bool(getattr(args, "style_gold", ""))
-    needed = style_state_count if gold_mode else max(0, style_state_count - len(hints))
-    descriptions = (
-        generate_descriptions(teacher, hints, needed, args.max_new_tokens, seams.DECISION_STATE_MAX_CHARS)
-        if needed
-        else []
-    )
-    if gold_mode:
-        style_states = list(descriptions)[:style_state_count]
-    else:
-        style_states = [
-            *(_served_description(hint) for hint in hints),
-            *descriptions,
-        ][: max(style_state_count, len(hints))]
-    style_problems = build_style_problems(style_states, seams)
-    if not style_problems:
-        raise SystemExit("the Ch2 style seam trained on 0 description-shaped states — check --seed-texts")
     if not args.rerank_pairs:
         raise SystemExit("the J1 rerank seam needs --rerank-pairs (make tacit-payloads)")
     rerank_pairs = load_rerank_pairs(Path(args.rerank_pairs)) if args.rerank_pairs else []
@@ -1569,13 +1338,11 @@ def _assemble_problems(
     if not rerank_problems:
         raise SystemExit("the J1 rerank seam trained on 0 pairs — check the rerank-pairs file")
     logger.info(
-        "problems: category/score/gate %d, style %d (states %d), rerank %d",
+        "problems: category/score/gate %d, rerank %d",
         len(problems),
-        len(style_problems),
-        len(style_states),
         len(rerank_problems),
     )
-    return [*problems, *style_problems, *rerank_problems], style_states, style_problems, rerank_problems
+    return [*problems, *rerank_problems], rerank_problems
 
 
 def _post_train_metrics(
@@ -1674,19 +1441,6 @@ def _seam_report(
     return block
 
 
-def _append_gold_rows(examples: list[Example], teacher: Any, style_gold: Sequence[dict[str, Any]]) -> int:
-    """Append the gold-supervised style rows to ``examples``; returns how many were added.
-
-    Appended AFTER teacher retention (so retained counts stay comparable across builds) and
-    BEFORE the stratified split, so the gold seams get eval rows of their own.
-    """
-    rows = gold_examples(teacher, style_gold) if style_gold else []
-    if rows:
-        examples.extend(rows)
-        logger.info("gold-supervised style rows appended: %d over %d problems", len(rows), len(style_gold))
-    return len(rows)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point: generate → teach → distill → save (or copy with ``--skip``)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1707,8 +1461,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("loading teacher %s onto CUDA (this takes minutes, no progress yet)", args.repo)
     seams = load_seam_prompts(Path(args.seam_prompts))
     hints = load_topic_hints(Path(args.seed_texts), limit=max(8, args.problems // 4)) if args.seed_texts else []
-    # Fail fast on a missing/malformed gold file, before the hours-long teacher pass.
-    style_gold = load_style_gold(Path(args.style_gold), seams) if args.style_gold else []
     # Explicit cuda:0 placement: the default device_map="auto" only uses CUDA when
     # torch.cuda.is_available(), and "auto" may also shard. Verified against the
     # anyjev 0.3.0 wheel (tacit.py): device_map is forwarded to
@@ -1748,9 +1500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         axes_per_state + 1,
     )
     gate_states = build_gate_states(states, hints, seams, gate_count)
-    problems, style_states, style_problems, rerank_problems = _assemble_problems(
-        teacher, hints, seams, args, states, gate_states, axes_per_state
-    )
+    problems, rerank_problems = _assemble_problems(teacher, hints, seams, args, states, gate_states, axes_per_state)
     results, teacher_shards = teacher_answers(teacher, args, problems)
     examples, dropped, probe = examples_from_results(
         teacher, problems, results, args.answer_mass_floor, args.score_mass_floor
@@ -1765,7 +1515,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"dropped {dropped}); lower --answer-mass-floor / --confidence-floor or raise --problems"
         )
     logger.info("retained rows per kind: %s", dict(kept))
-    gold_rows = _append_gold_rows(examples, teacher, style_gold)
     train_rows, eval_rows = _split_examples(examples, args.eval_frac, args.seed)
     student = train_student(init_dir, train_rows, args)
     logger.info("saving merged checkpoint to %s", out_dir)
@@ -1799,10 +1548,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "states": len(states),
                 "gate_states": len(gate_states),
                 "axes_per_state": axes_per_state,
-                "style_states": len(style_states),
-                "style_problems": len(style_problems),
-                "style_gold_problems": len(style_gold),
-                "style_gold_rows": gold_rows,
                 "rerank_problems": len(rerank_problems),
                 "teacher_shards": teacher_shards,
                 "min_seam_agreement": args.min_seam_agreement,

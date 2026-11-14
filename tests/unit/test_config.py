@@ -57,8 +57,8 @@ class TestDefaults:
         for seam in (decisions.style, decisions.weights, decisions.category, decisions.reasoning_gate):
             assert seam.enabled is False
             assert seam.api_key_env is None
-        assert decisions.style.model == "tacit-4b"
-        assert decisions.style.base_url == "http://design-pattern-tacit:8100"
+        assert decisions.style.model == "style-linear"
+        assert decisions.style.base_url == "http://design-pattern-style-head:8800/v1"
         assert decisions.style.timeout_seconds == 10.0
         assert decisions.weights.model == "tacit-4b"
         assert decisions.weights.base_url == "http://design-pattern-tacit:8100"
@@ -82,25 +82,9 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             ServerConfig.model_validate({"decisions": {"style": {"confidence_flor": 0.5}}})
 
-    def test_style_seam_accepts_both_providers_with_their_own_wire_root(self) -> None:
-        """Each provider has exactly one legal URL shape, and the pair must agree."""
-        tacit = ServerConfig.model_validate({"decisions": {"style": {"provider": "tacit"}}}).decisions.style
-        assert tacit.provider == "tacit"
-        assert tacit.base_url == "http://design-pattern-tacit:8100"
-        clm = ServerConfig.model_validate(
-            {
-                "decisions": {
-                    "style": {
-                        "provider": "clm",
-                        "base_url": "http://design-pattern-clm:8700/v1",
-                        "model": "clm-latest",
-                    }
-                }
-            }
-        ).decisions.style
-        assert clm.provider == "clm"
-        assert clm.base_url.endswith("/v1")
-        linear = ServerConfig.model_validate(
+    def test_style_seam_is_linear_only(self) -> None:
+        """The style seam has exactly one provider and one legal URL shape."""
+        style = ServerConfig.model_validate(
             {
                 "decisions": {
                     "style": {
@@ -111,40 +95,55 @@ class TestDefaults:
                 }
             }
         ).decisions.style
-        assert linear.provider == "linear"
-        assert linear.base_url.endswith("/v1")
+        assert style.provider == "linear"
+        assert style.base_url.endswith("/v1")
+        with pytest.raises(ValidationError):
+            ServerConfig.model_validate(
+                {"decisions": {"style": {"provider": "tacit", "base_url": "http://design-pattern-tacit:8100"}}}
+            )
 
     @pytest.mark.parametrize(
-        "payload",
+        ("seam", "payload"),
         [
-            pytest.param({"provider": "clm", "base_url": "http://design-pattern-tacit:8100"}, id="clm-on-gateway"),
-            pytest.param({"provider": "tacit", "base_url": "http://design-pattern-clm:8700/v1"}, id="tacit-on-v1"),
             pytest.param(
-                {"provider": "linear", "base_url": "http://design-pattern-tacit:8100"}, id="linear-on-gateway"
+                "style",
+                {"provider": "linear", "base_url": "http://design-pattern-tacit:8100"},
+                id="linear-on-gateway",
+            ),
+            pytest.param(
+                "weights",
+                {"provider": "tacit", "base_url": "http://design-pattern-tacit:8100/v1"},
+                id="tacit-on-v1",
             ),
         ],
     )
-    def test_a_half_switched_style_seam_fails_at_load(self, payload: dict[str, object]) -> None:
+    def test_a_half_switched_style_seam_fails_at_load(self, seam: str, payload: dict[str, object]) -> None:
         """Flipping ``provider`` without its endpoint (or the reverse) is a startup error.
 
         Left interchangeable the mismatch 404s, and the degrade-never-raise contract turns it
         into a silently dead seam — exactly the state a hurried rollback produces.
         """
         with pytest.raises(ValidationError):
-            ServerConfig.model_validate({"decisions": {"style": payload}})
+            ServerConfig.model_validate({"decisions": {seam: payload}})
 
-    @pytest.mark.parametrize("provider", ["clm", "linear"])
-    def test_a_heads_model_is_rejected_on_every_seam_but_style(self, provider: str) -> None:
-        """No heads-model client exists for the other four seams, so claiming one would be a lie."""
+    def test_a_heads_model_is_rejected_on_every_seam_but_style(self) -> None:
+        """No linear-head client exists for the other seams, so claiming one would be a lie."""
         with pytest.raises(ValidationError):
             ServerConfig.model_validate(
-                {"decisions": {"weights": {"provider": provider, "base_url": "http://design-pattern-clm:8700/v1"}}}
+                {
+                    "decisions": {
+                        "weights": {
+                            "provider": "linear",
+                            "base_url": "http://design-pattern-style-head:8800/v1",
+                        }
+                    }
+                }
             )
 
     def test_decisions_snapshot_values(self) -> None:
         snapshot = ServerConfig.model_validate({}).effective_parameters()
         assert snapshot["decisions_style_enabled"] is False
-        assert snapshot["decisions_style_model"] == "tacit-4b"
+        assert snapshot["decisions_style_model"] == "style-linear"
         assert snapshot["decisions_weights_enabled"] is False
         assert snapshot["decisions_category_enabled"] is False
         assert snapshot["decisions_reasoning_gate_enabled"] is False

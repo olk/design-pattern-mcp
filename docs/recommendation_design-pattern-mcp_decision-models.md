@@ -18,6 +18,12 @@ describes CLM as a *candidate* (§1–§5) is the research record that led to th
 as evidence; the CLM build lane, heads and sidecar no longer exist. This document is history, not
 a build instruction.
 
+**Status amendment (2026-11-14):** the Ch2 style seam is served only by the linear TF-IDF +
+calibrated-SVM head (`design-pattern-style-head`, `decisions.style.provider` pinned to
+`linear`); the Tacit style wiring and the CLM lane are both removed from the working tree
+(this time for good). AnyJev/Tacit-4B retains J1 rerank, J2 category, J4 weights and the J5
+gate. The body below is the research record.
+
 ---
 
 ## 0. Executive decision

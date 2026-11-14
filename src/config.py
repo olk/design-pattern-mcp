@@ -322,26 +322,24 @@ class DecisionSeamConfig(BaseModel):
     """One decision-model seam: the provider endpoint plus the knobs that bound it.
 
     Every seam is default-off. ``provider`` names which serving stack answers the seam and
-    therefore which wire it speaks: ``tacit`` (default) = the AnyJev gateway's
-    ``POST /v1/decide`` and ``base_url`` is the gateway ROOT; ``clm`` = the TypeSafe-
-    compatible ``POST /v1/systemone`` and ``base_url`` is the ``/v1`` root. Only the Ch2
-    style seam honours ``clm`` — the other seams stay on Tacit. ``api_key_env`` is the
-    only credential path: it stays reachable for a hosted endpoint with the same wire,
-    and ``None`` means no ``Authorization`` header at all.
+    therefore which wire it speaks: the Ch2 style seam is served ONLY by ``linear`` (the
+    TypeSafe-compatible ``POST /v1/systemone`` on the style-head's ``/v1`` root); every
+    other seam is served ONLY by ``tacit``, the AnyJev gateway's ``POST /v1/decide`` on
+    the gateway ROOT. ``api_key_env`` is the only credential path: it stays reachable
+    for a hosted endpoint with the same wire, and ``None`` means no ``Authorization``
+    header at all.
     """
 
     enabled: bool = Field(default=False, description="Opt-in seam switch.")
-    provider: Literal["tacit", "clm", "linear"] = Field(
+    provider: Literal["tacit", "linear"] = Field(
         default="tacit",
-        description=(
-            "Serving stack behind the seam: tacit (/v1/decide), clm (/v1/systemone), or linear (/v1/systemone, CPU)."
-        ),
+        description=("Serving stack behind the seam: tacit (/v1/decide) or linear (/v1/systemone, CPU)."),
     )
     base_url: str = Field(
         default="http://design-pattern-tacit:8100",
-        description=("anyjev gateway root (no /v1 suffix), or the /v1 root when provider=clm or linear."),
+        description=("anyjev gateway root (no /v1 suffix), or the /v1 root when provider=linear."),
     )
-    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b | clm-latest | style-linear).")
+    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b | style-linear).")
     api_key_env: str | None = Field(
         default=None,
         description="Optional env var holding a bearer key; None = no Authorization header.",
@@ -352,9 +350,9 @@ class DecisionSeamConfig(BaseModel):
         le=1.0,
         description=(
             "Minimum confidence to act on the answer (ignored by the weights seam). The Ch2 "
-            "style seam gates on TWO stages under Tacit (category and shortlist questions) but "
-            "on ONE under CLM and linear (top probability minus mean of the rest). Set it from "
-            "scripts/decision_models/{tacit,clm}_calibrate.py, not the default."
+            "style seam gates on ONE 36-criterion /v1/systemone stage (top probability minus "
+            "mean of the rest). Set it from scripts/decision_models/style_head_calibrate.py, "
+            "not the default."
         ),
     )
     timeout_seconds: float = Field(
@@ -376,14 +374,14 @@ class DecisionSeamConfig(BaseModel):
         """``provider`` and the ``base_url`` shape must agree, in BOTH directions.
 
         Each wire has one URL shape: Tacit's gateway root (the client appends ``/v1/decide``)
-        and clm-serve's ``/v1`` root (the client appends ``/systemone``). Leaving them
+        and the style head's ``/v1`` root (the client appends ``/systemone``). Leaving them
         interchangeable makes a half-switched deployment — a rollback that moves only
         ``provider``, or a flip that moves only the URL — into a 404 that the
         degrade-never-raise contract turns into a silently dead seam. Checked here so the
         misconfiguration is a startup error instead.
         """
         root = self.base_url.rstrip("/")
-        if self.provider in ("clm", "linear") and not root.endswith("/v1"):
+        if self.provider == "linear" and not root.endswith("/v1"):
             raise ValueError(f"provider={self.provider} needs the /v1 root, got base_url={self.base_url!r}")
         if self.provider == "tacit" and root.endswith("/v1"):
             raise ValueError(f"provider=tacit needs the gateway ROOT (no /v1 suffix), got base_url={self.base_url!r}")
@@ -396,9 +394,9 @@ class DecisionSeamConfig(BaseModel):
 #: would otherwise resolve back onto the generic defaults.
 _SEAM_DEFAULTS: dict[str, dict[str, Any]] = {
     "style": {
-        "provider": "tacit",
-        "base_url": "http://design-pattern-tacit:8100",
-        "model": "tacit-4b",
+        "provider": "linear",
+        "base_url": "http://design-pattern-style-head:8800/v1",
+        "model": "style-linear",
         "timeout_seconds": 10.0,
     },
     "weights": {
@@ -454,16 +452,18 @@ class DecisionsConfig(BaseModel):
         return merged
 
     @model_validator(mode="after")
-    def _only_the_style_seam_may_use_a_heads_model(self) -> DecisionsConfig:
-        """Reject ``provider=clm``/``linear`` on any seam but ``style``: there is no client for it.
+    def _each_seam_provider_has_a_client(self) -> DecisionsConfig:
+        """Each seam's provider must be the one its client implements: linear on style, tacit elsewhere.
 
-        The other four seams have exactly one implementation (``TacitClient``). Allowing the
+        The style seam has exactly one implementation (``DecisionModelClient`` against the
+        linear head); the other seams have exactly one (``TacitClient``). Allowing the
         field to say otherwise would make the startup report claim a provider that never
         answers — and misconfiguration that reads as configuration is worse than a crash.
         """
         for name, seam in self._seams().items():
-            if name != "style" and seam.provider != "tacit":
-                raise ValueError(f"decisions.{name}.provider={seam.provider!r}: only 'style' may use clm/linear")
+            want = "linear" if name == "style" else "tacit"
+            if seam.provider != want:
+                raise ValueError(f"decisions.{name}.provider={seam.provider!r}: only {want!r} is legal here")
         return self
 
     def _seams(self) -> dict[str, DecisionSeamConfig]:

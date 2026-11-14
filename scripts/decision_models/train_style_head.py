@@ -2,10 +2,10 @@
 """Train the Ch2 style seam's linear head: TF-IDF(1-2gram) + a calibrated linear SVM.
 
 The seam's two neural providers were measured and rejected on the same 138-row
-family-disjoint holdout (``docs/clm-fine-tune.md`` §9: 0.507 and 0.457 accuracy against a
-0.65 bar), while a linear model over the SAME 719 train labels scored 0.833
-(``docs/tacit-fine-tune.md`` §4.7.1). The task is a lexical read that a frozen encoder's
-contrastive heads do not extract, so the third provider is a bag of n-grams.
+family-disjoint holdout (0.507 and 0.457 accuracy against a 0.65 bar; numbers preserved
+in ``docs/linear-style-head.md`` §1), while a linear model over the SAME 719 train labels
+scored 0.833 (``docs/tacit-fine-tune.md`` §4.7.1). The task is a lexical read that a frozen
+encoder's contrastive heads do not extract, so the surviving provider is a bag of n-grams.
 
 **The classifier is not the one the plan first named, and that is a recorded correction.**
 The first build fitted ``LogisticRegression(C=1.0, lbfgs)`` and scored 0.4348 — gate FAIL —

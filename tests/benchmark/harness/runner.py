@@ -26,6 +26,7 @@ from src.patterns.loader import PatternLoader
 from src.patterns.retriever import RetrievalIndex
 from src.patterns.safe_tei_rerank import build_reranker
 from src.pipeline import DesignPipeline, compose_selection
+from src.decisions.client import DecisionModelClient
 from src.decisions.tacit import TacitClient, reasoning_gate
 from src.reasoning.client import ReasoningClient
 from src.schemas import AnalysisResult, PipelineResult
@@ -131,9 +132,9 @@ def _unconfigured(seam: Any) -> bool:
     return seam.api_key_env is not None and not os.environ.get(seam.api_key_env)
 
 
-def _style_client(seam: Any) -> TacitClient | None:
-    """The Ch2 style-seam client (two-stage Tacit choice), or None when off/unconfigured."""
-    return None if not seam.enabled or _unconfigured(seam) else TacitClient(seam)
+def _style_client(seam: Any) -> DecisionModelClient | None:
+    """The Ch2 style-seam client (the linear head), or None when off/unconfigured."""
+    return None if not seam.enabled or _unconfigured(seam) else DecisionModelClient(seam)
 
 
 def _tacit_client(seam: Any) -> TacitClient | None:
@@ -261,7 +262,7 @@ class LiveExecutor:
         """One provenance line naming every seam's wired state (never a flag alone)."""
         decisions = self._config.decisions
         parts = [
-            _seam_provenance("style", decisions.style, self._pipeline._style_client, "TacitClient"),
+            _seam_provenance("style", decisions.style, self._pipeline._style_client, "DecisionModelClient"),
             _seam_provenance("weights", decisions.weights, self._pipeline._weights_client, "TacitClient"),
             _seam_provenance("category", decisions.category, self._pipeline._category_client, "TacitClient"),
             _seam_provenance("gate", decisions.reasoning_gate, self._gate_client, "TacitClient"),

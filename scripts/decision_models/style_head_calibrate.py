@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Calibrate the Ch2 style seam's confidence floor against held-out style rows.
 
-Replays the holdout-split rows of ``qa/typed/style.jsonl`` through a running
-``clm-serve`` (``POST /v1/systemone`` with the served question verbatim) and
+Replays the holdout-split rows of ``qa/typed/style.jsonl`` through the running
+linear style head (``POST /v1/systemone`` with the served question verbatim) and
 reports, per candidate floor: acted rate, acted accuracy, ECE and Brier score —
 plus the confidence distribution. The operator picks the floor from that table
 and sets ``decisions.style.confidence_floor`` (env
@@ -10,11 +10,11 @@ and sets ``decisions.style.confidence_floor`` (env
 ``docs/JEV_DECISION_MODEL_ANALYSIS_PLAN.md`` §7 ("ECE/Brier on held-out
 families before trusting any threshold").
 
-``confidence`` here is TypeSafe-style (top prob − mean of rest,
-``src/clm/schema.py::confidence`` at the pinned upstream revision), NOT the top
-probability — the ``--metric`` flag replays the table under either definition so
-the choice is explicit. Holdout rows only: ``--split holdout`` is the default
-and training rows are refused unless ``--split`` says otherwise.
+``confidence`` here is TypeSafe-style (top prob − mean of rest, as the style head
+serves it), NOT the top probability — the ``--metric`` flag replays the table
+under either definition so the choice is explicit. Holdout rows only:
+``--split holdout`` is the default and training rows are refused unless
+``--split`` says otherwise.
 
 Acted accuracy is stratified, because the seam acts on the two answer kinds
 differently (``src/pipeline.py::_apply_decision_style``): a confident ``none``
@@ -48,18 +48,18 @@ noise:
   138; a script stricter than the gate it feeds would report FAIL on a PASSING arm).
   The report still prints, and every flipped row is listed for diagnosis.
 * ``--permutations K`` replays each row K times with a seeded random ordering of its
-  same 36-criterion map. The criteria are an unordered answer set — CLM embeds each
-  criterion independently — so the argmax must not depend on the order they were
-  written in. Order agreement is REPORTED (``style_choice_order_agreement``), not
-  gated here: it is a property of the head measured for the arm comparison, whereas a
-  repeat flip is a determinism defect.
+  same 36-criterion map. The criteria are an unordered answer set — the head scores
+  each label against the state independently of the map order — so the argmax must
+  not depend on the order they were written in. Order agreement is REPORTED
+  (``style_choice_order_agreement``), not gated here: it is a property of the head
+  measured for the arm comparison, whereas a repeat flip is a determinism defect.
 
 Run it against a serving container (stdlib only, no torch)::
 
-    python scripts/decision_models/clm_calibrate.py \\
-        --style qa/typed/style.jsonl --base-url http://127.0.0.1:18700/v1 \\
+    python scripts/decision_models/style_head_calibrate.py \\
+        --style qa/typed/style.jsonl --base-url http://127.0.0.1:18800/v1 \\
         --floors 0.3 0.4 0.5 0.6 --metric confidence \\
-        --min-acted-accuracy 0.8 --min-acted-rate 0.3 --report models/clm-calibration.json
+        --min-acted-accuracy 0.8 --min-acted-rate 0.3 --report models/style-head-calibration.json
 """
 
 from __future__ import annotations
@@ -90,8 +90,8 @@ _WILSON_Z = 1.96
 #: acceptance target (``C_repeat >= 0.99``), NOT 1.0: with 138 holdout rows 0.99 tolerates
 #: one flipped row, and a script stricter than the gate it exists to feed produces two
 #: contradicting verdicts — a measurement that passes the objective but fails ``make
-#: clm-calibrate``. On a temperature-0 head the expected number of flips is 0, so any flip
-#: at all is still visible in ``consistency.unstable_rows`` for diagnosis.
+#: style-head-calibrate``. On a deterministic head the expected number of flips is 0, so
+#: any flip at all is still visible in ``consistency.unstable_rows`` for diagnosis.
 MIN_REPEAT_AGREEMENT = 0.99
 
 
@@ -100,8 +100,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Calibrate decisions.style.confidence_floor on held-out style rows.")
     parser.add_argument("--style", default="qa/typed/style.jsonl", help="qa/typed/style.jsonl")
     parser.add_argument("--split", default="holdout", help="qa/ source split to replay (default: holdout).")
-    parser.add_argument("--base-url", required=True, help="clm-serve /v1 root (e.g. http://127.0.0.1:18700/v1).")
-    parser.add_argument("--model", default="clm-latest", help="Served model name.")
+    parser.add_argument("--base-url", required=True, help="style-head /v1 root (e.g. http://127.0.0.1:18800/v1).")
+    parser.add_argument("--model", default="style-linear", help="Served model name.")
     parser.add_argument("--question-id", default=DEFAULT_QUESTION_ID, help="Question id to ask and score.")
     parser.add_argument("--timeout", type=float, default=120.0, help="Per-request timeout in seconds.")
     parser.add_argument(
@@ -137,7 +137,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Recommend only a floor with at least this many acted overrides (small-n guard).",
     )
     parser.add_argument(
-        "--report", default="", help="Write the full report JSON here (e.g. models/clm-calibration.json)."
+        "--report", default="", help="Write the full report JSON here (e.g. models/style-head-calibration.json)."
     )
     parser.add_argument(
         "--repeats",
@@ -180,7 +180,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--served-model-repo",
         default="",
-        help="HF repo of the served checkpoint (the make rule passes CLM_HEADS_REPO).",
+        help="Provenance of the served head (the make rule names the train corpus, not an upstream repo).",
     )
     parser.add_argument(
         "--labels",
@@ -248,11 +248,11 @@ def ask(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload: dict[str, Any] = json.load(response)
     except OSError as exc:
-        raise SystemExit(f"clm-serve request failed for row {row.get('id')!r}: {exc}") from exc
+        raise SystemExit(f"style-head request failed for row {row.get('id')!r}: {exc}") from exc
     answers: dict[str, Any] = payload.get("answers") or {}
     answer = answers.get(question_id)
     if not isinstance(answer, dict):
-        raise SystemExit(f"clm-serve answer for row {row.get('id')!r} carries no {question_id!r} entry: {payload!r}")
+        raise SystemExit(f"style-head answer for row {row.get('id')!r} carries no {question_id!r} entry: {payload!r}")
     return answer
 
 
@@ -559,12 +559,12 @@ def order_invariance(
 ) -> dict[str, Any] | None:
     """Whether the argmax survives a re-ordering of the criteria map.
 
-    The criteria are an UNORDERED answer set — CLM embeds each criterion independently — so
-    a head whose argmax moves when the map is written in another order is reading position,
-    not meaning. ``style_choice_order_agreement`` is the gated number: rows identical across
-    every permuted run. ``canonical_agreement`` additionally compares each permuted run to
-    the canonical-order run, so a head that is order-stable but drifted from the served
-    order is visible instead of averaging away.
+    The criteria are an UNORDERED answer set — the head scores each label against the
+    state independently of the map order — so a head whose argmax moves when the map
+    is written in another order is reading position, not meaning. ``style_choice_order_agreement``
+    is the gated number: rows identical across every permuted run. ``canonical_agreement``
+    additionally compares each permuted run to the canonical-order run, so a head that is
+    order-stable but drifted from the served order is visible instead of averaging away.
     """
     if not replays:
         return None
@@ -595,7 +595,7 @@ def replay(
         answer = ask(args.base_url, args.model, row, args.question_id, args.timeout, criteria)
         choice = answer.get("choice")
         if not isinstance(choice, str):
-            raise SystemExit(f"clm-serve answer for row {row.get('id')!r} carries no string choice: {answer!r}")
+            raise SystemExit(f"style-head answer for row {row.get('id')!r} carries no string choice: {answer!r}")
         records.append(
             {
                 "scenario_id": (row.get("source") or {}).get("scenario_id"),
@@ -686,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_path.write_text(text + "\n", encoding="utf-8")
     print(text)
     if args.min_acted_accuracy is not None and report["recommended"]["floor"] is None:
-        print(f"clm-calibrate: FAIL: {report['recommended']['reason']}", file=sys.stderr)
+        print(f"style-head-calibrate: FAIL: {report['recommended']['reason']}", file=sys.stderr)
         return 2
     return 0
 

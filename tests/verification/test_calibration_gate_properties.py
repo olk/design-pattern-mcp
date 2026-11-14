@@ -1,4 +1,4 @@
-"""L2 oracles for the Ch2 style calibration gate (scripts/decision_models/tacit_calibrate.py).
+"""L2 oracles for the Ch2 style calibration gate (scripts/decision_models/style_head_calibrate.py).
 
 The gate decides whether a confidence floor may ship, so its arithmetic must hold for any
 replay table, not just the corpus that happened to be measured:
@@ -6,11 +6,9 @@ replay table, not just the corpus that happened to be measured:
   CG-1  monotonicity: acted count and hits are non-increasing as the floor rises.
   CG-2  recommendation honesty: a recommended floor clears all three bars and no lower
         tabulated floor does.
-  CG-3  ceiling soundness: ``attainable_with_perfect_ranking == False`` implies no floor can
-        be recommended — the answer link binds, not the threshold.
 
 The calibrator is a build-time script (not an importable package), loaded by path exactly as
-``tests/unit/test_decision_model_scripts.py`` loads it.
+``tests/unit/test_style_head_calibrate.py`` loads it.
 """
 
 from __future__ import annotations
@@ -37,9 +35,9 @@ def _load(name: str, filename: str) -> Any:
     return module
 
 
-calibrator = _load("tacit_calibrate_properties", "tacit_calibrate.py")
+calibrator = _load("style_head_calibrate_properties", "style_head_calibrate.py")
 
-_choices: st.SearchStrategy[str | None] = st.one_of(st.just("a"), st.just("none"), st.none())
+_choices: st.SearchStrategy[str] = st.sampled_from(["a", "none"])
 _labels: st.SearchStrategy[str] = st.sampled_from(["a", "b", "none"])
 _row = st.fixed_dictionaries(
     {
@@ -51,27 +49,8 @@ _row = st.fixed_dictionaries(
 _floors = st.lists(st.sampled_from(_FLOORS), min_size=1, max_size=len(_FLOORS), unique=True).map(sorted)
 
 
-def _records(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "scenario_id": str(index),
-            "label": row["label"],
-            "gold_shard": None,
-            "choice": row["choice"],
-            "confidence": float(row["confidence"]),
-            "correct": row["choice"] == row["label"],
-            "winner_shard": None,
-            "shards": [],
-        }
-        for index, row in enumerate(rows)
-    ]
-
-
-def _pairs(rows: Sequence[dict[str, Any]]) -> list[tuple[float, float, bool, str | None]]:
-    return [
-        (float(row["confidence"]), float(row["confidence"]), row["choice"] == row["label"], row["choice"])
-        for row in rows
-    ]
+def _pairs(rows: Sequence[dict[str, Any]]) -> list[tuple[float, bool, str]]:
+    return [(float(row["confidence"]), row["choice"] == row["label"], row["choice"]) for row in rows]
 
 
 def _qualifies(row: dict[str, Any], accuracy: float, rate: float, min_acted: int) -> bool:
@@ -94,8 +73,8 @@ class TestCG1Monotonicity:
         hits = [
             sum(
                 1
-                for _confidence, confidence, correct, choice in pairs
-                if confidence >= row["floor"] and choice not in (None, "none") and correct
+                for confidence, correct, choice in pairs
+                if confidence >= row["floor"] and choice != "none" and correct
             )
             for row in table
         ]
@@ -129,28 +108,3 @@ class TestCG2RecommendationHonesty:
         for row in ordered:
             if row["floor"] < chosen["floor"]:
                 assert not _qualifies(row, accuracy, rate, min_acted)
-
-
-class TestCG3CeilingSoundness:
-    @given(
-        rows=st.lists(_row, min_size=1, max_size=40),
-        floors=_floors,
-        accuracy=st.sampled_from([0.5, 0.8]),
-        rate=st.sampled_from([0.1, 0.3]),
-        min_acted=st.sampled_from([1, 5, 10]),
-    )
-    @settings(max_examples=80, deadline=None)
-    def test_unattainable_ceiling_implies_no_recommendation(
-        self,
-        rows: list[dict[str, Any]],
-        floors: list[float],
-        accuracy: float,
-        rate: float,
-        min_acted: int,
-    ) -> None:
-        records = _records(rows)
-        ceiling = calibrator.diagnostics(records, floors, accuracy, rate, min_acted)["gate_ceiling"]
-        table = calibrator.summarize(_pairs(rows), floors, 10)["floors"]
-        recommended = calibrator.recommend(table, accuracy, rate, min_acted)
-        if not ceiling["attainable_with_perfect_ranking"]:
-            assert recommended["floor"] is None

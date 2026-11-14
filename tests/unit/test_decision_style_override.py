@@ -1,6 +1,6 @@
-"""Ch2 substitution contract: confident two-stage Tacit choices override the LLM style.
+"""Ch2 substitution contract: confident linear-head choices override the LLM style.
 
-A fake Tacit style client is injected into DesignPipeline; no network. Proves
+A fake decision-model style client is injected into DesignPipeline; no network. Proves
 same-description → same-style → same affinity set, the caller-hint win, and the
 override-on-confident-answer-only degrade rules.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.config import ServerConfig
-from src.decisions.tacit import StyleDecision
+from src.decisions.client import StyleDecision
 from src.patterns.loader import PatternLoader
 from src.pipeline import DesignPipeline
 from src.schemas import DesignBrief

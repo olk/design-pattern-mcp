@@ -75,19 +75,15 @@ def _seam_status(seam: DecisionSeamConfig) -> str:
     return f"ok ({seam.provider}, model={seam.model})"
 
 
-def style_client_for(seam: DecisionSeamConfig) -> TacitClient | DecisionModelClient:
-    """The Ch2 seam's client for ``seam.provider``: one seam, one wire per provider.
+def style_client_for(seam: DecisionSeamConfig) -> DecisionModelClient:
+    """The Ch2 seam's client: the linear head's ``/v1/systemone`` via :class:`DecisionModelClient`.
 
-    ``tacit`` is the AnyJev gateway's two-question ``/v1/decide``; ``clm`` (the CLM-8B heads)
-    and ``linear`` (the CPU logistic-regression head) both speak the TypeSafe-compatible
-    ``/v1/systemone`` and share :class:`DecisionModelClient` unchanged. Kept as a function
-    rather than an inline branch so the mapping is testable: a provider the config accepts but
-    the server never wires is a seam that silently never answers, which is exactly the class of
-    misconfiguration that reads as configuration.
+    Kept as a function rather than an inline construction so the mapping is testable:
+    a provider the config accepts but the server never wires is a seam that silently
+    never answers, which is exactly the class of misconfiguration that reads as
+    configuration.
     """
-    if seam.provider in ("clm", "linear"):
-        return DecisionModelClient(seam)
-    return TacitClient(seam)
+    return DecisionModelClient(seam)
 
 
 def _decisions_status(config: ServerConfig) -> dict[str, str]:
@@ -285,8 +281,8 @@ class DesignPatternServer:
         self._reasoning_health: dict[str, str] = {}
         # One client per seam (style / weights / category / reasoning gate): separate
         # instances keep each seam's timeout and cache exact instead of sharing one knob.
-        # The style seam is the only one with two possible providers (Tacit or CLM).
-        self._style_client: TacitClient | DecisionModelClient | None = None
+        # The style seam is served only by the linear head (DecisionModelClient).
+        self._style_client: DecisionModelClient | None = None
         self._weights_client: TacitClient | None = None
         self._category_client: TacitClient | None = None
         self._gate_client: TacitClient | None = None
@@ -445,9 +441,8 @@ class DesignPatternServer:
             return
         style = self._config.decisions.style
         if self._decisions_status["style"].startswith("ok"):
-            # One seam, one wire per provider: everything but the Ch2 style is Tacit's
-            # /v1/decide, while the style seam may be the CLM-8B heads (clm) or the CPU
-            # linear head (linear) — both speak /v1/systemone (see style_client_for).
+            # The Ch2 style seam is the linear head's /v1/systemone (see style_client_for);
+            # everything else is Tacit's /v1/decide.
             self._style_client = style_client_for(style)
             self._pipeline._style_client = self._style_client
         weights = self._config.decisions.weights

@@ -4,12 +4,9 @@
 #   docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml up -d
 #   make docker-up-decisions
 #
-# Two of the three sidecars are GPU-only, and each names its own card through CDI:
+# One sidecar is GPU-only and names its own card through CDI:
 #   * design-pattern-tacit        Tacit-4B (~8 GB) in vLLM plus the AnyJev gateway (gpu=0);
-#   * design-pattern-clm          frozen Qwen3-8B encoder (~16 GB) + the two 20M heads (gpu=1);
 #   * design-pattern-style-head   the linear Ch2 style head — CPU, no card, tiny.
-# On a single 24 GB card, start one GPU sidecar at a time and point its CDI device at 0
-# (`CLM_GPU_DEVICE=nvidia.com/gpu=0`), or run the seam it does not serve off.
 #
 # Every seam is switched on here and only here: the base compose file has no
 # decision-model env at all, and config/config.json defaults every seam to false.
@@ -17,14 +14,13 @@
 # TEI rerank, unfiltered retrieval, reasoning runs) — it never fails a tool call.
 name: design-pattern-mcp-dev
 
-# The linear style head is the one CPU sidecar of the three, and it is also the only member of
+# The linear style head is the one CPU sidecar of the two, and it is also the only member of
 # the style-seam-only overlay (docker/docker-compose.style-head.yml) that a GPU-less host can
 # run. It is DEFINED there, once, and included here so the two stacks cannot drift on its
 # image, port or healthcheck. That file's mcp env block (linear defaults) is overridden by the
-# one below, which keeps this stack's default provider on Tacit.
+# one below, which keeps the same linear values explicitly.
 include:
   - path: docker-compose.style-head.yml
-
 services:
   design-pattern-tacit:
     image: ${TACIT_IMAGE:-design-pattern-tacit:latest}
@@ -64,56 +60,23 @@ services:
       retries: 5
       start_period: 300s
 
-  design-pattern-clm:
-    image: ${CLM_IMAGE:-design-pattern-clm:latest}
-    container_name: design-pattern-clm-dev
-    restart: unless-stopped
-    environment:
-      # Encoder + heads are baked into the image; clm-serve must not reach the Hub.
-      - HF_HUB_OFFLINE=1
-    ports:
-      # Loopback only: clm-serve's auth() is a no-op while CLM_API_KEY is unset, which this
-      # override leaves unset (the server sends no Authorization either). The publish is what
-      # confines it: the container listens on 0.0.0.0 so the bridge can forward. A host-network
-      # run has no publish, so it must pass CLM_BIND_HOST=127.0.0.1 (see docker/clm-entrypoint.sh).
-      - "127.0.0.1:18700:8700" # dev host port; container 8700 = clm-serve
-    # GPU via CDI, for the reason spelled out on the Tacit service above: the CDI name is
-    # resolved by the daemon into the OCI spec, so it works under any container runtime.
-    devices:
-      - ${CLM_GPU_DEVICE:-nvidia.com/gpu=1}
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python3",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8700/health', timeout=5)",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 300s
-
   design-pattern-mcp:
     environment:
       # J1 rerank: Tacit's per-candidate relevance leg in front of the fused pool; the TEI
       # sidecar stays the mandatory fallback inside the client, so it remains a dependency.
       - RERANKER_PROVIDER=${RERANKER_PROVIDER:-tacit}
       - RERANKER_TACIT_BASE_URL=http://design-pattern-tacit:8100
-      # Ch2 style: ONE seam, THREE possible providers. `tacit` (default) is the gateway's
-      # two-stage choice (category -> <=26-style shortlist); `clm` is the 36-criterion
-      # /v1/systemone over the fine-tuned heads; `linear` is the same /v1/systemone wire
-      # answered by the CPU TF-IDF + logistic-regression head. Provider, endpoint and model
-      # move together (`make docker-up-decisions STYLE_PROVIDER=linear`), because a `clm`/
-      # `linear` provider on a Tacit gateway URL is a dead seam that only logs warnings.
-      # Default OFF: the seam's own A/B was candidate-loss (docs/JEV_BENCHMARK_REPORT.md), so
-      # it stays dark until calibration says otherwise. Enable only with a floor from the
-      # matching calibration artifact, set in the same command:
-      #   DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=<floor> make docker-up-decisions STYLE_PROVIDER=clm
+      # Ch2 style: the linear head's 36-criterion /v1/systemone, served by the CPU TF-IDF +
+      # calibrated-SVM head. Provider, endpoint and model move together
+      # (`make docker-up-decisions`), because a provider on the wrong URL is a dead seam
+      # that only logs warnings.
+      # Default OFF: enable only with a floor from models/style-head-calibration.json,
+      # set in the same command:
+      #   DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=<floor> make docker-up-decisions
       - DECISIONS_STYLE_ENABLED=${DECISIONS_STYLE_ENABLED:-false}
-      - DECISIONS_STYLE_PROVIDER=${DECISIONS_STYLE_PROVIDER:-tacit}
-      - DECISIONS_STYLE_BASE_URL=${DECISIONS_STYLE_BASE_URL:-http://design-pattern-tacit:8100}
-      - DECISIONS_STYLE_MODEL=${DECISIONS_STYLE_MODEL:-tacit-4b}
+      - DECISIONS_STYLE_PROVIDER=${DECISIONS_STYLE_PROVIDER:-linear}
+      - DECISIONS_STYLE_BASE_URL=${DECISIONS_STYLE_BASE_URL:-http://design-pattern-style-head:8800/v1}
+      - DECISIONS_STYLE_MODEL=${DECISIONS_STYLE_MODEL:-style-linear}
       - DECISIONS_STYLE_CONFIDENCE_FLOOR=${DECISIONS_STYLE_CONFIDENCE_FLOOR:-0.5}
       # J4 weights: Tacit score questions, 8 axes per part.
       - DECISIONS_WEIGHTS_ENABLED=${DECISIONS_WEIGHTS_ENABLED:-true}

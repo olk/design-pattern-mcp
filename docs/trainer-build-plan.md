@@ -32,7 +32,7 @@ nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1
 Each bullet traces base image → COPY/RUN → cached artifact → what the final image carries. Nothing below runs at `docker run`.
 
 1. Tacit `docker/Dockerfile.tacit` `:weights` (`FROM python:3.11-slim`): `snapshot_download(morriszjm/Tacit-4B)` → cached artifact `/models/tacit-4b`.
-2. Tacit `docker/Dockerfile.tacit` `:self-distill` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`): `pip install anyjev[client]==0.3.0 peft bitsandbytes datasets`, `COPY --from=weights`, `COPY tacit_self_distill.py`, `COPY src/decisions/seam_prompts.py`, `COPY qa/qa.jsonl`, `COPY qa/typed/rerank_pairs.jsonl` to `/build/qa/rerank_pairs.jsonl`, then the single GPU `RUN --device=nvidia.com/gpu=all python3 /build/tacit_self_distill.py --init-dir /models/tacit-4b --out /out/tacit-4b ...` with knobs `TACIT_PROBLEMS=6000 / TACIT_STATES=0 / TACIT_STYLE_STATES=0 / TACIT_RERANK_PROBLEMS=0 / TACIT_TEACHER_SHARDS=0 / TACIT_MIN_SEAM_AGREEMENT=0.6 / TACIT_CONFIDENCE_FLOOR=0.5 / TACIT_GATE_CONFIDENCE_FLOOR= / TACIT_MIN_KIND_ROWS=1 / TACIT_EPOCHS=1 / TACIT_LR=1e-4 / TACIT_BATCH=4 / TACIT_ACCUM=8 / TACIT_COT_MAX_TOKENS=2048 / TACIT_MAX_NEW_TOKENS=256` and flags `--style-states ... --rerank-pairs /build/qa/rerank_pairs.jsonl --rerank-problems ... --teacher-shards ... --min-seam-agreement ...`. The script runs teacher state-writing + a CoT `generate` answer pass sharded across the visible GPUs (`--teacher-shards 0` = one shard per visible CUDA device), trains all six seams from the one checkpoint — category, weights, gate, style-stage1, style-stage2 over description-shaped states, rerank over all ~1400 train pairs — builds gate states from the dataset's own descriptions in the exact `tacit.gate_state` shape, keeps `score` rows unfiltered and `choice` rows only above `TACIT_CONFIDENCE_FLOOR` (dropping any teacher result that omits an option key), and fails the build when a serving kind keeps no rows, when a per-seam student-vs-teacher agreement gate drops below 0.6, or when the weights expected-level MAE exceeds 0.2; then QLoRA-trains a 4-bit nf4/bf16 student, `merge_and_unload()` + `save_pretrained(..., safe_serialization=True)` plus tokenizer files and `self-distill.json` to `/out/tacit-4b`. Default cost: ~8-9k teacher questions, roughly 20-30 h on one 3090 / ~5-8 h with default auto-sharding on a 4-GPU host.
+2. Tacit `docker/Dockerfile.tacit` `:self-distill` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`): `pip install anyjev[client]==0.3.0 peft bitsandbytes datasets`, `COPY --from=weights`, `COPY tacit_self_distill.py`, `COPY src/decisions/seam_prompts.py`, `COPY qa/qa.jsonl`, `COPY qa/typed/rerank_pairs.jsonl` to `/build/qa/rerank_pairs.jsonl`, then the single GPU `RUN --device=nvidia.com/gpu=all python3 /build/tacit_self_distill.py --init-dir /models/tacit-4b --out /out/tacit-4b ...` with knobs `TACIT_PROBLEMS=6000 / TACIT_STATES=0 / TACIT_RERANK_PROBLEMS=0 / TACIT_TEACHER_SHARDS=0 / TACIT_MIN_SEAM_AGREEMENT=0.6 / TACIT_CONFIDENCE_FLOOR=0.5 / TACIT_GATE_CONFIDENCE_FLOOR= / TACIT_MIN_KIND_ROWS=1 / TACIT_EPOCHS=1 / TACIT_LR=1e-4 / TACIT_BATCH=4 / TACIT_ACCUM=8 / TACIT_COT_MAX_TOKENS=2048 / TACIT_MAX_NEW_TOKENS=256` and flags `--rerank-pairs /build/qa/rerank_pairs.jsonl --rerank-problems ... --teacher-shards ... --min-seam-agreement ...`. The script runs teacher state-writing + a CoT `generate` answer pass sharded across the visible GPUs (`--teacher-shards 0` = one shard per visible CUDA device), trains four seams from the one checkpoint — category, weights, gate, and rerank over all ~1400 train pairs (the Ch2 style seam moved to the linear head 2026-11-14) — builds gate states from the dataset's own descriptions in the exact `tacit.gate_state` shape, keeps `score` rows unfiltered and `choice` rows only above `TACIT_CONFIDENCE_FLOOR` (dropping any teacher result that omits an option key), and fails the build when a serving kind keeps no rows, when a per-seam student-vs-teacher agreement gate drops below 0.6, or when the weights expected-level MAE exceeds 0.2; then QLoRA-trains a 4-bit nf4/bf16 student, `merge_and_unload()` + `save_pretrained(..., safe_serialization=True)` plus tokenizer files and `self-distill.json` to `/out/tacit-4b`. Default cost: ~8k teacher questions (no style problems since 2026-11-14), roughly 20-30 h on one 3090 / ~5-8 h with default auto-sharding on a 4-GPU host.
 3. Tacit `docker/Dockerfile.tacit` `:runtime-base`: fresh `vllm-openai` shell, `pip install anyjev[client]==0.3.0`, `COPY docker/tacit-entrypoint.sh`, `ENV HF_HUB_OFFLINE=1`, `TACIT_ADAPTIVE=false`, `EXPOSE 8100`, `HEALTHCHECK` on `127.0.0.1:8100/v1/stats`, `ENTRYPOINT tacit-entrypoint.sh`. Never carries `/build`.
 4. Tacit `docker/Dockerfile.tacit` `:runtime-distilled` (DEFAULT as last stage): `COPY --from=self-distill /out/tacit-4b /models/tacit` — the only trained artifact in the shipped image. (`:runtime-released` COPYs untrained weights instead; fallback only.)
 5. Tacit serve path (`ENTRYPOINT` + `docker/tacit-entrypoint.sh`): asserts `/models/tacit/config.json`, backgrounds `vllm serve ${MODEL_DIR} --served-model-name tacit-4b --host 127.0.0.1 --port 8000 --max-model-len 8192`, polls `/health` (900 s timeout), then `exec python3 -m anyjev.serve --model ... --upstream http://127.0.0.1:8000/v1 --host ${TACIT_BIND_HOST:-0.0.0.0} --port 8100` (the compose publish is what confines the gateway to loopback, so a `--network host` run must pass `TACIT_BIND_HOST=127.0.0.1`, since anyjev.serve has no auth). Final image runs only `vllm serve` + `anyjev.serve` (`POST /v1/decide`, `GET /v1/stats`).
@@ -196,7 +196,7 @@ set -euxo pipefail; cd /root/design-pattern-mcp
 grep -E "teacher kept [0-9]+ of [0-9]+ problems" build-tacit.log || { echo "GATE FAIL: no teacher-kept line in build-tacit.log" >&2; exit 1; }
 grep -E "wrote distilled checkpoint to /out/tacit-4b" build-tacit.log || { echo "GATE FAIL: no wrote-checkpoint line in build-tacit.log" >&2; exit 1; }
 # Every seam carried problems, and the per-seam fidelity gates ran (no SystemExit in the log).
-grep -E "problems: category/score/gate [0-9]+, style [0-9]+ \(states [0-9]+\), rerank [0-9]+" build-tacit.log || { echo "GATE FAIL: no problem-composition line" >&2; exit 1; }
+grep -E "problems: category/score/gate [0-9]+, rerank [0-9]+" build-tacit.log || { echo "GATE FAIL: no problem-composition line" >&2; exit 1; }
 grep -E "an under-trained seam must not ship|has no eval rows" build-tacit.log && { echo "GATE FAIL: a seam gate failed" >&2; exit 1; } || true
 make docker-build-tacit-base
 docker run --rm --entrypoint cat design-pattern-tacit:latest /models/tacit/self-distill.json
@@ -248,9 +248,8 @@ tag + date and the sha256 of every train input (`scripts/decision_models/tacit_s
 `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl`,
 `docker/Dockerfile.tacit`). A cached rebuild verifies the marker with `sha256sum -c` and refuses a
 stale host dir: if you change the corpus or the trainer, `rm -rf models/tacit-4b` and
-rebuild to retrain. `models/tacit-calibration.json` (from `make tacit-calibrate`) is the
-second piece of evidence and lives outside the checkpoint dir — it belongs to a serving run,
-not to the checkpoint.
+rebuild to retrain. (The Ch2 style seam is no longer a Tacit seam: calibrate with
+`make style-head-calibrate`, `docs/linear-style-head.md` §7.)
 
 Two guards keep the rerank-pair artifact honest, because the catalog itself is not
 hashed (7290 files): `qa/typed/rerank_pairs.jsonl` is hashed into the extract marker, so a
@@ -261,43 +260,17 @@ so a catalog edit that was never re-derived fails the build instead of replaying
 
 ## Calibrate Before Enabling the Style Seam
 
-The distilled checkpoint ships uncalibrated: `decisions.style.confidence_floor` defaults to
-0.5 with no measurement behind it, and the compose overlay therefore keeps
-`DECISIONS_STYLE_ENABLED=false`. Enable the seam only after a calibration run names a
-floor.
-
-```bash
-make docker-up-decisions          # or start only design-pattern-tacit + design-pattern-mcp
-make tacit-calibrate              # replays the 30 held-out style rows against :18100
-```
-
-`tacit-calibrate` writes `models/tacit-calibration.json` and prints a `recommended.floor`:
-the lowest floor whose acted answers clear `TACIT_CAL_MIN_ACTED_ACCURACY` at an acted
-rate of at least `TACIT_CAL_MIN_ACTED_RATE`, with ECE/Brier and the confidence
-distribution alongside. If nothing qualifies it exits 2 — a checkpoint that cannot act
-accurately must not be enabled, and the release step says so instead of guessing. Set
-the floor in the same command as the enable:
-
-```bash
-DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=<recommended.floor> make docker-up-decisions
-```
-
-Re-run after every retrain — the floor belongs to the weights, not the repo. Note the
-seam's own A/B against the LLM style is `candidate-loss`
-(`docs/JEV_BENCHMARK_REPORT.md`), so an accurate checkpoint is necessary but not sufficient:
-the gate measures the model, not whether acting on it helps selection.
+The Ch2 style seam is served only by the linear TF-IDF head — it is not a Tacit seam, so
+this plan's Tacit build neither trains nor calibrates it. Calibrate with
+`make style-head-calibrate` (writes `models/style-head-calibration.json`) and enable only
+with the floor the report recommends, per `docs/linear-style-head.md` §7.
 
 ## Measure the Seam Before Trusting the Checkpoint
 
-The build gates bound the checkpoint; they do not measure the seam. That measurement is
-`make benchmark-style-ab`, which runs the pre-registered A/B twice through the full
-stack with the decision overlay — `DECISIONS_STYLE_ENABLED=false` then `=true` with the
-calibrated floor (read from `models/tacit-calibration.json`; the target refuses to run
-without it) — over `tests/benchmark/scenarios/full.json`, `SPLIT=holdout`, `REPEAT=3`,
-and hands both run dirs to `benchmark-compare` (+15% holdout p95 rule). Both arms use the
-same corpus, split, repeat count and images, which is what makes the comparison
-pre-registered rather than exploratory. Record the verdict next to the calibration
-artifact; `candidate-loss` means keep the seam off regardless of checkpoint accuracy.
+The build gates bound the checkpoint; they do not measure the style seam. That measurement
+is `make benchmark-style-ab` against the linear head (floor from
+`models/style-head-calibration.json`; the target refuses to run without it), per
+`docs/linear-style-head.md` §7.
 
 ## Risks, Gaps, and Follow-ups
 

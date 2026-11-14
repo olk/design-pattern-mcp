@@ -401,7 +401,7 @@ LEDGER_SCHEMA = (
     "row carries its adjudicated label and the adjudicator's reason. `rubric_sha256` pins the "
     "annotation rubric the verdicts were made under. The reviewer field records WHO reviewed (a "
     "human expert, or a model review pass with its identity stated); human expert sign-off, when "
-    "performed, is listed in `human_review`. tacit_calibrate.py refuses to recommend a floor "
+    "performed, is listed in `human_review`. style_head_calibrate.py refuses to recommend a floor "
     "until this ledger certifies the label source."
 )
 

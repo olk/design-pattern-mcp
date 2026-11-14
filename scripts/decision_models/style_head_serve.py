@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Serve the Ch2 style seam's linear head over the TypeSafe ``/v1/systemone`` wire.
 
-The wire is the one ``src/decisions/client.py`` already speaks, so this is a THIRD provider
-behind the same seam (``decisions.style.provider = "linear"``), not a new client: the server
+The wire is the one ``src/decisions/client.py`` already speaks, so this is the seam's only
+provider (``decisions.style.provider = "linear"``), not a new client: the server
 sends one ``choice`` question whose criterion keys are the 36-label answer space and reads
 ``answers[qid].choice`` / ``.confidence`` back.
 
@@ -22,13 +22,13 @@ Design notes that are load-bearing:
   Answering anyway would redistribute the score columns onto different questions; refusing
   makes the seam degrade to the LLM style with a visible cause.
 * **``confidence`` is TypeSafe-style** (top probability minus the mean of the rest), which
-  is what the seam floors on and what ``clm_calibrate.py --metric confidence`` reads.
-  Reporting the top probability instead would silently change the meaning of every floor
-  fitted on the CLM arms.
+  is what the seam floors on and what ``style_head_calibrate.py --metric confidence`` reads.
+  Reporting the top probability instead would silently change the meaning of every fitted
+  floor.
 * **The bind address is the caller's choice.** The CMD passes ``--host 0.0.0.0`` so the
   compose bridge can forward; the loopback-only publish in
   ``docker/docker-compose.decision-models.yml`` is what confines it, exactly as
-  ``docker/clm-entrypoint.sh`` does for clm-serve.
+  ``docker/tacit-entrypoint.sh`` does for the Tacit gateway.
 
 Delivery is one temperature-free ``predict_proba`` per request, so identical bytes in give
 identical bytes out; the seam's own LRU cache sits in front of this.

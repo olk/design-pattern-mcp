@@ -2,18 +2,17 @@
 
 Both sides of the training/serving boundary read these strings:
 
-* the server, through :mod:`src.decisions.tacit` (the Ch2 style, J1 rerank, J2
-  category, J4 weights and J5 gate seams — every seam is served by the AnyJev
-  Tacit-4B gateway);
+* the server, through :mod:`src.decisions.tacit` (the J1 rerank, J2 category, J4
+  weights and J5 gate seams — every Tacit seam is served by the AnyJev gateway)
+  and :mod:`src.decisions.client` (the Ch2 style seam's served criteria map);
 * the Tacit image build, which copies this one file into the trainer so the student
-  is trained on exactly the prompts it will serve.
+  is trained on exactly the prompts it will serve; the linear style head derives its
+  labels and class order from the style vocabulary in this module.
 
 Nothing here imports third-party packages: the trainer image has torch, not pydantic.
 """
 
 from __future__ import annotations
-
-from collections.abc import Sequence
 
 #: Ordered weight levels for one quality axis (``score`` question, lowest first).
 #: The expected value is ``Σ i·p_i / (len-1)``, i.e. a five-level axis maps to [0, 1].
@@ -51,8 +50,8 @@ CATEGORY_GLOSSES: dict[str, str] = {
 }
 
 #: Fixed one-line gloss per architecture style (the Ch2 style ``choice`` question
-#: shows these as the criterion texts; server and Tacit trainer share them so the
-#: student is trained on exactly the prompt it will serve).
+#: shows these as the criterion texts; server and linear head trainer share them so the
+#: head is fitted on exactly the criteria it will serve).
 STYLE_GLOSSES: dict[str, str] = {
     "event-driven": "Components communicate primarily through asynchronous events and message flows",
     "broker": "Independent components interact only through a central message broker",
@@ -114,9 +113,9 @@ STYLE_INSTRUCTIONS = (
 
 #: The Ch2 style answer space: every architecture style the seam may name, in the order the
 #: implementation guide lists them (§10.1). Deliberately a flat vocabulary: ``src/style_affinity.py``
-#: owns the style→category PRIOR, and this module (copied standalone into the trainer image, so it
-#: cannot import the server package) must not restate that prior — reading it backwards as a
-#: filter is exactly what made 16 of 22 labelled holdout rows unanswerable. A unit test pins this
+#: owns the style→category PRIOR, which the linear head learns from the label derivation
+#: instead of restating here — reading the affinity table backwards as a shortlist filter
+#: is exactly what made 16 of 22 labelled holdout rows unanswerable. A unit test pins this
 #: set to that table's keys so a style can neither appear here nor vanish unnoticed.
 STYLE_VOCABULARY: tuple[str, ...] = (
     "event-driven",
@@ -155,44 +154,6 @@ STYLE_VOCABULARY: tuple[str, ...] = (
     "hybrid-cloud",
     "multi-cloud",
 )
-
-#: AnyJev's letter readout caps ``choice``/``score`` at 26 options (``anyjev``
-#: ``question.py`` ``MAX_OPTIONS``; the gateway answers HTTP 400 beyond). A shard keeps a
-#: slot free for ``none``, so one question carries at most this many styles.
-_STYLE_OPTION_CAP = 26
-_STYLE_SHARD_CAP = _STYLE_OPTION_CAP - 1
-
-
-def style_shards() -> tuple[tuple[str, ...], ...]:
-    """The Ch2 style shortlists: the whole vocabulary split into BALANCED shards.
-
-    The question is 35-way and AnyJev takes at most 25 styles plus ``none`` per ask, so
-    serving asks one question per shard and keeps the most confident named style across them
-    (``src/decisions/tacit.py::choose_style``). Every shard is a legal question on its own and
-    their union IS :data:`STYLE_VOCABULARY`, so no style is ever unanswerable.
-
-    Shards are EQUAL WIDTH by construction (18 + 17 today, not 25 + 10): a softmax over 10
-    options concentrates more mass than one over 25, so an uneven split would let the narrow
-    shard win cross-shard comparisons for free and bias the very floor the calibration fits.
-
-    Deriving the shards from category affinity was a defect, not a shortcut: the §10.1 table
-    lists the styles that *favour* a pattern category, not every style a system in that
-    category may have. It crams ``security-verification`` into three cloud styles, so a
-    security scenario answered ``layered-monolith`` could not be expressed at all — and
-    16 of 22 labelled holdout rows became unwinnable before the model was consulted.
-    """
-    total = len(STYLE_VOCABULARY)
-    count = -(-total // _STYLE_SHARD_CAP)  # ceil: shards needed at the widest legal width
-    width = -(-total // count)  # ceil: equalising them keeps the softmaxes comparable
-    shards = tuple(STYLE_VOCABULARY[start : start + width] for start in range(0, total, width))
-    assert all(len(shard) + 1 <= _STYLE_OPTION_CAP for shard in shards), shards  # noqa: S101
-    return shards
-
-
-def style_question(styles: Sequence[str]) -> str:
-    """The Ch2 stage-2 style ``choice`` question: instructions plus inline glosses."""
-    glosses = "; ".join(f"{style} = {STYLE_GLOSSES[style]}" for style in styles)
-    return f"{STYLE_INSTRUCTIONS} Options: {glosses}; {STYLE_NONE_KEY} = {STYLE_NONE_GLOSS}"
 
 
 # J1 rerank ---------------------------------------------------------------------

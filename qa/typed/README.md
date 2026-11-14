@@ -49,7 +49,7 @@ says so explicitly).
   Review state is machine-readable: `review.json` records per-scenario review
   (reviewer identity, label, `labels_sha256`, `rationale_ok`) plus a
   `human_review` block — a model review pass is recorded as such, never as
-  expert sign-off — and `make tacit-calibrate` refuses to recommend a confidence
+  expert sign-off — and `make style-head-calibrate` refuses to recommend a confidence
   floor until the ledger certifies the label source byte-for-byte — no calibrated
   floor exists for unreviewed labels.
 - Noul: 20 per scenario over the 100 scenarios authored 2026-10-27 (the 2026-11
@@ -96,11 +96,11 @@ Per `docs/recommendation_design-pattern-mcp_decision-models.md` §4/§7.5:
   the released checkpoint writes states, answers its own questions with thinking,
   and a QLoRA student reproduces the label distribution in one forward. The
   training problems are the served questions — category, weights and gate from
-  `build_problems`, the Ch2 style shards from `build_style_problems`, and the
-  J1 `yes_no` items from `rerank_pairs.jsonl`. These typed labels are therefore
-  **evaluation and calibration** data: `make tacit-calibrate` replays the holdout
-  style rows through the served sharded path to produce the seam's floor, and the
-  holdout rerank pairs score the leg (nDCG) without touching the weights.
+  `build_problems`, and the J1 `yes_no` items from `rerank_pairs.jsonl`. These typed
+  labels are therefore **evaluation and calibration** data for the Tacit seams, and
+  **training** data for the linear Ch2 style head: `make style-head-calibrate` replays
+  the holdout style rows through the served `/v1/systemone` path to produce the seam's
+  floor, and the holdout rerank pairs score the leg (nDCG) without touching the weights.
 - **Eikos-4B** (LoRA r64), **Clef-flash-9B** (QLoRA), **Kev-4B**
   (`kev.train --init_from`) each want 500–2,000 labeled decisions — this
   export (2,258 train) is in budget. Kev's data shape is the API shape plus

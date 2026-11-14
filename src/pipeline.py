@@ -113,10 +113,6 @@ if TYPE_CHECKING:  # pragma: no cover - type-only import (reasoning.client pulls
     from src.decisions.tacit import TacitClient
     from src.reasoning.client import ReasoningClient
 
-    #: Either wire the Ch2 style seam may be served on: Tacit's two-stage ``choice`` or the
-    #: CLM heads' one 36-criterion ``/v1/systemone``. Both expose ``choose_style``.
-    type StyleClient = TacitClient | DecisionModelClient
-
 logger = logging.getLogger(__name__)
 
 #: Payload type parameter of :meth:`PipelineDone.payload_as`.
@@ -1558,7 +1554,7 @@ class DesignPipeline(Workflow):
         llm: LLMClientProtocol,
         guard: AntiScopeGuard | None = None,
         reasoning: ReasoningClient | None = None,
-        style_client: StyleClient | None = None,
+        style_client: DecisionModelClient | None = None,
         weights_client: TacitClient | None = None,
         category_client: TacitClient | None = None,
     ) -> None:
