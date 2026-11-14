@@ -20,7 +20,7 @@
 	docker-build-tei-rerank dense-cache \
 	docker-build-tacit docker-build-tacit-base docker-build-tacit-tunnel \
 	docker-build-style-head \
-	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
+	docker-build-decision docker-up-decisions docker-down-decisions decisions-smoke \
 	tacit-payloads tacit-payloads-check \
 	style-head-calibrate check-dockerfile-shell \
 	docker-publish docker-publish-tei docker-publish-tacit docker-publish-style-head docker-publish-all \
@@ -59,8 +59,8 @@ TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
 # production container — whose 127.0.0.1 is its own — can reach it as tacit-tunnel:8100.
 # Local-only image, never published: it carries no artifact, only the ssh client.
 TACIT_TUNNEL_IMAGE := design-pattern-tacit-tunnel
-# Registry pair for the sidecar. Published on demand (docker-publish-tacit), never by
-# docker-publish-all: the image is ~29 GB, so a server release must not force that upload.
+# Registry pair for the sidecar. Ships in docker-publish-all (and on demand via
+# docker-publish-tacit): the image is ~29 GB, so budget time/bandwidth for the upload.
 TACIT_HUB_REPO   := olkowa/design-pattern-tacit
 TACIT_GHCR_REPO  := ghcr.io/olk/design-pattern-tacit
 # Publish refuses weights whose manifest does not certify every seam (>= 10 eval rows each):
@@ -375,9 +375,6 @@ docker-build: $(DENSE_CACHE_PREREQ) ## Build the MCP server image with data/dens
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):latest .
 
-docker-build-nocache: ## Build the MCP server image without a dense cache (first start embeds, ~19 min)
-	@$(MAKE) --no-print-directory docker-build SKIP_DENSE_CACHE=1
-
 docker-build-bootstrap: ## [internal] Build the server image that runs the cache builder (no cache baked)
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):latest .
@@ -400,9 +397,11 @@ docker-build-tei-rerank: ## Build the TEI rerank sidecar image
 
 docker-build-tei: docker-build-tei-embed docker-build-tei-rerank ## Build both TEI sidecar images
 
-docker-build-all: docker-build docker-build-tei ## Build all three images, dense cache generated and baked in
+# Sequential prerequisites on purpose: docker-build-tacit holds the GPU for its
+# self-distill RUN, so parallel make must not overlap it with another GPU build.
+docker-build-all: docker-build docker-build-tei docker-build-decision ## Build every image: server (+dense cache), TEI pair, Tacit, style head
 
-docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense cache, then build all three images
+docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense cache, then build every image
 
 ##@ Decision models (AnyJev Tacit-4B)
 
@@ -479,7 +478,7 @@ docker-build-tacit-tunnel: ## Build the Tacit SSH-tunnel sidecar (alpine + opens
 	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.tacit-tunnel \
 		-t $(TACIT_TUNNEL_IMAGE):$(DOCKER_TAG) -t $(TACIT_TUNNEL_IMAGE):latest .
 
-docker-build-decision-models: docker-build-tacit docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
+docker-build-decision: docker-build-tacit docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
 
 docker-up-decisions: ## Start the dev stack with the decision-model sidecars (one GPU, one CPU)
 	$(STYLE_PROVIDER_ENV) TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) \
@@ -620,7 +619,11 @@ docker-publish-tei: docker-build-tei ## Push both TEI images to Docker Hub + GHC
 	$(call publish-image,$(TEI_RERANK_IMAGE),$(TEI_RERANK_HUB_REPO),$(TEI_RERANK_GHCR_REPO))
 	docker logout ghcr.io
 
-# On demand, never from docker-publish-all: the sidecar is a ~29 GB GPU image.
+# Ships from docker-publish-all (and on demand via this target). A release from a machine
+# without the trained weights aborts in docker-build-tacit on the committed sentinels
+# ("holds the COMMITTED sentinels but no weight shards … Run rm -rf"), and only after
+# that does the GPU self-distill run; the cert guard below catches a different failure
+# (a smoke build that slipped through with warnings), not this one.
 # It depends on the build rule on purpose — that is what pins the pushed weights to
 # TACIT_TRAIN_INPUTS through models/tacit-4b/.extract-complete. No clean-tree gate
 # (unlike docker-publish): the trained checkpoint is deliberately untracked, so a real
@@ -651,7 +654,7 @@ docker-publish-style-head: docker-build-style-head ## Push the style head image 
 	$(call publish-image,$(STYLE_HEAD_IMAGE),$(STYLE_HEAD_HUB_REPO),$(STYLE_HEAD_GHCR_REPO))
 	docker logout ghcr.io
 
-docker-publish-all: docker-publish docker-publish-tei ## Build and push all three images
+docker-publish-all: docker-publish docker-publish-tei docker-publish-tacit docker-publish-style-head ## Build and push every image: server, TEI pair, Tacit, style head
 
 # File target, not phony: the cache is expensive (one TEI round-trip per
 # embedder batch, ~15 min for the 486-record catalog on CPU) and is only rebuilt
@@ -757,7 +760,7 @@ benchmark-draft: ## Benchmark: draft full.json candidates from the catalog (in D
 # Exits 1 on a candidate-loss verdict (pre-registered rule in tests/benchmark/README.md).
 # Pre-registered A/B of the Ch2 style seam with a decision-model sidecar in the loop. The
 # decision overlay renders without a GPU (`docker compose ... config`), but the runs need the
-# card and the trained image (`make docker-build-decision-models`). The seam is off in the
+# card and the trained image (`make docker-build-decision`). The seam is off in the
 # baseline arm and on in the candidate arm; everything else (corpus, split, repeat, image) is
 # identical, which is what `benchmark-compare`'s +15% p95 rule requires.
 #

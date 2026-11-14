@@ -49,8 +49,11 @@ git clone https://git.odvlh.xyz/olli/design-pattern-mcp.git && cd design-pattern
 # 2. Add your API key
 export OPENCODE_API_KEY=your_key_here
 
-# 3. Build + start (three images: MCP server + TEI embed + TEI rerank)
-make docker-build-all
+# 3. Build + start. Full stack (server + TEI pair + Tacit + style head) needs a GPU
+#    builder for Tacit's self-distill; without one, build the CPU images and run Tacit
+#    where a card exists (systemd/README.md "Decision models"):
+make docker-build-all                       # GPU builder
+# make docker-build docker-build-tei docker-build-style-head   # no GPU builder
 make docker-up
 
 # 4. Demo (analyze-only: fast. For the full design: make client-design)
@@ -391,8 +394,11 @@ Run both servers side by side (dev host ports `:8060` architecture, `:8822` desi
 ### Docker (manual)
 
 ```bash
-# Build the three images (dense vector cache generated and baked in)
-make docker-build-all
+# Build every image (dense vector cache generated and baked in). Tacit self-distills
+# on a GPU builder — without one it aborts on the committed sentinels (the weights are
+# untracked), so build the CPU images instead and run Tacit where a card exists:
+make docker-build-all                       # GPU builder
+# make docker-build docker-build-tei docker-build-style-head   # no GPU builder
 
 # Run with your API key
 OPENCODE_API_KEY=your_key make docker-up
@@ -599,7 +605,7 @@ that would empty the pool is discarded; a weights vector that comes back unusabl
 all-zero after one retry) sends that part down the LLM path; the reasoning gate fails open.
 
 ```bash
-make docker-build-decision-models   # Tacit self-distilled in-image (GPU + CDI) + the CPU style head
+make docker-build-decision   # Tacit self-distilled in-image (GPU + CDI) + the CPU style head
 make docker-up-decisions            # stack + the sidecars (one GPU, one CPU)
 make decisions-smoke                # assert the wire contracts on 18100 (Tacit) and 18800 (style head)
 make docker-down-decisions
@@ -892,7 +898,7 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 | `make verify-ledger` / `make verify-cross-consistency` | Ledger + NL-doc consistency gates |
 | `make benchmark-live` / `make benchmark-analyze` / `make benchmark-compare` / `make benchmark-selfcheck` | Benchmark harness (see above) |
 | `make embed-cache` | Force-regenerate `data/dense-cache/` |
-| `make docker-build-all` | Build all three images (dense cache baked in) |
+| `make docker-build-all` | Build every image: server, TEI pair, Tacit, style head (dense cache baked in) |
 | `make docker-up` / `make docker-down` | Start / stop the dev stack |
 | `make client-analyze` / `make client-design` / `make client-async` | Demo clients against `http://localhost:8822/mcp` |
 | `make docker-publish` | Push the server image to Docker Hub + GHCR (+ git tag) |
@@ -940,9 +946,9 @@ All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml
 # 1. Login to GHCR (interactive — paste token at the password prompt)
 docker login ghcr.io -u olk
 
-# 2. Build and push all three images (MCP + TEI embedder + TEI reranker)
+# 2. Build and push every image (MCP + TEI embedder + TEI reranker + Tacit + style head)
 #    The umbrella target builds the MCP image, tags it, pushes it, creates the git tag,
-#    then builds and pushes each TEI image in sequence.
+#    then builds and pushes TEI, Tacit and the style head in sequence.
 make docker-publish-all
 
 # 3. Logout from GHCR immediately after publishing
@@ -950,11 +956,11 @@ make docker-publish-all
 docker logout ghcr.io
 ```
 
-On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-tacit` builds and pushes the Tacit sidecar (same two registries, on demand — never from `docker-publish-all`).
+On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-tacit` and `make docker-publish-style-head` push the decision sidecars individually (same two registries), and all four ride `docker-publish-all`.
 
 ### First push — set packages public (GHCR only)
 
-GHCR packages default to **private**. After the first `make docker-publish-all` (and the first `make docker-publish-tacit`), flip every package to public:
+GHCR packages default to **private**. After the first `make docker-publish-all`, flip every package to public:
 
 | Package | Settings URL |
 |---|---|
@@ -962,12 +968,13 @@ GHCR packages default to **private**. After the first `make docker-publish-all` 
 | TEI embedder | `https://github.com/users/olk/packages/container/pattern-tei-embed/settings` |
 | TEI reranker | `https://github.com/users/olk/packages/container/pattern-tei-rerank/settings` |
 | Tacit sidecar | `https://github.com/users/olk/packages/container/design-pattern-tacit/settings` |
+| Style head | `https://github.com/users/olk/packages/container/design-pattern-style-head/settings` |
 
 Set each to **Public** and save.
 
 ### Partial failure recovery
 
-If the push fails mid-way (e.g., GHCR auth was not configured), Docker Hub layers are already uploaded. After fixing auth, re-running `make docker-publish-all` is safe — each registry reports a cache hit for already-uploaded layers and completes the remaining push. For targeted retries, the TEI sidecars can be pushed with `make docker-publish-tei`.
+If the push fails mid-way (e.g., GHCR auth was not configured), Docker Hub layers are already uploaded. After fixing auth, re-running `make docker-publish-all` is safe — each registry reports a cache hit for already-uploaded layers and completes the remaining push. For targeted retries, the TEI sidecars can be pushed with `make docker-publish-tei` and the decision sidecars with `make docker-publish-tacit` / `make docker-publish-style-head`.
 
 ---
 

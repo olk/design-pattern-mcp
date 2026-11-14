@@ -15,16 +15,19 @@ This directory contains the systemd unit that starts the
 - systemd-based Linux host.
 - Docker Engine with the Compose plugin.
 - `graemer` is in the `docker` group.
-- All three images available locally: MCP server, TEI pair, style head (Step 0).
+- Images available locally (Step 0).
 - **Shared TEI infra stack** — see [`pattern-tei-infra`](https://github.com/olk/pattern-tei-infra).
 
 ## Step 0 — Build or pull images
 
+This host is GPU-less by design, so it builds the CPU images only — the full
+`make docker-build-all` includes Tacit's GPU self-distill and aborts here on the
+committed sentinels (weights untracked). Run Tacit on a GPU host instead
+("Decision models" below).
+
 ```bash
-# From the repo root (server + TEI pair, dense cache baked in):
-make docker-build-all
-# Plus the CPU style head (~20 s, no GPU):
-make docker-build-style-head
+# From the repo root (server + TEI pair + style head):
+make docker-build docker-build-tei docker-build-style-head
 ```
 
 Or pull published images and retag to `:local` so the `ExecStartPre` guard passes.
@@ -157,7 +160,7 @@ explicit operator choice, trusted nets only.)
 ## Updating
 
 ```bash
-make docker-build-all
+make docker-build docker-build-tei docker-build-style-head
 sudo systemctl reload design-pattern-mcp
 ```
 
