@@ -80,7 +80,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8812/mcp" \
 |---|---|---|
 | TEI embed / rerank | external `pattern-tei-infra` (`pattern-tei-shared`) | shared GPU/CPU infra, one copy for all pattern servers |
 | style head (Ch2) | in this stack (`design-pattern-style-head`) | CPU-only, no GPU, no port — the seam ships on and must resolve |
-| Tacit gateway (J1/J2/J4/J5) | a GPU host, reached over SSH (below) | needs a card; the gateway has no auth, so it never faces the network |
+| Tacit gateway (J1/J2/J4/J5) | GPU host via `tacit-tunnel` service (`--profile tacit`) | needs a card; gateway has no auth and container loopback is its own, so ssh runs in-stack |
 
 ## Decision models
 
@@ -91,11 +91,14 @@ The Ch2 style seam ships **on** (linear head, floor 0.6), served by the in-stack
 `/etc/design-pattern-mcp/.env`. Set `DECISIONS_STYLE_ENABLED=false` there to stand
 the seam down to the LLM style.
 
-The Tacit seams (J1 rerank, J2 category, J4 weights, J5 gate) are **off** and have no
-service here. To enable them:
+The Tacit seams (J1 rerank, J2 category, J4 weights, J5 gate) are **off** and their
+gateway lives on a GPU host — reached through the opt-in `tacit-tunnel` service
+(below), never directly: the gateway has no auth, so it binds loopback on its own
+host, and the production container's `127.0.0.1` is itself, so a host-level tunnel
+would be invisible to it. The sidecar runs the ssh client on `pattern-tei-shared`
+and forwards the gateway as `tacit-tunnel:8100`.
 
-1. **GPU host** — run the gateway on loopback (it has no auth; compose confines it
-   to `127.0.0.1` for the same reason):
+1. **GPU host** — run the gateway on loopback:
 
    ```bash
    make docker-build-tacit            # tags :1.0.1 and :latest
@@ -104,45 +107,43 @@ service here. To enable them:
      design-pattern-tacit:latest
    ```
 
-2. **This host** — persistent SSH tunnel as its own unit
-   (`/etc/systemd/system/tacit-tunnel.service`; key-based auth, no password prompts):
-
-   ```ini
-   [Unit]
-   Description=SSH tunnel to Tacit gateway
-   After=network-online.target
-   Wants=network-online.target
-
-   [Service]
-   ExecStart=/usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-     -L 8100:127.0.0.1:8100 gpu-host
-   Restart=always
-   RestartSec=10
-   User=graemer
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
+2. **This host** — deployment key + pinned host key (key auth only, no passwords,
+   no trust-on-first-use — the entrypoint refuses to run without both files):
 
    ```bash
-   sudo systemctl enable --now tacit-tunnel
+   sudo install -o root -g docker -m 750 -d /etc/design-pattern-mcp/ssh
+   sudo install -o root -g docker -m 640 ~/.ssh/tacit_tunnel_ed25519 \
+     /etc/design-pattern-mcp/ssh/id_ed25519
+   ssh-keyscan -t ed25519 gpu-host | sudo tee /etc/design-pattern-mcp/ssh/known_hosts
+   sudo chmod 640 /etc/design-pattern-mcp/ssh/known_hosts
    ```
 
-3. **`/etc/design-pattern-mcp/.env`** — all four URLs at the tunnel endpoint, plus
-   the switches (all default off):
+   Verify the `known_hosts` line against the GPU host's key fingerprint before
+   proceeding — `ssh-keyscan` output is unverified bytes until you do.
+
+3. **`/etc/design-pattern-mcp/.env`** — tunnel target plus the seam switches
+   (all default off):
 
    ```
-   DECISIONS_WEIGHTS_BASE_URL=http://127.0.0.1:8100
-   DECISIONS_CATEGORY_BASE_URL=http://127.0.0.1:8100
-   DECISIONS_REASONING_GATE_BASE_URL=http://127.0.0.1:8100
-   RERANKER_PROVIDER=tacit
-   RERANKER_TACIT_BASE_URL=http://127.0.0.1:8100
+   TACIT_TUNNEL_SSH_HOST=gpu-host
+   TACIT_TUNNEL_SSH_USER=graemer
    DECISIONS_WEIGHTS_ENABLED=true
    DECISIONS_CATEGORY_ENABLED=true
    DECISIONS_REASONING_GATE_ENABLED=true
+   RERANKER_PROVIDER=tacit
    ```
 
-   Then `sudo systemctl reload design-pattern-mcp`. Startup log shows
+   The four `*_BASE_URL`s already default to `http://tacit-tunnel:8100` in the
+   compose file — set them only to override. Then bring the tunnel up alongside
+   the stack:
+
+   ```bash
+   sudo systemctl reload design-pattern-mcp   # compose up without the tunnel
+   docker compose --profile tacit up -d       # from /etc/design-pattern-mcp
+   ```
+
+   (Or add `--profile tacit` to the unit's `ExecStart`/`ExecReload` lines if the
+   tunnel should always run with the stack.) Startup log shows
    `ok (tacit, model=tacit-4b)` per seam; any transport failure degrades silently to
    the non-model path, so check the logs for `degraded` warnings if a seam reports
    `ok` but behaves like the baseline.

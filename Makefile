@@ -18,7 +18,7 @@
 	docker-build docker-build-all docker-build-cached docker-build-nocache \
 	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
 	docker-build-tei-rerank dense-cache \
-	docker-build-tacit docker-build-tacit-base \
+	docker-build-tacit docker-build-tacit-base docker-build-tacit-tunnel \
 	docker-build-style-head \
 	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
 	tacit-payloads tacit-payloads-check \
@@ -54,6 +54,11 @@ DENSE_CACHE_DIR    ?= data/dense-cache
 # run time; the *-base target builds the released-weights variant and needs no GPU.
 TACIT_IMAGE      := design-pattern-tacit
 TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
+# SSH-tunnel sidecar for the systemd stack (alpine + openssh-client, no model):
+# it forwards the GPU host's loopback-bound gateway onto the shared network, so the
+# production container — whose 127.0.0.1 is its own — can reach it as tacit-tunnel:8100.
+# Local-only image, never published: it carries no artifact, only the ssh client.
+TACIT_TUNNEL_IMAGE := design-pattern-tacit-tunnel
 # Registry pair for the sidecar. Published on demand (docker-publish-tacit), never by
 # docker-publish-all: the image is ~29 GB, so a server release must not force that upload.
 TACIT_HUB_REPO   := olkowa/design-pattern-tacit
@@ -469,6 +474,10 @@ docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (n
 docker-build-style-head: ## Build the linear style head sidecar (CPU; the build gates the head)
 	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.style-head \
 		-t $(STYLE_HEAD_IMAGE):$(DOCKER_TAG) -t $(STYLE_HEAD_IMAGE):latest .
+
+docker-build-tacit-tunnel: ## Build the Tacit SSH-tunnel sidecar (alpine + openssh-client)
+	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.tacit-tunnel \
+		-t $(TACIT_TUNNEL_IMAGE):$(DOCKER_TAG) -t $(TACIT_TUNNEL_IMAGE):latest .
 
 docker-build-decision-models: docker-build-tacit docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
 
