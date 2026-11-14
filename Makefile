@@ -20,7 +20,7 @@
 	docker-build-tei-rerank dense-cache \
 	docker-build-tacit docker-build-tacit-base docker-build-tacit-tunnel \
 	docker-build-style-head \
-	docker-build-decision docker-up-decisions docker-down-decisions decisions-smoke \
+	docker-build-decision docker-up-decisions docker-down-decisions docker-up-style docker-down-style decisions-smoke \
 	tacit-payloads tacit-payloads-check \
 	style-head-calibrate check-dockerfile-shell \
 	docker-publish docker-publish-tei docker-publish-tacit docker-publish-style-head docker-publish-all \
@@ -487,6 +487,19 @@ docker-up-decisions: ## Start the dev stack with the decision-model sidecars (on
 docker-down-decisions: ## Stop the whole dev stack including the decision-model sidecars
 	TACIT_IMAGE=$(TACIT_IMAGE):$(DOCKER_TAG) \
 		STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM) down
+
+# Style-only lane: the base stack plus the CPU head, no GPU anywhere. This is what a
+# GPU-less host runs — plain `docker-up` starts no sidecar, and the default-on style
+# seam would degrade silently against a dead endpoint. Same project as COMPOSE_DM (the
+# last -f file's `name:` wins in both), so switching lanes is down + up, never a
+# second stack.
+COMPOSE_STYLE := docker compose -f docker/docker-compose.yml -f docker/docker-compose.style-head.yml
+
+docker-up-style: ## Start the dev stack with the CPU style head only (no GPU)
+	$(STYLE_PROVIDER_ENV) STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_STYLE) up -d
+
+docker-down-style: ## Stop the dev stack including the CPU style head
+	STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_STYLE) down
 
 decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docker-up-decisions)
 	@echo "==> Tacit /v1/decide"

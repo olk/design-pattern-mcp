@@ -25,6 +25,7 @@ An MCP (Model Context Protocol) server that provides design-pattern selection ex
 - [Working Together with architecture-pattern-mcp](#-working-together-with-architecture-pattern-mcp)
 - [Install Alternatives](#install-alternatives)
   - [Docker (manual)](#docker-manual)
+  - [Which stack to run](#which-stack-to-run)
   - [Local Development (uv)](#local-development-uv)
 - [Configuration](#configuration)
   - [Decision models (AnyJev Tacit-4B)](#decision-models-anyjev-tacit-4b)
@@ -49,12 +50,13 @@ git clone https://git.odvlh.xyz/olli/design-pattern-mcp.git && cd design-pattern
 # 2. Add your API key
 export OPENCODE_API_KEY=your_key_here
 
-# 3. Build + start. Full stack (server + TEI pair + Tacit + style head) needs a GPU
-#    builder for Tacit's self-distill; without one, build the CPU images and run Tacit
-#    where a card exists (systemd/README.md "Decision models"):
+# 3. Build + start. The GPU lane runs everything; the CPU lane runs everything
+#    except Tacit (run that where a card exists — systemd/README.md "Decision models").
+#    Plain `docker-up` starts no decision sidecar at all.
 make docker-build-all                       # GPU builder
+make docker-up-decisions                    # GPU host: server + TEI + Tacit + style head
 # make docker-build docker-build-tei docker-build-style-head   # no GPU builder
-make docker-up
+# make docker-up-style                                          # no GPU host
 
 # 4. Demo (analyze-only: fast. For the full design: make client-design)
 make client-analyze
@@ -396,15 +398,31 @@ Run both servers side by side (dev host ports `:8060` architecture, `:8822` desi
 ```bash
 # Build every image (dense vector cache generated and baked in). Tacit self-distills
 # on a GPU builder — without one it aborts on the committed sentinels (the weights are
-# untracked), so build the CPU images instead and run Tacit where a card exists:
+# untracked), so build the CPU images instead and pick the matching start command
+# ([Which stack to run](#which-stack-to-run) for the full matrix):
 make docker-build-all                       # GPU builder
 # make docker-build docker-build-tei docker-build-style-head   # no GPU builder
 
-# Run with your API key
-OPENCODE_API_KEY=your_key make docker-up
+# Run with your API key (GPU host shown; CPU lane starts with `make docker-up-style`)
+OPENCODE_API_KEY=your_key make docker-up-decisions
 ```
 
-First `docker-build-all` generates the FAISS dense cache (`data/dense-cache/`) via the TEI embed sidecar and bakes it into the server image; `make docker-build-nocache` skips that (first startup then embeds the corpus, ~19 min).
+### Which stack to run
+
+| You have | Build | Start | What runs |
+|---|---|---|---|
+| GPU builder + GPU host | `make docker-build-all` | `make docker-up-decisions` | server + TEI pair + Tacit gateway + style head — every seam live |
+| No GPU | `make docker-build docker-build-tei docker-build-style-head` | `make docker-up-style` | server + TEI pair + style head — Ch2 on, Tacit seams off |
+| No decisions (TEI only) | `make docker-build` | `make docker-up` | server + TEI pair in-stack, no decision sidecars — style degrades to the LLM sample |
+| Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external, Tacit via `--profile tacit` tunnel |
+
+Switching lanes is down + up, with the matching down: the two sidecar lanes share the
+`design-pattern-mcp-dev` project (`make docker-down-decisions` / `make docker-down-style`
+stop either), but plain `make docker-up` is its own `design-pattern-mcp` project — and
+every lane reuses the fixed `container_name: design-pattern-mcp-dev`, so going base →
+sidecar lane without `make docker-down` first fails with "container name already in
+use". `make decisions-smoke` asserts the sidecar wire contracts on 18100 (Tacit) and
+18800 (style head).
 
 Both compose stacks back that cache directory with a **named Docker volume**
 (`design-pattern-mcp-dev-dense-cache` / `design-pattern-mcp-systemd-dense-cache`,
@@ -646,7 +664,7 @@ arm that yields a qualifying confidence floor.
 
 ```bash
 make docker-build-style-head            # CPU, ~20 s; the training RUN *is* the accuracy gate
-make docker-up-decisions
+make docker-up-style                    # base + style head, no GPU
 make style-head-calibrate               # floor + repeat/order probes -> models/style-head-calibration.json
 make benchmark-style-ab
 ```
