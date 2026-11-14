@@ -9,6 +9,10 @@
 #   - TEI sidecars are NOT defined here — they live in the shared
 #     `pattern-tei-infra` stack (https://github.com/olk/pattern-tei-infra).
 #     This stack joins the `pattern-tei-shared` external network to reach them.
+#   - The Ch2 style head IS defined here: it is a CPU-only sidecar (local build tag,
+#     no ports, no GPU), and the style seam ships on. The Tacit gateway is NOT: it
+#     needs a GPU host, so the Tacit seams (J1 rerank, J2 category, J4 weights, J5
+#     gate) stay off unless the operator points their BASE_URLs at a reachable gateway.
 #
 # Every environment name set here must match a `{env:...}` placeholder in
 # config/config.json. A name that does not is SILENTLY IGNORED (the server falls
@@ -58,6 +62,12 @@ services:
       - EMBEDDER_API_KEY=${EMBEDDER_API_KEY:-not-needed}
 
       - RERANKER_BASE_URL=http://pattern-tei-rerank:8080
+      # Rerank scorer switch (default tei). Tacit needs the gateway over the SSH tunnel
+      # (see README "Decision models"); without it, leave provider=tei and the URL below
+      # is inert.
+      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-tei}
+      - RERANKER_TACIT_BASE_URL=${RERANKER_TACIT_BASE_URL:-http://127.0.0.1:8100}
+      - RERANKER_TACIT_TIMEOUT_SECONDS=${RERANKER_TACIT_TIMEOUT_SECONDS:-60}
 
       # Dense embedding cache: /app/data/dense-cache ships baked into the image
       # and is backed by the NAMED volume below, so the reloaded snapshot (zero
@@ -86,15 +96,33 @@ services:
       - REASONING_MAX_TOTAL_STEPS=8
       - REASONING_QUIET_STDERR=true
       - REASONING_FAIL_FAST=true
-      # Ch2 style seam: on by default, served by the CPU linear head. The base_url below is
-      # a placeholder for the deployment's sidecar address; if the sidecar is unreachable
-      # the seam degrades to the LLM style. Set DECISIONS_STYLE_ENABLED=false to stand it down.
+      # Ch2 style seam: on by default, served by the design-pattern-style-head service
+      # below (CPU, no published port — internal on pattern-tei-shared, like the TEI
+      # sidecars it joins). If the sidecar is unreachable the seam degrades
+      # to the LLM style. Set DECISIONS_STYLE_ENABLED=false to stand it down.
       - DECISIONS_STYLE_ENABLED=${DECISIONS_STYLE_ENABLED:-true}
       - DECISIONS_STYLE_PROVIDER=${DECISIONS_STYLE_PROVIDER:-linear}
       - DECISIONS_STYLE_BASE_URL=${DECISIONS_STYLE_BASE_URL:-http://design-pattern-style-head:8800/v1}
       - DECISIONS_STYLE_MODEL=${DECISIONS_STYLE_MODEL:-style-linear}
       - DECISIONS_STYLE_CONFIDENCE_FLOOR=${DECISIONS_STYLE_CONFIDENCE_FLOOR:-0.6}
-      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+      # Tacit seams (J4 weights, J2 category, J5 gate). All off by default; the gateway
+      # lives on a GPU host and is reached over the SSH tunnel, so the URLs below point
+      # at its loopback forward (see README "Decision models"). The timeouts match the
+      # dev overlay; weights has no confidence floor (expected-level MAE path).
+      - DECISIONS_WEIGHTS_ENABLED=${DECISIONS_WEIGHTS_ENABLED:-false}
+      - DECISIONS_WEIGHTS_BASE_URL=${DECISIONS_WEIGHTS_BASE_URL:-http://127.0.0.1:8100}
+      - DECISIONS_WEIGHTS_MODEL=${DECISIONS_WEIGHTS_MODEL:-tacit-4b}
+      - DECISIONS_WEIGHTS_TIMEOUT_SECONDS=${DECISIONS_WEIGHTS_TIMEOUT_SECONDS:-30}
+      - DECISIONS_CATEGORY_ENABLED=${DECISIONS_CATEGORY_ENABLED:-false}
+      - DECISIONS_CATEGORY_BASE_URL=${DECISIONS_CATEGORY_BASE_URL:-http://127.0.0.1:8100}
+      - DECISIONS_CATEGORY_MODEL=${DECISIONS_CATEGORY_MODEL:-tacit-4b}
+      - DECISIONS_CATEGORY_CONFIDENCE_FLOOR=${DECISIONS_CATEGORY_CONFIDENCE_FLOOR:-0.5}
+      - DECISIONS_CATEGORY_TIMEOUT_SECONDS=${DECISIONS_CATEGORY_TIMEOUT_SECONDS:-10}
+      - DECISIONS_REASONING_GATE_ENABLED=${DECISIONS_REASONING_GATE_ENABLED:-false}
+      - DECISIONS_REASONING_GATE_BASE_URL=${DECISIONS_REASONING_GATE_BASE_URL:-http://127.0.0.1:8100}
+      - DECISIONS_REASONING_GATE_MODEL=${DECISIONS_REASONING_GATE_MODEL:-tacit-4b}
+      - DECISIONS_REASONING_GATE_CONFIDENCE_FLOOR=${DECISIONS_REASONING_GATE_CONFIDENCE_FLOOR:-0.5}
+      - DECISIONS_REASONING_GATE_TIMEOUT_SECONDS=${DECISIONS_REASONING_GATE_TIMEOUT_SECONDS:-5}
 
       - TASKS_HEARTBEAT_ENABLED=true
       - TASKS_HEARTBEAT_INTERVAL_SECONDS=30
@@ -134,6 +162,31 @@ services:
       timeout: 10s
       retries: 3
       start_period: 1800s # cold start embeds the whole catalog when no cache is baked
+
+  # The Ch2 style seam's only provider: a TF-IDF + calibrated-SVM head in a CPU
+  # sidecar. Local build tag by default (make docker-build-style-head); point
+  # STYLE_HEAD_IMAGE at olkowa/design-pattern-style-head:<tag> to run a published one.
+  # No published port — internal on pattern-tei-shared, reached at
+  # design-pattern-style-head:8800 exactly like the TEI sidecars this stack already joins.
+  # Deliberately NOT in design-pattern-mcp's depends_on: the seam degrades to the LLM
+  # style when the sidecar is down, and a hard dependency would fail the server for a soft seam.
+  design-pattern-style-head:
+    image: ${STYLE_HEAD_IMAGE:-design-pattern-style-head:latest}
+    container_name: "design-pattern-style-head"
+    networks: [pattern-tei-shared]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
 networks:
   pattern-tei-shared:
