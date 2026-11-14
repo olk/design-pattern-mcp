@@ -570,8 +570,9 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
 
 An optional, self-hosted decision layer: one GPU sidecar answers the bounded judgments the
 pipeline would otherwise ask the generator, so selection stops paying LLM latency (and
-variance) for closed-set questions. **Every seam is default-off** — the base compose stack
-never starts the sidecar, and `config/config.json` defaults all of them to `false`.
+variance) for closed-set questions. The Ch2 style seam is on by default (CPU head, no GPU
+needed); the Tacit seams stay default-off — the base compose stack never starts the Tacit
+sidecar, and `config/config.json` defaults them to `false`.
 
 | Seam | Model / wire | Substitutes | Degrades to |
 |---|---|---|---|
@@ -647,8 +648,8 @@ make benchmark-style-ab
 The seam, endpoint, model name and floor all follow from the provider (always `linear` now).
 The head also has a CPU-only overlay, `docker/docker-compose.style-head.yml`, for hosts whose
 card cannot serve vLLM at all — the full decision overlay's server depends on the Tacit
-gateway, this one does not. The seam stays default-off until `benchmark-style-ab` clears the
-pre-registered rule.
+gateway, this one does not. The seam ships on (`DECISIONS_STYLE_ENABLED=true`): set it to
+`false` to stand it down to the LLM style.
 
 Measurement, the recipe correction it forced, and the operating procedure:
 [docs/linear-style-head.md](docs/linear-style-head.md).
@@ -679,7 +680,7 @@ Measurement, the recipe correction it forced, and the operating procedure:
 | `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
 | `RERANK_TOP_N` | `10` | Rerank top N |
 | `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) or `tacit` (per-candidate `yes_no` over `/v1/decide`; any failure re-issues the identical TEI call) |
-| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 seam: the linear head replaces the LLM-sampled style when its answer clears the floor |
+| `DECISIONS_STYLE_ENABLED` | `true` | Ch2 seam: the linear head replaces the LLM-sampled style when its answer clears the floor |
 | `DECISIONS_STYLE_PROVIDER` | `linear` | Ch2 wire: pinned to `linear` (CPU linear head, `/v1/systemone` on the `/v1` root). Provider, endpoint and model must move together — the config refuses a half-switched pair |
 | `DECISIONS_WEIGHTS_ENABLED` | `false` | J4 seam: Tacit `score` questions replace the batched weights LLM call |
 | `DECISIONS_CATEGORY_ENABLED` | `false` | J2 seam: Tacit category `choice` narrows the retrieved pool (never a hard router) |

@@ -23,7 +23,7 @@
 	docker-build-decision-models docker-up-decisions docker-down-decisions decisions-smoke \
 	tacit-payloads tacit-payloads-check \
 	style-head-calibrate check-dockerfile-shell \
-	docker-publish docker-publish-tei docker-publish-tacit docker-publish-all \
+	docker-publish docker-publish-tei docker-publish-tacit docker-publish-style-head docker-publish-all \
 	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
 	embed-cache
 
@@ -94,7 +94,9 @@ VLLM_IMAGE_TAG   ?= v0.17.1
 # Linear style head (the Ch2 seam's only provider): a TF-IDF + calibrated-SVM head
 # fitted in its own image build, whose training RUN is also the accuracy gate.
 STYLE_HEAD_IMAGE := design-pattern-style-head
-
+# Registry pair for the style head, published by docker-publish-style-head.
+STYLE_HEAD_HUB_REPO  := olkowa/design-pattern-style-head
+STYLE_HEAD_GHCR_REPO := ghcr.io/olk/design-pattern-style-head
 # The Ch2 style seam's one switch: it always names the linear head, so the endpoint,
 # model name and wire shape move together and a style run cannot inherit a Tacit
 # gateway URL (the config validator rejects that pairing outright, and this keeps it
@@ -489,9 +491,9 @@ decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docke
 		-d '{"model":"style-linear","state":"A checkout service with flash sales.","questions":{"architecture_style":{"type":"choice","instructions":"Which architecture style best characterizes the system described in the state?"}}}' \
 		| python3 -c "import json,sys; a=json.load(sys.stdin)['answers']['architecture_style']; print(f\"choice={a['choice']} confidence={a['confidence']:.4f} classes={len(a['probabilities'])}\")"
 
-# Floor calibration for the Ch2 style seam. The head ships uncalibrated: run this against
-# a live style head (docker-up-decisions) and set the floor it recommends —
-# DECISIONS_STYLE_ENABLED stays false until this passes.
+# Floor calibration for the Ch2 style seam. The shipped floor (0.5) is a placeholder: run
+# this against a live style head (docker-up-decisions) and set the floor it recommends —
+# DECISIONS_STYLE_CONFIDENCE_FLOOR=<recommended.floor>.
 STYLE_HEAD_BASE_URL            ?= http://127.0.0.1:18800/v1
 STYLE_HEAD_CAL_FLOORS          ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7
 STYLE_HEAD_CAL_MIN_ACTED_ACCURACY ?= 0.8
@@ -629,6 +631,14 @@ print({k: d.get(k) for k in ('repo','problems','examples','kept','epochs','lr')}
 	$(call publish-image,$(TACIT_IMAGE),$(TACIT_HUB_REPO),$(TACIT_GHCR_REPO))
 	docker logout ghcr.io
 
+# TEI shape: build first (the training RUN inside the build is the accuracy gate, so a
+# built image is always a gated head), then tag + push both registries.
+docker-publish-style-head: docker-build-style-head ## Push the style head image to Docker Hub + GHCR
+	docker login -u olkowa
+	docker login ghcr.io -u olk
+	$(call publish-image,$(STYLE_HEAD_IMAGE),$(STYLE_HEAD_HUB_REPO),$(STYLE_HEAD_GHCR_REPO))
+	docker logout ghcr.io
+
 docker-publish-all: docker-publish docker-publish-tei ## Build and push all three images
 
 # File target, not phony: the cache is expensive (one TEI round-trip per
@@ -701,14 +711,15 @@ BENCH_ENV := BENCH_SCENARIOS="$(BENCH_SCENARIOS)" OUT="$(OUT)" RUN_ID="$(RUN_ID)
 	ALLOW_MISMATCH="$(ALLOW_MISMATCH)" DRY_RUN="$(DRY_RUN)" PER_FAMILY="$(PER_FAMILY)" \
 	REQUIRE_REPEAT_STABILITY="$(REQUIRE_REPEAT_STABILITY)" \
 	FAMILIES="$(FAMILIES)" DRAFT_OUT="$(DRAFT_OUT)" BENCH_DECISION_OVERLAY="$(BENCH_DECISION_OVERLAY)" \
-	$(if $(DECISIONS_STYLE_ENABLED),DECISIONS_STYLE_ENABLED="$(DECISIONS_STYLE_ENABLED)") \
+	DECISIONS_STYLE_ENABLED="$(if $(DECISIONS_STYLE_ENABLED),$(DECISIONS_STYLE_ENABLED),false)" \
 	$(if $(DECISIONS_STYLE_CONFIDENCE_FLOOR),DECISIONS_STYLE_CONFIDENCE_FLOOR="$(DECISIONS_STYLE_CONFIDENCE_FLOOR)")
-# The two style forwards above are CONDITIONAL on purpose. Unconditional, an unset make
-# variable exports the name with an EMPTY value, and the benchmark container's ServerConfig
-# load rejects '' for a bool and a float — so every target that loads the config in-container
-# (`benchmark-selfcheck`, `benchmark-live`, `benchmark-analyze`) failed before it started, and
-# an A/B arm died after its whole stack was warm. The arms that DO want a value pass it
-# explicitly after BENCH_ENV, which still wins on the command line.
+# `DECISIONS_STYLE_ENABLED` defaults to false (not unset) on purpose: the shipped
+# config.json carries the seam ON, but no non-style target starts the head, so an absent
+# var would make every scenario log a degradation warning and report style=wired against
+# a dead endpoint. The floor forward below stays CONDITIONAL — an unset make variable
+# exports the name with an EMPTY value, and the benchmark container's ServerConfig load
+# rejects '' for a float. The arms that DO want a value pass it explicitly after BENCH_ENV,
+# which still wins on the command line.
 
 benchmark-selfcheck: ## Benchmark: metric self-check, hand-computed anchors (in Docker; no stack)
 	@$(BENCH_ENV) $(BENCH_DOCKER) selfcheck

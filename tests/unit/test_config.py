@@ -304,6 +304,17 @@ class TestRepositoryConfig:
         assert config.port > 0
         assert config.retrieval.dense_weight + config.retrieval.bm25_weight == pytest.approx(1.0)
 
+    def test_repository_config_ships_the_style_seam_on(self) -> None:
+        """Shipped default: Ch2 style on (linear head); the Tacit seams stay off."""
+        raw = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
+        config = ServerConfig.model_validate(expand_env_in_obj(raw))
+        assert config.decisions.style.enabled is True
+        assert config.decisions.style.provider == "linear"
+        assert config.decisions.style.base_url == "http://design-pattern-style-head:8800/v1"
+        assert config.decisions.style.model == "style-linear"
+        for seam in (config.decisions.weights, config.decisions.category, config.decisions.reasoning_gate):
+            assert seam.enabled is False
+
     def test_repository_config_ships_both_tools_for_every_phase(self) -> None:
         raw = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
         config = ServerConfig.model_validate(expand_env_in_obj(raw))

@@ -8,9 +8,10 @@ a bag-of-n-grams head served on CPU behind the `/v1/systemone` wire, and the mea
 that decided it ships.
 
 Status: **the linear head is the Ch2 seam's only provider** (`decisions.style.provider` is
-pinned to `linear`; the Tacit/CLM style wirings are removed). The seam ships default-off and
-is enabled only by an operator who sets the floor from `models/style-head-calibration.json`
-(recommended 0.6, §6). **Historical note:** the `models/clm-calibration*.json` citations in
+pinned to `linear`; the Tacit/CLM style wirings are removed). The seam ships on, served by
+the CPU sidecar; the calibrated floor lives in `models/style-head-calibration.json`
+(recommended 0.6, §6 — the shipped 0.5 is the placeholder until the operator sets it).
+**Historical note:** the `models/clm-calibration*.json` citations in
 §1 and the `models/tacit-calibration.json` citation beside them name artifacts that no longer
 exist — they were removed with their lanes, and the numbers they carried survive only here.
 The calibrator is now `scripts/decision_models/style_head_calibrate.py`. §1/§5/§6 below are
@@ -258,9 +259,10 @@ the failure mode selected — and it won, so that status is now **superseded**:
 * the linear head **ships as a supported `decisions.style.provider`**, served by the CPU
   sidecar, with a measured recommendation: **floor 0.6** (65 % act rate at acted accuracy
   1.000 on the holdout; the operating point under which the A/B passed);
-* the seam itself **stays default-off** (`enabled = false`) — enabling remains an explicit
-  operator choice with the calibrated floor. The provider was `tacit` when run 1's verdict
-  was recorded; the §7 merge pinned it to `linear`, which is what this branch ships;
+* the seam itself **ships on** (`enabled = true` in the shipped config and the compose
+  overlays) — disabling remains an explicit operator choice (`DECISIONS_STYLE_ENABLED=false`).
+  The provider was `tacit` when run 1's verdict was recorded; the §7 merge pinned it to
+  `linear`, which is what this branch ships;
 * `linear-style-seam` is **eligible for the §7 merge into `tacit`**, which is what the
   verification gate required.
 
@@ -309,8 +311,8 @@ runs. That answer is at n=18 and inherits the same power caveat, stated with the
 make docker-build-style-head                    # ~20 s; the build gates the head
 make docker-up-decisions                        # or: docker compose -f docker/docker-compose.style-head.yml
 make style-head-calibrate                       # writes models/style-head-calibration.json
-# enable only with the floor the report recommends:
-DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=0.6 \
+# the seam ships on; set the floor the report recommends:
+DECISIONS_STYLE_CONFIDENCE_FLOOR=0.6 \
   make docker-up-decisions
 ```
 
@@ -323,7 +325,7 @@ stack: a hard dependency would fail every Tacit-only deployment whose operator n
 image, and the seam already degrades to the LLM style.
 
 There is no other Ch2 provider to revert to: `decisions.style.provider` is pinned to `linear`
-and `config/config.json` defaults the seam to the style head (off). To stand the seam down,
+and `config/config.json` defaults the seam to the style head (on). To stand the seam down,
 set `DECISIONS_STYLE_ENABLED=false` — the LLM-sampled style stands, as in the A/B's baseline
 arm.
 
