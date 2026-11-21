@@ -596,6 +596,8 @@ variance) for closed-set questions. The Ch2 style seam is on by default (CPU hea
 needed); the Tacit seams stay default-off — the base compose stack never starts the Tacit
 sidecar, and `config/config.json` defaults them to `false`.
 
+> **Execution time:** both lanes are faster than the LLM path they replace. The linear head answers in ~8 ms (≈8.4 ms over 4140 calibration requests) and cut holdout p95 e2e by 34.0% (run 2) / 37.5% (run 1) in `make benchmark-style-ab` (`docs/linear-style-head.md` §6). Tacit answers one forward per decision (`TACIT_ADAPTIVE=false`, no thinking/sampling) instead of a generator round-trip, so the weights/category/gate legs skip LLM latency entirely; J1 rerank still needs its non-inferiority A/B (`make benchmark-rerank-ab`, holdout p95 within +15% of TEI) before claiming a win there.
+
 | Seam | Model / wire | Substitutes | Degrades to |
 |---|---|---|---|
 | Ch2 style | linear head `POST /v1/systemone`, ONE 36-criterion `choice` (35 styles + `none`) | the LLM-sampled `brief.architecture_style`, when the answer clears `DECISIONS_STYLE_CONFIDENCE_FLOOR` | the LLM style |
