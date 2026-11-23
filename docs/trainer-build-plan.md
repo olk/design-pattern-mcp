@@ -4,7 +4,7 @@ Build-time training, serve-only image. All training runs inside the LXC containe
 
 ## Prerequisites
 
-1. Proxmox host: Proxmox VE 8.x, kernel with cgroupv2, 4x RTX 3090 visible. Ampere CC 8.6 satisfies the compute gate in the `docker/Dockerfile.tacit` header (`>= 7.5 + bfloat16` for QLoRA).
+1. Proxmox host: Proxmox VE 8.x, kernel with cgroupv2, 4x RTX 3090 visible. Ampere CC 8.6 satisfies the compute gate in the `docker/Dockerfile.tacit-gpu` header (`>= 7.5 + bfloat16` for QLoRA).
 
 ```bash
 nvidia-smi -L
@@ -13,7 +13,7 @@ ls -l /dev/nvidia* /dev/nvidia-caps/*   # derive cgroup majors; do not assume
 pveversion   # record; plan assumes PVE 8.x
 ```
 
-2. Host NVIDIA driver MUST be >= 575.x. The pinned base `vllm/vllm-openai:v0.17.1` (`docker/Dockerfile.tacit`) carries CUDA 12.9.1, whose Linux driver floor is 575.57.08 — a 550 host fails at the first `vllm serve` with "CUDA driver version is insufficient".
+2. Host NVIDIA driver MUST be >= 575.x. The pinned base `vllm/vllm-openai:v0.17.1` (`docker/Dockerfile.tacit-gpu`) carries CUDA 12.9.1, whose Linux driver floor is 575.57.08 — a 550 host fails at the first `vllm serve` with "CUDA driver version is insufficient".
 
 ```bash
 cat /proc/driver/nvidia/version   # e.g. NVRM 580.178.04; record exact version
@@ -31,16 +31,16 @@ nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1
 
 Each bullet traces base image → COPY/RUN → cached artifact → what the final image carries. Nothing below runs at `docker run`.
 
-1. Tacit `docker/Dockerfile.tacit` `:weights` (`FROM python:3.11-slim`): `snapshot_download(morriszjm/Tacit-4B)` → cached artifact `/models/tacit-4b`.
-2. Tacit `docker/Dockerfile.tacit` `:self-distill` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`): `pip install anyjev[client]==0.3.0 peft bitsandbytes datasets`, `COPY --from=weights`, `COPY tacit_self_distill.py`, `COPY src/decisions/seam_prompts.py`, `COPY qa/qa.jsonl`, `COPY qa/typed/rerank_pairs.jsonl` to `/build/qa/rerank_pairs.jsonl`, then the single GPU `RUN --device=nvidia.com/gpu=all python3 /build/tacit_self_distill.py --init-dir /models/tacit-4b --out /out/tacit-4b ...` with knobs `TACIT_PROBLEMS=6000 / TACIT_STATES=0 / TACIT_RERANK_PROBLEMS=0 / TACIT_TEACHER_SHARDS=0 / TACIT_MIN_SEAM_AGREEMENT=0.6 / TACIT_CONFIDENCE_FLOOR=0.5 / TACIT_GATE_CONFIDENCE_FLOOR= / TACIT_MIN_KIND_ROWS=1 / TACIT_EPOCHS=1 / TACIT_LR=1e-4 / TACIT_BATCH=4 / TACIT_ACCUM=8 / TACIT_COT_MAX_TOKENS=2048 / TACIT_MAX_NEW_TOKENS=256` and flags `--rerank-pairs /build/qa/rerank_pairs.jsonl --rerank-problems ... --teacher-shards ... --min-seam-agreement ...`. The script runs teacher state-writing + a CoT `generate` answer pass sharded across the visible GPUs (`--teacher-shards 0` = one shard per visible CUDA device), trains four seams from the one checkpoint — category, weights, gate, and rerank over all ~1400 train pairs (the Ch2 style seam moved to the linear head 2026-11-14) — builds gate states from the dataset's own descriptions in the exact `tacit.gate_state` shape, keeps `score` rows unfiltered and `choice` rows only above `TACIT_CONFIDENCE_FLOOR` (dropping any teacher result that omits an option key), and fails the build when a serving kind keeps no rows, when a per-seam student-vs-teacher agreement gate drops below 0.6, or when the weights expected-level MAE exceeds 0.2; then QLoRA-trains a 4-bit nf4/bf16 student, `merge_and_unload()` + `save_pretrained(..., safe_serialization=True)` plus tokenizer files and `self-distill.json` to `/out/tacit-4b`. Default cost: ~8k teacher questions (no style problems since 2026-11-14), roughly 20-30 h on one 3090 / ~5-8 h with default auto-sharding on a 4-GPU host.
-3. Tacit `docker/Dockerfile.tacit` `:runtime-base`: fresh `vllm-openai` shell, `pip install anyjev[client]==0.3.0`, `COPY docker/tacit-entrypoint.sh`, `ENV HF_HUB_OFFLINE=1`, `TACIT_ADAPTIVE=false`, `EXPOSE 8100`, `HEALTHCHECK` on `127.0.0.1:8100/v1/stats`, `ENTRYPOINT tacit-entrypoint.sh`. Never carries `/build`.
-4. Tacit `docker/Dockerfile.tacit` `:runtime-distilled` (DEFAULT as last stage): `COPY --from=self-distill /out/tacit-4b /models/tacit` — the only trained artifact in the shipped image. (`:runtime-released` COPYs untrained weights instead; fallback only.)
+1. Tacit `docker/Dockerfile.tacit-gpu` `:weights` (`FROM python:3.11-slim`): `snapshot_download(morriszjm/Tacit-4B)` → cached artifact `/models/tacit-4b`.
+2. Tacit `docker/Dockerfile.tacit-gpu` `:self-distill` (`FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`): `pip install anyjev[client]==0.3.0 peft bitsandbytes datasets`, `COPY --from=weights`, `COPY tacit_self_distill.py`, `COPY src/decisions/seam_prompts.py`, `COPY qa/qa.jsonl`, `COPY qa/typed/rerank_pairs.jsonl` to `/build/qa/rerank_pairs.jsonl`, then the single GPU `RUN --device=nvidia.com/gpu=all python3 /build/tacit_self_distill.py --init-dir /models/tacit-4b --out /out/tacit-4b ...` with knobs `TACIT_PROBLEMS=6000 / TACIT_STATES=0 / TACIT_RERANK_PROBLEMS=0 / TACIT_TEACHER_SHARDS=0 / TACIT_MIN_SEAM_AGREEMENT=0.6 / TACIT_CONFIDENCE_FLOOR=0.5 / TACIT_GATE_CONFIDENCE_FLOOR= / TACIT_MIN_KIND_ROWS=1 / TACIT_EPOCHS=1 / TACIT_LR=1e-4 / TACIT_BATCH=4 / TACIT_ACCUM=8 / TACIT_COT_MAX_TOKENS=2048 / TACIT_MAX_NEW_TOKENS=256` and flags `--rerank-pairs /build/qa/rerank_pairs.jsonl --rerank-problems ... --teacher-shards ... --min-seam-agreement ...`. The script runs teacher state-writing + a CoT `generate` answer pass sharded across the visible GPUs (`--teacher-shards 0` = one shard per visible CUDA device), trains four seams from the one checkpoint — category, weights, gate, and rerank over all ~1400 train pairs (the Ch2 style seam moved to the linear head 2026-11-14) — builds gate states from the dataset's own descriptions in the exact `tacit.gate_state` shape, keeps `score` rows unfiltered and `choice` rows only above `TACIT_CONFIDENCE_FLOOR` (dropping any teacher result that omits an option key), and fails the build when a serving kind keeps no rows, when a per-seam student-vs-teacher agreement gate drops below 0.6, or when the weights expected-level MAE exceeds 0.2; then QLoRA-trains a 4-bit nf4/bf16 student, `merge_and_unload()` + `save_pretrained(..., safe_serialization=True)` plus tokenizer files and `self-distill.json` to `/out/tacit-4b`. Default cost: ~8k teacher questions (no style problems since 2026-11-14), roughly 20-30 h on one 3090 / ~5-8 h with default auto-sharding on a 4-GPU host.
+3. Tacit `docker/Dockerfile.tacit-gpu` `:runtime-base`: fresh `vllm-openai` shell, `pip install anyjev[client]==0.3.0`, `COPY docker/tacit-entrypoint.sh`, `ENV HF_HUB_OFFLINE=1`, `TACIT_ADAPTIVE=false`, `EXPOSE 8100`, `HEALTHCHECK` on `127.0.0.1:8100/v1/stats`, `ENTRYPOINT tacit-entrypoint.sh`. Never carries `/build`.
+4. Tacit `docker/Dockerfile.tacit-gpu` `:runtime-distilled` (DEFAULT as last stage): `COPY --from=self-distill /out/tacit-4b /models/tacit` — the only trained artifact in the shipped image. (`:runtime-released` COPYs untrained weights instead; fallback only.)
 5. Tacit serve path (`ENTRYPOINT` + `docker/tacit-entrypoint.sh`): asserts `/models/tacit/config.json`, backgrounds `vllm serve ${MODEL_DIR} --served-model-name tacit-4b --host 127.0.0.1 --port 8000 --max-model-len 8192`, polls `/health` (900 s timeout), then `exec python3 -m anyjev.serve --model ... --upstream http://127.0.0.1:8000/v1 --host ${TACIT_BIND_HOST:-0.0.0.0} --port 8100` (the compose publish is what confines the gateway to loopback, so a `--network host` run must pass `TACIT_BIND_HOST=127.0.0.1`, since anyjev.serve has no auth). Final image runs only `vllm serve` + `anyjev.serve` (`POST /v1/decide`, `GET /v1/stats`).
 6. Build mechanics the Dockerfile relies on: `# syntax=docker/dockerfile:1.14-labs` (L1) is mandatory — `RUN --device` does not parse on 1.7-1.13; `RUN --gpus` does not exist. The GPU is granted by `--device=nvidia.com/gpu=all` on exactly one RUN plus the `docker build --allow device=nvidia.com/gpu=all` entitlement. Daemon side: Docker ≥ 25, `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, `docker info` shows `cdi: nvidia.com/gpu=all`.
 
 ## Build Procedure in LXC
 
-The single GPU RUN requests `nvidia.com/gpu=all` and the teacher pass shards across the visible GPUs, so no other GPU work may run during the build. Explicitly NOT used: the `docker run --gpus all tacit-trainer ...` out-of-band recipe in the `docker/Dockerfile.tacit` header — no training at `docker run`, no training outside the LXC build.
+The single GPU RUN requests `nvidia.com/gpu=all` and the teacher pass shards across the visible GPUs, so no other GPU work may run during the build. Explicitly NOT used: the `docker run --gpus all tacit-trainer ...` out-of-band recipe in the `docker/Dockerfile.tacit-gpu` header — no training at `docker run`, no training outside the LXC build.
 
 1. Proxmox host: confirm drivers + 4x GPU visibility (Prerequisite 1-2 commands). Record the exact driver version.
 
@@ -144,7 +144,7 @@ set -euxo pipefail
 git clone <repo-url> /root/design-pattern-mcp
 cd /root/design-pattern-mcp
 git rev-parse HEAD
-ls docker/Dockerfile.tacit docker/tacit-entrypoint.sh scripts/decision_models/tacit_self_distill.py src/decisions/seam_prompts.py qa/qa.jsonl qa/typed/rerank_pairs.jsonl
+ls docker/Dockerfile.tacit-gpu docker/tacit-entrypoint.sh scripts/decision_models/tacit_self_distill.py src/decisions/seam_prompts.py qa/qa.jsonl qa/typed/rerank_pairs.jsonl
 '
 ```
 
@@ -153,7 +153,7 @@ ls docker/Dockerfile.tacit docker/tacit-entrypoint.sh scripts/decision_models/ta
 ```bash
 pct exec 220 -- bash -lc '
 set -euxo pipefail; cd /root/design-pattern-mcp
-docker build --check --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit .
+docker build --check --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit-gpu .
 '
 ```
 
@@ -169,7 +169,7 @@ BUILDKIT_PROGRESS=plain make docker-build-tacit 2>&1 | tee build-tacit.log
 ```bash
 # Raw form when a proxy is needed (the Makefile forwards the HF secret but no proxy args):
 # BUILDKIT_PROGRESS=plain docker build --allow device=nvidia.com/gpu=all \
-#   -f docker/Dockerfile.tacit --target runtime-distilled \
+#   -f docker/Dockerfile.tacit-gpu --target runtime-distilled \
 #   --secret id=hf_token,src=/root/.cache/hf_token \
 #   --build-arg VLLM_IMAGE_TAG=v0.17.1 --build-arg TACIT_MODEL_REPO=morriszjm/Tacit-4B \
 #   -t design-pattern-tacit:latest .
@@ -246,7 +246,7 @@ docker info | grep -i -E "cdi|runtime"   # cdi serves RUN --device; nvidia runti
 runs re-bake that host dir with no GPU. The `.extract-complete` marker records the image
 tag + date and the sha256 of every train input (`scripts/decision_models/tacit_self_distill.py`,
 `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl`,
-`docker/Dockerfile.tacit`). A cached rebuild verifies the marker with `sha256sum -c` and refuses a
+`docker/Dockerfile.tacit-gpu`). A cached rebuild verifies the marker with `sha256sum -c` and refuses a
 stale host dir: if you change the corpus or the trainer, `rm -rf models/tacit-4b` and
 rebuild to retrain. (The Ch2 style seam is no longer a Tacit seam: calibrate with
 `make style-head-calibrate`, `docs/linear-style-head.md` §7.)
@@ -281,7 +281,7 @@ is `make benchmark-style-ab` against the linear head (floor from
 - R5 — Makefile forwards the HF secret but no proxy args. `make docker-build-tacit` passes `--secret id=hf_token,src=$(HF_TOKEN_FILE)` whenever `~/.cache/hf_token` is non-empty (and fails loudly for an explicitly-set missing path), but it forwards no `http_proxy/*` build args. Public repos + direct egress: fine. Gated repos: drop the token file in place. Proxied trainer: use the raw `docker build` form in Build Step 8. Owner: repo maintainer (Makefile) / operator (workaround).
 - R6 — Base-image tags only half-pinned. `VLLM_IMAGE_TAG=v0.17.1` is pinned; `python:3.11-slim` floats on patch, `peft/bitsandbytes/datasets` are not pinned. Rebuilds months apart may drift. Owner: repo maintainer.
 - R7 — Upstream fragility: `morriszjm/Tacit-4B`. No fallback if the repo is renamed or gated. Mitigation: the `:runtime-released` target builds with no GPU as a smoke/standby image. Owner: ML engineer.
-- R8 — Dockerfile-vs-Context conflict (resolved by Constraints). The `docker/Dockerfile.tacit` header documents training via `docker run --gpus all tacit-trainer ...` outside the build; this plan forbids it — all training is the in-`docker-build` `RUN --device` stages. Owner: acknowledged; no action.
+- R8 — Dockerfile-vs-Context conflict (resolved by Constraints). The `docker/Dockerfile.tacit-gpu` header documents training via `docker run --gpus all tacit-trainer ...` outside the build; this plan forbids it — all training is the in-`docker-build` `RUN --device` stages. Owner: acknowledged; no action.
 - R9 — Build-cache invalidation cost + log-grep gate. `COPY qa/...` + trainer scripts sit below the heavy `pip install` layers; any edit re-runs the full multi-hour GPU RUN (no checkpoint resume in the trainer). Keep datasets frozen during a build; use the small-knob smoke shape for iteration. A `CACHED` rebuild must never masquerade as a fresh train — the Verification Step 1 log-grep gate (`teacher kept` / `wrote distilled checkpoint`) plus the `:base` weight diff enforces this. Logs are captured with `BUILDKIT_PROGRESS=plain` so trainer stdout lands in the file. Owner: operator.
 - R10 — Missing operator inputs. Clone URL for Build Step 6, Proxmox storage pool name (`local-lvm` assumed), bridge name (`vmbr0` assumed), host driver version. Owner: human reviewer must fill before execution.
 - R11 — Image distribution. Plan yields images inside the trainer LXC's Docker daemon only. Pushing to a registry or `docker save` transfer to serving hosts is out of scope. Owner: infra/repo maintainer.

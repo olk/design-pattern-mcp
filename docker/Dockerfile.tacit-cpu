@@ -1,0 +1,50 @@
+# AnyJev Tacit-4B decision sidecar — CPU runtime (docker/Dockerfile.tacit-gpu is the GPU
+# sibling). Same trained checkpoint, dequantized NF4 -> BF16 in the dequant stage: vLLM
+# CPU supports only AWQ/GPTQ/compressed-tensors INT8, not bitsandbytes. Base is
+# vllm/vllm-openai-cpu (VLLM_TARGET_DEVICE=cpu baked upstream; the CUDA vllm-openai
+# image cannot serve on CPU and --device cpu does not switch it). No GPU anywhere;
+# the builder needs ~16 GB free RAM for the dequant stage.
+ARG VLLM_IMAGE_TAG=v0.17.1
+
+# -- Stage 1: dequantize the trained NF4 checkpoint to plain BF16 ------------------------
+FROM python:3.11-slim AS dequant
+
+# CPU-only torch wheel (~200 MB, not the 2.5 GB CUDA default); transformers<5 for the
+# same reason as the GPU file (anyjev[client]'s unbounded requirement).
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
+    && pip install --no-cache-dir "transformers<5" bitsandbytes accelerate
+
+COPY models/tacit-4b /in/tacit-4b
+COPY scripts/decision_models/tacit_dequantize.py /build/tacit_dequantize.py
+RUN python3 /build/tacit_dequantize.py --in-dir /in/tacit-4b --out-dir /out/tacit-4b \
+    && test "$(stat -c%s /out/tacit-4b/model.safetensors)" -gt 7000000000
+
+# -- Stage 2: CPU runtime ----------------------------------------------------------------
+FROM vllm/vllm-openai-cpu:${VLLM_IMAGE_TAG} AS runtime
+
+RUN pip install --no-cache-dir "anyjev[client]==0.3.0" "transformers<5"
+
+COPY docker/tacit-entrypoint.sh /usr/local/bin/tacit-entrypoint.sh
+RUN chmod +x /usr/local/bin/tacit-entrypoint.sh
+
+ENV HF_HUB_OFFLINE=1 \
+    TACIT_MODEL_DIR=/models/tacit \
+    TACIT_SERVED_MODEL=tacit-4b \
+    TACIT_UPSTREAM_PORT=8000 \
+    TACIT_PORT=8100 \
+    TACIT_ADAPTIVE=false \
+    TACIT_DTYPE=bfloat16 \
+    VLLM_CPU_KVCACHE_SPACE=8
+
+EXPOSE 8100
+
+# CPU model load is slower than the GPU 300 s default; vLLM CPU docs: --shm-size=4g,
+# SYS_NICE + seccomp=unconfined for NUMA placement (compose/run flags, not the image).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=900s --retries=5 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/v1/stats', timeout=5)"
+
+ENTRYPOINT ["/usr/local/bin/tacit-entrypoint.sh"]
+
+COPY --from=dequant /out/tacit-4b /models/tacit
+RUN test -s /models/tacit/config.json && test -s /models/tacit/self-distill.json \
+    && python3 -c "import json,sys; sys.exit(1 if json.load(open('/models/tacit/config.json')).get('quantization_config') else 0)"

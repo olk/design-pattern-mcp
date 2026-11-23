@@ -5,7 +5,7 @@ How to self-distil the AnyJev Tacit-4B decision model, bake the result into
 
 The entry point is one make rule — `make docker-build-tacit`. Training runs inside the
 image build (BuildKit `RUN --device`), not on the host; the shipped image only serves.
-`Makefile:390` drives `docker/Dockerfile.tacit`, whose `self-distill` stage runs
+`Makefile:390` drives `docker/Dockerfile.tacit-gpu`, whose `self-distill` stage runs
 `scripts/decision_models/tacit_self_distill.py`.
 
 Related documents: `docs/trainer-build-plan.md` (Proxmox LXC runbook, host prep),
@@ -130,7 +130,7 @@ flowchart TD
     B -- "yes" --> C["Wire-contract smoke (§4.7)"]
     C --> I["A/B the rerank leg<br/>(non-inferior vs TEI)"]
     I --> J["Publish (§7)"]
-    J --> K["Deploy on a GPU host (§4.8)"]
+    J --> K["Deploy (§4.8 GPU / §4.9 CPU)"]
 ```
 
 **Before anything else:** the artifact currently sitting in `models/tacit-4b/` fails step 1
@@ -199,15 +199,16 @@ that refusal is the guard working. Never route around it with
 runtime (the overlay reserves one device) and host port 18100 free (§4.8):
 
 ```bash
-TACIT_IMAGE=olkowa/design-pattern-tacit DOCKER_TAG=1.0.2 make docker-up-decisions
+TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.2 make docker-up-decisions
 make decisions-smoke
 ```
 
-Not `TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.2 make docker-up-decisions` — the target
-appends `:$(DOCKER_TAG)` itself (`Makefile:448`), producing `…:1.0.2:1.0.2`, which Docker
-rejects (`invalid reference format`). The alternative is the overlay directly with
+The override is a full image reference and passes through verbatim (`TACIT_IMAGE ?=` in
+the Makefile; unset, it defaults to the locally built `design-pattern-tacit:$(DOCKER_TAG)`).
+Nothing appends `:$(DOCKER_TAG)` — an untagged `TACIT_IMAGE=olkowa/design-pattern-tacit`
+would resolve `:latest`. The same reference works against the overlay directly:
 `TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.2 docker compose -f docker/docker-compose.yml
--f docker/docker-compose.decision-models.yml up -d` (§4.8, form b).
+-f docker/docker-compose.decision-models.yml up -d` (§4.8).
 
 **The traps at a glance:**
 
@@ -236,7 +237,7 @@ Only the full build certifies every seam.
 
 The cache marker (`.extract-complete`) hashes **the train inputs only** — trainer script,
 `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl`,
-`docker/Dockerfile.tacit` (`Makefile:121-123`). It does **not** hash the knob values.
+`docker/Dockerfile.tacit-gpu` (`Makefile:121-123`). It does **not** hash the knob values.
 A smoke build therefore leaves a marker that validates, and the next run takes the
 `runtime-distilled-cached` path and silently ships the 200-problem weights.
 
@@ -293,7 +294,7 @@ The four commands answer four different questions, and none of them is "is the m
 
 `sha256sum -c` printing five `OK` lines is the provenance gate: the marker hashes the trainer
 script, `src/decisions/seam_prompts.py`, `qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl` and
-`docker/Dockerfile.tacit` (`Makefile:121-123`). It does **not** hash the knob values, so it
+`docker/Dockerfile.tacit-gpu` (`Makefile:121-123`). It does **not** hash the knob values, so it
 cannot distinguish a full build from a smoke build, and it does not hash the weights — the
 manifest is the only record of the shape that produced them.
 
@@ -473,17 +474,18 @@ from. External quality stays with the serving-side benchmark. Serving is §4.8.
 
 ### 4.5 CPU production support
 
-**CPU-only production serving is not supported.** The sidecar runs this checkpoint in CUDA
-vLLM; the repository ships no CPU serving path, no CPU image and no CPU validation for the
-artifact. A GPU-free host can *build* and *inspect* the image (§4.6), not serve it.
+**CPU production serving runs through the CPU sidecar** (§4.9): the same trained
+checkpoint, dequantized NF4 → BF16 in the image build and served on `vllm-openai-cpu`.
+The GPU path below still serves the NF4 checkpoint directly on CUDA vLLM. Why the two
+paths differ:
 
 1. **The runtime is CUDA vLLM.** `runtime-base` is `FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`
-   (`docker/Dockerfile.tacit:168`, default `v0.17.1`), the entrypoint starts
+   (`docker/Dockerfile.tacit-gpu:168`, default `v0.17.1`), the entrypoint starts
    `vllm serve "${MODEL_DIR}"` (`docker/tacit-entrypoint.sh:34`), and the compose overlay
    reserves an NVIDIA device by CDI name — `nvidia.com/gpu=0`
    (`docker/docker-compose.decision-models.yml:41-42`). The overlay calls the sidecar GPU-only
-   (`docker/docker-compose.decision-models.yml:7`), and the Dockerfile scopes the GPU-free
-   variant to "build and inspect the image" (`docker/Dockerfile.tacit:23`).
+   (`docker/docker-compose.decision-models.yml:9-10`), and the Dockerfile scopes the GPU-free
+   variant to "build and inspect the image" (`docker/Dockerfile.tacit-gpu:23`).
 2. **The artifact is a bitsandbytes 4-bit checkpoint.** `models/tacit-4b/config.json` declares
    `"quant_method": "bitsandbytes"`, `"load_in_4bit": true`, `"bnb_4bit_quant_type": "nf4"`,
    `"bnb_4bit_quant_storage": "uint8"` and `"bnb_4bit_use_double_quant": true`; the safetensors
@@ -535,15 +537,17 @@ unreachable sidecar degrades to the non-model path (LLM style and weights, TEI r
 unfiltered retrieval, reasoning runs) and never fails a tool call
 (`docker/docker-compose.decision-models.yml:13-14`).
 
-If CPU serving becomes a hard requirement, it needs an out-of-tree re-export of the checkpoint
-to a format the chosen CPU engine supports, plus a fresh validation of all four Tacit seams. This
-repository produces and validates neither, so that route is unsupported and unmeasured here.
+CPU serving (§4.9) is the in-tree answer to that requirement: the re-export is
+`scripts/decision_models/tacit_dequantize.py` in the `dequant` stage of
+`docker/Dockerfile.tacit-cpu`, and the same `make decisions-smoke` wire contract
+validates it. A *different* CPU engine would still need its own re-export and seam
+validation — that route remains unsupported and unmeasured here.
 
 ### 4.6 Rebuild without a GPU (optional)
 
 The extracted checkpoint is the portable artifact, but its marker is validated against
 **that host's** `TACIT_TRAIN_INPUTS` — the trainer script, `src/decisions/seam_prompts.py`,
-`qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl` and `docker/Dockerfile.tacit` must be
+`qa/qa.jsonl`, `qa/typed/rerank_pairs.jsonl` and `docker/Dockerfile.tacit-gpu` must be
 byte-identical there. Start from an empty directory so stale shards cannot survive the copy:
 
 ```bash
@@ -554,7 +558,7 @@ ssh <build-host> 'bash -lc "cd ~/design-pattern-mcp && make docker-build-tacit"'
 
 When the inputs differ the rule refuses with `is stale` (it does not silently retrain). Then
 either restore the exact bytes, or build the cached stage directly and own the provenance
-claim — `docker build --target runtime-distilled-cached -f docker/Dockerfile.tacit .` — which
+claim — `docker build --target runtime-distilled-cached -f docker/Dockerfile.tacit-gpu .` — which
 needs no GPU and skips the marker check. `.dockerignore` keeps `models/tacit-4b/` in the
 build context; the `runtime-distilled-cached` stage `COPY`s it and fails fast when
 `config.json` or `self-distill.json` is empty. The weight shards are deliberately untracked
@@ -770,11 +774,10 @@ Enabling needs a seam-appropriate non-inferiority rule (candidate hit rate >= ba
 lower bound, holdout p95 within +15 %, repeat agreement non-inferior) approved and
 implemented first.
 
-
-### 4.8 Production: serving the verified artifact (GPU only)
+### 4.8 Production: serving the verified artifact (GPU)
 
 §4.1–§4.7 produce, verify and smoke the artifact; this section is what a serving host runs.
-The sidecar image is the only supported serving path, and that path is GPU-only (§4.5).
+The sidecar image is the only supported serving path — this section covers the GPU image; §4.9 covers the CPU image for GPU-less hosts.
 
 #### Prerequisites
 
@@ -801,7 +804,7 @@ health-checks `GET /v1/stats` with a 300 s start period, and reserves one NVIDIA
 
 | Variable | Overlay default | Effect |
 |---|---|---|
-| `TACIT_IMAGE` | `design-pattern-tacit:latest` | image reference; `make docker-up-decisions` appends `:$(DOCKER_TAG)` |
+| `TACIT_IMAGE` | `design-pattern-tacit:latest` | full image reference; `make docker-up-decisions` defaults it to `design-pattern-tacit:$(DOCKER_TAG)`, an explicit value passes through verbatim |
 | `TACIT_ADAPTIVE` | `false` | one forward per decision, no thinking, no sampling; `true` lets the gateway escalate low-margin decisions to reasoning |
 | `RERANKER_PROVIDER` | `tacit` | J1 rerank leg; TEI stays the in-client fallback |
 | `DECISIONS_WEIGHTS_ENABLED` | `true` | J4 quality-axis weights |
@@ -819,21 +822,19 @@ curl -s http://127.0.0.1:18100/v1/stats
 make docker-down-decisions
 ```
 
-To serve a **published** tag, pin it in one of two ways (both checked with `make -n` and
+To serve a **published** tag, pass the full reference (checked with `make -n` and
 `docker compose config`):
 
 ```bash
-# (a) the make rule appends :$(DOCKER_TAG) — supply the tag as DOCKER_TAG
-TACIT_IMAGE=olkowa/design-pattern-tacit DOCKER_TAG=1.0.1 make docker-up-decisions
+TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 make docker-up-decisions
 
-# (b) drive the overlay directly — no suffix is appended
+# or drive the overlay directly with the same reference
 TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 \
   docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml up -d
 ```
 
-Passing `TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1` to `make docker-up-decisions` yields
-`olkowa/design-pattern-tacit:1.0.1:1.0.1`: the rule appends `:$(DOCKER_TAG)` (`Makefile:448`),
-and Docker rejects that reference. Use (a) or (b).
+The value passes through verbatim — nothing appends `:$(DOCKER_TAG)`, so an untagged
+`TACIT_IMAGE=olkowa/design-pattern-tacit` would resolve `:latest`.
 
 #### Confirm the served weights are the verified ones
 
@@ -848,18 +849,17 @@ one verified in §4.4 — re-tag or re-publish before serving.
 
 #### Limits
 
-- **CPU-only production serving is not supported.** The full evidence chain is §4.5. In
-  short: the runtime base is `FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}`
-  (`docker/Dockerfile.tacit:168`), all three runtime stages derive from it, and the
-  entrypoint runs `vllm serve`; the checkpoint is a
-  bitsandbytes NF4 4-bit checkpoint (`quantization_config.quant_method: "bitsandbytes"`,
-  `load_in_4bit: true`, `bnb_4bit_quant_type: "nf4"`, `bnb_4bit_quant_storage: "uint8"`,
-  `bnb_4bit_use_double_quant: true`); and vLLM's quantization matrix marks bitsandbytes
+- **CPU serving needs the CPU image, not the GPU one.** The GPU runtime base is
+  `FROM vllm/vllm-openai:${VLLM_IMAGE_TAG}` (`docker/Dockerfile.tacit-gpu:168`), all
+  three runtime stages derive from it, and the checkpoint is a bitsandbytes NF4 4-bit
+  checkpoint (`quantization_config.quant_method: "bitsandbytes"`, `load_in_4bit: true`,
+  `bnb_4bit_quant_type: "nf4"`, `bnb_4bit_quant_storage: "uint8"`,
+  `bnb_4bit_use_double_quant: true`); vLLM's quantization matrix marks bitsandbytes
   unsupported on x86 CPU and Arm CPU while its CPU page documents FP32/FP16/BF16 plus
   AWQ/GPTQ/compressed-tensor INT8 W8A8 only —
   <https://docs.vllm.ai/en/latest/features/quantization/> and
-  <https://docs.vllm.ai/en/latest/getting_started/installation/cpu/>. A GPU-free host can
-  build and inspect the image (§4.6), not serve it.
+  <https://docs.vllm.ai/en/latest/getting_started/installation/cpu/>. The full evidence
+  chain is §4.5; the serving path is §4.9.
 - **Publishing is gated separately from serving.** `make docker-publish-tacit` refuses a
   manifest whose `eval` block has a seam below `min_eval_rows`; an artifact can be served
   locally while uncertified (this repository's `models/tacit-4b` is, on `category` — §4.4) but
@@ -874,6 +874,27 @@ one verified in §4.4 — re-tag or re-publish before serving.
   default (one forward per decision); `true` escalates low-margin decisions to the model's own
   reasoning, which is exploration, not a selection-affecting default
   (`docker/tacit-entrypoint.sh:12-15`).
+
+### 4.9 Production: serving on a GPU-less host (CPU image)
+
+`make docker-build-tacit-cpu` bakes the same trained checkpoint as the GPU image, but
+dequantized NF4 → BF16 in the build (`scripts/decision_models/tacit_dequantize.py` in the
+`dequant` stage of `docker/Dockerfile.tacit-cpu` — vLLM CPU cannot load the bitsandbytes
+checkpoint as §4.5 shows) and served on `vllm-openai-cpu:v0.17.1`. No GPU anywhere; the
+builder needs ~16 GB free RAM for the dequant stage. Start it with the CPU overlay:
+
+```bash
+make docker-up-decisions-cpu     # stack + CPU sidecar, no GPU (same 18100 port)
+make decisions-smoke             # same wire contract as the GPU leg
+make docker-down-decisions
+```
+
+The build refuses the same way the GPU cached path does when `models/tacit-4b/` is not a
+proven extract or is stale — the marker rule is unchanged: any edit to a
+`TACIT_TRAIN_INPUTS` file without a retrain refuses the build. The one exception is the
+`Dockerfile.tacit` → `Dockerfile.tacit-gpu` rename itself, whose marker refresh
+(regenerated 2026-11-21: path/comments only, no trainer-semantics change) is a one-time
+provenance reset committed with the rename.
 
 ## 5. Cache and retrain semantics
 
@@ -891,7 +912,7 @@ one verified in §4.4 — re-tag or re-publish before serving.
 Build the trainer stage, run it against a GPU, then bake the output:
 
 ```bash
-docker build --target self-distill -t tacit-trainer -f docker/Dockerfile.tacit .
+docker build --target self-distill -t tacit-trainer -f docker/Dockerfile.tacit-gpu .
 docker run --gpus all -v "$PWD/out:/out" tacit-trainer python3 /build/tacit_self_distill.py \
   --init-dir /models/tacit-4b --out /out/tacit-4b \
   --seam-prompts /build/seam_prompts.py --seed-texts /build/qa/qa.jsonl \
@@ -908,7 +929,7 @@ CPU-only host), so write the marker in the same shape:
 mkdir -p models/tacit-4b && cp -a out/tacit-4b/. models/tacit-4b/
 { echo "# out-of-band $(date -u +%FT%TZ)"; \
   sha256sum scripts/decision_models/tacit_self_distill.py src/decisions/seam_prompts.py \
-            qa/qa.jsonl qa/typed/rerank_pairs.jsonl docker/Dockerfile.tacit; } \
+            qa/qa.jsonl qa/typed/rerank_pairs.jsonl docker/Dockerfile.tacit-gpu; } \
   > models/tacit-4b/.extract-complete
 make docker-build-tacit
 ```
@@ -916,7 +937,7 @@ make docker-build-tacit
 The guard verifies the marker against **that host's** `TACIT_TRAIN_INPUTS`, so the copied
 weights are only reusable where the trainer script, prompt vocabulary, `qa/qa.jsonl`, the
 rerank pairs and the Dockerfile are byte-identical. Where they cannot be, bypass the guard
-with `docker build --target runtime-distilled-cached -f docker/Dockerfile.tacit .` — that
+with `docker build --target runtime-distilled-cached -f docker/Dockerfile.tacit-gpu .` — that
 builds the baked checkpoint with no GPU and no provenance check, so the assertion is yours.
 `--skip` copies the released checkpoint without training — for out-of-band inspection only,
 never for a ship.
@@ -949,7 +970,7 @@ TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 make docker-up-decisions
 | `ERROR: models/tacit-4b/ is stale` | A train input changed since extraction | Restore the exact input bytes, retrain on a GPU host, or build `--target runtime-distilled-cached` directly (no provenance check) |
 | `sha256sum: ... no properly formatted checksum lines found` | Legacy marker format | Same as stale: retrain, or bypass with `--target runtime-distilled-cached` |
 | A cached build shipped smoke weights | Knobs are not hashed — only `TACIT_TRAIN_INPUTS` | `rm -rf models/tacit-4b` after every smoke build (§4.2) |
-| `torch.cuda.is_available() is false: no GPU visible to the trainer` | CDI device not mounted into the RUN | Confirm `--allow device=nvidia.com/gpu=all` and the `ldconfig` prefix in `docker/Dockerfile.tacit:144` |
+| `torch.cuda.is_available() is false: no GPU visible to the trainer` | CDI device not mounted into the RUN | Confirm `--allow device=nvidia.com/gpu=all` and the `ldconfig` prefix in `docker/Dockerfile.tacit-gpu:144` |
 | `teacher landed on cpu, not CUDA` | accelerate fell back to CPU | Check the CDI mount; the run refuses an hours-long CPU train |
 | `too few usable teacher rows for [...]` | Floors too strict or budget too small | Lower `--answer-mass-floor`/floor, raise `TACIT_PROBLEMS` |
 | `too thin to certify [...]` warning | A seam has fewer than 20 eval rows (smoke-sized build) | Not a failure — certification needs the full build |
@@ -964,8 +985,8 @@ TACIT_IMAGE=olkowa/design-pattern-tacit:1.0.1 make docker-up-decisions
 | `Makefile:390` (`docker-build-tacit`) | The rule: payload check, cache switch, build, extract, marker |
 | `Makefile:69-92` | Knob defaults |
 | `Makefile:121-123` | `TACIT_TRAIN_INPUTS` — the only bytes the marker hashes |
-| `docker/Dockerfile.tacit:94-165` | `self-distill` stage and the GPU `RUN` |
-| `docker/Dockerfile.tacit:196-213` | `runtime-released` / `runtime-distilled-cached` / `runtime-distilled` |
+| `docker/Dockerfile.tacit-gpu:94-165` | `self-distill` stage and the GPU `RUN` |
+| `docker/Dockerfile.tacit-gpu:196-213` | `runtime-released` / `runtime-distilled-cached` / `runtime-distilled` |
 | `scripts/decision_models/tacit_self_distill.py` | The trainer |
 | `src/decisions/seam_prompts.py` | Served prompt vocabulary, shared byte-for-byte |
 | `qa/qa.jsonl` | Topic hints for state writing |

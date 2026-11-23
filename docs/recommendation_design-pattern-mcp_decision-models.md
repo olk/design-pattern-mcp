@@ -6,7 +6,7 @@
 
 **Status:** recommendation complete, and **implemented** (2026-10-27): the four decision seams and the
 rerank provider switch ship in `src/decisions/`, `src/patterns/tacit_rerank.py` and the one
-`docker/Dockerfile.tacit` sidecar, all default-off — see README §"Decision models (AnyJev
+`docker/Dockerfile.tacit-gpu` sidecar, all default-off — see README §"Decision models (AnyJev
 Tacit-4B)" and `docs/implementation-guide.md` §6/§7.1/§14. The one-line answer is in §0; the
 evidence is in §1–§6; the adoption plan is in §7.
 

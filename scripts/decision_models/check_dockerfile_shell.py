@@ -14,7 +14,7 @@ This checker extracts every shell-form ``RUN``/``CMD``/``ENTRYPOINT`` payload an
 per instruction: unbalanced/embedded quotes, a ``#`` outside quotes, and — when a dash
 binary is available — the actual ``dash -n`` verdict. Exit 1 when any rule fails.
 
-    python scripts/decision_models/check_dockerfile_shell.py docker/Dockerfile.tacit
+    python scripts/decision_models/check_dockerfile_shell.py docker/Dockerfile.tacit-gpu
 """
 
 from __future__ import annotations

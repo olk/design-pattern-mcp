@@ -6,7 +6,7 @@ answers them *with* its own thinking, and a student is trained to reproduce the
 reasoning-conditioned label distribution in ONE forward. No human labels, no external
 model, no teacher API — the checkpoint is its own teacher.
 
-This script runs inside ``docker/Dockerfile.tacit`` on a GPU builder, but it is
+This script runs inside ``docker/Dockerfile.tacit-gpu`` on a GPU builder, but it is
 standalone-runnable:
 
     python scripts/decision_models/tacit_self_distill.py \\

@@ -35,6 +35,7 @@ vllm serve "${MODEL_DIR}" \
     --served-model-name "${SERVED_MODEL}" \
     --host 127.0.0.1 \
     --port "${UPSTREAM_PORT}" \
+    --dtype "${TACIT_DTYPE:-auto}" \
     --max-model-len 8192 &
 VLLM_PID=$!
 

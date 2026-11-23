@@ -1,6 +1,6 @@
 """Build-time decision-model scripts: train/serve prompt parity and the seam gates.
 
-These scripts run inside the sidecar image build (``docker/Dockerfile.tacit``), where a
+These scripts run inside the sidecar image build (``docker/Dockerfile.tacit-gpu``), where a
 wiring bug only surfaces after hours of state generation and teacher answering. Everything
 expensive is stubbed here; what is asserted is the *wiring*: the trainer asks exactly the
 questions the server asks (``src/decisions/seam_prompts.py``) at every seam, its ``main()``
@@ -513,8 +513,6 @@ def test_answer_and_examples_split_reproduces_retention(trainer: types.ModuleTyp
     assert abs(max(probe[0].target) - 0.2) < 1e-9
 
 
-
-
 def test_load_rerank_pairs_keeps_train_rows_only(trainer: types.ModuleType, tmp_path: Path) -> None:
     """Holdout pairs are eval material: they must never reach the training weights."""
     path = tmp_path / "rerank_pairs.jsonl"
@@ -663,8 +661,6 @@ def test_teacher_answers_merges_shards_in_order(trainer: types.ModuleType, monke
         trainer.teacher_answers(object(), args, problems)
 
 
-
-
 def _main_fakes(
     trainer: types.ModuleType,
     seen: dict[str, Any],
@@ -788,8 +784,6 @@ def _main_args(init_dir: Path, out_dir: Path, pairs: Path, *extra: str) -> list[
         str(pairs),
         *extra,
     ]
-
-
 
 
 def test_trainer_main_walks_generate_to_save(
@@ -954,8 +948,6 @@ def test_trainer_skip_copies_the_released_checkpoint(trainer: types.ModuleType, 
     assert (out_dir / "config.json").is_file()
 
 
-
-
 @pytest.fixture(scope="module")
 def shell_check() -> types.ModuleType:
     return _load("check_dockerfile_shell", "check_dockerfile_shell.py")
@@ -1001,12 +993,11 @@ def test_shell_check_passes_a_clean_payload(shell_check: types.ModuleType) -> No
 
 def test_shell_check_reads_the_real_dockerfile(shell_check: types.ModuleType) -> None:
     """The fat self-distill RUN (the ``ldconfig && exec`` shape) must carry no hazard."""
-    text = (REPO_ROOT / "docker" / "Dockerfile.tacit").read_text(encoding="utf-8")
+    text = (REPO_ROOT / "docker" / "Dockerfile.tacit-gpu").read_text(encoding="utf-8")
     fat = [p for p in shell_check.payloads(text) if "tacit_self_distill.py" in p.command]
     assert fat, "the self-distill RUN must be discoverable"
     for payload in fat:
         assert shell_check.problems(payload) == []
-
 
 
 # -- style label derivation: the served answer space is the invariant -------------------
@@ -1058,4 +1049,3 @@ def test_style_rows_reject_criteria_drifted_from_the_served_vocabulary(labeler: 
     criteria.pop(dropped)
     with pytest.raises(SystemExit, match="criteria keys drifted"):
         labeler.to_style_row(scenario, criteria, "qa/qa.jsonl", "abc123")
-

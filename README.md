@@ -403,9 +403,11 @@ Run both servers side by side (dev host ports `:8060` architecture, `:8822` desi
 # ([Which stack to run](#which-stack-to-run) for the full matrix):
 make docker-build-all                       # GPU builder
 # make docker-build-base   # no GPU builder
+# make docker-build-tacit-cpu  # no-GPU Tacit sidecar on top of -base (needs the trained models/tacit-4b/ from a GPU builder)
 
 # Run with your API key (GPU host shown; without a GPU start with plain `make docker-up`,
-# whose base file already includes the style head)
+# whose base file already includes the style head — or `make docker-up-decisions-cpu`
+# for the full decision stack on the CPU Tacit sidecar)
 OPENCODE_API_KEY=your_key make docker-up-decisions
 ```
 
@@ -413,7 +415,8 @@ OPENCODE_API_KEY=your_key make docker-up-decisions
 
 | GPU builder + GPU host | `make docker-build-all` | `make docker-up-decisions` | server + TEI pair + Tacit gateway + style head — every seam live |
 | No GPU | `make docker-build-base` | `make docker-up` | server + TEI pair + style head — Ch2 on (config.json default), Tacit seams off |
-| Style off | same as above | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
+| No GPU, Tacit seams on | `make docker-build-base` + `make docker-build-tacit-cpu` | `make docker-up-decisions-cpu` | server + TEI pair + CPU Tacit sidecar + style head — every seam live, no GPU anywhere (needs the trained checkpoint) |
+| Style off | same as No GPU | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
 | Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external; decisions overlay points Tacit seams at the HTTP gateway |
 
 Switching between `docker-up` and `docker-up-decisions` is down + up with the matching
@@ -633,11 +636,13 @@ The Tacit image bakes its weights (no Hub access at start, `HF_HUB_OFFLINE=1`) a
 build*: it self-distils the model on this server's own seam prompts
 (`src/decisions/seam_prompts.py`, shared by trainer and server) over the category, weights,
 gate and rerank seams — with the teacher pass sharded across
-the visible GPUs. An under-trained seam fails the build (per-seam agreement and weights-MAE
+the visible GPUs. The shipped weights are Tacit-4B fine-tuned for design-pattern
+selection — `:base` below is the released, untrained checkpoint. An under-trained
+seam fails the build (per-seam agreement and weights-MAE
 gates). It needs a GPU on the builder, granted through a CDI device entitlement:
 
 ```bash
-docker build --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit --target runtime-distilled .
+docker build --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit-gpu --target runtime-distilled .
 ```
 
 No GPU builder? `make docker-build-tacit-base` builds the `runtime-released` target
@@ -647,6 +652,10 @@ pointing compose at it:
 ```bash
 TACIT_IMAGE=design-pattern-tacit:base make docker-up-decisions
 ```
+
+No GPU at serve time either? `make docker-build-tacit-cpu` bakes the same trained
+checkpoint dequantized to BF16 and served on `vllm-openai-cpu` — full Tacit seams with
+no GPU anywhere (`make docker-up-decisions-cpu`, [docs/tacit-fine-tune.md](docs/tacit-fine-tune.md) §4.9).
 
 The sidecar serves from one 24 GB card (Tacit-4B ≈ 8 GB in vLLM plus the gateway).
 
@@ -938,7 +947,7 @@ Ground rules (from `AGENTS.md`): `src/` is mypy-strict; schema changes change `d
 
 ## Publishing
 
-Four images are published to two registries; the three below share the umbrella target, the Tacit sidecar has its own on-demand one:
+Six images are published to two registries; all ride the umbrella `docker-publish-all` target, and each sidecar lane has its own on-demand target:
 
 | Image | Docker Hub | GHCR | Tags |
 |---|---|---|---|
@@ -946,10 +955,12 @@ Four images are published to two registries; the three below share the umbrella 
 | TEI embedder | `olkowa/pattern-tei-embed` | `ghcr.io/olk/pattern-tei-embed` | `$(DOCKER_TAG)`, `latest` |
 | TEI reranker | `olkowa/pattern-tei-rerank` | `ghcr.io/olk/pattern-tei-rerank` | `$(DOCKER_TAG)`, `latest` |
 | Tacit sidecar | `olkowa/design-pattern-tacit` | `ghcr.io/olk/design-pattern-tacit` | `$(DOCKER_TAG)`, `latest` |
+| Tacit sidecar (CPU) | `olkowa/design-pattern-tacit-cpu` | `ghcr.io/olk/design-pattern-tacit-cpu` | `$(DOCKER_TAG)`, `latest` |
+| Style head | `olkowa/design-pattern-style-head` | `ghcr.io/olk/design-pattern-style-head` | `$(DOCKER_TAG)`, `latest` |
 
-All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged. The Tacit sidecar is **not** part of `docker-publish-all`: it is a ~29 GB GPU image, so it is published on demand with `make docker-publish-tacit` (which builds it first, so the pushed weights are the ones pinned by `models/tacit-4b/.extract-complete`).
+All six images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged. The Tacit sidecars are ~29 GB (GPU) and ~12 GB (CPU), so they are also published on demand with `make docker-publish-tacit` / `make docker-publish-tacit-cpu` (each builds first, so the pushed weights are the ones pinned by `models/tacit-4b/.extract-complete`).
 
-> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred. The Tacit sidecar is ~29 GB uncompressed (vLLM base + baked 4B weights), so its first push is the largest in this repo; re-pushing an unchanged build only transfers new layers.
+> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred. The Tacit sidecars are ~29 GB (GPU) / ~12 GB (CPU) (vLLM base + baked 4B weights), so the GPU sidecar's first push is the largest in this repo; re-pushing an unchanged build only transfers new layers.
 
 ### Prerequisites
 
@@ -963,9 +974,9 @@ All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml
 # 1. Login to GHCR (interactive — paste token at the password prompt)
 docker login ghcr.io -u olk
 
-# 2. Build and push every image (MCP + TEI embedder + TEI reranker + Tacit + style head)
+# 2. Build and push every image (MCP + TEI embedder + TEI reranker + Tacit GPU+CPU + style head)
 #    The umbrella target builds the MCP image, tags it, pushes it, creates the git tag,
-#    then builds and pushes TEI, Tacit and the style head in sequence.
+#    then builds and pushes TEI, both Tacit sidecars and the style head in sequence.
 make docker-publish-all
 
 # 3. Logout from GHCR immediately after publishing
@@ -973,7 +984,7 @@ make docker-publish-all
 docker logout ghcr.io
 ```
 
-On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-tacit` and `make docker-publish-style-head` push the decision sidecars individually (same two registries), and all four ride `docker-publish-all`.
+On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-tacit`, `make docker-publish-tacit-cpu` and `make docker-publish-style-head` push the decision sidecars individually (same two registries), and all six ride `docker-publish-all`.
 
 ### First push — set packages public (GHCR only)
 
@@ -1004,6 +1015,7 @@ The server can run as a systemd service on any systemd-based Linux host. It star
 | `systemd/design-pattern-mcp.service` | The systemd unit |
 | `systemd/docker-compose.yml` | Production compose variant (no `build:`, absolute paths, container port 8050) |
 | `systemd/docker-compose.decision-models.yml` | Opt-in overlay: Tacit gateway URLs over plain HTTP (enabled via `COMPOSE_FILE` in `.env`) |
+| `systemd/docker-compose.tacit-cpu.yml` | CPU-lane overlay: budgets for the in-stack `tacit` sidecar (third in `COMPOSE_FILE`, with `COMPOSE_PROFILES=tacit-cpu`) |
 | `systemd/README.md` | Full runbook: install, verify, troubleshooting |
 
 The production compose is the deployment variant of the dev file: pre-built images only, absolute paths, deployable to `/etc/design-pattern-mcp/`. The TEI sidecars live in the shared [pattern-tei-infra](https://github.com/olk/pattern-tei-infra) stack; this stack joins its Docker network and reaches them by DNS name. Start the service only after the shared TEI infra is `active (running)`.
@@ -1018,6 +1030,7 @@ docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-he
 sudo install -d /etc/design-pattern-mcp/config
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
 sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
+sudo install -m 644 systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/
 sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
 sudo install -m 644 systemd/design-pattern-mcp.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now design-pattern-mcp

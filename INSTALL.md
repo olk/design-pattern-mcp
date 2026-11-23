@@ -194,7 +194,8 @@ docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-he
 ```
 
 (`design-pattern-mcp.service` runs `ExecStartPre=docker image inspect` on both
-`:latest` tags — the retags are what make that pass.)
+`:latest` tags — the retags are what make that pass — plus a conditional inspect
+of the CPU Tacit image when `COMPOSE_PROFILES=tacit-cpu` selects the CPU lane.)
 
 ### B2 — configuration files under `/etc/design-pattern-mcp/`
 
@@ -202,6 +203,7 @@ docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-he
 sudo install -d /etc/design-pattern-mcp/config
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
 sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
+sudo install -m 644 systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/
 # The repo config is the canonical template ({env:VAR:-default} expansion;
 # compose-provided env vars override it).
 sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
@@ -309,7 +311,7 @@ probe embedding instead of a full corpus pass.
 - **Upgrading from a pre-volume deployment**: the older compose file has no mount — the
   cache then lives in the container layer and dies with the container. Re-install the
   compose files for your path — Path B:
-  `sudo install -m 644 systemd/docker-compose.yml systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/` (B2);
+  `sudo install -m 644 systemd/docker-compose.yml systemd/docker-compose.decision-models.yml systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/` (B2);
   Path A: `make docker-build` — then recreate the container
   (`docker compose up -d` / `sudo systemctl reload design-pattern-mcp`). Path B runs
   compose from `/etc`, so without that install the deployed stack keeps the old

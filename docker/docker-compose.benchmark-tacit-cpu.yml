@@ -1,0 +1,87 @@
+# Benchmark-only overlay: Tacit-4B on CPU for the TEI-vs-Tacit e2e A/B.
+# BENCH_DECISION_OVERLAY accepts exactly one -f file, so this combines the MCP
+# seam env of docker-compose.decision-models.yml with the CPU sidecar swap of
+# docker-compose.tacit-cpu.yml into one layer:
+#   BENCH_DECISION_OVERLAY=docker/docker-compose.benchmark-tacit-cpu.yml make benchmark-e2e ...
+# (scripts/benchmark-tei-vs-tacit-cpu.sh is the driver; keep the two in sync.)
+# Not for dev use (dev CPU lane is COMPOSE_DM_CPU); no other target references it.
+#
+# CPU-lane shape (measured 2026-11-21): RERANKER stays TEI (Tacit full-text rerank
+# at ~55 s/item x ~35 docs x serial parts is hours per analyze); style (linear
+# head) + weights + category + gate are ON with the CPU timeouts; the workflow
+# budget is 3600 s so a 900+900 weights retry fits inside 0.9 x deadline.
+
+services:
+  design-pattern-tacit:
+    image: ${TACIT_CPU_IMAGE:-design-pattern-tacit-cpu:latest}
+    container_name: design-pattern-tacit-dev
+    restart: unless-stopped
+    environment:
+      # All weights are baked into the image; the gateway must not reach the Hub.
+      - HF_HUB_OFFLINE=1
+      # false = one forward per decision (deterministic, the shipped behaviour).
+      - TACIT_ADAPTIVE=${TACIT_ADAPTIVE:-false}
+      - TACIT_DTYPE=bfloat16
+      - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-8}
+    ports:
+      # Loopback only: anyjev.serve has no auth of its own, so this sidecar must
+      # never be reachable beyond the workstation.
+      - "127.0.0.1:18100:8100" # dev host port; container 8100 = the gateway
+    # No devices entry: CPU image, no GPU reservation (unlike the GPU overlay).
+    shm_size: "4gb" # vLLM CPU: --shm-size=4g
+    cap_add: [SYS_NICE] # NUMA get_mempolicy/migrate_pages
+    security_opt: [seccomp=unconfined]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/v1/stats', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s # CPU model load is slower than the GPU 300 s
+
+  design-pattern-mcp:
+    environment:
+      # Reasoning pinned OFF (not merely defaulted): both arms measure the
+      # decision path, and a host REASONING_ENABLED=true leaking into one arm
+      # would silently change every latency and quality number the A/B compares.
+      - REASONING_ENABLED=false
+      # J1 rerank stays TEI on the CPU lane (see header); the Tacit leg remains
+      # wired as the URL/timeout only, so RERANKER_PROVIDER=tacit stays expressible.
+      - RERANKER_PROVIDER=${RERANKER_PROVIDER:-tei}
+      - RERANKER_TACIT_BASE_URL=http://design-pattern-tacit:8100
+      - RERANKER_TACIT_TIMEOUT_SECONDS=${RERANKER_TACIT_TIMEOUT_SECONDS:-60}
+      # Ch2 style: linear head, floor 0.6 (the A/B-winning operating point).
+      - DECISIONS_STYLE_ENABLED=${DECISIONS_STYLE_ENABLED:-true}
+      - DECISIONS_STYLE_PROVIDER=${DECISIONS_STYLE_PROVIDER:-linear}
+      - DECISIONS_STYLE_BASE_URL=${DECISIONS_STYLE_BASE_URL:-http://design-pattern-style-head:8800/v1}
+      - DECISIONS_STYLE_MODEL=${DECISIONS_STYLE_MODEL:-style-linear}
+      - DECISIONS_STYLE_CONFIDENCE_FLOOR=${DECISIONS_STYLE_CONFIDENCE_FLOOR:-0.6}
+      # J4 weights: Tacit score questions, 8 axes per part (32 items = 466 s).
+      - DECISIONS_WEIGHTS_ENABLED=${DECISIONS_WEIGHTS_ENABLED:-true}
+      - DECISIONS_WEIGHTS_BASE_URL=http://design-pattern-tacit:8100
+      - DECISIONS_WEIGHTS_MODEL=tacit-4b
+      - DECISIONS_WEIGHTS_TIMEOUT_SECONDS=${DECISIONS_WEIGHTS_TIMEOUT_SECONDS:-900}
+      # J2 category: soft 9-way narrowing of the retrieved pool.
+      - DECISIONS_CATEGORY_ENABLED=${DECISIONS_CATEGORY_ENABLED:-true}
+      - DECISIONS_CATEGORY_BASE_URL=http://design-pattern-tacit:8100
+      - DECISIONS_CATEGORY_MODEL=tacit-4b
+      - DECISIONS_CATEGORY_TIMEOUT_SECONDS=${DECISIONS_CATEGORY_TIMEOUT_SECONDS:-120}
+      # J5 gate: skip deliberation when the decision is already determined.
+      - DECISIONS_REASONING_GATE_ENABLED=${DECISIONS_REASONING_GATE_ENABLED:-true}
+      - DECISIONS_REASONING_GATE_BASE_URL=http://design-pattern-tacit:8100
+      - DECISIONS_REASONING_GATE_MODEL=tacit-4b
+      - DECISIONS_REASONING_GATE_TIMEOUT_SECONDS=${DECISIONS_REASONING_GATE_TIMEOUT_SECONDS:-30}
+      # Workflow budget: the ~466 s Tacit weights call runs inside 0.9 x deadline.
+      - TASKS_DEADLINE_SECONDS=${TASKS_DEADLINE_SECONDS:-3600}
+    depends_on:
+      design-pattern-tei-embed:
+        condition: service_healthy
+      design-pattern-tei-rerank:
+        condition: service_healthy
+      design-pattern-tacit:
+        condition: service_healthy
