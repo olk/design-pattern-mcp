@@ -41,6 +41,10 @@ export TEI_IMAGE="${TEI_IMAGE:-design-pattern-tei-embed:1.0.1}"
 export TEI_RERANK_IMAGE="${TEI_RERANK_IMAGE:-design-pattern-tei-rerank:1.0.1}"
 export TACIT_CPU_IMAGE="${TACIT_CPU_IMAGE:-design-pattern-tacit-cpu:1.0.1}"
 export STYLE_HEAD_IMAGE="${STYLE_HEAD_IMAGE:-design-pattern-style-head:1.0.1}"
+# Image pins as MAKE ARGS (not exports): a Makefile `:=` shadows same-named env
+# vars in recipes (proven 2026-11-23) — CLI args beat file assignments. Only names
+# the Makefile defines need this; MCP_IMAGE/TEI_IMAGE flow via export.
+PIN_ARGS=("TACIT_CPU_IMAGE=$TACIT_CPU_IMAGE" "TEI_RERANK_IMAGE=$TEI_RERANK_IMAGE" "STYLE_HEAD_IMAGE=$STYLE_HEAD_IMAGE")
 # Bring-up budget: Tacit-CPU model load (start_period 900 s) + MCP cold re-embed
 # of the catalog (~20 min on CPU under DENSE_CACHE_MODE=off, which every e2e arm
 # runs with) stack on first bring-up.
@@ -76,7 +80,7 @@ start_tacit_watch() { # $1=outfile
   while true; do
     echo "=== $(date -u +%FT%TZ) ==="
     curl -fsS -m 10 "$TACIT_STATS_URL" 2>/dev/null || echo "STATS_UNREACHABLE"
-    docker logs --tail 30 design-pattern-mcp-dev 2>&1 | grep -i 'degrad' || true
+    docker logs --tail 30 design-pattern-mcp-dev 2>&1 | grep -iE 'decision degraded|choice degraded' || true
     sleep 60
   done > "$1" 2>&1 & echo $! > "$1.pid"
   log "tacit watch polling -> $1"
@@ -126,11 +130,15 @@ log "GENERATOR_API_KEY renders non-empty in both file sets"
 
 # The candidate file set must actually carry the Tacit service; the baseline set
 # must not (a silent no-op arm would compare TEI against TEI).
-docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml \
-  -f "$OVERLAY" config --services 2>/dev/null | grep -qx "design-pattern-tacit" \
+# Capture-then-grep (never `producer | grep -q`): with `set -o pipefail`, grep -q's
+# early exit can SIGPIPE the producer into a flaky false failure (hit 1/5 preflights).
+rendered_services="$(docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml \
+  -f "$OVERLAY" config --services 2>/dev/null)" || die "compose config failed for the candidate file set"
+grep -qx "design-pattern-tacit" <<<"$rendered_services" \
   || die "overlay does not render a design-pattern-tacit service"
-if docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml \
-  config --services 2>/dev/null | grep -qx "design-pattern-tacit"; then
+rendered_base="$(docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml \
+  config --services 2>/dev/null)" || die "compose config failed for the baseline file set"
+if grep -qx "design-pattern-tacit" <<<"$rendered_base"; then
   die "baseline file set renders design-pattern-tacit — the arms would not differ"
 fi
 log "overlay renders design-pattern-tacit; baseline does not"
@@ -139,7 +147,8 @@ for dir in "$RUNS/$A_ID" "$RUNS/$B_ID"; do
   [ ! -e "$dir" ] || [ -z "$(ls -A "$dir" 2>/dev/null)" ] \
     || die "run dir not empty (stale results would mix): $dir"
 done
-if docker ps --format '{{.Names}}' | grep -qx "design-pattern-mcp-dev-benchmark-run-.*"; then
+running_containers="$(docker ps --format '{{.Names}}' 2>/dev/null)"
+if grep -qx "design-pattern-mcp-dev-benchmark-run-.*" <<<"$running_containers"; then
   die "another benchmark run container is active"
 fi
 log "preflight green: corpus=$SCENARIOS split=$SPLIT limit=$LIMIT repeat=$REPEAT"
@@ -170,7 +179,7 @@ run_arm() { # $1=tag $2=files $3=RUN_ID $4=pre-hook-fn $5...=extra make args
     docker compose $files down --remove-orphans >/dev/null 2>&1 || true
     if ! "$pre"; then log "$tag: pre-hook failed"; continue; fi
     if make benchmark-e2e BENCH_SCENARIOS="$SCENARIOS" SPLIT="$SPLIT" \
-      LIMIT="$LIMIT" REPEAT="$REPEAT" RUN_ID="$run_id" "$@"; then
+      LIMIT="$LIMIT" REPEAT="$REPEAT" RUN_ID="$run_id" "$@" "${PIN_ARGS[@]}"; then
       log "$tag complete: $RUNS/$run_id"
       return 0
     fi
@@ -209,9 +218,9 @@ stop_tacit_watch
 B_DECISIONS=$(tacit_decisions_max "$RUNS/$STAMP-tacit-cpu-tacit-watch.log"); B_DECISIONS=${B_DECISIONS:-0}
 [ "$B_DECISIONS" -gt 0 ] || die "arm B shows ZERO Tacit decisions — it measured the fallback path, not the seam"
 log "arm B seam usage: $B_DECISIONS Tacit decisions observed (window max)"
-if grep -qi 'degrad' "$RUNS/$STAMP-tacit-cpu-tacit-watch.log"; then
+if grep -qiE 'decision degraded|choice degraded' "$RUNS/$STAMP-tacit-cpu-tacit-watch.log"; then
   log "WARNING: degraded-seam lines in arm B watch log (the lane's as-deployed behavior — counted in the report, not hidden):"
-  grep -i 'degrad' "$RUNS/$STAMP-tacit-cpu-tacit-watch.log" | sort | uniq -c | sort -rn | head -20 || true
+  grep -iE 'decision degraded|choice degraded' "$RUNS/$STAMP-tacit-cpu-tacit-watch.log" | cut -c1-250 | sort | uniq -c | sort -rn | head -20 || true
 fi
 
 # --- compare ------------------------------------------------------------------

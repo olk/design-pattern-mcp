@@ -28,7 +28,7 @@ box; the second one followed the test work that killed the new clusters:
 | `src/pipeline.py` | 62 functions / 2706 mutants, 1670 killed (ratio 0.62) |
 | `_decision_part_state` | 18/18 killed (1.00) — the state text is pinned byte-for-byte incl. the 8/4/1500 caps |
 | `_matches_category` | 5/5 killed (1.00) |
-| `_narrow_by_category` | 90/92 killed (0.98) — floor boundary, per-part continuation (skip + empty-filter), the override map and the kept/pool/skipped/replaced log fields |
+| `_narrow_by_category` | 90/92 killed (0.98) — floor boundary, per-part continuation (skip + empty-filter), the override map and the kept/pool/skipped/replaced log fields (+ agree-gate/kept-floor branches 2026-11-23; counts predate the guard — L3 unrunnable on this host, verified by hand-applied mutant sample instead) |
 | `_process_weight_proposals` | 64/104 killed (0.62) — prior blend, `+architecture_prior` label, E4 label and smoothing are pinned |
 | `_tacit_weight_proposals` | 47/59 killed (0.80) — per-part retry and the retried-part log field |
 | Gate | `--gate` clean against the regenerated baseline |

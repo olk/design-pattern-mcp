@@ -196,11 +196,10 @@ async def test_weights_seam_disabled_keeps_the_llm_path(catalog: PatternLoader) 
 async def test_category_narrowing_filters_on_a_confident_choice(catalog: PatternLoader) -> None:
     client = _FakeTacit(category=("persistence-state", 0.9))
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
-    parts = _parts()[:1]
-    narrowed, overrides = await pipeline._narrow_by_category(
-        parts, _brief(), [[_hit("repository"), _hit("strategy"), _hit("observer")]]
-    )
-    assert [hit.name for hit in narrowed[0]] == ["repository"]
+    parts = [_parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})]
+    pool = [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work"), _hit("strategy")]
+    narrowed, overrides = await pipeline._narrow_by_category(parts, _brief(), [pool])
+    assert [hit.name for hit in narrowed[0]] == ["repository", "data-mapper", "active-record", "unit-of-work"]
     assert overrides == {"p1": "persistence-state"}
     assert client.category_calls == [_decision_part_state(_brief(), parts[0])]
 
@@ -216,12 +215,11 @@ async def test_category_narrowing_below_floor_keeps_the_pool(catalog: PatternLoa
 
 
 async def test_category_narrowing_never_empties_the_pool(catalog: PatternLoader) -> None:
-    """A filter that keeps nothing is discarded — the unfiltered pool stands."""
+    """A filter that keeps nothing is a rump of zero: the unfiltered pool stands."""
     client = _FakeTacit(category=("security-verification", 0.95))
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
-    narrowed, overrides = await pipeline._narrow_by_category(
-        _parts()[:1], _brief(), [[_hit("repository"), _hit("strategy")]]
-    )
+    parts = [_parts()[0].model_copy(update={"category_hypothesis": "security-verification"})]
+    narrowed, overrides = await pipeline._narrow_by_category(parts, _brief(), [[_hit("repository"), _hit("strategy")]])
     assert [hit.name for hit in narrowed[0]] == ["repository", "strategy"]
     assert overrides == {}
 
@@ -246,12 +244,14 @@ async def test_category_narrowing_disabled_never_calls_the_client(catalog: Patte
 
 
 async def test_category_narrowing_keeps_names_the_catalog_does_not_know(catalog: PatternLoader) -> None:
+    """Unknown names are never dropped — and count toward the kept floor."""
     client = _FakeTacit(category=("persistence-state", 0.9))
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
+    parts = [_parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})]
     narrowed, overrides = await pipeline._narrow_by_category(
-        _parts()[:1], _brief(), [[_hit("repository"), _hit("no-such-record")]]
+        parts, _brief(), [[_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("no-such-record")]]
     )
-    assert [hit.name for hit in narrowed[0]] == ["repository", "no-such-record"]
+    assert [hit.name for hit in narrowed[0]] == ["repository", "data-mapper", "active-record", "no-such-record"]
     assert overrides == {"p1": "persistence-state"}
 
 
@@ -261,13 +261,22 @@ async def test_category_narrowing_reaches_the_selection(catalog: PatternLoader) 
     pipeline = _pipeline(
         catalog,
         category_client=client,
-        hits=[StubHit("repository", 0.0317, 1, 1), StubHit("strategy", 0.0317, 2, 2)],
+        hits=[
+            StubHit("repository", 0.0317, 1, 1),
+            StubHit("data-mapper", 0.0317, 2, 2),
+            StubHit("active-record", 0.0317, 3, 3),
+            StubHit("unit-of-work", 0.0317, 4, 4),
+            StubHit("strategy", 0.0317, 5, 5),
+        ],
         decisions={"category": {"enabled": True}},
     )
-    selections = await pipeline._select_all(_parts()[:1], _brief(), None)
+    part = _parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})
+    selections = await pipeline._select_all([part], _brief(), None)
     candidate_names = {candidate.name for candidate in selections["p1"].candidates}
     assert "strategy" not in candidate_names
-    assert "repository" in candidate_names
+    assert {"repository", "data-mapper", "active-record", "unit-of-work"} <= candidate_names
+
+
 # -- the shared §7.1 tail: prior blend, E4 label, and the state contract --------------
 
 
@@ -281,9 +290,7 @@ async def test_weights_seam_flat_vector_takes_the_architecture_prior(
         restated_goal="serving views without stale data",
         quality_attributes={"scalability": 1.0, "testability": 0.5},
     )
-    pipeline = _pipeline(
-        catalog, weights_client=client, decisions={"weights": {"enabled": True}}
-    )
+    pipeline = _pipeline(catalog, weights_client=client, decisions={"weights": {"enabled": True}})
     selections = await pipeline._select_all(_parts()[:1], brief, None)
     selection = selections["p1"]
     assert selection.weights_source == "decision-model+architecture_prior"
@@ -319,9 +326,7 @@ async def test_weights_seam_retries_only_the_failed_parts(
     good = dict.fromkeys(QUALITY_AXES, 0.0)
     good["reliability"] = 1.0
     client = _FakeTacit(vectors=[[good, None], [good]])
-    pipeline = _pipeline(
-        catalog, weights_client=client, decisions={"weights": {"enabled": True}}
-    )
+    pipeline = _pipeline(catalog, weights_client=client, decisions={"weights": {"enabled": True}})
     selections = await pipeline._select_all(_parts(), _brief(), None)
     assert selections["p1"].weights_source == "decision-model"
     assert selections["p2"].weights_source == "decision-model"
@@ -351,15 +356,15 @@ def test_decision_part_state_carries_the_brief_and_the_part() -> None:
     ]
     long_part = part.model_copy(update={"statement": "x" * 5000})
     assert len(_decision_part_state(brief, long_part)) <= 1500
+
+
 def test_decision_part_state_caps_components_and_constraints() -> None:
     """The 8-component / 4-constraint caps keep the state bounded before the 1500-char cut."""
     brief = DesignBrief(
         restated_goal="goal",
         components=[BriefComponent(name=f"C{index}") for index in range(10)],
     )
-    part = DecisionPart(
-        id="p1", statement="s", constraints=[f"c{index}" for index in range(6)]
-    )
+    part = DecisionPart(id="p1", statement="s", constraints=[f"c{index}" for index in range(6)])
     state = _decision_part_state(brief, part)
     assert "Components: C0, C1, C2, C3, C4, C5, C6, C7" in state
     assert "C8" not in state
@@ -375,44 +380,37 @@ async def test_category_narrowing_logs_the_kept_and_pool_sizes(
         category_client=client,
         decisions={"category": {"enabled": True}},
     )
+    part = _parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})
+    pool = [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work"), _hit("strategy")]
     with caplog.at_level(logging.DEBUG, logger="src.pipeline"):
-        await pipeline._narrow_by_category(
-            _parts()[:1],
-            _brief(),
-            [[_hit("repository"), _hit("strategy"), _hit("observer")]],
-        )
-    record = next(
-        r for r in caplog.records if r.getMessage() == "Category narrowing applied"
-    )
+        await pipeline._narrow_by_category([part], _brief(), [pool])
+    record = next(r for r in caplog.records if r.getMessage() == "Category narrowing applied")
     assert record.part_id == "p1"  # type: ignore[attr-defined]
     assert record.category == "persistence-state"  # type: ignore[attr-defined]
-    assert record.kept == 1  # type: ignore[attr-defined]
-    assert record.pool == 3  # type: ignore[attr-defined]
+    assert record.kept == 4  # type: ignore[attr-defined]
+    assert record.pool == 5  # type: ignore[attr-defined]
     assert record.confidence == pytest.approx(0.9)  # type: ignore[attr-defined]
 
 
-async def test_category_narrowing_logs_the_empty_filter_fallback(
+async def test_category_narrowing_logs_the_rump_pool_skip(
     catalog: PatternLoader, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A filter below the kept floor logs its sizes instead of narrowing."""
     client = _FakeTacit(category=("security-verification", 0.95))
     pipeline = _pipeline(
         catalog,
         category_client=client,
         decisions={"category": {"enabled": True}},
     )
-    with caplog.at_level(logging.DEBUG, logger="src.pipeline"):
-        await pipeline._narrow_by_category(
-            _parts()[:1], _brief(), [[_hit("repository"), _hit("strategy")]]
-        )
-    record = next(
-        r
-        for r in caplog.records
-        if r.getMessage()
-        == "Category narrowing kept nothing; using the unfiltered pool"
-    )
+    part = _parts()[0].model_copy(update={"category_hypothesis": "security-verification"})
+    with caplog.at_level(logging.INFO, logger="src.pipeline"):
+        await pipeline._narrow_by_category([part], _brief(), [[_hit("repository"), _hit("strategy")]])
+    record = next(r for r in caplog.records if r.getMessage() == "Category narrowing skipped: rump pool")
     assert record.part_id == "p1"  # type: ignore[attr-defined]
     assert record.category == "security-verification"  # type: ignore[attr-defined]
+    assert record.kept == 0  # type: ignore[attr-defined]
     assert record.pool == 2  # type: ignore[attr-defined]
+    assert record.min_kept == 4  # type: ignore[attr-defined]
 
 
 async def test_category_narrowing_logs_the_skipped_reason(
@@ -425,9 +423,7 @@ async def test_category_narrowing_logs_the_skipped_reason(
         decisions={"category": {"enabled": True}},
     )
     with caplog.at_level(logging.DEBUG, logger="src.pipeline"):
-        await pipeline._narrow_by_category(
-            _parts()[:1], _brief(), [[_hit("repository")]]
-        )
+        await pipeline._narrow_by_category(_parts()[:1], _brief(), [[_hit("repository")]])
     record = next(r for r in caplog.records if r.getMessage() == "Category narrowing skipped")
     assert record.part_id == "p1"  # type: ignore[attr-defined]
     assert record.category == "persistence-state"  # type: ignore[attr-defined]
@@ -447,17 +443,11 @@ async def test_weights_seam_retry_logs_the_failed_part_ids(
     )
     with caplog.at_level(logging.INFO, logger="src.pipeline"):
         await pipeline._select_all(_parts(), _brief(), None)
-    record = next(
-        r
-        for r in caplog.records
-        if r.getMessage() == "Tacit weights unusable; retrying those parts"
-    )
+    record = next(r for r in caplog.records if r.getMessage() == "Tacit weights unusable; retrying those parts")
     assert record.part_ids == ["p2"]  # type: ignore[attr-defined]
 
 
-async def test_weights_tail_logs_the_source_and_peak(
-    catalog: PatternLoader, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_weights_tail_logs_the_source_and_peak(catalog: PatternLoader, caplog: pytest.LogCaptureFixture) -> None:
     flat = dict.fromkeys(QUALITY_AXES, 0.1)
     client = _FakeTacit(vectors=[[flat]])
     brief = DesignBrief(restated_goal="g", quality_attributes={"scalability": 1.0})
@@ -468,21 +458,18 @@ async def test_weights_tail_logs_the_source_and_peak(
     )
     with caplog.at_level(logging.INFO, logger="src.pipeline"):
         await pipeline._select_all(_parts()[:1], brief, None)
-    record = next(
-        r for r in caplog.records if r.getMessage() == "Part weights extracted"
-    )
+    record = next(r for r in caplog.records if r.getMessage() == "Part weights extracted")
     assert record.weights_source == "decision-model+architecture_prior"  # type: ignore[attr-defined]
     assert record.peak == pytest.approx(0.1)  # type: ignore[attr-defined]
     assert record.part_id == "p1"  # type: ignore[attr-defined]
 
 
-async def test_category_narrowing_replaces_a_conflicting_hypothesis(catalog: PatternLoader) -> None:
-    """The narrowed category becomes the part's effective one for scoring and fallback.
+async def test_category_narrowing_disagreement_keeps_hypothesis_and_pool(catalog: PatternLoader) -> None:
+    """A disagreeing answer changes nothing: no filter, no override.
 
-    The 7.3 adjustment scores a hit +5 when its category equals ``part.category_hypothesis``
-    and -10 otherwise, and E5/E7 take the fallback primary from that same hypothesis. A
-    narrowed pool scored against the old hypothesis would therefore take -10 on every
-    survivor and fall back to a pattern from outside the pool.
+    The §7.3 adjustment scores +5/−10 off ``part.category_hypothesis`` — adopting
+    a wrong category would swing every survivor by 15 points on top of filtering
+    them. 2026-11-23 ablation: model overrides went 0/3, all fatal.
     """
     client = _FakeTacit(category=("persistence-state", 0.9))
     pipeline = _pipeline(
@@ -493,21 +480,19 @@ async def test_category_narrowing_replaces_a_conflicting_hypothesis(catalog: Pat
     )
     part = _parts()[0].model_copy(update={"category_hypothesis": "behavior-selection"})
     selection = (await pipeline._select_all([part], _brief(), None))["p1"]
-    assert selection.part.category_hypothesis == "persistence-state"
-    assert selection.primary == "repository"
-    labels = [adjustment.label for adjustment in selection.candidates[0].adjustments]
-    assert "category_match" in labels
-    assert "category_mismatch" not in labels
+    assert selection.part.category_hypothesis == "behavior-selection"
+    candidate_names = {candidate.name for candidate in selection.candidates}
+    assert {"repository", "strategy"} <= candidate_names
 
 
 async def test_category_narrowing_at_exactly_the_floor_narrows(catalog: PatternLoader) -> None:
     """The floor is inclusive: confidence == confidence_floor is enough to act."""
     client = _FakeTacit(category=("persistence-state", 0.5))
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
-    narrowed, overrides = await pipeline._narrow_by_category(
-        _parts()[:1], _brief(), [[_hit("repository"), _hit("strategy")]]
-    )
-    assert [hit.name for hit in narrowed[0]] == ["repository"]
+    part = _parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})
+    pool = [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work")]
+    narrowed, overrides = await pipeline._narrow_by_category([part], _brief(), [pool])
+    assert [hit.name for hit in narrowed[0]] == ["repository", "data-mapper", "active-record", "unit-of-work"]
     assert overrides == {"p1": "persistence-state"}
 
 
@@ -515,38 +500,97 @@ async def test_category_narrowing_continues_after_a_skipped_part(catalog: Patter
     """One low-confidence part must not stop the remaining parts from narrowing."""
     client = _ScriptedCategoryTacit([("persistence-state", 0.2), ("persistence-state", 0.9)])
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
-    hits = [[_hit("repository"), _hit("strategy")], [_hit("repository"), _hit("strategy")]]
-    narrowed, overrides = await pipeline._narrow_by_category(_parts(), _brief(), hits)
+    p1, p2 = _parts()
+    p2 = p2.model_copy(update={"category_hypothesis": "persistence-state"})
+    hits = [
+        [_hit("repository"), _hit("strategy")],
+        [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work")],
+    ]
+    narrowed, overrides = await pipeline._narrow_by_category([p1, p2], _brief(), hits)
     assert [hit.name for hit in narrowed[0]] == ["repository", "strategy"]  # skipped
-    assert [hit.name for hit in narrowed[1]] == ["repository"]  # narrowed
+    assert [hit.name for hit in narrowed[1]] == [
+        "repository",
+        "data-mapper",
+        "active-record",
+        "unit-of-work",
+    ]  # narrowed
     assert overrides == {"p2": "persistence-state"}
 
 
-async def test_category_narrowing_continues_after_an_empty_filter(catalog: PatternLoader) -> None:
-    """A filter that keeps nothing falls back for that part only."""
+async def test_category_narrowing_continues_after_a_rump_pool(catalog: PatternLoader) -> None:
+    """A rump filter falls back for that part only."""
     client = _ScriptedCategoryTacit([("security-verification", 0.9), ("persistence-state", 0.9)])
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
-    hits = [[_hit("repository"), _hit("strategy")], [_hit("repository"), _hit("strategy")]]
-    narrowed, overrides = await pipeline._narrow_by_category(_parts(), _brief(), hits)
-    assert [hit.name for hit in narrowed[0]] == ["repository", "strategy"]  # kept unfiltered
-    assert [hit.name for hit in narrowed[1]] == ["repository"]
+    p1 = _parts()[0].model_copy(update={"category_hypothesis": "security-verification"})
+    p2 = _parts()[1].model_copy(update={"category_hypothesis": "persistence-state"})
+    hits = [
+        [_hit("repository"), _hit("strategy")],
+        [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work")],
+    ]
+    narrowed, overrides = await pipeline._narrow_by_category([p1, p2], _brief(), hits)
+    assert [hit.name for hit in narrowed[0]] == ["repository", "strategy"]  # rump: kept unfiltered
+    assert [hit.name for hit in narrowed[1]] == ["repository", "data-mapper", "active-record", "unit-of-work"]
     assert overrides == {"p2": "persistence-state"}
 
 
 async def test_category_narrowing_logs_only_a_real_replacement(
     catalog: PatternLoader, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """``replaced_hypothesis`` names the discarded hypothesis, and is None when it agrees."""
+    """Agreement applies with ``replaced_hypothesis`` None; conflict logs a skip, never applies."""
     conflicting = _parts()[0].model_copy(update={"category_hypothesis": "behavior-selection"})
     agreeing = _parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})
     client = _FakeTacit(category=("persistence-state", 0.9))
     pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
+    pool = [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work")]
     with caplog.at_level(logging.INFO, logger="src.pipeline"):
-        await pipeline._narrow_by_category([conflicting], _brief(), [[_hit("repository")]])
-        await pipeline._narrow_by_category([agreeing], _brief(), [[_hit("repository")]])
+        await pipeline._narrow_by_category([conflicting], _brief(), [pool])
+        await pipeline._narrow_by_category([agreeing], _brief(), [pool])
     applied = [r for r in caplog.records if r.getMessage() == "Category narrowing applied"]
-    assert applied[0].replaced_hypothesis == "behavior-selection"  # type: ignore[attr-defined]
-    assert applied[1].replaced_hypothesis is None  # type: ignore[attr-defined]
+    assert len(applied) == 1
+    assert applied[0].replaced_hypothesis is None  # type: ignore[attr-defined]
+    skipped = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Category narrowing skipped: model disagrees with part hypothesis"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0].hypothesis == "behavior-selection"  # type: ignore[attr-defined]
+
+
+async def test_category_narrowing_disagreement_skips_after_calling(catalog: PatternLoader) -> None:
+    """The client is still consulted (tallies count the call); only the filter is skipped."""
+    client = _FakeTacit(category=("persistence-state", 0.9))
+    pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
+    part = _parts()[0].model_copy(update={"category_hypothesis": "behavior-selection"})
+    pool = [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work")]
+    narrowed, overrides = await pipeline._narrow_by_category([part], _brief(), [pool])
+    assert [hit.name for hit in narrowed[0]] == ["repository", "data-mapper", "active-record", "unit-of-work"]
+    assert overrides == {}
+    assert client.category_calls == [_decision_part_state(_brief(), part)]
+
+
+async def test_category_narrowing_kept_floor_boundary(catalog: PatternLoader) -> None:
+    """Kept 3 abstains, kept 4 narrows: the floor is inclusive."""
+    client = _ScriptedCategoryTacit([("persistence-state", 0.9), ("persistence-state", 0.9)])
+    pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
+    p1 = _parts()[0].model_copy(update={"category_hypothesis": "persistence-state"})
+    p2 = _parts()[1].model_copy(update={"category_hypothesis": "persistence-state"})
+    thin = [_hit("repository"), _hit("data-mapper"), _hit("active-record")]
+    full = [*thin, _hit("unit-of-work")]
+    narrowed, overrides = await pipeline._narrow_by_category([p1, p2], _brief(), [thin, full])
+    assert [hit.name for hit in narrowed[0]] == ["repository", "data-mapper", "active-record"]
+    assert [hit.name for hit in narrowed[1]] == ["repository", "data-mapper", "active-record", "unit-of-work"]
+    assert overrides == {"p2": "persistence-state"}
+
+
+async def test_category_narrowing_missing_hypothesis_never_agrees(catalog: PatternLoader) -> None:
+    """A part without a hypothesis cannot agree: even a confident choice stands down."""
+    client = _FakeTacit(category=("persistence-state", 0.9))
+    pipeline = _pipeline(catalog, category_client=client, decisions={"category": {"enabled": True}})
+    pool = [_hit("repository"), _hit("data-mapper"), _hit("active-record"), _hit("unit-of-work")]
+    narrowed, overrides = await pipeline._narrow_by_category(_parts()[:1], _brief(), [pool])
+    assert [hit.name for hit in narrowed[0]] == ["repository", "data-mapper", "active-record", "unit-of-work"]
+    assert overrides == {}
 
 
 async def test_select_all_falls_back_when_every_hit_is_vetoed(catalog: PatternLoader) -> None:

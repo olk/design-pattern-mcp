@@ -2428,18 +2428,23 @@ class DesignPipeline(Workflow):
         brief: DesignBrief,
         hits_by_part: list[list[RetrievalHit]],
     ) -> tuple[list[list[RetrievalHit]], dict[str, PatternCategory]]:
-        """J2: keep the hits whose catalog category matches a confident choice (soft, never a router).
+        """J2: keep the hits whose catalog category matches a confident, agreeing choice.
 
-        Narrowing only ever reorders the pool *after* retrieval: no category means no
-        narrowing, below-floor confidence means no narrowing, and a filter that would
-        empty the pool falls back to the unfiltered list — so recall can shrink but the
-        decision can never be starved by the model.
+        Narrowing only ever touches the pool *after* retrieval, and only when the
+        model's answer agrees with the part's own hypothesis: a disagreeing answer
+        (a missing hypothesis never agrees) keeps the unfiltered pool, as does a
+        filter that would keep fewer than ``min_kept`` candidates — so a wrong
+        category can neither overrule the LLM nor herd the decision into a rump
+        election (2026-11-23 ablation: overrides 0/3, all fatal; correct
+        narrowings kept 6-9 of 10).
 
-        Returns the (possibly narrowed) hits plus, per narrowed part, the category the
-        caller must adopt as that part's effective category (§7.3 adjustment and E5/E7
-        fallback read the part's hypothesis, so leaving a stale one would score the pool
-        against a category the pool no longer contains).
+        Returns the (possibly narrowed) hits plus, per narrowed part, the category
+        the caller must adopt as that part's effective category (§7.3 adjustment
+        and E5/E7 fallback read the part's hypothesis, so leaving a stale one
+        would score the pool against a category the pool no longer contains).
         """
+        # Floor for a viable narrowed pool: elections smaller than this are noise.
+        min_kept = 4
         client = self._category_client
         seam = self._config.decisions.category
         if client is None or not seam.enabled:
@@ -2455,11 +2460,29 @@ class DesignPipeline(Workflow):
                 )
                 narrowed.append(hits)
                 continue
-            kept = [hit for hit in hits if self._matches_category(hit.name, category)]
-            if not kept:
+            if part.category_hypothesis is None or category != part.category_hypothesis:
                 logger.info(
-                    "Category narrowing kept nothing; using the unfiltered pool",
-                    extra={"part_id": part.id, "category": category, "pool": len(hits)},
+                    "Category narrowing skipped: model disagrees with part hypothesis",
+                    extra={
+                        "part_id": part.id,
+                        "category": category,
+                        "confidence": round(confidence, 4),
+                        "hypothesis": part.category_hypothesis,
+                    },
+                )
+                narrowed.append(hits)
+                continue
+            kept = [hit for hit in hits if self._matches_category(hit.name, category)]
+            if len(kept) < min_kept:
+                logger.info(
+                    "Category narrowing skipped: rump pool",
+                    extra={
+                        "part_id": part.id,
+                        "category": category,
+                        "kept": len(kept),
+                        "pool": len(hits),
+                        "min_kept": min_kept,
+                    },
                 )
                 narrowed.append(hits)
                 continue
