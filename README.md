@@ -50,14 +50,14 @@ git clone https://git.odvlh.xyz/olli/design-pattern-mcp.git && cd design-pattern
 # 2. Add your API key
 export OPENCODE_API_KEY=your_key_here
 
-# 3. Build + start. The GPU lane runs everything; the CPU lane runs everything
-#    except Tacit (run that where a card exists — systemd/README.md "Decision models").
-#    The style seam is on in both: the head is in the base file and config.json
-#    enables it. `DECISIONS_STYLE_ENABLED=false` stands it down to the LLM style.
-make docker-build-all                       # GPU builder
-make docker-up-decisions                    # GPU host: server + TEI + Tacit + style head
-# make docker-build-base   # no GPU builder
-# make docker-up                                              # no GPU host
+# 3. Build + start. Default is no-Tacit-seams on every tier (measured 2026-11:
+#    Tacit buys no selection quality at any scale, and costs ~2 min/call on
+#    CPU) — the decisions lane stays an explicit opt-in. CPU TEI sidecars
+#    are the benchmarked path.
+make docker-build-base                         # base images (no Tacit weights)
+make docker-up                                 # server + TEI pair + style head, no Tacit
+# make docker-build-all       # + Tacit sidecars (only for the decisions lane)
+# make docker-up-decisions    # opt-in: every seam live (measured: no gain)
 
 # 4. Demo (analyze-only: fast. For the full design: make client-design)
 make client-analyze
@@ -405,15 +405,15 @@ make docker-build-all                       # GPU builder
 # make docker-build-base   # no GPU builder
 # make docker-build-tacit-cpu  # no-GPU Tacit sidecar on top of -base (needs the trained models/tacit-4b/ from a GPU builder)
 
-# Run with your API key (GPU host shown; without a GPU start with plain `make docker-up`,
-# whose base file already includes the style head — or `make docker-up-decisions-cpu`
-# for the full decision stack on the CPU Tacit sidecar)
-OPENCODE_API_KEY=your_key make docker-up-decisions
+# Run with your API key (no-Tacit-seams default — add the decisions lane only
+# if you re-measure a gain: `make docker-up-decisions` runs every seam live).
+OPENCODE_API_KEY=your_key make docker-up
 ```
 
 ### Which stack to run
 
-| GPU builder + GPU host | `make docker-build-all` | `make docker-up-decisions` | server + TEI pair + Tacit gateway + style head — every seam live |
+| Any host | `make docker-build-base` | `make docker-up` | server + TEI pair (CPU sidecars, the benchmarked path) + style head, no Tacit seams — the default |
+| GPU decisions opt-in | `make docker-build-all` | `make docker-up-decisions` | + Tacit gateway — every seam live (measured: no selection gain, +~2 min/call on CPU) |
 | No GPU | `make docker-build-base` | `make docker-up` | server + TEI pair + style head — Ch2 on (config.json default), Tacit seams off |
 | No GPU, Tacit seams on | `make docker-build-base` + `make docker-build-tacit-cpu` | `make docker-up-decisions-cpu` | server + TEI pair + CPU Tacit sidecar + style head — every seam live, no GPU anywhere (needs the trained checkpoint) |
 | Style off | same as No GPU | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
@@ -471,7 +471,7 @@ The TEI sidecars are required for full retrieval quality: a dense leg (Qwen3-Emb
 
 > **TEI startup:** both sidecar images (`docker/Dockerfile.tei-embed`, `docker/Dockerfile.tei-rerank`) ship a self-built TEI router (v1.9.4 + unmerged [PR #884](https://github.com/huggingface/text-embeddings-inference/pull/884)) with `WARMUP_TOKENS=0` by default — this skips the synthetic warmup pass (measured ~131 s embed / ~78 s rerank) so containers become ready after weight load only. Override per sidecar via `TEI_WARMUP_TOKENS` / `TEI_RERANK_WARMUP_TOKENS` (positive N warms with N tokens instead; values > `MAX_BATCH_TOKENS` are rejected at startup).
 
-**GPU TEI:** the shipped sidecars are CPU images (`cpu-1.9`). On a host with a TEI-CUDA-supported NVIDIA GPU (compute capability ≥ 7.5) plus the NVIDIA container toolkit, `make docker-build-tei-embed-gpu` builds the embed sidecar on the CUDA base (`ghcr.io/huggingface/text-embeddings-inference:cuda-1.9`) and `make docker-up-gpu` starts the dev stack with `docker/docker-compose.gpu.yml` (reserves 1 GPU). The override covers the embed sidecar only — the reranker stays on CPU. On GPU a small positive `WARMUP_TOKENS` warms kernels at startup instead of skipping the pass.
+**GPU TEI:** the shipped sidecars are CPU images (`cpu-1.9`). `make docker-up-gpu` is currently broken (references missing `docker/docker-compose.gpu.yml` — GPU hosts run the CPU sidecars via `make docker-up` until that overlay exists). When fixed: on a host with a TEI-CUDA-supported NVIDIA GPU (compute capability ≥ 7.5) plus the NVIDIA container toolkit, `make docker-build-tei-embed-gpu` builds the embed sidecar on the CUDA base (`ghcr.io/huggingface/text-embeddings-inference:cuda-1.9`) and `make docker-up-gpu` starts the dev stack with the overlay (reserving 1 GPU, embed sidecar only — the reranker stays on CPU).
 
 **Already-running embedder/reranker:** when embedding and reranking endpoints already run on other servers, point the MCP server at them via `EMBEDDER_BASE_URL` (OpenAI-compatible route, `http://<host>:8080/v1`) plus `RERANKER_BASE_URL` (`http://<host>:8080`) and skip the sidecars. The embedder forwards `EMBEDDER_MODEL` (default `openai//data/embedding-model`) and `EMBEDDER_API_KEY` through LiteLLM — provider/model syntax is documented in the [LiteLLM embedding docs](https://docs.litellm.ai/docs/embedding/supported_embedding). The reranker is **not** a LiteLLM client — it POSTs `{base_url}/rerank` directly (`src/patterns/safe_tei_rerank.py`), so `RERANKER_MODEL` (default `Alibaba-NLP/gte-reranker-modernbert-base`) is a TEI model name, not a LiteLLM model string. A remote embedder serving a different model invalidates the baked dense cache — regenerate it with `make embed-cache` so vectors match the serving model.
 
