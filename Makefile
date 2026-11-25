@@ -505,7 +505,7 @@ docker-build-style-head: ## Build the linear style head sidecar (CPU; the build 
 	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.style-head \
 		-t $(STYLE_HEAD_IMAGE):$(DOCKER_TAG) -t $(STYLE_HEAD_IMAGE):latest .
 
-docker-build-decision: docker-build-tacit docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
+docker-build-decision: docker-build-tacit docker-build-tacit-cpu docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
 
 docker-up-decisions: ## Start the dev stack with the decision-model sidecars (one GPU, one CPU)
 	$(STYLE_PROVIDER_ENV) TACIT_IMAGE=$(TACIT_IMAGE) \
@@ -865,10 +865,11 @@ benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the s
 		B=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-on $(BENCH_DOCKER) compare
 
 # Selection-level acceptance for the J1 rerank leg: same overlay stack, corpus, split and
-# repeat, only RERANKER_PROVIDER differs. Keep the Tacit leg as the overlay default only if
-# the candidate arm is non-inferior on holdout hit rate and recall@3, with zero veto/fallback
-# regressions and e2e p95 within +15% — `benchmark-compare` exits 1 on a candidate-loss
-# verdict, which is a verdict to report (fall back to RERANKER_PROVIDER=tei), not a crash.
+# repeat, only RERANKER_PROVIDER differs. Decided 2026-11-24 (run 20261124-173228):
+# Tacit was non-inferior on hits/recall with zero fallback regressions and a likely
+# ~30 s p95 gain, but agreement-negative (4/6 vs 6/6) — so TEI stays the overlay
+# default and Tacit an explicit opt-in. Re-run to re-verify; `benchmark-compare`
+# exits 1 on a candidate-loss verdict, which is a verdict to report, not a crash.
 RERANK_AB_SCENARIOS ?= tests/benchmark/scenarios/full.json
 RERANK_AB_REPEAT    ?= 3
 RERANK_AB_STAMP     ?= $(shell date -u +%Y%m%d-%H%M%S)
