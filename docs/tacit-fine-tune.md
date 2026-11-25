@@ -806,12 +806,12 @@ health-checks `GET /v1/stats` with a 300 s start period, and reserves one NVIDIA
 |---|---|---|
 | `TACIT_IMAGE` | `design-pattern-tacit:latest` | full image reference; `make docker-up-decisions` defaults it to `design-pattern-tacit:$(DOCKER_TAG)`, an explicit value passes through verbatim |
 | `TACIT_ADAPTIVE` | `false` | one forward per decision, no thinking, no sampling; `true` lets the gateway escalate low-margin decisions to reasoning |
-| `RERANKER_PROVIDER` | `tacit` | J1 rerank leg; TEI stays the in-client fallback |
+| `RERANKER_PROVIDER` | `tei` | J1 rerank leg (TEI cross-encoder; J1 A/B 20261124-173228: Tacit neutral on quality, −2 repeat groups — Tacit stays explicit opt-in); TEI is the in-client fallback either way |
 | `DECISIONS_WEIGHTS_ENABLED` | `true` | J4 quality-axis weights |
 | `DECISIONS_CATEGORY_ENABLED` | `true` | J2 category narrowing |
 | `DECISIONS_REASONING_GATE_ENABLED` | `true` | J5 reasoning gate |
-| `DECISIONS_STYLE_ENABLED` | `false` | Ch2 style (linear head); enable only with a floor from `make style-head-calibrate` |
-| `DECISIONS_STYLE_CONFIDENCE_FLOOR` | `0.5` | style acting floor; must be the calibrated value |
+| `DECISIONS_STYLE_ENABLED` | `true` | Ch2 style (linear head) at the calibrated floor |
+| `DECISIONS_STYLE_CONFIDENCE_FLOOR` | `0.6` | style acting floor; the A/B-winning operating point, must come from `models/style-head-calibration.json` |
 
 #### Run
 
