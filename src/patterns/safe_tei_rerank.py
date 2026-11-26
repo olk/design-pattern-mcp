@@ -18,7 +18,6 @@ import httpx
 
 from src.config import RerankerConfig
 from src.errors import ERROR_RETRIEVAL_UNAVAILABLE, DesignPatternError
-from src.patterns.tacit_rerank import TacitReranker
 from src.patterns.nodes import tokenize
 
 
@@ -136,13 +135,10 @@ class LexicalReranker:
 
 
 def build_reranker(config: RerankerConfig) -> RerankerProtocol:
-    """The reranker for ``config`` (§6 step 4).
+    """The reranker for ``config`` (§6 step 4): the mandatory TEI cross-encoder pass.
 
-    ``provider="tei"`` (default) is the mandatory cross-encoder pass and refuses an
-    empty ``base_url`` at construction. ``provider="tacit"`` wraps the AnyJev
-    ``POST /v1/decide`` per-candidate leg around exactly that TEI reranker, so an
-    unreachable Tacit stack degrades to the same cross-encoder pass instead of failing
-    retrieval.
+    ``provider="tei"`` is the only legal value (validated at config load) and refuses an
+    empty ``base_url`` at construction.
     """
     if not config.config.base_url.strip():
         raise DesignPatternError(
@@ -150,13 +146,4 @@ def build_reranker(config: RerankerConfig) -> RerankerProtocol:
             "reranker base_url is empty — the mandatory cross-encoder pass cannot start",
             hint="set RERANKER_BASE_URL or config/config.json reranker.config.base_url",
         )
-    tei = TEIReranker(config)
-    if config.provider == "tacit":
-        if not config.tacit_base_url.strip():
-            raise DesignPatternError(
-                ERROR_RETRIEVAL_UNAVAILABLE,
-                "reranker.provider is 'tacit' but tacit_base_url is empty",
-                hint="set RERANKER_TACIT_BASE_URL or config/config.json reranker.tacit_base_url",
-            )
-        return TacitReranker(config.tacit_base_url, config.tacit_timeout_seconds, fallback=tei)
-    return tei
+    return TEIReranker(config)

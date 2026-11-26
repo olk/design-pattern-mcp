@@ -45,42 +45,37 @@ class TestDefaults:
             "generator_timeout_seconds",
             "decisions_style_enabled",
             "decisions_style_model",
-            "decisions_weights_enabled",
-            "decisions_category_enabled",
-            "decisions_reasoning_gate_enabled",
             "reranker_provider",
         ):
             assert key in snapshot
 
-    def test_decisions_defaults_are_per_seam_and_off(self) -> None:
-        decisions = ServerConfig.model_validate({}).decisions
-        for seam in (decisions.style, decisions.weights, decisions.category, decisions.reasoning_gate):
-            assert seam.enabled is False
-            assert seam.api_key_env is None
-        assert decisions.style.model == "style-linear"
-        assert decisions.style.base_url == "http://design-pattern-style-head:8800/v1"
-        assert decisions.style.timeout_seconds == 10.0
-        assert decisions.weights.model == "tacit-4b"
-        assert decisions.weights.base_url == "http://design-pattern-tacit:8100"
-        assert decisions.weights.timeout_seconds == 30.0
-        assert decisions.category.confidence_floor == 0.5
-        assert decisions.reasoning_gate.timeout_seconds == 5.0
+    def test_the_decision_seam_defaults(self) -> None:
+        style = ServerConfig.model_validate({}).decisions.style
+        assert style.enabled is False
+        assert style.api_key_env is None
+        assert style.provider == "linear"
+        assert style.model == "style-linear"
+        assert style.base_url == "http://design-pattern-style-head:8800/v1"
+        assert style.confidence_floor == 0.5
+        assert style.timeout_seconds == 10.0
 
     def test_partial_seam_override_keeps_that_seams_own_endpoint(self) -> None:
         """A partial override must not fall back onto the generic seam defaults."""
-        decisions = ServerConfig.model_validate({"decisions": {"weights": {"enabled": True}}}).decisions
-        assert decisions.weights.enabled is True
-        assert decisions.weights.base_url == "http://design-pattern-tacit:8100"
-        assert decisions.weights.model == "tacit-4b"
-        assert decisions.weights.timeout_seconds == 30.0
-        # The siblings keep their own per-seam timeouts untouched.
+        decisions = ServerConfig.model_validate({"decisions": {"style": {"enabled": True}}}).decisions
+        assert decisions.style.enabled is True
+        assert decisions.style.base_url == "http://design-pattern-style-head:8800/v1"
+        assert decisions.style.model == "style-linear"
         assert decisions.style.timeout_seconds == 10.0
-        assert decisions.reasoning_gate.timeout_seconds == 5.0
 
     def test_a_seam_rejects_an_unknown_key(self) -> None:
         """Seams are closed: a misspelt knob must fail loudly instead of being ignored."""
         with pytest.raises(ValidationError):
             ServerConfig.model_validate({"decisions": {"style": {"confidence_flor": 0.5}}})
+
+    def test_removed_seam_keys_are_rejected_at_load(self) -> None:
+        """A config copied from an earlier release still carries the removed seams; extra=forbid refuses them."""
+        with pytest.raises(ValidationError):
+            ServerConfig.model_validate({"decisions": {"weights": {"enabled": True}}})
 
     def test_style_seam_is_linear_only(self) -> None:
         """The style seam has exactly one provider and one legal URL shape."""
@@ -99,61 +94,29 @@ class TestDefaults:
         assert style.base_url.endswith("/v1")
         with pytest.raises(ValidationError):
             ServerConfig.model_validate(
-                {"decisions": {"style": {"provider": "tacit", "base_url": "http://design-pattern-tacit:8100"}}}
+                {"decisions": {"style": {"provider": "hosted", "base_url": "http://example.invalid:8100"}}}
             )
 
-    @pytest.mark.parametrize(
-        ("seam", "payload"),
-        [
-            pytest.param(
-                "style",
-                {"provider": "linear", "base_url": "http://design-pattern-tacit:8100"},
-                id="linear-on-gateway",
-            ),
-            pytest.param(
-                "weights",
-                {"provider": "tacit", "base_url": "http://design-pattern-tacit:8100/v1"},
-                id="tacit-on-v1",
-            ),
-        ],
-    )
-    def test_a_half_switched_style_seam_fails_at_load(self, seam: str, payload: dict[str, object]) -> None:
+    def test_a_half_switched_style_seam_fails_at_load(self) -> None:
         """Flipping ``provider`` without its endpoint (or the reverse) is a startup error.
 
         Left interchangeable the mismatch 404s, and the degrade-never-raise contract turns it
         into a silently dead seam — exactly the state a hurried rollback produces.
         """
         with pytest.raises(ValidationError):
-            ServerConfig.model_validate({"decisions": {seam: payload}})
-
-    def test_a_heads_model_is_rejected_on_every_seam_but_style(self) -> None:
-        """No linear-head client exists for the other seams, so claiming one would be a lie."""
-        with pytest.raises(ValidationError):
             ServerConfig.model_validate(
-                {
-                    "decisions": {
-                        "weights": {
-                            "provider": "linear",
-                            "base_url": "http://design-pattern-style-head:8800/v1",
-                        }
-                    }
-                }
+                {"decisions": {"style": {"provider": "linear", "base_url": "http://decision-gateway:8100"}}}
             )
 
     def test_decisions_snapshot_values(self) -> None:
         snapshot = ServerConfig.model_validate({}).effective_parameters()
         assert snapshot["decisions_style_enabled"] is False
         assert snapshot["decisions_style_model"] == "style-linear"
-        assert snapshot["decisions_weights_enabled"] is False
-        assert snapshot["decisions_category_enabled"] is False
-        assert snapshot["decisions_reasoning_gate_enabled"] is False
         assert snapshot["reranker_provider"] == "tei"
 
     def test_reranker_provider_defaults_to_tei(self) -> None:
         reranker = ServerConfig.model_validate({}).reranker
         assert reranker.provider == "tei"
-        assert reranker.tacit_base_url == "http://design-pattern-tacit:8100"
-        assert reranker.tacit_timeout_seconds == 60.0
 
     def test_reranker_provider_rejects_unknown_value(self) -> None:
         with pytest.raises(ValidationError):
@@ -305,7 +268,7 @@ class TestRepositoryConfig:
         assert config.retrieval.dense_weight + config.retrieval.bm25_weight == pytest.approx(1.0)
 
     def test_repository_config_ships_the_style_seam_on(self) -> None:
-        """Shipped default: Ch2 style on (linear head); the Tacit seams stay off."""
+        """Shipped default: Ch2 style on (linear head)."""
         raw = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))
         config = ServerConfig.model_validate(expand_env_in_obj(raw))
         assert config.decisions.style.enabled is True
@@ -313,8 +276,6 @@ class TestRepositoryConfig:
         assert config.decisions.style.base_url == "http://design-pattern-style-head:8800/v1"
         assert config.decisions.style.model == "style-linear"
         assert config.decisions.style.confidence_floor == 0.6
-        for seam in (config.decisions.weights, config.decisions.category, config.decisions.reasoning_gate):
-            assert seam.enabled is False
 
     def test_repository_config_ships_both_tools_for_every_phase(self) -> None:
         raw = json.loads((REPO_ROOT / "config" / "config.json").read_text(encoding="utf-8"))

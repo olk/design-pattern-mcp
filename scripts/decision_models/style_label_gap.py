@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""The §4.7.1 style-label gap: authoring briefs, pool validation, the leakage gate, application.
+"""The 2026-11 style-label gap: authoring briefs, pool validation, the leakage gate, application.
 
 Why this exists
 ---------------
-``docs/tacit-fine-tune.md`` §4.7.1 blocks style-seam enablement on data volume, not modelling:
+The enable-path data preconditions block style-seam enablement on data volume, not modelling:
 139 reviewed train style labels and a 30-row holdout cannot certify a confidence floor. The
 recorded requirement is ``>= 500`` reviewed train style labels and ``>= 100`` holdout rows that
 are family-disjoint, with organic scenarios ``>= 70 %`` of new train rows and ``100 %`` of new
@@ -30,8 +30,7 @@ Subcommands
     intersection and id collisions. Non-zero exit on any violation.
 ``apply``
     Append accepted rows to the corpus (``tests/benchmark/scenarios/full.json``), to
-    ``STYLE_LABELS`` in ``derive_style_labels.py``, and regenerate ``qa/typed/style.jsonl`` plus
-    the mirrored ``qa/typed/choice.jsonl``. Existing corpus rows keep their order and bytes, so
+    ``STYLE_LABELS`` in ``derive_style_labels.py``, and regenerate ``qa/typed/style.jsonl``. Existing corpus rows keep their order and bytes, so
     a benchmark arm that cuts the first N scenarios still sees the same N.
 
 Every artifact this writes is derived from the corpus and the label source; nothing here is
@@ -61,7 +60,6 @@ from src.style_affinity import STYLE_AFFINITY  # noqa: E402
 DEFAULT_CORPUS = "tests/benchmark/scenarios/full.json"
 DEFAULT_LABELS = "scripts/decision_models/derive_style_labels.py"
 DEFAULT_STYLE_OUT = "qa/typed/style.jsonl"
-DEFAULT_CHOICE_OUT = "qa/typed/choice.jsonl"
 
 #: Candidate-pool targets. Sized for a ~610-label reviewed corpus at the plan's 65 % yield
 #: assumption; the 500-label gate survives a yield as low as 50 % (361 / 720).
@@ -777,31 +775,6 @@ def insert_style_labels(source: str, entries: Mapping[str, tuple[str, str]], hea
     return "".join([*lines[:close_index], *block, *lines[close_index:]])
 
 
-def choice_rows(
-    corpus: Mapping[str, Any], criteria: Mapping[str, str], instructions: str, digest: str
-) -> list[dict[str, Any]]:
-    """The mirrored J2 category rows: one per corpus scenario, in corpus order."""
-    rows: list[dict[str, Any]] = []
-    for scenario in corpus["scenarios"]:
-        rows.append(
-            {
-                "type": "choice",
-                "id": f"{scenario['scenario_id']}:choice",
-                "state": scenario["description"],
-                "instructions": instructions,
-                "criteria": dict(criteria),
-                "label": scenario["category"],
-                "source": {
-                    "corpus": DEFAULT_CORPUS,
-                    "corpus_sha12": digest,
-                    "scenario_id": scenario["scenario_id"],
-                    "split": scenario["split"],
-                },
-            }
-        )
-    return rows
-
-
 def corpus_text(corpus: Mapping[str, Any]) -> str:
     """Serialize a corpus document exactly as the repository stores it (verified round-trip)."""
     return json.dumps(dict(corpus), indent=2, ensure_ascii=False) + "\n"
@@ -813,10 +786,9 @@ def apply_pool(
     corpus_path: Path,
     labels_path: Path,
     style_out: Path,
-    choice_out: Path,
     header: str,
 ) -> dict[str, Any]:
-    """Append accepted rows to the corpus and label source, then regenerate both artifacts."""
+    """Append accepted rows to the corpus and label source, then regenerate the style rows."""
     corpus = load_corpus(corpus_path)
     existing = {str(scenario["scenario_id"]) for scenario in corpus["scenarios"]}
     labels = read_style_labels(labels_path)
@@ -841,25 +813,12 @@ def apply_pool(
     labels_path.write_text(insert_style_labels(labels_path.read_text(encoding="utf-8"), new_labels, header), "utf-8")
     digest = hashlib.sha256(corpus_path.read_bytes()).hexdigest()[:12]
     style_count = _regenerate_style_rows(labels_path, corpus_path, style_out)
-    criteria, instructions = _choice_preamble(choice_out)
-    rows = choice_rows(corpus, criteria, instructions, digest)
-    choice_out.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
     return {
         "appended_scenarios": len(new_scenarios),
         "appended_labels": len(new_labels),
         "style_rows": style_count,
-        "choice_rows": len(rows),
         "corpus_sha12": digest,
     }
-
-
-def _choice_preamble(choice_out: Path) -> tuple[Mapping[str, str], str]:
-    """The criteria glosses and instructions already used by ``choice.jsonl`` (row 1)."""
-    for line in choice_out.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            row = json.loads(line)
-            return row["criteria"], row["instructions"]
-    raise SystemExit(f"{choice_out} carries no rows to copy the criteria preamble from")
 
 
 def _regenerate_style_rows(labels_path: Path, corpus_path: Path, style_out: Path) -> int:
@@ -1041,7 +1000,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
         corpus_path=Path(args.corpus),
         labels_path=Path(args.labels),
         style_out=Path(args.style_out),
-        choice_out=Path(args.choice_out),
         header=args.header,
     )
     print(json.dumps(result, indent=2))
@@ -1085,7 +1043,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     apply_cmd.add_argument("--corpus", default=DEFAULT_CORPUS)
     apply_cmd.add_argument("--labels", default=DEFAULT_LABELS)
     apply_cmd.add_argument("--style-out", default=DEFAULT_STYLE_OUT)
-    apply_cmd.add_argument("--choice-out", default=DEFAULT_CHOICE_OUT)
     apply_cmd.add_argument("--header", default="style-label gap 2026-11")
     apply_cmd.set_defaults(func=cmd_apply)
     return parser.parse_args(argv)

@@ -27,7 +27,6 @@ from src.patterns.retriever import RetrievalIndex
 from src.patterns.safe_tei_rerank import build_reranker
 from src.pipeline import DesignPipeline, compose_selection
 from src.decisions.client import DecisionModelClient
-from src.decisions.tacit import TacitClient, reasoning_gate
 from src.reasoning.client import ReasoningClient
 from src.schemas import AnalysisResult, PipelineResult
 
@@ -137,11 +136,6 @@ def _style_client(seam: Any) -> DecisionModelClient | None:
     return None if not seam.enabled or _unconfigured(seam) else DecisionModelClient(seam)
 
 
-def _tacit_client(seam: Any) -> TacitClient | None:
-    """The Tacit client for one seam, or None when the seam is off/unconfigured."""
-    return None if not seam.enabled or _unconfigured(seam) else TacitClient(seam)
-
-
 def _seam_provenance(name: str, seam: Any, client: Any, client_type: str) -> str:
     """``name=wired|unconfigured|disabled`` — read off the wired object, never the flag."""
     if client is not None:
@@ -159,7 +153,6 @@ class LiveExecutor:
     def __init__(
         self,
         *,
-        gate_client: TacitClient | None,
         config: ServerConfig,
         catalog: PatternLoader,
         recorder: StageRecorder,
@@ -172,7 +165,6 @@ class LiveExecutor:
         self._recorder = recorder
         self._pipeline = pipeline
         self._reasoning_health = reasoning_health
-        self._gate_client = gate_client
         self._index_source = index_source
         self.recorder = recorder
 
@@ -205,19 +197,15 @@ class LiveExecutor:
         )
         agent = build_llm_client(config)
         llm = LLMTimingProxy(agent, recorder)
-        # Mirror DesignPatternServer._wire_decision_seams: an arm that turns a seam on must
+        # Mirror DesignPatternServer._wire_decision_seams: an arm that turns the seam on must
         # actually get the client, or the run is silently A/A and the manifest lies about it.
         style_client = _style_client(config.decisions.style)
-        weights_client = _tacit_client(config.decisions.weights)
-        category_client = _tacit_client(config.decisions.category)
-        gate_client = _tacit_client(config.decisions.reasoning_gate)
         reasoning_inner: ReasoningClient | None = None
         reasoning_health: dict[str, str] | None = None
         if config.reasoning.enabled:
             reasoning_inner = ReasoningClient(  # type: ignore[arg-type]  # runtime is DesignAgent
                 config.reasoning,
                 agent,
-                gate=reasoning_gate(gate_client, config.decisions.reasoning_gate),
             )
             reasoning_health = await reasoning_inner.health_check()
         pipeline = DesignPipeline(
@@ -231,25 +219,9 @@ class LiveExecutor:
                 else None
             ),
             style_client=style_client,
-            weights_client=weights_client,
-            category_client=category_client,
         )
         pipeline.validate()
-        if any(
-            seam.enabled and not _unconfigured(seam)
-            for seam in (
-                config.decisions.style,
-                config.decisions.weights,
-                config.decisions.category,
-                config.decisions.reasoning_gate,
-            )
-        ) and not (style_client or weights_client or category_client or gate_client):
-            raise RuntimeError(
-                "decision seams are enabled but no client was wired — an arm like this would "
-                "measure A/A and record a false provenance line"
-            )
         return cls(
-            gate_client=gate_client,
             config=config,
             catalog=catalog,
             recorder=recorder,
@@ -259,15 +231,11 @@ class LiveExecutor:
         )
 
     def _describe_decision_seams(self) -> str:
-        """One provenance line naming every seam's wired state (never a flag alone)."""
-        decisions = self._config.decisions
-        parts = [
-            _seam_provenance("style", decisions.style, self._pipeline._style_client, "DecisionModelClient"),
-            _seam_provenance("weights", decisions.weights, self._pipeline._weights_client, "TacitClient"),
-            _seam_provenance("category", decisions.category, self._pipeline._category_client, "TacitClient"),
-            _seam_provenance("gate", decisions.reasoning_gate, self._gate_client, "TacitClient"),
-        ]
-        return " ".join(parts) + f" reranker={self._config.reranker.provider}"
+        """One provenance line naming the seam's wired state (never a flag alone)."""
+        style = _seam_provenance(
+            "style", self._config.decisions.style, self._pipeline._style_client, "DecisionModelClient"
+        )
+        return f"{style} reranker={self._config.reranker.provider}"
 
     def describe(self) -> dict[str, Any]:
         """Seam provenance: real objects behind timing proxies plus the reasoning health map."""

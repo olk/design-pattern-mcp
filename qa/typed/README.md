@@ -1,14 +1,8 @@
-# Typed labels for decision-model finetuning
+# Typed labels for the Ch2 style seam
 
-3,914 typed labels derived from `tests/benchmark/scenarios/full.json`
-(the 2,169 script-derived rows over the original 169 scenarios, plus 857 reviewed
-style rows and 857 mirrored choice rows): the noul labels are script-derived from
-the 169 original scenarios (no new review burden); the style labels are per-scenario
-reviewed judgments with a quoted rationale each
-(`scripts/decision_models/derive_style_labels.py`).
-Corpus labels are agent-curated, **human expert review pending**.
+857 reviewed style rows: one per scenario of `tests/benchmark/scenarios/full.json` (the corpus grew from 169 to 857 scenarios in the 2026-11 style-label gap work). Each row is a per-scenario reviewed judgment with a quoted rationale (`scripts/decision_models/derive_style_labels.py`). The label source is agent-curated; `review.json` records the review state (two-blind-annotator pass plus adjudication, and the project owner's sampled audit sheet).
 
-The 2026-11 style-label gap work (§4.7.1 of `docs/tacit-fine-tune.md`) took the
+The 2026-11 style-label gap work (the 2026-11 gap plan, since deleted — see git history) took the
 corpus from 169 to 857 scenarios: 688 candidates were labelled by **two blind
 model annotators** under `qa/typed/style-rubric.md` with opaque row ids, Cohen's
 kappa recorded per batch (0.978-0.993 train, 0.981 and 1.000 holdout), and every
@@ -23,16 +17,11 @@ says so explicitly).
 
 ## Files
 
-| file | n | shape | seam |
+| file | n | shape | use |
 |---|---|---|---|
-| `choice.jsonl` | 857 | `state` + 9 `criteria` + `label` (category) | J2 category |
-| `style.jsonl` | 857 | `state` + 36 `criteria` + `label` (style) | Ch2 style |
-| `noul.jsonl` | 2000 | `state` + `proposition` + boolean `label` (+ `candidate_text`) | J1 per-candidate relevance |
-| `rerank_pairs.jsonl` | 2000 | `statement` + `document` (+ `gain`, `split`, `name`) | J1 serving bytes (train + eval) |
-| `review.json` | — | per-scenario human review ledger | Ch2 enable-path gate |
+| `style.jsonl` | 857 | `state` + 36 `criteria` + `label` (style) | Ch2 style: head training and floor calibration |
+| `review.json` | — | per-scenario review ledger | Ch2 enable-path gate |
 
-- Choice: 1 per scenario, criteria = the 9 catalog categories with a one-line
-  gloss each, label = the scenario's category.
 - Style: 1 per scenario, criteria/instructions = the served Ch2 vocabulary verbatim
   (`src/decisions/seam_prompts.py` shared vocabulary), `state` = the raw scenario
   description bytes the seam receives, label = the reviewed dominant
@@ -52,59 +41,11 @@ says so explicitly).
   expert sign-off — and `make style-head-calibrate` refuses to recommend a confidence
   floor until the ledger certifies the label source byte-for-byte — no calibrated
   floor exists for unreviewed labels.
-- Noul: 20 per scenario over the 100 scenarios authored 2026-10-27 (the 2026-11
-  style-exemplar scenarios added no noul rows) — every labeled pattern is a
-  positive (`label_tier`: `primary` / `acceptable_primary` / `supporting`),
-  padded with cross-category negatives (`label_tier: negative`, deterministic
-  per-scenario seed) for a fixed 20. Verdict: 307 true / 1693 false.
-  `candidate_text` is the compact catalog evidence (`name: intent` + problem
-  excerpt); `proposition` embeds it so single-text trainers also see description
-  alignment, not just names. It is **not** the served rerank text, which is each
-  record's `document_text` (`src/patterns/loader.py`).
-- Rerank pairs: one row per (scenario, candidate) over **both** splits — the
-  `decision_statement` the pipeline serves plus the candidate record's
-  `document_text`, i.e. exactly one stage-2 `yes_no` item
-  (`seam_prompts.rerank_state`). `train` rows (1,400) feed
-  `tacit_self_distill.py --rerank-pairs`; `holdout` rows (600) are eval material
-  only. `gain` is the reviewed `label_tier` as a TREC graded-relevance step
-  (primary 3 / acceptable_primary 2 / supporting 1 / negative 0) for nDCG.
-  Derived by `scripts/decision_models/derive_rerank_pairs.py` (`make tacit-payloads`)
-  because the Tacit image has no pattern catalog; regenerate after any corpus,
-  noul or catalog change (`make tacit-payloads-check` byte-compares, and the Tacit
-  cache marker pins it).
 
 ## Split
 
-Train = 2,258, holdout = 768 (choice + style: 719/138 each; noul: 1,400/600).
-Families never cross the split. Train on `source.split == "train"`; fit thresholds
-/ temperature on held-out **families**, not training rows (recommendation §6.6).
+Train = 719, holdout = 138. Families never cross the split. Train on `source.split == "train"`; fit thresholds / temperature on held-out **families**, not training rows. The style split is the enable-path instrument: 719 train labels (>= the 500 floor, every class >= 13 rows) and 138 family-disjoint holdout rows (>= the 100 floor, every class >= 2 rows), so a confidence floor is measured over the whole served vocabulary.
 
-The style split is the §4.7.1 instrument: 719 train labels (>= the 500 floor, every
-class >= 13 rows) and 138 family-disjoint holdout rows (>= the 100 floor, every class
->= 2 rows) so a confidence floor is measured over the whole served vocabulary
-instead of the 11 classes the 30-row holdout happened to contain.
+## Ledger re-stamp (2026-11-26)
 
-The rerank pairs keep the same rule: `tacit_self_distill.load_rerank_pairs` reads
-`split == "train"` rows only, so the holdout pairs can never reach the weights.
-
-## Recipe fit
-
-Per `docs/recommendation_design-pattern-mcp_decision-models.md` §4/§7.5:
-
-- **AnyJev Tacit-4B** serves every seam and is trained by self-distillation
-  (`scripts/decision_models/tacit_self_distill.py`), which needs no human labels:
-  the released checkpoint writes states, answers its own questions with thinking,
-  and a QLoRA student reproduces the label distribution in one forward. The
-  training problems are the served questions — category, weights and gate from
-  `build_problems`, and the J1 `yes_no` items from `rerank_pairs.jsonl`. These typed
-  labels are therefore **evaluation and calibration** data for the Tacit seams, and
-  **training** data for the linear Ch2 style head: `make style-head-calibrate` replays
-  the holdout style rows through the served `/v1/systemone` path to produce the seam's
-  floor, and the holdout rerank pairs score the leg (nDCG) without touching the weights.
-- **Eikos-4B** (LoRA r64), **Clef-flash-9B** (QLoRA), **Kev-4B**
-  (`kev.train --init_from`) each want 500–2,000 labeled decisions — this
-  export (2,258 train) is in budget. Kev's data shape is the API shape plus
-  `label`, exactly these records.
-
-Label tiers double as sample weights: `primary` > `acceptable_primary` >
-`supporting` > `negative`.
+`scripts/decision_models/derive_style_labels.py` changed in a comment-only edit (three stale references removed: two to the deleted `qa/typed/choice.jsonl`, one to a script that no longer exists). `review.json` was re-stamped to the new sha256 with `style_label_review.py certify --carry-forward`: the tool's documented semantics — a carried entry is a claim about the label, not about the file bytes — so every one of the 857 verdicts was carried unchanged. This is a re-stamp, **not a re-review**; `models/style-head-calibration.json` keeps the digest it recorded at calibration time (`8b1bc3313211`).

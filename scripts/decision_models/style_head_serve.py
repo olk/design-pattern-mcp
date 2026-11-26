@@ -27,8 +27,7 @@ Design notes that are load-bearing:
   floor.
 * **The bind address is the caller's choice.** The CMD passes ``--host 0.0.0.0`` so the
   compose bridge can forward; the loopback-only publish in
-  ``docker/docker-compose.decision-models.yml`` is what confines it, exactly as
-  ``docker/tacit-entrypoint.sh`` does for the Tacit gateway.
+  ``docker/docker-compose.yml`` is what confines it.
 
 Delivery is one temperature-free ``predict_proba`` per request, so identical bytes in give
 identical bytes out; the seam's own LRU cache sits in front of this.

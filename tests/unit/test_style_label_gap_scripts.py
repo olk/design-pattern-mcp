@@ -363,10 +363,14 @@ def test_dedup_command_reads_each_side_by_its_own_split(gap: types.ModuleType, t
     code = gap.main(
         [
             "dedup",
-            "--corpus", str(corpus),
-            "--holdout", str(pool),
-            "--train-pool", str(pool),
-            "--report", str(tmp_path / "dedup.json"),
+            "--corpus",
+            str(corpus),
+            "--holdout",
+            str(pool),
+            "--train-pool",
+            str(pool),
+            "--report",
+            str(tmp_path / "dedup.json"),
         ]
     )
     assert code == 0
@@ -468,7 +472,12 @@ def test_disputed_row_keeps_the_adjudicators_reason_even_when_the_label_matches_
     """The reason explains a disagreement, so it must survive a final label the brief also wanted."""
     ids = [f"s{index}" for index in range(8)]
     pool = [
-        {"scenario_id": sid, "split": "train", "description": "d", "_pool": {"style": "broker", "rationale": "authored"}}
+        {
+            "scenario_id": sid,
+            "split": "train",
+            "description": "d",
+            "_pool": {"style": "broker", "rationale": "authored"},
+        }
         for sid in ids
     ]
     pack = _write(tmp_path / "batch-02.blind.jsonl", [{"scenario_id": sid, "state": "d"} for sid in ids])
@@ -589,22 +598,6 @@ def test_corpus_serialization_round_trips() -> None:
     raw = path.read_text(encoding="utf-8")
     module = _load("style_label_gap", "style_label_gap.py")
     assert module.corpus_text(json.loads(raw)) == raw
-
-
-def test_choice_rows_mirror_the_corpus_categories() -> None:
-    """The choice mirror is derived, so its labels must be the corpus categories verbatim."""
-    module = _load("style_label_gap", "style_label_gap.py")
-    corpus = {
-        "_meta": {},
-        "scenarios": [
-            {"scenario_id": "s1", "description": "d1", "category": "behaviour-selection", "split": "train"},
-            {"scenario_id": "s2", "description": "d2", "category": "domain-modeling", "split": "holdout"},
-        ],
-    }
-    rows = module.choice_rows(corpus, {"a": "gloss"}, "Which?", "deadbeef1234")
-    assert [row["label"] for row in rows] == ["behaviour-selection", "domain-modeling"]
-    assert [row["source"]["split"] for row in rows] == ["train", "holdout"]
-    assert all(row["source"]["corpus_sha12"] == "deadbeef1234" for row in rows)
 
 
 def test_blind_packs_carry_no_labels_and_no_style_in_the_id(review: types.ModuleType, tmp_path: Path) -> None:

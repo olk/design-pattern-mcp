@@ -9,8 +9,6 @@ This directory contains the systemd unit that starts the
 |---|---|
 | `docker/docker-compose.yml` (repo root) | **Development**. Has `build:` sections, designed for `make docker-up`. |
 | `systemd/docker-compose.yml` (this dir) | **Production / systemd**. No `build:` (images pre-built), absolute paths, designed for `systemctl enable`. |
-| `systemd/docker-compose.decision-models.yml` | Opt-in overlay: Tacit gateway URLs + in-stack CPU sidecar (profile `tacit-cpu`). Enabled via `COMPOSE_FILE` in `.env`. |
-| `systemd/docker-compose.tacit-cpu.yml` | CPU-lane overlay: budgets for the in-stack sidecar (third in `COMPOSE_FILE`). |
 
 ## Prerequisites
 
@@ -22,10 +20,7 @@ This directory contains the systemd unit that starts the
 
 ## Step 0 — Build or pull images
 
-This host is GPU-less by design, so it builds the CPU images only — the full
-`make docker-build-all` includes Tacit's GPU self-distill and aborts here on the
-committed sentinels (weights untracked). Serve Tacit from a GPU host over the
-network, or in-stack via the CPU sidecar ("Decision models" below).
+This host is GPU-less by design, so it builds the CPU images only; every image in the base set is CPU-only.
 
 ```bash
 # From the repo root (server + TEI pair + style head):
@@ -45,10 +40,8 @@ sudo systemctl enable --now pattern-tei-infra.service
 # 1. Create deployment directory.
 sudo install -d /etc/design-pattern-mcp/config
 
-# 2. Copy the production compose files (base + decision overlay + CPU lane).
+# 2. Copy the production compose file.
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
-sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
-sudo install -m 644 systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/
 # 3. Copy application config.
 sudo install -m 644 ~/.config/design-pattern-mcp/config.json \
                 /etc/design-pattern-mcp/config/
@@ -86,93 +79,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8812/mcp" \
 |---|---|---|
 | TEI embed / rerank | external `pattern-tei-infra` (`pattern-tei-shared`) | shared GPU/CPU infra, one copy for all pattern servers |
 | style head (Ch2) | in this stack (`design-pattern-style-head`) | CPU-only, no GPU, no port — the seam ships on and must resolve |
-| Tacit gateway (J1/J2/J4/J5) | GPU host, plain HTTP (`http://tacit:8100` by default) | needs a card; `anyjev.serve` has no auth, so trusted networks only |
-| Tacit CPU sidecar | this stack, profile `tacit-cpu` (`tacit`) + `tacit-cpu.yml` lane file | GPU-less prod: in-stack BF16 gateway with CPU-sized budgets, rerank stays TEI |
 
-## Decision models
+## Style head
 
-Three files: `docker-compose.yml` runs MCP + style head (Ch2 on, floor 0.6) with
-TEI external; `docker-compose.decision-models.yml` adds the env that points the
-Tacit seams at a gateway; `docker-compose.tacit-cpu.yml` retunes the lane budgets
-for the in-stack CPU sidecar (GPU-less prod only). Enable the overlay persistently
-in `/etc/design-pattern-mcp/.env`:
-
-```
-COMPOSE_FILE=docker-compose.yml:docker-compose.decision-models.yml
-```
-
-then `sudo systemctl reload design-pattern-mcp`. To run a published head build
-instead of the local one, set `STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:<tag>`
-in the same `.env`.
-
-The shipped Tacit weights are Tacit-4B fine-tuned for design-pattern selection
-(baked by `make docker-build-tacit` on a GPU builder); `:base` is the released,
-untrained checkpoint.
-
-The Tacit seams (J1 rerank, J2 category, J4 weights, J5 gate) stay **off** until the
-overlay is on AND the switches below are set. The gateway lives on a GPU host and is
-reached over plain HTTP.
-
-1. **GPU host** — run the gateway on a trusted-network address (it has no auth of its
-   own — never a publicly reachable port):
-
-   ```bash
-   make docker-build-tacit            # tags :1.0.1 and :latest
-   docker run -d --name design-pattern-tacit --restart unless-stopped \
-     --device nvidia.com/gpu=0 -p 10.0.0.5:8100:8100 \
-     design-pattern-tacit:latest
-   ```
-
-   (Replace `10.0.0.5` with the host's firewalled private address; the entrypoint
-   listens on `0.0.0.0` inside the container, so the publish is what confines it.)
-
-GPU-less hosts skip the external gateway and serve the seams in-stack instead.
-`make docker-build-tacit-cpu` bakes the BF16 sidecar (needs the trained checkpoint
-from the GPU builder — `docs/tacit-fine-tune.md` §4.9), then layer the CPU lane
-third and enable its profile in `/etc/design-pattern-mcp/.env`:
-
-```
-COMPOSE_FILE=docker-compose.yml:docker-compose.decision-models.yml:docker-compose.tacit-cpu.yml
-COMPOSE_PROFILES=tacit-cpu
-```
-
-No URL change needed: the sidecar is named `tacit` and the lane pins every Tacit
-endpoint to `http://tacit:8100` — leftover `TACIT_GATEWAY_URL` / `RERANKER_PROVIDER`
-lines from the GPU path are inert while the lane file is layered, so a migration
-only changes `COMPOSE_FILE` and adds the profile. The lane file is what makes the
-seams usable on CPU — weights/category/gate timeouts 900/120/30 s,
-`TASKS_DEADLINE_SECONDS=3600` for the ~466 s weights call — and it pins rerank to
-TEI (the Tacit full-text leg is hours per analyze on CPU).
-
-2. **`/etc/design-pattern-mcp/.env`** — gateway address plus the seam switches
-   (all default off):
-
-   ```
-   COMPOSE_FILE=docker-compose.yml:docker-compose.decision-models.yml
-   TACIT_GATEWAY_URL=http://10.0.0.5:8100
-   DECISIONS_WEIGHTS_ENABLED=true
-   DECISIONS_CATEGORY_ENABLED=true
-   DECISIONS_REASONING_GATE_ENABLED=true
-   RERANKER_PROVIDER=tacit
-   ```
-
-   `TACIT_GATEWAY_URL` feeds all four Tacit endpoints (each `*_BASE_URL` still wins
-   individually when set). The overlay default assumes a host named `tacit`.
-
-   ```bash
-   sudo systemctl reload design-pattern-mcp
-   ```
-
-   Startup log shows `ok (tacit, model=tacit-4b)` per seam; any transport failure degrades silently to
-   the non-model path, so check the logs for `degraded` warnings if a seam reports
-   `ok` but behaves like the baseline.
-
-Never by including the dev overlay `docker/docker-compose.decision-models.yml` (a
-different file from the systemd overlay above): its
-`depends_on: design-pattern-tacit: service_healthy` would make the production server
-unstartable without a local healthy gateway. Same for the dev CPU file
-`docker/docker-compose.tacit-cpu.yml`: it overrides a `design-pattern-tacit` service
-this stack does not define, on networks it does not join.
+`docker-compose.yml` runs MCP + style head (Ch2 on, floor 0.6) with TEI external; no overlay is needed. To run a published head build instead of the local one, set `STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:<tag>` in `/etc/design-pattern-mcp/.env`, then `sudo systemctl reload design-pattern-mcp`. To stand the seam down, set `DECISIONS_STYLE_ENABLED=false` in the same file.
 
 ## Updating
 

@@ -139,9 +139,7 @@ async def reasoning_log_handler(message: LogMessage) -> None:
     greppable while the record's level is DEBUG.
     """
     level = str(message.level).lower()
-    level_no = (
-        logging.DEBUG if level in _DEMOTED_MCP_LEVELS else _MCP_LEVELS.get(level, logging.INFO)
-    )
+    level_no = logging.DEBUG if level in _DEMOTED_MCP_LEVELS else _MCP_LEVELS.get(level, logging.INFO)
     prefix = f"Received {message.level.upper()} from server"
     if message.logger:
         prefix += f" ({message.logger})"
@@ -237,8 +235,7 @@ def _coerce_shannon_stage(phase: str) -> str:
     """Map a DPML phase name onto shannonthinking's thoughtType enum."""
     tag = _PHASE_TAG_ALIASES.get(phase.strip().lower())
     if tag is None:
-        logger.debug("Unknown reasoning phase %r; defaulting shannon stage to %s",
-                     phase, _DEFAULT_SHANNON_STAGE)
+        logger.debug("Unknown reasoning phase %r; defaulting shannon stage to %s", phase, _DEFAULT_SHANNON_STAGE)
         return _DEFAULT_SHANNON_STAGE
     return tag
 
@@ -261,11 +258,9 @@ class ReasoningClient:
         self,
         config: ReasoningConfig,
         agent: DesignAgent,
-        gate: Callable[[str, dict[str, Any]], Awaitable[bool | None]] | None = None,
     ) -> None:
         self._config = config
         self._agent = agent
-        self._gate = gate
         self._trace_cache: OrderedDict[tuple[str, str, int], ReasoningTrace] = OrderedDict()
         self._inflight: dict[tuple[str, str, int], asyncio.Future[ReasoningTrace]] = {}
         self._clients: dict[str, Client[StdioTransport]] = {}
@@ -292,11 +287,6 @@ class ReasoningClient:
 
         A phase whose strategy is disabled returns an empty, non-degraded trace
         before the cache is consulted.
-
-        The optional ``gate`` (the J5 decision-model seam) can veto the deliberation
-        for one call: ``False`` returns the same empty, non-degraded trace a disabled
-        phase produces, ``True``/``None`` proceed. The gate is fail-open by contract —
-        it is asked before the cache so a gated-out call consumes no cache slot.
         """
         if not self.enabled or self._closed:
             return self._degraded_trace(phase, "reasoning disabled")
@@ -305,12 +295,6 @@ class ReasoningClient:
             # A disabled phase contributes an empty context, not the degraded
             # in-prompt scaffold: no generator call, no subprocess, no cache entry.
             return ReasoningTrace(phase=phase)
-        if self._gate is not None:
-            proceed = await self._ask_gate(phase, context_payload)
-            if proceed is False:
-                logger.debug("Reasoning gate skipped deliberation", extra={"phase": phase})
-                return ReasoningTrace(phase=phase)
-
         key = _cache_key(phase, context_payload)
         if key is not None:
             cached = self._trace_cache.get(key)
@@ -321,19 +305,6 @@ class ReasoningClient:
             if joined is not None:
                 return joined
         return await self._run_loop(phase, strategy, context_payload, key)
-
-    async def _ask_gate(self, phase: str, context_payload: dict[str, Any]) -> bool | None:
-        """Ask the J5 gate, failing open: a broken gate must never fail a tool call."""
-        gate = self._gate
-        if gate is None:  # pragma: no cover - callers check first
-            return None
-        try:
-            return await gate(phase, context_payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - the gate is an optional accelerator
-            logger.warning("Reasoning gate failed; proceeding with reasoning: %s", exc)
-            return None
 
     async def _join_in_flight(
         self,
@@ -379,9 +350,7 @@ class ReasoningClient:
             raise
         except Exception as exc:  # noqa: BLE001 - degradation contract
             logger.warning("Reasoning loop for phase %s degraded: %s", phase, exc)
-            trace = self._degraded_trace(
-                phase, f"{type(exc).__name__}: {exc}"
-            )
+            trace = self._degraded_trace(phase, f"{type(exc).__name__}: {exc}")
         finally:
             self._publish_result(key, future, trace)
         if key is not None:
@@ -535,14 +504,8 @@ class ReasoningClient:
     ) -> str:
         """One MCP round trip over the cached persistent stdio client."""
         client = await self._get_client(contract)
-        phase_tag = (
-            draft.phase_tag
-            if contract.name == CODE_TOOL.name
-            else _coerce_shannon_stage(draft.phase_tag)
-        )
-        payload = draft_to_params(
-            _with_phase_tag(draft, phase_tag), contract, number, total
-        )
+        phase_tag = draft.phase_tag if contract.name == CODE_TOOL.name else _coerce_shannon_stage(draft.phase_tag)
+        payload = draft_to_params(_with_phase_tag(draft, phase_tag), contract, number, total)
         try:
             result = await client.call_tool(contract.name, payload)
         except BaseException:
@@ -559,9 +522,7 @@ class ReasoningClient:
         checks: tuple[tuple[ReasoningTool, list[str] | str], ...] = tuple(
             (
                 tool,
-                self._config.shannonthinking_cmd
-                if tool == "shannon"
-                else self._config.code_reasoning_cmd,
+                self._config.shannonthinking_cmd if tool == "shannon" else self._config.code_reasoning_cmd,
             )
             for tool in self._config.active_tools()
         )
@@ -656,11 +617,7 @@ def _resolve_cmd(tool_key: str, cmd: list[str] | str) -> list[str]:
     if cmd:
         return cmd
     if tool_key == SHANNON_TOOL.name:
-        return (
-            list(SHANNON_EMBEDDED_CMD)
-            if os.path.exists(SHANNON_EMBEDDED_CMD[1])
-            else list(SHANNON_NPX_CMD)
-        )
+        return list(SHANNON_EMBEDDED_CMD) if os.path.exists(SHANNON_EMBEDDED_CMD[1]) else list(SHANNON_NPX_CMD)
     return (
         list(CODE_REASONING_EMBEDDED_CMD)
         if os.path.exists(CODE_REASONING_EMBEDDED_CMD[1])
@@ -689,6 +646,4 @@ def render_context(payload: dict[str, Any]) -> str:
 def render_prior_steps(steps: list[ReasoningStep]) -> str:
     if not steps:
         return ""
-    return "\n\nPrior steps:\n" + "\n".join(
-        f"- [{s.tool}/{s.phase_tag}] {s.thought}" for s in steps
-    )
+    return "\n\nPrior steps:\n" + "\n".join(f"- [{s.tool}/{s.phase_tag}] {s.thought}" for s in steps)

@@ -4,7 +4,7 @@
 The seam's two neural providers were measured and rejected on the same 138-row
 family-disjoint holdout (0.507 and 0.457 accuracy against a 0.65 bar; numbers preserved
 in ``docs/linear-style-head.md`` §1), while a linear model over the SAME 719 train labels
-scored 0.833 (``docs/tacit-fine-tune.md`` §4.7.1). The task is a lexical read that a frozen
+scored 0.833 (``docs/linear-style-head.md`` §2). The task is a lexical read that a frozen
 encoder's contrastive heads do not extract, so the surviving provider is a bag of n-grams.
 
 **The classifier is not the one the plan first named, and that is a recorded correction.**

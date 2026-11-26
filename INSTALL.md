@@ -188,22 +188,17 @@ docker tag "olkowa/design-pattern-mcp:${VERSION}" design-pattern-mcp:latest
 docker pull "olkowa/design-pattern-style-head:${VERSION}"
 docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-head:latest
 # (If a pull 404s — no published release yet — build locally and skip the retag:
-# `make docker-build-base`; the unit inspects
-# the `:latest` tags, which the local builds already tag. Never `make docker-build-all`
-# here: Tacit's self-distill aborts on this GPU-less host.)
+# `make docker-build-base`; the unit inspects the `:latest` tags, which the local builds already tag.)
 ```
 
 (`design-pattern-mcp.service` runs `ExecStartPre=docker image inspect` on both
-`:latest` tags — the retags are what make that pass — plus a conditional inspect
-of the CPU Tacit image when `COMPOSE_PROFILES=tacit-cpu` selects the CPU lane.)
+`:latest` tags — the retags are what make that pass.)
 
 ### B2 — configuration files under `/etc/design-pattern-mcp/`
 
 ```bash
 sudo install -d /etc/design-pattern-mcp/config
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
-sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
-sudo install -m 644 systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/
 # The repo config is the canonical template ({env:VAR:-default} expansion;
 # compose-provided env vars override it).
 sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
@@ -254,7 +249,7 @@ sudo systemctl reload   design-pattern-mcp   # recreate containers after editing
 sudo systemctl reload design-pattern-mcp
 # Logs
 journalctl -u design-pattern-mcp -n 50
-COMPOSE_FILE=/etc/design-pattern-mcp/docker-compose.yml:/etc/design-pattern-mcp/docker-compose.decision-models.yml docker compose -p dpml-systemd logs -f
+docker compose -p dpml-systemd logs -f
 ```
 
 ## Dense-embedding cache (restart durability)
@@ -311,7 +306,7 @@ probe embedding instead of a full corpus pass.
 - **Upgrading from a pre-volume deployment**: the older compose file has no mount — the
   cache then lives in the container layer and dies with the container. Re-install the
   compose files for your path — Path B:
-  `sudo install -m 644 systemd/docker-compose.yml systemd/docker-compose.decision-models.yml systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/` (B2);
+  `sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/` (B2);
   Path A: `make docker-build` — then recreate the container
   (`docker compose up -d` / `sudo systemctl reload design-pattern-mcp`). Path B runs
   compose from `/etc`, so without that install the deployed stack keeps the old
@@ -350,7 +345,7 @@ B: `sudo systemctl restart design-pattern-mcp`). Full provider list:
 | `docker image inspect design-pattern-mcp:latest` failed (unit start) | B1 retag step missed or used a different tag. |
 | `network pattern-tei-shared not found` | TEI infra not running: `sudo systemctl start pattern-tei-infra.service`. |
 | MCP container unhealthy; logs show TEI connection errors | TEI still cold-starting (start_period 120 s) — recheck health after ~2 min; if persistent, verify B0 (Path B) or the dev sidecars (Path A). |
-| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build` (bakes the cache; `docker-build-all` does the same but additionally runs Tacit's GPU self-distill — GPU builder only). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
+| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build` (bakes the cache; `docker-build-all` builds the same server image plus the sidecars). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
 | Dense cache seems missing on the host although the log shows a cache hit | Expected — the logged path is the *in-container* view of the named volume. Inspect `docker exec <container> ls -l /app/data/dense-cache`, or `docker volume inspect --format '{{.Mountpoint}}' design-pattern-mcp-dev-dense-cache` (resp. `-systemd-`); verify the mount with `docker inspect -f '{{json .Mounts}}' <container>`. |
 | Log shows `Dense cache write failed` but startup continues | By design (best-effort write-back): the cache directory is read-only/root-owned or full. Fix ownership or point `DENSE_CACHE_PATH` at a writable directory; the run keeps the vectors it just embedded. |
 | Container healthy but design tool calls fail with 401/502, or every LLM call returns `ERR_009` | Generator API key wrong/missing in the env file, or provider env block mismatched — see generator section. An env file written for an older release still uses the removed `DESIGN_PATTERN_` prefix (`DESIGN_PATTERN_GENERATOR_API_KEY`, `DESIGN_PATTERN_DENSE_CACHE_MODE`, …): strip it from every key, and reinstall `config/config.json` in the same step — its `{env:...}` placeholders carry the variable names. |

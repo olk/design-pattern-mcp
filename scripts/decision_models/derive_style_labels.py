@@ -2,8 +2,8 @@
 """Derive style gold labels from the benchmark scenarios (review input, not labels).
 
 Reads ``tests/benchmark/scenarios/full.json`` and writes ``qa/typed/style.jsonl``:
-one row per scenario, in the same ``{"id", "state", "type", "instructions",
-"criteria", "label", "source"}`` shape as ``qa/typed/choice.jsonl``. The state is
+one row per scenario, as ``{"id", "state", "type", "instructions",
+"criteria", "label", "source"}``. The state is
 the raw scenario description bytes (that is what the Ch2 seam receives), and the
 criteria/instructions are the seam's own prompt vocabulary from
 ``src/decisions/seam_prompts.py``. Labels come from ``STYLE_LABELS`` below, which
@@ -48,10 +48,10 @@ from src.decisions import seam_prompts  # noqa: E402
 
 #: scenario_id -> (label, rationale). Every train-split scenario must appear here;
 #: holdout scenarios appear too (labeled, but never exported to training weights).
-#: Corpus labels are agent-curated, human expert review pending (same status as the
-#: choice.jsonl labels — see qa/typed/README.md). Status is machine-readable:
+#: Corpus labels are agent-curated, human expert review pending (see
+#: qa/typed/README.md). Status is machine-readable:
 #: ``qa/typed/review.json`` records per-scenario review (reviewer, labels_sha256,
-#: rationale_ok) and ``tacit_calibrate.py`` refuses to recommend a confidence floor
+#: rationale_ok) and ``style_head_calibrate.py`` refuses to recommend a confidence floor
 #: until the ledger covers this file byte-for-byte — the floor is the seam's
 #: enablement, so unreviewed labels cannot be calibrated into production.
 STYLE_LABELS: dict[str, tuple[str, str]] = {

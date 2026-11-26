@@ -14,16 +14,14 @@
 	verify-ledger verify-cross-consistency verify-patterns verify-all \
 	health client-analyze client-design client-async \
 	benchmark-selfcheck benchmark-offline benchmark-live benchmark-analyze benchmark-e2e benchmark-compare \
-	benchmark-sidecars-up benchmark-draft benchmark-style-ab benchmark-rerank-ab \
+	benchmark-sidecars-up benchmark-draft benchmark-style-ab \
 	docker-build docker-build-all docker-build-base docker-build-cached docker-build-nocache \
 	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
 	docker-build-tei-rerank dense-cache \
-	docker-build-tacit docker-build-tacit-base docker-build-tacit-cpu \
 	docker-build-style-head \
-	docker-build-decision docker-up-decisions docker-up-decisions-cpu docker-down-decisions docker-down-decisions-cpu decisions-smoke \
-	tacit-payloads tacit-payloads-check \
-	style-head-calibrate check-dockerfile-shell \
-	docker-publish docker-publish-tei docker-publish-tacit docker-publish-tacit-cpu docker-publish-style-head docker-publish-all \
+	decisions-smoke \
+	style-head-calibrate \
+	docker-publish docker-publish-tei docker-publish-style-head docker-publish-all \
 	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
 	embed-cache
 
@@ -50,55 +48,6 @@ EMBED_TEI_BASE     ?= ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
 EMBED_TEI_BASE_GPU ?= ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
 DENSE_CACHE_DIR    ?= data/dense-cache
 
-# Decision-model sidecar (docker/docker-compose.decision-models.yml). It is GPU-only at
-# run time; the *-base target builds the released-weights variant and needs no GPU.
-TACIT_GPU_IMAGE      := design-pattern-tacit
-# Full Tacit image reference for the GPU lane. `?=` so a documented override
-# (TACIT_IMAGE=<repo>:<tag>, README + docs/tacit-fine-tune.md) passes through to
-# the overlay verbatim; the default pins the locally built :$(DOCKER_TAG) and still
-# honors a command-line DOCKER_TAG (recursive expansion at use time).
-TACIT_IMAGE ?= $(TACIT_GPU_IMAGE):$(DOCKER_TAG)
-TACIT_MODEL_REPO ?= morriszjm/Tacit-4B
-# Registry pair for the sidecar. Ships in docker-publish-all (and on demand via
-# docker-publish-tacit): the image is ~29 GB, so budget time/bandwidth for the upload.
-TACIT_HUB_REPO   := olkowa/design-pattern-tacit
-TACIT_GHCR_REPO  := ghcr.io/olk/design-pattern-tacit
-TACIT_CPU_IMAGE     := design-pattern-tacit-cpu
-TACIT_CPU_HUB_REPO  := olkowa/design-pattern-tacit-cpu
-TACIT_CPU_GHCR_REPO := ghcr.io/olk/design-pattern-tacit-cpu
-# Publish refuses weights whose manifest does not certify every seam (>= 10 eval rows each):
-# the build gate lets a quick-smoke run through with warnings, and the marker hashes inputs,
-# not knobs, so this is the last check that a smoke artifact cannot ship by accident.
-TACIT_ALLOW_UNCERTIFIED ?= 0
-# Self-distillation knobs, sized to MAX EFFORT: the fine-tune's aim is pattern-selection
-# consistency and quality, so the defaults spend the available GPU envelope on volume and
-# coverage (all train rerank pairs) and keep the recipe's single epoch.
-# The teacher pass shards across the visible GPUs (TACIT_TEACHER_SHARDS=0 = one per device).
-# `make docker-build-tacit TACIT_PROBLEMS=200 TACIT_RERANK_PROBLEMS=100 TACIT_COT_MAX_TOKENS=512`
-# is the quick-smoke shape.
-TACIT_PROBLEMS       ?= 6000
-# Design states to write. 0 = derive from TACIT_PROBLEMS (questions per state shrink as
-# this grows, so the teacher budget holds while state diversity rises).
-TACIT_STATES         ?= 0
-# J1 rerank question budget; 0 = ALL train pairs in qa/typed/rerank_pairs.jsonl.
-TACIT_RERANK_PROBLEMS ?= 0
-# Teacher answer shards; 0 = auto (one per visible CUDA device), 1 = in-process.
-TACIT_TEACHER_SHARDS ?= 0
-# Build fails when an answer seam's student-vs-teacher eval agreement drops below this.
-TACIT_MIN_SEAM_AGREEMENT ?= 0.6
-# Must equal the served seam floor (DESIGN_PATTERN_DECISIONS_*_CONFIDENCE_FLOOR).
-TACIT_CONFIDENCE_FLOOR ?= 0.5
-# The reasoning-gate seam's own floor, when the deployment raises it alone.
-TACIT_GATE_CONFIDENCE_FLOOR ?= $(TACIT_CONFIDENCE_FLOOR)
-# Build fails when a serving kind (choice/score/yes_no) keeps fewer rows than this.
-TACIT_MIN_KIND_ROWS  ?= 1
-TACIT_EPOCHS         ?= 1
-TACIT_LR             ?= 1e-4
-TACIT_BATCH          ?= 4
-TACIT_ACCUM          ?= 8
-TACIT_COT_MAX_TOKENS ?= 2048
-TACIT_MAX_NEW_TOKENS ?= 384
-VLLM_IMAGE_TAG   ?= v0.17.1
 # Linear style head (the Ch2 seam's only provider): a TF-IDF + calibrated-SVM head
 # fitted in its own image build, whose training RUN is also the accuracy gate.
 STYLE_HEAD_IMAGE := design-pattern-style-head
@@ -106,53 +55,23 @@ STYLE_HEAD_IMAGE := design-pattern-style-head
 STYLE_HEAD_HUB_REPO  := olkowa/design-pattern-style-head
 STYLE_HEAD_GHCR_REPO := ghcr.io/olk/design-pattern-style-head
 # The Ch2 style seam's one switch: it always names the linear head, so the endpoint,
-# model name and wire shape move together and a style run cannot inherit a Tacit
-# gateway URL (the config validator rejects that pairing outright, and this keeps it
-# unexpressible).
+# model name and wire shape move together (the config validator refuses any other
+# provider, and this keeps a mismatch unexpressible).
 STYLE_PROVIDER ?= linear
 STYLE_PROVIDER_ENV = DECISIONS_STYLE_PROVIDER=linear \
 	DECISIONS_STYLE_BASE_URL=http://design-pattern-style-head:8800/v1 \
 	DECISIONS_STYLE_MODEL=style-linear
 
-# Host-persisted trained artifacts (extract-then-rebuild).
-# First run of docker-build-tacit trains on the GPU builder,
-# tags the image as usual, then extracts the shipped weights to the host dir via
-# `docker create` + `docker cp` (the container is never started, no GPU needed).
-# A later run finds the sentinels plus the .extract-complete marker and builds
-# the *-cached Dockerfile stage instead, which COPYs the host dir into the image
-# as the fine-tuned model — same image names, tags, and build args, no GPU, no
-# retrain. The marker is written LAST, only after a successful copy with
-# non-empty sentinels, so a partial copy never leaves a reusable dir; it is
-# committed with the artifacts so a fresh clone still reuses.
-#   Tacit: models/tacit-4b  <- /models/tacit (full HF checkpoint: config.json,
-#          model.safetensors shards, tokenizer files, self-distill.json)
-TACIT_HOST_DIR      := models/tacit-4b
-TACIT_HOST_CONFIG   := $(TACIT_HOST_DIR)/config.json
-TACIT_HOST_MANIFEST := $(TACIT_HOST_DIR)/self-distill.json
-TACIT_HOST_COMPLETE := $(TACIT_HOST_DIR)/.extract-complete
-# Parse-time target switch (same shape as DENSE_CACHE_PREREQ): sentinels plus
-# the completion marker, or the train path — a dir without the marker is not
-# proven complete output, even if a header file survived a partial copy.
-TACIT_TRAIN_TARGET  := runtime-distilled
-TACIT_CACHED_TARGET := runtime-distilled-cached
-TACIT_BUILD_TARGET  := $(if $(and $(wildcard $(TACIT_HOST_CONFIG)),$(wildcard $(TACIT_HOST_MANIFEST)),$(wildcard $(TACIT_HOST_COMPLETE))),$(TACIT_CACHED_TARGET),$(TACIT_TRAIN_TARGET))
-# Content provenance for the cached distilled weights: the files whose bytes the
-# self-distillation consumed. The train path records their shas in the completion marker;
-# the cached path refuses to build when the marker's shas no longer match, so a stale
-# host dir can never be re-baked against a changed prompt vocabulary or pair artifact.
-TACIT_TRAIN_INPUTS  := scripts/decision_models/tacit_self_distill.py \
-	src/decisions/seam_prompts.py qa/qa.jsonl qa/typed/rerank_pairs.jsonl \
-	docker/Dockerfile.tacit-gpu
 # HF Hub token for authenticated model downloads (higher rate limits, gated repos).
 # File holds the raw token only, no key=value. Empty/missing file = anonymous
 # download (fine for the pinned public repos, just the huggingface_hub warning).
-# Every HF-fetching Dockerfile (tacit, tei-embed, tei-rerank) reads it via
+# Every HF-fetching Dockerfile (tei-embed, tei-rerank) reads it via
 # `RUN --mount=type=secret,id=hf_token`; the secret is mounted per-RUN, never baked
 # into a layer.
 comma := ,
-# BuildKit progress mode for the decision-model builds. `plain` streams RUN
-# stdout (trainer phases, per-shard progress) to the terminal and `tee`d logs;
-# the default `tty` collapses it. Override per-call: `make docker-build-tacit
+# BuildKit progress mode for the style-head build. `plain` streams RUN
+# stdout (the trainer's gate line) to the terminal and `tee`d logs;
+# the default `tty` collapses it. Override per-call: `make docker-build-style-head
 # DOCKER_BUILD_PROGRESS=tty`.
 DOCKER_BUILD_PROGRESS ?= plain
 HF_TOKEN_FILE ?= $(HOME)/.cache/hf_token
@@ -161,8 +80,6 @@ HF_TOKEN_FILE ?= $(HOME)/.cache/hf_token
 # so fail instead of silently going anonymous. Recursive (=, not :=) so the
 # error fires only when a docker-build recipe expands HF_SECRET_ARG.
 HF_SECRET_ARG = $(if $(shell test -s "$(HF_TOKEN_FILE)" && echo yes),--secret id=hf_token$(comma)src=$(HF_TOKEN_FILE),$(if $(filter-out file,$(origin HF_TOKEN_FILE)),$(error HF_TOKEN_FILE="$(HF_TOKEN_FILE)" is missing or empty)))
-COMPOSE_DM_GPU := docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml
-COMPOSE_DM_CPU := docker compose -f docker/docker-compose.yml -f docker/docker-compose.decision-models.yml -f docker/docker-compose.tacit-cpu.yml
 
 .DEFAULT_GOAL := help
 
@@ -407,95 +324,11 @@ docker-build-tei: docker-build-tei-embed docker-build-tei-rerank ## Build both T
 # sidecars.
 docker-build-base: docker-build docker-build-tei docker-build-style-head ## Build the base stack images (server + TEI pair + style head, no GPU)
 
-# Sequential prerequisites on purpose: docker-build-tacit holds the GPU for its
-# self-distill RUN, so parallel make must not overlap it with another GPU build.
-docker-build-all: docker-build docker-build-tei docker-build-decision ## Build every image: server (+dense cache), TEI pair, Tacit, style head
+docker-build-all: docker-build docker-build-tei docker-build-style-head ## Build every image: server (+ dense cache), TEI pair, style head
 
 docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense cache, then build every image
 
-##@ Decision models (AnyJev Tacit-4B)
-
-docker-build-tacit-base: ## Build the Tacit sidecar with the released weights (no GPU needed; tag :base)
-	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.tacit-gpu --target runtime-released $(HF_SECRET_ARG) \
-		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
-		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
-		-t $(TACIT_GPU_IMAGE):$(DOCKER_TAG)-base -t $(TACIT_GPU_IMAGE):base .
-
-docker-build-tacit: tacit-payloads-check check-dockerfile-shell ## Fine-tune Tacit in the image build (GPU self-distill once; later runs reuse models/tacit-4b, no GPU)
-	@# Cached path first: refuse a stale host dir whose marker shas no longer match
-	@# the current train inputs — BEFORE docker build, so a stale cache never
-	@# re-tags the image and the failure is loud, not a silent old-weights rebuild.
-	@if [ "$(TACIT_BUILD_TARGET)" = "$(TACIT_CACHED_TARGET)" ]; then \
-		if ! ls -A "$(TACIT_HOST_DIR)"/*.safetensors >/dev/null 2>&1; then \
-			echo "ERROR: $(TACIT_HOST_DIR)/ holds the COMMITTED sentinels but no weight shards."; \
-			echo "       A fresh clone looks exactly like this: config.json + self-distill.json are in git,"; \
-			echo "       the multi-GB weights are not. The cached stage would COPY a dir vLLM cannot load."; \
-			echo "Run 'rm -rf $(TACIT_HOST_DIR)' so the train path rebuilds the weights."; \
-			exit 1; \
-		fi; \
-		if ! (cd "$(CURDIR)" && sha256sum -c "$(TACIT_HOST_COMPLETE)" --quiet --status 2>/dev/null); then \
-			echo "ERROR: $(TACIT_HOST_DIR)/ is stale — a train input changed since the weights were extracted."; \
-			echo "Run 'rm -rf $(TACIT_HOST_DIR)' and rebuild to retrain, or restore the inputs."; \
-			(cd "$(CURDIR)" && sha256sum -c "$(TACIT_HOST_COMPLETE)" 2>&1 | grep -v ': OK' || true); \
-			exit 1; \
-		fi; \
-	fi
-	docker build --progress=$(DOCKER_BUILD_PROGRESS) --allow device=nvidia.com/gpu=all $(HF_SECRET_ARG) \
-		-f docker/Dockerfile.tacit-gpu --target $(TACIT_BUILD_TARGET) \
-		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
-		--build-arg TACIT_MODEL_REPO=$(TACIT_MODEL_REPO) \
-		--build-arg TACIT_PROBLEMS=$(TACIT_PROBLEMS) \
-		--build-arg TACIT_STATES=$(TACIT_STATES) \
-		--build-arg TACIT_RERANK_PROBLEMS=$(TACIT_RERANK_PROBLEMS) \
-		--build-arg TACIT_TEACHER_SHARDS=$(TACIT_TEACHER_SHARDS) \
-		--build-arg TACIT_MIN_SEAM_AGREEMENT=$(TACIT_MIN_SEAM_AGREEMENT) \
-		--build-arg TACIT_CONFIDENCE_FLOOR=$(TACIT_CONFIDENCE_FLOOR) \
-		--build-arg TACIT_GATE_CONFIDENCE_FLOOR=$(TACIT_GATE_CONFIDENCE_FLOOR) \
-		--build-arg TACIT_MIN_KIND_ROWS=$(TACIT_MIN_KIND_ROWS) \
-		--build-arg TACIT_EPOCHS=$(TACIT_EPOCHS) \
-		--build-arg TACIT_LR=$(TACIT_LR) \
-		--build-arg TACIT_BATCH=$(TACIT_BATCH) \
-		--build-arg TACIT_ACCUM=$(TACIT_ACCUM) \
-		--build-arg TACIT_COT_MAX_TOKENS=$(TACIT_COT_MAX_TOKENS) \
-		--build-arg TACIT_MAX_NEW_TOKENS=$(TACIT_MAX_NEW_TOKENS) \
-		-t $(TACIT_GPU_IMAGE):$(DOCKER_TAG) -t $(TACIT_GPU_IMAGE):latest .
-	@# Train path only: extract the shipped weights to $(TACIT_HOST_DIR)/ via
-	@# `docker create` (never started) + `docker cp`; the next run builds cached.
-	@# The .extract-complete marker is written LAST, only after a successful copy
-	@# with non-empty sentinels — a partial copy never leaves a reusable dir. It
-	@# carries the sha256 of every train input so the check above can refuse a stale dir.
-	@if [ "$(TACIT_BUILD_TARGET)" = "$(TACIT_TRAIN_TARGET)" ]; then \
-		mkdir -p "$(TACIT_HOST_DIR)"; \
-		cid=$$(docker create "$(TACIT_GPU_IMAGE):$(DOCKER_TAG)"); \
-		docker cp "$$cid:/models/tacit/." "$(TACIT_HOST_DIR)/"; rc=$$?; \
-		docker rm "$$cid" >/dev/null; \
-		if [ $$rc -ne 0 ]; then rm -f "$(TACIT_HOST_COMPLETE)"; exit $$rc; fi; \
-		test -s "$(TACIT_HOST_CONFIG)" && test -s "$(TACIT_HOST_MANIFEST)" || exit 1; \
-		{ echo "# $(TACIT_GPU_IMAGE):$(DOCKER_TAG) $$(date -u +%FT%TZ)"; \
-		  sha256sum $(TACIT_TRAIN_INPUTS); } > "$(TACIT_HOST_COMPLETE)"; \
-	fi
-	@test -s "$(TACIT_HOST_CONFIG)" && test -s "$(TACIT_HOST_MANIFEST)" && test -f "$(TACIT_HOST_COMPLETE)"
-
-docker-build-tacit-cpu: check-dockerfile-shell ## Build the CPU Tacit sidecar from the trained checkpoint (in-image NF4->BF16 dequant; no GPU, ~16 GB builder RAM)
-	@if [ "$(TACIT_BUILD_TARGET)" != "$(TACIT_CACHED_TARGET)" ]; then \
-		echo "ERROR: $(TACIT_HOST_DIR) is not a proven extract (config.json + self-distill.json + .extract-complete)."; \
-		echo "       Run 'make docker-build-tacit' on the GPU builder first, or restore the trained dir."; \
-		exit 1; \
-	fi
-	@if ! ls -A "$(TACIT_HOST_DIR)"/*.safetensors >/dev/null 2>&1; then \
-		echo "ERROR: $(TACIT_HOST_DIR)/ holds the COMMITTED sentinels but no weight shards."; \
-		echo "       A fresh clone looks exactly like this: config.json + self-distill.json are in git,"; \
-		echo "       the multi-GB weights are not. The dequant stage needs the real checkpoint."; \
-		echo "       Run 'make docker-build-tacit' on the GPU builder first, or restore the trained dir."; \
-		exit 1; \
-	fi
-	@if ! (cd "$(CURDIR)" && sha256sum -c "$(TACIT_HOST_COMPLETE)" --quiet --status 2>/dev/null); then \
-		echo "ERROR: $(TACIT_HOST_DIR)/ is stale — a train input changed since the weights were extracted."; \
-		exit 1; \
-	fi
-	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.tacit-cpu \
-		--build-arg VLLM_IMAGE_TAG=$(VLLM_IMAGE_TAG) \
-		-t $(TACIT_CPU_IMAGE):$(DOCKER_TAG) -t $(TACIT_CPU_IMAGE):latest .
+##@ Decision models (linear style head)
 
 # The linear Ch2 style head: CPU only, ~1 min, and the training RUN inside the build is also
 # the accuracy gate (a head below 0.65 holdout accuracy exits 2 and fails the build). There
@@ -505,27 +338,7 @@ docker-build-style-head: ## Build the linear style head sidecar (CPU; the build 
 	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.style-head \
 		-t $(STYLE_HEAD_IMAGE):$(DOCKER_TAG) -t $(STYLE_HEAD_IMAGE):latest .
 
-docker-build-decision: docker-build-tacit docker-build-tacit-cpu docker-build-style-head ## Build the Tacit + style-head sidecars, in-image
-
-docker-up-decisions: ## Start the dev stack with the decision-model sidecars (one GPU, one CPU)
-	$(STYLE_PROVIDER_ENV) TACIT_IMAGE=$(TACIT_IMAGE) \
-		STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM_GPU) up -d
-
-docker-up-decisions-cpu: ## Start the dev decision stack with the CPU Tacit sidecar (no GPU)
-	$(STYLE_PROVIDER_ENV) TACIT_CPU_IMAGE=$(TACIT_CPU_IMAGE):$(DOCKER_TAG) \
-		STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM_CPU) up -d
-
-docker-down-decisions: ## Stop the whole dev stack including the decision-model sidecars
-	TACIT_IMAGE=$(TACIT_IMAGE) \
-		STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM_GPU) down
-
-docker-down-decisions-cpu: ## Stop the whole dev stack including the decision-model sidecars
-	TACIT_CPU_IMAGE=$(TACIT_CPU_IMAGE):$(DOCKER_TAG) \
-		STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) $(COMPOSE_DM_CPU) down
-
-decisions-smoke: ## Smoke-test the running sidecars' wire contracts (needs docker-up-decisions)
-	@echo "==> Tacit /v1/decide"
-	@uv run python scripts/decision_models/decision_smoke.py --base-url $(TACIT_BASE_URL) --timeout $(DECISIONS_SMOKE_TIMEOUT)
+decisions-smoke: ## Smoke-test the style head's wire contract (needs docker-up)
 	@# The linear head is criteria-blind, so this payload deliberately carries NO criteria: any
 	@# criteria map it is sent must equal its 36 trained labels exactly, and a partial one is
 	@# refused with 422 (that refusal is the drift guard, exercised by test_style_head.py).
@@ -579,44 +392,6 @@ style-head-calibrate: ## Calibrate decisions.style.confidence_floor against a ru
 		--served-container-started-at "$$(docker inspect -f '{{.State.StartedAt}}' $(STYLE_HEAD_SERVED_CONTAINER) 2>/dev/null || true)" \
 		--served-model-repo "$(STYLE_HEAD_SERVED_REPO)"
 
-# Served rerank pairs (statement x candidate document) for the Ch2/J1 training seams.
-# Re-run after any corpus, noul or catalog change: the artifact carries the candidates'
-# document_text, which the Tacit image cannot derive (it has no pattern catalog).
-TACIT_PAYLOAD_CHECK  := /tmp/tacit-rerank-pairs.check.jsonl
-
-tacit-payloads: ## Regenerate qa/typed/rerank_pairs.jsonl from the corpus + catalog
-	uv run python scripts/decision_models/derive_rerank_pairs.py
-
-# The catalog is not hashed in TACIT_TRAIN_INPUTS (7290 files), so a catalog edit that was
-# never re-derived would otherwise leave a byte-identical pair file and a valid cache:
-# training (and the eval replay) would score document_text the server no longer sends.
-# Regenerate to a temp path and byte-compare instead of trusting the marker.
-tacit-payloads-check: ## Fail when qa/typed/rerank_pairs.jsonl drifts from the corpus + catalog
-	@uv run python scripts/decision_models/derive_rerank_pairs.py --out $(TACIT_PAYLOAD_CHECK) >/dev/null
-	@if ! cmp -s $(TACIT_PAYLOAD_CHECK) qa/typed/rerank_pairs.jsonl; then \
-		echo "ERROR: qa/typed/rerank_pairs.jsonl is stale — the corpus, noul or catalog changed since it was derived."; \
-		echo "       Run 'make tacit-payloads' and commit the new artifact (the trainer consumes these bytes)."; \
-		rm -f $(TACIT_PAYLOAD_CHECK); exit 1; \
-	fi
-	@rm -f $(TACIT_PAYLOAD_CHECK)
-
-# `docker build --check` does not evaluate shell syntax, and Dockerfile shells are dash
-# even when the developer's /bin/sh is bash. Two real defects reached a build this way: a
-# stray quote that produced `Syntax error: "(" unexpected`, and a '#' that commented out a
-# gate command. Validate every shell payload before spending an hour on the image; this
-# runs from the build targets so it cannot regress silently.
-DOCKERFILE_SHELL_CHECK := $(UV) run python scripts/decision_models/check_dockerfile_shell.py
-
-check-dockerfile-shell: ## Validate Dockerfile shell payloads (dash) before a build
-	@$(DOCKERFILE_SHELL_CHECK) docker/Dockerfile.tacit-gpu docker/Dockerfile.tacit-cpu
-
-# Live gateway root for the decisions smoke probe (decisions-smoke).
-TACIT_BASE_URL             ?= http://127.0.0.1:18100
-# Per-request timeout for the same probe. 120 s serves the CPU sidecar (cold BF16
-# inference ≈ 30 s for both probes); the GPU leg answers in seconds, so it only ever
-# spends the extra budget on a hung gateway.
-DECISIONS_SMOKE_TIMEOUT  ?= 120
-
 # Tag and push a local image to both Docker Hub and GHCR.
 # Args: local_image hub_repo ghcr_repo
 # Usage: $(call publish-image,$(DOCKER_IMAGE),$(DOCKER_HUB_REPO),$(GHCR_REPO))
@@ -658,47 +433,6 @@ docker-publish-tei: docker-build-tei ## Push both TEI images to Docker Hub + GHC
 	$(call publish-image,$(TEI_RERANK_IMAGE),$(TEI_RERANK_HUB_REPO),$(TEI_RERANK_GHCR_REPO))
 	docker logout ghcr.io
 
-# Ships from docker-publish-all (and on demand via this target). A release from a machine
-# without the trained weights aborts in docker-build-tacit on the committed sentinels
-# ("holds the COMMITTED sentinels but no weight shards … Run rm -rf"), and only after
-# that does the GPU self-distill run; the cert guard below catches a different failure
-# (a smoke build that slipped through with warnings), not this one.
-# It depends on the build rule on purpose — that is what pins the pushed weights to
-# TACIT_TRAIN_INPUTS through models/tacit-4b/.extract-complete. No clean-tree gate
-# (unlike docker-publish): the trained checkpoint is deliberately untracked, so a real
-# train output would always trip it. The manifest is echoed as the provenance record.
-# Publish also refuses a manifest that does not certify every seam: the trainer records
-# the certification threshold (min_eval_rows, 20) in self-distill.json and the guard
-# below reads it from there, so the two can never drift. The build gate lets a
-# quick-smoke run through with warnings, and the marker hashes inputs, not knobs — this
-# is the last check that a smoke artifact cannot ship by accident
-# (TACIT_ALLOW_UNCERTIFIED=1 overrides).
-docker-publish-tacit: docker-build-tacit ## Push the Tacit sidecar image to Docker Hub + GHCR
-	@test -s "$(TACIT_HOST_MANIFEST)" || { \
-		echo "ERROR: $(TACIT_HOST_MANIFEST) is missing - the image has no train provenance"; exit 1; }
-	@echo "Publishing $(TACIT_GPU_IMAGE):$(DOCKER_TAG) distilled from:"
-	@python3 -c "import json;d=json.load(open('$(TACIT_HOST_MANIFEST)'));\
-print({k: d.get(k) for k in ('repo','problems','examples','kept','epochs','lr')})"
-	@python3 -c 'import json,sys;m=json.load(open("$(TACIT_HOST_MANIFEST)"));g=("category","rerank","gate","weights");e=m.get("eval") or {};t=m.get("min_eval_rows");thin=g if t is None else [s for s in g if int((e.get(s) or {}).get("n") or 0)<int(t)];allow="$(TACIT_ALLOW_UNCERTIFIED)"=="1";print("ERROR: manifest records no min_eval_rows - legacy uncertified artifact; retrain or pass TACIT_ALLOW_UNCERTIFIED=1") if t is None and not allow else (print("ERROR: uncertified seams",thin,"- fewer than",t,"eval rows each; run the full build or pass TACIT_ALLOW_UNCERTIFIED=1") if thin and not allow else (print("WARNING: publishing uncertified seams",thin) if thin else None));sys.exit(1 if thin and not allow else 0)'
-	docker login -u olkowa
-	docker login ghcr.io -u olk
-	$(call publish-image,$(TACIT_GPU_IMAGE),$(TACIT_HUB_REPO),$(TACIT_GHCR_REPO))
-	docker logout ghcr.io
-
-# Same provenance rules as docker-publish-tacit: the CPU image bakes the same trained
-# checkpoint (dequantized in-build), so the same manifest + certification guard applies.
-docker-publish-tacit-cpu: docker-build-tacit-cpu ## Push the CPU Tacit sidecar image to Docker Hub + GHCR
-	@test -s "$(TACIT_HOST_MANIFEST)" || { \
-		echo "ERROR: $(TACIT_HOST_MANIFEST) is missing - the image has no train provenance"; exit 1; }
-	@echo "Publishing $(TACIT_CPU_IMAGE):$(DOCKER_TAG) distilled from:"
-	@python3 -c "import json;d=json.load(open('$(TACIT_HOST_MANIFEST)'));\
-print({k: d.get(k) for k in ('repo','problems','examples','kept','epochs','lr')})"
-	@python3 -c 'import json,sys;m=json.load(open("$(TACIT_HOST_MANIFEST)"));g=("category","rerank","gate","weights");e=m.get("eval") or {};t=m.get("min_eval_rows");thin=g if t is None else [s for s in g if int((e.get(s) or {}).get("n") or 0)<int(t)];allow="$(TACIT_ALLOW_UNCERTIFIED)"=="1";print("ERROR: manifest records no min_eval_rows - legacy uncertified artifact; retrain or pass TACIT_ALLOW_UNCERTIFIED=1") if t is None and not allow else (print("ERROR: uncertified seams",thin,"- fewer than",t,"eval rows each; run the full build or pass TACIT_ALLOW_UNCERTIFIED=1") if thin and not allow else (print("WARNING: publishing uncertified seams",thin) if thin else None));sys.exit(1 if thin and not allow else 0)'
-	docker login -u olkowa
-	docker login ghcr.io -u olk
-	$(call publish-image,$(TACIT_CPU_IMAGE),$(TACIT_CPU_HUB_REPO),$(TACIT_CPU_GHCR_REPO))
-	docker logout ghcr.io
-
 # TEI shape: build first (the training RUN inside the build is the accuracy gate, so a
 # built image is always a gated head), then tag + push both registries.
 docker-publish-style-head: docker-build-style-head ## Push the style head image to Docker Hub + GHCR
@@ -707,7 +441,7 @@ docker-publish-style-head: docker-build-style-head ## Push the style head image 
 	$(call publish-image,$(STYLE_HEAD_IMAGE),$(STYLE_HEAD_HUB_REPO),$(STYLE_HEAD_GHCR_REPO))
 	docker logout ghcr.io
 
-docker-publish-all: docker-publish docker-publish-tei docker-publish-tacit docker-publish-tacit-cpu docker-publish-style-head ## Build and push every image: server, TEI pair, Tacit GPU+CPU, style head
+docker-publish-all: docker-publish docker-publish-tei docker-publish-style-head ## Build and push every image: server, TEI pair, style head
 
 # File target, not phony: the cache is expensive (one TEI round-trip per
 # embedder batch, ~15 min for the 486-record catalog on CPU) and is only rebuilt
@@ -778,7 +512,7 @@ BENCH_ENV := BENCH_SCENARIOS="$(BENCH_SCENARIOS)" OUT="$(OUT)" RUN_ID="$(RUN_ID)
 	FLIP="$(FLIP)" CLIENT_URL="$(CLIENT_URL)" CALL_TIMEOUT="$(CALL_TIMEOUT)" A="$(A)" B="$(B)" \
 	ALLOW_MISMATCH="$(ALLOW_MISMATCH)" DRY_RUN="$(DRY_RUN)" PER_FAMILY="$(PER_FAMILY)" \
 	REQUIRE_REPEAT_STABILITY="$(REQUIRE_REPEAT_STABILITY)" \
-	FAMILIES="$(FAMILIES)" DRAFT_OUT="$(DRAFT_OUT)" BENCH_DECISION_OVERLAY="$(BENCH_DECISION_OVERLAY)" \
+	FAMILIES="$(FAMILIES)" DRAFT_OUT="$(DRAFT_OUT)" \
 	DECISIONS_STYLE_ENABLED="$(if $(DECISIONS_STYLE_ENABLED),$(DECISIONS_STYLE_ENABLED),false)" \
 	$(if $(DECISIONS_STYLE_CONFIDENCE_FLOOR),DECISIONS_STYLE_CONFIDENCE_FLOOR="$(DECISIONS_STYLE_CONFIDENCE_FLOOR)")
 # `DECISIONS_STYLE_ENABLED` defaults to false (not unset) on purpose: the shipped
@@ -811,11 +545,10 @@ benchmark-draft: ## Benchmark: draft full.json candidates from the catalog (in D
 	@$(BENCH_ENV) $(BENCH_DOCKER) draft
 
 # Exits 1 on a candidate-loss verdict (pre-registered rule in tests/benchmark/README.md).
-# Pre-registered A/B of the Ch2 style seam with a decision-model sidecar in the loop. The
-# decision overlay renders without a GPU (`docker compose ... config`), but the runs need the
-# card and the trained image (`make docker-build-decision`). The seam is off in the
-# baseline arm and on in the candidate arm; everything else (corpus, split, repeat, image) is
-# identical, which is what `benchmark-compare`'s +15% p95 rule requires.
+# Pre-registered A/B of the Ch2 style seam with the linear head in the loop. The style head
+# lives in the base file, so the base stack alone is the CPU-only instrument; the seam is off
+# in the baseline arm and on in the candidate arm, and everything else (corpus, split, repeat,
+# image) is identical, which is what `benchmark-compare`'s +15% p95 rule requires.
 #
 # The linear style head serves the seam, and its calibration artifact supplies the floor.
 # The floor is always read from the artifact of the provider actually under test, never
@@ -826,20 +559,12 @@ STYLE_AB_STAMP     ?= $(shell date -u +%Y%m%d-%H%M%S)
 STYLE_AB_FLOOR      = $(LINEAR_STYLE_FLOOR)
 STYLE_AB_FLOOR_FILE = $(STYLE_HEAD_CAL_REPORT)
 STYLE_CALIBRATE_TARGET = style-head-calibrate
-# Which overlay the A/B stack carries. The default is none — the style head lives in
-# the base file, so the base stack alone is the CPU-only instrument. The GPU overlay's
-# design-pattern-mcp depends_on the Tacit gateway and therefore cannot come up on a
-# host whose card predates Ampere. On a GPU host, run the full stack instead by
-# overriding the overlay:
-#   make benchmark-style-ab \
-#     STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml
-STYLE_AB_OVERLAY     ?=
 # Bring the linear head up inside the A/B project. The harness tears its whole compose project
 # down at the end of EVERY arm, so this runs before each arm — starting it once would leave
 # arm 2 with a dead seam (and a dead seam is silent: the LLM style stands, the arm still
 # completes, and the comparison would quietly measure nothing).
 STYLE_HEAD_UP = STYLE_HEAD_IMAGE=$(STYLE_HEAD_IMAGE):$(DOCKER_TAG) \
-	docker compose -f docker/docker-compose.yml $(if $(STYLE_AB_OVERLAY),-f $(STYLE_AB_OVERLAY)) up -d --wait design-pattern-style-head
+	docker compose -f docker/docker-compose.yml up -d --wait design-pattern-style-head
 
 benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the sidecar + GPU)
 	@test -n "$(STYLE_AB_FLOOR)" || { \
@@ -853,39 +578,16 @@ benchmark-style-ab: ## Benchmark: pre-registered Ch2 style-seam A/B (needs the s
 	@echo "==> arm 1/2: DECISIONS_STYLE_ENABLED=false (the LLM-sampled style stands)"
 	@$(STYLE_HEAD_UP)
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
-		RUN_ID=$(STYLE_AB_STAMP)-style-off BENCH_DECISION_OVERLAY=$(STYLE_AB_OVERLAY) \
+		RUN_ID=$(STYLE_AB_STAMP)-style-off \
 		$(STYLE_PROVIDER_ENV) DECISIONS_STYLE_ENABLED=false DECISIONS_STYLE_CONFIDENCE_FLOOR=$(STYLE_AB_FLOOR) $(BENCH_DOCKER) e2e
 	@echo "==> arm 2/2: DECISIONS_STYLE_ENABLED=true provider=$(STYLE_PROVIDER) (floor from $(STYLE_AB_FLOOR_FILE))"
 	@$(STYLE_HEAD_UP)
 	@$(BENCH_ENV) BENCH_SCENARIOS=$(STYLE_AB_SCENARIOS) SPLIT=holdout REPEAT=$(STYLE_AB_REPEAT) \
-		RUN_ID=$(STYLE_AB_STAMP)-style-on BENCH_DECISION_OVERLAY=$(STYLE_AB_OVERLAY) \
+		RUN_ID=$(STYLE_AB_STAMP)-style-on \
 		$(STYLE_PROVIDER_ENV) DECISIONS_STYLE_ENABLED=true DECISIONS_STYLE_CONFIDENCE_FLOOR=$(STYLE_AB_FLOOR) $(BENCH_DOCKER) e2e
 	@echo "==> compare against the pre-registered rule (holdout p95 >= +15% AND repeat non-inferiority)"
 	@$(BENCH_ENV) REQUIRE_REPEAT_STABILITY=1 A=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-off \
 		B=$(BENCH_RUNS)/$(STYLE_AB_STAMP)-style-on $(BENCH_DOCKER) compare
-
-# Selection-level acceptance for the J1 rerank leg: same overlay stack, corpus, split and
-# repeat, only RERANKER_PROVIDER differs. Decided 2026-11-24 (run 20261124-173228):
-# Tacit was non-inferior on hits/recall with zero fallback regressions and a likely
-# ~30 s p95 gain, but agreement-negative (4/6 vs 6/6) — so TEI stays the overlay
-# default and Tacit an explicit opt-in. Re-run to re-verify; `benchmark-compare`
-# exits 1 on a candidate-loss verdict, which is a verdict to report, not a crash.
-RERANK_AB_SCENARIOS ?= tests/benchmark/scenarios/full.json
-RERANK_AB_REPEAT    ?= 3
-RERANK_AB_STAMP     ?= $(shell date -u +%Y%m%d-%H%M%S)
-
-benchmark-rerank-ab: ## Benchmark: pre-registered J1 rerank A/B, TEI vs Tacit (needs the sidecar + GPU)
-	@echo "==> arm 1/2: RERANKER_PROVIDER=tei (the cross-encoder baseline)"
-	@$(BENCH_ENV) BENCH_SCENARIOS=$(RERANK_AB_SCENARIOS) SPLIT=holdout REPEAT=$(RERANK_AB_REPEAT) \
-		RUN_ID=$(RERANK_AB_STAMP)-rerank-tei BENCH_DECISION_OVERLAY=docker/docker-compose.decision-models.yml \
-		RERANKER_PROVIDER=tei $(BENCH_DOCKER) e2e
-	@echo "==> arm 2/2: RERANKER_PROVIDER=tacit (per-candidate yes_no leg)"
-	@$(BENCH_ENV) BENCH_SCENARIOS=$(RERANK_AB_SCENARIOS) SPLIT=holdout REPEAT=$(RERANK_AB_REPEAT) \
-		RUN_ID=$(RERANK_AB_STAMP)-rerank-tacit BENCH_DECISION_OVERLAY=docker/docker-compose.decision-models.yml \
-		RERANKER_PROVIDER=tacit $(BENCH_DOCKER) e2e
-	@echo "==> compare against the pre-registered rule (non-inferior; holdout p95 within +15%)"
-	@$(BENCH_ENV) A=$(BENCH_RUNS)/$(RERANK_AB_STAMP)-rerank-tei B=$(BENCH_RUNS)/$(RERANK_AB_STAMP)-rerank-tacit \
-		$(BENCH_DOCKER) compare
 
 benchmark-compare: ## Benchmark: compare two run dirs (A=<baseline> B=<candidate>), in Docker
 	@[ -n "$(A)" ] && [ -n "$(B)" ] || { echo "usage: make benchmark-compare A=<baseline-dir> B=<candidate-dir>"; exit 2; }

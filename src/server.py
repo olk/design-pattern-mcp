@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,14 +50,13 @@ from src.tools import create_all_tools
 from src.reasoning import ReasoningConfig
 from src.reasoning.client import ReasoningClient
 from src.decisions.client import DecisionModelClient
-from src.decisions.tacit import TacitClient, reasoning_gate
 
 ERROR_SERVER_INIT = "ERR_013"
 
 logger = logging.getLogger(__name__)
 
 
-SEAM_NAMES: tuple[str, ...] = ("style", "weights", "category", "reasoning_gate")
+SEAM_NAMES: tuple[str, ...] = ("style",)
 
 
 def _seam_status(seam: DecisionSeamConfig) -> str:
@@ -87,13 +86,8 @@ def style_client_for(seam: DecisionSeamConfig) -> DecisionModelClient:
 
 
 def _decisions_status(config: ServerConfig) -> dict[str, str]:
-    """Per-seam status map for the startup log line (all four seams, always present)."""
-    return {
-        "style": _seam_status(config.decisions.style),
-        "weights": _seam_status(config.decisions.weights),
-        "category": _seam_status(config.decisions.category),
-        "reasoning_gate": _seam_status(config.decisions.reasoning_gate),
-    }
+    """Per-seam status map for the startup log line (every seam, always present)."""
+    return {"style": _seam_status(config.decisions.style)}
 
 
 def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None:
@@ -279,13 +273,8 @@ class DesignPatternServer:
         # exist from construction (otherwise startup dies with AttributeError).
         self._reasoning_client: ReasoningClient | None = None
         self._reasoning_health: dict[str, str] = {}
-        # One client per seam (style / weights / category / reasoning gate): separate
-        # instances keep each seam's timeout and cache exact instead of sharing one knob.
-        # The style seam is served only by the linear head (DecisionModelClient).
+        # The style seam's client (linear head), None until the seam is wired at startup.
         self._style_client: DecisionModelClient | None = None
-        self._weights_client: TacitClient | None = None
-        self._category_client: TacitClient | None = None
-        self._gate_client: TacitClient | None = None
         self._decisions_status: dict[str, str] = dict.fromkeys(SEAM_NAMES, "disabled")
 
     # -- startup ------------------------------------------------------------------
@@ -342,7 +331,7 @@ class DesignPatternServer:
             await self._pipeline.warmup()
             self._pipeline.validate()
 
-            # Decision seams first: the J5 gate client is an input of the reasoning client.
+            # Decision seam first, so the pipeline never serves an unwired style client.
             self._decisions_status = self._decisions_health()
             self._wire_decision_seams()
 
@@ -384,7 +373,7 @@ class DesignPatternServer:
             return None
         if self._llm is None:
             raise RuntimeError("DesignAgent not initialized — cannot build ReasoningClient")
-        return ReasoningClient(reasoning_config, self._llm, gate=self._reasoning_gate())  # type: ignore[arg-type]  # runtime is DesignAgent
+        return ReasoningClient(reasoning_config, self._llm)  # type: ignore[arg-type]  # runtime is DesignAgent
 
     async def _check_reasoning_health(self, client: ReasoningClient, fail_fast: bool) -> None:
         """LOUD startup health check for the reasoning MCP tools.
@@ -430,35 +419,19 @@ class DesignPatternServer:
         return status
 
     def _wire_decision_seams(self) -> None:
-        """Construct the enabled seam clients and inject them into the pipeline.
+        """Construct the style seam client and inject it into the pipeline.
 
-        No network call happens here: every client degrades per call, so a
+        No network call happens here: the client degrades per call, so a
         misconfigured or unreachable sidecar costs a warning, never a failed tool
-        call. Seams whose status is not ``ok`` are left unwired — the startup log
+        call. A seam whose status is not ``ok`` is left unwired — the startup log
         already says why.
         """
         if self._pipeline is None:
             return
         style = self._config.decisions.style
         if self._decisions_status["style"].startswith("ok"):
-            # The Ch2 style seam is the linear head's /v1/systemone (see style_client_for);
-            # everything else is Tacit's /v1/decide.
             self._style_client = style_client_for(style)
             self._pipeline._style_client = self._style_client
-        weights = self._config.decisions.weights
-        if self._decisions_status["weights"].startswith("ok"):
-            self._weights_client = TacitClient(weights)
-            self._pipeline._weights_client = self._weights_client
-        category = self._config.decisions.category
-        if self._decisions_status["category"].startswith("ok"):
-            self._category_client = TacitClient(category)
-            self._pipeline._category_client = self._category_client
-        if self._decisions_status["reasoning_gate"].startswith("ok"):
-            self._gate_client = TacitClient(self._config.decisions.reasoning_gate)
-
-    def _reasoning_gate(self) -> Callable[[str, dict[str, Any]], Awaitable[bool | None]] | None:
-        """The J5 gate closure over the Tacit client (``None`` when the seam is off)."""
-        return reasoning_gate(self._gate_client, self._config.decisions.reasoning_gate)
 
     async def _cleanup(self) -> None:
         """Tear down resources; always called from the lifespan finally block."""
@@ -477,15 +450,9 @@ class DesignPatternServer:
             if self._reasoning_client:
                 await self._reasoning_client.close()
                 logger.debug("Cleaned up ReasoningClient")
-            for name, client in (
-                ("style client", self._style_client),
-                ("TacitClient(weights)", self._weights_client),
-                ("TacitClient(category)", self._category_client),
-                ("TacitClient(reasoning_gate)", self._gate_client),
-            ):
-                if client is not None:
-                    await client.close()
-                    logger.debug("Cleaned up %s", name)
+            if self._style_client is not None:
+                await self._style_client.close()
+                logger.debug("Cleaned up style client")
             self._tools.clear()
             logger.info("Server resources cleanup completed")
         except Exception as exc:

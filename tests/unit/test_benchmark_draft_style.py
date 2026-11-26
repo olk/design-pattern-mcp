@@ -127,8 +127,9 @@ def test_compose_scenario_id_respects_the_schema_cap() -> None:
 
 
 #: Served styles whose only train labels the 2026-11 audit corrected away, and the review that
-#: closed the gap. The dict must stay empty now: the style-gap corpus work (docs/tacit-fine-tune.md
-#: §4.7.1) added 25 reviewed api-gateway train exemplars, so any remaining gap is a regression.
+#: closed the gap. The dict must stay empty now: the 2026-11 style-gap corpus work
+#: (docs/linear-style-head.md §1) added 25 reviewed api-gateway train exemplars, so any
+#: remaining gap is a regression.
 _UNCOVERED_TRAIN_STYLES: dict[str, str] = {}
 
 #: §4.7.1 data precondition on the holdout: `>= 100` family-disjoint rows, so a lowered holdout

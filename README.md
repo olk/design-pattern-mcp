@@ -28,7 +28,6 @@ An MCP (Model Context Protocol) server that provides design-pattern selection ex
   - [Which stack to run](#which-stack-to-run)
   - [Local Development (uv)](#local-development-uv)
 - [Configuration](#configuration)
-  - [Decision models (AnyJev Tacit-4B)](#decision-models-anyjev-tacit-4b)
   - [Decision models (linear style head, the Ch2 seam)](#decision-models-linear-style-head-the-ch2-seam)
 - [Structured Reasoning](#structured-reasoning)
 - [Long-running tools & timeouts](#long-running-tools--timeouts)
@@ -50,14 +49,11 @@ git clone https://git.odvlh.xyz/olli/design-pattern-mcp.git && cd design-pattern
 # 2. Add your API key
 export OPENCODE_API_KEY=your_key_here
 
-# 3. Build + start. Default is no-Tacit-seams on every tier (measured 2026-11:
-#    Tacit buys no selection quality at any scale, and costs ~2 min/call on
-#    CPU) — the decisions lane stays an explicit opt-in. CPU TEI sidecars
-#    are the benchmarked path.
-make docker-build-base                         # base images (no Tacit weights)
-make docker-up                                 # server + TEI pair + style head, no Tacit
-# make docker-build-all       # + Tacit sidecars (only for the decisions lane)
-# make docker-up-decisions    # opt-in: every seam live (measured: no gain)
+# 3. Build + start. Server + TEI pair + CPU style head — the benchmarked path.
+#    (A neural decision sidecar was measured 2026-11 and removed: no selection
+#    gain at any scale, +~2 min per call on CPU.)
+make docker-build-base                         # base images
+make docker-up                                 # server + TEI pair + style head
 
 # 4. Demo (analyze-only: fast. For the full design: make client-design)
 make client-analyze
@@ -397,33 +393,21 @@ Run both servers side by side (dev host ports `:8060` architecture, `:8822` desi
 ### Docker (manual)
 
 ```bash
-# Build every image (dense vector cache generated and baked in). Tacit self-distills
-# on a GPU builder — without one it aborts on the committed sentinels (the weights are
-# untracked), so build the CPU images instead and pick the matching start command
-# ([Which stack to run](#which-stack-to-run) for the full matrix):
-make docker-build-all                       # GPU builder
-# make docker-build-base   # no GPU builder
-# make docker-build-tacit-cpu  # no-GPU Tacit sidecar on top of -base (needs the trained models/tacit-4b/ from a GPU builder)
-
-# Run with your API key (no-Tacit-seams default — add the decisions lane only
-# if you re-measure a gain: `make docker-up-decisions` runs every seam live).
+# Build every image (dense vector cache generated and baked in):
+make docker-build-all                       # same image set as docker-build-base
+# Run with your API key
 OPENCODE_API_KEY=your_key make docker-up
 ```
 
 ### Which stack to run
 
-| Any host | `make docker-build-base` | `make docker-up` | server + TEI pair (CPU sidecars, the benchmarked path) + style head, no Tacit seams — the default |
-| GPU decisions opt-in | `make docker-build-all` | `make docker-up-decisions` | + Tacit gateway — every seam live (measured: no selection gain, +~2 min/call on CPU) |
-| No GPU | `make docker-build-base` | `make docker-up` | server + TEI pair + style head — Ch2 on (config.json default), Tacit seams off |
-| No GPU, Tacit seams on | `make docker-build-base` + `make docker-build-tacit-cpu` | `make docker-up-decisions-cpu` | server + TEI pair + CPU Tacit sidecar + style head — every seam live, no GPU anywhere (needs the trained checkpoint) |
-| Style off | same as No GPU | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
-| Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external; decisions overlay points Tacit seams at the HTTP gateway |
+| Stack | Build | Start | What runs |
+|---|---|---|---|
+| Any host (default) | `make docker-build-base` | `make docker-up` | server + TEI pair (CPU sidecars, the benchmarked path) + style head |
+| Style off | same as above | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
+| Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external |
 
-Switching between `docker-up` and `docker-up-decisions` is down + up with the matching
-down: the base lane runs the `design-pattern-mcp` project, the decisions lane its own
-`design-pattern-mcp-dev` project — and both reuse fixed `container_name`s, so switching
-without `make docker-down` first fails with "container name already in use".
-`make decisions-smoke` asserts the sidecar wire contracts on 18100 (Tacit) and 18800 (style head).
+`make decisions-smoke` asserts the style head's wire contract on 18800.
 
 Both compose stacks back that cache directory with a **named Docker volume**
 (`design-pattern-mcp-dev-dense-cache` / `design-pattern-mcp-systemd-dense-cache`,
@@ -591,76 +575,6 @@ instead of a full corpus pass (~19 min on the CPU TEI sidecar).
   `make embed-cache` snapshot is reused, or point it at
   `~/.config/design-pattern-mcp/dense-cache` and let the first start write it.
 
-### Decision models (AnyJev Tacit-4B)
-
-An optional, self-hosted decision layer: one GPU sidecar answers the bounded judgments the
-pipeline would otherwise ask the generator, so selection stops paying LLM latency (and
-variance) for closed-set questions. The Ch2 style seam is on by default (CPU head, no GPU
-needed); the Tacit seams stay default-off — the base compose stack never starts the Tacit
-sidecar, and `config/config.json` defaults them to `false`.
-
-> **Execution time:** both lanes are faster than the LLM path they replace. The linear head answers in ~8 ms (≈8.4 ms over 4140 calibration requests) and cut holdout p95 e2e by 34.0% (run 2) / 37.5% (run 1) in `make benchmark-style-ab` (`docs/linear-style-head.md` §6). Tacit answers one forward per decision (`TACIT_ADAPTIVE=false`, no thinking/sampling) instead of a generator round-trip, so the weights/category/gate legs skip LLM latency entirely; J1 rerank still needs its non-inferiority A/B (`make benchmark-rerank-ab`, holdout p95 within +15% of TEI) before claiming a win there.
-
-| Seam | Model / wire | Substitutes | Degrades to |
-|---|---|---|---|
-| Ch2 style | linear head `POST /v1/systemone`, ONE 36-criterion `choice` (35 styles + `none`) | the LLM-sampled `brief.architecture_style`, when the answer clears `DECISIONS_STYLE_CONFIDENCE_FLOOR` | the LLM style |
-| J1 rerank | Tacit `POST /v1/decide`, one `yes_no` per fused-pool candidate (`RERANKER_PROVIDER=tacit`) | the TEI cross-encoder pass over the fused pool | the TEI reranker (identical call) |
-| J4 weights | Tacit `POST /v1/decide` (`score`, 8 axes per part) | the one batched weights LLM call, part by part | the LLM weights call |
-| J2 category | Tacit `POST /v1/decide` (`choice`, 9 categories) | one part's retrieved pool, narrowed after retrieval, and that part's effective category for scoring/fallback | no narrowing (unfiltered pool, LLM hypothesis) |
-| J5 gate | Tacit `POST /v1/decide` (`yes_no`) | whether a phase deliberates first | reasoning runs |
-
-One procedure is worth stating because it shapes the wire:
-
-- **Rerank is retrieve-then-rerank.** Stage 1 is the deterministic fused pool hybrid
-  retrieval already produces (already capped at `rerank_top_n` survivors); stage 2 asks one
-  `yes_no` relevance question per unique candidate document, in ONE batched request, and
-  orders the pool by `p(Yes)`. `yes_no` is exempt from the 26-option cap, so pool size is
-  unconstrained. Scores are absolute per-document probabilities, so they compare across
-  pools — at the cost of one forward per candidate, which is why `rerank_text: capsule` is
-  the recommended pairing for this provider.
-
-The invariant is the same one `docs/JEV_DECISION_MODEL_ANALYSIS_PLAN.md` §7 pins: **an
-outage never fails a tool call.** Every client returns `None`/falls back on HTTP errors,
-timeouts and shape mismatches, and the pipeline's non-model path stands. A category filter
-that would empty the pool is discarded; a weights vector that comes back unusable (or
-all-zero after one retry) sends that part down the LLM path; the reasoning gate fails open.
-
-```bash
-make docker-build-decision   # Tacit self-distilled in-image (GPU + CDI) + the CPU style head
-make docker-up-decisions            # stack + the sidecars (one GPU, one CPU)
-make decisions-smoke                # assert the wire contracts on 18100 (Tacit) and 18800 (style head)
-make docker-down-decisions
-```
-
-The Tacit image bakes its weights (no Hub access at start, `HF_HUB_OFFLINE=1`) and *trains in the
-build*: it self-distils the model on this server's own seam prompts
-(`src/decisions/seam_prompts.py`, shared by trainer and server) over the category, weights,
-gate and rerank seams — with the teacher pass sharded across
-the visible GPUs. The shipped weights are Tacit-4B fine-tuned for design-pattern
-selection — `:base` below is the released, untrained checkpoint. An under-trained
-seam fails the build (per-seam agreement and weights-MAE
-gates). It needs a GPU on the builder, granted through a CDI device entitlement:
-
-```bash
-docker build --allow device=nvidia.com/gpu=all -f docker/Dockerfile.tacit-gpu --target runtime-distilled .
-```
-
-No GPU builder? `make docker-build-tacit-base` builds the `runtime-released` target
-instead (a `:base` tag) — released weights, untrained, no GPU anywhere. Start that variant by
-pointing compose at it:
-
-```bash
-TACIT_IMAGE=design-pattern-tacit:base make docker-up-decisions
-```
-
-No GPU at serve time either? `make docker-build-tacit-cpu` bakes the same trained
-checkpoint dequantized to BF16 and served on `vllm-openai-cpu` — full Tacit seams with
-no GPU anywhere (`make docker-up-decisions-cpu`, [docs/tacit-fine-tune.md](docs/tacit-fine-tune.md) §4.9).
-
-The sidecar serves from one 24 GB card (Tacit-4B ≈ 8 GB in vLLM plus the gateway).
-
-Fine-tuning procedure (fine-tune → image → publish): [docs/tacit-fine-tune.md](docs/tacit-fine-tune.md).
-
 ### Decision models (linear style head, the Ch2 seam)
 
 `design-pattern-style-head` serves the Ch2 architecture-style substitution over the
@@ -669,7 +583,7 @@ a TF-IDF(1-2gram) + CalibratedClassifierCV(LinearSVC) head — ~450 MB, **no GPU
 and no network at run time**, ~8 ms per decision. It exists because the task turned out to be a
 lexical read — measured on the same 138-row family-disjoint holdout as both removed neural
 providers, it scores **0.8333** top-1 where they scored 0.5072 / 0.4565, and it is the only
-arm that yields a qualifying confidence floor.
+arm that yields a qualifying confidence floor. A neural decision-model lane (a 4B gateway sidecar behind the rerank, weights, category and reasoning-gate seams) was measured over 2026-11 and removed 2026-11-26: it bought no selection quality at any measured scale and cost roughly two minutes per call on CPU; `docs/linear-style-head.md` §1 keeps the numbers.
 
 ```bash
 make docker-build-style-head            # CPU, ~20 s; the training RUN *is* the accuracy gate
@@ -677,16 +591,17 @@ make docker-up                          # base stack, style head included, no GP
 make style-head-calibrate               # floor + repeat/order probes -> models/style-head-calibration.json
 make benchmark-style-ab
 
-The seam, endpoint, model name and floor all follow from the provider (always `linear` now).
-The head runs in the base compose file (`make docker-up`), so hosts whose card
-cannot serve vLLM at all still get the seam — the full decision overlay's server depends
-on the Tacit gateway, the base stack does not. The seam ships on
+The seam, endpoint, model name and floor all follow from the provider (always `linear`).
+The head runs in the base compose file (`make docker-up`), so no GPU is needed anywhere.
+The seam ships on
 (`DECISIONS_STYLE_ENABLED=true`): set it to `false` to stand it down to the LLM style.
 
 Measurement, the recipe correction it forced, and the operating procedure:
 [docs/linear-style-head.md](docs/linear-style-head.md).
 
 ### Key environment variables
+
+A config file copied from an earlier release may still carry the removed lane's keys (`reranker` provider fields, `decisions.weights`, `decisions.category`, `decisions.reasoning_gate`); `ServerConfig` rejects unknown keys, so delete those blocks before upgrading.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -711,18 +626,14 @@ Measurement, the recipe correction it forced, and the operating procedure:
 | `RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the CPU TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
 | `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
 | `RERANK_TOP_N` | `10` | Rerank top N |
-| `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) or `tacit` (per-candidate `yes_no` over `/v1/decide`; any failure re-issues the identical TEI call) |
+| `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) and the only legal value |
 | `DECISIONS_STYLE_ENABLED` | `true` | Ch2 seam: the linear head replaces the LLM-sampled style when its answer clears the floor |
 | `DECISIONS_STYLE_PROVIDER` | `linear` | Ch2 wire: pinned to `linear` (CPU linear head, `/v1/systemone` on the `/v1` root). Provider, endpoint and model must move together — the config refuses a half-switched pair |
-| `DECISIONS_WEIGHTS_ENABLED` | `false` | J4 seam: Tacit `score` questions replace the batched weights LLM call |
-| `DECISIONS_CATEGORY_ENABLED` | `false` | J2 seam: Tacit category `choice` narrows the retrieved pool (never a hard router) |
-| `DECISIONS_REASONING_GATE_ENABLED` | `false` | J5 seam: Tacit `yes_no` can skip a phase's deliberation |
-| `DECISIONS_{STYLE,WEIGHTS,CATEGORY,REASONING_GATE}_BASE_URL` | sidecar service names | Per-seam endpoint (any provider speaking the same wire, e.g. hosted Jev for judging) |
-| `DECISIONS_{...}_MODEL` | `style-linear` (style) / `tacit-4b` (others) | Served model identity, recorded in the startup log |
+| `DECISIONS_STYLE_BASE_URL` | sidecar service names | Per-seam endpoint (any provider speaking the same wire) |
+| `DECISIONS_STYLE_MODEL` | `style-linear` | Served model identity, recorded in the startup log |
 | `DECISIONS_STYLE_CONFIDENCE_FLOOR` | `0.6` | Ch2 act threshold: the A/B-winning operating point (65 % act @ 1.000 on the holdout) |
-| `DECISIONS_{CATEGORY,REASONING_GATE}_CONFIDENCE_FLOOR` | `0.5` | Minimum confidence/probability to act on the answer |
-| `DECISIONS_{...}_API_KEY_ENV` | unset | Name of the env var holding a bearer key; unset = no `Authorization` header (local sidecars) |
-| `DECISIONS_{...}_TIMEOUT_SECONDS` | `10` (`weights` `30`, `reasoning_gate` `5`) | Per-call bound; expiry degrades to the non-model path |
+| `DECISIONS_STYLE_API_KEY_ENV` | unset | Name of the env var holding a bearer key; unset = no `Authorization` header (local sidecars) |
+| `DECISIONS_STYLE_TIMEOUT_SECONDS` | `10` | Per-call bound; expiry degrades to the non-model path |
 | `REASONING_ENABLED` | `true` | Master switch for the pre-LLM reasoning layer |
 | `REASONING_{ANALYZE,WEIGHTS,GENERATE,EVALUATE}_ENABLED` | `true` | Per-phase reasoning switches; a disabled phase contributes an empty reasoning context (no generator call, no subprocess, no cache entry), while an *outage* in an enabled phase degrades silently to the in-prompt scaffold |
 | `REASONING_{...}_THOUGHTS` | `2` / phase | Reasoning steps before each phase's main call |
@@ -924,11 +835,10 @@ One full-text rerank request already saturates the CPU TEI sidecar's 16,384-toke
 | `make verify-ledger` / `make verify-cross-consistency` | Ledger + NL-doc consistency gates |
 | `make benchmark-live` / `make benchmark-analyze` / `make benchmark-compare` / `make benchmark-selfcheck` | Benchmark harness (see above) |
 | `make embed-cache` | Force-regenerate `data/dense-cache/` |
-| `make docker-build-all` | Build every image: server, TEI pair, Tacit, style head (dense cache baked in) |
+| `make docker-build-all` | Build every image: server, TEI pair, style head (dense cache baked in) |
 | `make docker-up` / `make docker-down` | Start / stop the dev stack |
 | `make client-analyze` / `make client-design` / `make client-async` | Demo clients against `http://localhost:8822/mcp` |
 | `make docker-publish` | Push the server image to Docker Hub + GHCR (+ git tag) |
-| `make docker-publish-tacit` | Push the Tacit sidecar image to Docker Hub + GHCR |
 
 **Development workflow:**
 
@@ -947,20 +857,18 @@ Ground rules (from `AGENTS.md`): `src/` is mypy-strict; schema changes change `d
 
 ## Publishing
 
-Six images are published to two registries; all ride the umbrella `docker-publish-all` target, and each sidecar lane has its own on-demand target:
+Four images are published to two registries; all ride the umbrella `docker-publish-all` target, and each sidecar lane has its own on-demand target:
 
 | Image | Docker Hub | GHCR | Tags |
 |---|---|---|---|
 | MCP server | `olkowa/design-pattern-mcp` | `ghcr.io/olk/design-pattern-mcp` | `$(DOCKER_TAG)`, `latest` |
 | TEI embedder | `olkowa/pattern-tei-embed` | `ghcr.io/olk/pattern-tei-embed` | `$(DOCKER_TAG)`, `latest` |
 | TEI reranker | `olkowa/pattern-tei-rerank` | `ghcr.io/olk/pattern-tei-rerank` | `$(DOCKER_TAG)`, `latest` |
-| Tacit sidecar | `olkowa/design-pattern-tacit` | `ghcr.io/olk/design-pattern-tacit` | `$(DOCKER_TAG)`, `latest` |
-| Tacit sidecar (CPU) | `olkowa/design-pattern-tacit-cpu` | `ghcr.io/olk/design-pattern-tacit-cpu` | `$(DOCKER_TAG)`, `latest` |
 | Style head | `olkowa/design-pattern-style-head` | `ghcr.io/olk/design-pattern-style-head` | `$(DOCKER_TAG)`, `latest` |
 
-All six images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged. The Tacit sidecars are ~29 GB (GPU) and ~12 GB (CPU), so they are also published on demand with `make docker-publish-tacit` / `make docker-publish-tacit-cpu` (each builds first, so the pushed weights are the ones pinned by `models/tacit-4b/.extract-complete`).
+All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged.
 
-> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred. The Tacit sidecars are ~29 GB (GPU) / ~12 GB (CPU) (vLLM base + baked 4B weights), so the GPU sidecar's first push is the largest in this repo; re-pushing an unchanged build only transfers new layers.
+> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred.
 
 ### Prerequisites
 
@@ -974,9 +882,9 @@ All six images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`
 # 1. Login to GHCR (interactive — paste token at the password prompt)
 docker login ghcr.io -u olk
 
-# 2. Build and push every image (MCP + TEI embedder + TEI reranker + Tacit GPU+CPU + style head)
+# 2. Build and push every image (MCP + TEI embedder + TEI reranker + style head)
 #    The umbrella target builds the MCP image, tags it, pushes it, creates the git tag,
-#    then builds and pushes TEI, both Tacit sidecars and the style head in sequence.
+#    then builds and pushes the TEI pair and the style head in sequence.
 make docker-publish-all
 
 # 3. Logout from GHCR immediately after publishing
@@ -984,7 +892,7 @@ make docker-publish-all
 docker logout ghcr.io
 ```
 
-On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-tacit`, `make docker-publish-tacit-cpu` and `make docker-publish-style-head` push the decision sidecars individually (same two registries), and all six ride `docker-publish-all`.
+On subsequent publishes repeat steps 1–3. If your PAT has expired, generate a new one at the link above. `make docker-publish` pushes only the MCP server image (plus the `v$(DOCKER_TAG)` git tag and the MCP Registry entry via `mcp-publisher`); `make docker-publish-tei` pushes only the two TEI sidecars; `make docker-publish-style-head` pushes the style head individually (same two registries), and all four ride `docker-publish-all`.
 
 ### First push — set packages public (GHCR only)
 
@@ -995,14 +903,13 @@ GHCR packages default to **private**. After the first `make docker-publish-all`,
 | MCP server | `https://github.com/users/olk/packages/container/design-pattern-mcp/settings` |
 | TEI embedder | `https://github.com/users/olk/packages/container/pattern-tei-embed/settings` |
 | TEI reranker | `https://github.com/users/olk/packages/container/pattern-tei-rerank/settings` |
-| Tacit sidecar | `https://github.com/users/olk/packages/container/design-pattern-tacit/settings` |
 | Style head | `https://github.com/users/olk/packages/container/design-pattern-style-head/settings` |
 
 Set each to **Public** and save.
 
 ### Partial failure recovery
 
-If the push fails mid-way (e.g., GHCR auth was not configured), Docker Hub layers are already uploaded. After fixing auth, re-running `make docker-publish-all` is safe — each registry reports a cache hit for already-uploaded layers and completes the remaining push. For targeted retries, the TEI sidecars can be pushed with `make docker-publish-tei` and the decision sidecars with `make docker-publish-tacit` / `make docker-publish-style-head`.
+If the push fails mid-way (e.g., GHCR auth was not configured), Docker Hub layers are already uploaded. After fixing auth, re-running `make docker-publish-all` is safe — each registry reports a cache hit for already-uploaded layers and completes the remaining push. For targeted retries, the TEI sidecars can be pushed with `make docker-publish-tei` and the style head with `make docker-publish-style-head`.
 
 ---
 
@@ -1014,8 +921,6 @@ The server can run as a systemd service on any systemd-based Linux host. It star
 |---|---|
 | `systemd/design-pattern-mcp.service` | The systemd unit |
 | `systemd/docker-compose.yml` | Production compose variant (no `build:`, absolute paths, container port 8050) |
-| `systemd/docker-compose.decision-models.yml` | Opt-in overlay: Tacit gateway URLs over plain HTTP (enabled via `COMPOSE_FILE` in `.env`) |
-| `systemd/docker-compose.tacit-cpu.yml` | CPU-lane overlay: budgets for the in-stack `tacit` sidecar (third in `COMPOSE_FILE`, with `COMPOSE_PROFILES=tacit-cpu`) |
 | `systemd/README.md` | Full runbook: install, verify, troubleshooting |
 
 The production compose is the deployment variant of the dev file: pre-built images only, absolute paths, deployable to `/etc/design-pattern-mcp/`. The TEI sidecars live in the shared [pattern-tei-infra](https://github.com/olk/pattern-tei-infra) stack; this stack joins its Docker network and reaches them by DNS name. Start the service only after the shared TEI infra is `active (running)`.
@@ -1029,8 +934,6 @@ docker pull "olkowa/design-pattern-style-head:${VERSION}"
 docker tag "olkowa/design-pattern-style-head:${VERSION}" design-pattern-style-head:latest
 sudo install -d /etc/design-pattern-mcp/config
 sudo install -m 644 systemd/docker-compose.yml /etc/design-pattern-mcp/
-sudo install -m 644 systemd/docker-compose.decision-models.yml /etc/design-pattern-mcp/
-sudo install -m 644 systemd/docker-compose.tacit-cpu.yml /etc/design-pattern-mcp/
 sudo install -m 644 config/config.json /etc/design-pattern-mcp/config/
 sudo install -m 644 systemd/design-pattern-mcp.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now design-pattern-mcp

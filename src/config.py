@@ -131,17 +131,8 @@ class RerankerConfig(BaseModel):
     #: first two use cases (~3x fewer characters, measured 3.6-4.3x faster on
     #: the CPU sidecar). Rankings are NOT equivalent — capsule is opt-in.
     rerank_text: Literal["full", "capsule"] = Field(default="full")
-    #: Rerank backend (§6 step 4): ``tei`` = the cross-encoder sidecar (default),
-    #: ``tacit`` = one ``yes_no`` relevance question per fused-pool candidate over the
-    #: AnyJev gateway. The TEI sidecar stays the mandatory fallback inside the client,
-    #: so retrieval never depends on the Tacit stack being up. ``tacit_base_url`` is the
-    #: gateway ROOT (the client appends ``/v1/decide``). With ``tacit``, keep
-    #: ``rerank_text: full``: the pair artifact the fine-tune and its eval are derived
-    #: from carries each candidate's ``document_text``, so ``capsule`` would serve bytes
-    #: the seam never trained on (available, but trained-byte-divergent).
-    provider: Literal["tei", "tacit"] = Field(default="tei")
-    tacit_base_url: str = Field(default="http://design-pattern-tacit:8100")
-    tacit_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    #: Rerank backend (§6 step 4): ``tei`` is the cross-encoder sidecar and the only legal value.
+    provider: Literal["tei"] = Field(default="tei")
     config: RerankerInnerConfig = Field(default_factory=RerankerInnerConfig)
 
     model_config = {"extra": "forbid"}
@@ -321,25 +312,23 @@ class PromptConfig(BaseModel):
 class DecisionSeamConfig(BaseModel):
     """One decision-model seam: the provider endpoint plus the knobs that bound it.
 
-    Every seam is default-off. ``provider`` names which serving stack answers the seam and
-    therefore which wire it speaks: the Ch2 style seam is served ONLY by ``linear`` (the
-    TypeSafe-compatible ``POST /v1/systemone`` on the style-head's ``/v1`` root); every
-    other seam is served ONLY by ``tacit``, the AnyJev gateway's ``POST /v1/decide`` on
-    the gateway ROOT. ``api_key_env`` is the only credential path: it stays reachable
-    for a hosted endpoint with the same wire, and ``None`` means no ``Authorization``
-    header at all.
+    The seam is default-off in the model (the shipped ``config/config.json`` and the compose
+    files turn the style seam on). ``provider`` names which serving stack answers the seam and
+    therefore which wire it speaks: ``linear``, the TypeSafe-compatible ``POST /v1/systemone`` on
+    the style head's ``/v1`` root, is the only provider. ``api_key_env`` is the only credential
+    path: it stays reachable for a hosted endpoint with the same wire, and ``None`` means no
+    ``Authorization`` header at all.
     """
 
     enabled: bool = Field(default=False, description="Opt-in seam switch.")
-    provider: Literal["tacit", "linear"] = Field(
-        default="tacit",
-        description=("Serving stack behind the seam: tacit (/v1/decide) or linear (/v1/systemone, CPU)."),
+    provider: Literal["linear"] = Field(
+        default="linear", description="Serving stack behind the seam: linear (/v1/systemone, CPU)."
     )
     base_url: str = Field(
-        default="http://design-pattern-tacit:8100",
-        description=("anyjev gateway root (no /v1 suffix), or the /v1 root when provider=linear."),
+        default="http://design-pattern-style-head:8800/v1",
+        description="The style head's /v1 root (the client appends /systemone).",
     )
-    model: str = Field(default="tacit-4b", description="Served model name (tacit-4b | style-linear).")
+    model: str = Field(default="style-linear", description="Served model name.")
     api_key_env: str | None = Field(
         default=None,
         description="Optional env var holding a bearer key; None = no Authorization header.",
@@ -349,7 +338,7 @@ class DecisionSeamConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Minimum confidence to act on the answer (ignored by the weights seam). The Ch2 "
+            "Minimum confidence to act on the answer. The Ch2 "
             "style seam gates on ONE 36-criterion /v1/systemone stage (top probability minus "
             "mean of the rest). Set it from scripts/decision_models/style_head_calibrate.py, "
             "not the default."
@@ -371,109 +360,28 @@ class DecisionSeamConfig(BaseModel):
 
     @model_validator(mode="after")
     def _base_url_matches_the_provider_wire(self) -> DecisionSeamConfig:
-        """``provider`` and the ``base_url`` shape must agree, in BOTH directions.
+        """``base_url`` must be the style head's ``/v1`` root.
 
-        Each wire has one URL shape: Tacit's gateway root (the client appends ``/v1/decide``)
-        and the style head's ``/v1`` root (the client appends ``/systemone``). Leaving them
-        interchangeable makes a half-switched deployment — a rollback that moves only
-        ``provider``, or a flip that moves only the URL — into a 404 that the
-        degrade-never-raise contract turns into a silently dead seam. Checked here so the
+        The client appends ``/systemone``; a gateway-style root (no ``/v1``) would 404, and the
+        degrade-never-raise contract turns that into a silently dead seam. Checked here so the
         misconfiguration is a startup error instead.
         """
-        root = self.base_url.rstrip("/")
-        if self.provider == "linear" and not root.endswith("/v1"):
+        if not self.base_url.rstrip("/").endswith("/v1"):
             raise ValueError(f"provider={self.provider} needs the /v1 root, got base_url={self.base_url!r}")
-        if self.provider == "tacit" and root.endswith("/v1"):
-            raise ValueError(f"provider=tacit needs the gateway ROOT (no /v1 suffix), got base_url={self.base_url!r}")
         return self
-
-
-#: Per-seam defaults. The seams share one gateway but not one timeout (the weights seam
-#: asks 8 questions per part); a seam must keep ITS timeout when a caller supplies only a
-#: partial override (``{"weights": {"enabled": true}}``), which a nested-model replacement
-#: would otherwise resolve back onto the generic defaults.
-_SEAM_DEFAULTS: dict[str, dict[str, Any]] = {
-    "style": {
-        "provider": "linear",
-        "base_url": "http://design-pattern-style-head:8800/v1",
-        "model": "style-linear",
-        "timeout_seconds": 10.0,
-    },
-    "weights": {
-        "provider": "tacit",
-        "base_url": "http://design-pattern-tacit:8100",
-        "model": "tacit-4b",
-        "timeout_seconds": 30.0,
-    },
-    "category": {
-        "provider": "tacit",
-        "base_url": "http://design-pattern-tacit:8100",
-        "model": "tacit-4b",
-        "timeout_seconds": 10.0,
-    },
-    "reasoning_gate": {
-        "provider": "tacit",
-        "base_url": "http://design-pattern-tacit:8100",
-        "model": "tacit-4b",
-        "timeout_seconds": 5.0,
-    },
-}
 
 
 class DecisionsConfig(BaseModel):
-    """The four decision-model seams (JEV report §1.5); all default-off, wired per seam.
+    """The decision-model seam (Ch2 style); default-off in the model, wired per seam.
 
     Hosted TypeSafe Jev defaults are gone — the same wire stays reachable by pointing
-    ``base_url`` + ``api_key_env`` at it. A seam left out of the config keeps its own
-    default endpoint, and a *partial* seam object is merged onto that endpoint rather than
-    replaced by the generic ``DecisionSeamConfig`` defaults.
+    ``base_url`` + ``api_key_env`` at it. A *partial* seam object falls back onto this model's
+    own field defaults, which are that seam's defaults.
     """
 
-    style: DecisionSeamConfig = Field(default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["style"]))
-    weights: DecisionSeamConfig = Field(default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["weights"]))
-    category: DecisionSeamConfig = Field(default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["category"]))
-    reasoning_gate: DecisionSeamConfig = Field(
-        default_factory=lambda: DecisionSeamConfig(**_SEAM_DEFAULTS["reasoning_gate"])
-    )
+    style: DecisionSeamConfig = Field(default_factory=DecisionSeamConfig)
 
     model_config = {"extra": "forbid"}
-
-    @model_validator(mode="before")
-    @classmethod
-    def _merge_partial_seams(cls, data: Any) -> Any:
-        """Fill each supplied seam object's absent keys from that seam's own defaults."""
-        if not isinstance(data, dict):
-            return data
-        merged = dict(data)
-        for name, defaults in _SEAM_DEFAULTS.items():
-            value = merged.get(name)
-            if isinstance(value, dict):
-                merged[name] = {**defaults, **value}
-        return merged
-
-    @model_validator(mode="after")
-    def _each_seam_provider_has_a_client(self) -> DecisionsConfig:
-        """Each seam's provider must be the one its client implements: linear on style, tacit elsewhere.
-
-        The style seam has exactly one implementation (``DecisionModelClient`` against the
-        linear head); the other seams have exactly one (``TacitClient``). Allowing the
-        field to say otherwise would make the startup report claim a provider that never
-        answers — and misconfiguration that reads as configuration is worse than a crash.
-        """
-        for name, seam in self._seams().items():
-            want = "linear" if name == "style" else "tacit"
-            if seam.provider != want:
-                raise ValueError(f"decisions.{name}.provider={seam.provider!r}: only {want!r} is legal here")
-        return self
-
-    def _seams(self) -> dict[str, DecisionSeamConfig]:
-        """Every seam by name, in the order the startup report lists them."""
-        return {
-            "style": self.style,
-            "weights": self.weights,
-            "category": self.category,
-            "reasoning_gate": self.reasoning_gate,
-        }
 
 
 class ServerConfig(BaseModel):
@@ -555,9 +463,6 @@ class ServerConfig(BaseModel):
             "tasks_deadline_seconds": self.tasks.deadline_seconds,
             "decisions_style_enabled": self.decisions.style.enabled,
             "decisions_style_model": self.decisions.style.model,
-            "decisions_weights_enabled": self.decisions.weights.enabled,
-            "decisions_category_enabled": self.decisions.category.enabled,
-            "decisions_reasoning_gate_enabled": self.decisions.reasoning_gate.enabled,
             "reranker_provider": self.reranker.provider,
         }
 

@@ -2,17 +2,16 @@
 
 The Ch2 style seam replaces the LLM-sampled `brief.architecture_style` with a decision-model
 answer. Two neural providers were measured and rejected on the same 138-row family-disjoint
-holdout, then removed from the repo (the Tacit style arm: `docs/tacit-fine-tune.md` §4.7.1;
-the CLM arm's numbers are preserved in §1 below). This document records the surviving lane:
+holdout, then removed from the repo (both arms' numbers are preserved in §1 below). This document records the surviving lane:
 a bag-of-n-grams head served on CPU behind the `/v1/systemone` wire, and the measurement
 that decided it ships.
 
 Status: **the linear head is the Ch2 seam's only provider** (`decisions.style.provider` is
-pinned to `linear`; the Tacit/CLM style wirings are removed). The seam ships on at floor 0.6
+pinned to `linear`; the neural style wirings are removed). The seam ships on at floor 0.6
 (the run-2 A/B winner, §6); the artifact's `recommended.floor` of 0.1 is the lowest
 bar-clearing floor, not the shipped default.
 **Historical note:** the `models/clm-calibration*.json` citations in
-§1 and the `models/tacit-calibration.json` citation beside them name artifacts that no longer
+§1 and the `models/<lane>-calibration.json` citations beside them name artifacts that no longer
 exist — they were removed with their lanes, and the numbers they carried survive only here.
 The calibrator is now `scripts/decision_models/style_head_calibrate.py`. §1/§5/§6 below are
 the measurement history, preserved verbatim.
@@ -22,7 +21,7 @@ the measurement history, preserved verbatim.
 | arm | holdout top-1 | source |
 |---|---|---|
 | released CLM-v0.1-8B heads | 0.0362 | `models/clm-calibration-base.json` |
-| AnyJev Tacit-4B (gold-supervised) | 0.4203 | `models/tacit-calibration.json` |
+| neural 4B decision lane (gold-supervised; removed 2026-11-26) | 0.4203 | the lane's calibration artifact, removed with it |
 | CLM-8B heads-only, run 1 | 0.5072 | in-build eval gate |
 | CLM-8B heads-only, run 2 | 0.4565 | `models/clm-calibration.json` |
 | **linear head, calibrated SVM** | **0.8333** | `models/style-head-calibration.json`, n=138 |
@@ -30,7 +29,9 @@ the measurement history, preserved verbatim.
 Chance is `1/36 ≈ 0.028`; the classes are near-balanced. Twenty times the parameters and ten
 times the compute bought less than two thirds of a linear model's accuracy: the task is a
 lexical read of the state text, and a frozen encoder's contrastive heads do not extract it.
-That is the same conclusion `docs/tacit-fine-tune.md` §4.7.1 reached from the other direction.
+That is the same conclusion the removed neural lane's own calibration reached from the other direction (record below).
+
+**Removed-lane record (2026-11-26).** The neural lane's style arm was measured twice on the 138-row family-disjoint holdout and never cleared the enable bars (0.80 acted accuracy at a 0.30 acted rate, >= 10 acted rows): whole-holdout top-1 0.442 (chance 0.028) with ECE 0.322 and Brier 0.332; acted accuracy reached 0.913 only at a 0.167 acted rate (floor 0.95) and was 0.593 at the 0.30 rate point (floor 0.85); five repeats flipped acted rows at every floor from 0.5 up (`max_confidence_spread` 0.031). On the earlier 30-row instrument three checkpoints managed 5-7 named hits of the 8 required (best acted accuracies 0.238 / 0.259 / 0.267), and gold supervision moved held-out `style-gold` agreement only to 0.333 against a teacher fidelity of 0.778 on 128 gold-style train labels. The lane's fine-tune and trainer records were deleted with it; recover them with `git log --diff-filter=D --name-only -- docs/` and `git show <commit>^:<path>`.
 
 ## 2. The recipe, and the correction the first build forced
 
@@ -126,14 +127,14 @@ point, not just signal.
 Consistency, which is what makes a floor a threshold on answers rather than on noise:
 `style_choice_repeat_agreement = 1.0` (138/138 rows, confidence spread 0.0) and
 `style_choice_order_agreement = 1.0` over the permutations. Label provenance:
-`label_review.certified = true` at `review.json` sha `8b1bc3313211`.
+`label_review.certified = true` at the ledger digest of that run (`8b1bc3313211`; re-stamped 2026-11-26 to the label source's current sha — see `qa/typed/README.md`).
 
 Serving reproduces the trainer exactly: the same 138 rows fetched over HTTP agree with the gold
 label on 115 of 138 (`0.8333`), so there is no train/serve skew in the label mapping.
 
 ## 6. A/B verdict
 
-`make benchmark-style-ab STYLE_PROVIDER=linear STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml`
+`make benchmark-style-ab`
 — the pre-registered rule, verbatim from `tests/benchmark/harness/compare.py`:
 
 > candidate wins iff holdout p95 e2e improves >= 15% AND candidate overall acceptable-primary hit
@@ -197,8 +198,8 @@ selection-quality instrument, not a style-accuracy one. The style seam's accurac
 where it belongs — on the 138-row style holdout, above (§5) — and the A/B only asks whether
 turning the seam ON costs latency or selection quality against the LLM-sampled style.
 
-The arms run the **full decision overlay** on the 4× RTX 3090 host (`tacit-clm-ft`): Tacit on
-`gpu0` serving the weights/category/reasoning-gate seams, both TEI sidecars, and the linear
+The arms ran with the **full decision stack of that release** on a 4× RTX 3090 host: the neural sidecar
+on `gpu0` serving the weights/category/reasoning-gate seams (removed 2026-11-26), both TEI sidecars, and the linear
 head — the pre-registered configuration, where only `DECISIONS_STYLE_ENABLED` (and the floor,
 read from `models/style-head-calibration.json` rather than typed in) differs between arms. The
 floor itself was re-derived on that host against the served head before the run (same 138 rows,
@@ -262,9 +263,9 @@ the failure mode selected — and it won, so that status is now **superseded**:
   1.000 on the holdout; the operating point under which the A/B passed);
 * the seam itself **ships on** (`enabled = true` in the shipped config and the compose
   overlays) — disabling remains an explicit operator choice (`DECISIONS_STYLE_ENABLED=false`).
-  The provider was `tacit` when run 1's verdict was recorded; the §7 merge pinned it to
-  `linear`, which is what this branch ships;
-* `linear-style-seam` is **eligible for the §7 merge into `tacit`**, which is what the
+  The provider was the neural decision lane when run 1's verdict was recorded; the §7 merge
+  pinned it to `linear`, which is what this branch ships;
+* `linear-style-seam` is **eligible for the §7 merge into the then-default lane**, which is what the
   verification gate required.
 
 No part of that is a re-run until green: run 1's numbers, reasoning and discarded status stay
@@ -311,7 +312,6 @@ runs. That answer is at n=18 and inherits the same power caveat, stated with the
 ```bash
 make docker-build-style-head                    # ~20 s; the build gates the head
 make docker-up                                  # base stack, style head included, no GPU
-# or: make docker-up-decisions                  # full stack with the Tacit gateway
 ```
 
 The seam ships on at floor 0.6 — no per-deployment step. `make style-head-calibrate`
@@ -320,10 +320,8 @@ is the maintainer tool for corpus/head changes: it rewrites
 bar-clearing floor, not the shipped default — 0.1 lost run 1 on repeat stability, so
 re-shipping still means re-winning the A/B at the new point (§6).
 
-The head runs in the base compose file, so `make docker-up` needs no GPU at
-all — but the full decision stack's `design-pattern-mcp` depends on the Tacit gateway,
-so that lane needs an Ampere-class card. The head is deliberately not in
-`design-pattern-mcp`'s `depends_on` in either stack: a hard dependency would fail every
+The head runs in the base compose file, so `make docker-up` needs no GPU at all. The head is
+deliberately not in `design-pattern-mcp`'s `depends_on`: a hard dependency would fail every
 deployment whose operator never built the image, and the seam already degrades to the
 LLM style.
 
@@ -332,28 +330,24 @@ and `config/config.json` defaults the seam to the style head (on, floor 0.6). To
 seam down, set `DECISIONS_STYLE_ENABLED=false` — the LLM-sampled style stands, as in the
 A/B's baseline arm.
 
-### Reproducing the A/B on a GPU host
+### Reproducing the A/B
 
-The arms need the Tacit gateway, so they run where a card can serve vLLM (here
-`tacit-clm-ft`, 4× RTX 3090). From a workstation checkout of this branch:
+The arms need only the base stack (both TEI sidecars and the linear head; no GPU), so they run
+wherever `make docker-build-base` succeeded. From a workstation checkout of this branch:
 
 ```bash
 git bundle create /tmp/lsh.bundle 22445902..linear-style-seam      # base = clm-style-seam tip
 ssh host 'cat > /tmp/lsh.bundle' < /tmp/lsh.bundle
 ssh host 'cd design-pattern-mcp && git fetch /tmp/lsh.bundle linear-style-seam:linear-style-seam &&
           git checkout linear-style-seam'
-# the host carries UNCOMMITTED CLM evidence (models/clm-heads extras, calibration JSONs):
-# copy it aside before the first checkout — the branch's tracked copies are not the whole story
-ssh host 'cd design-pattern-mcp && cp -a models/clm-heads models/clm-calibration*.json /tmp/host-uncommitted/'
 ssh host 'cd design-pattern-mcp && make docker-build-style-head &&
           docker build --target production -f Dockerfile -t design-pattern-mcp:latest .'
 ssh host 'cd design-pattern-mcp && make style-head-calibrate'      # floor from the served head
 ssh host 'cd design-pattern-mcp && setsid nohup make benchmark-style-ab \
-  STYLE_PROVIDER=linear STYLE_AB_OVERLAY=docker/docker-compose.decision-models.yml \
   STYLE_AB_SCENARIOS=tests/benchmark/scenarios/seed.json > /tmp/style-ab.log 2>&1 &'
 ```
 
-Two costs to budget, both fixed per arm and both by design: Tacit's vLLM load (~2-3 min) and
+One cost to budget, fixed per arm and by design:
 the catalog embed, because `docker-compose.benchmark.yml` forces `DENSE_CACHE_MODE=off` so an
 arm can never measure a warm cache (an MCP image built without a baked cache also starts empty
 — `make docker-build` needs `uv` on the host to generate one). Only then do the records run.
