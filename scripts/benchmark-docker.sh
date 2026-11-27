@@ -40,8 +40,8 @@ BENCH_SCENARIOS="${BENCH_SCENARIOS:-tests/benchmark/scenarios/seed.json}"
 BENCH_RUNS="${BENCH_RUNS:-data/benchmark-runs}"
 RUN_ID="${RUN_ID:-$MODE-$(date -u +%Y%m%d-%H%M%S)}"
 MCP_IMAGE="${MCP_IMAGE:-design-pattern-mcp:latest}"
-TEI_IMAGE="${TEI_IMAGE:-design-pattern-tei-embed:latest}"
-TEI_RERANK_IMAGE="${TEI_RERANK_IMAGE:-design-pattern-tei-rerank:latest}"
+TEI_IMAGE="${TEI_IMAGE:-design-pattern-tei-embed-gpu:latest}"
+TEI_RERANK_IMAGE="${TEI_RERANK_IMAGE:-design-pattern-tei-rerank-gpu:latest}"
 # Optional knobs: default to empty so direct invocation (outside the Makefile's BENCH_ENV,
 # which always exports them) is safe under `set -u`.
 OUT="${OUT:-}" LIMIT="${LIMIT:-}" SPLIT="${SPLIT:-}" REPEAT="${REPEAT:-}"

@@ -80,7 +80,6 @@ services:
       - DENSE_CACHE_WRITE=true
       # Declared sidecar-model identity for the cache fingerprint (empty = probe decides).
       - EMBED_MODEL_REPO=${EMBED_MODEL_REPO:-}
-      - EMBED_ONNX_VARIANT=${EMBED_ONNX_VARIANT:-}
       # litellm routes openai/* models through the OpenAI SDK, which refuses to
       # construct its client with api_key=None even for a local api_base. TEI does
       # no auth, so any non-empty string satisfies the SDK (must stay in sync with
@@ -153,9 +152,20 @@ services:
       start_period: 1800s # cold start embeds the whole catalog through TEI (~20 min on CPU)
 
   design-pattern-tei-embed:
-    image: ${TEI_IMAGE:-design-pattern-tei-embed:latest}
+    image: ${TEI_IMAGE:-design-pattern-tei-embed-gpu:latest}
     container_name: design-pattern-tei-embed-dev
     restart: unless-stopped
+    # CUDA is required (the sidecars refuse to start without it). CDI form: the
+    # daemon's default runtime is runc, and CDI works under it without a runtime
+    # override. `nvidia.com/gpu=all` is a device name in /var/run/cdi/nvidia.yaml.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     # No published ports — internal only, reached via Docker DNS.
     environment:
       - HF_HUB_OFFLINE=1
@@ -173,15 +183,32 @@ services:
       start_period: 120s # model load on CPU is slow
 
   design-pattern-tei-rerank:
-    image: ${TEI_RERANK_IMAGE:-design-pattern-tei-rerank:latest}
+    image: ${TEI_RERANK_IMAGE:-design-pattern-tei-rerank-gpu:latest}
     container_name: design-pattern-tei-rerank-dev
     restart: unless-stopped
+    # CUDA is required (the sidecars refuse to start without it). CDI form: the
+    # daemon's default runtime is runc, and CDI works under it without a runtime
+    # override. `nvidia.com/gpu=all` is a device name in /var/run/cdi/nvidia.yaml.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     environment:
       - HF_HUB_OFFLINE=1
       - HUGGINGFACE_HUB_CACHE=/data
       - MAX_CONCURRENT_REQUESTS=64
       - WARMUP_TOKENS=${TEI_RERANK_WARMUP_TOKENS:-0}
       - MAX_CLIENT_BATCH_SIZE=48
+      # OOM guard (2026-11-27): the no-flash f32 cross-encoder needs ~3.2 GB
+      # transient attention per 8k-token pair; a 16384-token batch of two long
+      # pairs overflows the shared 11 GB 1080 Ti (CUDA_ERROR_OUT_OF_MEMORY,
+      # twice observed → ERR_008). 8192 bounds a batch to one full-length pair
+      # worst case; scores unchanged, only more forward passes.
+      - MAX_BATCH_TOKENS=8192
       - AUTO_TRUNCATE=true
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]

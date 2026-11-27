@@ -15,13 +15,13 @@ deep-dive).
 | Component | Image (Docker Hub — public registry) | Role |
 |---|---|---|
 | MCP server | `olkowa/design-pattern-mcp` | Tool server, streamable-http (container port 8050 both stacks) |
-| TEI embedder | `olkowa/pattern-tei-embed` | Qwen3-Embedding-0.6B sidecar; required for retrieval |
-| TEI reranker | `olkowa/pattern-tei-rerank` | Reranker sidecar (`gte-reranker-modernbert-base`); required for retrieval |
+| TEI embedder | `olkowa/pattern-tei-embed-gpu` | Qwen3-Embedding-0.6B sidecar; required for retrieval |
+| TEI reranker | `olkowa/pattern-tei-rerank-gpu` | Reranker sidecar (`gte-reranker-modernbert-base`); required for retrieval |
 | Style head | `olkowa/design-pattern-style-head` | Ch2 style seam (TF-IDF + linear SVM, CPU); versions with the MCP release |
 
-Tags: `latest` plus a pinned release tag per image — TEI embed/rerank `1.1.1`
-(the TEI images change rarely and are shared with the sibling
-`architecture-pattern-mcp` server). Use Docker Hub. Images are
+Tags: `latest` plus a pinned release tag per image — the same version tag for
+all four, TEI embed/rerank included (`make docker-publish-tei` pushes the `-gpu`
+TEI pair with the MCP version). Use Docker Hub. Images are
 **linux/amd64 only**; on arm64 hosts build locally instead:
 `make docker-build-base`.
 
@@ -47,7 +47,8 @@ and compose projects are already distinct
 test -f docker/docker-compose.yml && echo "repo clone: OK"
 docker compose version                      # needs ≥ v2.20
 id -nG | tr ' ' '\n' | grep -qx docker && echo "docker group: OK"
-df -h /var/lib/docker                       # ≥ 8 GB free (MCP ≈ 1 GB with baked dense cache, TEI ≈ 6 GB)
+nvidia-smi -L                                    # an NVIDIA GPU is required (TEI sidecars reserve it via CDI; CPU-only hosts use the -cpu pair, note after A6)
+df -h /var/lib/docker                       # ≥ 18 GB free (MCP ≈ 1 GB with baked dense cache, TEI ≈ 14 GB)
 ```
 
 For Path B additionally:
@@ -69,19 +70,19 @@ the install steps below stay the same.
 and resolved from an env file.
 
 ```bash
-# A1. Resolve the MCP release version and pull the images. TEI pins differ
-#     from the MCP version (shared TEI images release rarely); check the tags
-#     table at the top of this file for the current TEI pin.
+# A1. Resolve the MCP release version and pull the images. The TEI images
+#     carry the same version tag as the MCP server.
 VERSION=$(grep -m 1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-TEI_VERSION=1.1.1
 docker pull "olkowa/design-pattern-mcp:${VERSION}"
-# If the MCP pull 404s (no published release yet — confirm at
-# https://hub.docker.com/r/olkowa/design-pattern-mcp/tags), build it
-# locally instead (the TEI pulls below still work; those images are published):
+# If a pull 404s (no published release yet — confirm at
+# https://hub.docker.com/r/olkowa/design-pattern-mcp/tags), build locally
+# instead:
 #   make docker-build-base
-# and in step A2 use MCP_IMAGE=design-pattern-mcp:latest (the local build tag).
-docker pull "olkowa/pattern-tei-embed:${TEI_VERSION}"
-docker pull "olkowa/pattern-tei-rerank:${TEI_VERSION}"
+# and in step A2 use the local build tags: MCP_IMAGE=design-pattern-mcp:latest,
+# TEI_IMAGE=design-pattern-tei-embed-gpu:latest,
+# TEI_RERANK_IMAGE=design-pattern-tei-rerank-gpu:latest.
+docker pull "olkowa/pattern-tei-embed-gpu:${VERSION}"
+docker pull "olkowa/pattern-tei-rerank-gpu:${VERSION}"
 docker pull "olkowa/design-pattern-style-head:${VERSION}"
 # If the style-head pull 404s (unpublished), build it locally instead:
 #   make docker-build-style-head
@@ -92,22 +93,22 @@ docker pull "olkowa/design-pattern-style-head:${VERSION}"
 # A2. Write the env file next to the compose file (compose interpolation source).
 cat > docker/.env <<EOF
 MCP_IMAGE=olkowa/design-pattern-mcp:${VERSION}
-TEI_IMAGE=olkowa/pattern-tei-embed:${TEI_VERSION}
-TEI_RERANK_IMAGE=olkowa/pattern-tei-rerank:${TEI_VERSION}
+TEI_IMAGE=olkowa/pattern-tei-embed-gpu:${VERSION}
+TEI_RERANK_IMAGE=olkowa/pattern-tei-rerank-gpu:${VERSION}
 STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:${VERSION}
 OPENCODE_API_KEY=sk-REPLACE-ME
 EOF
 
 # A3. Sanity check: interpolation resolved to the Hub refs (each printed image:
-#     olkowa/design-pattern-mcp:…, olkowa/pattern-tei-embed:…,
-#     olkowa/pattern-tei-rerank:…, olkowa/design-pattern-style-head:…). Empty
+#     olkowa/design-pattern-mcp:…, olkowa/pattern-tei-embed-gpu:…,
+#     olkowa/pattern-tei-rerank-gpu:…, olkowa/design-pattern-style-head:…). Empty
 #     OPENCODE_API_KEY warning is expected
 docker compose --env-file docker/.env -f docker/docker-compose.yml config | grep 'image:'
 
 # A4. Start. TEI sidecars cold-start model weights; first start takes ~2 min.
 #     (Published server images bake in the dense embedding cache; a locally
 #     built cache-less image instead embeds the whole catalog at first start,
-#     ~19 min on CPU.)
+#     ~5 min through the GPU sidecar.)
 docker compose --env-file docker/.env -f docker/docker-compose.yml up -d
 
 # A5. Wait until all three report "healthy" (poll if still "starting").
@@ -121,6 +122,13 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8822/mcp" \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0.0.0"}},"id":1}'
 ```
+
+CPU-only hosts: build the `-cpu` pair (`make docker-build-tei-cpu`) and append
+`-f docker/docker-compose.cpu.yml` to the A3/A4/`down` commands above (or run
+`make docker-up-cpu` from a repo checkout) — same models, shared dense cache.
+Regenerate the cache through the CPU sidecar first (`make embed-cache-cpu`;
+plain `make embed-cache` starts the GPU sidecar), then `make docker-build`
+picks it up with no GPU anywhere.
 
 Installed endpoint: `http://localhost:8822/mcp` (streamable-http).
 
@@ -153,15 +161,15 @@ the `sed` below substitutes the invoking user.
 ### B0 — shared TEI infra (prerequisite, once)
 
 ```bash
-TEI_VERSION=1.1.1   # TEI pins differ from the MCP version; see the tags table
+VERSION=$(grep -m 1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')   # TEI images carry the MCP release tag
 git clone https://github.com/olk/pattern-tei-infra /tmp/pattern-tei-infra
 
 # Pull Hub images and retag to the local names the infra compose expects
 # (pattern-tei-embed:latest / pattern-tei-rerank:latest).
-docker pull "olkowa/pattern-tei-embed:${TEI_VERSION}"
-docker pull "olkowa/pattern-tei-rerank:${TEI_VERSION}"
-docker tag "olkowa/pattern-tei-embed:${TEI_VERSION}" pattern-tei-embed:latest
-docker tag "olkowa/pattern-tei-rerank:${TEI_VERSION}" pattern-tei-rerank:latest
+docker pull "olkowa/pattern-tei-embed-gpu:${VERSION}"
+docker pull "olkowa/pattern-tei-rerank-gpu:${VERSION}"
+docker tag "olkowa/pattern-tei-embed-gpu:${VERSION}" pattern-tei-embed:latest
+docker tag "olkowa/pattern-tei-rerank-gpu:${VERSION}" pattern-tei-rerank:latest
 
 sudo install -d /etc/pattern-tei-infra
 sudo install -m 644 /tmp/pattern-tei-infra/docker-compose.yml /etc/pattern-tei-infra/
@@ -178,6 +186,12 @@ docker inspect -f '{{.Name}} {{.State.Health.Status}}' pattern-tei-embed pattern
 Note: this stack is shared with the sibling `architecture-pattern-mcp`,
 `agent-pattern-mcp`, and `blockchain-pattern-mcp` servers. If any of them
 has it already installed and running on the host, skip B0 entirely.
+
+CPU-only infra host: run the `-cpu` TEI pair instead — `make docker-build-tei-cpu`,
+then in B0 retag the `-cpu` images (`docker tag design-pattern-tei-embed-cpu:latest
+pattern-tei-embed:latest`, same for rerank) instead of pulling, and enable this
+stack's CPU lane (`systemd/docker-compose.cpu.yml` via `COMPOSE_FILE` — see
+`systemd/README.md` "CPU lane"). Same models, shared dense cache.
 
 ### B1 — images under the local names the unit checks
 
@@ -353,7 +367,7 @@ B: `sudo systemctl restart design-pattern-mcp`). Full provider list:
 | Unit fails reading environment file | `/etc/design-pattern-mcp/.env` missing or unreadable: recreate per B2 (`root:docker 640`, user in `docker` group). |
 | `start request repeated too quickly` | Earlier start failed; inspect `journalctl -u design-pattern-mcp -n 50`, fix, then `systemctl reset-failed design-pattern-mcp` and start again. |
 | Reranker HTTP 429 "Model is overloaded" | One full-text rerank request already saturates the CPU sidecar's token buffer — keep `RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default). |
-| Image pull fails for `${VERSION}`/`${TEI_VERSION}` | Tag not published; check tags endpoints (A1 comment) and use `latest`. |
+| Image pull fails for `${VERSION}` | Tag not published; check tags endpoints (A1 comment) and use `latest`. |
 
 ## Uninstall
 

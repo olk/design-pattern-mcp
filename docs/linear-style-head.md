@@ -311,7 +311,7 @@ runs. That answer is at n=18 and inherits the same power caveat, stated with the
 
 ```bash
 make docker-build-style-head                    # ~20 s; the build gates the head
-make docker-up                                  # base stack, style head included, no GPU
+make docker-up                                  # base stack, style head included (GPU pair; -cpu pair via make docker-up-cpu)
 ```
 
 The seam ships on at floor 0.6 — no per-deployment step. `make style-head-calibrate`
@@ -320,7 +320,7 @@ is the maintainer tool for corpus/head changes: it rewrites
 bar-clearing floor, not the shipped default — 0.1 lost run 1 on repeat stability, so
 re-shipping still means re-winning the A/B at the new point (§6).
 
-The head runs in the base compose file, so `make docker-up` needs no GPU at all. The head is
+The head runs in the base compose file and needs no GPU itself, but `make docker-up` reserves the GPU for the TEI sidecars (`docker-up-cpu` drops the reservation for the `-cpu` pair). The head is
 deliberately not in `design-pattern-mcp`'s `depends_on`: a hard dependency would fail every
 deployment whose operator never built the image, and the seam already degrades to the
 LLM style.
@@ -332,8 +332,8 @@ A/B's baseline arm.
 
 ### Reproducing the A/B
 
-The arms need only the base stack (both TEI sidecars and the linear head; no GPU), so they run
-wherever `make docker-build-base` succeeded. From a workstation checkout of this branch:
+The arms need only the base stack (both TEI sidecars and the linear head), so they run
+wherever `make docker-build-base` succeeded and an NVIDIA GPU is present (or the `-cpu` pair is built). From a workstation checkout of this branch:
 
 ```bash
 git bundle create /tmp/lsh.bundle 22445902..linear-style-seam      # base = clm-style-seam tip

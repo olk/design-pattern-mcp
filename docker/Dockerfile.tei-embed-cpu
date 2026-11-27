@@ -1,0 +1,140 @@
+# Thin override of ghcr.io/huggingface/text-embeddings-inference, build-arg driven.
+#
+# CPU build of the embed sidecar. It serves the SAME safetensors release as
+# the GPU build (`docker/Dockerfile.tei-embed-gpu`) through TEI's candle
+# backend, so both images share the dense-cache identity (`model_repo` /
+# `onnx_variant`) and the baked cache survives a CPU<->GPU switch with no
+# re-embed. The trade-off for the shared repo: candle on CPU caps
+# `max_batch_requests` at 4 for this model (the retired ORT/ONNX build
+# doubled that to 8), so client batches > 4 are split into sequential
+# sub-batches inside one HTTP request — slower, not broken. The CPU compose
+# overlay (`docker/docker-compose.cpu.yml`) defaults the client batch to 4.
+#
+# No GPU anywhere in this build: no nvcc, no CUDA_COMPUTE_CAP, no
+# compute-cap match patch (that check is compiled in only with the `cuda`
+# feature), no entrypoint bypass (the cpu base execs the router directly —
+# the per-arch dispatcher exists only on the cuda base).
+#
+# Build args (defaults below; the Makefile forwards them):
+#
+#   EMBED_MODEL_REPO    HuggingFace repo id; must ship `model.safetensors`.
+#                       MUST match the GPU build's value — it is part of the
+#                       dense-cache fingerprint.
+#   EMBED_POOLING       Token-pooling mode; `last-token` matches Qwen3's
+#                       training (TEI default `cls` would be silently wrong).
+#   EMBED_DTYPE         Serving dtype, `float32`.
+#   TEI_BASE_IMAGE      TEI base tag. Only the router binary is replaced.
+#
+# Runtime tunables: identical to the GPU build (same values, same meanings —
+# see docker/Dockerfile.tei-embed-gpu). No USE_FLASH_ATTENTION here: no flash
+# kernel is compiled and the CPU load path never consults it.
+#
+# No model weights are downloaded at runtime: they are baked in at build time
+# and served with `HF_HUB_OFFLINE=1` in docker-compose.yml.
+#
+# NOTE: CMD must be in JSON exec form so the args are appended to the
+# entrypoint instead of being wrapped in `/bin/sh -c`.
+
+ARG TEI_BASE_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+
+# Stage 0: build the TEI router from source (v1.9.4 + unmerged PR #884).
+#
+# PR #884 (huggingface/text-embeddings-inference#884, head 5806bdc) adds
+# --warmup-tokens / WARMUP_TOKENS so the synthetic startup warmup pass can be
+# skipped (0) or shrunk (N) without lowering MAX_BATCH_TOKENS. The PR is
+# OPEN/UNMERGED; both ARGs move together when rebasing onto a newer tag (or
+# the patch is dropped once it merges).
+#
+# Feature set: `candle,http` = candle backend on CPU. (`static-linking` would
+# be a no-op here — it only affects the cudarc/mkl optional dependencies,
+# neither of which is enabled.)
+FROM rust:1.92-bookworm AS router-builder
+# rust:1.92 matches upstream rust-toolchain.toml channel 1.92.0; bookworm
+# matches the TEI runtime base (Debian 12) so glibc ABI lines up.
+ARG TEI_SOURCE_VERSION=v1.9.4
+ARG TEI_PR884_SHA=5806bdc99f11ad490cd7e38c1f4dd757034c0adb
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${TEI_SOURCE_VERSION} \
+        https://github.com/huggingface/text-embeddings-inference.git /usr/src/tei \
+    && cd /usr/src/tei \
+    && git fetch --depth 2 origin ${TEI_PR884_SHA} \
+    && git diff FETCH_HEAD^ FETCH_HEAD -- backends/src/lib.rs router/src/lib.rs router/src/main.rs \
+        | git apply --3way
+# NOTE: not `git cherry-pick` — the shallow tag clone shares no history with
+# the PR commit, so cherry-pick degrades to add/add conflicts on every file.
+# Diffing the PR commit against its own parent (^) applies exactly the PR's
+# changes to the three code files; docs/README drift on main is skipped.
+# FETCH_HEAD^ is present because the fetch uses depth 2; the fetch targets
+# the pinned SHA (not pull/884/head) so a PR update cannot move the build.
+RUN cd /usr/src/tei \
+    && cargo build --release -p text-embeddings-router \
+        --no-default-features --features candle,http
+# Binary lands at /usr/src/tei/target/release/text-embeddings-router
+
+# Stage 1: download the safetensors weights.
+# The TEI runtime image is a pure Rust binary with no Python, so a slim Python
+# image is used purely for the download and the result is copied forward.
+FROM python:3.10-slim AS model-downloader
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG EMBED_MODEL_REPO=Qwen/Qwen3-Embedding-0.6B
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+
+# The model repo is public on the Hub, so HF_TOKEN is optional.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "import os; \
+from huggingface_hub import snapshot_download; \
+snapshot_download( \
+    os.environ['EMBED_MODEL_REPO'], \
+    token=os.environ.get('HF_TOKEN') or None, \
+    local_dir='/data/embedding-model', \
+    allow_patterns=[ \
+        '*.json', '*.txt', 'tokenizer*', 'special_tokens*', \
+        'model.safetensors', \
+    ], \
+)"
+
+# Stage 2: runtime image with the model baked in and config patched.
+FROM ${TEI_BASE_IMAGE}
+
+ARG EMBED_POOLING=last-token
+ARG EMBED_DTYPE=float32
+
+COPY --from=model-downloader /data /data
+
+# Overwrite the stock router with the PR#884 build. The cpu base has no
+# arch dispatcher — its entrypoint execs this binary directly.
+COPY --from=router-builder /usr/src/tei/target/release/text-embeddings-router \
+     /usr/local/bin/text-embeddings-router
+
+ENV HF_HUB_OFFLINE=1 \
+    POOLING=${EMBED_POOLING} \
+    DTYPE=${EMBED_DTYPE}
+
+# Runtime tunables as image-level defaults, overridable via the compose
+# environment block or `docker run -e VAR=VALUE`. Same values as the GPU
+# build (see docker/Dockerfile.tei-embed-gpu for what each one means).
+ENV MAX_CONCURRENT_REQUESTS=32 \
+    MAX_BATCH_TOKENS=8192 \
+    MAX_CLIENT_BATCH_SIZE=32 \
+    AUTO_TRUNCATE=true \
+    PROMETHEUS_PORT=0 \
+    HOSTNAME=0.0.0.0 \
+    PORT=8080 \
+    WARMUP_TOKENS=0
+
+RUN sed -i -E 's/("max_position_embeddings"[[:space:]]*:[[:space:]]*)32768/\18192/' \
+        /data/embedding-model/config.json
+
+CMD ["--model-id", "/data/embedding-model"]

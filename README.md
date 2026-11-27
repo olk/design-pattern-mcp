@@ -403,7 +403,7 @@ OPENCODE_API_KEY=your_key make docker-up
 
 | Stack | Build | Start | What runs |
 |---|---|---|---|
-| Any host (default) | `make docker-build-base` | `make docker-up` | server + TEI pair (CPU sidecars, the benchmarked path) + style head |
+| Any host (default) | `make docker-build-base` | `make docker-up` | server + TEI pair (CUDA default, `-cpu` pair via `docker-up-cpu` — the benchmarked path) + style head |
 | Style off | same as above | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
 | Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external |
 
@@ -453,9 +453,9 @@ Or use the installed console script (after `make install`): `design-pattern-mcp`
 
 The TEI sidecars are required for full retrieval quality: a dense leg (Qwen3-Embedding-0.6B via the embed sidecar) and a BM25 leg are fused at startup (`service_healthy` ordering guarantees the embedder is up before the server accepts requests — a failed index warm-up refuses server start). The reranker sidecar (`gte-reranker-modernbert-base`) reranks candidate patterns. Without reachable sidecars, start with `--offline` (deterministic lexical-only retrieval, no network).
 
-> **TEI startup:** both sidecar images (`docker/Dockerfile.tei-embed`, `docker/Dockerfile.tei-rerank`) ship a self-built TEI router (v1.9.4 + unmerged [PR #884](https://github.com/huggingface/text-embeddings-inference/pull/884)) with `WARMUP_TOKENS=0` by default — this skips the synthetic warmup pass (measured ~131 s embed / ~78 s rerank) so containers become ready after weight load only. Override per sidecar via `TEI_WARMUP_TOKENS` / `TEI_RERANK_WARMUP_TOKENS` (positive N warms with N tokens instead; values > `MAX_BATCH_TOKENS` are rejected at startup).
+> **TEI startup:** both sidecar images (`docker/Dockerfile.tei-embed-gpu`, `docker/Dockerfile.tei-rerank-gpu`, with `-cpu` mates for GPU-less hosts) ship a self-built TEI router (v1.9.4 + unmerged [PR #884](https://github.com/huggingface/text-embeddings-inference/pull/884)) with `WARMUP_TOKENS=0` by default — this skips the synthetic warmup pass (measured ~131 s embed / ~78 s rerank) so containers become ready after weight load only. Override per sidecar via `TEI_WARMUP_TOKENS` / `TEI_RERANK_WARMUP_TOKENS` (positive N warms with N tokens instead; values > `MAX_BATCH_TOKENS` are rejected at startup).
 
-**GPU TEI:** the shipped sidecars are CPU images (`cpu-1.9`). `make docker-up-gpu` is currently broken (references missing `docker/docker-compose.gpu.yml` — GPU hosts run the CPU sidecars via `make docker-up` until that overlay exists). When fixed: on a host with a TEI-CUDA-supported NVIDIA GPU (compute capability ≥ 7.5) plus the NVIDIA container toolkit, `make docker-build-tei-embed-gpu` builds the embed sidecar on the CUDA base (`ghcr.io/huggingface/text-embeddings-inference:cuda-1.9`) and `make docker-up-gpu` starts the dev stack with the overlay (reserving 1 GPU, embed sidecar only — the reranker stays on CPU).
+**GPU TEI:** both sidecars are CUDA images (`cuda-1.9` base) with a self-built router built for sm_61 as the minimum — this host's GTX 1080 Ti (compute capability 6.1) sits below the stock image's 75 floor, so the router is compiled from the same TEI tag with the non-flash CUDA feature set and overwrites the stock binary. The embedded PTX JIT-compiles on newer cards, so the same image serves sm >= 61 (Ampere/Ada/Hopper/Blackwell); first model load on a newer card pays a one-time JIT compile, and sm_61 is the only hardware tested so far. Both serve safetensors weights through candle (no ONNX). `make docker-up` requires an NVIDIA GPU via the container toolkit (CDI reservation in `docker/docker-compose.yml`). GPU-less hosts use the CPU pair instead (`docker/Dockerfile.tei-*-cpu`, candle backend, same safetensors repos) via `make docker-build-tei-cpu` + `make docker-up-cpu`; the dense cache is shared between lanes, so switching never re-embeds.
 
 **Already-running embedder/reranker:** when embedding and reranking endpoints already run on other servers, point the MCP server at them via `EMBEDDER_BASE_URL` (OpenAI-compatible route, `http://<host>:8080/v1`) plus `RERANKER_BASE_URL` (`http://<host>:8080`) and skip the sidecars. The embedder forwards `EMBEDDER_MODEL` (default `openai//data/embedding-model`) and `EMBEDDER_API_KEY` through LiteLLM — provider/model syntax is documented in the [LiteLLM embedding docs](https://docs.litellm.ai/docs/embedding/supported_embedding). The reranker is **not** a LiteLLM client — it POSTs `{base_url}/rerank` directly (`src/patterns/safe_tei_rerank.py`), so `RERANKER_MODEL` (default `Alibaba-NLP/gte-reranker-modernbert-base`) is a TEI model name, not a LiteLLM model string. A remote embedder serving a different model invalidates the baked dense cache — regenerate it with `make embed-cache` so vectors match the serving model.
 
@@ -531,7 +531,7 @@ compose override (cold-start measurement).
 The dense retrieval leg is one FAISS index over every catalog record (486 records → 486
 `document_text` embeddings at startup). That matrix is snapshotted to disk next to a
 manifest and reloaded on the next start, so a restart costs **one probe embedding**
-instead of a full corpus pass (~19 min on the CPU TEI sidecar).
+instead of a full corpus pass (~5 min through the GPU embed sidecar).
 
 - **Path**: `DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image).
   Contents: `manifest.json` (the commit marker) + `vectors.npy`. A directory without a
@@ -587,12 +587,12 @@ arm that yields a qualifying confidence floor. A neural decision-model lane (a 4
 
 ```bash
 make docker-build-style-head            # CPU, ~20 s; the training RUN *is* the accuracy gate
-make docker-up                          # base stack, style head included, no GPU
+make docker-up                          # base stack, style head included (GPU pair; -cpu pair via make docker-up-cpu)
 make style-head-calibrate               # floor + repeat/order probes -> models/style-head-calibration.json
 make benchmark-style-ab
 
 The seam, endpoint, model name and floor all follow from the provider (always `linear`).
-The head runs in the base compose file (`make docker-up`), so no GPU is needed anywhere.
+The head itself needs no GPU (CPU, in the base compose file), but `make docker-up` reserves the GPU for the TEI sidecars (`docker-up-cpu` runs the `-cpu` pair instead).
 The seam ships on
 (`DECISIONS_STYLE_ENABLED=true`): set it to `false` to stand it down to the LLM style.
 
@@ -623,7 +623,7 @@ A config file copied from an earlier release may still carry the removed lane's 
 | `DENSE_CACHE_WRITE` | `true` | Persist a re-embedded corpus (best-effort — a failed write logs `Dense cache write failed` and the run keeps its vectors) |
 | `RETRIEVAL_DENSE_WEIGHT` | `0.7` | Dense-leg fusion weight (must sum with `..._BM25_WEIGHT` to 1.0 ± 1e-3 — config-validated; a leg below 0.05 logs a warning) |
 | `RETRIEVAL_BM25_WEIGHT` | `0.3` | BM25-leg fusion weight |
-| `RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the CPU TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
+| `RETRIEVAL_MAX_CONCURRENT_PARTS` | `1` | Per-part rerank concurrency. Cap-2 saturates the TEI rerank sidecar's 16,384-token buffer (HTTP 429) — leave at 1 unless you measured your sidecar |
 | `RERANK_TEXT` | `full` | Rerank input text: `full` (rankings as documented) or `capsule` (3.6–4.3× faster, diverging rankings — opt-in) |
 | `RERANK_TOP_N` | `10` | Rerank top N |
 | `RERANKER_PROVIDER` | `tei` | Rerank scorer: `tei` (the cross-encoder sidecar) and the only legal value |
@@ -806,7 +806,7 @@ Local non-Docker runs must point `EMBEDDER_BASE_URL` / `RERANKER_BASE_URL` at re
 
 ### Reranker 429s
 
-One full-text rerank request already saturates the CPU TEI sidecar's 16,384-token inference buffer (`MAX_BATCH_TOKENS=8192` interacts with request packing; measured 2026-09-25): a cap-2 `retrieve_many` leg fails outright with HTTP 429 "Model is overloaded". Keep `RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default); the server-side invariant also keeps `dense_top_k + bm25_top_k` ≤ the sidecar's `MAX_CLIENT_BATCH_SIZE` (48).
+One full-text rerank request already saturates the TEI sidecar's 16,384-token inference buffer (`MAX_BATCH_TOKENS=8192` interacts with request packing; measured 2026-09-25): a cap-2 `retrieve_many` leg fails outright with HTTP 429 "Model is overloaded". Keep `RETRIEVAL_MAX_CONCURRENT_PARTS=1` (shipped default); the server-side invariant also keeps `dense_top_k + bm25_top_k` ≤ the sidecar's `MAX_CLIENT_BATCH_SIZE` (48).
 
 ### Pattern JSON files not loading
 
@@ -862,13 +862,13 @@ Four images are published to two registries; all ride the umbrella `docker-publi
 | Image | Docker Hub | GHCR | Tags |
 |---|---|---|---|
 | MCP server | `olkowa/design-pattern-mcp` | `ghcr.io/olk/design-pattern-mcp` | `$(DOCKER_TAG)`, `latest` |
-| TEI embedder | `olkowa/pattern-tei-embed` | `ghcr.io/olk/pattern-tei-embed` | `$(DOCKER_TAG)`, `latest` |
-| TEI reranker | `olkowa/pattern-tei-rerank` | `ghcr.io/olk/pattern-tei-rerank` | `$(DOCKER_TAG)`, `latest` |
+| TEI embedder | `olkowa/pattern-tei-embed-gpu` | `ghcr.io/olk/pattern-tei-embed-gpu` | `$(DOCKER_TAG)`, `latest` |
+| TEI reranker | `olkowa/pattern-tei-rerank-gpu` | `ghcr.io/olk/pattern-tei-rerank-gpu` | `$(DOCKER_TAG)`, `latest` |
 | Style head | `olkowa/design-pattern-style-head` | `ghcr.io/olk/design-pattern-style-head` | `$(DOCKER_TAG)`, `latest` |
 
-All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI images are shared with the sibling `architecture-pattern-mcp` server and change rarely — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged.
+All four images share the same `$(DOCKER_TAG)` (the version from `pyproject.toml`). The TEI `-gpu` repos are this project's own (the un-suffixed `pattern-tei-*` repos stay with the sibling `architecture-pattern-mcp` server) — blob deduplication keeps re-tagging unchanged TEI images cheap, and TEI pushes can be skipped when the sidecars are unchanged.
 
-> **Bandwidth note:** the TEI embedder image is ~5 GB (ONNX fp32 weights baked in). First push to each registry is ~5 GB upload. Subsequent pushes are incremental — only changed layers are transferred.
+> **Bandwidth note:** the TEI embedder image is ~7.3 GB (safetensors weights baked in; reranker ~6.7 GB). First push to each registry is ~7 GB upload. Subsequent pushes are incremental — only changed layers are transferred.
 
 ### Prerequisites
 
@@ -901,8 +901,8 @@ GHCR packages default to **private**. After the first `make docker-publish-all`,
 | Package | Settings URL |
 |---|---|
 | MCP server | `https://github.com/users/olk/packages/container/design-pattern-mcp/settings` |
-| TEI embedder | `https://github.com/users/olk/packages/container/pattern-tei-embed/settings` |
-| TEI reranker | `https://github.com/users/olk/packages/container/pattern-tei-rerank/settings` |
+| TEI embedder | `https://github.com/users/olk/packages/container/pattern-tei-embed-gpu/settings` |
+| TEI reranker | `https://github.com/users/olk/packages/container/pattern-tei-rerank-gpu/settings` |
 | Style head | `https://github.com/users/olk/packages/container/design-pattern-style-head/settings` |
 
 Set each to **Public** and save.

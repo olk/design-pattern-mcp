@@ -1,0 +1,228 @@
+# Thin override of ghcr.io/huggingface/text-embeddings-inference, build-arg driven.
+#
+# CUDA build for NVIDIA GPUs sm_61 and newer (Pascal through Blackwell).
+#
+# The stock image only serves compute capability 75+ (per-arch router binaries
+# 75..120 behind an arch dispatcher, default target sm_80), so this host's
+# Pascal GPU (compute capability 6.1) is excluded. We build the router from the
+# same TEI tag with the non-flash CUDA feature set for sm_61 and overwrite the
+# stock binary — the same shape the CPU build used. sm_61 is the FLOOR, not the
+# only arch: nvcc embeds PTX alongside the sm_61 SASS, and the driver JITs that
+# PTX on any newer card (Ampere/Ada/Hopper/Blackwell), so one image serves
+# sm >= 61. Two stock allow-lists stop at 75 and are widened here: the
+# /entrypoint.sh arch dispatcher (bypassed — see the Stage 2 comment) and TEI's
+# own compute_cap_matching table (patched in Stage 0 to accept any runtime cap
+# >= 61 for a sm_61 build). The base image's CUDA 12.9 user-mode libraries are
+# reused as-is.
+#
+# Why the model artifact changed with the backend
+# ------------------------------------------------
+# candle cannot load ONNX. The CPU build served the community ONNX export
+# (`onnx-community/Qwen3-Embedding-0.6B-ONNX`) through the ORT backend; this
+# build serves the same model's safetensors release
+# (`Qwen/Qwen3-Embedding-0.6B`) through candle. The in-image path
+# `/data/embedding-model` and the server's model string are unchanged (the path
+# is the contract), but the vectors are not bit-identical to the ORT ones, so
+# the dense cache is regenerated once (`make embed-cache`).
+#
+# Build args (defaults below; the Makefile forwards them):
+#
+#   EMBED_MODEL_REPO    HuggingFace repo id; must ship `model.safetensors`.
+#                       Part of the dense-cache fingerprint
+#                       (`embedder.config.model_repo`); `make docker-up`
+#                       forwards this same value.
+#   EMBED_POOLING       Token-pooling mode; `last-token` matches Qwen3's
+#                       training (TEI default `cls` would be silently wrong).
+#   EMBED_DTYPE         Serving dtype. `float32`: Pascal has no bf16 and a
+#                       1/64-rate fp16 path, so float32 is the right value
+#                       here as well as the retained one.
+#   TEI_BASE_IMAGE      TEI base tag. Only the router binary is replaced.
+#   CUDA_COMPUTE_CAP    Minimum architecture, two digits (`61` = Pascal). Read
+#                       at BUILD time by the kernel build scripts (nvcc
+#                       `--gpu-architecture=sm_<cap>`, checked against `nvcc
+#                       --list-gpu-code`; an unsupported value fails the build)
+#                       and baked into the router as its compile-time cap. The
+#                       build embeds SASS for sm_<cap> plus PTX, which the
+#                       driver JIT-compiles on newer cards; at start the router
+#                       accepts any GPU with runtime cap >= <cap> (see Stage 0).
+#                       Raising this drops older cards — it never adds newer ones.
+#
+# Runtime tunables (clap env fallbacks — see TEI --help):
+#
+#   MAX_CONCURRENT_REQUESTS  (default 512 in TEI; we set 32)
+#   MAX_BATCH_TOKENS       (default 16384 in TEI; we set 8192)
+#   MAX_CLIENT_BATCH_SIZE  (default 32 in TEI; must be >= the client's
+#                          EMBEDDER_BATCH_SIZE, else HTTP 429 `no permits
+#                          available` — one permit is taken per input, not per
+#                          request)
+#   AUTO_TRUNCATE           (default true; silently truncates inputs longer
+#                          than max_input_length. Keep enabled: client
+#                          requirement strings can reach ~100 000 chars.)
+#   PROMETHEUS_PORT        (default 9000; we set 0 so /metrics is never
+#                          exposed outside the container)
+#   HOSTNAME               (default 0.0.0.0. Docker injects HOSTNAME=<container
+#                          id> at runtime and TEI rejects non-IP values, so the
+#                          effective bind is always 0.0.0.0; kept for API
+#                          consistency)
+#   PORT                   (default 8080. If changed, update the healthcheck
+#                          URL in docker-compose.yml and any
+#                          EMBEDDER_BASE_URL that hard-codes :8080)
+#   WARMUP_TOKENS          (unset upstream = synthetic warmup pass, the 131 s
+#                          measured startup cost; we set 0 to skip it via
+#                          PR #884. Values > MAX_BATCH_TOKENS are rejected.)
+#   POOLING, DTYPE         Pinned via EMBED_POOLING / EMBED_DTYPE; surfaced as
+#                          env vars so CMD can stay exec-form and short.
+#   USE_FLASH_ATTENTION    (stock CUDA base defaults it to True; this build
+#                          has no flash kernel, so it is pinned False.)
+#
+# No model weights are downloaded at runtime: they are baked in at build time
+# and served with `HF_HUB_OFFLINE=1` in docker-compose.yml.
+#
+# NOTE: CMD must be in JSON exec form so the args are appended to the
+# entrypoint instead of being wrapped in `/bin/sh -c`.
+
+ARG TEI_BASE_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
+ARG CUDA_COMPUTE_CAP=61
+
+# Stage 0: build the TEI router from source (v1.9.4 + unmerged PR #884) for CUDA.
+#
+# PR #884 (huggingface/text-embeddings-inference#884, head 5806bdc) adds
+# --warmup-tokens / WARMUP_TOKENS so the synthetic startup warmup pass can be
+# skipped (0) or shrunk (N) without lowering MAX_BATCH_TOKENS. The PR is
+# OPEN/UNMERGED; both ARGs move together when rebasing onto a newer tag (or
+# the patch is dropped once it merges).
+#
+# Feature set: `candle-cuda-volta` = candle on CUDA without flash-attention
+# (flash kernels need sm_80+). `static-linking` matches the stock image's build.
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS router-builder
+# The CUDA toolkit of the `cuda-1.9` base itself, so the compiled kernels and
+# the statically linked CUDA runtime agree with the base's libraries.
+# The kernel build scripts call nvcc and read CUDA_COMPUTE_CAP from the env.
+ARG TEI_SOURCE_VERSION=v1.9.4
+ARG TEI_PR884_SHA=5806bdc99f11ad490cd7e38c1f4dd757034c0adb
+ARG CUDA_COMPUTE_CAP
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP} \
+    PATH="/root/.cargo/bin:${PATH}"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl pkg-config libssl-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
+# 1.92.0 is the channel of the TEI tag's rust-toolchain.toml (the CPU build
+# used the rust:1.92 image for the same reason).
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y --default-toolchain 1.92.0 --profile minimal
+RUN git clone --depth 1 --branch ${TEI_SOURCE_VERSION} \
+        https://github.com/huggingface/text-embeddings-inference.git /usr/src/tei \
+    && cd /usr/src/tei \
+    && git fetch --depth 2 origin ${TEI_PR884_SHA} \
+    && git diff FETCH_HEAD^ FETCH_HEAD -- backends/src/lib.rs router/src/lib.rs router/src/main.rs \
+        | git apply --3way
+# NOTE: not `git cherry-pick` — the shallow tag clone shares no history with
+# the PR commit, so cherry-pick degrades to add/add conflicts on every file.
+# Diffing the PR commit against its own parent (^) applies exactly the PR's
+# changes to the three code files; docs/README drift on main is skipped.
+# FETCH_HEAD^ is present because the fetch uses depth 2; the fetch targets
+# the pinned SHA (not pull/884/head) so a PR update cannot move the build.
+# TEI's compute-cap match table (backends/candle/src/compute_cap.rs) only
+# enumerates caps 75+ — stock never builds below that — so without this the
+# router would refuse its own kernels ("Runtime compute cap 61 is not
+# compatible with compile time compute cap 61"). The added arm accepts any
+# runtime cap >= the build's CUDA_COMPUTE_CAP (61 by default, interpolated
+# from the stage ENV so raising the floor keeps the widening): older cards
+# still fail (no SASS or PTX for them), newer cards JIT the embedded PTX —
+# first model load pays a one-time JIT compile. PTX completeness was verified
+# with cuobjdump on the builder stage (every kernel entry present in the
+# sm_61 PTX, and it assembles for sm_89); sm_61 remains the only hardware
+# tested so far. Re-verify against the file on rebase (the grep fails the
+# build if the anchor line moved).
+RUN cd /usr/src/tei \
+    && sed -i "s/        (75, 75) => true,/        (runtime, ${CUDA_COMPUTE_CAP}) if runtime >= ${CUDA_COMPUTE_CAP} => true,\n        (75, 75) => true,/" backends/candle/src/compute_cap.rs \
+    && grep -q "(runtime, ${CUDA_COMPUTE_CAP}) if runtime >= ${CUDA_COMPUTE_CAP} => true" backends/candle/src/compute_cap.rs
+RUN cd /usr/src/tei \
+    && cargo build --release -p text-embeddings-router \
+        --no-default-features --features candle-cuda-volta,static-linking,http
+# Binary lands at /usr/src/tei/target/release/text-embeddings-router
+
+# Stage 1: download the safetensors weights.
+# The TEI runtime image is a pure Rust binary with no Python, so a slim Python
+# image is used purely for the download and the result is copied forward.
+FROM python:3.10-slim AS model-downloader
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG EMBED_MODEL_REPO=Qwen/Qwen3-Embedding-0.6B
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+
+# The model repo is public on the Hub, so HF_TOKEN is optional.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "import os; \
+from huggingface_hub import snapshot_download; \
+snapshot_download( \
+    os.environ['EMBED_MODEL_REPO'], \
+    token=os.environ.get('HF_TOKEN') or None, \
+    local_dir='/data/embedding-model', \
+    allow_patterns=[ \
+        '*.json', '*.txt', 'tokenizer*', 'special_tokens*', \
+        'model.safetensors', \
+    ], \
+)"
+
+# Stage 2: runtime image with the model baked in and config patched.
+FROM ${TEI_BASE_IMAGE}
+
+ARG EMBED_POOLING=last-token
+ARG EMBED_DTYPE=float32
+
+COPY --from=model-downloader /data /data
+
+# Overwrite the stock (sm_80, flash-attention) router with the sm_61-floor build.
+COPY --from=router-builder /usr/src/tei/target/release/text-embeddings-router \
+     /usr/local/bin/text-embeddings-router
+
+# Bypass the stock arch dispatcher: /entrypoint.sh execs per-arch binaries
+# (text-embeddings-router-{75,80,90,100,120}) by detected compute cap and
+# refuses anything else, so on a sub-75 card it would exit before our
+# binary ever runs ("cuda compute cap 61 is not supported"). This keeps the
+# dispatcher's GPU gate byte-identical (nvidia-smi must exist — no silent
+# CPU path) and execs our binary instead. It deliberately drops the
+# cuda-compat LD_LIBRARY_PATH branch, which only triggers on driver CUDA <
+# 12.9.1 (this host runs driver 580 / CUDA 13.x).
+RUN printf '%s\n' \
+        '#!/bin/bash' \
+        '# CUDA entrypoint: GPU gate + exec our router (see Dockerfile).' \
+        'if ! command -v nvidia-smi &>/dev/null; then' \
+        "    echo \"Error: 'nvidia-smi' command not found.\"" \
+        '    exit 1' \
+        'fi' \
+        'exec /usr/local/bin/text-embeddings-router "$@"' \
+    > /usr/local/bin/entrypoint-cuda.sh \
+    && chmod +x /usr/local/bin/entrypoint-cuda.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint-cuda.sh"]
+
+ENV HF_HUB_OFFLINE=1 \
+    POOLING=${EMBED_POOLING} \
+    DTYPE=${EMBED_DTYPE} \
+    USE_FLASH_ATTENTION=False
+
+# Runtime tunables as image-level defaults, overridable via the compose
+# environment block or `docker run -e VAR=VALUE`.
+ENV MAX_CONCURRENT_REQUESTS=32 \
+    MAX_BATCH_TOKENS=8192 \
+    MAX_CLIENT_BATCH_SIZE=32 \
+    AUTO_TRUNCATE=true \
+    PROMETHEUS_PORT=0 \
+    HOSTNAME=0.0.0.0 \
+    PORT=8080 \
+    WARMUP_TOKENS=0
+
+RUN sed -i -E 's/("max_position_embeddings"[[:space:]]*:[[:space:]]*)32768/\18192/' \
+        /data/embedding-model/config.json
+
+CMD ["--model-id", "/data/embedding-model"]

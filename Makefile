@@ -16,14 +16,14 @@
 	benchmark-selfcheck benchmark-offline benchmark-live benchmark-analyze benchmark-e2e benchmark-compare \
 	benchmark-sidecars-up benchmark-draft benchmark-style-ab \
 	docker-build docker-build-all docker-build-base docker-build-cached docker-build-nocache \
-	docker-build-bootstrap docker-build-tei docker-build-tei-embed docker-build-tei-embed-gpu \
-	docker-build-tei-rerank dense-cache \
+docker-build-bootstrap docker-build-tei docker-build-tei-embed-gpu docker-build-tei-embed-cpu \
+	docker-build-tei-rerank-gpu docker-build-tei-rerank-cpu docker-build-tei-cpu dense-cache \
 	docker-build-style-head \
 	decisions-smoke \
 	style-head-calibrate \
 	docker-publish docker-publish-tei docker-publish-style-head docker-publish-all \
-	docker-up docker-up-gpu docker-down docker-logs docker-logs-follow docker-rm clean \
-	embed-cache
+docker-up-gpu docker-up-cpu docker-down docker-logs docker-logs-follow docker-rm clean \
+	embed-cache embed-cache-cpu
 
 COMPOSE := docker compose -f docker/docker-compose.yml
 UV ?= uv
@@ -33,20 +33,29 @@ DOCKER_TAG      := $(shell grep -m 1 '^version' pyproject.toml | sed -E 's/.*"([
 DOCKER_HUB_REPO := olkowa/design-pattern-mcp
 GHCR_REPO       := ghcr.io/olk/design-pattern-mcp
 
-TEI_EMBED_IMAGE      := design-pattern-tei-embed
-TEI_RERANK_IMAGE     := design-pattern-tei-rerank
-TEI_EMBED_HUB_REPO   := olkowa/pattern-tei-embed
-TEI_EMBED_GHCR_REPO  := ghcr.io/olk/pattern-tei-embed
-TEI_RERANK_HUB_REPO  := olkowa/pattern-tei-rerank
-TEI_RERANK_GHCR_REPO := ghcr.io/olk/pattern-tei-rerank
+# Local TEI image names: the lane is part of the NAME, never the tag. The -gpu
+# pair (CUDA) and the -cpu pair (candle) both carry :$(DOCKER_TAG) and :latest;
+# the compose files and scripts/benchmark-docker.sh default to :latest. Only
+# the GPU pair is published, under the same $(DOCKER_TAG) as the server.
+TEI_EMBED_IMAGE      := design-pattern-tei-embed-gpu
+TEI_RERANK_IMAGE     := design-pattern-tei-rerank-gpu
+TEI_EMBED_IMAGE_CPU  := design-pattern-tei-embed-cpu
+TEI_RERANK_IMAGE_CPU := design-pattern-tei-rerank-cpu
+TEI_EMBED_HUB_REPO   := olkowa/pattern-tei-embed-gpu
+TEI_EMBED_GHCR_REPO  := ghcr.io/olk/pattern-tei-embed-gpu
+TEI_RERANK_HUB_REPO  := olkowa/pattern-tei-rerank-gpu
+TEI_RERANK_GHCR_REPO := ghcr.io/olk/pattern-tei-rerank-gpu
 
-EMBED_MODEL_REPO   ?= onnx-community/Qwen3-Embedding-0.6B-ONNX
-EMBED_ONNX_VARIANT ?= fp32
+EMBED_MODEL_REPO   ?= Qwen/Qwen3-Embedding-0.6B
 EMBED_POOLING      ?= last-token
 EMBED_DTYPE        ?= float32
-EMBED_TEI_BASE     ?= ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
-EMBED_TEI_BASE_GPU ?= ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
+EMBED_TEI_BASE     ?= ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
+EMBED_TEI_BASE_CPU ?= ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+CUDA_COMPUTE_CAP   ?= 61   # minimum arch served by the -gpu pair (sm >= 61 via PTX JIT)
 DENSE_CACHE_DIR    ?= data/dense-cache
+# Extra compose file(s) for the cache-builder's sidecar start (e.g.
+# `-f docker/docker-compose.cpu.yml` via `embed-cache-cpu` on GPU-less hosts).
+DENSE_CACHE_OVERLAY ?=
 
 # Linear style head (the Ch2 seam's only provider): a TF-IDF + calibrated-SVM head
 # fitted in its own image build, whose training RUN is also the accuracy gate.
@@ -300,31 +309,47 @@ docker-build-bootstrap: ## [internal] Build the server image that runs the cache
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 	docker build --target production -f Dockerfile -t $(DOCKER_IMAGE):latest .
 
-docker-build-tei-embed: ## Build the TEI embed sidecar (EMBED_MODEL_REPO=…, EMBED_ONNX_VARIANT=fp32|int8)
-	docker build -f docker/Dockerfile.tei-embed $(HF_SECRET_ARG) \
+docker-build-tei-embed-gpu: ## Build the GPU TEI embed sidecar image (design-pattern-tei-embed-gpu)
+	docker build -f docker/Dockerfile.tei-embed-gpu $(HF_SECRET_ARG) \
 		--build-arg EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) \
-		--build-arg EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) \
 		--build-arg EMBED_POOLING=$(EMBED_POOLING) \
 		--build-arg EMBED_DTYPE=$(EMBED_DTYPE) \
 		--build-arg TEI_BASE_IMAGE=$(EMBED_TEI_BASE) \
+		--build-arg CUDA_COMPUTE_CAP=$(CUDA_COMPUTE_CAP) \
 		-t $(TEI_EMBED_IMAGE):$(DOCKER_TAG) -t $(TEI_EMBED_IMAGE):latest .
 
-docker-build-tei-embed-gpu: ## Build the TEI embed sidecar on the CUDA base (needs an NVIDIA GPU at run time)
-	$(MAKE) --no-print-directory docker-build-tei-embed EMBED_TEI_BASE=$(EMBED_TEI_BASE_GPU)
+docker-build-tei-embed-cpu: ## Build the CPU TEI embed sidecar image (design-pattern-tei-embed-cpu; same model repo, shared cache)
+	docker build -f docker/Dockerfile.tei-embed-cpu $(HF_SECRET_ARG) \
+		--build-arg EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) \
+		--build-arg EMBED_POOLING=$(EMBED_POOLING) \
+		--build-arg EMBED_DTYPE=$(EMBED_DTYPE) \
+		--build-arg TEI_BASE_IMAGE=$(EMBED_TEI_BASE_CPU) \
+		-t $(TEI_EMBED_IMAGE_CPU):$(DOCKER_TAG) -t $(TEI_EMBED_IMAGE_CPU):latest .
 
-docker-build-tei-rerank: ## Build the TEI rerank sidecar image
-	docker build -f docker/Dockerfile.tei-rerank $(HF_SECRET_ARG) \
+docker-build-tei-rerank-gpu: ## Build the GPU TEI rerank sidecar image (design-pattern-tei-rerank-gpu)
+	docker build -f docker/Dockerfile.tei-rerank-gpu $(HF_SECRET_ARG) \
+		--build-arg TEI_BASE_IMAGE=$(EMBED_TEI_BASE) \
+		--build-arg CUDA_COMPUTE_CAP=$(CUDA_COMPUTE_CAP) \
 		-t $(TEI_RERANK_IMAGE):$(DOCKER_TAG) -t $(TEI_RERANK_IMAGE):latest .
 
-docker-build-tei: docker-build-tei-embed docker-build-tei-rerank ## Build both TEI sidecar images
+docker-build-tei-rerank-cpu: ## Build the CPU TEI rerank sidecar image (design-pattern-tei-rerank-cpu)
+	docker build -f docker/Dockerfile.tei-rerank-cpu $(HF_SECRET_ARG) \
+		--build-arg TEI_BASE_IMAGE=$(EMBED_TEI_BASE_CPU) \
+		-t $(TEI_RERANK_IMAGE_CPU):$(DOCKER_TAG) -t $(TEI_RERANK_IMAGE_CPU):latest .
+
+docker-build-tei: docker-build-tei-embed-gpu docker-build-tei-rerank-gpu ## Build both TEI sidecar images (CUDA pair, the default)
+
+docker-build-tei-cpu: docker-build-tei-embed-cpu docker-build-tei-rerank-cpu ## Build both CPU TEI sidecar images (design-pattern-tei-embed-cpu, design-pattern-tei-rerank-cpu)
 
 # The runnable base stack in one command (server + TEI pair + style head): everything
-# `docker-up` and the systemd base file start, with no GPU anywhere. `docker-build`
+# `docker-up-gpu` starts. The default TEI pair needs an NVIDIA GPU at run time (but
+# not at build time — nvcc cross-compiles); the -cpu pair (docker-build-tei-cpu,
+# docker-up-cpu) runs anywhere. `docker-build`
 # stays server-only on purpose — it feeds `docker-publish`, which must not drag in
 # sidecars.
-docker-build-base: docker-build docker-build-tei docker-build-style-head ## Build the base stack images (server + TEI pair + style head, no GPU)
+docker-build-base: docker-build docker-build-tei docker-build-style-head ## Build the base stack images (server + GPU TEI pair + style head)
 
-docker-build-all: docker-build docker-build-tei docker-build-style-head ## Build every image: server (+ dense cache), TEI pair, style head
+docker-build-all: docker-build docker-build-tei docker-build-tei-cpu docker-build-style-head ## Build every image: server (+ dense cache), TEI pair, style head
 
 docker-build-cached: embed-cache docker-build-all ## Force-regenerate the dense cache, then build every image
 
@@ -338,7 +363,7 @@ docker-build-style-head: ## Build the linear style head sidecar (CPU; the build 
 	docker build --progress=$(DOCKER_BUILD_PROGRESS) -f docker/Dockerfile.style-head \
 		-t $(STYLE_HEAD_IMAGE):$(DOCKER_TAG) -t $(STYLE_HEAD_IMAGE):latest .
 
-decisions-smoke: ## Smoke-test the style head's wire contract (needs docker-up)
+decisions-smoke: ## Smoke-test the style head's wire contract (needs docker-up-gpu)
 	@# The linear head is criteria-blind, so this payload deliberately carries NO criteria: any
 	@# criteria map it is sent must equal its 36 trained labels exactly, and a partial one is
 	@# refused with 422 (that refusal is the drift guard, exercised by test_style_head.py).
@@ -444,13 +469,14 @@ docker-publish-style-head: docker-build-style-head ## Push the style head image 
 docker-publish-all: docker-publish docker-publish-tei docker-publish-style-head ## Build and push every image: server, TEI pair, style head
 
 # File target, not phony: the cache is expensive (one TEI round-trip per
-# embedder batch, ~15 min for the 486-record catalog on CPU) and is only rebuilt
-# when the artifact is gone — `embed-cache` is the explicit force path.
+# embedder batch, ~5 min for the 486-record catalog through the GPU sidecar,
+# ~15 min through the CPU sidecar) and is only rebuilt when the artifact is
+# gone — `embed-cache` is the explicit force path.
 # The image prerequisites are ORDER-ONLY on purpose: they are phony (always
 # "remade"), so ordinary prerequisites would mark this target out of date on
-# every run and re-embed the whole catalog 15 min at a time.
-$(DENSE_CACHE_MANIFEST) $(DENSE_CACHE_VECTORS) &: | docker-build-tei-embed docker-build-bootstrap ## Generate data/dense-cache/ from the catalog (starts the TEI embed sidecar)
-	@$(COMPOSE) up -d design-pattern-tei-embed
+# every run and re-embed the whole catalog 5 min at a time.
+$(DENSE_CACHE_MANIFEST) $(DENSE_CACHE_VECTORS) &: | docker-build-tei-embed-gpu docker-build-bootstrap ## Generate data/dense-cache/ from the catalog (starts the TEI embed sidecar)
+	@$(COMPOSE) $(DENSE_CACHE_OVERLAY) up -d design-pattern-tei-embed
 	@printf ">> waiting for design-pattern-tei-embed-dev"; \
 	for _ in $$(seq 1 60); do \
 		if [ "$$(docker inspect -f '{{.State.Health.Status}}' design-pattern-tei-embed-dev 2>/dev/null)" = "healthy" ]; then echo " healthy"; break; fi; \
@@ -460,7 +486,6 @@ $(DENSE_CACHE_MANIFEST) $(DENSE_CACHE_VECTORS) &: | docker-build-tei-embed docke
 	$(COMPOSE) run --rm --no-deps -T \
 		-v "$(CURDIR)/$(DENSE_CACHE_DIR):/out" \
 		-e EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) \
-		-e EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) \
 		--entrypoint python design-pattern-mcp \
 		-m src.patterns.dense_cache build --out /out
 	@ls -l $(DENSE_CACHE_DIR)
@@ -471,12 +496,15 @@ embed-cache: ## Force-regenerate data/dense-cache/ (starts the TEI embed sidecar
 	@rm -f $(DENSE_CACHE_MANIFEST) $(DENSE_CACHE_DIR)/vectors.npy
 	@$(MAKE) --no-print-directory dense-cache
 
-docker-up: ## Start the dev stack (requires make docker-build-all once)
-	EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) $(COMPOSE) up -d --build
+embed-cache-cpu: ## Force-regenerate data/dense-cache/ via the CPU sidecar (no GPU needed)
+	@rm -f $(DENSE_CACHE_MANIFEST) $(DENSE_CACHE_DIR)/vectors.npy
+	@$(MAKE) --no-print-directory dense-cache DENSE_CACHE_OVERLAY="-f docker/docker-compose.cpu.yml"
 
-docker-up-gpu: ## Start the dev stack with the CUDA embed sidecar (needs an NVIDIA GPU)
-	EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) EMBED_ONNX_VARIANT=$(EMBED_ONNX_VARIANT) \
-	$(COMPOSE) -f docker/docker-compose.yml -f docker/docker-compose.gpu.yml up -d --build
+docker-up-gpu: ## Start the dev stack on the GPU pair (requires make docker-build-all once)
+	EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) $(COMPOSE) up -d --build
+
+docker-up-cpu: ## Start the dev stack on the CPU pair (-cpu images, no GPU needed)
+	EMBED_MODEL_REPO=$(EMBED_MODEL_REPO) $(COMPOSE) -f docker/docker-compose.cpu.yml up -d --build
 
 docker-down: ## Stop the dev stack
 	$(COMPOSE) down
@@ -502,7 +530,7 @@ docker-rm: ## Remove the local server image
 # propagation. live/analyze need a warm data/dense-cache (make dense-cache) plus the generator
 # key from config/.env; e2e runs the full stack under DENSE_CACHE_MODE=off (cold start re-embeds
 # the catalog, ~20 min on CPU) and tears the stack down afterwards (restart dev stack:
-# make docker-up).
+# make docker-up-gpu).
 BENCH_RUNS      ?= data/benchmark-runs
 BENCH_SCENARIOS ?= tests/benchmark/scenarios/seed.json
 BENCH_COMPOSE   := docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml

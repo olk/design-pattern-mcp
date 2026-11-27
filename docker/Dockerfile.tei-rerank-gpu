@@ -1,0 +1,153 @@
+# TEI reranker sidecar for design-pattern-mcp, CUDA build.
+#
+# Serves Alibaba-NLP/gte-reranker-modernbert-base via Hugging Face Text
+# Embeddings Inference (TEI) on the GPU. Weights (safetensors) are baked into
+# the image at build time so the container runs fully offline
+# (HF_HUB_OFFLINE=1).
+#
+# Same construction as docker/Dockerfile.tei-embed-gpu: the stock `cuda-1.9` image
+# targets compute capability 75+, so the router is rebuilt from the same TEI
+# tag with the non-flash CUDA feature set for CUDA_COMPUTE_CAP (61 = Pascal,
+# the minimum — the image serves sm >= 61 via PTX JIT, see the embed
+# Dockerfile) and overwrites the stock binary, with the same two widenings
+# (the entrypoint bypass in Stage 2, the >= 61 match-table arm in Stage 0).
+# candle reads safetensors, so the ONNX file the CPU build shipped is no
+# longer downloaded.
+#
+# Model rationale:
+#   - ModernBERT architecture (in TEI's official supported archs list)
+#   - Listed in TEI's Re-Ranking supported-models table
+#   - English-only, 149 M params, 8k context, Apache 2.0
+#
+# No config patch is needed: max_position_embeddings=8192 < default
+# max_batch_tokens=16384, so TEI accepts the model config without warning.
+#
+# Runtime tunables (clap env fallbacks):
+#
+#   MAX_CONCURRENT_REQUESTS  (default 512 in TEI; we set 64. /rerank consumes
+#                          one queue slot per text, so this must be >= the
+#                          number of texts in one rerank request.)
+#   MAX_BATCH_TOKENS       (default 16384 in TEI; above the 8k model context.)
+#   MAX_CLIENT_BATCH_SIZE  (default 32 in TEI; must be >= the client's
+#                          max_batch_size. 48 matches RERANKER_MAX_BATCH_SIZE.
+#                          Invariant: max_batch_size <=
+#                          min(MAX_CLIENT_BATCH_SIZE, MAX_CONCURRENT_REQUESTS).)
+#   AUTO_TRUNCATE           (default true; keep enabled for long requirement
+#                          strings)
+#   PROMETHEUS_PORT        (we set 0 so /metrics is never exposed)
+#   HOSTNAME               (Docker's injected container id is rejected by TEI;
+#                          effective bind is always 0.0.0.0)
+#   PORT                   (8080; update the healthcheck and
+#                          RERANKER_BASE_URL if changed)
+#   WARMUP_TOKENS          (unset upstream = the 78 s measured warmup pass; we
+#                          set 0 to skip it via PR #884)
+#   USE_FLASH_ATTENTION    (stock CUDA base defaults it to True; this build
+#                          has no flash kernel, so it is pinned False.)
+#
+# Clap precedence: CLI flag > env var > built-in default.
+# --model-id and --dtype stay pinned in CMD (sequence-classification models
+# take no --pooling). The tunables above are set via environment variables.
+
+ARG TEI_BASE_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
+ARG CUDA_COMPUTE_CAP=61
+
+# Stage 0: build the TEI router from source (v1.9.4 + unmerged PR #884) for
+# CUDA. See docker/Dockerfile.tei-embed-gpu for the rebase rules of the two ARGs.
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS router-builder
+ARG TEI_SOURCE_VERSION=v1.9.4
+ARG TEI_PR884_SHA=5806bdc99f11ad490cd7e38c1f4dd757034c0adb
+ARG CUDA_COMPUTE_CAP
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP} \
+    PATH="/root/.cargo/bin:${PATH}"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl pkg-config libssl-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y --default-toolchain 1.92.0 --profile minimal
+RUN git clone --depth 1 --branch ${TEI_SOURCE_VERSION} \
+        https://github.com/huggingface/text-embeddings-inference.git /usr/src/tei \
+    && cd /usr/src/tei \
+    && git fetch --depth 2 origin ${TEI_PR884_SHA} \
+    && git diff FETCH_HEAD^ FETCH_HEAD -- backends/src/lib.rs router/src/lib.rs router/src/main.rs \
+        | git apply --3way
+# Accept any runtime cap >= the build's CUDA_COMPUTE_CAP in TEI's compute-cap
+# match table (see docker/Dockerfile.tei-embed-gpu for why); the arm
+# interpolates the ARG, so raising the floor keeps the widening.
+RUN cd /usr/src/tei \
+    && sed -i "s/        (75, 75) => true,/        (runtime, ${CUDA_COMPUTE_CAP}) if runtime >= ${CUDA_COMPUTE_CAP} => true,\n        (75, 75) => true,/" backends/candle/src/compute_cap.rs \
+    && grep -q "(runtime, ${CUDA_COMPUTE_CAP}) if runtime >= ${CUDA_COMPUTE_CAP} => true" backends/candle/src/compute_cap.rs
+RUN cd /usr/src/tei \
+    && cargo build --release -p text-embeddings-router \
+        --no-default-features --features candle-cuda-volta,static-linking,http
+# Binary lands at /usr/src/tei/target/release/text-embeddings-router
+
+# Stage 1: download weights into a local directory.
+FROM python:3.10-slim AS model-downloader
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+
+# HF_TOKEN is optional (public model). Use the BuildKit secret if available.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "import os; \
+from huggingface_hub import snapshot_download; \
+snapshot_download( \
+    'Alibaba-NLP/gte-reranker-modernbert-base', \
+    token=os.environ.get('HF_TOKEN') or None, \
+    local_dir='/data/reranker-model', \
+    allow_patterns=[ \
+        '*.json', '*.txt', \
+        'tokenizer*', 'special_tokens*', \
+        'model.safetensors', \
+    ], \
+)"
+
+# Stage 2: runtime image with the model baked in.
+FROM ${TEI_BASE_IMAGE}
+
+COPY --from=model-downloader /data /data
+
+# Overwrite the stock (sm_80, flash-attention) router with the sm_61-floor build.
+COPY --from=router-builder /usr/src/tei/target/release/text-embeddings-router \
+     /usr/local/bin/text-embeddings-router
+
+# Bypass the stock arch dispatcher (see docker/Dockerfile.tei-embed-gpu): it only
+# knows caps 75+ and would refuse any sub-75 card before our binary runs.
+RUN printf '%s\n' \
+        '#!/bin/bash' \
+        '# CUDA entrypoint: GPU gate + exec our router (see Dockerfile).' \
+        'if ! command -v nvidia-smi &>/dev/null; then' \
+        "    echo \"Error: 'nvidia-smi' command not found.\"" \
+        '    exit 1' \
+        'fi' \
+        'exec /usr/local/bin/text-embeddings-router "$@"' \
+    > /usr/local/bin/entrypoint-cuda.sh \
+    && chmod +x /usr/local/bin/entrypoint-cuda.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint-cuda.sh"]
+
+ENV HF_HUB_OFFLINE=1 \
+    USE_FLASH_ATTENTION=False
+
+# Runtime tunables as image-level defaults, overridable via the compose
+# environment block or `docker run -e VAR=VALUE`.
+ENV MAX_CONCURRENT_REQUESTS=64 \
+    MAX_BATCH_TOKENS=16384 \
+    MAX_CLIENT_BATCH_SIZE=48 \
+    AUTO_TRUNCATE=true \
+    PROMETHEUS_PORT=0 \
+    HOSTNAME=0.0.0.0 \
+    PORT=8080 \
+    WARMUP_TOKENS=0
+
+# Pinned invariants only; everything else is controlled by environment variables.
+CMD ["--model-id", "/data/reranker-model", \
+     "--dtype", "float32"]

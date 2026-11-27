@@ -9,6 +9,7 @@ This directory contains the systemd unit that starts the
 |---|---|
 | `docker/docker-compose.yml` (repo root) | **Development**. Has `build:` sections, designed for `make docker-up`. |
 | `systemd/docker-compose.yml` (this dir) | **Production / systemd**. No `build:` (images pre-built), absolute paths, designed for `systemctl enable`. |
+| `systemd/docker-compose.cpu.yml` (this dir) | CPU lane overlay: `EMBEDDER_BATCH_SIZE=4` for the CPU TEI pair; enabled via `COMPOSE_FILE` in `.env` (see "CPU lane"). |
 
 ## Prerequisites
 
@@ -20,7 +21,7 @@ This directory contains the systemd unit that starts the
 
 ## Step 0 — Build or pull images
 
-This host is GPU-less by design, so it builds the CPU images only; every image in the base set is CPU-only.
+This host is GPU-less by design: production TEI runs in the external `pattern-tei-infra` stack, so this stack only runs the server and the style head (both CPU-only). `make docker-build-base` still builds the GPU-only TEI pair too, but those images are not started here.
 
 ```bash
 # From the repo root (server + TEI pair + style head):
@@ -83,6 +84,28 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8812/mcp" \
 ## Style head
 
 `docker-compose.yml` runs MCP + style head (Ch2 on, floor 0.6) with TEI external; no overlay is needed. To run a published head build instead of the local one, set `STYLE_HEAD_IMAGE=olkowa/design-pattern-style-head:<tag>` in `/etc/design-pattern-mcp/.env`, then `sudo systemctl reload design-pattern-mcp`. To stand the seam down, set `DECISIONS_STYLE_ENABLED=false` in the same file.
+
+## CPU lane
+
+When the `pattern-tei-infra` host has no NVIDIA GPU, run the CPU TEI pair there and this overlay here. Infra side (once):
+
+```bash
+make docker-build-tei-cpu   # if the -cpu images are not local yet
+docker tag design-pattern-tei-embed-cpu:latest pattern-tei-embed:latest
+docker tag design-pattern-tei-rerank-cpu:latest pattern-tei-rerank:latest
+sudo systemctl restart pattern-tei-infra
+```
+
+This side:
+
+```bash
+sudo install -m 644 systemd/docker-compose.cpu.yml /etc/design-pattern-mcp/
+# append to /etc/design-pattern-mcp/.env (edit the line if one exists):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.cpu.yml
+sudo systemctl reload design-pattern-mcp
+```
+
+The overlay only lowers `EMBEDDER_BATCH_SIZE` to 4 (candle-on-CPU cap; the base default 8 assumes the GPU pair) — the server and style head are CPU-only in both lanes, and the dense cache is shared, so switching never re-embeds. An explicit `EMBED_CLIENT_BATCH_SIZE` in `.env` overrides the overlay default in both lanes. Switch back by deleting the `COMPOSE_FILE` line, retagging the `-gpu` images onto `pattern-tei-*:latest`, and reloading both units.
 
 ## Updating
 

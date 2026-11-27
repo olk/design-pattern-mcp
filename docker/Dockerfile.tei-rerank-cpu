@@ -1,0 +1,103 @@
+# TEI reranker sidecar for design-pattern-mcp, CPU build.
+#
+# Serves Alibaba-NLP/gte-reranker-modernbert-base via Hugging Face Text
+# Embeddings Inference (TEI) on the CPU through the candle backend. Weights
+# (safetensors — the SAME repo as the GPU build
+# `docker/Dockerfile.tei-rerank-gpu`) are baked into the image at build time
+# so the container runs fully offline (HF_HUB_OFFLINE=1).
+#
+# Same construction as docker/Dockerfile.tei-embed-cpu: the stock `cpu-1.9`
+# router is rebuilt from the same TEI tag (v1.9.4 + unmerged PR #884) with
+# the CPU candle feature set and overwrites the stock binary. The cpu base
+# has no arch dispatcher — its entrypoint execs the router directly — so no
+# entrypoint bypass and no compute-cap patch are needed.
+#
+# No config patch is needed: max_position_embeddings=8192 < default
+# max_batch_tokens=16384, so TEI accepts the model config without warning.
+#
+# Runtime tunables: identical to the GPU build (same values — 64 / 16384 /
+# 48 / true / 0 / 0.0.0.0 / 8080 / 0; see
+# docker/Dockerfile.tei-rerank-gpu for what each one means). No
+# USE_FLASH_ATTENTION here: no flash kernel is compiled and the CPU load
+# path never consults it.
+#
+# Clap precedence: CLI flag > env var > built-in default.
+# --model-id and --dtype stay pinned in CMD (sequence-classification models
+# take no --pooling). The tunables above are set via environment variables.
+
+ARG TEI_BASE_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+
+# Stage 0: build the TEI router from source (v1.9.4 + unmerged PR #884).
+# See docker/Dockerfile.tei-embed-cpu for the rebase rules of the two ARGs.
+FROM rust:1.92-bookworm AS router-builder
+ARG TEI_SOURCE_VERSION=v1.9.4
+ARG TEI_PR884_SHA=5806bdc99f11ad490cd7e38c1f4dd757034c0adb
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${TEI_SOURCE_VERSION} \
+        https://github.com/huggingface/text-embeddings-inference.git /usr/src/tei \
+    && cd /usr/src/tei \
+    && git fetch --depth 2 origin ${TEI_PR884_SHA} \
+    && git diff FETCH_HEAD^ FETCH_HEAD -- backends/src/lib.rs router/src/lib.rs router/src/main.rs \
+        | git apply --3way
+RUN cd /usr/src/tei \
+    && cargo build --release -p text-embeddings-router \
+        --no-default-features --features candle,http
+# Binary lands at /usr/src/tei/target/release/text-embeddings-router
+
+# Stage 1: download weights into a local directory.
+FROM python:3.10-slim AS model-downloader
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN pip install --no-cache-dir huggingface_hub
+
+# HF_TOKEN is optional (public model). Use the BuildKit secret if available.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "import os; \
+from huggingface_hub import snapshot_download; \
+snapshot_download( \
+    'Alibaba-NLP/gte-reranker-modernbert-base', \
+    token=os.environ.get('HF_TOKEN') or None, \
+    local_dir='/data/reranker-model', \
+    allow_patterns=[ \
+        '*.json', '*.txt', \
+        'tokenizer*', 'special_tokens*', \
+        'model.safetensors', \
+    ], \
+)"
+
+# Stage 2: runtime image with the model baked in.
+FROM ${TEI_BASE_IMAGE}
+
+COPY --from=model-downloader /data /data
+
+# Overwrite the stock router with the PR#884 build.
+COPY --from=router-builder /usr/src/tei/target/release/text-embeddings-router \
+     /usr/local/bin/text-embeddings-router
+
+ENV HF_HUB_OFFLINE=1
+
+# Runtime tunables as image-level defaults, overridable via the compose
+# environment block or `docker run -e VAR=VALUE`.
+ENV MAX_CONCURRENT_REQUESTS=64 \
+    MAX_BATCH_TOKENS=16384 \
+    MAX_CLIENT_BATCH_SIZE=48 \
+    AUTO_TRUNCATE=true \
+    PROMETHEUS_PORT=0 \
+    HOSTNAME=0.0.0.0 \
+    PORT=8080 \
+    WARMUP_TOKENS=0
+
+# Pinned invariants only; everything else is controlled by environment variables.
+CMD ["--model-id", "/data/reranker-model", \
+     "--dtype", "float32"]
