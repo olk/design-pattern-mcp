@@ -15,15 +15,17 @@ deep-dive).
 | Component | Image (Docker Hub — public registry) | Role |
 |---|---|---|
 | MCP server | `olkowa/design-pattern-mcp` | Tool server, streamable-http (container port 8050 both stacks) |
-| TEI embedder | `olkowa/pattern-tei-embed-gpu` | Qwen3-Embedding-0.6B sidecar; required for retrieval |
-| TEI reranker | `olkowa/pattern-tei-rerank-gpu` | Reranker sidecar (`gte-reranker-modernbert-base`); required for retrieval |
+| TEI embedder | `olkowa/pattern-tei-embed-gpu` | Qwen3-Embedding-0.6B sidecar; required for retrieval (CUDA, sm_61 minimum) |
+| TEI reranker | `olkowa/pattern-tei-rerank-gpu` | Reranker sidecar (`gte-reranker-modernbert-base`); required for retrieval (CUDA, sm_61 minimum) |
 | Style head | `olkowa/design-pattern-style-head` | Ch2 style seam (TF-IDF + linear SVM, CPU); versions with the MCP release |
 
 Tags: `latest` plus a pinned release tag per image — the same version tag for
 all four, TEI embed/rerank included (`make docker-publish-tei` pushes the `-gpu`
-TEI pair with the MCP version). Use Docker Hub. Images are
-**linux/amd64 only**; on arm64 hosts build locally instead:
-`make docker-build-base`.
+TEI pair with the MCP version). Only `-gpu` is published; the `-cpu` pair is a
+local build (`make docker-build-tei-cpu`). `-gpu` needs an NVIDIA GPU with
+sm_61 minimum (sm_60 and below unsupported; sm_61 is the only hardware tested).
+Use Docker Hub. Images are **linux/amd64 only**; on arm64 hosts build locally
+instead: `make docker-build-base`.
 
 Pick exactly ONE path:
 
@@ -47,7 +49,7 @@ and compose projects are already distinct
 test -f docker/docker-compose.yml && echo "repo clone: OK"
 docker compose version                      # needs ≥ v2.20
 id -nG | tr ' ' '\n' | grep -qx docker && echo "docker group: OK"
-nvidia-smi -L                                    # an NVIDIA GPU is required (TEI sidecars reserve it via CDI; CPU-only hosts use the -cpu pair, note after A6)
+nvidia-smi -L                                    # NVIDIA GPU with sm_61 minimum for the default `-gpu` TEI pair (CDI reservation; sm_60 and below unsupported; CPU-only hosts use the local-build `-cpu` pair, note after A6)
 df -h /var/lib/docker                       # ≥ 18 GB free (MCP ≈ 1 GB with baked dense cache, TEI ≈ 14 GB)
 ```
 
@@ -108,7 +110,7 @@ docker compose --env-file docker/.env -f docker/docker-compose.yml config | grep
 # A4. Start. TEI sidecars cold-start model weights; first start takes ~2 min.
 #     (Published server images bake in the dense embedding cache; a locally
 #     built cache-less image instead embeds the whole catalog at first start,
-#     ~5 min through the GPU sidecar.)
+#     ~5 min via the GPU sidecar vs ~19 min via the CPU sidecar — full-catalog cache build only.)
 docker compose --env-file docker/.env -f docker/docker-compose.yml up -d
 
 # A5. Wait until all three report "healthy" (poll if still "starting").
@@ -125,7 +127,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8822/mcp" \
 
 CPU-only hosts: build the `-cpu` pair (`make docker-build-tei-cpu`) and append
 `-f docker/docker-compose.cpu.yml` to the A3/A4/`down` commands above (or run
-`make docker-up-cpu` from a repo checkout) — same models, shared dense cache.
+`make docker-up-cpu` from a repo checkout) — same models, shared dense cache (cache build ~19 min via CPU vs ~5 min via GPU).
 Regenerate the cache through the CPU sidecar first (`make embed-cache-cpu`;
 plain `make embed-cache` starts the GPU sidecar), then `make docker-build`
 picks it up with no GPU anywhere.
@@ -191,7 +193,7 @@ CPU-only infra host: run the `-cpu` TEI pair instead — `make docker-build-tei-
 then in B0 retag the `-cpu` images (`docker tag design-pattern-tei-embed-cpu:latest
 pattern-tei-embed:latest`, same for rerank) instead of pulling, and enable this
 stack's CPU lane (`systemd/docker-compose.cpu.yml` via `COMPOSE_FILE` — see
-`systemd/README.md` "CPU lane"). Same models, shared dense cache.
+`systemd/README.md` "CPU lane"). Same models, shared dense cache (cache build ~19 min via CPU vs ~5 min via GPU).
 
 ### B1 — images under the local names the unit checks
 
@@ -276,7 +278,7 @@ because the image default does not exist on a workstation). Off switches:
 `DENSE_CACHE_MODE=off` (compose stack or host run), `mode: off` in a config file.
 
 The dense retrieval leg embeds one `document_text` per catalog record (486) at startup
-(~19 min on the CPU TEI sidecar). That matrix is snapshotted to
+(~19 min via the CPU TEI sidecar, ~5 min via the GPU sidecar — full-catalog cache build only). That matrix is snapshotted to
 `DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image) as
 `manifest.json` + `vectors.npy` and reloaded on the next start, so a restart costs one
 probe embedding instead of a full corpus pass.
@@ -293,7 +295,7 @@ probe embedding instead of a full corpus pass.
   changes the catalogue or the model, delete it first
   (`docker volume rm design-pattern-mcp-systemd-dense-cache` resp.
   `design-pattern-mcp-dev-dense-cache`, or `docker compose down -v`) — otherwise the
-  fingerprint guards force one re-embed (~19 min) and rewrite the volume. For a
+  fingerprint guards force one re-embed (~19 min via CPU, ~5 min via GPU) and rewrite the volume. For a
   genuinely cold cache use a cache-less image (`make docker-build-nocache`) or switch
   the cache off: `DENSE_CACHE_MODE=off` in the stack's env (compose forwards the host
   value; a host run reads the same name). A bare `docker run` gets no volume; pass
@@ -359,7 +361,7 @@ B: `sudo systemctl restart design-pattern-mcp`). Full provider list:
 | `docker image inspect design-pattern-mcp:latest` failed (unit start) | B1 retag step missed or used a different tag. |
 | `network pattern-tei-shared not found` | TEI infra not running: `sudo systemctl start pattern-tei-infra.service`. |
 | MCP container unhealthy; logs show TEI connection errors | TEI still cold-starting (start_period 120 s) — recheck health after ~2 min; if persistent, verify B0 (Path B) or the dev sidecars (Path A). |
-| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min on CPU; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build` (bakes the cache; `docker-build-all` builds the same server image plus the sidecars). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
+| MCP container unhealthy for many minutes; logs show dense-cache re-embed | Cache-less image, empty volume, or an invalidated snapshot embeds the whole catalog at first start (~19 min via CPU, ~5 min via GPU — full-catalog cache build only; healthcheck start_period 1800 s). Wait, or rebuild with `make docker-build` (bakes the cache; `docker-build-all` builds the same server image plus the sidecars). A reset volume re-seeds from the image, so the re-embed happens once per new catalogue/model. |
 | Dense cache seems missing on the host although the log shows a cache hit | Expected — the logged path is the *in-container* view of the named volume. Inspect `docker exec <container> ls -l /app/data/dense-cache`, or `docker volume inspect --format '{{.Mountpoint}}' design-pattern-mcp-dev-dense-cache` (resp. `-systemd-`); verify the mount with `docker inspect -f '{{json .Mounts}}' <container>`. |
 | Log shows `Dense cache write failed` but startup continues | By design (best-effort write-back): the cache directory is read-only/root-owned or full. Fix ownership or point `DENSE_CACHE_PATH` at a writable directory; the run keeps the vectors it just embedded. |
 | Container healthy but design tool calls fail with 401/502, or every LLM call returns `ERR_009` | Generator API key wrong/missing in the env file, or provider env block mismatched — see generator section. An env file written for an older release still uses the removed `DESIGN_PATTERN_` prefix (`DESIGN_PATTERN_GENERATOR_API_KEY`, `DESIGN_PATTERN_DENSE_CACHE_MODE`, …): strip it from every key, and reinstall `config/config.json` in the same step — its `{env:...}` placeholders carry the variable names. |

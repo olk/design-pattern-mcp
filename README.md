@@ -403,7 +403,7 @@ OPENCODE_API_KEY=your_key make docker-up
 
 | Stack | Build | Start | What runs |
 |---|---|---|---|
-| Any host (default) | `make docker-build-base` | `make docker-up` | server + TEI pair (CUDA default, `-cpu` pair via `docker-up-cpu` — the benchmarked path) + style head |
+| Any host (default) | `make docker-build-base` | `make docker-up` | server + TEI pair (CUDA `-gpu` default, sm_61 minimum; `-cpu` pair via `docker-up-cpu` — the benchmarked lane) + style head |
 | Style off | same as above | `DECISIONS_STYLE_ENABLED=false make docker-up` | same stack, Ch2 stands down to the LLM sample |
 | Production host | Step 0 in `systemd/README.md` | `systemctl enable --now design-pattern-mcp` | systemd stack: server + style head in-stack, TEI external |
 
@@ -455,7 +455,7 @@ The TEI sidecars are required for full retrieval quality: a dense leg (Qwen3-Emb
 
 > **TEI startup:** both sidecar images (`docker/Dockerfile.tei-embed-gpu`, `docker/Dockerfile.tei-rerank-gpu`, with `-cpu` mates for GPU-less hosts) ship a self-built TEI router (v1.9.4 + unmerged [PR #884](https://github.com/huggingface/text-embeddings-inference/pull/884)) with `WARMUP_TOKENS=0` by default — this skips the synthetic warmup pass (measured ~131 s embed / ~78 s rerank) so containers become ready after weight load only. Override per sidecar via `TEI_WARMUP_TOKENS` / `TEI_RERANK_WARMUP_TOKENS` (positive N warms with N tokens instead; values > `MAX_BATCH_TOKENS` are rejected at startup).
 
-**GPU TEI:** both sidecars are CUDA images (`cuda-1.9` base) with a self-built router built for sm_61 as the minimum — this host's GTX 1080 Ti (compute capability 6.1) sits below the stock image's 75 floor, so the router is compiled from the same TEI tag with the non-flash CUDA feature set and overwrites the stock binary. The embedded PTX JIT-compiles on newer cards, so the same image serves sm >= 61 (Ampere/Ada/Hopper/Blackwell); first model load on a newer card pays a one-time JIT compile, and sm_61 is the only hardware tested so far. Both serve safetensors weights through candle (no ONNX). `make docker-up` requires an NVIDIA GPU via the container toolkit (CDI reservation in `docker/docker-compose.yml`). GPU-less hosts use the CPU pair instead (`docker/Dockerfile.tei-*-cpu`, candle backend, same safetensors repos) via `make docker-build-tei-cpu` + `make docker-up-cpu`; the dense cache is shared between lanes, so switching never re-embeds.
+**GPU TEI:** both sidecars are CUDA images (`cuda-1.9` base) with a self-built router built for sm_61 as the minimum — this host's GTX 1080 Ti (compute capability 6.1) sits below the stock image's 75 floor, so the router is compiled from the same TEI tag with the non-flash CUDA feature set and overwrites the stock binary. The embedded PTX JIT-compiles on newer cards, so the same image serves sm >= 61 (Ampere/Ada/Hopper/Blackwell); sm_60 and below are unsupported. First model load on a newer card pays a one-time JIT compile, and sm_61 is the only hardware tested so far. Both serve safetensors weights through candle (no ONNX). `make docker-up` requires an NVIDIA GPU via the container toolkit (CDI reservation in `docker/docker-compose.yml`). GPU-less hosts use the CPU pair instead (`docker/Dockerfile.tei-*-cpu`, candle backend, same safetensors repos, local build only — only `-gpu` is published) via `make docker-build-tei-cpu` + `make docker-up-cpu`; the dense cache is shared between lanes, so switching never re-embeds. Measured lane difference is the full-catalog dense-cache build only: ~5 min via the GPU sidecar vs ~19 min via the CPU sidecar; no e2e retrieval/inference GPU benchmark exists.
 
 **Already-running embedder/reranker:** when embedding and reranking endpoints already run on other servers, point the MCP server at them via `EMBEDDER_BASE_URL` (OpenAI-compatible route, `http://<host>:8080/v1`) plus `RERANKER_BASE_URL` (`http://<host>:8080`) and skip the sidecars. The embedder forwards `EMBEDDER_MODEL` (default `openai//data/embedding-model`) and `EMBEDDER_API_KEY` through LiteLLM — provider/model syntax is documented in the [LiteLLM embedding docs](https://docs.litellm.ai/docs/embedding/supported_embedding). The reranker is **not** a LiteLLM client — it POSTs `{base_url}/rerank` directly (`src/patterns/safe_tei_rerank.py`), so `RERANKER_MODEL` (default `Alibaba-NLP/gte-reranker-modernbert-base`) is a TEI model name, not a LiteLLM model string. A remote embedder serving a different model invalidates the baked dense cache — regenerate it with `make embed-cache` so vectors match the serving model.
 
@@ -531,7 +531,7 @@ compose override (cold-start measurement).
 The dense retrieval leg is one FAISS index over every catalog record (486 records → 486
 `document_text` embeddings at startup). That matrix is snapshotted to disk next to a
 manifest and reloaded on the next start, so a restart costs **one probe embedding**
-instead of a full corpus pass (~5 min through the GPU embed sidecar).
+instead of a full corpus pass (~5 min via the GPU embed sidecar vs ~19 min via the CPU sidecar — full-catalog cache build only).
 
 - **Path**: `DENSE_CACHE_PATH` (`/app/data/dense-cache` in the image).
   Contents: `manifest.json` (the commit marker) + `vectors.npy`. A directory without a
@@ -547,7 +547,7 @@ instead of a full corpus pass (~5 min through the GPU embed sidecar).
   upgrades. A **fresh** volume is seeded from the image's baked snapshot; an **existing**
   one keeps its own, so after a catalogue- or model-changing rebuild delete it
   (`docker volume rm <name>`) before `up -d`, otherwise the guards force one re-embed
-  (~19 min) and rewrite the volume. A genuinely cold cache needs a cache-less image
+  (~19 min via CPU, ~5 min via GPU — full-catalog cache build only) and rewrite the volume. A genuinely cold cache needs a cache-less image
   (`make docker-build-nocache`) or `mode=off` — `DENSE_CACHE_MODE=off` covers both the
   compose stacks and host runs.
 - **Rebuilt automatically** when the embedding function changes (model string, text
